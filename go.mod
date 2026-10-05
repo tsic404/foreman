@@ -3,6 +3,7 @@ module github.com/tsic404/foreman
 go 1.27
 
 require (
+	github.com/coder/websocket v1.8.14
 	github.com/prometheus/client_golang v1.23.2
 	k8s.io/api v0.37.1
 	k8s.io/apimachinery v0.37.1

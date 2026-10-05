@@ -60,6 +60,14 @@ type Reconciler interface {
 	Reconcile(ctx context.Context) error
 }
 
+// PendingReports is the recovery module's durable terminal-report queue
+// (contract §4: terminal callbacks are never dropped). The scheduler
+// enqueues daemon terminal reports whose forward exhausted the proxy's
+// retry budget; recovery drains the queue until the server accepts them.
+type PendingReports interface {
+	Enqueue(taskID string, ep Endpoint, body []byte) error
+}
+
 // noopMetrics keeps every Metrics call site nil-safe.
 type noopMetrics struct{}
 
