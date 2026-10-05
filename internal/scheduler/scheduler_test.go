@@ -141,6 +141,7 @@ type fakeMetrics struct {
 func (f *fakeMetrics) TaskClaimed()               { f.claimed++ }
 func (f *fakeMetrics) TaskTerminal(result string) { f.terminal = append(f.terminal, result) }
 func (f *fakeMetrics) JobBootSeconds(float64)     {}
+func (f *fakeMetrics) JobCreateSeconds(float64)   {}
 func (f *fakeMetrics) InflightJobs(n int)         { f.inflight = append(f.inflight, n) }
 func (f *fakeMetrics) DuplicateDispatch()         { f.duplicates++ }
 

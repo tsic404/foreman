@@ -48,6 +48,7 @@ type Metrics interface {
 	TaskClaimed()
 	TaskTerminal(result string)
 	JobBootSeconds(seconds float64)
+	JobCreateSeconds(seconds float64)
 	InflightJobs(n int)
 	DuplicateDispatch()
 }
@@ -62,11 +63,12 @@ type Reconciler interface {
 // noopMetrics keeps every Metrics call site nil-safe.
 type noopMetrics struct{}
 
-func (noopMetrics) TaskClaimed()           {}
-func (noopMetrics) TaskTerminal(string)    {}
-func (noopMetrics) JobBootSeconds(float64) {}
-func (noopMetrics) InflightJobs(int)       {}
-func (noopMetrics) DuplicateDispatch()     {}
+func (noopMetrics) TaskClaimed()             {}
+func (noopMetrics) TaskTerminal(string)      {}
+func (noopMetrics) JobBootSeconds(float64)   {}
+func (noopMetrics) JobCreateSeconds(float64) {}
+func (noopMetrics) InflightJobs(int)         {}
+func (noopMetrics) DuplicateDispatch()       {}
 
 func orNoopMetrics(m Metrics) Metrics {
 	if m == nil {
