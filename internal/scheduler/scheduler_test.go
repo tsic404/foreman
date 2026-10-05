@@ -160,13 +160,16 @@ type fixture struct {
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	f := &fixture{
-		reg:     registry.New(nil),
 		jobs:    &fakeJobs{},
 		server:  &fakeServer{},
 		builder: &fakeBuilder{},
 		metrics: &fakeMetrics{},
 		now:     testNow,
 	}
+	// The registry shares the fixture clock: with the real clock its done
+	// index (TTL 24h) would expire entries stamped at testNow and the suite
+	// would rot with wall time.
+	f.reg = registry.New(func() time.Time { return f.now })
 	cfg, err := LoadConfig(func(string) string { return "" })
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)

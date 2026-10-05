@@ -1,6 +1,8 @@
-// Package recovery implements the failure-compensation side of Foreman:
-// the durable pending terminal-report queue here, and (in later slices) the
-// restart/failure reconciler. Design: docs/05-modules/failure-handling.md.
+// Package recovery implements the failure-compensation and recovery side of
+// Foreman: the durable pending terminal-report queue, the restart/failure
+// reconciler over the Job/Pod facts and the server's C13 truth, the K8s
+// object watcher, the heartbeat-suspect signal and the cancel-ack timeout.
+// Design: docs/05-modules/failure-handling.md, contracts §3.4/§4.
 package recovery
 
 import (
