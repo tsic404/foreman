@@ -253,6 +253,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		return err
 	}
 	s.metrics.TaskClaimed()
+	s.metrics.JobCreateSeconds(e.JobCreatedAt.Sub(e.ClaimedAt).Seconds())
 	s.metrics.InflightJobs(s.reg.Inflight())
 	s.log.InfoContext(ctx, "job.created",
 		"task_id", e.TaskID, "job_name", e.JobName,
