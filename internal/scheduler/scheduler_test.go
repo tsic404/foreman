@@ -550,8 +550,10 @@ func TestOnReportTerminalFailureKeepsObjects(t *testing.T) {
 	f.reg.Put(e)
 	f.server.forwardCode = 500
 
+	// Without a wired PendingReports queue the daemon still gets 502
+	// (proxy.md 转发 switch) and the terminal entry is retained.
 	code, _, err := f.sched.OnReport(context.Background(), EPComplete, e, []byte(`{}`))
-	if err != nil || code != 500 {
+	if err != nil || code != 502 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
 	e, _ = f.reg.Get("task-1")

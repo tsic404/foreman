@@ -10,6 +10,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sync"
 	"time"
 
@@ -95,6 +96,13 @@ func WithReconciler(r Reconciler) Option {
 	return func(s *Scheduler) { s.reconciler = r }
 }
 
+// WithPendingReports wires the recovery module's durable terminal-report
+// queue; terminal forwards that exhaust the proxy's retry budget are
+// enqueued instead of dropped (contract §4).
+func WithPendingReports(p PendingReports) Option {
+	return func(s *Scheduler) { s.pendingReports = p }
+}
+
 // WithLogger overrides the logger (tests).
 func WithLogger(l *slog.Logger) Option {
 	return func(s *Scheduler) { s.log = l.With("component", "scheduler") }
@@ -111,8 +119,9 @@ type Scheduler struct {
 	metrics Metrics
 	log     *slog.Logger
 
-	reconciler Reconciler
-	now        func() time.Time
+	reconciler     Reconciler
+	pendingReports PendingReports
+	now            func() time.Time
 
 	claimMu     *keyedMutex
 	pendingFail sync.Map // task_id → failReport: terminal reports not yet delivered
@@ -405,9 +414,17 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 
 	code, resp, err := s.server.Forward(ctx, ep, e.TaskID, body)
 	if err != nil {
+		if ep.IsTerminal() {
+			// The proxy's retry budget is exhausted (or the transport is
+			// down): contract §4 forbids dropping the report — queue it and
+			// tell the daemon the upstream is unavailable (proxy.md 转发).
+			s.enqueuePending(ctx, e, ep, body)
+			return http.StatusBadGateway, upstreamUnavailableBody, nil
+		}
 		return 0, nil, fmt.Errorf("forward %s for task %s: %w", ep, e.TaskID, err)
 	}
 	if ep.IsTerminal() {
+		defer s.metrics.InflightJobs(s.reg.Inflight())
 		switch {
 		case code >= 200 && code < 300:
 			s.cleanup(ctx, e)
@@ -416,16 +433,139 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			// cleanup idempotent (proxy.md 转发 switch).
 			s.cleanup(ctx, e)
 			return 200, resp, nil
-		default:
-			// Permanent or transient failure: the entry stays terminal, the
-			// objects stay, recovery's pending-report queue re-sends and the
-			// reconcile loop retries the deletion.
+		case code == 400 || code == 403 || code == 409:
+			// Permanent failure (§1.1 failure table): no retry, no queue;
+			// the entry stays terminal and the objects stay for inspection.
 			s.log.ErrorContext(ctx, "task.forward_failed",
 				"task_id", e.TaskID, "endpoint", string(ep), "status", code)
+		default:
+			// Transient failure with the retry budget exhausted: queue the
+			// report; recovery drains it until the server accepts (§4).
+			s.log.ErrorContext(ctx, "task.forward_failed",
+				"task_id", e.TaskID, "endpoint", string(ep), "status", code)
+			s.enqueuePending(ctx, e, ep, body)
+			return http.StatusBadGateway, upstreamUnavailableBody, nil
 		}
-		s.metrics.InflightJobs(s.reg.Inflight())
+		return code, resp, nil
+	}
+	if code == 404 {
+		// A non-terminal forward answered 404: the server deleted the task
+		// (proxy.md 转发 switch → failure-handling scenario #9).
+		if err := s.OnTaskVanished(ctx, e.TaskID); err != nil {
+			s.log.ErrorContext(ctx, "task vanish cleanup failed",
+				"task_id", e.TaskID, "job_name", e.JobName, "err", err)
+		}
+		return 404, resp, nil
+	}
+	if code >= 500 || code == http.StatusRequestTimeout || code == http.StatusTooManyRequests {
+		// Transient upstream failure: the §1.2/proxy.md 转发 switch maps it
+		// to 502 for the daemon (the daemon owns the retry).
+		return http.StatusBadGateway, upstreamUnavailableBody, nil
 	}
 	return code, resp, nil
+}
+
+// upstreamUnavailableBody is the §1.2 error body for a transiently
+// undeliverable forward (proxy.md 转发 switch).
+var upstreamUnavailableBody = []byte(`{"error":"upstream unavailable"}`)
+
+// enqueuePending lands a terminal report in the recovery module's durable
+// queue (contract §4: terminal callbacks are never dropped). Without a
+// wired queue the entry stays terminal and reconcile keeps the objects.
+func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep Endpoint, body []byte) {
+	if s.pendingReports == nil {
+		s.log.ErrorContext(ctx, "task.forward_undelivered",
+			"task_id", e.TaskID, "endpoint", string(ep),
+			"reason", "no pending-report queue wired")
+		return
+	}
+	if err := s.pendingReports.Enqueue(e.TaskID, ep, body); err != nil {
+		s.log.ErrorContext(ctx, "task.forward_undelivered",
+			"task_id", e.TaskID, "endpoint", string(ep),
+			"reason", "pending-report enqueue failed", "err", err)
+	}
+}
+
+// OnTaskVanished handles failure-handling scenario #9: the server deleted
+// the task (C4/C13 404). The Job/Secret are removed and the entry dropped;
+// no terminal report is sent for a task the server no longer knows.
+func (s *Scheduler) OnTaskVanished(ctx context.Context, taskID string) error {
+	e, ok := s.reg.Get(taskID)
+	if !ok {
+		return nil
+	}
+	s.log.InfoContext(ctx, "task.vanished",
+		"task_id", e.TaskID, "job_name", e.JobName)
+	// A queued synthetic report is moot once the task is gone server-side.
+	s.pendingFail.Delete(taskID)
+	s.deleteObjects(ctx, e)
+	if err := s.reg.Delete(taskID); err != nil {
+		return err
+	}
+	s.metrics.InflightJobs(s.reg.Inflight())
+	return nil
+}
+
+// OnBootTimeout handles failure-handling scenario #4: the Job's daemon never
+// started within the boot deadline. The task is failed on the daemon's
+// behalf (C10, failure_reason=job_boot_timeout) and the objects removed.
+func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
+	e, ok := s.reg.Get(taskID)
+	if !ok || e.IsTerminal() || !e.StartedAt.IsZero() {
+		return nil
+	}
+	if _, err := s.reg.MarkTerminal(taskID, registry.ResultFailed, s.now()); err != nil {
+		return err
+	}
+	s.metrics.TaskTerminal(string(registry.ResultFailed))
+	s.log.ErrorContext(ctx, "task.failed_compensated",
+		"task_id", e.TaskID, "job_name", e.JobName,
+		"failure_reason", "job_boot_timeout")
+	report := failReport{reason: "job_boot_timeout", message: "job daemon did not start before the boot deadline"}
+	if err := s.reportFail(ctx, taskID, report); err != nil {
+		// Keep the terminal entry: a reconcile round retries the report
+		// before the objects may be deleted (contract §4).
+		s.pendingFail.Store(taskID, report)
+		s.metrics.InflightJobs(s.reg.Inflight())
+		return nil
+	}
+	s.metrics.InflightJobs(s.reg.Inflight())
+	return s.cleanup(ctx, e)
+}
+
+// ConvergeLeaseRefused settles an entry whose prepare-lease was refused
+// (C4 400: the task left the renewable pre-start state). C13 decides:
+// running marks the entry started (leasing stops), terminal settles and
+// cleans up, a deleted task vanishes; anything else waits for the next
+// lease round (proxy.md §prepare-lease 保活).
+func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) error {
+	e, ok := s.reg.Get(taskID)
+	if !ok || e.IsTerminal() {
+		return nil
+	}
+	st, err := s.server.TaskStatus(ctx, taskID)
+	switch {
+	case errors.Is(err, ErrTaskNotFound):
+		return s.OnTaskVanished(ctx, taskID)
+	case err != nil:
+		return err
+	}
+	s.reg.SetLastStatusSeen(taskID, st)
+	switch {
+	case st == "running":
+		// The daemon started without Foreman seeing S8 (e.g. a restart):
+		// stop leasing, keep the Job, wait for the daemon's reports.
+		s.reg.MarkStarted(taskID, s.now())
+		return nil
+	case registry.IsTerminalResult(st):
+		if _, err := s.reg.MarkTerminal(taskID, registry.Result(st), s.now()); err != nil {
+			return err
+		}
+		return s.cleanup(ctx, e)
+	default:
+		// queued/dispatched/waiting_*: no decisive fact — retry next round.
+		return nil
+	}
 }
 
 // OnJobGone is the compensation entry for a Job that disappeared or failed
