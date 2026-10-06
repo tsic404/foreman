@@ -1,0 +1,29 @@
+# Foreman namespaces (contracts §5.3).
+#
+# `foreman` hosts the single-replica Foreman Deployment, its Service and the
+# server credential; `multica-agents` hosts every Job/Secret Foreman creates,
+# the Job placeholder ServiceAccount and the foreman-gc DaemonSet.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: foreman
+  labels:
+    app.kubernetes.io/name: foreman
+    # Foreman runs unprivileged and mount-free: it satisfies restricted PSA.
+    pod-security.kubernetes.io/enforce: restricted
+    pod-security.kubernetes.io/audit: restricted
+    pod-security.kubernetes.io/warn: restricted
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: multica-agents
+  labels:
+    app.kubernetes.io/name: foreman-job
+    # Job pods use node-local hostPath volumes (ADR-005) and a root
+    # init container that fixes directory ownership, so `restricted` would
+    # reject them; `baseline` still forbids privileged/hostNetwork/hostPID.
+    pod-security.kubernetes.io/enforce: baseline
+    pod-security.kubernetes.io/audit: baseline
+    pod-security.kubernetes.io/warn: baseline

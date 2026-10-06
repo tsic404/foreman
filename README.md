@@ -16,6 +16,21 @@ Multica Server  ◄── fake client ──  Foreman  ── fake server ──
 - **Fake server** — accepts connections from the official `multica` daemon running inside each Job pod, dispatches the claimed task, receives progress reports.
 - **Job orchestration** — one Job per task; node-local caches (repo mirror, session files) are reused via hostPath + soft node affinity, with graceful fallback to a cold start on any other node.
 
+## Build and deploy
+
+```bash
+make build-foreman        # bin/foreman      — the scheduler process
+make build-gc             # bin/foreman-gc   — node-local cache collector
+make build-foreman-image  # container image for the Deployment
+make build-job-image      # Job image: upstream multica CLI + omp + foreman-gc
+make check                # gofmt + vet + tests + build
+```
+
+Deployment lives in `deploy/` (namespaces, RBAC, Secrets, Deployment/Service,
+`foreman-gc` DaemonSet) and is applied with `kubectl apply -f deploy/`; see
+`deploy/README.md` for the Secret values, the Job image digest pinning and the
+node-local state root.
+
 ## Status
 
 Early development. The protocol feasibility has been validated against Multica daemon `v0.6.0`.
