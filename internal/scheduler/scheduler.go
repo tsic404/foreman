@@ -26,6 +26,17 @@ import (
 // (failure-handling reconcileOne step 1).
 const jobGoneGracePeriod = 60 * time.Second
 
+// Failure reasons carried in the synthesized fail report (C10 body
+// failure_reason) for every compensation path (failure-handling 场景矩阵).
+const (
+	FailureReasonJobCreateFailed = "job_create_failed"
+	FailureReasonJobMissing      = "job_missing"
+	FailureReasonJobBootTimeout  = "job_boot_timeout"
+	FailureReasonJobFailed       = "job_failed"
+	FailureReasonJobDeadline     = "job_deadline_exceeded"
+	FailureReasonJobEvicted      = "job_evicted"
+)
+
 // claimHead is the subset of the claim payload the scheduler reads to index
 // the task (proxy.md 数据结构). Everything else passes through opaque.
 type claimHead struct {
@@ -288,7 +299,10 @@ func (s *Scheduler) resolveDuplicateClaim(ctx context.Context, existing registry
 	case errors.Is(err, ErrTaskNotFound):
 		s.log.WarnContext(ctx, "duplicate_dispatch",
 			"task_id", existing.TaskID, "old_job_name", existing.JobName, "action", "drop_task_gone")
-		s.deleteObjects(ctx, existing)
+		// The claim proceeds as a replacement: leftover objects are handled
+		// idempotently by the new claim (delete-then-create Secret, tolerated
+		// AlreadyExists Job), so a failed delete needs no retry handle.
+		_ = s.deleteObjects(ctx, existing)
 		_ = s.reg.Delete(existing.TaskID)
 		return false, 0, nil
 	case err != nil:
@@ -316,7 +330,10 @@ func (s *Scheduler) resolveDuplicateClaim(ctx context.Context, existing registry
 		// execution) and let the new claim build a fresh Job.
 		s.log.WarnContext(ctx, "duplicate_dispatch",
 			"task_id", existing.TaskID, "old_job_name", existing.JobName, "action", "replace_pre_start")
-		s.deleteObjects(ctx, existing)
+		// The claim proceeds as a replacement: leftover objects are handled
+		// idempotently by the new claim (delete-then-create Secret, tolerated
+		// AlreadyExists Job), so a failed delete needs no retry handle.
+		_ = s.deleteObjects(ctx, existing)
 		_ = s.reg.Delete(existing.TaskID)
 		return true, existing.Attempt, nil
 	default:
@@ -490,20 +507,11 @@ func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep
 // the task (C4/C13 404). The Job/Secret are removed and the entry dropped;
 // no terminal report is sent for a task the server no longer knows.
 func (s *Scheduler) OnTaskVanished(ctx context.Context, taskID string) error {
-	e, ok := s.reg.Get(taskID)
-	if !ok {
-		return nil
+	if e, ok := s.reg.Get(taskID); ok {
+		s.log.InfoContext(ctx, "task.vanished",
+			"task_id", e.TaskID, "job_name", e.JobName)
 	}
-	s.log.InfoContext(ctx, "task.vanished",
-		"task_id", e.TaskID, "job_name", e.JobName)
-	// A queued synthetic report is moot once the task is gone server-side.
-	s.pendingFail.Delete(taskID)
-	s.deleteObjects(ctx, e)
-	if err := s.reg.Delete(taskID); err != nil {
-		return err
-	}
-	s.metrics.InflightJobs(s.reg.Inflight())
-	return nil
+	return s.ReleaseTask(ctx, taskID)
 }
 
 // OnBootTimeout handles failure-handling scenario #4: the Job's daemon never
@@ -520,8 +528,8 @@ func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
 	s.metrics.TaskTerminal(string(registry.ResultFailed))
 	s.log.ErrorContext(ctx, "task.failed_compensated",
 		"task_id", e.TaskID, "job_name", e.JobName,
-		"failure_reason", "job_boot_timeout")
-	report := failReport{reason: "job_boot_timeout", message: "job daemon did not start before the boot deadline"}
+		"failure_reason", FailureReasonJobBootTimeout)
+	report := failReport{reason: FailureReasonJobBootTimeout, message: "job daemon did not start before the boot deadline"}
 	if err := s.reportFail(ctx, taskID, report); err != nil {
 		// Keep the terminal entry: a reconcile round retries the report
 		// before the objects may be deleted (contract §4).
@@ -568,8 +576,10 @@ func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) err
 	}
 }
 
-// OnJobGone is the compensation entry for a Job that disappeared or failed
-// without a daemon report (recovery calls it). C13 decides what to settle.
+// OnJobGone is the compensation entry for a Job object that disappeared
+// without a daemon report (failure-handling 场景 #1 step 1 / #2 / #9 / #11).
+// The grace period tolerates the first-visibility delay of a freshly created
+// Job; C13 then decides what to settle.
 func (s *Scheduler) OnJobGone(ctx context.Context, jobName string) error {
 	e, ok := s.reg.ByJob(jobName)
 	if !ok {
@@ -582,42 +592,118 @@ func (s *Scheduler) OnJobGone(ctx context.Context, jobName string) error {
 		// Freshly created: tolerate the first-visibility delay.
 		return nil
 	}
+	return s.FailJob(ctx, jobName, FailureReasonJobMissing)
+}
+
+// FailJob compensates a Job whose container ended without the daemon
+// reporting a terminal state (failure-handling 场景 #3/#5/#11, and #1's
+// missing-Job path via OnJobGone). reason is the failure_reason reported to
+// the server; C13 decides first what to report (判据模型): a terminal server
+// status is settled as-is, a task the server deleted is released without a
+// report, and only a still-active task gets the synthesized fail.
+// Idempotent: an already-terminal entry is only cleaned up (顺序规则 2).
+func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
+	e, ok := s.reg.ByJob(jobName)
+	if !ok {
+		return nil
+	}
+	if e.IsTerminal() {
+		return s.cleanup(ctx, e)
+	}
 	st, err := s.server.TaskStatus(ctx, e.TaskID)
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
 		// Task deleted server-side (scenario #9): clean up, report nothing.
-		s.deleteObjects(ctx, e)
-		return s.reg.Delete(e.TaskID)
+		return s.ReleaseTask(ctx, e.TaskID)
 	case err != nil:
 		return fmt.Errorf("check status of task %s: %w", e.TaskID, err)
 	}
 	s.reg.SetLastStatusSeen(e.TaskID, st)
 	if registry.IsTerminalResult(st) {
-		if _, err := s.reg.MarkTerminal(e.TaskID, registry.Result(st), time.Time{}); err != nil {
-			return err
-		}
-		return s.cleanup(ctx, e)
+		return s.SettleTerminal(ctx, e.TaskID, st)
 	}
-	// The container ended while the server still considers the task active:
-	// fail it on the daemon's behalf (failure-handling scenario #3).
 	s.log.ErrorContext(ctx, "task.failed_compensated",
-		"task_id", e.TaskID, "job_name", e.JobName, "failure_reason", "job_missing")
-	if _, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, time.Time{}); err != nil {
+		"task_id", e.TaskID, "job_name", e.JobName, "failure_reason", reason)
+	if _, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, s.now()); err != nil {
 		return err
 	}
 	s.metrics.TaskTerminal(string(registry.ResultFailed))
-	e.State = registry.StateTerminal
-	e.Result = registry.ResultFailed
 	// Contract §4: a terminal callback is never dropped. If the report does
-	// not land, keep the terminal entry — Reconcile retries the report via
-	// pendingFail before it may clean up (the durable pending-reports queue
-	// belongs to the recovery module).
-	report := failReport{reason: "job_missing", message: "job disappeared without a terminal report"}
+	// not land, keep the terminal entry — a later round retries it before
+	// the objects may be deleted.
+	report := failReport{reason: reason, message: "container ended without a terminal report"}
 	if err := s.reportFail(ctx, e.TaskID, report); err != nil {
 		s.pendingFail.Store(e.TaskID, report)
 		return nil
 	}
+	e, ok = s.reg.Get(e.TaskID)
+	if !ok {
+		return nil
+	}
 	return s.cleanup(ctx, e)
+}
+
+// SettleTerminal converges an entry the server already holds as terminal
+// (C13 completed/failed/cancelled, or a rebuilt entry whose cleanup is
+// still pending): a synthetic fail report still queued in memory lands
+// first (contract §4), then the entry is marked terminal and the Job/Secret
+// go (顺序规则 1). A report that fails keeps the entry for the next round.
+func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) error {
+	e, ok := s.reg.Get(taskID)
+	if !ok {
+		return nil
+	}
+	if report, ok := s.pendingFail.Load(taskID); ok {
+		if err := s.reportFail(ctx, taskID, report.(failReport)); err != nil {
+			return nil // keep the entry; next round retries
+		}
+		s.pendingFail.Delete(taskID)
+	}
+	if !e.IsTerminal() {
+		if _, err := s.reg.MarkTerminal(taskID, registry.Result(result), s.now()); err != nil {
+			return err
+		}
+		s.metrics.TaskTerminal(result)
+		s.log.InfoContext(ctx, "task.terminal",
+			"task_id", e.TaskID, "job_name", e.JobName, "result", result)
+	}
+	return s.cleanup(ctx, e)
+}
+
+// AdoptRunning records that the server considers the task running (C13),
+// e.g. after a restart rebuilt the entry: the Job is kept, lease renewals
+// stop (started_at is set) and the daemon's reports are accepted
+// (failure-handling 场景 #1).
+func (s *Scheduler) AdoptRunning(ctx context.Context, taskID string) error {
+	e, ok := s.reg.MarkStarted(taskID, s.now())
+	if !ok {
+		return nil
+	}
+	s.log.InfoContext(ctx, "task.adopted_running",
+		"task_id", e.TaskID, "job_name", e.JobName)
+	return nil
+}
+
+// ReleaseTask removes the Job/Secret and drops the mapping without any
+// terminal report: the server already holds the truth (failure-handling
+// 场景 #2 redispatch, #8 cancel timeout, #9 deleted task). A failed deletion
+// keeps the entry: it is the only retry handle, and dropping it would leave
+// a zombie Job or leak the credential Secret (顺序规则 2).
+func (s *Scheduler) ReleaseTask(ctx context.Context, taskID string) error {
+	e, ok := s.reg.Get(taskID)
+	if !ok {
+		return nil
+	}
+	// A queued synthetic report is moot once the task is released or gone.
+	s.pendingFail.Delete(taskID)
+	if err := s.deleteObjects(ctx, e); err != nil {
+		return err
+	}
+	if err := s.reg.Delete(taskID); err != nil {
+		return err
+	}
+	s.metrics.InflightJobs(s.reg.Inflight())
+	return nil
 }
 
 // Reconcile converges the live index with the server. With a recovery
@@ -687,22 +773,12 @@ func (s *Scheduler) Rebuild(ctx context.Context) error {
 // network round-trip could clobber a concurrent daemon callback.
 func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) error {
 	if e.IsTerminal() {
-		// A pending synthetic fail report must land before the entry may go
-		// (contract §4: terminal callbacks are never dropped).
-		if report, ok := s.pendingFail.Load(e.TaskID); ok {
-			if err := s.reportFail(ctx, e.TaskID, report.(failReport)); err != nil {
-				return nil // keep the entry; next round retries
-			}
-			s.pendingFail.Delete(e.TaskID)
-		}
-		// Terminal but the objects survived an earlier delete failure.
-		return s.cleanup(ctx, e)
+		return s.SettleTerminal(ctx, e.TaskID, string(e.Result))
 	}
 	st, err := s.server.TaskStatus(ctx, e.TaskID)
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
-		s.deleteObjects(ctx, e)
-		return s.reg.Delete(e.TaskID)
+		return s.ReleaseTask(ctx, e.TaskID)
 	case err != nil:
 		return err
 	}
@@ -710,21 +786,16 @@ func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) err
 	switch {
 	case st == "running":
 		// The task is executing: keep the Job and accept the daemon's
-		// reports. MarkStarted sets started_at once; it only gates the boot
+		// reports. AdoptRunning sets started_at once; it only gates the boot
 		// timeout, so the rebuild-time approximation is safe. A miss means
 		// the entry turned terminal or was deleted mid-round — benign.
-		s.reg.MarkStarted(e.TaskID, s.now())
-		return nil
+		return s.AdoptRunning(ctx, e.TaskID)
 	case st == "queued" || st == "dispatched":
 		// Not started and the payload is gone with the restart: release the
 		// Job so the server re-dispatches after its reclaim window.
-		s.deleteObjects(ctx, e)
-		return s.reg.Delete(e.TaskID)
+		return s.ReleaseTask(ctx, e.TaskID)
 	case registry.IsTerminalResult(st):
-		if _, err := s.reg.MarkTerminal(e.TaskID, registry.Result(st), time.Time{}); err != nil {
-			return err
-		}
-		return s.cleanup(ctx, e)
+		return s.SettleTerminal(ctx, e.TaskID, st)
 	default:
 		// e.g. waiting_local_directory: no decisive fact yet — keep waiting
 		// (failure-handling 判据模型).
@@ -742,8 +813,8 @@ func (s *Scheduler) failClaim(ctx context.Context, e registry.TaskEntry, cause e
 	}
 	s.metrics.TaskTerminal(string(registry.ResultFailed))
 	s.log.ErrorContext(ctx, "task.failed_compensated",
-		"task_id", e.TaskID, "job_name", e.JobName, "failure_reason", "job_create_failed")
-	report := failReport{reason: "job_create_failed", message: cause.Error()}
+		"task_id", e.TaskID, "job_name", e.JobName, "failure_reason", FailureReasonJobCreateFailed)
+	report := failReport{reason: FailureReasonJobCreateFailed, message: cause.Error()}
 	if err := s.reportFail(ctx, e.TaskID, report); err != nil {
 		s.pendingFail.Store(e.TaskID, report)
 	}
@@ -771,32 +842,32 @@ func (s *Scheduler) reportFail(ctx context.Context, taskID string, report failRe
 }
 
 // cleanup deletes the Job and its credential Secret, then drops the entry.
-// The entry is kept when a deletion fails so the next reconcile retries it.
+// The entry is kept when either deletion fails so the next reconcile round
+// retries it (顺序规则 2); both objects are attempted in either case so one
+// failure cannot leak the other.
 func (s *Scheduler) cleanup(ctx context.Context, e registry.TaskEntry) error {
-	if err := s.jobs.DeleteJob(ctx, e.JobName); err != nil {
-		s.log.ErrorContext(ctx, "job.delete_failed",
-			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
-		return err
-	}
-	if err := s.jobs.DeleteSecret(ctx, credName(e.JobName)); err != nil {
-		s.log.ErrorContext(ctx, "job.delete_failed",
-			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
+	if err := s.deleteObjects(ctx, e); err != nil {
 		return err
 	}
 	return s.reg.Delete(e.TaskID)
 }
 
 // deleteObjects removes the K8s objects without touching the entry; used on
-// paths that discard the mapping separately.
-func (s *Scheduler) deleteObjects(ctx context.Context, e registry.TaskEntry) {
+// paths that discard the mapping separately. The joined error is the caller's
+// retry handle: the entry stays live until every delete succeeded.
+func (s *Scheduler) deleteObjects(ctx context.Context, e registry.TaskEntry) error {
+	var errs []error
 	if err := s.jobs.DeleteJob(ctx, e.JobName); err != nil {
 		s.log.ErrorContext(ctx, "job.delete_failed",
 			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
+		errs = append(errs, fmt.Errorf("delete job %s: %w", e.JobName, err))
 	}
 	if err := s.jobs.DeleteSecret(ctx, credName(e.JobName)); err != nil {
 		s.log.ErrorContext(ctx, "job.delete_failed",
 			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
+		errs = append(errs, fmt.Errorf("delete secret %s: %w", credName(e.JobName), err))
 	}
+	return errors.Join(errs...)
 }
 
 // jobbuilderEntry maps the registry entry to the builder's input view.
