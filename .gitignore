@@ -1,2 +1,4 @@
 # Build output (make build-foreman / make build-gc).
 /bin/
+# Release digest mapping written by scripts/publish-images.sh.
+/dist/

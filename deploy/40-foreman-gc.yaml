@@ -41,7 +41,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: foreman-gc
-          image: registry.tsic.top/multica/foreman-job@sha256:0000000000000000000000000000000000000000000000000000000000000000 # REPLACE
+          image: registry.tsic.top/multica/foreman-job@sha256:f46f297bea0cd62a0f9addfa432e540551574e2d525c89908dd59837273ff7f8
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/foreman-gc"]
           env:

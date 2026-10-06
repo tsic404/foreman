@@ -19,7 +19,16 @@ BASE_IMAGE ?= alpine:3.20
 GOFLAGS ?= -trimpath
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build build-foreman build-gc build-foreman-image build-job-image test vet fmt check
+# Publishing / delivery chain (deploy/README.md §Images). These are the same
+# entry points CI uses — never a hand-rolled push:
+#   make publish-images   build + push both images, write dist/release-images.env
+#   make pin-digest       write the pushed Job digest into both deploy files
+#   make verify-delivery  registry API/TLS + pinned digests (CLUSTER=1: pods)
+#   make qa-registry-trust  install the registry CA into a k3d QA node
+export VERSION REGISTRY BASE_IMAGE CONTAINER_TOOL
+
+.PHONY: all build build-foreman build-gc build-foreman-image build-job-image test vet fmt check \
+	publish-images pin-digest verify-delivery qa-registry-trust
 
 all: build
 
@@ -58,3 +67,24 @@ fmt:
 	gofmt -l .
 
 check: fmt vet test build
+
+# --- delivery chain ---------------------------------------------------------
+
+# Build and push both images, emit the <sha7>:<job-digest> mapping. Requires
+# MULTICA_CLI_URL/_SHA256 and OMP_URL/_SHA256 (upstream release artifacts).
+publish-images:
+	./scripts/publish-images.sh
+
+# Pin the pushed Job image digest into both deploy files:
+#   make pin-digest DIGEST=sha256:…   |   make pin-digest FROM=dist/release-images.env
+pin-digest:
+	./scripts/pin-job-image-digest.sh $(if $(FROM),--from-file $(FROM),--digest $(DIGEST))
+
+# Check registry API/TLS, published tags and the deploy-pinned digest.
+# CLUSTER=1 also checks the deployed pods for ErrImagePull/ImagePullBackOff.
+verify-delivery:
+	./scripts/verify-delivery.sh $(if $(CA_FILE),--ca $(CA_FILE),) $(if $(filter 1,$(CLUSTER)),--cluster,)
+
+# Install the registry CA into a k3d QA node (NODE=k3d-test-server-0 CA=… HOST_IP=…).
+qa-registry-trust:
+	./scripts/qa-registry-trust.sh --node $(NODE) --ca $(CA) $(if $(HOST_IP),--host-ip $(HOST_IP),)

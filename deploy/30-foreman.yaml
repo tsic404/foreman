@@ -78,7 +78,7 @@ spec:
             - name: FOREMAN_JOB_IMAGE
               value: "registry.tsic.top/multica/foreman-job"
             - name: FOREMAN_JOB_IMAGE_DIGEST
-              value: "sha256:0000000000000000000000000000000000000000000000000000000000000000" # REPLACE
+              value: "sha256:f46f297bea0cd62a0f9addfa432e540551574e2d525c89908dd59837273ff7f8"
             - name: FOREMAN_JOB_IMAGE_PULL_SECRETS
               value: '["registry-tsic"]'
             - name: FOREMAN_MAX_INFLIGHT_JOBS

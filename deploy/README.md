@@ -77,6 +77,71 @@ equivalent used for staging clusters — it takes the artifact URL + SHA-256 for
 the upstream CLI and for `omp`, so the built image can be checked against the
 upstream release (AC-13 provenance).
 
+### Publishing (CI)
+
+`.github/workflows/release-images.yml` runs on a `v*.*.*` tag: it builds and
+pushes both images, then emits the mapping the deploy surface consumes and
+verifies it against the registry. It needs
+
+- a runner that can reach the private registry (the `FOREMAN_RELEASE_RUNNER`
+  repository variable overrides the default `["self-hosted","linux"]` labels),
+- secrets `MULTICA_CLI_URL`/`MULTICA_CLI_SHA256` and `OMP_URL`/`OMP_SHA256`
+  (upstream release artifacts), `REGISTRY_USERNAME`/`REGISTRY_PASSWORD`, and
+  `REGISTRY_CA_PEM` when the registry certificate is not publicly trusted.
+
+Every step failure fails the job — a push that never landed, a TLS trust gap or
+a digest that is not actually served is a red build, never a silent
+half-release.
+
+The same three commands run by hand against any staging registry:
+
+```bash
+make publish-images         # build + push, writes dist/release-images.env
+make pin-digest FROM=dist/release-images.env
+make verify-delivery CLUSTER=1   # + registry API/TLS, published tags, live pods
+```
+
+`publish-images` prints the deployment-facing mapping `<sha7>:<digest>` (the
+Job image digest of that commit); `dist/release-images.env` carries both image
+digests and is uploaded as the workflow artifact. `pin-digest` writes the Job
+digest into **both** places above and refuses to run if either file no longer
+has exactly one digest reference — run it after every release and commit the
+result, so `kubectl apply -f deploy/` never ships the placeholder digest.
+`verify-delivery --static` (no network) gates pull requests on exactly that
+consistency.
+
+Knobs beyond the defaults: `publish-images` honours `REGISTRY`, `BASE_IMAGE`,
+`CONTAINER_TOOL`, `PUSH_LATEST` (publish `foreman:latest` too) and `OUT`;
+`verify-delivery` honours `REGISTRY_HOST`, `REGISTRY_PATH`, `VERSION`,
+`CA_FILE`, `DEPLOY_DIR`, `DEPLOY_NAMESPACE`, `JOB_NAMESPACE` and `TIMEOUT`;
+`qa-registry-trust` takes `--registry-host` and `--no-restart`. Each script
+prints its header with `--help`.
+
+## QA cluster registry access
+
+`registry.tsic.top` is a private registry: the k3d QA cluster must *resolve* it
+and *trust* its certificate. `--tls-skip-verify` and `imagePullPolicy: Always`
+workarounds are not the path — install the CA and let containerd verify:
+
+```bash
+# On the docker host of the k3d cluster (CA = PEM that signed registry.tsic.top).
+make qa-registry-trust NODE=k3d-test-server-0 \
+  CA=/path/registry-ca.crt HOST_IP=<address the node reaches the registry on>
+```
+
+The script copies the CA into the node (per-registry `registries.yaml` config +
+the node's system trust store), mirrors the registry hostname to that endpoint
+and restarts the node so containerd loads it. Node-local resolution of the
+registry hostname is added as well, for tools that bypass containerd (`curl`
+in the node, `crictl pull` by name); pods resolve the hostname through the
+cluster DNS entry added the same way.
+
+If the registry is broken cluster-side — `GET /v2/` answering 404, a default
+`ingress.local` certificate, a digest that no longer exists — `make
+verify-delivery` fails with the specific `ALERT:` line. That check is the
+deploy-pipeline signal for `ErrImagePull`/`ImagePullBackOff`; `CLUSTER=1` adds
+the live pod check on top of it.
+
 ## Node-local state
 
 Job pods and `foreman-gc` share the node directory `${FOREMAN_STATE_ROOT}`

@@ -1,0 +1,24 @@
+# Guard the digest pinning that AC-13 depends on: the Job image is referenced
+# by digest in exactly two places, and the two references must stay equal and
+# must not regress to a placeholder.
+#
+# Static only — no registry access — so it can run on a hosted runner.
+name: deploy-digest-check
+
+on:
+  pull_request:
+    paths: ["deploy/**", "scripts/**", "Makefile", ".github/workflows/**"]
+  push:
+    branches: [main]
+    paths: ["deploy/**", "scripts/**", "Makefile"]
+
+permissions:
+  contents: read
+
+jobs:
+  digest-consistency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: deploy/ digest references agree
+        run: scripts/verify-delivery.sh --static

@@ -1,0 +1,92 @@
+# Publish the two images deploy/ references (docs/04-architecture.md
+# §部署/运行方式): `foreman:<version>` for the Deployment and `foreman-job:<version>`
+# for the Job pods / foreman-gc DaemonSet, plus the `<sha7>:<digest>` mapping the
+# deploy surface pins.
+#
+# The registry is private and reachable only from inside the tailnet, so the job
+# runs on a self-hosted runner (override the label set with the
+# FOREMAN_RELEASE_RUNNER repository variable). Every failure — build, push, TLS
+# trust, verification — fails the job, which is the alert; no partial state is
+# reported as a release.
+name: release-images
+
+on:
+  push:
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version tag to publish (e.g. v0.1.0)
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ${{ fromJSON(vars.FOREMAN_RELEASE_RUNNER || '["self-hosted","linux"]') }}
+    env:
+      VERSION: ${{ github.event.inputs.version || github.ref_name }}
+      REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'registry.tsic.top/multica' }}
+      BASE_IMAGE: ${{ vars.FOREMAN_BASE_IMAGE || 'alpine:3.20' }}
+      # Upstream release artifacts for the Job image (F1/AC-13: the CLI and omp
+      # binaries are taken verbatim and checked against these digests).
+      MULTICA_CLI_URL: ${{ secrets.MULTICA_CLI_URL }}
+      MULTICA_CLI_SHA256: ${{ secrets.MULTICA_CLI_SHA256 }}
+      OMP_URL: ${{ secrets.OMP_URL }}
+      OMP_SHA256: ${{ secrets.OMP_SHA256 }}
+      REGISTRY_USERNAME: ${{ secrets.REGISTRY_USERNAME }}
+      REGISTRY_PASSWORD: ${{ secrets.REGISTRY_PASSWORD }}
+      # PEM of the CA that signed the registry certificate, when it is private.
+      REGISTRY_CA_PEM: ${{ secrets.REGISTRY_CA_PEM }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Trust the registry certificate
+        run: |
+          set -euo pipefail
+          [ -n "${REGISTRY_CA_PEM:-}" ] || { echo "no REGISTRY_CA_PEM secret: relying on the runner trust store"; exit 0; }
+          printf '%s\n' "$REGISTRY_CA_PEM" > /tmp/registry-ca.crt
+          if command -v update-ca-certificates >/dev/null; then
+            sudo install -m 644 /tmp/registry-ca.crt /usr/local/share/ca-certificates/registry-ca.crt
+            sudo update-ca-certificates
+          elif command -v trust >/dev/null; then
+            sudo install -m 644 /tmp/registry-ca.crt /etc/ca-certificates/trust-source/anchors/registry-ca.crt
+            sudo trust extract-compat
+          fi
+          # the container runtime pulls with the same store
+          sudo systemctl restart docker 2>/dev/null || true
+          curl -sS --cacert /tmp/registry-ca.crt "https://${REGISTRY%%/*}/v2/" >/dev/null
+
+      - name: Log in to the registry
+        if: env.REGISTRY_USERNAME != ''
+        run: printf '%s' "$REGISTRY_PASSWORD" | docker login "${REGISTRY%%/*}" -u "$REGISTRY_USERNAME" --password-stdin
+
+      - name: Build and push images
+        run: scripts/publish-images.sh
+
+      - name: Verify the delivery chain
+        run: |
+          set -euo pipefail
+          args=(--version "$VERSION")
+          [ -f /tmp/registry-ca.crt ] && args+=(--ca /tmp/registry-ca.crt)
+          scripts/verify-delivery.sh "${args[@]}"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-images-${{ env.VERSION }}
+          path: dist/release-images.env
+          retention-days: 90
+
+      - name: Alert on failure
+        if: failure()
+        run: |
+          echo "::error title=Image delivery failed::$VERSION was not published or failed verification on $REGISTRY; the deploy surface must not be pinned to this release."
