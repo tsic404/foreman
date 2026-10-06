@@ -21,9 +21,12 @@ metadata:
   name: multica-agents
   labels:
     app.kubernetes.io/name: foreman-job
-    # Job pods use node-local hostPath volumes (ADR-005) and a root
-    # init container that fixes directory ownership, so `restricted` would
-    # reject them; `baseline` still forbids privileged/hostNetwork/hostPID.
-    pod-security.kubernetes.io/enforce: baseline
-    pod-security.kubernetes.io/audit: baseline
-    pod-security.kubernetes.io/warn: baseline
+    # Job and gc pods mount node-local hostPath volumes (ADR-005), which the
+    # baseline and restricted PSA profiles both forbid — a cluster with either
+    # of them enforced rejects those pods. PSA is an admission switch only: it
+    # grants no privilege, and F4 stays enforced by the pod specs themselves
+    # (no privileged/hostNetwork/hostPID/docker.sock; agent and gc containers
+    # non-root with all capabilities dropped).
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged

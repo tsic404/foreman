@@ -2,6 +2,7 @@ package gc
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -29,7 +30,7 @@ func newTestCollector(t *testing.T, cfg Config) *Collector {
 	t.Helper()
 	// Discard log output: the rounds are asserted through Stats and the
 	// resulting file tree, not through log scraping.
-	return New(cfg, slog.New(slog.NewJSONHandler(os.NewFile(0, os.DevNull), nil)))
+	return New(cfg, slog.New(slog.NewJSONHandler(io.Discard, nil)))
 }
 
 // makeTree creates files (relative to root) and returns root.

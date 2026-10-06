@@ -28,8 +28,12 @@ Job by the job builder, so the Service name must stay `foreman` in namespace
 `10-secrets.yaml` carries **placeholders**; `kubectl apply -f deploy/` will
 overwrite live values with them, so pick one of:
 
-- edit the file before applying (replace `REPLACE_ME` and the zero hex key), or
+- edit the file before applying (replace every `REPLACE_ME`), or
 - create the Secrets out of band and remove `10-secrets.yaml` from the apply set.
+
+The shipped `FOREMAN_JOB_TOKEN_KEY` placeholder is deliberately not valid hex:
+an un-replaced copy makes Foreman fail its startup self-check and CrashLoop,
+rather than serve with a key anyone can read from the repository.
 
 ```bash
 # Server credential: mdt_/mul_ token bound to FOREMAN_DAEMON_ID + workspace.
