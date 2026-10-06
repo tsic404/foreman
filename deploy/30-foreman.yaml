@@ -1,0 +1,201 @@
+# Foreman Deployment + Service (contracts §5.3).
+#
+# Single replica (NG7): two Foreman instances would claim the same runtime and
+# double-dispatch tasks, so the strategy is Recreate and replicas is pinned.
+# Environment: every §5.1 key with its contract default spelled out, except
+# MULTICA_SERVER_URL / MULTICA_WORKSPACE_ID (deployment values) and the two
+# secret keys. The Job image digest in FOREMAN_JOB_IMAGE_DIGEST must equal the
+# digest pinned in 40-foreman-gc.yaml — see deploy/README.md §Images.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: foreman
+  namespace: foreman
+  labels:
+    app.kubernetes.io/name: foreman
+    app.kubernetes.io/component: scheduler
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: foreman
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: foreman
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: foreman
+      automountServiceAccountToken: true
+      imagePullSecrets:
+        - name: registry-tsic
+      terminationGracePeriodSeconds: 30
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: foreman
+          image: registry.tsic.top/multica/foreman:v0.1.0 # REPLACE with the released tag
+          imagePullPolicy: IfNotPresent
+          args: ["-listen=:8080"]
+          ports:
+            - name: http
+              containerPort: 8080
+              protocol: TCP
+          env:
+            # --- server identity / credentials (§5.1) ---
+            - name: MULTICA_SERVER_URL
+              value: "http://multica.tsic.top"
+            - name: MULTICA_WORKSPACE_ID
+              value: "f311e8ff-e026-4c6e-b267-dcc004f08782"
+            - name: MULTICA_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: foreman-secret
+                  key: MULTICA_TOKEN
+            - name: FOREMAN_DAEMON_ID
+              value: "foreman"
+            - name: FOREMAN_JOB_TOKEN_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: foreman-secret
+                  key: FOREMAN_JOB_TOKEN_KEY
+            - name: FOREMAN_JOB_TOKEN_TTL
+              value: "24h"
+            # --- Job placement / lifecycle ---
+            - name: FOREMAN_JOB_NAMESPACE
+              value: "multica-agents"
+            - name: FOREMAN_JOB_IMAGE
+              value: "registry.tsic.top/multica/foreman-job"
+            - name: FOREMAN_JOB_IMAGE_DIGEST
+              value: "sha256:0000000000000000000000000000000000000000000000000000000000000000" # REPLACE
+            - name: FOREMAN_JOB_IMAGE_PULL_SECRETS
+              value: '["registry-tsic"]'
+            - name: FOREMAN_MAX_INFLIGHT_JOBS
+              value: "100"
+            - name: FOREMAN_CLAIM_BATCH_MAX
+              value: "32"
+            - name: FOREMAN_CLAIM_INTERVAL
+              value: "5s"
+            - name: FOREMAN_CLAIM_INTERVAL_IDLE
+              value: "30s"
+            - name: FOREMAN_LEASE_REFRESH_INTERVAL
+              value: "15s"
+            - name: FOREMAN_JOB_BOOT_TIMEOUT
+              value: "300s"
+            - name: FOREMAN_TASK_MAX_DURATION
+              value: "86400"
+            - name: FOREMAN_RECONCILE_INTERVAL
+              value: "30s"
+            - name: FOREMAN_JOB_TTL_SECONDS
+              value: "600"
+            # --- node-local state (ADR-005) ---
+            - name: FOREMAN_STATE_ROOT
+              value: "/var/lib/foreman"
+            - name: FOREMAN_REPO_CACHE_MODE
+              value: "shared"
+            - name: FOREMAN_PREFER_NODE_REUSE
+              value: "true"
+            - name: FOREMAN_MAX_JOBS_PER_NODE
+              value: "4"
+            - name: FOREMAN_CACHE_MAX_BYTES
+              value: "50Gi"
+            - name: FOREMAN_CACHE_TTL
+              value: "720h"
+            - name: FOREMAN_TASK_DIR_TTL
+              value: "168h"
+            - name: FOREMAN_GC_INTERVAL
+              value: "6h"
+            - name: FOREMAN_GC_QUIESCE
+              value: "30m"
+            # --- Job container resources ---
+            - name: FOREMAN_JOB_CPU_REQUEST
+              value: "1"
+            - name: FOREMAN_JOB_MEMORY_REQUEST
+              value: "2Gi"
+            - name: FOREMAN_JOB_CPU_LIMIT
+              value: "4"
+            - name: FOREMAN_JOB_MEMORY_LIMIT
+              value: "8Gi"
+            - name: FOREMAN_JOB_NODE_SELECTOR
+              value: '{"kubernetes.io/os":"linux"}'
+            - name: FOREMAN_JOB_TOLERATIONS
+              value: '[{"key":"unreachable","operator":"Exists","effect":"NoExecute"},{"key":"maybe_unreachable","operator":"Exists","effect":"NoExecute"}]'
+            # --- observability ---
+            - name: FOREMAN_LOG_LEVEL
+              value: "info"
+            - name: FOREMAN_METRICS_ENABLED
+              value: "true"
+            - name: FOREMAN_WS_ENABLED
+              value: "true"
+          livenessProbe:
+            httpGet:
+              path: /foreman/healthz
+              port: http
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /foreman/healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              cpu: 200m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 1000
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            # ADR-002: no PVC. This emptyDir holds nothing but the durable
+            # terminal-report queue (contract §4) between container restarts.
+            - name: state
+              mountPath: /var/lib/foreman
+      volumes:
+        - name: state
+          emptyDir: {}
+---
+# Job-side entry point: the Job daemon's MULTICA_SERVER_URL resolves to
+# foreman.foreman.svc.cluster.local:8080 (contract §1.2/§5.2).
+apiVersion: v1
+kind: Service
+metadata:
+  name: foreman
+  namespace: foreman
+  labels:
+    app.kubernetes.io/name: foreman
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8080"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: foreman
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      protocol: TCP

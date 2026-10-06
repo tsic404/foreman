@@ -1,0 +1,29 @@
+# Prometheus Operator scrape object (contracts §5.3).
+#
+# OPTIONAL: it needs the monitoring.coreos.com CRDs from the Prometheus
+# Operator, which the base deploy/ set does not assume. The Service and the
+# Deployment already carry the prometheus.io/* annotations as the
+# operator-free fallback, so apply this file only on a cluster that has the
+# CRDs:
+#
+#   kubectl apply -f deploy/optional/servicemonitor.yaml
+---
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: foreman
+  namespace: foreman
+  labels:
+    app.kubernetes.io/name: foreman
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: foreman
+  namespaceSelector:
+    matchNames:
+      - foreman
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s
+      scrapeTimeout: 10s

@@ -19,6 +19,10 @@ const redactedValue = "[redacted]"
 // slog.JSONHandler with the contract's fixed fields — ts (renamed from
 // slog's "time"), level, msg, component. The returned logger redacts token
 // values and any attr keyed "auth_token" before they reach w.
+//
+// An empty component leaves the logger untagged: the composition root uses
+// that as the shared base, so components that tag their own component
+// (slog.Default().With("component", …)) emit exactly one component field.
 func NewLogger(w io.Writer, level slog.Level, component string) *slog.Logger {
 	json := slog.NewJSONHandler(w, &slog.HandlerOptions{
 		Level: level,
@@ -31,7 +35,11 @@ func NewLogger(w io.Writer, level slog.Level, component string) *slog.Logger {
 			return a
 		},
 	})
-	return slog.New(&redactHandler{next: json}).With("component", component)
+	log := slog.New(&redactHandler{next: json})
+	if component == "" {
+		return log
+	}
+	return log.With("component", component)
 }
 
 // redactHandler scrubs credentials from every record. Callers must still
