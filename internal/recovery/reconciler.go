@@ -305,6 +305,15 @@ func (r *Reconciler) round(ctx context.Context) error {
 		if ctx.Err() != nil {
 			break
 		}
+		// Node placement is the fact the per-node soft cap counts
+		// (FOREMAN_MAX_JOBS_PER_NODE) and the node-reuse affinity keys on
+		// (contract §1.3: Pod 读 spec.nodeName). The pods are already listed
+		// for this round; record the node once it is known.
+		if e.NodeName == "" {
+			if node := podNodeName(byJob[e.JobName]); node != "" {
+				r.reg.SetNode(e.TaskID, node)
+			}
+		}
 		if err := r.reconcileOne(ctx, e, byJob[e.JobName]); err != nil {
 			r.log.WarnContext(ctx, "reconcile entry failed",
 				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID, "err", err)

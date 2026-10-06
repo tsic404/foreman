@@ -34,6 +34,11 @@ type TokenIssuer interface {
 // soft node-reuse affinity (FOREMAN_PREFER_NODE_REUSE).
 type NodeIndex interface {
 	LastNodeForIssue(issueID string) string
+	// NodeSaturated reports whether the node currently sits at or over the
+	// per-node soft cap (FOREMAN_MAX_JOBS_PER_NODE, ADR-006 节流). A
+	// saturated node drops out of the candidate set of the next Job, so the
+	// cap is a placement preference — never admission control.
+	NodeSaturated(nodeName string) bool
 }
 
 var dns1123Label = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
@@ -73,12 +78,18 @@ func jobName(taskID string) string {
 }
 
 // preferredNode returns the soft-affinity node for e's issue, "" when reuse
-// is disabled or no history exists.
+// is disabled, no history exists, or the node sits at its concurrency cap:
+// a saturated node must not attract another Job (task-mapping §同节点并发 —
+// the cap lowers the node's priority, it never blocks the Job).
 func (b *Builder) preferredNode(e TaskEntry) string {
 	if !b.cfg.PreferNodeReuse || b.cfg.Nodes == nil {
 		return ""
 	}
-	return b.cfg.Nodes.LastNodeForIssue(e.IssueID)
+	node := b.cfg.Nodes.LastNodeForIssue(e.IssueID)
+	if node == "" || b.cfg.Nodes.NodeSaturated(node) {
+		return ""
+	}
+	return node
 }
 
 func (b *Builder) cacheMode() string {

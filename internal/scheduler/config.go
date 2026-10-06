@@ -13,6 +13,7 @@ import (
 // Environment variable names from the contract config table (§5.1).
 const (
 	EnvMaxInflightJobs = "FOREMAN_MAX_INFLIGHT_JOBS"
+	EnvMaxJobsPerNode  = "FOREMAN_MAX_JOBS_PER_NODE"
 	EnvClaimBatchMax   = "FOREMAN_CLAIM_BATCH_MAX"
 	EnvJobBootTimeout  = "FOREMAN_JOB_BOOT_TIMEOUT"
 )
@@ -20,6 +21,7 @@ const (
 // Contract defaults (§5.1).
 const (
 	DefaultMaxInflightJobs = 100
+	DefaultMaxJobsPerNode  = 4
 	DefaultClaimBatchMax   = 32
 	DefaultJobBootTimeout  = 300 * time.Second
 
@@ -32,7 +34,12 @@ const (
 // seams (Registry, Jobs, Builder, Server, Metrics, Reconciler) are set on
 // Scheduler directly, not via env.
 type Config struct {
-	JobNamespace    string
+	JobNamespace string
+	// MaxJobsPerNode is the per-node soft cap of concurrent Jobs
+	// (FOREMAN_MAX_JOBS_PER_NODE, ADR-006 §决策结果 3): a node at or over it
+	// loses its reuse affinity for the next claim. It is never admission
+	// control — no Job is queued, refused, or deleted on account of it.
+	MaxJobsPerNode  int
 	MaxInflightJobs int
 	ClaimBatchMax   int
 	JobBootTimeout  time.Duration
@@ -46,6 +53,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	}
 	cfg := Config{
 		JobNamespace:    jobbuilder.DefaultJobNamespace,
+		MaxJobsPerNode:  DefaultMaxJobsPerNode,
 		MaxInflightJobs: DefaultMaxInflightJobs,
 		ClaimBatchMax:   DefaultClaimBatchMax,
 		JobBootTimeout:  DefaultJobBootTimeout,
@@ -53,6 +61,15 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 
 	if v := strings.TrimSpace(getenv(jobbuilder.EnvJobNamespace)); v != "" {
 		cfg.JobNamespace = v
+	}
+	if raw := strings.TrimSpace(getenv(EnvMaxJobsPerNode)); raw != "" {
+		// A cap below 1 would either disable node placement entirely or mean
+		// "unlimited"; the contract gives neither, so refuse the value.
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return Config{}, fmt.Errorf("%s must be a positive integer, got %q", EnvMaxJobsPerNode, raw)
+		}
+		cfg.MaxJobsPerNode = n
 	}
 	if raw := strings.TrimSpace(getenv(EnvMaxInflightJobs)); raw != "" {
 		n, err := strconv.Atoi(raw)

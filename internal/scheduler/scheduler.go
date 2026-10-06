@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sort"
 	"sync"
 	"time"
 
@@ -136,6 +137,11 @@ type Scheduler struct {
 
 	claimMu     *keyedMutex
 	pendingFail sync.Map // task_id → failReport: terminal reports not yet delivered
+
+	// nodeMu serializes the per-node soft cap refresh: concurrent claims
+	// would otherwise interleave the marker replacement and log the same
+	// transition twice.
+	nodeMu sync.Mutex
 }
 
 // New builds a Scheduler. reg, jobs, builder and server are required.
@@ -184,6 +190,58 @@ func (s *Scheduler) ClaimBudget() int {
 		free = 0
 	}
 	return min(free, s.cfg.ClaimBatchMax)
+}
+
+// RefreshNodeSaturation recomputes the per-node soft cap
+// (FOREMAN_MAX_JOBS_PER_NODE, ADR-006 §决策结果 3) from the live index and
+// republishes the saturation markers: every node holding at least
+// MaxJobsPerNode non-terminal Jobs is marked, so the next claim drops its
+// reuse affinity (jobbuilder) and adds no further load to it. Jobs are never
+// deleted and nothing is queued or refused — the cap is a placement
+// preference, not admission control (task-mapping §同节点并发).
+//
+// Node names appear one reconcile round after placement (the round reads
+// spec.nodeName), so a node's load is the Jobs it held as of that round.
+// It returns the observed per-node load.
+func (s *Scheduler) RefreshNodeSaturation(ctx context.Context) map[string]int {
+	s.nodeMu.Lock()
+	defer s.nodeMu.Unlock()
+
+	load := s.reg.ActiveJobsByNode()
+	saturated := make([]string, 0, len(load))
+	for node, n := range load {
+		if n >= s.cfg.MaxJobsPerNode {
+			saturated = append(saturated, node)
+		}
+	}
+	sort.Strings(saturated)
+	previous := s.reg.SaturatedNodes()
+	s.reg.SetSaturatedNodes(saturated)
+
+	// Log only the transitions: the load of every node would flood the log
+	// once per round, while a transition carries the count and the cap the
+	// operator needs (observability.md §结构化日志).
+	was := make(map[string]bool, len(previous))
+	for _, node := range previous {
+		was[node] = true
+	}
+	now := make(map[string]bool, len(saturated))
+	for _, node := range saturated {
+		now[node] = true
+		if !was[node] {
+			s.log.InfoContext(ctx, "node.saturation",
+				"node", node, "active_jobs", load[node],
+				"max_jobs_per_node", s.cfg.MaxJobsPerNode, "saturated", true)
+		}
+	}
+	for _, node := range previous {
+		if !now[node] {
+			s.log.InfoContext(ctx, "node.saturation",
+				"node", node, "active_jobs", load[node],
+				"max_jobs_per_node", s.cfg.MaxJobsPerNode, "saturated", false)
+		}
+	}
+	return load
 }
 
 // OnClaim registers a freshly claimed task and creates its Secret + Job
@@ -242,6 +300,11 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	s.log.InfoContext(ctx, "task.claimed",
 		"task_id", e.TaskID, "job_name", e.JobName,
 		"issue_identifier", e.IssueIdentifier, "agent_id", e.AgentID)
+
+	// The per-node soft cap is applied right before the Job is rendered
+	// ("下一次 claim 前把该节点从候选里排除", task-mapping §同节点并发): the
+	// refresh marks the nodes at their cap so the affinity below skips them.
+	s.RefreshNodeSaturation(ctx)
 
 	job, secret, err := s.builder.Build(jobbuilderEntry(e), e.Payload)
 	if err != nil {
@@ -709,7 +772,10 @@ func (s *Scheduler) ReleaseTask(ctx context.Context, taskID string) error {
 // Reconcile converges the live index with the server. With a recovery
 // reconciler wired it delegates; otherwise it runs the built-in startup
 // convergence (task-mapping §持久化与重建 step 3) over every live entry.
+// The per-node soft cap is refreshed first: its markers are derived state of
+// the live index and must not outlive the load they describe.
 func (s *Scheduler) Reconcile(ctx context.Context) error {
+	s.RefreshNodeSaturation(ctx)
 	if s.reconciler != nil {
 		return s.reconciler.Reconcile(ctx)
 	}

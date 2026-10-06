@@ -3,6 +3,7 @@ package registry
 import (
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 	"time"
 )
@@ -33,6 +34,10 @@ type Registry struct {
 	// covers in-flight AND historical mappings). One string per issue, so
 	// growth tracks distinct issues, not tasks.
 	lastNode map[string]string
+	// Saturation markers of the per-node soft cap (task-mapping §同节点并发,
+	// ADR-006 节流): replaced wholesale by the scheduler's reconcile round,
+	// so the set never outgrows the live node count.
+	saturated map[string]bool
 
 	runtimes        map[string]JobRuntime // job_runtime_id → runtime
 	runtimeByDaemon map[string]string     // daemon_id → job_runtime_id
@@ -51,6 +56,7 @@ func New(now func() time.Time) *Registry {
 		byDaemon:        make(map[string]string),
 		done:            newTTLMap(DoneIndexTTL, now),
 		lastNode:        make(map[string]string),
+		saturated:       make(map[string]bool),
 		runtimes:        make(map[string]JobRuntime),
 		runtimeByDaemon: make(map[string]string),
 	}
@@ -261,6 +267,61 @@ func (r *Registry) LastNodeForIssue(issueID string) string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.lastNode[issueID]
+}
+
+// ActiveJobsByNode counts the non-terminal entries placed on each node
+// (contract §3.1: Inflight semantics). Entries whose pod has not landed yet
+// carry no node_name and are not counted, so the load appears one reconcile
+// round after placement. It is the load input of the per-node soft cap
+// (ADR-006 §决策结果 3).
+func (r *Registry) ActiveJobsByNode() map[string]int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	byNode := make(map[string]int)
+	for _, e := range r.live {
+		if e.State == StateTerminal || e.NodeName == "" {
+			continue
+		}
+		byNode[e.NodeName]++
+	}
+	return byNode
+}
+
+// SetSaturatedNodes replaces the saturation markers (task-mapping §同节点并发:
+// Reconcile marks the nodes at or over FOREMAN_MAX_JOBS_PER_NODE). The whole
+// set is replaced because a node that dropped below the cap must lose its
+// marker again; replacement also prunes nodes that left the index.
+func (r *Registry) SetSaturatedNodes(nodes []string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	next := make(map[string]bool, len(nodes))
+	for _, n := range nodes {
+		if n != "" {
+			next[n] = true
+		}
+	}
+	r.saturated = next
+}
+
+// SaturatedNodes returns the current saturation markers, sorted.
+func (r *Registry) SaturatedNodes() []string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]string, 0, len(r.saturated))
+	for n := range r.saturated {
+		out = append(out, n)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// NodeSaturated implements jobbuilder.NodeIndex: the node currently sits at
+// or over the per-node soft cap, so its reuse affinity must be dropped
+// (soft constraint — the Job is still created, no admission control).
+func (r *Registry) NodeSaturated(nodeName string) bool {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	return r.saturated[nodeName]
 }
 
 func (r *Registry) dropIndexesLocked(e TaskEntry) {
