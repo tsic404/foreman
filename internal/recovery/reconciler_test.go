@@ -819,3 +819,45 @@ func (w *fakeWatcher) Watch(ctx context.Context, notify func()) error {
 	<-ctx.Done()
 	return nil
 }
+
+// ---- node placement (input of the per-node soft cap) ----
+
+func TestReconcileRecordsPodNodePlacement(t *testing.T) {
+	e := testEntry("t1")
+	e.IssueID = "issue-t1"
+	reg := newRegistry(t, e)
+	objs := &fakeObjects{
+		job:  runningJob("fm-t1"),
+		pods: []corev1.Pod{podFor("fm-t1", func(p *corev1.Pod) { p.Spec.NodeName = "company-02" })},
+	}
+	r := newTestReconciler(t, reg, objs, &fakeStatus{status: "running"}, &fakeSettler{})
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	got, _ := reg.Get("t1")
+	if got.NodeName != "company-02" {
+		t.Fatalf("node_name = %q, want company-02", got.NodeName)
+	}
+	// The placement also seeds the soft node-reuse affinity of the issue.
+	if last := reg.LastNodeForIssue("issue-t1"); last != "company-02" {
+		t.Fatalf("LastNodeForIssue = %q, want company-02", last)
+	}
+}
+
+func TestReconcileLeavesNodeEmptyWhilePodIsPending(t *testing.T) {
+	e := testEntry("t1")
+	reg := newRegistry(t, e)
+	objs := &fakeObjects{
+		job:  runningJob("fm-t1"),
+		pods: []corev1.Pod{podFor("fm-t1", nil)}, // no spec.nodeName yet
+	}
+	r := newTestReconciler(t, reg, objs, &fakeStatus{status: "running"}, &fakeSettler{})
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got, _ := reg.Get("t1"); got.NodeName != "" {
+		t.Fatalf("node_name = %q, want empty for an unscheduled pod", got.NodeName)
+	}
+}

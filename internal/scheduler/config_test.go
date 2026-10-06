@@ -20,6 +20,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.MaxInflightJobs != 100 {
 		t.Fatalf("MaxInflightJobs = %d", cfg.MaxInflightJobs)
 	}
+	if cfg.MaxJobsPerNode != 4 {
+		t.Fatalf("MaxJobsPerNode = %d, want contract default 4", cfg.MaxJobsPerNode)
+	}
 	if cfg.ClaimBatchMax != 32 {
 		t.Fatalf("ClaimBatchMax = %d", cfg.ClaimBatchMax)
 	}
@@ -31,6 +34,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 func TestLoadConfigOverrides(t *testing.T) {
 	cfg, err := LoadConfig(envFrom(map[string]string{
 		EnvMaxInflightJobs:      "7",
+		EnvMaxJobsPerNode:       "2",
 		EnvClaimBatchMax:        "5",
 		EnvJobBootTimeout:       "90s",
 		"FOREMAN_JOB_NAMESPACE": "agents-x",
@@ -38,7 +42,7 @@ func TestLoadConfigOverrides(t *testing.T) {
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	if cfg.MaxInflightJobs != 7 || cfg.ClaimBatchMax != 5 ||
+	if cfg.MaxInflightJobs != 7 || cfg.ClaimBatchMax != 5 || cfg.MaxJobsPerNode != 2 ||
 		cfg.JobBootTimeout != 90*time.Second || cfg.JobNamespace != "agents-x" {
 		t.Fatalf("cfg = %+v", cfg)
 	}
@@ -58,6 +62,9 @@ func TestLoadConfigRejectsBadValues(t *testing.T) {
 	for _, env := range []map[string]string{
 		{EnvMaxInflightJobs: "0"},
 		{EnvMaxInflightJobs: "abc"},
+		{EnvMaxJobsPerNode: "0"},
+		{EnvMaxJobsPerNode: "-1"},
+		{EnvMaxJobsPerNode: "4.5"},
 		{EnvClaimBatchMax: "-1"},
 		{EnvJobBootTimeout: "10"},
 		{EnvJobBootTimeout: "-5s"},

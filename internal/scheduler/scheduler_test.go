@@ -1,12 +1,15 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
+	"strconv"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -950,5 +953,150 @@ func TestClaimBudget(t *testing.T) {
 	f.reg.Put(registry.TaskEntry{TaskID: "t100", JobName: "fm-t100", DaemonID: "fm-t100", State: registry.StateRunning})
 	if got := f.sched.ClaimBudget(); got != 0 {
 		t.Fatalf("ClaimBudget = %d, want 0", got)
+	}
+}
+
+// ---- per-node soft cap (FOREMAN_MAX_JOBS_PER_NODE, ADR-006 节流) ----
+
+// testIssuer satisfies jobbuilder.TokenIssuer (the real builder is wired so
+// the affinity decision of a claim is exercised end to end).
+type testIssuer struct{}
+
+func (testIssuer) Issue(string, string, string, time.Duration) (string, error) {
+	return "fmj_test.token", nil
+}
+
+// newCappedScheduler builds a scheduler over f's registry whose builder is
+// the real jobbuilder, so Job objects carry the genuine affinity.
+func newCappedScheduler(t *testing.T, f *fixture, maxJobsPerNode int, logw io.Writer) *Scheduler {
+	t.Helper()
+	jbCfg, err := jobbuilder.LoadConfig(envFrom(map[string]string{
+		jobbuilder.EnvJobImageDigest: "sha256:4242424242424242424242424242424242424242424242424242424242424242",
+	}))
+	if err != nil {
+		t.Fatalf("jobbuilder.LoadConfig: %v", err)
+	}
+	jbCfg.Issuer = testIssuer{}
+	jbCfg.Nodes = f.reg
+	cfg, err := LoadConfig(envFrom(map[string]string{EnvMaxJobsPerNode: strconv.Itoa(maxJobsPerNode)}))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	s, err := New(cfg, f.reg, f.jobs, jobbuilder.NewBuilder(jbCfg), f.server, f.metrics,
+		WithClock(func() time.Time { return f.now }),
+		WithLogger(slog.New(slog.NewJSONHandler(logw, nil))))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	return s
+}
+
+// place seeds a live Job already placed on node: the state the reconcile
+// round leaves behind after reading spec.nodeName.
+func place(t *testing.T, f *fixture, taskID, issueID, node string) {
+	t.Helper()
+	e := registry.TaskEntry{
+		TaskID: taskID, IssueID: issueID, JobName: "fm-" + taskID,
+		DaemonID: "fm-" + taskID, JobRuntimeID: "rt-" + taskID,
+		State: registry.StateRunning,
+	}
+	if err := f.reg.Put(e); err != nil {
+		t.Fatalf("Put(%s): %v", taskID, err)
+	}
+	f.reg.SetNode(taskID, node)
+}
+
+// affinityNode returns the hostname the Job prefers, "" when it carries no
+// reuse affinity.
+func affinityNode(t *testing.T, job *batchv1.Job) string {
+	t.Helper()
+	aff := job.Spec.Template.Spec.Affinity
+	if aff == nil || aff.NodeAffinity == nil {
+		return ""
+	}
+	terms := aff.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+	if len(terms) == 0 {
+		return ""
+	}
+	expr := terms[0].Preference.MatchExpressions
+	if len(expr) != 1 || len(expr[0].Values) != 1 {
+		t.Fatalf("unexpected affinity expression: %+v", expr)
+	}
+	return expr[0].Values[0]
+}
+
+func TestRefreshNodeSaturationMarksNodesAtCap(t *testing.T) {
+	f := newFixture(t)
+	place(t, f, "t1", "issue-a", "node-a")
+	place(t, f, "t2", "issue-b", "node-a")
+	place(t, f, "t3", "issue-c", "node-b")
+	sched := newCappedScheduler(t, f, 2, io.Discard)
+
+	load := sched.RefreshNodeSaturation(context.Background())
+	if load["node-a"] != 2 || load["node-b"] != 1 || len(load) != 2 {
+		t.Fatalf("load = %v, want node-a=2 node-b=1", load)
+	}
+	if markers := f.reg.SaturatedNodes(); len(markers) != 1 || markers[0] != "node-a" {
+		t.Fatalf("saturated = %v, want [node-a]", markers)
+	}
+
+	// A node that drops below the cap must lose its marker again.
+	if _, err := f.reg.MarkTerminal("t1", registry.ResultCompleted, testNow); err != nil {
+		t.Fatalf("MarkTerminal: %v", err)
+	}
+	if load = sched.RefreshNodeSaturation(context.Background()); load["node-a"] != 1 {
+		t.Fatalf("load after terminal = %v, want node-a=1", load)
+	}
+	if markers := f.reg.SaturatedNodes(); len(markers) != 0 {
+		t.Fatalf("saturated = %v, want none once the load dropped", markers)
+	}
+}
+
+func TestRefreshNodeSaturationLogsLoadAndCap(t *testing.T) {
+	f := newFixture(t)
+	place(t, f, "t1", "issue-a", "node-a")
+	place(t, f, "t2", "issue-b", "node-a")
+	var buf bytes.Buffer
+	sched := newCappedScheduler(t, f, 2, &buf)
+
+	sched.RefreshNodeSaturation(context.Background())
+	for _, want := range []string{
+		`"msg":"node.saturation"`, `"node":"node-a"`,
+		`"active_jobs":2`, `"max_jobs_per_node":2`, `"saturated":true`,
+	} {
+		if !strings.Contains(buf.String(), want) {
+			t.Errorf("log line %q misses %s", buf.String(), want)
+		}
+	}
+}
+
+func TestOnClaimDropsAffinityForSaturatedNode(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		maxPerNode   int
+		wantAffinity string
+	}{
+		{"below the cap keeps the reuse affinity", 3, "node-a"},
+		{"at the cap drops the reuse affinity", 2, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			// issue-1 (the claim payload's issue) ran on node-a, which
+			// already holds two live Jobs.
+			place(t, f, "t1", "issue-1", "node-a")
+			place(t, f, "t2", "issue-b", "node-a")
+			sched := newCappedScheduler(t, f, tc.maxPerNode, io.Discard)
+
+			if err := sched.OnClaim(context.Background(), claimPayload("task-x")); err != nil {
+				t.Fatalf("OnClaim: %v", err)
+			}
+			// The soft cap never blocks a Job: it only picks its placement.
+			if len(f.jobs.createdJobs) != 1 {
+				t.Fatalf("created Jobs = %d, want 1", len(f.jobs.createdJobs))
+			}
+			if got := affinityNode(t, f.jobs.createdJobs[0]); got != tc.wantAffinity {
+				t.Errorf("affinity node = %q, want %q", got, tc.wantAffinity)
+			}
+		})
 	}
 }

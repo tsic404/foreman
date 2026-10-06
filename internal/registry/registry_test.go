@@ -181,6 +181,55 @@ func TestNodeIndex(t *testing.T) {
 	r.SetNode("ghost", "node-b") // no panic on unknown task
 }
 
+func TestActiveJobsByNode(t *testing.T) {
+	r := New(fixedClock())
+	for _, id := range []string{"t1", "t2", "t3"} {
+		if err := r.Put(entryFor(id)); err != nil {
+			t.Fatalf("Put(%s): %v", id, err)
+		}
+	}
+	r.SetNode("t1", "node-a")
+	r.SetNode("t2", "node-a")
+	r.SetNode("t3", "node-b")
+
+	load := r.ActiveJobsByNode()
+	if load["node-a"] != 2 || load["node-b"] != 1 || len(load) != 2 {
+		t.Fatalf("ActiveJobsByNode = %v, want node-a=2 node-b=1", load)
+	}
+	// Terminal Jobs do not hold node capacity: their pod is on its way out.
+	if _, err := r.MarkTerminal("t2", ResultCompleted, testNow); err != nil {
+		t.Fatalf("MarkTerminal: %v", err)
+	}
+	if load = r.ActiveJobsByNode(); load["node-a"] != 1 {
+		t.Fatalf("after terminal: node-a = %d, want 1", load["node-a"])
+	}
+	// t3's node_name is recorded but its pod never landed on it — the entry
+	// still counts: the Job holds the node until it settles.
+	if load["node-b"] != 1 {
+		t.Fatalf("node-b = %d, want 1", load["node-b"])
+	}
+}
+
+func TestNodeSaturationMarkers(t *testing.T) {
+	r := New(fixedClock())
+	if r.NodeSaturated("node-a") {
+		t.Fatal("fresh registry reports a saturated node")
+	}
+	r.SetSaturatedNodes([]string{"node-b", "node-a", ""})
+	if nodes := r.SaturatedNodes(); len(nodes) != 2 || nodes[0] != "node-a" || nodes[1] != "node-b" {
+		t.Fatalf("SaturatedNodes = %v, want [node-a node-b]", nodes)
+	}
+	if !r.NodeSaturated("node-a") || r.NodeSaturated("node-c") {
+		t.Fatalf("marker lookup wrong: %v", r.SaturatedNodes())
+	}
+	// The set is replaced wholesale: a node that fell below the cap must
+	// lose its marker, and stale nodes must not survive.
+	r.SetSaturatedNodes(nil)
+	if r.NodeSaturated("node-a") || len(r.SaturatedNodes()) != 0 {
+		t.Fatalf("markers survived an empty replacement: %v", r.SaturatedNodes())
+	}
+}
+
 func TestMarkStarted(t *testing.T) {
 	r := New(fixedClock())
 	e := entryFor("t1")

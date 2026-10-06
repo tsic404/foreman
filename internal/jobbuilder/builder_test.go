@@ -40,6 +40,15 @@ func (f *fakeIssuer) Issue(jobName, taskID, workspaceID string, ttl time.Duratio
 type fakeNodes map[string]string
 
 func (n fakeNodes) LastNodeForIssue(issueID string) string { return n[issueID] }
+func (n fakeNodes) NodeSaturated(string) bool              { return false }
+
+// saturatedNodes is a node index whose node sits at its per-node soft cap.
+type saturatedNodes struct {
+	fakeNodes
+	node string
+}
+
+func (n saturatedNodes) NodeSaturated(node string) bool { return node == n.node }
 
 func testConfig() Config {
 	cfg, err := LoadConfig(envFrom(map[string]string{EnvJobImageDigest: testDigest}))
@@ -400,6 +409,26 @@ func TestBuildPreferredNodeAffinity(t *testing.T) {
 	job, _ = mustBuild(t, cfg, entry, testPayload())
 	if job.Spec.Template.Spec.Affinity != nil {
 		t.Error("affinity must be omitted when no node history exists")
+	}
+}
+
+// A node at FOREMAN_MAX_JOBS_PER_NODE is no longer a candidate for the next
+// Job of the issue (ADR-006 节流); the Job itself is still rendered.
+func TestBuildDropsAffinityForSaturatedNode(t *testing.T) {
+	entry := testEntry()
+
+	cfg := testConfig()
+	cfg.Nodes = saturatedNodes{fakeNodes: fakeNodes{entry.IssueID: "company-02"}, node: "company-02"}
+	job, _ := mustBuild(t, cfg, entry, testPayload())
+	if job.Spec.Template.Spec.Affinity != nil {
+		t.Error("affinity must be omitted for a node at its per-node cap")
+	}
+
+	// Another node's saturation leaves the reuse affinity in place.
+	cfg.Nodes = saturatedNodes{fakeNodes: fakeNodes{entry.IssueID: "company-02"}, node: "company-03"}
+	job, _ = mustBuild(t, cfg, entry, testPayload())
+	if job.Spec.Template.Spec.Affinity == nil {
+		t.Error("affinity must survive when only an unrelated node is saturated")
 	}
 }
 

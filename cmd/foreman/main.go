@@ -231,6 +231,7 @@ func run() error {
 		"daemon_id", proxyCfg.DaemonID,
 		"job_namespace", schedCfg.JobNamespace,
 		"job_image", jbCfg.JobImage+"@"+jbCfg.JobImageDigest,
+		"max_jobs_per_node", schedCfg.MaxJobsPerNode,
 		"ws_enabled", proxyCfg.WSEnabled,
 	)
 

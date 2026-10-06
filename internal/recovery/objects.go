@@ -44,6 +44,18 @@ func indexPods(pods []corev1.Pod) map[string][]corev1.Pod {
 	return byJob
 }
 
+// podNodeName returns the node a Job's pod was scheduled on ("" while the pod
+// is Pending or does not exist yet). A Job has at most one pod
+// (parallelism: 1), so the first placement found is the placement.
+func podNodeName(pods []corev1.Pod) string {
+	for i := range pods {
+		if node := pods[i].Spec.NodeName; node != "" {
+			return node
+		}
+	}
+	return ""
+}
+
 // jobEndReason applies the Job/Pod facts of 判据模型: the Job object says
 // whether the container ended, the pod refines why. A failed or succeeded
 // Job both mean the container is gone — the daemon (its main process) cannot
