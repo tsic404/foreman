@@ -77,8 +77,8 @@ fi
   die "the image is missing /usr/local/bin/omp or /usr/local/bin/foreman-gc"
 note "omp + foreman-gc present and executable"
 
-# `test -x` also passes for a binary built against another libc — that one dies
-# at exec (missing interpreter), so run it.
+# `test -x` also passes for a binary built against another libc, or one whose
+# shared libraries the image lacks — both die at exec, so run it.
 omp_version=$("$CONTAINER_TOOL" run --rm --entrypoint omp "$IMAGE" --version) ||
-  die "omp is present but does not run here (libc mismatch? check OMP_ASSET against the base image)"
+  die "omp is present but does not run here (wrong libc or missing shared libraries? check OMP_ASSET and the base image)"
 note "omp runs: $omp_version"

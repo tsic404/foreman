@@ -66,7 +66,8 @@ jobs:
           MULTICA_CLI_VERSION: ${{ vars.MULTICA_CLI_VERSION || '0.6.1' }}
           OMP_VERSION: ${{ vars.OMP_VERSION || '18.6.1' }}
           # Empty uses the musl default; set the repo variable when
-          # FOREMAN_BASE_IMAGE is a glibc base so `omp` matches its libc.
+          # FOREMAN_BASE_IMAGE is a glibc base so `omp` matches its libc —
+          # a custom base must also carry the C++ runtime `omp` links.
           OMP_ASSET: ${{ vars.OMP_ASSET }}
         run: scripts/resolve-upstream-artifacts.sh
 
