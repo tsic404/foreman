@@ -199,7 +199,7 @@ func TestIntegrationCancelWaitsForAckThenReleases(t *testing.T) {
 
 type stubBuilder struct{}
 
-func (stubBuilder) Build(e jobbuilder.TaskEntry, _ json.RawMessage) (*batchv1.Job, *corev1.Secret, error) {
+func (stubBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, error) {
 	return &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: fakeJobName(e.TaskID)}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: fakeJobName(e.TaskID) + "-cred"}}, nil
 }

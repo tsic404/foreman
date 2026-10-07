@@ -36,6 +36,13 @@ const (
 	FailureReasonJobFailed       = "job_failed"
 	FailureReasonJobDeadline     = "job_deadline_exceeded"
 	FailureReasonJobEvicted      = "job_evicted"
+	// FailureReasonInvalidJobTemplate is the build-time invariant fallback
+	// (failure-handling scenario #0): the overlay passed startup validation,
+	// so a hit here is a configuration/implementation defect, never retried.
+	FailureReasonInvalidJobTemplate = "invalid_job_template"
+	// FailureReasonInvalidTaskID is scenario #0's other half: the task ID
+	// cannot become a legal Job name (05-modules/job-template.md §错误处理).
+	FailureReasonInvalidTaskID = "invalid_task_id"
 )
 
 // claimHead is the subset of the claim payload the scheduler reads to index
@@ -306,7 +313,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	// refresh marks the nodes at their cap so the affinity below skips them.
 	s.RefreshNodeSaturation(ctx)
 
-	job, secret, err := s.builder.Build(jobbuilderEntry(e), e.Payload)
+	job, secret, err := s.builder.Build(jobbuilderEntry(e))
 	if err != nil {
 		s.failClaim(ctx, e, err)
 		return err
@@ -828,7 +835,7 @@ func (s *Scheduler) Rebuild(ctx context.Context) error {
 	}
 	// Payloads never leave process memory (F3), so every rebuilt entry lacks
 	// one; the C13 convergence releases pre-start entries for redispatch.
-	s.log.InfoContext(ctx, "registry.rebuilt", "jobs", rebuilt, "payload_missing", rebuilt)
+	s.log.InfoContext(ctx, "registry.rebuilt", "jobs", rebuilt)
 	return nil
 }
 
@@ -878,9 +885,19 @@ func (s *Scheduler) failClaim(ctx context.Context, e registry.TaskEntry, cause e
 		s.log.ErrorContext(ctx, "mark terminal failed", "task_id", e.TaskID, "err", err)
 	}
 	s.metrics.TaskTerminal(string(registry.ResultFailed))
+	// A rejected template is not a create failure: the Job must not be
+	// retried, the operator has to fix the overlay (failure-handling #0).
+	reason := FailureReasonJobCreateFailed
+	var invalid *jobbuilder.ValidationError
+	switch {
+	case errors.As(cause, &invalid):
+		reason = FailureReasonInvalidJobTemplate
+	case errors.Is(cause, jobbuilder.ErrInvalidTaskID):
+		reason = FailureReasonInvalidTaskID
+	}
 	s.log.ErrorContext(ctx, "task.failed_compensated",
-		"task_id", e.TaskID, "job_name", e.JobName, "failure_reason", FailureReasonJobCreateFailed)
-	report := failReport{reason: FailureReasonJobCreateFailed, message: cause.Error()}
+		"task_id", e.TaskID, "job_name", e.JobName, "failure_reason", reason, "err", cause.Error())
+	report := failReport{reason: reason, message: cause.Error()}
 	if err := s.reportFail(ctx, e.TaskID, report); err != nil {
 		s.pendingFail.Store(e.TaskID, report)
 	}

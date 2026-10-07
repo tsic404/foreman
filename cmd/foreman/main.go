@@ -135,6 +135,14 @@ func run() error {
 	}
 	jbCfg.Issuer = issuer
 	jbCfg.Nodes = reg
+	jbCfg.Logger = baseLog
+
+	// Startup gate: an illegal job-overlay.yaml must refuse to serve
+	// (CrashLoopBackOff), never fail at the first claim (03-contracts §5.4).
+	builder, err := jobbuilder.NewBuilder(jbCfg)
+	if err != nil {
+		return fmt.Errorf("job template: %w", err)
+	}
 
 	// scheduler and recovery reference each other (Settler vs Reconciler);
 	// the adapter breaks the construction cycle.
@@ -143,7 +151,7 @@ func run() error {
 		schedCfg,
 		reg,
 		scheduler.NewJobClient(clientset, schedCfg.JobNamespace),
-		jobbuilder.NewBuilder(jbCfg),
+		builder,
 		client,
 		metrics,
 		scheduler.WithPendingReports(pending),

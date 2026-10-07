@@ -3,8 +3,10 @@ package jobbuilder
 import (
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math"
 	"os"
+	"path"
 	"regexp"
 	"strconv"
 	"strings"
@@ -86,8 +88,23 @@ type Config struct {
 	NodeSelector     map[string]string
 	Tolerations      []corev1.Toleration
 
+	// OverlayPath is where the optional job-overlay.yaml is mounted
+	// (03-contracts.md §5.4). The Deployment fixes it; §5.4 has no env switch
+	// on purpose, so only tests point it elsewhere.
+	OverlayPath string
+
 	Issuer TokenIssuer
 	Nodes  NodeIndex
+	Logger *slog.Logger
+}
+
+// logger falls back to the process default so the module logs through the
+// same handler main installed (observability §结构化日志).
+func (c Config) logger() *slog.Logger {
+	if c.Logger != nil {
+		return c.Logger
+	}
+	return slog.Default()
 }
 
 // LoadConfig reads the jobbuilder configuration from env (os.Getenv when
@@ -112,6 +129,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		MemoryLimit:      defaultMemoryLimit,
 		NodeSelector:     map[string]string{"kubernetes.io/os": "linux"},
 		Tolerations:      defaultTolerations,
+		OverlayPath:      OverlayPath,
 	}
 
 	if v := strings.TrimSpace(getenv(EnvJobNamespace)); v != "" {
@@ -177,7 +195,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		cfg.JobTTLSeconds = int32(secs)
 	}
 	if v := strings.TrimSpace(getenv(EnvStateRoot)); v != "" {
-		cfg.StateRoot = v
+		cfg.StateRoot = path.Clean(v)
 	}
 	if v := strings.TrimSpace(getenv(EnvRepoCacheMode)); v != "" {
 		if v != CacheModeShared && v != CacheModeIsolated {

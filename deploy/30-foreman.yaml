@@ -173,9 +173,19 @@ spec:
             # terminal-report queue (contract §4) between container restarts.
             - name: state
               mountPath: /var/lib/foreman
+            # §5.4 overlay carrier: optional, so a missing ConfigMap falls back
+            # to the built-in default template (AC-20) instead of blocking
+            # container creation with CreateContainerConfigError.
+            - name: job-template
+              mountPath: /etc/foreman/job-template
+              readOnly: true
       volumes:
         - name: state
           emptyDir: {}
+        - name: job-template
+          configMap:
+            name: foreman-job-template
+            optional: true
 ---
 # Job-side entry point: the Job daemon's MULTICA_SERVER_URL resolves to
 # foreman.foreman.svc.cluster.local:8080 (contract §1.2/§5.2).
