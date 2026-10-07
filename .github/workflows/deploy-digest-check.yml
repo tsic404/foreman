@@ -1,0 +1,29 @@
+# Guard the digest pinning AC-13 depends on: the Job image is referenced by
+# digest in exactly two deploy files, and the two references must stay equal.
+# Static only — no registry access — so it runs on a hosted runner for every
+# change that touches the deploy surface.
+name: deploy-digest-check
+
+on:
+  pull_request:
+    paths: ["deploy/**", "scripts/**", ".github/workflows/**", "Makefile"]
+  push:
+    branches: [main]
+    paths: ["deploy/**", "scripts/**", "Makefile"]
+
+permissions:
+  contents: read
+
+jobs:
+  digest-consistency:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: deploy/ digest references agree
+        run: |
+          set -euo pipefail
+          scripts/deploy-digest.sh --check
+          if grep -q 'sha256:0000000000000000000000000000000000000000000000000000000000000000' deploy/30-foreman.yaml; then
+            echo "::warning title=Job image digest is still the placeholder::pin the first published digest — make pin-job-image-digest DIGEST=<digest from the build-images summary>"
+          fi

@@ -36,7 +36,7 @@ func (f *fakeLogReader) ReadLogs(_ context.Context, namespace, jobName string, t
 func newTestHandler(reg *registry.Registry, logs PodLogReader) http.Handler {
 	return NewOpsHandler(NewMetrics(), reg, logs, OpsConfig{
 		Version:   "v0.1.0",
-		JobImage:  "registry.tsic.top/multica/foreman-job@sha256:abc",
+		JobImage:  "ghcr.io/tsic404/foreman-job@sha256:abc",
 		RuntimeID: func() string { return "rt-123" },
 		StartedAt: time.Now().Add(-time.Minute),
 	})

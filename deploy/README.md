@@ -42,12 +42,13 @@ kubectl -n foreman create secret generic foreman-secret \
   --from-literal=FOREMAN_JOB_TOKEN_KEY="$(head -c 32 /dev/urandom | xxd -p -c 64)" \
   --dry-run=client -o yaml | kubectl apply -f -
 
-# Private registry pull secret (ns multica-agents and ns foreman).
+# GHCR pull secret (ns multica-agents and ns foreman): a GitHub token with
+# read:packages, because the ghcr.io/tsic404/foreman* packages are private.
 kubectl -n multica-agents create secret docker-registry registry-tsic \
-  --docker-server=registry.tsic.top --docker-username=<user> --docker-password=<password> \
+  --docker-server=ghcr.io --docker-username=<github-user> --docker-password=<token> \
   --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n foreman create secret docker-registry registry-tsic \
-  --docker-server=registry.tsic.top --docker-username=<user> --docker-password=<password> \
+  --docker-server=ghcr.io --docker-username=<github-user> --docker-password=<token> \
   --dry-run=client -o yaml | kubectl apply -f -
 ```
 
@@ -56,13 +57,30 @@ characters); `MULTICA_TOKEN` must start with `mdt_` or `mul_`.
 
 ## Images
 
-Two images come from this repo (`docs/04-architecture.md` §部署/运行方式):
+Two images come from this repo (`docs/04-architecture.md` §部署/运行方式): the
+scheduler image for the Deployment, and the Job image (upstream multica CLI +
+`omp` + `foreman-gc`) that both the Job pods and the `foreman-gc` DaemonSet run.
 
-```bash
-make build-foreman        # bin/foreman        → registry.tsic.top/multica/foreman:<ver>
-make build-foreman-image  # container for the Deployment above
-make build-job-image      # Job image: upstream multica CLI + omp + foreman-gc
-```
+`.github/workflows/build-images.yml` builds and publishes both to GHCR — on
+every push to `main` and on `v*.*.*` tags:
+
+| Image | Tags |
+|---|---|
+| `ghcr.io/tsic404/foreman` | `<version>`, `latest` |
+| `ghcr.io/tsic404/foreman-job` | `<version>` |
+
+`<version>` is the pushed tag; on `main` it is the newest `v*.*.*` tag
+reachable from the commit, falling back to the Makefile `VERSION` (`v0.1.0`) —
+the same value `FOREMAN_JOB_IMAGE` below carries. `latest` follows `main` only.
+The workflow needs no secrets for the push (`GITHUB_TOKEN`, `packages: write`)
+and resolves the upstream Job-image artifacts from their release checksum
+manifests; `MULTICA_CLI_VERSION` / `OMP_VERSION` repository variables pin other
+upstream versions than the defaults in the workflow. `omp` is a native binary,
+so the release asset must match the base image's libc: `OMP_ASSET` defaults to
+`omp-linux-musl-x64` for the musl base (`FOREMAN_BASE_IMAGE`, default
+`alpine:3.20`); a glibc base needs `OMP_ASSET=omp-linux-x64` as the repository
+variable (or in the environment for a local build). A mismatch is caught by the
+smoke step below, which runs `omp`.
 
 The Job image is referenced **by digest** in two places that must agree:
 
@@ -71,11 +89,45 @@ The Job image is referenced **by digest** in two places that must agree:
 - the `image:` of the `foreman-gc` DaemonSet in `40-foreman-gc.yaml`
   (the DaemonSet runs the same image as the Job pods).
 
-CI builds the Job image from upstream release artifacts and publishes it; this
-repo only consumes the digest (NG8). `make build-job-image` is the local
-equivalent used for staging clusters — it takes the artifact URL + SHA-256 for
-the upstream CLI and for `omp`, so the built image can be checked against the
-upstream release (AC-13 provenance).
+CI publishes that digest and prints the deploy-facing mapping `<sha7>:<digest>`
+in the workflow summary (and in the `release-images-<version>` artifact) — the
+value this repo shares with the registry, so a cluster runs the image CI built:
+
+```bash
+make pin-job-image-digest DIGEST=sha256:…   # writes both references above
+make check-deploy-digest                    # both exist, parse, and agree
+```
+
+`build-images` warns when `deploy/` still pins a digest other than the one it
+just published, and `deploy-digest-check` fails any change whose two references
+disagree. Until the first publish both carry the all-zero placeholder, so
+`kubectl apply -f deploy/` needs the pin step first.
+
+The same commands run by hand against any registry (the delivery entry points
+CI calls); `make build-job-image` is the local equivalent used for staging
+clusters and takes the artifact URL + SHA-256 for the upstream CLI archive and
+for `omp`, so the built image can be checked against the upstream release
+(AC-13 provenance):
+
+```bash
+make resolve-upstream                   # upstream artifact URL + SHA-256 pairs
+make publish-images                     # build + push both images, print <sha7>:<digest>
+make smoke-job-image IMAGE=ghcr.io/tsic404/foreman-job@sha256:…
+```
+
+`smoke-job-image` pulls the image and verifies three things: the upstream
+`multica` binary inside it (AC-13), that the binaries the Job spec and the
+DaemonSet exec are present, and that `omp` actually runs — `test -x` cannot
+catch a binary built for another libc. With `--expect-digest` it also resolves
+the tag and compares the digest with an independently published value, so it
+takes a tag reference, not an `@sha256:…` pin (that form would only compare
+itself; CI passes the tag plus the digest `publish-images` reported).
+
+Both scripts need only a container CLI on `PATH` (`CONTAINER_TOOL`, default
+`docker`) with a reachable daemon: a CI runner provides one, and a nix shell
+does with `nix-shell -p docker --run 'make smoke-job-image IMAGE=…'` (or
+`nix shell nixpkgs#docker-client` for the client alone, with the daemon on the
+usual socket or `DOCKER_HOST`). The scripts have no nix dependency of their own.
 
 ## Node-local state
 

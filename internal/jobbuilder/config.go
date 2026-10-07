@@ -39,7 +39,7 @@ const (
 // Contract defaults (§5.1).
 const (
 	DefaultJobNamespace    = "multica-agents"
-	DefaultJobImage        = "registry.tsic.top/multica/foreman-job"
+	DefaultJobImage        = "ghcr.io/tsic404/foreman-job"
 	DefaultJobTokenTTL     = 24 * time.Hour
 	DefaultTaskMaxDuration = 86400 * time.Second
 	DefaultJobTTLSeconds   = 600
