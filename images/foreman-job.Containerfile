@@ -8,8 +8,10 @@
 #     daemon's repo cache need.
 #
 # The upstream artifacts are inputs, not build logic: CI (or `make
-# build-job-image`) passes the release URL and its SHA-256, so the resulting
-# image can be diffed against the upstream release binary (AC-13).
+# build-job-image`) passes each release artifact URL and the SHA-256 from the
+# release's checksum manifest, so the image can be diffed against the upstream
+# release (AC-13). The CLI ships as an archive; only its `multica` member is
+# installed.
 ARG BASE_IMAGE=alpine:3.20
 FROM ${BASE_IMAGE}
 
@@ -28,9 +30,12 @@ RUN set -eux; \
 
 # Upstream artifacts, verified by digest before they become part of the image.
 RUN set -eux; \
-    wget -q -O /usr/local/bin/multica "${MULTICA_CLI_URL}"; \
-    echo "${MULTICA_CLI_SHA256}  /usr/local/bin/multica" | sha256sum -c -; \
+    wget -q -O /tmp/multica-cli.tar.gz "${MULTICA_CLI_URL}"; \
+    echo "${MULTICA_CLI_SHA256}  /tmp/multica-cli.tar.gz" | sha256sum -c -; \
+    tar -xzf /tmp/multica-cli.tar.gz -C /tmp multica; \
+    mv /tmp/multica /usr/local/bin/multica; \
     chmod 0755 /usr/local/bin/multica; \
+    rm -f /tmp/multica-cli.tar.gz; \
     wget -q -O /usr/local/bin/omp "${OMP_URL}"; \
     echo "${OMP_SHA256}  /usr/local/bin/omp" | sha256sum -c -; \
     chmod 0755 /usr/local/bin/omp; \

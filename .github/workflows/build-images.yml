@@ -1,0 +1,132 @@
+# Publish the two images the deploy surface consumes (04-architecture.md
+# §部署/运行方式): `foreman:<version>` (+ `latest`) for the Deployment and
+# `foreman-job:<version>` for the Job pods and the foreman-gc DaemonSet, plus
+# the `<sha7>:<digest>` mapping deploy/README.md §Images pins.
+#
+# GHCR is the registry (the workspace owner's decision, replacing the private
+# registry the design still names); `GITHUB_TOKEN` authenticates the push via
+# `packages: write`. Every step failure fails the job — a push that never
+# landed or a digest that is not actually served is a red build, never a silent
+# half-release.
+name: build-images
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version tag to publish (defaults to the newest v*.*.* tag, else the Makefile VERSION)
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-images-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    # Hosted runners reach GHCR; FOREMAN_RELEASE_RUNNER (JSON label array)
+    # overrides them when the images must be built behind the tailnet.
+    runs-on: ${{ fromJSON(vars.FOREMAN_RELEASE_RUNNER || '["ubuntu-latest"]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the newest reachable v*.*.* tag names the release
+
+      - name: Resolve the version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_VERSION" ]; then
+            version=$INPUT_VERSION
+          elif [ "$GITHUB_REF_TYPE" = tag ]; then
+            version=$GITHUB_REF_NAME
+          else
+            version=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || make -s print-version)
+          fi
+          [[ $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error title=Version resolution failed::$version is not a v<major>.<minor>.<patch> tag"
+            exit 1
+          }
+          echo "version=$version" >>"$GITHUB_OUTPUT"
+          echo "publishing $version from $GITHUB_SHA" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Resolve the upstream Job-image artifacts
+        id: upstream
+        env:
+          # Bumping either version is a change to what the Job image ships:
+          # set the repo variable, review the release notes, open a PR.
+          MULTICA_CLI_VERSION: ${{ vars.MULTICA_CLI_VERSION || '0.6.1' }}
+          OMP_VERSION: ${{ vars.OMP_VERSION || '18.6.1' }}
+          # Empty uses the musl default; set the repo variable when
+          # FOREMAN_BASE_IMAGE is a glibc base so `omp` matches its libc.
+          OMP_ASSET: ${{ vars.OMP_ASSET }}
+        run: scripts/resolve-upstream-artifacts.sh
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push the images
+        id: publish
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
+          BASE_IMAGE: ${{ vars.FOREMAN_BASE_IMAGE || 'alpine:3.20' }}
+          # `latest` tracks main only: an older tag build must not move it back.
+          PUSH_LATEST: ${{ github.ref_type == 'tag' && '0' || '1' }}
+          MULTICA_CLI_URL: ${{ steps.upstream.outputs.MULTICA_CLI_URL }}
+          MULTICA_CLI_SHA256: ${{ steps.upstream.outputs.MULTICA_CLI_SHA256 }}
+          OMP_URL: ${{ steps.upstream.outputs.OMP_URL }}
+          OMP_SHA256: ${{ steps.upstream.outputs.OMP_SHA256 }}
+        run: scripts/publish-images.sh
+
+      - name: Smoke the pushed Job image
+        env:
+          JOB_IMAGE: ${{ steps.publish.outputs.job_image }}
+          JOB_DIGEST: ${{ steps.publish.outputs.job_digest }}
+          MULTICA_CLI_URL: ${{ steps.upstream.outputs.MULTICA_CLI_URL }}
+          MULTICA_CLI_SHA256: ${{ steps.upstream.outputs.MULTICA_CLI_SHA256 }}
+        run: |
+          set -euo pipefail
+          # AC-13 provenance: the binary inside the image must be the `multica`
+          # member of the verified upstream release archive.
+          curl -fsSL "$MULTICA_CLI_URL" -o /tmp/multica-cli.tar.gz
+          echo "$MULTICA_CLI_SHA256  /tmp/multica-cli.tar.gz" | sha256sum -c -
+          tar -xzf /tmp/multica-cli.tar.gz -C /tmp multica
+          # The tag plus the digest the publish step reported: the smoke resolves
+          # the tag itself, so a tag that moved fails instead of matching itself.
+          scripts/smoke-job-image.sh "$JOB_IMAGE" \
+            --expect-digest "$JOB_DIGEST" \
+            --expect-cli-sha256 "$(sha256sum /tmp/multica | cut -d' ' -f1)"
+
+      - name: Check the deploy/ digest pin
+        env:
+          JOB_DIGEST: ${{ steps.publish.outputs.job_digest }}
+        run: |
+          set -euo pipefail
+          if scripts/deploy-digest.sh --check --expect "$JOB_DIGEST"; then
+            echo "deploy/ already pins $JOB_DIGEST" >>"$GITHUB_STEP_SUMMARY"
+          else
+            echo "::warning title=deploy/ digest pin is stale::run 'make pin-job-image-digest DIGEST=$JOB_DIGEST' and commit the result"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-images-${{ steps.version.outputs.version }}
+          path: dist/release-images.env
+          retention-days: 90
+
+      - name: Report the failure
+        if: failure()
+        run: echo "::error title=Image delivery failed::$GITHUB_REF was not published to GHCR, or the published image failed verification; do not pin this release."

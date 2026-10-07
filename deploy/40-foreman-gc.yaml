@@ -41,7 +41,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: foreman-gc
-          image: registry.tsic.top/multica/foreman-job@sha256:0000000000000000000000000000000000000000000000000000000000000000 # REPLACE
+          # Digest-pinned, and identical to FOREMAN_JOB_IMAGE_DIGEST in
+          # 30-foreman.yaml — scripts/deploy-digest.sh enforces that (AC-13).
+          image: ghcr.io/tsic404/foreman-job@sha256:0000000000000000000000000000000000000000000000000000000000000000 # pin: make pin-job-image-digest
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/foreman-gc"]
           env:

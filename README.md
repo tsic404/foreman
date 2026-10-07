@@ -26,6 +26,12 @@ make build-job-image      # Job image: upstream multica CLI + omp + foreman-gc
 make check                # gofmt + vet + tests + build
 ```
 
+Both images are built and published to GHCR by
+`.github/workflows/build-images.yml` on every push to `main` and on `v*.*.*`
+tags; `make resolve-upstream` and `make publish-images` are the local
+equivalents of what that workflow runs, and `make smoke-job-image` verifies a
+published Job image.
+
 Deployment lives in `deploy/` (namespaces, RBAC, Secrets, Deployment/Service,
 `foreman-gc` DaemonSet) and is applied with `kubectl apply -f deploy/`; see
 `deploy/README.md` for the Secret values, the Job image digest pinning and the

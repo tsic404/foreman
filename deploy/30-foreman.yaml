@@ -45,8 +45,10 @@ spec:
           type: RuntimeDefault
       containers:
         - name: foreman
-          image: registry.tsic.top/multica/foreman:v0.1.0 # REPLACE with the released tag
-          imagePullPolicy: IfNotPresent
+          image: ghcr.io/tsic404/foreman:latest
+          # A moving tag: always pull so a rollout restart picks up the release
+          # the build-images workflow just published.
+          imagePullPolicy: Always
           args: ["-listen=:8080"]
           ports:
             - name: http
@@ -76,9 +78,11 @@ spec:
             - name: FOREMAN_JOB_NAMESPACE
               value: "multica-agents"
             - name: FOREMAN_JOB_IMAGE
-              value: "registry.tsic.top/multica/foreman-job"
+              value: "ghcr.io/tsic404/foreman-job:v0.1.0"
             - name: FOREMAN_JOB_IMAGE_DIGEST
-              value: "sha256:0000000000000000000000000000000000000000000000000000000000000000" # REPLACE
+              # From the build-images workflow summary: <sha7>:<digest>.
+              # make pin-job-image-digest DIGEST=sha256:… writes both places.
+              value: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
             - name: FOREMAN_JOB_IMAGE_PULL_SECRETS
               value: '["registry-tsic"]'
             - name: FOREMAN_MAX_INFLIGHT_JOBS
