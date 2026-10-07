@@ -5,7 +5,9 @@
 #   * `omp`, the agent backend, at /usr/local/bin/omp (MULTICA_OMP_PATH),
 #   * `foreman-gc`, which the foreman-gc DaemonSet runs from this same image,
 #   * a shell + git + CA roots, which the Job's prepare init container and the
-#     daemon's repo cache need.
+#     daemon's repo cache need,
+#   * the C++ runtime `omp` links (Alpine's `libstdc++` package): the upstream
+#     release binary is dynamically linked, so the bare musl base cannot run it.
 #
 # The upstream artifacts are inputs, not build logic: CI (or `make
 # build-job-image`) passes each release artifact URL and the SHA-256 from the
@@ -23,7 +25,7 @@ ARG OMP_SHA256
 RUN set -eux; \
     test -n "${MULTICA_CLI_URL}" && test -n "${MULTICA_CLI_SHA256}"; \
     test -n "${OMP_URL}" && test -n "${OMP_SHA256}"; \
-    apk add --no-cache ca-certificates git tzdata; \
+    apk add --no-cache ca-certificates git libstdc++ tzdata; \
     addgroup -g 1000 agent; \
     adduser -D -u 1000 -G agent -h /home/agent agent; \
     mkdir -p /home/agent /state/workspaces

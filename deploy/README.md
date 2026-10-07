@@ -79,8 +79,10 @@ upstream versions than the defaults in the workflow. `omp` is a native binary,
 so the release asset must match the base image's libc: `OMP_ASSET` defaults to
 `omp-linux-musl-x64` for the musl base (`FOREMAN_BASE_IMAGE`, default
 `alpine:3.20`); a glibc base needs `OMP_ASSET=omp-linux-x64` as the repository
-variable (or in the environment for a local build). A mismatch is caught by the
-smoke step below, which runs `omp`.
+variable (or in the environment for a local build). The base must also carry the
+C++ runtime `omp` links: the image installs Alpine's `libstdc++` package (which
+brings `libgcc`), and a slimmer base that ships neither fails at exec. Both
+mismatches are caught by the smoke step below, which runs `omp`.
 
 The Job image is referenced **by digest** in two places that must agree:
 
@@ -118,10 +120,11 @@ make smoke-job-image IMAGE=ghcr.io/tsic404/foreman-job@sha256:…
 `smoke-job-image` pulls the image and verifies three things: the upstream
 `multica` binary inside it (AC-13), that the binaries the Job spec and the
 DaemonSet exec are present, and that `omp` actually runs — `test -x` cannot
-catch a binary built for another libc. With `--expect-digest` it also resolves
-the tag and compares the digest with an independently published value, so it
-takes a tag reference, not an `@sha256:…` pin (that form would only compare
-itself; CI passes the tag plus the digest `publish-images` reported).
+catch a binary built for another libc, nor one missing its shared libraries.
+With `--expect-digest` it also resolves the tag and compares the digest with an
+independently published value, so it takes a tag reference, not an `@sha256:…`
+pin (that form would only compare itself; CI passes the tag plus the digest
+`publish-images` reported).
 
 Both scripts need only a container CLI on `PATH` (`CONTAINER_TOOL`, default
 `docker`) with a reachable daemon: a CI runner provides one, and a nix shell
