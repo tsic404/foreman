@@ -115,7 +115,7 @@ type fakeBuilder struct {
 	delay  time.Duration
 }
 
-func (f *fakeBuilder) Build(e jobbuilder.TaskEntry, _ json.RawMessage) (*batchv1.Job, *corev1.Secret, error) {
+func (f *fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, error) {
 	f.got = e
 	if f.delay > 0 {
 		time.Sleep(f.delay)
@@ -275,6 +275,59 @@ func TestOnClaimSecretFailureFailsTaskWithoutJob(t *testing.T) {
 	}
 	if body["failure_reason"] != "job_create_failed" {
 		t.Fatalf("failure_reason = %q", body["failure_reason"])
+	}
+}
+
+func TestOnClaimInvalidTemplateFailsWithInvalidJobTemplate(t *testing.T) {
+	f := newFixture(t)
+	f.builder.err = &jobbuilder.ValidationError{
+		Source:     "job template",
+		Violations: []jobbuilder.Violation{{Path: "spec.template.spec.initContainers[1].volumeMounts[0].name", Rule: "C-9"}},
+	}
+
+	err := f.sched.OnClaim(context.Background(), claimPayload("task-1"))
+	if err == nil {
+		t.Fatal("OnClaim error swallowed")
+	}
+	e, ok := f.reg.Get("task-1")
+	if !ok || e.State != registry.StateTerminal || e.Result != registry.ResultFailed {
+		t.Fatalf("entry = %+v, %v", e, ok)
+	}
+	if len(f.jobs.createdJobs) != 0 || len(f.jobs.createdSecrets) != 0 {
+		t.Fatalf("objects created for a rejected template: jobs=%d secrets=%d", len(f.jobs.createdJobs), len(f.jobs.createdSecrets))
+	}
+	if len(f.server.forwards) != 1 || f.server.forwards[0].ep != EPFail {
+		t.Fatalf("forwards = %+v", f.server.forwards)
+	}
+	var body map[string]string
+	if err := json.Unmarshal([]byte(f.server.forwards[0].body), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["failure_reason"] != FailureReasonInvalidJobTemplate {
+		t.Fatalf("failure_reason = %q, want %q (failure-handling #0)", body["failure_reason"], FailureReasonInvalidJobTemplate)
+	}
+}
+
+func TestOnClaimInvalidTaskIDFailsWithInvalidTaskID(t *testing.T) {
+	f := newFixture(t)
+	f.builder.err = fmt.Errorf("%w: %q does not yield a valid Job name", jobbuilder.ErrInvalidTaskID, "TASK-1")
+
+	err := f.sched.OnClaim(context.Background(), claimPayload("task-1"))
+	if err == nil {
+		t.Fatal("OnClaim error swallowed")
+	}
+	if len(f.jobs.createdJobs) != 0 || len(f.jobs.createdSecrets) != 0 {
+		t.Fatalf("objects created for an invalid task id: jobs=%d secrets=%d", len(f.jobs.createdJobs), len(f.jobs.createdSecrets))
+	}
+	if len(f.server.forwards) != 1 || f.server.forwards[0].ep != EPFail {
+		t.Fatalf("forwards = %+v", f.server.forwards)
+	}
+	var body map[string]string
+	if err := json.Unmarshal([]byte(f.server.forwards[0].body), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body["failure_reason"] != FailureReasonInvalidTaskID {
+		t.Fatalf("failure_reason = %q, want %q (failure-handling #0)", body["failure_reason"], FailureReasonInvalidTaskID)
 	}
 }
 
@@ -978,11 +1031,16 @@ func newCappedScheduler(t *testing.T, f *fixture, maxJobsPerNode int, logw io.Wr
 	}
 	jbCfg.Issuer = testIssuer{}
 	jbCfg.Nodes = f.reg
+	jbCfg.Logger = slog.New(slog.NewJSONHandler(logw, nil))
 	cfg, err := LoadConfig(envFrom(map[string]string{EnvMaxJobsPerNode: strconv.Itoa(maxJobsPerNode)}))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
-	s, err := New(cfg, f.reg, f.jobs, jobbuilder.NewBuilder(jbCfg), f.server, f.metrics,
+	builder, err := jobbuilder.NewBuilder(jbCfg)
+	if err != nil {
+		t.Fatalf("jobbuilder.NewBuilder: %v", err)
+	}
+	s, err := New(cfg, f.reg, f.jobs, builder, f.server, f.metrics,
 		WithClock(func() time.Time { return f.now }),
 		WithLogger(slog.New(slog.NewJSONHandler(logw, nil))))
 	if err != nil {

@@ -1,9 +1,11 @@
 package jobbuilder
 
 import (
-	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -71,15 +73,11 @@ func testEntry() TaskEntry {
 	}
 }
 
-func testPayload() json.RawMessage {
-	return json.RawMessage(`{"id":"` + testTaskID + `","auth_token":"mat_secret","remote_mcp_daemon_token":"mcp_secret","agent":{"id":"a1"}}`)
-}
-
-func mustBuild(t *testing.T, cfg Config, e TaskEntry, payload json.RawMessage) (*batchv1.Job, *corev1.Secret) {
+func mustBuild(t *testing.T, cfg Config, e TaskEntry) (*batchv1.Job, *corev1.Secret) {
 	t.Helper()
 	issuer := &fakeIssuer{token: "fmj_test.sig"}
 	cfg.Issuer = issuer
-	job, secret, err := NewBuilder(cfg).Build(e, payload)
+	job, secret, err := newTestBuilder(t, cfg).Build(e)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -89,8 +87,29 @@ func mustBuild(t *testing.T, cfg Config, e TaskEntry, payload json.RawMessage) (
 	return job, secret
 }
 
+// newTestBuilder runs the startup gate over cfg; the test config points at a
+// non-existent overlay path, so present=false (the AC-20 default path).
+func newTestBuilder(t *testing.T, cfg Config) *Builder {
+	t.Helper()
+	if cfg.OverlayPath == "" {
+		cfg.OverlayPath = filepath.Join(t.TempDir(), "job-overlay.yaml")
+	}
+	if cfg.Logger == nil {
+		cfg.Logger = discardLogger()
+	}
+	builder, err := NewBuilder(cfg)
+	if err != nil {
+		t.Fatalf("NewBuilder: %v", err)
+	}
+	return builder
+}
+
+func discardLogger() *slog.Logger {
+	return slog.New(slog.NewJSONHandler(io.Discard, nil))
+}
+
 func TestBuildJobMetadata(t *testing.T) {
-	job, _ := mustBuild(t, testConfig(), testEntry(), testPayload())
+	job, _ := mustBuild(t, testConfig(), testEntry())
 
 	if job.Name != testJobName {
 		t.Errorf("job name = %q, want %q", job.Name, testJobName)
@@ -129,7 +148,7 @@ func TestBuildJobMetadata(t *testing.T) {
 }
 
 func TestBuildJobSpec(t *testing.T) {
-	job, _ := mustBuild(t, testConfig(), testEntry(), testPayload())
+	job, _ := mustBuild(t, testConfig(), testEntry())
 	spec := job.Spec
 
 	if *spec.BackoffLimit != 0 || *spec.Completions != 1 || *spec.Parallelism != 1 {
@@ -145,7 +164,7 @@ func TestBuildJobSpec(t *testing.T) {
 }
 
 func TestBuildPodSpec(t *testing.T) {
-	job, _ := mustBuild(t, testConfig(), testEntry(), testPayload())
+	job, _ := mustBuild(t, testConfig(), testEntry())
 	pod := job.Spec.Template
 
 	wantPodLabels := map[string]string{
@@ -213,7 +232,7 @@ func TestBuildPodSpec(t *testing.T) {
 }
 
 func TestBuildContainers(t *testing.T) {
-	job, _ := mustBuild(t, testConfig(), testEntry(), testPayload())
+	job, _ := mustBuild(t, testConfig(), testEntry())
 	spec := job.Spec.Template.Spec
 
 	if len(spec.Containers) != 1 {
@@ -288,7 +307,7 @@ func TestBuildContainers(t *testing.T) {
 }
 
 func TestBuildAgentEnv(t *testing.T) {
-	job, _ := mustBuild(t, testConfig(), testEntry(), testPayload())
+	job, _ := mustBuild(t, testConfig(), testEntry())
 	env := job.Spec.Template.Spec.Containers[0].Env
 
 	want := []struct {
@@ -335,7 +354,7 @@ func TestBuildAgentEnv(t *testing.T) {
 }
 
 func TestBuildVolumes(t *testing.T) {
-	job, _ := mustBuild(t, testConfig(), testEntry(), testPayload())
+	job, _ := mustBuild(t, testConfig(), testEntry())
 	volumes := job.Spec.Template.Spec.Volumes
 
 	if len(volumes) != 5 {
@@ -366,7 +385,7 @@ func TestBuildVolumes(t *testing.T) {
 func TestBuildIsolatedCacheMode(t *testing.T) {
 	cfg := testConfig()
 	cfg.RepoCacheMode = CacheModeIsolated
-	job, _ := mustBuild(t, cfg, testEntry(), testPayload())
+	job, _ := mustBuild(t, cfg, testEntry())
 
 	for _, v := range job.Spec.Template.Spec.Volumes {
 		if v.HostPath != nil {
@@ -383,7 +402,7 @@ func TestBuildPreferredNodeAffinity(t *testing.T) {
 
 	cfg := testConfig()
 	cfg.Nodes = fakeNodes{entry.IssueID: "company-02"}
-	job, _ := mustBuild(t, cfg, entry, testPayload())
+	job, _ := mustBuild(t, cfg, entry)
 	affinity := job.Spec.Template.Spec.Affinity
 	if affinity == nil || affinity.NodeAffinity == nil {
 		t.Fatal("affinity missing for known node")
@@ -399,14 +418,14 @@ func TestBuildPreferredNodeAffinity(t *testing.T) {
 	}
 
 	cfg.PreferNodeReuse = false
-	job, _ = mustBuild(t, cfg, entry, testPayload())
+	job, _ = mustBuild(t, cfg, entry)
 	if job.Spec.Template.Spec.Affinity != nil {
 		t.Error("affinity must be omitted when FOREMAN_PREFER_NODE_REUSE=false")
 	}
 
 	cfg = testConfig()
 	cfg.Nodes = fakeNodes{}
-	job, _ = mustBuild(t, cfg, entry, testPayload())
+	job, _ = mustBuild(t, cfg, entry)
 	if job.Spec.Template.Spec.Affinity != nil {
 		t.Error("affinity must be omitted when no node history exists")
 	}
@@ -419,14 +438,14 @@ func TestBuildDropsAffinityForSaturatedNode(t *testing.T) {
 
 	cfg := testConfig()
 	cfg.Nodes = saturatedNodes{fakeNodes: fakeNodes{entry.IssueID: "company-02"}, node: "company-02"}
-	job, _ := mustBuild(t, cfg, entry, testPayload())
+	job, _ := mustBuild(t, cfg, entry)
 	if job.Spec.Template.Spec.Affinity != nil {
 		t.Error("affinity must be omitted for a node at its per-node cap")
 	}
 
 	// Another node's saturation leaves the reuse affinity in place.
 	cfg.Nodes = saturatedNodes{fakeNodes: fakeNodes{entry.IssueID: "company-02"}, node: "company-03"}
-	job, _ = mustBuild(t, cfg, entry, testPayload())
+	job, _ = mustBuild(t, cfg, entry)
 	if job.Spec.Template.Spec.Affinity == nil {
 		t.Error("affinity must survive when only an unrelated node is saturated")
 	}
@@ -435,7 +454,7 @@ func TestBuildDropsAffinityForSaturatedNode(t *testing.T) {
 func TestBuildActiveDeadlineDisabled(t *testing.T) {
 	cfg := testConfig()
 	cfg.TaskMaxDuration = 0
-	job, _ := mustBuild(t, cfg, testEntry(), testPayload())
+	job, _ := mustBuild(t, cfg, testEntry())
 	if job.Spec.ActiveDeadlineSeconds != nil {
 		t.Errorf("activeDeadlineSeconds = %v, want nil when FOREMAN_TASK_MAX_DURATION=0", *job.Spec.ActiveDeadlineSeconds)
 	}
@@ -451,9 +470,12 @@ func TestBuildInvalidTaskID(t *testing.T) {
 	} {
 		entry := testEntry()
 		entry.TaskID = taskID
-		job, secret, err := NewBuilder(testConfigWithIssuer()).Build(entry, testPayload())
+		job, secret, err := newTestBuilder(t, testConfigWithIssuer()).Build(entry)
 		if err == nil {
 			t.Errorf("taskID %q: expected error, got job=%v", taskID, job != nil)
+		}
+		if !errors.Is(err, ErrInvalidTaskID) {
+			t.Errorf("taskID %q: error must wrap ErrInvalidTaskID (failure_reason=invalid_task_id), got %v", taskID, err)
 		}
 		if job != nil || secret != nil {
 			t.Errorf("taskID %q: objects must be nil on error", taskID)
@@ -464,13 +486,13 @@ func TestBuildInvalidTaskID(t *testing.T) {
 func TestBuildIssuerError(t *testing.T) {
 	cfg := testConfig()
 	cfg.Issuer = &fakeIssuer{err: errors.New("boom")}
-	if _, _, err := NewBuilder(cfg).Build(testEntry(), testPayload()); err == nil {
+	if _, _, err := newTestBuilder(t, cfg).Build(testEntry()); err == nil {
 		t.Fatal("expected issuer error to propagate")
 	}
 }
 
 func TestBuildMissingIssuer(t *testing.T) {
-	if _, _, err := NewBuilder(testConfig()).Build(testEntry(), testPayload()); err == nil {
+	if _, _, err := newTestBuilder(t, testConfig()).Build(testEntry()); err == nil {
 		t.Fatal("expected error when Config.Issuer is unset")
 	}
 }
@@ -480,7 +502,7 @@ func TestBuildSecret(t *testing.T) {
 	issuer := &fakeIssuer{token: "fmj_payload.sig"}
 	cfg.Issuer = issuer
 	entry := testEntry()
-	_, secret, err := NewBuilder(cfg).Build(entry, testPayload())
+	_, secret, err := newTestBuilder(t, cfg).Build(entry)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -515,65 +537,6 @@ func TestBuildSecret(t *testing.T) {
 	if config.Token != "fmj_payload.sig" {
 		t.Errorf("config.json token = %q, want the issued token", config.Token)
 	}
-}
-
-func TestPayloadAnnotation(t *testing.T) {
-	build := func(t *testing.T, payload json.RawMessage) map[string]string {
-		t.Helper()
-		job, _ := mustBuild(t, testConfig(), testEntry(), payload)
-		return job.Annotations
-	}
-
-	t.Run("strips credential fields and base64-encodes the rest", func(t *testing.T) {
-		annotations := build(t, testPayload())
-		encoded, ok := annotations["foreman.tsic.top/payload"]
-		if !ok {
-			t.Fatal("payload annotation missing")
-		}
-		raw, err := base64.StdEncoding.DecodeString(encoded)
-		if err != nil {
-			t.Fatalf("annotation is not valid base64: %v", err)
-		}
-		var fields map[string]json.RawMessage
-		if err := json.Unmarshal(raw, &fields); err != nil {
-			t.Fatalf("annotation is not valid JSON: %v", err)
-		}
-		if _, ok := fields["auth_token"]; ok {
-			t.Error("auth_token must be stripped")
-		}
-		if _, ok := fields["remote_mcp_daemon_token"]; ok {
-			t.Error("remote_mcp_daemon_token must be stripped")
-		}
-		if _, ok := fields["id"]; !ok {
-			t.Error("non-sensitive fields must survive")
-		}
-	})
-
-	t.Run("omitted when a remaining field matches the server token shape", func(t *testing.T) {
-		for _, payload := range []string{
-			`{"id":"x","note":"use mdt_abc123"}`,
-			`{"nested":{"token":"mul_xyz"}}`,
-		} {
-			if _, ok := build(t, json.RawMessage(payload))["foreman.tsic.top/payload"]; ok {
-				t.Errorf("payload %s must drop the annotation", payload)
-			}
-		}
-	})
-
-	t.Run("omitted when the payload exceeds 128KB", func(t *testing.T) {
-		payload := json.RawMessage(`{"id":"x","blob":"` + strings.Repeat("a", 200*1024) + `"}`)
-		if _, ok := build(t, payload)["foreman.tsic.top/payload"]; ok {
-			t.Error("oversized payload must drop the annotation")
-		}
-	})
-
-	t.Run("omitted when the payload is missing or unparseable", func(t *testing.T) {
-		for _, payload := range []json.RawMessage{nil, {}, json.RawMessage(`{not json`)} {
-			if _, ok := build(t, payload)["foreman.tsic.top/payload"]; ok {
-				t.Errorf("payload %q must drop the annotation", payload)
-			}
-		}
-	})
 }
 
 func testConfigWithIssuer() Config {

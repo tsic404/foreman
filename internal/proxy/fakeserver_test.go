@@ -81,7 +81,7 @@ func (f *fakeJobs) deleted(name string) bool {
 // fakeBuilder renders a bare Job+Secret pair.
 type fakeBuilder struct{}
 
-func (fakeBuilder) Build(e jobbuilder.TaskEntry, _ json.RawMessage) (*batchv1.Job, *corev1.Secret, error) {
+func (fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, error) {
 	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "fm-" + e.TaskID}}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fm-" + e.TaskID + "-cred"}}
 	return job, secret, nil

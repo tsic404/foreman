@@ -101,6 +101,28 @@ The ones a staging/test cluster usually overrides:
 | `FOREMAN_JOB_BOOT_TIMEOUT` | `60s` | boot-timeout assertions |
 | `FOREMAN_LOG_LEVEL` | `debug` | heartbeat / WS assertions |
 
+## Job template overlay (optional)
+
+The Deployment mounts the optional ConfigMap `foreman-job-template` at
+`/etc/foreman/job-template/` (`optional: true`, key `job-overlay.yaml`).
+Without the ConfigMap, Jobs render from the built-in default template; with it,
+the deployment's partial `batchv1.Job` is merged in with strategic merge patch
+semantics after a two-stage validation (contract §5.4):
+
+```bash
+kubectl -n foreman create configmap foreman-job-template --from-file=job-overlay.yaml=./job-overlay.yaml
+kubectl -n foreman rollout restart deploy/foreman
+```
+
+- The file is read once at startup: an edit needs a Foreman restart, and the
+  startup log records the overlay sha256 plus the applied/refused verdict.
+- An illegal overlay refuses startup (CrashLoopBackOff) and logs each
+  violation as `path: rule`; there is no env switch, the file's existence is
+  the switch.
+- `containers` stays a single container (`agent`): auxiliary containers are
+  appended as `initContainers` entries — native sidecars (`restartPolicy:
+  Always`) and one-shot prepare-init entries (no `restartPolicy`).
+
 ## Post-install checks
 
 ```bash

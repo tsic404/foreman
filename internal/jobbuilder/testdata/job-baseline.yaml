@@ -1,0 +1,142 @@
+# TC-tech-job-01 / AC-20 的权威回归基线。
+# 本文件是 `docs/05-modules/job-template.md` §Job Manifest（默认模板）的测试基线拷贝：
+# 占位符字面保留（替换规则见 job-template.md「占位符与回归基线」）；条件性的 nodeAffinity
+# 块不在基线内（归一化时从实际对象删除，形状由 TC-tech-job-01 单独断言）。
+# 修订 job-template.md 的默认模板必须同 PR 同步本文件。
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fm-<task_id>
+  namespace: multica-agents
+  labels:
+    app.kubernetes.io/name: foreman-job
+    app.kubernetes.io/managed-by: foreman
+    foreman.tsic.top/task-id: "<task_id>"
+    foreman.tsic.top/agent-id: "<agent_id>"
+    foreman.tsic.top/workspace-id: "<workspace_id>"
+  annotations:
+    foreman.tsic.top/issue-id: "<issue_id>"
+    foreman.tsic.top/issue-identifier: "<issue-identifier>"
+    foreman.tsic.top/daemon-id: "fm-<task_id>"
+    foreman.tsic.top/job-runtime-id: "<job runtime uuid>"
+    foreman.tsic.top/claimed-at: "<RFC3339>"
+    foreman.tsic.top/attempt: "1"
+spec:
+  backoffLimit: 0
+  completions: 1
+  parallelism: 1
+  ttlSecondsAfterFinished: 600
+  activeDeadlineSeconds: 86400
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: foreman-job
+        foreman.tsic.top/task-id: "<task_id>"
+    spec:
+      restartPolicy: Never
+      terminationGracePeriodSeconds: 30
+      serviceAccountName: multica-omp
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      imagePullSecrets:
+        - name: registry-tsic
+      nodeSelector:
+        kubernetes.io/os: linux
+      tolerations:
+        - { key: unreachable, operator: Exists, effect: NoExecute }
+        - { key: maybe_unreachable, operator: Exists, effect: NoExecute }
+      topologySpreadConstraints:
+        - maxSkew: 3
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels: { app.kubernetes.io/name: foreman-job }
+      initContainers:
+        - name: prepare
+          image: registry.tsic.top/multica/foreman-job@sha256:<digest>
+          imagePullPolicy: IfNotPresent
+          command: ["/bin/sh", "-ec"]
+          args:
+            - |
+              cp /cred/config.json /home/agent/cred/config.json
+              chmod 0400 /home/agent/cred/config.json
+              chown -R 1000:1000 /home/agent /state/workspaces
+          securityContext:
+            runAsUser: 0
+            runAsNonRoot: false
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits:   { cpu: 200m, memory: 128Mi }
+          volumeMounts:
+            - { name: home,       mountPath: /home/agent }
+            - { name: workspaces, mountPath: /state/workspaces }
+            - { name: cred,       mountPath: /home/agent/cred }
+            - { name: cred-src,   mountPath: /cred, readOnly: true }
+      containers:
+        - name: agent
+          image: registry.tsic.top/multica/foreman-job@sha256:<digest>
+          imagePullPolicy: IfNotPresent
+          workingDir: /home/agent
+          command: ["/usr/local/bin/multica"]
+          args: ["daemon", "start", "--foreground"]
+          tty: true
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: "1", memory: 2Gi }
+            limits:   { cpu: "4", memory: 8Gi }
+          env:
+            - { name: MULTICA_SERVER_URL,                  value: "http://foreman.foreman.svc.cluster.local:8080" }
+            - { name: MULTICA_TASK_CONFIG_ROOT,            value: "/home/agent/cred" }
+            - { name: MULTICA_DAEMON_ID,                   valueFrom: { fieldRef: { fieldPath: "metadata.labels['job-name']" } } }
+            - { name: MULTICA_DAEMON_DEVICE_NAME,          valueFrom: { fieldRef: { fieldPath: "spec.nodeName" } } }
+            - { name: MULTICA_AGENT_RUNTIME_NAME,          value: "foreman-job" }
+            - { name: MULTICA_DAEMON_MAX_CONCURRENT_TASKS, value: "1" }
+            - { name: MULTICA_WORKSPACES_ROOT,             value: "/state/workspaces" }
+            - { name: TMPDIR,                              value: "/tmp" }
+            - { name: TMP,                                 value: "/tmp" }
+            - { name: TEMP,                                value: "/tmp" }
+            - { name: MULTICA_GC_ENABLED,                  value: "false" }
+            - { name: MULTICA_DAEMON_AUTO_UPDATE,          value: "false" }
+            - { name: MULTICA_DAEMON_AUTO_RELOAD,          value: "false" }
+            - { name: MULTICA_OMP_PATH,                    value: "/usr/local/bin/omp" }
+            - { name: HOME,                                value: "/home/agent" }
+            - { name: LOG_LEVEL,                           value: "info" }
+          volumeMounts:
+            - { name: home,       mountPath: /home/agent }
+            - { name: cred,       mountPath: /home/agent/cred }
+            - { name: workspaces, mountPath: /state/workspaces }
+            - { name: tmp,        mountPath: /tmp }
+      volumes:
+        - name: home
+          hostPath: { path: /var/lib/foreman/home, type: DirectoryOrCreate }
+        - name: workspaces
+          hostPath: { path: /var/lib/foreman/workspaces, type: DirectoryOrCreate }
+        - name: tmp
+          emptyDir: { sizeLimit: 2Gi }
+        - name: cred
+          emptyDir: { sizeLimit: 16Mi }
+        - name: cred-src
+          secret: { secretName: fm-<task_id>-cred, defaultMode: 0400 }
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: fm-<task_id>-cred
+  namespace: multica-agents
+  labels: { app.kubernetes.io/managed-by: foreman, foreman.tsic.top/task-id: "<task_id>" }
+type: Opaque
+stringData:
+  config.json: '{"token":"fmj_<payload>.<sig>"}'

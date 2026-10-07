@@ -1,7 +1,6 @@
 package jobbuilder
 
 import (
-	"encoding/json"
 	"path"
 	"strconv"
 	"time"
@@ -26,7 +25,27 @@ const (
 	annoJobRuntimeID    = "foreman.tsic.top/job-runtime-id"
 	annoClaimedAt       = "foreman.tsic.top/claimed-at"
 	annoAttempt         = "foreman.tsic.top/attempt"
-	annoPayload         = "foreman.tsic.top/payload"
+)
+
+// Container, volume and mount names locked by 清单 A (03-contracts.md §5.4):
+// overlay validation and rendering must agree on them by construction.
+const (
+	containerAgent   = "agent"
+	containerPrepare = "prepare"
+
+	volumeHome       = "home"
+	volumeWorkspaces = "workspaces"
+	volumeTmp        = "tmp"
+	volumeCred       = "cred"
+	volumeCredSrc    = "cred-src"
+
+	mountHome       = "/home/agent"
+	mountWorkspaces = "/state/workspaces"
+	mountCred       = "/home/agent/cred"
+	mountTmp        = "/tmp"
+	mountCredSrc    = "/cred"
+
+	foremanDomain = "foreman.tsic.top/"
 )
 
 // Template constants fixed by the job-template module design (not configurable).
@@ -41,6 +60,9 @@ const (
 	configFileKey     = "config.json"
 	credFileMode      = 0o400
 	secretCredSuffix  = "-cred"
+
+	agentCommand    = "/usr/local/bin/multica"
+	agentWorkingDir = "/home/agent"
 )
 
 // initScript copies the Job Token out of the read-only Secret mount and fixes
@@ -60,30 +82,17 @@ var (
 	initMemoryLimit   = resource.MustParse("128Mi")
 )
 
-func (b *Builder) job(name string, e TaskEntry, payload json.RawMessage) *batchv1.Job {
-	annotations := map[string]string{
-		annoIssueID:         e.IssueID,
-		annoIssueIdentifier: e.IssueIdentifier,
-		annoDaemonID:        name,
-		annoJobRuntimeID:    e.JobRuntimeID,
-		annoClaimedAt:       e.ClaimedAt.UTC().Format(time.RFC3339),
-		annoAttempt:         strconv.Itoa(e.Attempt),
-	}
-	if encoded, ok := sanitizePayload(payload); ok {
-		annotations[annoPayload] = encoded
-	}
+// defaultJob renders the built-in default template (docs/05-modules/job-template.md
+// §Job Manifest) with the §5.1 env tuning applied and the per-task fields
+// already written; the overlay merges on top of it and Build then re-writes
+// the authoritative paths (§5.4 step 6).
+func (b *Builder) defaultJob(name string, e TaskEntry) *batchv1.Job {
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name,
-			Namespace: b.cfg.JobNamespace,
-			Labels: map[string]string{
-				labelAppName:     jobAppName,
-				labelManagedBy:   managedByForeman,
-				labelTaskID:      e.TaskID,
-				labelAgentID:     e.AgentID,
-				labelWorkspaceID: e.WorkspaceID,
-			},
-			Annotations: annotations,
+			Name:        name,
+			Namespace:   b.cfg.JobNamespace,
+			Labels:      b.identityLabels(e),
+			Annotations: b.identityAnnotations(name, e),
 		},
 		Spec: batchv1.JobSpec{
 			BackoffLimit:            new(int32(0)),
@@ -97,6 +106,30 @@ func (b *Builder) job(name string, e TaskEntry, payload json.RawMessage) *batchv
 		job.Spec.ActiveDeadlineSeconds = new(int64(b.cfg.TaskMaxDuration / time.Second))
 	}
 	return job
+}
+
+// identityLabels is the §3.2 Job label set.
+func (b *Builder) identityLabels(e TaskEntry) map[string]string {
+	return map[string]string{
+		labelAppName:     jobAppName,
+		labelManagedBy:   managedByForeman,
+		labelTaskID:      e.TaskID,
+		labelAgentID:     e.AgentID,
+		labelWorkspaceID: e.WorkspaceID,
+	}
+}
+
+// identityAnnotations is the §3.2 Job annotation set. The task payload never
+// appears here: it stays in Foreman memory only (F3/ADR-007).
+func (b *Builder) identityAnnotations(name string, e TaskEntry) map[string]string {
+	return map[string]string{
+		annoIssueID:         e.IssueID,
+		annoIssueIdentifier: e.IssueIdentifier,
+		annoDaemonID:        name,
+		annoJobRuntimeID:    e.JobRuntimeID,
+		annoClaimedAt:       e.ClaimedAt.UTC().Format(time.RFC3339),
+		annoAttempt:         strconv.Itoa(e.Attempt),
+	}
 }
 
 func (b *Builder) podTemplate(name string, e TaskEntry) corev1.PodTemplateSpec {
@@ -119,48 +152,43 @@ func (b *Builder) podTemplate(name string, e TaskEntry) corev1.PodTemplateSpec {
 				RunAsNonRoot:   new(true),
 				SeccompProfile: &corev1.SeccompProfile{Type: corev1.SeccompProfileTypeRuntimeDefault},
 			},
-			ImagePullSecrets: b.imagePullSecrets(),
+			ImagePullSecrets: b.cfg.imagePullSecrets(),
 			NodeSelector:     b.cfg.NodeSelector,
 			Tolerations:      b.cfg.Tolerations,
-			Affinity:         b.affinity(e),
 			TopologySpreadConstraints: []corev1.TopologySpreadConstraint{{
 				MaxSkew:           3,
 				TopologyKey:       "kubernetes.io/hostname",
 				WhenUnsatisfiable: corev1.ScheduleAnyway,
 				LabelSelector:     &metav1.LabelSelector{MatchLabels: map[string]string{labelAppName: jobAppName}},
 			}},
-			InitContainers: []corev1.Container{b.prepareContainer()},
-			Containers:     []corev1.Container{b.agentContainer()},
-			Volumes:        b.volumes(name),
+			InitContainers: []corev1.Container{defaultPrepareContainer(b.cfg)},
+			Containers:     []corev1.Container{defaultAgentContainer(b.cfg)},
+			Volumes:        b.cfg.volumes(name),
 		},
 	}
 }
 
-func (b *Builder) affinity(e TaskEntry) *corev1.Affinity {
-	node := b.preferredNode(e)
-	if node == "" {
-		return nil
-	}
-	return &corev1.Affinity{
-		NodeAffinity: &corev1.NodeAffinity{
-			PreferredDuringSchedulingIgnoredDuringExecution: []corev1.PreferredSchedulingTerm{{
-				Weight: 100,
-				Preference: corev1.NodeSelectorTerm{
-					MatchExpressions: []corev1.NodeSelectorRequirement{{
-						Key:      "kubernetes.io/hostname",
-						Operator: corev1.NodeSelectorOpIn,
-						Values:   []string{node},
-					}},
-				},
+// preferredTerm is the soft node-reuse affinity item appended after the merge
+// (03-contracts §5.4 「affinity 注入」).
+func preferredTerm(node string) corev1.PreferredSchedulingTerm {
+	return corev1.PreferredSchedulingTerm{
+		Weight: 100,
+		Preference: corev1.NodeSelectorTerm{
+			MatchExpressions: []corev1.NodeSelectorRequirement{{
+				Key:      "kubernetes.io/hostname",
+				Operator: corev1.NodeSelectorOpIn,
+				Values:   []string{node},
 			}},
 		},
 	}
 }
 
-func (b *Builder) prepareContainer() corev1.Container {
+// defaultPrepareContainer is the credential-copy init container (ADR-007): the
+// only code that runs as root, with every field locked by 清单 A.
+func defaultPrepareContainer(cfg Config) corev1.Container {
 	return corev1.Container{
-		Name:            "prepare",
-		Image:           b.imageRef(),
+		Name:            containerPrepare,
+		Image:           cfg.imageRef(),
 		ImagePullPolicy: corev1.PullIfNotPresent,
 		Command:         []string{"/bin/sh", "-ec"},
 		Args:            []string{initScript},
@@ -176,21 +204,23 @@ func (b *Builder) prepareContainer() corev1.Container {
 			Limits:   corev1.ResourceList{corev1.ResourceCPU: initCPULimit, corev1.ResourceMemory: initMemoryLimit},
 		},
 		VolumeMounts: []corev1.VolumeMount{
-			{Name: "home", MountPath: "/home/agent"},
-			{Name: "workspaces", MountPath: "/state/workspaces"},
-			{Name: "cred", MountPath: "/home/agent/cred"},
-			{Name: "cred-src", MountPath: "/cred", ReadOnly: true},
+			{Name: volumeHome, MountPath: mountHome},
+			{Name: volumeWorkspaces, MountPath: mountWorkspaces},
+			{Name: volumeCred, MountPath: mountCred},
+			{Name: volumeCredSrc, MountPath: mountCredSrc, ReadOnly: true},
 		},
 	}
 }
 
-func (b *Builder) agentContainer() corev1.Container {
+// defaultAgentContainer is the single business container (ADR-001 收窄口径):
+// the unmodified upstream daemon with its 16-key env set (§5.2).
+func defaultAgentContainer(cfg Config) corev1.Container {
 	return corev1.Container{
-		Name:            "agent",
-		Image:           b.imageRef(),
+		Name:            containerAgent,
+		Image:           cfg.imageRef(),
 		ImagePullPolicy: corev1.PullIfNotPresent,
-		WorkingDir:      "/home/agent",
-		Command:         []string{"/usr/local/bin/multica"},
+		WorkingDir:      agentWorkingDir,
+		Command:         []string{agentCommand},
 		Args:            []string{"daemon", "start", "--foreground"},
 		TTY:             true, // daemon writes logs to stderr only when it is a terminal
 		SecurityContext: &corev1.SecurityContext{
@@ -201,15 +231,15 @@ func (b *Builder) agentContainer() corev1.Container {
 			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
 		},
 		Resources: corev1.ResourceRequirements{
-			Requests: corev1.ResourceList{corev1.ResourceCPU: b.cfg.CPURequest, corev1.ResourceMemory: b.cfg.MemoryRequest},
-			Limits:   corev1.ResourceList{corev1.ResourceCPU: b.cfg.CPULimit, corev1.ResourceMemory: b.cfg.MemoryLimit},
+			Requests: corev1.ResourceList{corev1.ResourceCPU: cfg.CPURequest, corev1.ResourceMemory: cfg.MemoryRequest},
+			Limits:   corev1.ResourceList{corev1.ResourceCPU: cfg.CPULimit, corev1.ResourceMemory: cfg.MemoryLimit},
 		},
 		Env: agentEnv(),
 		VolumeMounts: []corev1.VolumeMount{
-			{Name: "home", MountPath: "/home/agent"},
-			{Name: "cred", MountPath: "/home/agent/cred"},
-			{Name: "workspaces", MountPath: "/state/workspaces"},
-			{Name: "tmp", MountPath: "/tmp"},
+			{Name: volumeHome, MountPath: mountHome},
+			{Name: volumeCred, MountPath: mountCred},
+			{Name: volumeWorkspaces, MountPath: mountWorkspaces},
+			{Name: volumeTmp, MountPath: mountTmp},
 		},
 	}
 }
@@ -221,55 +251,79 @@ func agentEnv() []corev1.EnvVar {
 	}
 	return []corev1.EnvVar{
 		{Name: "MULTICA_SERVER_URL", Value: foremanServerURL},
-		{Name: "MULTICA_TASK_CONFIG_ROOT", Value: "/home/agent/cred"},
+		{Name: "MULTICA_TASK_CONFIG_ROOT", Value: mountCred},
 		{Name: "MULTICA_DAEMON_ID", ValueFrom: fieldRef("metadata.labels['job-name']")},
 		{Name: "MULTICA_DAEMON_DEVICE_NAME", ValueFrom: fieldRef("spec.nodeName")},
-		{Name: "MULTICA_AGENT_RUNTIME_NAME", Value: "foreman-job"},
+		{Name: "MULTICA_AGENT_RUNTIME_NAME", Value: jobAppName},
 		{Name: "MULTICA_DAEMON_MAX_CONCURRENT_TASKS", Value: "1"},
-		{Name: "MULTICA_WORKSPACES_ROOT", Value: "/state/workspaces"},
-		{Name: "TMPDIR", Value: "/tmp"},
-		{Name: "TMP", Value: "/tmp"},
-		{Name: "TEMP", Value: "/tmp"},
+		{Name: "MULTICA_WORKSPACES_ROOT", Value: mountWorkspaces},
+		{Name: "TMPDIR", Value: mountTmp},
+		{Name: "TMP", Value: mountTmp},
+		{Name: "TEMP", Value: mountTmp},
 		{Name: "MULTICA_GC_ENABLED", Value: "false"},
 		{Name: "MULTICA_DAEMON_AUTO_UPDATE", Value: "false"},
 		{Name: "MULTICA_DAEMON_AUTO_RELOAD", Value: "false"},
 		{Name: "MULTICA_OMP_PATH", Value: "/usr/local/bin/omp"},
-		{Name: "HOME", Value: "/home/agent"},
+		{Name: "HOME", Value: agentWorkingDir},
 		{Name: "LOG_LEVEL", Value: "info"},
 	}
 }
 
-func (b *Builder) volumes(name string) []corev1.Volume {
-	var stateVolumes []corev1.Volume
-	if b.cacheMode() == CacheModeIsolated {
-		stateVolumes = []corev1.Volume{
-			{Name: "home", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-			{Name: "workspaces", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{}}},
-		}
-	} else {
-		dirOrCreate := corev1.HostPathDirectoryOrCreate
-		stateVolumes = []corev1.Volume{
-			{Name: "home", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: path.Join(b.cfg.StateRoot, "home"), Type: &dirOrCreate}}},
-			{Name: "workspaces", VolumeSource: corev1.VolumeSource{HostPath: &corev1.HostPathVolumeSource{Path: path.Join(b.cfg.StateRoot, "workspaces"), Type: &dirOrCreate}}},
-		}
+// authoritativeEnvKeys is the §5.2 key set overlay env entries must not touch.
+var authoritativeEnvKeys = func() map[string]bool {
+	keys := map[string]bool{}
+	for _, entry := range agentEnv() {
+		keys[entry.Name] = true
 	}
-	return append(stateVolumes,
-		corev1.Volume{Name: "tmp", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: &tmpVolumeSize}}},
-		corev1.Volume{Name: "cred", VolumeSource: corev1.VolumeSource{EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: &credVolumeSize}}},
-		corev1.Volume{Name: "cred-src", VolumeSource: corev1.VolumeSource{Secret: &corev1.SecretVolumeSource{
-			SecretName:  name + secretCredSuffix,
-			DefaultMode: new(int32(credFileMode)),
-		}}},
-	)
+	return keys
+}()
+
+// volumes is the built-in five-volume set: the two cache volumes follow
+// FOREMAN_REPO_CACHE_MODE (ADR-005), the rest are fixed. jobName feeds the
+// per-task credential Secret of cred-src.
+func (c Config) volumes(jobName string) []corev1.Volume {
+	return append([]corev1.Volume{
+		c.stateVolume(volumeHome),
+		c.stateVolume(volumeWorkspaces),
+	}, emptyDirVolume(volumeTmp), emptyDirVolume(volumeCred), credSrcVolume(jobName))
 }
 
-func (b *Builder) imageRef() string {
-	return b.cfg.JobImage + "@" + b.cfg.JobImageDigest
+// stateVolume renders home/workspaces: hostPath under FOREMAN_STATE_ROOT
+// (shared) or emptyDir (isolated).
+func (c Config) stateVolume(name string) corev1.Volume {
+	if c.RepoCacheMode == CacheModeIsolated {
+		return emptyDirVolume(name)
+	}
+	dirOrCreate := corev1.HostPathDirectoryOrCreate
+	return corev1.Volume{Name: name, VolumeSource: corev1.VolumeSource{
+		HostPath: &corev1.HostPathVolumeSource{Path: path.Join(c.StateRoot, name), Type: &dirOrCreate},
+	}}
 }
 
-func (b *Builder) imagePullSecrets() []corev1.LocalObjectReference {
-	refs := make([]corev1.LocalObjectReference, len(b.cfg.ImagePullSecrets))
-	for i, name := range b.cfg.ImagePullSecrets {
+func emptyDirVolume(name string) corev1.Volume {
+	size := credVolumeSize.DeepCopy()
+	if name == volumeTmp {
+		size = tmpVolumeSize.DeepCopy()
+	}
+	return corev1.Volume{Name: name, VolumeSource: corev1.VolumeSource{
+		EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: &size},
+	}}
+}
+
+// credSrcVolume renders the read-only Secret volume holding the Job Token.
+func credSrcVolume(jobName string) corev1.Volume {
+	return corev1.Volume{Name: volumeCredSrc, VolumeSource: corev1.VolumeSource{
+		Secret: &corev1.SecretVolumeSource{SecretName: jobName + secretCredSuffix, DefaultMode: new(int32(credFileMode))},
+	}}
+}
+
+func (c Config) imageRef() string {
+	return c.JobImage + "@" + c.JobImageDigest
+}
+
+func (c Config) imagePullSecrets() []corev1.LocalObjectReference {
+	refs := make([]corev1.LocalObjectReference, len(c.ImagePullSecrets))
+	for i, name := range c.ImagePullSecrets {
 		refs[i] = corev1.LocalObjectReference{Name: name}
 	}
 	return refs

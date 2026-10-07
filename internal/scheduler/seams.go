@@ -2,7 +2,6 @@ package scheduler
 
 import (
 	"context"
-	"encoding/json"
 	"errors"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -37,9 +36,10 @@ type ServerClient interface {
 }
 
 // JobBuilder renders the Job and credential Secret for an entry; satisfied
-// by *jobbuilder.Builder.
+// by *jobbuilder.Builder. The task payload is not part of the contract: it
+// never reaches a K8s object (F3/ADR-007).
 type JobBuilder interface {
-	Build(e jobbuilder.TaskEntry, payload json.RawMessage) (*batchv1.Job, *corev1.Secret, error)
+	Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, error)
 }
 
 // Metrics is the observability seam. The observability module provides the
