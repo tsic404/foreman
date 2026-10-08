@@ -82,7 +82,7 @@ spec:
             - name: FOREMAN_JOB_IMAGE_DIGEST
               # From the build-images workflow summary: <sha7>:<digest>.
               # make pin-job-image-digest DIGEST=sha256:… writes both places.
-              value: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+              value: "sha256:17f067e892f4431dee05af7c1e29a1c6b3c26c1b63fbfd95eba8ffc82737cb6b"
             - name: FOREMAN_JOB_IMAGE_PULL_SECRETS
               value: '["registry-tsic"]'
             - name: FOREMAN_MAX_INFLIGHT_JOBS

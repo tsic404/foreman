@@ -43,7 +43,7 @@ spec:
         - name: foreman-gc
           # Digest-pinned, and identical to FOREMAN_JOB_IMAGE_DIGEST in
           # 30-foreman.yaml — scripts/deploy-digest.sh enforces that (AC-13).
-          image: ghcr.io/tsic404/foreman-job@sha256:0000000000000000000000000000000000000000000000000000000000000000 # pin: make pin-job-image-digest
+          image: ghcr.io/tsic404/foreman-job@sha256:17f067e892f4431dee05af7c1e29a1c6b3c26c1b63fbfd95eba8ffc82737cb6b # pin: make pin-job-image-digest
           imagePullPolicy: IfNotPresent
           command: ["/usr/local/bin/foreman-gc"]
           env:
