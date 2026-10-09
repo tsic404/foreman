@@ -34,8 +34,8 @@ published Job image.
 
 Deployment lives in `deploy/` (namespaces, RBAC, Secrets, Deployment/Service,
 `foreman-gc` DaemonSet) and is applied with `kubectl apply -f deploy/`; see
-`deploy/README.md` for the Secret values, the Job image digest pinning and the
-node-local state root.
+`deploy/README.md` for the Secret values, the movable Job image reference and
+the node-local state root.
 
 ## Status
 

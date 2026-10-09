@@ -67,11 +67,12 @@ every push to `main` and on `v*.*.*` tags:
 | Image | Tags |
 |---|---|
 | `ghcr.io/tsic404/foreman` | `<version>`, `latest` |
-| `ghcr.io/tsic404/foreman-job` | `<version>` |
+| `ghcr.io/tsic404/foreman-job` | `<version>`, `latest` |
 
 `<version>` is the pushed tag; on `main` it is the newest `v*.*.*` tag
-reachable from the commit, falling back to the Makefile `VERSION` (`v0.1.0`) —
-the same value `FOREMAN_JOB_IMAGE` below carries. `latest` follows `main` only.
+reachable from the commit, falling back to the Makefile `VERSION` (`v0.1.0`).
+`latest` follows `main` only: the shipped `FOREMAN_JOB_IMAGE` points at it,
+while the version tags remain the rollback path (ADR-012).
 The workflow needs no secrets for the push (`GITHUB_TOKEN`, `packages: write`)
 and resolves the upstream Job-image artifacts from their release checksum
 manifests; `MULTICA_CLI_VERSION` / `OMP_VERSION` repository variables pin other
@@ -84,26 +85,26 @@ C++ runtime `omp` links: the image installs Alpine's `libstdc++` package (which
 brings `libgcc`), and a slimmer base that ships neither fails at exec. Both
 mismatches are caught by the smoke step below, which runs `omp`.
 
-The Job image is referenced **by digest** in two places that must agree:
+The Job image is referenced by a **movable tag** in two places that carry the
+same literal (ADR-012):
 
-- `FOREMAN_JOB_IMAGE_DIGEST` in `30-foreman.yaml` (rendered into every Job as
-  `image@sha256:…`), and
+- `FOREMAN_JOB_IMAGE` in `30-foreman.yaml` (written verbatim into every Job's
+  `agent` and `prepare` containers — no digest concatenation), and
 - the `image:` of the `foreman-gc` DaemonSet in `40-foreman-gc.yaml`
   (the DaemonSet runs the same image as the Job pods).
 
-CI publishes that digest and prints the deploy-facing mapping `<sha7>:<digest>`
-in the workflow summary (and in the `release-images-<version>` artifact) — the
-value this repo shares with the registry, so a cluster runs the image CI built:
+Rolling forward is one step: point `FOREMAN_JOB_IMAGE` at the new reference, or
+let the tag itself move. Rolling back uses the version tags CI keeps publishing
+(`v<ver>`) — `latest` alone is never the only published tag. Both containers in
+the Job template default to `imagePullPolicy: Always`, which is what lets a
+moved tag reach a node that already cached the reference; a deployment that
+pins a version tag can set `imagePullPolicy: IfNotPresent` through the job
+template overlay (§5.4「`imagePullPolicy`」段) and accepts that a moved tag then
+skips cached nodes. `foreman-gc` pulls `Always` for the same reason.
 
-```bash
-make pin-job-image-digest DIGEST=sha256:…   # writes both references above
-make check-deploy-digest                    # both exist, parse, and agree
-```
-
-`build-images` warns when `deploy/` still pins a digest other than the one it
-just published, and `deploy-digest-check` fails any change whose two references
-disagree. Until the first publish both carry the all-zero placeholder, so
-`kubectl apply -f deploy/` needs the pin step first.
+CI publishes each run's references and digests (the `release-images-<version>`
+artifact and the workflow summary) as the run's own record — nothing in
+`deploy/` is backfilled from it.
 
 The same commands run by hand against any registry (the delivery entry points
 CI calls); `make build-job-image` is the local equivalent used for staging
@@ -113,18 +114,18 @@ for `omp`, so the built image can be checked against the upstream release
 
 ```bash
 make resolve-upstream                   # upstream artifact URL + SHA-256 pairs
-make publish-images                     # build + push both images, print <sha7>:<digest>
-make smoke-job-image IMAGE=ghcr.io/tsic404/foreman-job@sha256:…
+make publish-images                     # build + push both images, print the references
+make smoke-job-image IMAGE=ghcr.io/tsic404/foreman-job:latest
 ```
 
 `smoke-job-image` pulls the image and verifies three things: the upstream
 `multica` binary inside it (AC-13), that the binaries the Job spec and the
 DaemonSet exec are present, and that `omp` actually runs — `test -x` cannot
 catch a binary built for another libc, nor one missing its shared libraries.
-With `--expect-digest` it also resolves the tag and compares the digest with an
-independently published value, so it takes a tag reference, not an `@sha256:…`
-pin (that form would only compare itself; CI passes the tag plus the digest
-`publish-images` reported).
+With `--expect-digest` it also resolves the tag and compares the digest with
+the digest the same job's publish step reported, so it takes a tag reference,
+not an `@sha256:…` pin (that form would only compare itself; CI passes the tag
+plus the digest `publish-images` reported).
 
 Both scripts need only a container CLI on `PATH` (`CONTAINER_TOOL`, default
 `docker`) with a reachable daemon: a CI runner provides one, and a nix shell

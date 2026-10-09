@@ -188,7 +188,7 @@ func run() error {
 	fakeServer := proxy.NewFakeServer(issuer, reg, sched, client, ws, metrics)
 	ops := observability.NewOpsHandler(metrics, reg, observability.NewK8sPodLogReader(clientset), observability.OpsConfig{
 		Version:   version,
-		JobImage:  jbCfg.JobImage + "@" + jbCfg.JobImageDigest,
+		JobImage:  jbCfg.JobImage,
 		RuntimeID: client.RuntimeID,
 		StartedAt: started,
 		Logger:    baseLog,
@@ -238,7 +238,7 @@ func run() error {
 		"workspace_id", proxyCfg.WorkspaceID,
 		"daemon_id", proxyCfg.DaemonID,
 		"job_namespace", schedCfg.JobNamespace,
-		"job_image", jbCfg.JobImage+"@"+jbCfg.JobImageDigest,
+		"job_image", jbCfg.JobImage,
 		"max_jobs_per_node", schedCfg.MaxJobsPerNode,
 		"ws_enabled", proxyCfg.WSEnabled,
 	)

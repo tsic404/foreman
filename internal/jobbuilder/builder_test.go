@@ -53,7 +53,7 @@ type saturatedNodes struct {
 func (n saturatedNodes) NodeSaturated(node string) bool { return node == n.node }
 
 func testConfig() Config {
-	cfg, err := LoadConfig(envFrom(map[string]string{EnvJobImageDigest: testDigest}))
+	cfg, err := LoadConfig(envFrom(map[string]string{}))
 	if err != nil {
 		panic(err)
 	}
@@ -231,6 +231,28 @@ func TestBuildPodSpec(t *testing.T) {
 	}
 }
 
+// TestBuildKeepsJobImageReferenceVerbatim (AC-13): the configured reference
+// reaches both containers exactly as given — a digest-carrying reference
+// included. The builder appends and normalizes nothing (ADR-012).
+func TestBuildKeepsJobImageReferenceVerbatim(t *testing.T) {
+	for _, ref := range []string{
+		"ghcr.io/tsic404/foreman-job:v0.1.0",
+		"ghcr.io/tsic404/foreman-job@" + testDigest,
+		"ghcr.io/tsic404/foreman-job:v0.1.0@" + testDigest,
+	} {
+		cfg := testConfig()
+		cfg.JobImage = ref
+		job, _ := mustBuild(t, cfg, testEntry())
+		spec := job.Spec.Template.Spec
+		if spec.Containers[0].Image != ref {
+			t.Errorf("agent image = %q, want the verbatim %q", spec.Containers[0].Image, ref)
+		}
+		if spec.InitContainers[0].Image != ref {
+			t.Errorf("prepare image = %q, want the verbatim %q", spec.InitContainers[0].Image, ref)
+		}
+	}
+}
+
 func TestBuildContainers(t *testing.T) {
 	job, _ := mustBuild(t, testConfig(), testEntry())
 	spec := job.Spec.Template.Spec
@@ -243,12 +265,12 @@ func TestBuildContainers(t *testing.T) {
 	}
 
 	agent := spec.Containers[0]
-	wantImage := DefaultJobImage + "@" + testDigest
+	wantImage := DefaultJobImage
 	if agent.Image != wantImage {
-		t.Errorf("agent image = %q, want %q", agent.Image, wantImage)
+		t.Errorf("agent image = %q, want the FOREMAN_JOB_IMAGE default %q", agent.Image, wantImage)
 	}
-	if agent.ImagePullPolicy != corev1.PullIfNotPresent {
-		t.Errorf("agent imagePullPolicy = %q", agent.ImagePullPolicy)
+	if agent.ImagePullPolicy != corev1.PullAlways {
+		t.Errorf("agent imagePullPolicy = %q, want Always (ADR-012 movable tag)", agent.ImagePullPolicy)
 	}
 	if agent.WorkingDir != "/home/agent" {
 		t.Errorf("agent workingDir = %q", agent.WorkingDir)
@@ -286,6 +308,12 @@ func TestBuildContainers(t *testing.T) {
 	init := spec.InitContainers[0]
 	if init.Name != "prepare" || init.Image != wantImage {
 		t.Errorf("init container = %q/%q, want prepare/%q", init.Name, init.Image, wantImage)
+	}
+	if init.Image != agent.Image {
+		t.Errorf("prepare image = %q, agent image = %q; both containers share FOREMAN_JOB_IMAGE (清单 B)", init.Image, agent.Image)
+	}
+	if init.ImagePullPolicy != corev1.PullAlways {
+		t.Errorf("prepare imagePullPolicy = %q, want Always (ADR-012 movable tag)", init.ImagePullPolicy)
 	}
 	if strings.Join(init.Command, " ") != "/bin/sh -ec" {
 		t.Errorf("init command = %v", init.Command)

@@ -184,12 +184,13 @@ func preferredTerm(node string) corev1.PreferredSchedulingTerm {
 }
 
 // defaultPrepareContainer is the credential-copy init container (ADR-007): the
-// only code that runs as root, with every field locked by 清单 A.
+// only code that runs as root, with every field locked by 清单 A except
+// imagePullPolicy (§5.4「imagePullPolicy」段).
 func defaultPrepareContainer(cfg Config) corev1.Container {
 	return corev1.Container{
 		Name:            containerPrepare,
 		Image:           cfg.imageRef(),
-		ImagePullPolicy: corev1.PullIfNotPresent,
+		ImagePullPolicy: corev1.PullAlways,
 		Command:         []string{"/bin/sh", "-ec"},
 		Args:            []string{initScript},
 		SecurityContext: &corev1.SecurityContext{
@@ -213,12 +214,13 @@ func defaultPrepareContainer(cfg Config) corev1.Container {
 }
 
 // defaultAgentContainer is the single business container (ADR-001 收窄口径):
-// the unmodified upstream daemon with its 16-key env set (§5.2).
+// the unmodified upstream daemon with its 16-key env set (§5.2). The pull
+// policy is Always so a moved tag reaches every node (ADR-012).
 func defaultAgentContainer(cfg Config) corev1.Container {
 	return corev1.Container{
 		Name:            containerAgent,
 		Image:           cfg.imageRef(),
-		ImagePullPolicy: corev1.PullIfNotPresent,
+		ImagePullPolicy: corev1.PullAlways,
 		WorkingDir:      agentWorkingDir,
 		Command:         []string{agentCommand},
 		Args:            []string{"daemon", "start", "--foreground"},
@@ -317,8 +319,10 @@ func credSrcVolume(jobName string) corev1.Volume {
 	}}
 }
 
+// imageRef is the Job image reference exactly as FOREMAN_JOB_IMAGE carries it
+// (ADR-012): no digest concatenation, no shape parsing.
 func (c Config) imageRef() string {
-	return c.JobImage + "@" + c.JobImageDigest
+	return c.JobImage
 }
 
 func (c Config) imagePullSecrets() []corev1.LocalObjectReference {

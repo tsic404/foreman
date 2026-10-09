@@ -58,8 +58,8 @@ spec:
             matchLabels: { app.kubernetes.io/name: foreman-job }
       initContainers:
         - name: prepare
-          image: ghcr.io/tsic404/foreman-job@sha256:<digest>
-          imagePullPolicy: IfNotPresent
+          image: <job-image>
+          imagePullPolicy: Always
           command: ["/bin/sh", "-ec"]
           args:
             - |
@@ -82,8 +82,8 @@ spec:
             - { name: cred-src,   mountPath: /cred, readOnly: true }
       containers:
         - name: agent
-          image: ghcr.io/tsic404/foreman-job@sha256:<digest>
-          imagePullPolicy: IfNotPresent
+          image: <job-image>
+          imagePullPolicy: Always
           workingDir: /home/agent
           command: ["/usr/local/bin/multica"]
           args: ["daemon", "start", "--foreground"]

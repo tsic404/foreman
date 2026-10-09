@@ -141,7 +141,7 @@ func checkOverlayContainers(v *violations, raw map[string]any) {
 			}
 		}
 		if _, present := m["image"]; present {
-			v.add(path+".image", "清单 B: image 定制只走 FOREMAN_JOB_IMAGE/FOREMAN_JOB_IMAGE_DIGEST")
+			v.add(path+".image", "清单 B: image 定制只走 FOREMAN_JOB_IMAGE")
 		}
 		if _, present := m["resources"]; present {
 			v.add(path+".resources", "清单 B: resources 由 §5.1 env 独占")
@@ -240,7 +240,16 @@ func checkOverlayInitContainers(v *violations, raw map[string]any) {
 		case "":
 			v.add(path+".name", "清单 A: 追加条目必须有 name（缺 name 由 SMP ErrNoMergeKey 拒绝）")
 		case containerPrepare:
-			v.add(path, "清单 A: 内置 prepare 全字段锁定（含 restartPolicy），overlay 不得出现该条目")
+			// The built-in prepare is locked field by field; the single
+			// exception is imagePullPolicy, which patches it in place
+			// (§5.4「imagePullPolicy」段). Anything else on this entry —
+			// restartPolicy included — would rewrite a locked sub-path.
+			for _, key := range sortedKeys(m) {
+				if key == "name" || key == "imagePullPolicy" {
+					continue
+				}
+				v.add(path+"."+key, "清单 A: 内置 prepare 锁定子路径（唯一例外 imagePullPolicy）")
+			}
 		case containerAgent:
 			v.add(path+".name", "清单 A: 追加条目不得命名为 agent")
 		}

@@ -453,16 +453,15 @@ func checkCredentialEnvRefs(v *violations, base string, ct corev1.Container) {
 }
 
 // checkLockedContainer compares a built-in container against its default
-// definition (清单 A), allowing the one C-6 strengthening for the agent.
+// definition (清单 A), allowing the one C-6 strengthening for the agent. The
+// imagePullPolicy is a free field on both containers (§5.4「imagePullPolicy」段)
+// and is deliberately not compared.
 func checkLockedContainer(v *violations, base string, got, want corev1.Container, allowReadOnlyRoot bool) {
 	if got.Name != want.Name {
 		v.add(base+".name", "清单 A: 容器名锁定")
 	}
 	if got.Image != want.Image {
-		v.add(base+".image", "清单 B: image 由 FOREMAN_JOB_IMAGE/FOREMAN_JOB_IMAGE_DIGEST 独占（digest 固定）")
-	}
-	if got.ImagePullPolicy != want.ImagePullPolicy {
-		v.add(base+".imagePullPolicy", "清单 A: 锁定")
+		v.add(base+".image", "清单 B: image 由 FOREMAN_JOB_IMAGE 独占（原样引用，ADR-012）")
 	}
 	if !reflect.DeepEqual(got.Command, want.Command) {
 		v.add(base+".command", "清单 A: 锁定（ADR-004 注入点）")
