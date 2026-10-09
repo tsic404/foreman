@@ -326,6 +326,12 @@ func TestBuildContainers(t *testing.T) {
 	if *isc.RunAsUser != 0 || *isc.RunAsNonRoot || *isc.AllowPrivilegeEscalation || !*isc.ReadOnlyRootFilesystem {
 		t.Errorf("init securityContext = %+v, want uid 0 root-only ro-rootfs no-escalation", isc)
 	}
+	if got := capabilityStrings(isc.Capabilities.Drop); !equalStrings(got, []string{"ALL"}) {
+		t.Errorf("init capabilities.drop = %v, want [ALL]", got)
+	}
+	if got := capabilityStrings(isc.Capabilities.Add); !equalStrings(got, []string{"CHOWN", "DAC_OVERRIDE"}) {
+		t.Errorf("init capabilities.add = %v, want [CHOWN DAC_OVERRIDE] (prepare 属主/元数据最小集)", got)
+	}
 	if init.Resources.Requests.Cpu().String() != "20m" || init.Resources.Limits.Memory().String() != "128Mi" {
 		t.Errorf("init resources = %v", init.Resources)
 	}
