@@ -217,8 +217,7 @@ func TestVolumeSecretRefs(t *testing.T) {
 // violation that refuses startup.
 func TestStateRootTrailingSlashAccepted(t *testing.T) {
 	cfg, err := LoadConfig(envFrom(map[string]string{
-		EnvJobImageDigest: testDigest,
-		EnvStateRoot:      "/var/lib/foreman/",
+		EnvStateRoot: "/var/lib/foreman/",
 	}))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
@@ -295,6 +294,7 @@ spec:
       priorityClassName: batch-low
       containers:
         - name: agent
+          imagePullPolicy: IfNotPresent
           env:
             - { name: HTTP_PROXY, value: "http://proxy.corp:3128" }
           securityContext:
@@ -302,6 +302,8 @@ spec:
           volumeMounts:
             - { name: models, mountPath: /opt/models, readOnly: true }
       initContainers:
+        - name: prepare
+          imagePullPolicy: IfNotPresent
         - name: wrapper-setup
           image: registry.corp.example/bootstrap@` + testPrepareInitDigest + `
           command: ["/bin/sh", "-ec"]
@@ -371,15 +373,27 @@ func TestBuildWithValidOverlay(t *testing.T) {
 		t.Errorf("sidecar mounts = %v, want [tmp] (the only shared exception)", got)
 	}
 
-	// All container images stay digest-pinned and prepare follows the agent
-	// image source (§5.1 env, 清单 B).
+	// agent and prepare carry the FOREMAN_JOB_IMAGE reference verbatim
+	// (ADR-012); overlay-appended entries keep their digest pin (清单 C-8).
 	if pod.Containers[0].Image != cfg.imageRef() || pod.InitContainers[0].Image != cfg.imageRef() {
 		t.Errorf("agent/prepare image = %q/%q, want %q", pod.Containers[0].Image, pod.InitContainers[0].Image, cfg.imageRef())
 	}
-	for _, ct := range append(append([]corev1.Container{}, pod.Containers...), pod.InitContainers...) {
+	if pod.Containers[0].Image != pod.InitContainers[0].Image {
+		t.Errorf("agent image %q != prepare image %q, want one shared reference (清单 B)", pod.Containers[0].Image, pod.InitContainers[0].Image)
+	}
+	for _, ct := range []corev1.Container{wrapper, sidecar} {
 		if !digestPinnedImage.MatchString(ct.Image) {
-			t.Errorf("container %s image %q is not digest-pinned", ct.Name, ct.Image)
+			t.Errorf("appended entry %s image %q is not digest-pinned (清单 C-8)", ct.Name, ct.Image)
 		}
+	}
+
+	// §5.4「imagePullPolicy」段: the free field reaches both built-in
+	// containers — the deployer's pinned-tag escape hatch depends on it.
+	if pod.Containers[0].ImagePullPolicy != corev1.PullIfNotPresent {
+		t.Errorf("agent imagePullPolicy = %q, want the overlay's IfNotPresent", pod.Containers[0].ImagePullPolicy)
+	}
+	if pod.InitContainers[0].ImagePullPolicy != corev1.PullIfNotPresent {
+		t.Errorf("prepare imagePullPolicy = %q, want the overlay's IfNotPresent", pod.InitContainers[0].ImagePullPolicy)
 	}
 
 	// 清单 A: the 16 authoritative env keys survive and the overlay env is added.
@@ -656,6 +670,18 @@ spec:
         - name: agent
           envFrom:
             - secretRef: { name: foreman-secret }`, []string{"envFrom[0].secretRef.name"}},
+		{"variant-36", 36, `spec:
+  template:
+    spec:
+      initContainers:
+        - name: prepare
+          restartPolicy: Always`, []string{"spec.template.spec.initContainers[0].restartPolicy"}},
+		{"variant-37", 37, `spec:
+  template:
+    spec:
+      initContainers:
+        - name: prepare
+          image: registry.corp.example/evil@` + testSidecarDigest, []string{"spec.template.spec.initContainers[0].image"}},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

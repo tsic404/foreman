@@ -4,8 +4,9 @@
 # double-dispatch tasks, so the strategy is Recreate and replicas is pinned.
 # Environment: every §5.1 key with its contract default spelled out, except
 # MULTICA_SERVER_URL / MULTICA_WORKSPACE_ID (deployment values) and the two
-# secret keys. The Job image digest in FOREMAN_JOB_IMAGE_DIGEST must equal the
-# digest pinned in 40-foreman-gc.yaml — see deploy/README.md §Images.
+# secret keys. FOREMAN_JOB_IMAGE is a full movable image reference (ADR-012);
+# the foreman-gc DaemonSet carries the same literal — see deploy/README.md
+# §Images.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -78,11 +79,7 @@ spec:
             - name: FOREMAN_JOB_NAMESPACE
               value: "multica-agents"
             - name: FOREMAN_JOB_IMAGE
-              value: "ghcr.io/tsic404/foreman-job:v0.1.0"
-            - name: FOREMAN_JOB_IMAGE_DIGEST
-              # From the build-images workflow summary: <sha7>:<digest>.
-              # make pin-job-image-digest DIGEST=sha256:… writes both places.
-              value: "sha256:0000000000000000000000000000000000000000000000000000000000000000"
+              value: "ghcr.io/tsic404/foreman-job:latest"
             - name: FOREMAN_JOB_IMAGE_PULL_SECRETS
               value: '["registry-tsic"]'
             - name: FOREMAN_MAX_INFLIGHT_JOBS

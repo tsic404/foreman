@@ -26,7 +26,7 @@ GOFLAGS ?= -trimpath
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
 .PHONY: all build build-foreman build-gc build-foreman-image build-job-image test vet fmt check \
-	print-version resolve-upstream publish-images pin-job-image-digest check-deploy-digest smoke-job-image
+	print-version resolve-upstream publish-images smoke-job-image
 
 all: build
 
@@ -45,7 +45,7 @@ build-foreman-image: build-foreman
 		-t $(FOREMAN_IMAGE) $(BIN_DIR)
 
 # Job image: upstream daemon CLI + omp, plus foreman-gc (the DaemonSet runs
-# this same image). Publishes $(JOB_IMAGE); pin the pushed digest in deploy/.
+# this same image). Publishes $(JOB_IMAGE), referenced by movable tag.
 build-job-image: build-gc
 	$(CONTAINER_TOOL) build -f images/foreman-job.Containerfile \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
@@ -76,18 +76,10 @@ print-version:
 resolve-upstream:
 	scripts/resolve-upstream-artifacts.sh
 
-# Build + push $(FOREMAN_IMAGE) and $(JOB_IMAGE), then print the <sha7>:<digest>
-# mapping deploy/ pins. Needs MULTICA_CLI_URL/_SHA256 and OMP_URL/_SHA256.
+# Build + push $(FOREMAN_IMAGE) and $(JOB_IMAGE), then report the published
+# references. Needs MULTICA_CLI_URL/_SHA256 and OMP_URL/_SHA256.
 publish-images:
 	scripts/publish-images.sh
-
-# Write the published Job digest into both deploy references.
-pin-job-image-digest:
-	scripts/deploy-digest.sh --pin $(DIGEST)
-
-# Both deploy references exist, parse, and agree.
-check-deploy-digest:
-	scripts/deploy-digest.sh --check
 
 # Pull the Job image and verify the digest (and the upstream CLI inside it).
 smoke-job-image:

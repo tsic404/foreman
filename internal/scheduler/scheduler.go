@@ -347,7 +347,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	s.metrics.InflightJobs(s.reg.Inflight())
 	s.log.InfoContext(ctx, "job.created",
 		"task_id", e.TaskID, "job_name", e.JobName,
-		"node_name", e.NodeName, "image_digest", jobImageDigest(job))
+		"node_name", e.NodeName, "image", jobImage(job))
 	return nil
 }
 
@@ -972,9 +972,9 @@ func credName(jobName string) string {
 	return jobName + "-cred"
 }
 
-// jobImageDigest extracts the agent container's pinned image reference for
-// the job.created log event.
-func jobImageDigest(job *batchv1.Job) string {
+// jobImage extracts the agent container's image reference for the job.created
+// log event (AC-10: the FOREMAN_JOB_IMAGE value verbatim).
+func jobImage(job *batchv1.Job) string {
 	if job == nil {
 		return ""
 	}

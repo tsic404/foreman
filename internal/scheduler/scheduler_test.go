@@ -1023,9 +1023,7 @@ func (testIssuer) Issue(string, string, string, time.Duration) (string, error) {
 // the real jobbuilder, so Job objects carry the genuine affinity.
 func newCappedScheduler(t *testing.T, f *fixture, maxJobsPerNode int, logw io.Writer) *Scheduler {
 	t.Helper()
-	jbCfg, err := jobbuilder.LoadConfig(envFrom(map[string]string{
-		jobbuilder.EnvJobImageDigest: "sha256:4242424242424242424242424242424242424242424242424242424242424242",
-	}))
+	jbCfg, err := jobbuilder.LoadConfig(envFrom(map[string]string{}))
 	if err != nil {
 		t.Fatalf("jobbuilder.LoadConfig: %v", err)
 	}
@@ -1047,6 +1045,41 @@ func newCappedScheduler(t *testing.T, f *fixture, maxJobsPerNode int, logw io.Wr
 		t.Fatalf("New: %v", err)
 	}
 	return s
+}
+
+// TestJobCreatedLogsImageReference (AC-10): the job.created event carries the
+// FOREMAN_JOB_IMAGE reference verbatim. With a movable tag there is no digest
+// to audit, so the reference itself is the record of what the Job will run.
+func TestJobCreatedLogsImageReference(t *testing.T) {
+	f := newFixture(t)
+	var buf bytes.Buffer
+	sched := newCappedScheduler(t, f, 4, &buf)
+	if err := sched.OnClaim(context.Background(), claimPayload("t1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	record := findLogRecord(t, buf.Bytes(), "job.created")
+	if got := record["image"]; got != jobbuilder.DefaultJobImage {
+		t.Errorf("job.created image = %v, want the reference %q", got, jobbuilder.DefaultJobImage)
+	}
+	if _, stale := record["image_digest"]; stale {
+		t.Error("job.created still carries the removed image_digest field")
+	}
+}
+
+// findLogRecord returns the first JSON log record whose msg equals event.
+func findLogRecord(t *testing.T, raw []byte, event string) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var record map[string]any
+		if json.Unmarshal([]byte(line), &record) != nil {
+			continue
+		}
+		if record["msg"] == event {
+			return record
+		}
+	}
+	t.Fatalf("no %s record in logs:\n%s", event, raw)
+	return nil
 }
 
 // place seeds a live Job already placed on node: the state the reconcile

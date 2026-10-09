@@ -48,9 +48,9 @@ note "pulling $IMAGE"
 "$CONTAINER_TOOL" pull "$IMAGE" >/dev/null
 
 if [ -n "$EXPECT_DIGEST" ]; then
-  # Compares the digest a tag resolves to with one an independent source
-  # published (CI's `<sha7>:<digest>` mapping). A digest-pinned reference would
-  # only compare the input with itself, so require the tag form.
+  # Compares the digest a tag resolves to with the digest the same job's
+  # publish step reported. A digest-pinned reference would only compare the
+  # input with itself, so require the tag form.
   case "$IMAGE" in
   *@sha256:*)
     die "--expect-digest needs a tag reference; pass '$IMAGE' without @sha256:… to check what the tag resolves to"

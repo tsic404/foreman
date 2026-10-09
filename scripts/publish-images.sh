@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# Build and push both Foreman images, then report the <sha7>:<job-digest> mapping
-# the deploy surface pins (deploy/README.md §Images). CI runs this; the same
-# command works against any registry by hand.
+# Build and push both Foreman images, then report the references and digests
+# this run published (deploy/README.md §Images). CI runs this; the same command
+# works against any registry by hand.
 #
 # Required: VERSION, MULTICA_CLI_URL/_SHA256, OMP_URL/_SHA256 (upstream release
 # artifacts, F1/AC-13). Optional: REGISTRY, BASE_IMAGE, CONTAINER_TOOL,
@@ -71,14 +71,19 @@ note "pushing $JOB_IMAGE"
 JOB_DIGEST=$(image_digest "$JOB_IMAGE")
 
 if [ "$PUSH_LATEST" = 1 ]; then
-  note "publishing $REGISTRY/foreman:latest"
-  "$CONTAINER_TOOL" tag "$FOREMAN_IMAGE" "$REGISTRY/foreman:latest"
-  "$CONTAINER_TOOL" push "$REGISTRY/foreman:latest" >/dev/null
+  # `latest` follows main for both images; the version tags stay the rollback
+  # path (ADR-012: never publish `latest` alone).
+  for image in "$FOREMAN_IMAGE" "$JOB_IMAGE"; do
+    latest="${image%:*}:latest"
+    note "publishing $latest"
+    "$CONTAINER_TOOL" tag "$image" "$latest"
+    "$CONTAINER_TOOL" push "$latest" >/dev/null
+  done
 fi
 
 mkdir -p "$(dirname "$OUT")"
 cat >"$OUT" <<EOF
-# Produced by scripts/publish-images.sh — consumed by scripts/deploy-digest.sh.
+# Produced by scripts/publish-images.sh — the release record for this run.
 GIT_SHA=$SHA7
 VERSION=$VERSION
 REGISTRY=$REGISTRY
@@ -88,24 +93,20 @@ JOB_IMAGE=$JOB_IMAGE
 JOB_DIGEST=$JOB_DIGEST
 EOF
 
-# The deployment-facing line: <sha7>:<job-image-digest>.
-MAPPING="$SHA7:$JOB_DIGEST"
-note "digest mapping written to $OUT"
-printf '%s\n' "$MAPPING"
+note "release record written to $OUT"
+printf '%s@%s\n' "$JOB_IMAGE" "$JOB_DIGEST"
 
 if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
   {
     printf '## Foreman images %s (%s)\n\n' "$VERSION" "$SHA7"
-    printf 'Deploy-facing mapping: `%s`\n\n' "$MAPPING"
     printf '| Image | Reference | Digest |\n|---|---|---|\n'
     printf '| foreman | `%s` | `%s` |\n' "$FOREMAN_IMAGE" "$FOREMAN_DIGEST"
     printf '| foreman-job | `%s` | `%s` |\n' "$JOB_IMAGE" "$JOB_DIGEST"
-    printf '\nPin the Job digest with `make pin-job-image-digest DIGEST=%s`.\n' "$JOB_DIGEST"
+    printf '\nThe Job image is referenced by movable tag (`FOREMAN_JOB_IMAGE`); no deploy/ backfill.\n'
   } >>"$GITHUB_STEP_SUMMARY"
 fi
 if [ -n "${GITHUB_OUTPUT:-}" ]; then
   {
-    printf 'mapping=%s\n' "$MAPPING"
     printf 'job_digest=%s\n' "$JOB_DIGEST"
     printf 'foreman_digest=%s\n' "$FOREMAN_DIGEST"
     printf 'job_image=%s\n' "$JOB_IMAGE"

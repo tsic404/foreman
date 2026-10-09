@@ -7,7 +7,6 @@ import (
 	"math"
 	"os"
 	"path"
-	"regexp"
 	"strconv"
 	"strings"
 	"time"
@@ -20,7 +19,6 @@ import (
 const (
 	EnvJobNamespace        = "FOREMAN_JOB_NAMESPACE"
 	EnvJobImage            = "FOREMAN_JOB_IMAGE"
-	EnvJobImageDigest      = "FOREMAN_JOB_IMAGE_DIGEST"
 	EnvJobImagePullSecrets = "FOREMAN_JOB_IMAGE_PULL_SECRETS"
 	EnvJobTokenTTL         = "FOREMAN_JOB_TOKEN_TTL"
 	EnvTaskMaxDuration     = "FOREMAN_TASK_MAX_DURATION"
@@ -39,7 +37,7 @@ const (
 // Contract defaults (§5.1).
 const (
 	DefaultJobNamespace    = "multica-agents"
-	DefaultJobImage        = "ghcr.io/tsic404/foreman-job"
+	DefaultJobImage        = "ghcr.io/tsic404/foreman-job:latest"
 	DefaultJobTokenTTL     = 24 * time.Hour
 	DefaultTaskMaxDuration = 86400 * time.Second
 	DefaultJobTTLSeconds   = 600
@@ -62,10 +60,6 @@ var (
 		{Key: "unreachable", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute},
 		{Key: "maybe_unreachable", Operator: corev1.TolerationOpExists, Effect: corev1.TaintEffectNoExecute},
 	}
-
-	// The digest pins the Job image (04-architecture §镜像权威); the test
-	// suite asserts the rendered reference keeps this exact shape.
-	imageDigestPattern = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 )
 
 // Config is the jobbuilder module's runtime configuration. Issuer and Nodes
@@ -73,7 +67,6 @@ var (
 type Config struct {
 	JobNamespace     string
 	JobImage         string
-	JobImageDigest   string
 	ImagePullSecrets []string
 	JobTokenTTL      time.Duration
 	TaskMaxDuration  time.Duration // 0 renders no activeDeadlineSeconds
@@ -135,18 +128,11 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if v := strings.TrimSpace(getenv(EnvJobNamespace)); v != "" {
 		cfg.JobNamespace = v
 	}
+	// FOREMAN_JOB_IMAGE is a full image reference, taken verbatim (ADR-012):
+	// `<registry>/<repo>[:<tag>][@sha256:<digest>]` — shape is not a predicate.
 	if v := strings.TrimSpace(getenv(EnvJobImage)); v != "" {
 		cfg.JobImage = v
 	}
-
-	digest := strings.TrimSpace(getenv(EnvJobImageDigest))
-	if digest == "" {
-		return Config{}, fmt.Errorf("%s is required", EnvJobImageDigest)
-	}
-	if !imageDigestPattern.MatchString(digest) {
-		return Config{}, fmt.Errorf("%s must match %q, got %q", EnvJobImageDigest, imageDigestPattern, digest)
-	}
-	cfg.JobImageDigest = digest
 
 	if raw := strings.TrimSpace(getenv(EnvJobImagePullSecrets)); raw != "" {
 		var names []string

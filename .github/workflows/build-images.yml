@@ -1,7 +1,8 @@
 # Publish the two images the deploy surface consumes (04-architecture.md
 # §部署/运行方式): `foreman:<version>` (+ `latest`) for the Deployment and
-# `foreman-job:<version>` for the Job pods and the foreman-gc DaemonSet, plus
-# the `<sha7>:<digest>` mapping deploy/README.md §Images pins.
+# `foreman-job:<version>` (+ `latest`) for the Job pods and the foreman-gc
+# DaemonSet. The Job image is consumed by movable tag (ADR-012), so there is no
+# digest backfill into deploy/; the run still records what it published.
 #
 # GHCR is the registry (the workspace owner's decision, replacing the private
 # registry the design still names); `GITHUB_TOKEN` authenticates the push via
@@ -110,17 +111,6 @@ jobs:
           scripts/smoke-job-image.sh "$JOB_IMAGE" \
             --expect-digest "$JOB_DIGEST" \
             --expect-cli-sha256 "$(sha256sum /tmp/multica | cut -d' ' -f1)"
-
-      - name: Check the deploy/ digest pin
-        env:
-          JOB_DIGEST: ${{ steps.publish.outputs.job_digest }}
-        run: |
-          set -euo pipefail
-          if scripts/deploy-digest.sh --check --expect "$JOB_DIGEST"; then
-            echo "deploy/ already pins $JOB_DIGEST" >>"$GITHUB_STEP_SUMMARY"
-          else
-            echo "::warning title=deploy/ digest pin is stale::run 'make pin-job-image-digest DIGEST=$JOB_DIGEST' and commit the result"
-          fi
 
       - uses: actions/upload-artifact@v4
         with:

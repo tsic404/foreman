@@ -4,8 +4,8 @@
 # Cleanup runs in the node's state root mounted at /state — never inside a Job
 # pod, because concurrent pods cannot safely judge each other's directories.
 # The image is the Job image (it ships foreman-gc alongside the daemon CLI and
-# omp), pinned by digest: keep it identical to FOREMAN_JOB_IMAGE_DIGEST in
-# 30-foreman.yaml — see deploy/README.md §Images.
+# omp), the same reference literal as FOREMAN_JOB_IMAGE in 30-foreman.yaml —
+# see deploy/README.md §Images.
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -41,10 +41,10 @@ spec:
           type: RuntimeDefault
       containers:
         - name: foreman-gc
-          # Digest-pinned, and identical to FOREMAN_JOB_IMAGE_DIGEST in
-          # 30-foreman.yaml — scripts/deploy-digest.sh enforces that (AC-13).
-          image: ghcr.io/tsic404/foreman-job@sha256:0000000000000000000000000000000000000000000000000000000000000000 # pin: make pin-job-image-digest
-          imagePullPolicy: IfNotPresent
+          # Same movable reference as FOREMAN_JOB_IMAGE (ADR-012); Always so a
+          # moved tag reaches every node instead of a stale cached layer.
+          image: ghcr.io/tsic404/foreman-job:latest
+          imagePullPolicy: Always
           command: ["/usr/local/bin/foreman-gc"]
           env:
             # The hostPath below is mounted here; on the node the same tree is

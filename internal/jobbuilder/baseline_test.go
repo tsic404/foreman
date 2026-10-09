@@ -25,14 +25,15 @@ const baselinePath = "testdata/job-baseline.yaml"
 // after placeholder substitution.
 func TestDefaultTemplateMatchesBaseline(t *testing.T) {
 	entry := testEntry()
-	docs := baselineDocuments(t, entry)
+	cfg := testConfig()
+	docs := baselineDocuments(t, entry, cfg.imageRef())
 	if len(docs) != 2 {
 		t.Fatalf("baseline must hold a Job and a Secret, got %d documents", len(docs))
 	}
 	wantJob := decodeDocument[batchv1.Job](t, docs[0])
 	wantSecret := decodeDocument[corev1.Secret](t, docs[1])
 
-	job, secret := mustBuild(t, testConfig(), entry)
+	job, secret := mustBuild(t, cfg, entry)
 
 	// apiVersion/kind come from the client-go scheme when the object is
 	// created, status is never rendered: the baseline comparison covers
@@ -68,7 +69,7 @@ func jobProjection(job *batchv1.Job) map[string]any {
 
 // baselineDocuments reads the baseline, rewrites the documented placeholders
 // with the test entry's values, and splits the multi-document YAML.
-func baselineDocuments(t *testing.T, entry TaskEntry) [][]byte {
+func baselineDocuments(t *testing.T, entry TaskEntry, jobImage string) [][]byte {
 	t.Helper()
 	raw, err := os.ReadFile(baselinePath)
 	if err != nil {
@@ -82,7 +83,7 @@ func baselineDocuments(t *testing.T, entry TaskEntry) [][]byte {
 		"<issue-identifier>":    entry.IssueIdentifier,
 		"<job runtime uuid>":    entry.JobRuntimeID,
 		"<RFC3339>":             entry.ClaimedAt.UTC().Format(time.RFC3339),
-		"<digest>":              strings.TrimPrefix(testDigest, "sha256:"),
+		"<job-image>":           jobImage,
 		`"fmj_<payload>.<sig>"`: `"fmj_test.sig"`,
 	}
 	text := string(raw)

@@ -13,7 +13,7 @@ func envFrom(values map[string]string) func(string) string {
 }
 
 func TestLoadConfigDefaults(t *testing.T) {
-	cfg, err := LoadConfig(envFrom(map[string]string{EnvJobImageDigest: testDigest}))
+	cfg, err := LoadConfig(envFrom(map[string]string{}))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
@@ -22,9 +22,6 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if cfg.JobImage != DefaultJobImage {
 		t.Errorf("JobImage = %q, want %q", cfg.JobImage, DefaultJobImage)
-	}
-	if cfg.JobImageDigest != testDigest {
-		t.Errorf("JobImageDigest = %q", cfg.JobImageDigest)
 	}
 	if len(cfg.ImagePullSecrets) != 1 || cfg.ImagePullSecrets[0] != "registry-tsic" {
 		t.Errorf("ImagePullSecrets = %v", cfg.ImagePullSecrets)
@@ -59,15 +56,33 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 }
 
-func TestLoadConfigRequiresDigest(t *testing.T) {
-	if _, err := LoadConfig(envFrom(map[string]string{})); err == nil || !strings.Contains(err.Error(), EnvJobImageDigest) {
-		t.Fatalf("err = %v, want a %s error", err, EnvJobImageDigest)
+// TestLoadConfigJobImageVerbatim: FOREMAN_JOB_IMAGE is a full image reference
+// taken verbatim — tag, digest and tag@digest forms are all legal, and the
+// shape is not a predicate (ADR-012).
+func TestLoadConfigJobImageVerbatim(t *testing.T) {
+	refs := []string{
+		"ghcr.io/tsic404/foreman-job:latest",
+		"ghcr.io/tsic404/foreman-job:v0.1.0",
+		"ghcr.io/tsic404/foreman-job@" + testDigest,
+		"ghcr.io/tsic404/foreman-job:v0.1.0@" + testDigest,
+		"registry.example.com:5000/team/job",
+	}
+	for _, ref := range refs {
+		cfg, err := LoadConfig(envFrom(map[string]string{EnvJobImage: ref}))
+		if err != nil {
+			t.Fatalf("LoadConfig(%q): %v", ref, err)
+		}
+		if cfg.JobImage != ref {
+			t.Errorf("JobImage = %q, want the verbatim %q", cfg.JobImage, ref)
+		}
+		if cfg.imageRef() != ref {
+			t.Errorf("imageRef() = %q, want %q", cfg.imageRef(), ref)
+		}
 	}
 }
 
 func TestLoadConfigOverrides(t *testing.T) {
 	cfg, err := LoadConfig(envFrom(map[string]string{
-		EnvJobImageDigest:      testDigest,
 		EnvJobNamespace:        "agents",
 		EnvJobImage:            "registry.example.com/foreman-job:v2",
 		EnvJobImagePullSecrets: `["a","b"]`,
@@ -122,7 +137,7 @@ func TestLoadConfigRejectsOverflow(t *testing.T) {
 		{EnvJobTTLSeconds, "2147483647", "2147483648"},   // math.MaxInt32
 	}
 	for _, tc := range cases {
-		env := map[string]string{EnvJobImageDigest: testDigest, tc.env: tc.fail}
+		env := map[string]string{tc.env: tc.fail}
 		if _, err := LoadConfig(envFrom(env)); err == nil || !strings.Contains(err.Error(), tc.env) {
 			t.Errorf("%s=%s: err = %v, want a %s error", tc.env, tc.fail, err, tc.env)
 		}
@@ -139,7 +154,6 @@ func TestLoadConfigRejectsBadValues(t *testing.T) {
 		env  string
 		want string
 	}{
-		{"bad digest", EnvJobImageDigest, EnvJobImageDigest},
 		{"bad token ttl", EnvJobTokenTTL, EnvJobTokenTTL},
 		{"bad max duration", EnvTaskMaxDuration, EnvTaskMaxDuration},
 		{"bad job ttl", EnvJobTTLSeconds, EnvJobTTLSeconds},
@@ -150,7 +164,6 @@ func TestLoadConfigRejectsBadValues(t *testing.T) {
 		{"bad tolerations", EnvJobTolerations, EnvJobTolerations},
 	}
 	bad := map[string]string{
-		EnvJobImageDigest:  "sha256:xyz",
 		EnvJobTokenTTL:     "abc",
 		EnvTaskMaxDuration: "-1",
 		EnvJobTTLSeconds:   "x",
@@ -161,7 +174,7 @@ func TestLoadConfigRejectsBadValues(t *testing.T) {
 		EnvJobTolerations:  `[`,
 	}
 	for _, tc := range cases {
-		env := map[string]string{EnvJobImageDigest: testDigest, tc.env: bad[tc.env]}
+		env := map[string]string{tc.env: bad[tc.env]}
 		if _, err := LoadConfig(envFrom(env)); err == nil || !strings.Contains(err.Error(), tc.want) {
 			t.Errorf("%s: err = %v, want a %s error", tc.name, err, tc.want)
 		}
