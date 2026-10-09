@@ -198,7 +198,14 @@ func defaultPrepareContainer(cfg Config) corev1.Container {
 			RunAsNonRoot:             new(false),
 			AllowPrivilegeEscalation: new(false),
 			ReadOnlyRootFilesystem:   new(true),
-			Capabilities:             &corev1.Capabilities{Drop: []corev1.Capability{"ALL"}},
+			// drop ALL leaves the uid-0 permitted set empty (permitted comes
+			// from bounding at execve), so chown -R needs CHOWN (target uid
+			// 1000 ≠ 0) and DAC_OVERRIDE (traverse other-uid hostPath dirs):
+			// the 属主/元数据 minimal set of 05-modules/job-template.md.
+			Capabilities: &corev1.Capabilities{
+				Drop: []corev1.Capability{"ALL"},
+				Add:  []corev1.Capability{"CHOWN", "DAC_OVERRIDE"},
+			},
 		},
 		Resources: corev1.ResourceRequirements{
 			Requests: corev1.ResourceList{corev1.ResourceCPU: initCPURequest, corev1.ResourceMemory: initMemoryRequest},

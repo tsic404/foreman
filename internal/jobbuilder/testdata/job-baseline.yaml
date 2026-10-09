@@ -71,7 +71,7 @@ spec:
             runAsNonRoot: false
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
-            capabilities: { drop: ["ALL"] }
+            capabilities: { drop: ["ALL"], add: ["CHOWN", "DAC_OVERRIDE"] }
           resources:
             requests: { cpu: 20m, memory: 32Mi }
             limits:   { cpu: 200m, memory: 128Mi }
