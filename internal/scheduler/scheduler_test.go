@@ -16,7 +16,9 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/registry"
@@ -37,11 +39,22 @@ type fakeJobs struct {
 	createJobErr    error
 	createSecretErr error
 	deleteJobErr    error
+	getJobErr       error
+
+	// existingJobs models Jobs already in the cluster: CreateJob answers
+	// AlreadyExists for their names and GetJob returns them (terminating,
+	// with a deletionTimestamp, for the names listed in terminatingJobs).
+	existingJobs    map[string]*batchv1.Job
+	terminatingJobs map[string]bool
+	onGetJob        func()
 }
 
 func (f *fakeJobs) CreateJob(_ context.Context, job *batchv1.Job) error {
 	if f.createJobErr != nil {
 		return f.createJobErr
+	}
+	if _, ok := f.existingJobs[job.Name]; ok {
+		return apierrors.NewAlreadyExists(schema.GroupResource{Group: "batch", Resource: "jobs"}, job.Name)
 	}
 	f.createdJobs = append(f.createdJobs, job)
 	return nil
@@ -53,6 +66,28 @@ func (f *fakeJobs) DeleteJob(_ context.Context, name string) error {
 	}
 	f.deletedJobs = append(f.deletedJobs, name)
 	return nil
+}
+
+// GetJob answers from existingJobs: a name listed in terminatingJobs comes
+// back with a deletionTimestamp (the foreground deletion window). onGetJob
+// runs first — on error probes too — so a test can release the name, trip
+// the wait deadline, or clear getJobErr.
+func (f *fakeJobs) GetJob(_ context.Context, name string) (*batchv1.Job, error) {
+	if f.onGetJob != nil {
+		f.onGetJob()
+	}
+	if f.getJobErr != nil {
+		return nil, f.getJobErr
+	}
+	job, ok := f.existingJobs[name]
+	if !ok {
+		return nil, nil
+	}
+	out := job.DeepCopy()
+	if f.terminatingJobs[name] {
+		out.DeletionTimestamp = &metav1.Time{Time: testNow}
+	}
+	return out, nil
 }
 
 func (f *fakeJobs) CreateSecret(_ context.Context, secret *corev1.Secret) error {
@@ -390,6 +425,146 @@ func TestDuplicateClaimPreStartReplacesEntry(t *testing.T) {
 	}
 	e, _ := f.reg.Get("task-1")
 	if e.Attempt != 2 || e.State != registry.StateJobCreated {
+		t.Fatalf("entry = %+v", e)
+	}
+}
+
+// A pre-start replacement deletes the old Job with Foreground, so the name
+// (fm-<task_id>) stays taken until the cascade finishes. The replacement
+// must wait for it instead of swallowing AlreadyExists as a restart replay:
+// the entry would otherwise bind to a Job about to disappear and the task
+// would converge to job_missing (AC-09: no task lost).
+func TestDuplicateClaimWaitsForTerminatingJobName(t *testing.T) {
+	f := newFixture(t)
+	f.claim(t, "task-1")
+	f.server.status = "dispatched"
+	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
+	f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
+	probes := 0
+	f.jobs.onGetJob = func() {
+		probes++
+		if probes >= 2 {
+			delete(f.jobs.existingJobs, "fm-task-1") // the cascade finished
+		}
+	}
+
+	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	if len(f.jobs.createdJobs) != 2 {
+		t.Fatalf("jobs created = %d, want 2", len(f.jobs.createdJobs))
+	}
+	if len(f.server.forwards) != 0 {
+		t.Fatalf("task reported failed on a name collision: %+v", f.server.forwards)
+	}
+	e, ok := f.reg.Get("task-1")
+	if !ok || e.State != registry.StateJobCreated || e.Attempt != 2 {
+		t.Fatalf("entry = %+v", e)
+	}
+}
+
+// A name that never frees (stuck pod, unresponsive node) must not become a
+// false failure: the claim is dropped and the server re-dispatches the task
+// once the lease lapses (failure-handling #1/#2).
+func TestClaimDefersWhileJobNameStillHeld(t *testing.T) {
+	f := newFixture(t)
+	f.claim(t, "task-1")
+	f.server.status = "dispatched"
+	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
+	f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
+	f.jobs.onGetJob = func() { f.now = f.now.Add(jobNameWait + time.Second) }
+
+	err := f.sched.OnClaim(context.Background(), claimPayload("task-1"))
+	if !errors.Is(err, errJobNameHeld) {
+		t.Fatalf("OnClaim err = %v, want errJobNameHeld", err)
+	}
+	if len(f.server.forwards) != 0 {
+		t.Fatalf("deferred claim reported a failure: %+v", f.server.forwards)
+	}
+	if _, ok := f.reg.Get("task-1"); ok {
+		t.Fatal("deferred claim kept the entry: its lease would be renewed, never re-dispatched")
+	}
+	if len(f.jobs.createdJobs) != 1 {
+		t.Fatalf("jobs created = %d, want 1 (the first claim's)", len(f.jobs.createdJobs))
+	}
+}
+
+// The other meaning of AlreadyExists: the Job is already there and not
+// terminating (restart replay). It is kept and the claim proceeds to
+// job_created without waiting.
+func TestClaimKeepsReplayedJobOnAlreadyExists(t *testing.T) {
+	f := newFixture(t)
+	f.jobs.createJobErr = apierrors.NewAlreadyExists(schema.GroupResource{Group: "batch", Resource: "jobs"}, "fm-task-1")
+	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
+
+	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	e, ok := f.reg.Get("task-1")
+	if !ok || e.State != registry.StateJobCreated {
+		t.Fatalf("entry = %+v", e)
+	}
+	if len(f.server.forwards) != 0 {
+		t.Fatalf("replay reported a failure: %+v", f.server.forwards)
+	}
+}
+
+// A transient read failure on the name probe must not become a task
+// failure: the truth is unknown, so the claim keeps polling, hits the
+// bound, and defers (dropped entry → server re-dispatch). Reporting
+// job_create_failed here would settle a task that is still perfectly
+// resumable (AC-09: 0 task lost).
+func TestClaimProbeErrorDoesNotFailTask(t *testing.T) {
+	f := newFixture(t)
+	f.claim(t, "task-1")
+	f.server.status = "dispatched"
+	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
+	f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
+	f.jobs.getJobErr = errors.New("apiserver unavailable")
+	f.jobs.onGetJob = func() { f.now = f.now.Add(jobNameWait + time.Second) }
+
+	err := f.sched.OnClaim(context.Background(), claimPayload("task-1"))
+	if !errors.Is(err, errJobNameHeld) {
+		t.Fatalf("OnClaim err = %v, want errJobNameHeld", err)
+	}
+	if len(f.server.forwards) != 0 {
+		t.Fatalf("probe failure reported a task failure: %+v", f.server.forwards)
+	}
+	if _, ok := f.reg.Get("task-1"); ok {
+		t.Fatal("deferred claim kept the entry: its lease would be renewed, never re-dispatched")
+	}
+}
+
+// The other half of the unknown-truth rule: once the probe recovers and the
+// name is free, the claim creates its Job without waiting out a poll
+// interval (GetJob's nil,nil means the object is gone).
+func TestClaimProbeErrorClearsAndJobIsCreated(t *testing.T) {
+	f := newFixture(t)
+	f.claim(t, "task-1")
+	f.server.status = "dispatched"
+	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
+	f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
+	f.jobs.getJobErr = errors.New("apiserver unavailable")
+	probes := 0
+	f.jobs.onGetJob = func() {
+		probes++
+		if probes >= 2 {
+			f.jobs.getJobErr = nil
+			delete(f.jobs.existingJobs, "fm-task-1")
+		}
+	}
+
+	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	if len(f.jobs.createdJobs) != 2 {
+		t.Fatalf("jobs created = %d, want 2", len(f.jobs.createdJobs))
+	}
+	if len(f.server.forwards) != 0 {
+		t.Fatalf("recovered claim reported a failure: %+v", f.server.forwards)
+	}
+	e, ok := f.reg.Get("task-1")
+	if !ok || e.State != registry.StateJobCreated || e.Attempt != 2 {
 		t.Fatalf("entry = %+v", e)
 	}
 }

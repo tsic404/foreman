@@ -41,6 +41,9 @@ type JobEventHandler func(JobEvent)
 type JobClient interface {
 	CreateJob(ctx context.Context, job *batchv1.Job) error
 	DeleteJob(ctx context.Context, name string) error
+	// GetJob returns the Job, or nil when it is gone (the recovery
+	// module's ObjectClient uses the same convention).
+	GetJob(ctx context.Context, name string) (*batchv1.Job, error)
 	CreateSecret(ctx context.Context, secret *corev1.Secret) error
 	DeleteSecret(ctx context.Context, name string) error
 	// ListJobs returns the foreman-managed Jobs in the configured namespace.
@@ -65,12 +68,36 @@ func (c *k8sJobClient) CreateJob(ctx context.Context, job *batchv1.Job) error {
 	return err
 }
 
+// jobDeleteOptions cascades the deletion to the Job's pods. An empty
+// DeleteOptions leaves the policy to the Job strategy, whose default is
+// Orphan: the Job disappears and its pods lose their ownerReferences
+// ("child pods are preserved by default when jobs are deleted"), so they
+// outlive the Job and the ttlSecondsAfterFinished fallback
+// (05-modules/job-template.md). Foreground holds the Job until its
+// dependents are gone — measured 2.3s for a daemon that exits on SIGTERM,
+// bounded by the template's 30s terminationGracePeriodSeconds.
+func jobDeleteOptions() metav1.DeleteOptions {
+	return metav1.DeleteOptions{PropagationPolicy: new(metav1.DeletePropagationForeground)}
+}
+
 func (c *k8sJobClient) DeleteJob(ctx context.Context, name string) error {
-	err := c.client.BatchV1().Jobs(c.namespace).Delete(ctx, name, metav1.DeleteOptions{})
+	err := c.client.BatchV1().Jobs(c.namespace).Delete(ctx, name, jobDeleteOptions())
 	if apierrors.IsNotFound(err) {
 		return nil
 	}
 	return err
+}
+
+// GetJob returns the Job, or nil when it is gone.
+func (c *k8sJobClient) GetJob(ctx context.Context, name string) (*batchv1.Job, error) {
+	job, err := c.client.BatchV1().Jobs(c.namespace).Get(ctx, name, metav1.GetOptions{})
+	if apierrors.IsNotFound(err) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	return job, nil
 }
 
 func (c *k8sJobClient) CreateSecret(ctx context.Context, secret *corev1.Secret) error {

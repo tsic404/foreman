@@ -27,6 +27,20 @@ import (
 // (failure-handling reconcileOne step 1).
 const jobGoneGracePeriod = 60 * time.Second
 
+// jobNamePollInterval is the cadence at which a claim retries a Job create
+// whose name is still held by a foreground-terminating predecessor.
+const jobNamePollInterval = 500 * time.Millisecond
+
+// jobNameWait bounds that retry. The Job controller deletes the pods first
+// and the Job object follows once they are gone, normally within the 30s
+// terminationGracePeriodSeconds of the template (05-modules/job-template.md).
+const jobNameWait = 45 * time.Second
+
+// errJobNameHeld reports that a Job name was still held by a terminating
+// predecessor after jobNameWait: the claim is deferred to the server's
+// re-dispatch, never reported as this task's failure.
+var errJobNameHeld = errors.New("job name still held by a terminating job")
+
 // Failure reasons carried in the synthesized fail report (C10 body
 // failure_reason) for every compensation path (failure-handling 场景矩阵).
 const (
@@ -341,13 +355,22 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		s.failClaim(ctx, e, fmt.Errorf("create credential secret: %w", err))
 		return err
 	}
-	if err := s.jobs.CreateJob(ctx, job); err != nil {
-		// AlreadyExists is a restart replay: the Job is there, carry on.
-		if !apierrors.IsAlreadyExists(err) {
-			_ = s.jobs.DeleteSecret(ctx, credName(jobName))
-			s.failClaim(ctx, e, fmt.Errorf("create job: %w", err))
+	if err := s.createJob(ctx, e, job); err != nil {
+		// Nothing of this claim is left in the cluster: drop the credential
+		// Secret again. A name still held by a terminating predecessor is
+		// not this task's failure — the entry goes and the server
+		// re-dispatches the task once the lease lapses, the same recovery
+		// as an undeliverable claim (failure-handling 场景 #1/#2).
+		_ = s.jobs.DeleteSecret(ctx, credName(jobName))
+		if errors.Is(err, errJobNameHeld) {
+			_ = s.reg.Delete(e.TaskID)
+			s.metrics.InflightJobs(s.reg.Inflight())
+			s.log.WarnContext(ctx, "task.claim_deferred",
+				"task_id", e.TaskID, "job_name", e.JobName, "err", err.Error())
 			return err
 		}
+		s.failClaim(ctx, e, fmt.Errorf("create job: %w", err))
+		return err
 	}
 
 	e.State = registry.StateJobCreated
@@ -362,6 +385,56 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		"task_id", e.TaskID, "job_name", e.JobName,
 		"node_name", e.NodeName, "image", jobImage(job))
 	return nil
+}
+
+// createJob places the entry's Job, resolving the two meanings of
+// AlreadyExists. A Job that is there and not terminating belongs to this
+// attempt (restart replay, or a retry of the same claim) and is kept. A Job
+// that is terminating — or one whose state cannot be read — holds the name
+// (job_name = fm-<task_id>, task-mapping invariant 2) until its pods are
+// gone; swallowing that would bind the entry to a disappearing Job
+// (job_missing). Wait (bounded) and retry; a name that never frees returns
+// errJobNameHeld, a deferred claim rather than this task's failure.
+func (s *Scheduler) createJob(ctx context.Context, e registry.TaskEntry, job *batchv1.Job) error {
+	deadline := s.now().Add(jobNameWait)
+	// maxPolls backs the clock bound so the loop cannot spin on a clock the
+	// caller froze (tests) or on a view that keeps reporting the name as
+	// free while Create disagrees.
+	maxPolls := int(jobNameWait / jobNamePollInterval)
+	for poll := 0; ; poll++ {
+		err := s.jobs.CreateJob(ctx, job)
+		if err == nil {
+			return nil
+		}
+		if !apierrors.IsAlreadyExists(err) {
+			return err
+		}
+		existing, probeErr := s.jobs.GetJob(ctx, e.JobName)
+		if probeErr == nil && existing != nil && existing.DeletionTimestamp == nil {
+			return nil
+		}
+		if probeErr != nil {
+			// Truth unknown: the name may still be held, so keep polling.
+			// Transient read failures stay in Debug (cf. prepare-lease);
+			// task.claim_deferred at the bound is the alert, and the outcome
+			// here is a deferred claim, never a task failure (AC-09).
+			s.log.DebugContext(ctx, "job.probe_failed",
+				"task_id", e.TaskID, "job_name", e.JobName, "err", probeErr)
+		}
+		if poll >= maxPolls || s.now().After(deadline) {
+			return fmt.Errorf("%w: %s", errJobNameHeld, e.JobName)
+		}
+		if probeErr == nil && existing == nil {
+			// The name just freed (GetJob's nil means the object is gone):
+			// retry the create without waiting out a poll interval.
+			continue
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(jobNamePollInterval):
+		}
+	}
 }
 
 // resolveDuplicateClaim applies the duplicate-claim rule (task-mapping

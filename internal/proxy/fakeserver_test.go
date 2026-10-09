@@ -48,6 +48,8 @@ func (f *fakeJobs) DeleteJob(_ context.Context, name string) error {
 	return nil
 }
 
+func (f *fakeJobs) GetJob(context.Context, string) (*batchv1.Job, error) { return nil, nil }
+
 func (f *fakeJobs) CreateSecret(_ context.Context, secret *corev1.Secret) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

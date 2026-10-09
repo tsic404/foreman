@@ -64,6 +64,41 @@ func TestJobClientCreateListDelete(t *testing.T) {
 	}
 }
 
+// A Job delete must cascade to its pods: the Job strategy's default
+// propagation is Orphan, which drops the Job object and strips the pods'
+// ownerReferences, so they outlive ttlSecondsAfterFinished (measured on k3s
+// v1.32.5: the pod still Running, owners=0, with no Job left). The fake
+// clientset runs no garbage collector, so the delete request itself is what
+// gets pinned here.
+func TestDeleteJobRequestsForegroundCascade(t *testing.T) {
+	clientset := fake.NewSimpleClientset()
+	c := NewJobClient(clientset, "multica-agents")
+	ctx := context.Background()
+
+	if err := c.CreateJob(ctx, managedJob("fm-a")); err != nil {
+		t.Fatalf("CreateJob: %v", err)
+	}
+	if err := c.DeleteJob(ctx, "fm-a"); err != nil {
+		t.Fatalf("DeleteJob: %v", err)
+	}
+
+	var policies []string
+	for _, action := range clientset.Actions() {
+		del, ok := action.(k8stesting.DeleteAction)
+		if !ok || action.GetResource().Resource != "jobs" {
+			continue
+		}
+		if p := del.GetDeleteOptions().PropagationPolicy; p != nil {
+			policies = append(policies, string(*p))
+		} else {
+			policies = append(policies, "<nil>")
+		}
+	}
+	if len(policies) != 1 || policies[0] != string(metav1.DeletePropagationForeground) {
+		t.Fatalf("Job delete propagation policies = %v, want [Foreground]", policies)
+	}
+}
+
 func TestWatchJobsDeliversInformerEvents(t *testing.T) {
 	clientset := fake.NewSimpleClientset()
 	c := NewJobClient(clientset, "multica-agents")
