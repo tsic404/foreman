@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -31,7 +32,7 @@ type ReportSender interface {
 }
 
 // pendingReport is one queued terminal report (contract §4). The file is
-// the queue: a report exists iff its file exists, so a crash never loses it.
+// the queue: a report is durable iff its file exists (staged until it lands).
 type pendingReport struct {
 	TaskID     string          `json:"task_id"`
 	Endpoint   string          `json:"endpoint"`
@@ -42,6 +43,10 @@ type pendingReport struct {
 
 var taskIDFileChars = regexp.MustCompile(`^[a-zA-Z0-9-]+$`)
 
+// validTaskID gates every task id that may name a queue file, so a task id
+// like ".." or "a/b" can never turn into a path outside the queue directory.
+func validTaskID(taskID string) bool { return taskIDFileChars.MatchString(taskID) }
+
 // PendingReports is the durable terminal-report queue
 // (FOREMAN_STATE_ROOT/pending-reports/<taskid>.json, contract §4).
 type PendingReports struct {
@@ -51,6 +56,15 @@ type PendingReports struct {
 
 	mu       sync.Mutex
 	onChange func(int) // foreman_pending_reports gauge hook
+
+	// staged holds the reports that are not durable yet: a write that failed
+	// (failure-handling 错误处理表「待发队列目录不可写：记 error + gauge 不
+	// 增长；退避后重试」) or a task id that can never name a queue file. It is
+	// the retry handle of that error row: every Drain retries the write,
+	// Queued counts the report as undelivered, and the gauge stays at the
+	// durable depth. A crash inside the window loses the report — the disk
+	// cannot take it either way.
+	staged map[string]pendingReport
 }
 
 // PendingReportsOption customizes a PendingReports queue.
@@ -80,9 +94,10 @@ func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReport
 		return nil, fmt.Errorf("create pending-reports dir: %w", err)
 	}
 	p := &PendingReports{
-		dir: dir,
-		now: time.Now,
-		log: slog.Default().With("component", "pending-reports"),
+		dir:    dir,
+		now:    time.Now,
+		log:    slog.Default().With("component", "pending-reports"),
+		staged: make(map[string]pendingReport),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -94,10 +109,13 @@ func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReport
 // queued only once the file is durable — failure-handling 顺序规则 5).
 // Re-enqueueing the same task replaces the body but keeps the original
 // enqueue time, so the TTL clocks the first failure.
+//
+// A write that does not land keeps the report staged in memory instead of
+// dropping it: Drain retries the write (错误处理表「退避后重试」) and Queued
+// reports it as undelivered, so the task's objects stay until it landed. The
+// returned error is that error row's "记 error" half — never a reason to
+// discard the report.
 func (p *PendingReports) Enqueue(taskID string, ep scheduler.Endpoint, body []byte) error {
-	if !taskIDFileChars.MatchString(taskID) {
-		return fmt.Errorf("task id %q is not a safe file name", taskID)
-	}
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	rep := pendingReport{
@@ -106,34 +124,63 @@ func (p *PendingReports) Enqueue(taskID string, ep scheduler.Endpoint, body []by
 		Body:       body,
 		EnqueuedAt: p.now(),
 	}
-	if raw, err := os.ReadFile(p.path(taskID)); err == nil {
-		var old pendingReport
-		if json.Unmarshal(raw, &old) == nil && !old.EnqueuedAt.IsZero() {
-			rep.EnqueuedAt = old.EnqueuedAt
-			rep.Attempts = old.Attempts
-		}
+	p.inheritClockLocked(&rep)
+	if !validTaskID(taskID) {
+		// The id can never name a queue file: keep the report staged so the
+		// drain delivers it straight from memory instead of losing it.
+		p.staged[taskID] = rep
+		return fmt.Errorf("task id %q is not a safe file name", taskID)
 	}
 	if err := p.writeLocked(rep); err != nil {
+		p.staged[taskID] = rep
 		return err
 	}
+	delete(p.staged, taskID)
 	p.log.Error("task.forward_queued",
 		"task_id", taskID, "endpoint", rep.Endpoint)
 	p.notifyLocked()
 	return nil
 }
 
-// Drain retries every queued report once through sender. A report leaves
-// the queue when the server accepts it (2xx) or settles it as moot
-// (404/409: server-side already terminal or deleted). Reports older than
-// PendingReportTTL are dropped with an error log (failure-handling 场景
-// #10). It returns the number of reports still queued.
+// inheritClockLocked keeps the enqueue time and attempt count of a report
+// the queue already knows (staged in memory or on disk), so the TTL bounds
+// the first failure rather than every re-enqueue.
+func (p *PendingReports) inheritClockLocked(rep *pendingReport) {
+	if prev, ok := p.staged[rep.TaskID]; ok && !prev.EnqueuedAt.IsZero() {
+		rep.EnqueuedAt, rep.Attempts = prev.EnqueuedAt, prev.Attempts
+		return
+	}
+	if !validTaskID(rep.TaskID) {
+		return
+	}
+	raw, err := os.ReadFile(p.path(rep.TaskID))
+	if err != nil {
+		return
+	}
+	var old pendingReport
+	if json.Unmarshal(raw, &old) == nil && !old.EnqueuedAt.IsZero() {
+		rep.EnqueuedAt, rep.Attempts = old.EnqueuedAt, old.Attempts
+	}
+}
+
+// Drain retries the staged writes and then every queued report once through
+// sender. A report leaves the queue when the server accepts it (2xx) or
+// settles it as moot (404/409: server-side already terminal or deleted).
+// Reports older than PendingReportTTL are dropped with an error log
+// (failure-handling 场景 #10). It returns the number of reports still
+// undelivered: the durable entries plus the ones a failed write left staged.
+//
+// A report whose task id cannot name a queue file is delivered straight from
+// staging: it can never become durable, and dropping it would lose a
+// terminal callback (contract §4).
 //
 // The lock is never held across the network: the queue is snapshotted,
 // forwarded, and settled entry-by-entry, so a slow upstream cannot block
 // Enqueue (the daemon's terminal-report path) or Len (metrics).
 func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, error) {
 	p.mu.Lock()
-	queue := p.listLocked()
+	p.flushStagedLocked()
+	queue := append(p.listLocked(), p.unstorableStagedLocked()...)
 	p.mu.Unlock()
 
 	var firstErr error
@@ -143,7 +190,7 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 				"task_id", rep.TaskID, "endpoint", rep.Endpoint,
 				"attempts", rep.Attempts, "reason", "pending report TTL exceeded")
 			p.mu.Lock()
-			p.removeLocked(rep.TaskID)
+			p.dropLocked(rep.TaskID)
 			p.mu.Unlock()
 			continue
 		}
@@ -153,14 +200,9 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 		if delivered {
 			p.log.Info("task.forward_delivered",
 				"task_id", rep.TaskID, "endpoint", rep.Endpoint, "attempts", rep.Attempts+1)
-			p.removeLocked(rep.TaskID)
-		} else if cur, ok := p.readLocked(rep.TaskID); ok {
-			// Merge with a concurrent re-enqueue: bump the attempt counter
-			// on the file as it stands now, never clobbering a newer body.
-			cur.Attempts++
-			if werr := p.writeLocked(cur); werr != nil {
-				p.log.Error("pending report update failed", "task_id", rep.TaskID, "err", werr)
-			}
+			p.dropLocked(rep.TaskID)
+		} else {
+			p.bumpAttemptsLocked(rep.TaskID)
 		}
 		p.mu.Unlock()
 		if err != nil && firstErr == nil {
@@ -171,17 +213,112 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 		}
 	}
 	p.mu.Lock()
-	remaining := len(p.listLocked())
+	durable := len(p.listLocked())
+	remaining := durable + len(p.staged)
 	p.mu.Unlock()
-	p.notify(remaining)
+	p.notify(durable)
 	return remaining, firstErr
 }
 
-// Len reports the queued report count (foreman_pending_reports).
+// flushStagedLocked retries the disk write of every staged report
+// (错误处理表「退避后重试」). A report whose write lands leaves the staging
+// area — listLocked then carries it, so it counts as queued only once the
+// file exists (顺序规则 5) — while a write that keeps failing stays staged
+// for the next round. A report past the TTL is dropped, and one whose id can
+// never name a file stays staged for the direct delivery.
+func (p *PendingReports) flushStagedLocked() {
+	for taskID, rep := range p.staged {
+		if p.now().Sub(rep.EnqueuedAt) > PendingReportTTL {
+			p.log.Error("task.forward_dropped",
+				"task_id", taskID, "endpoint", rep.Endpoint,
+				"attempts", rep.Attempts, "reason", "pending report TTL exceeded")
+			delete(p.staged, taskID)
+			continue
+		}
+		if !validTaskID(taskID) {
+			continue
+		}
+		if err := p.writeLocked(rep); err != nil {
+			p.log.Error("pending report write failed",
+				"task_id", taskID, "endpoint", rep.Endpoint, "err", err)
+			continue
+		}
+		p.log.Info("task.forward_queued",
+			"task_id", taskID, "endpoint", rep.Endpoint, "retried_write", true)
+		delete(p.staged, taskID)
+	}
+}
+
+// unstorableStagedLocked lists the staged reports whose task id can never
+// name a queue file; the delivery loop sends them straight from memory.
+func (p *PendingReports) unstorableStagedLocked() []pendingReport {
+	var out []pendingReport
+	for _, rep := range p.staged {
+		if !validTaskID(rep.TaskID) {
+			out = append(out, rep)
+		}
+	}
+	return out
+}
+
+// bumpAttemptsLocked records one more delivery attempt: a durable report is
+// rewritten so its count survives a restart, a staged one is bumped in
+// memory.
+func (p *PendingReports) bumpAttemptsLocked(taskID string) {
+	if validTaskID(taskID) {
+		if cur, ok := p.readLocked(taskID); ok {
+			// Merge with a concurrent re-enqueue: bump the attempt counter
+			// on the file as it stands now, never clobbering a newer body.
+			cur.Attempts++
+			if err := p.writeLocked(cur); err != nil {
+				p.log.Error("pending report update failed", "task_id", taskID, "err", err)
+			}
+			return
+		}
+	}
+	if rep, ok := p.staged[taskID]; ok {
+		rep.Attempts++
+		p.staged[taskID] = rep
+	}
+}
+
+// dropLocked removes a report from the queue, wherever it sits: the durable
+// file, the staging area, or both.
+func (p *PendingReports) dropLocked(taskID string) {
+	if validTaskID(taskID) {
+		p.removeLocked(taskID)
+	}
+	delete(p.staged, taskID)
+}
+
+// Len reports the durable queue depth — the foreman_pending_reports gauge.
+// A report counts once its write succeeded; one a failed write left staged
+// does not grow the gauge (错误处理表).
 func (p *PendingReports) Len() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	return len(p.listLocked())
+}
+
+// Queued reports whether taskID still has an undelivered report: one whose
+// file exists, or one a failed write left staged. The scheduler gates the
+// object cleanup of a terminal entry on it, so the Job/Secret go only once
+// the report landed (contract §4).
+//
+// A task id that cannot name a queue file is answered without touching the
+// filesystem: such a report is never a durable queue entry (Drain delivers
+// it straight from staging), so it gates no objects either.
+func (p *PendingReports) Queued(taskID string) bool {
+	if !validTaskID(taskID) {
+		return false
+	}
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if _, ok := p.readLocked(taskID); ok {
+		return true
+	}
+	_, ok := p.staged[taskID]
+	return ok
 }
 
 func (p *PendingReports) path(taskID string) string {
@@ -217,8 +354,14 @@ func (p *PendingReports) readLocked(taskID string) (pendingReport, bool) {
 	return p.readFileLocked(taskID + ".json")
 }
 
-// readFileLocked parses one queue file; malformed files are quarantined.
+// readFileLocked parses one queue file; malformed files are quarantined. A
+// name that cannot be a queue file is ignored outright, so no caller can
+// make it read or rename anything outside the queue directory.
 func (p *PendingReports) readFileLocked(name string) (pendingReport, bool) {
+	taskID, ok := strings.CutSuffix(name, ".json")
+	if !ok || !validTaskID(taskID) {
+		return pendingReport{}, false
+	}
 	raw, err := os.ReadFile(filepath.Join(p.dir, name))
 	if err != nil {
 		return pendingReport{}, false

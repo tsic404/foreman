@@ -9,9 +9,11 @@ import (
 	"github.com/tsic404/foreman/internal/registry"
 )
 
-// fakePendingReports records enqueued terminal reports.
+// fakePendingReports records enqueued terminal reports and models the queue
+// membership the scheduler gates its object cleanup on.
 type fakePendingReports struct {
 	reports []pendingCall
+	queued  map[string]bool
 }
 
 type pendingCall struct {
@@ -22,13 +24,25 @@ type pendingCall struct {
 
 func (f *fakePendingReports) Enqueue(taskID string, ep Endpoint, body []byte) error {
 	f.reports = append(f.reports, pendingCall{taskID, ep, string(body)})
+	if f.queued == nil {
+		f.queued = map[string]bool{}
+	}
+	f.queued[taskID] = true
 	return nil
 }
 
+// Queued reports whether the report is still undelivered.
+func (f *fakePendingReports) Queued(taskID string) bool { return f.queued[taskID] }
+
+// deliver models the recovery loop's drain landing the report.
+func (f *fakePendingReports) deliver(taskID string) { delete(f.queued, taskID) }
+
 func (f *fixture) withPendingReports() *fakePendingReports {
-	p := &fakePendingReports{}
-	WithPendingReports(p)(f.sched)
-	return p
+	// The fixture wires a queue for every test (New requires one); this
+	// resets it so a test sees only the reports it causes.
+	f.pending = &fakePendingReports{}
+	WithPendingReports(f.pending)(f.sched)
+	return f.pending
 }
 
 func (f *fixture) hasJob(name string) bool {
@@ -70,26 +84,34 @@ func TestOnBootTimeoutFailsAndCleansUp(t *testing.T) {
 	}
 }
 
-func TestOnBootTimeoutKeepsEntryWhenReportFails(t *testing.T) {
+func TestOnBootTimeoutQueuesReportAndKeepsObjects(t *testing.T) {
 	f := newFixture(t)
+	p := f.withPendingReports()
 	f.claim(t, "t-boot-fail")
 	f.server.forwardErr = errors.New("transport down")
 
 	if err := f.sched.OnBootTimeout(context.Background(), "t-boot-fail"); err != nil {
 		t.Fatalf("OnBootTimeout: %v", err)
 	}
-	// Contract §4: the terminal callback is never dropped — the entry stays
-	// and a reconcile round retries the report before cleaning up.
+	// Contract §4: the terminal callback is not dropped — it lands in the
+	// durable queue and the objects stay until a drain delivers it.
 	e, ok := f.reg.Get("t-boot-fail")
 	if !ok || !e.IsTerminal() {
 		t.Fatalf("entry = %+v, want retained terminal", e)
 	}
-	if f.hasJob("fm-t-boot-fail") == false {
-		t.Error("Job must survive until the fail report lands")
+	if len(p.reports) != 1 || p.reports[0].taskID != "t-boot-fail" || p.reports[0].ep != EPFail {
+		t.Fatalf("pending reports = %+v, want the boot-timeout fail report", p.reports)
+	}
+	if !strings.Contains(p.reports[0].body, "job_boot_timeout") {
+		t.Errorf("queued body = %s, want the C10 fail body", p.reports[0].body)
+	}
+	if !f.hasJob("fm-t-boot-fail") {
+		t.Error("Job must survive until the queued report lands")
 	}
 
-	// The server recovers; reconcile delivers the report and cleans up.
-	f.server.forwardErr = nil
+	// A drain delivered the report: the next round cleans up. The scheduler
+	// itself never forwards it a second time.
+	p.deliver("t-boot-fail")
 	if err := f.sched.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -98,6 +120,9 @@ func TestOnBootTimeoutKeepsEntryWhenReportFails(t *testing.T) {
 	}
 	if f.hasJob("fm-t-boot-fail") {
 		t.Error("Job must be deleted once the report landed")
+	}
+	if n := len(f.server.forwards); n != 1 {
+		t.Errorf("forwards = %d, want 1 (the queue owns the redelivery)", n)
 	}
 }
 
