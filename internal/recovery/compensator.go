@@ -30,8 +30,8 @@ type Settler interface {
 	// terminal report (#2 redispatch, #8 cancel timeout, #9 gone).
 	ReleaseTask(ctx context.Context, taskID string) error
 	// SyncInflight re-derives the inflight gauge from the live index. The
-	// round calls it every interval, so a settlement path that missed its own
-	// refresh cannot freeze a stale count past one round.
+	// round calls it on entry and a ticker repeats it every interval, so a
+	// settlement path that missed its own refresh cannot keep a stale count.
 	SyncInflight()
 }
 
