@@ -37,23 +37,22 @@ func HTTPStatus(err error) int {
 	}
 }
 
-// Reason returns a stable metrics label for a Verify error ("unknown" for
-// non-verification errors).
+// Reason returns the metrics label for a Verify error. The vocabulary is
+// closed (observability.md §指标: malformed|signature|expired|scope|unknown_job)
+// — a sixth value would split the counter into an off-contract series.
+// ErrRevoked is a terminal-task rejection, so it shares unknown_job; the
+// default keeps non-verification errors inside the same closed set.
 func Reason(err error) string {
 	switch {
 	case errors.Is(err, ErrMalformedToken):
-		return "malformed_token"
+		return "malformed"
 	case errors.Is(err, ErrBadSignature):
-		return "bad_signature"
+		return "signature"
 	case errors.Is(err, ErrExpired):
 		return "expired"
-	case errors.Is(err, ErrRevoked):
-		return "revoked"
-	case errors.Is(err, ErrUnknownJob):
-		return "unknown_job"
 	case errors.Is(err, ErrScopeMismatch):
-		return "scope_mismatch"
+		return "scope"
 	default:
-		return "unknown"
+		return "unknown_job"
 	}
 }

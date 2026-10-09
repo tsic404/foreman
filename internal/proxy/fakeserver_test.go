@@ -856,7 +856,7 @@ func TestExpiredAndForgedTokensRejected(t *testing.T) {
 	for _, rsn := range rig.metrics.authFails {
 		joined += rsn + ","
 	}
-	if !strings.Contains(joined, "expired") || !strings.Contains(joined, "bad_signature") {
-		t.Errorf("auth failure reasons = %v, want expired + bad_signature", rig.metrics.authFails)
+	if !strings.Contains(joined, "expired") || !strings.Contains(joined, "signature") {
+		t.Errorf("auth failure reasons = %v, want expired + signature", rig.metrics.authFails)
 	}
 }

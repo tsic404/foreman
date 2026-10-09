@@ -330,17 +330,40 @@ func TestHTTPStatus(t *testing.T) {
 
 func TestReason(t *testing.T) {
 	cases := map[error]string{
-		ErrMalformedToken: "malformed_token",
-		ErrBadSignature:   "bad_signature",
+		ErrMalformedToken: "malformed",
+		ErrBadSignature:   "signature",
 		ErrExpired:        "expired",
-		ErrRevoked:        "revoked",
+		ErrRevoked:        "unknown_job",
 		ErrUnknownJob:     "unknown_job",
-		ErrScopeMismatch:  "scope_mismatch",
-		errors.New("x"):   "unknown",
+		ErrScopeMismatch:  "scope",
+		errors.New("x"):   "unknown_job",
 	}
 	for err, want := range cases {
 		if got := Reason(err); got != want {
 			t.Errorf("Reason(%v) = %q, want %q", err, got, want)
+		}
+	}
+}
+
+// TestReasonVocabularyIsClosed pins the foreman_auth_failures_total reason
+// label to the closed enum of observability.md §指标
+// (malformed|signature|expired|scope|unknown_job): a sixth value lands on a
+// label the design does not define and splits the counter off-contract.
+func TestReasonVocabularyIsClosed(t *testing.T) {
+	want := []string{"malformed", "signature", "expired", "scope", "unknown_job"}
+	got := map[string]bool{}
+	for _, err := range []error{
+		ErrMalformedToken, ErrBadSignature, ErrExpired, ErrRevoked,
+		ErrUnknownJob, ErrScopeMismatch, errors.New("x"),
+	} {
+		got[Reason(err)] = true
+	}
+	if len(got) != len(want) {
+		t.Fatalf("Reason vocabulary = %v, want exactly %v", got, want)
+	}
+	for _, reason := range want {
+		if !got[reason] {
+			t.Errorf("Reason vocabulary %v is missing designed value %q", got, reason)
 		}
 	}
 }
