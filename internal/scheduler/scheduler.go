@@ -212,6 +212,13 @@ func (s *Scheduler) ClaimBudget() int {
 	return min(free, s.cfg.ClaimBatchMax)
 }
 
+// SyncInflight re-derives foreman_inflight_jobs from the live index. The
+// gauge is defined as Registry.Inflight() (observability.md §指标), so it is
+// a derived value, never an independently updated one: every settlement path
+// re-derives it on exit, and the recovery round repeats it so no missed
+// branch can freeze a stale count past one interval.
+func (s *Scheduler) SyncInflight() { s.metrics.InflightJobs(s.reg.Inflight()) }
+
 // RefreshNodeSaturation recomputes the per-node soft cap
 // (FOREMAN_MAX_JOBS_PER_NODE, ADR-006 §决策结果 3) from the live index and
 // republishes the saturation markers: every node holding at least
@@ -268,6 +275,7 @@ func (s *Scheduler) RefreshNodeSaturation(ctx context.Context) map[string]int {
 // (pending → job_created). A task the registry already knows goes through
 // the duplicate-claim rule; no second Job is ever created concurrently.
 func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
+	defer s.SyncInflight()
 	var head claimHead
 	if err := json.Unmarshal(task, &head); err != nil {
 		return fmt.Errorf("parse claim payload head: %w", err)
@@ -357,7 +365,6 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	}
 	s.metrics.TaskClaimed()
 	s.metrics.JobCreateSeconds(e.JobCreatedAt.Sub(e.ClaimedAt).Seconds())
-	s.metrics.InflightJobs(s.reg.Inflight())
 	s.log.InfoContext(ctx, "job.created",
 		"task_id", e.TaskID, "job_name", e.JobName,
 		"node_name", e.NodeName, "image", jobImage(job))
@@ -368,6 +375,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 // §重复 claim): C13 decides the truth. It reports whether the claim proceeds
 // as a replacement (old pre-start entry discarded) and the prior attempt.
 func (s *Scheduler) resolveDuplicateClaim(ctx context.Context, existing registry.TaskEntry) (bool, int, error) {
+	defer s.SyncInflight()
 	s.metrics.DuplicateDispatch()
 	if existing.IsTerminal() {
 		// Terminal is irreversible (invariant 4): even if the server
@@ -524,7 +532,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		return 0, nil, fmt.Errorf("forward %s for task %s: %w", ep, e.TaskID, err)
 	}
 	if ep.IsTerminal() {
-		defer s.metrics.InflightJobs(s.reg.Inflight())
+		defer s.SyncInflight()
 		switch {
 		case code >= 200 && code < 300:
 			s.cleanup(ctx, e)
@@ -598,6 +606,7 @@ func (s *Scheduler) OnTaskVanished(ctx context.Context, taskID string) error {
 // started within the boot deadline. The task is failed on the daemon's
 // behalf (C10, failure_reason=job_boot_timeout) and the objects removed.
 func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
+	defer s.SyncInflight()
 	e, ok := s.reg.Get(taskID)
 	if !ok || e.IsTerminal() || !e.StartedAt.IsZero() {
 		return nil
@@ -610,7 +619,6 @@ func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
 		"task_id", e.TaskID, "job_name", e.JobName,
 		"failure_reason", FailureReasonJobBootTimeout)
 	report := failReport{reason: FailureReasonJobBootTimeout, message: "job daemon did not start before the boot deadline"}
-	s.metrics.InflightJobs(s.reg.Inflight())
 	if err := s.reportFail(ctx, e, report); err != nil {
 		// The report is in the durable queue now: the entry and its objects
 		// stay until a drain lands it (contract §4).
@@ -625,6 +633,7 @@ func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
 // cleans up, a deleted task vanishes; anything else waits for the next
 // lease round (proxy.md §prepare-lease 保活).
 func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) error {
+	defer s.SyncInflight()
 	e, ok := s.reg.Get(taskID)
 	if !ok || e.IsTerminal() {
 		return nil
@@ -659,6 +668,7 @@ func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) err
 // The grace period tolerates the first-visibility delay of a freshly created
 // Job; C13 then decides what to settle.
 func (s *Scheduler) OnJobGone(ctx context.Context, jobName string) error {
+	defer s.SyncInflight()
 	e, ok := s.reg.ByJob(jobName)
 	if !ok {
 		return nil
@@ -681,6 +691,7 @@ func (s *Scheduler) OnJobGone(ctx context.Context, jobName string) error {
 // report, and only a still-active task gets the synthesized fail.
 // Idempotent: an already-terminal entry is only cleaned up (顺序规则 2).
 func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
+	defer s.SyncInflight()
 	e, ok := s.reg.ByJob(jobName)
 	if !ok {
 		return nil
@@ -726,6 +737,7 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 // the objects back until it lands (contract §4): the recovery loop drains
 // the queue every round and the round that saw it delivered cleans up.
 func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) error {
+	defer s.SyncInflight()
 	e, ok := s.reg.Get(taskID)
 	if !ok {
 		return nil
@@ -766,27 +778,22 @@ func (s *Scheduler) AdoptRunning(ctx context.Context, taskID string) error {
 // keeps the entry: it is the only retry handle, and dropping it would leave
 // a zombie Job or leak the credential Secret (顺序规则 2).
 func (s *Scheduler) ReleaseTask(ctx context.Context, taskID string) error {
+	defer s.SyncInflight()
 	e, ok := s.reg.Get(taskID)
 	if !ok {
 		return nil
 	}
-	if err := s.deleteObjects(ctx, e); err != nil {
-		return err
-	}
-	if err := s.reg.Delete(taskID); err != nil {
-		return err
-	}
-	s.metrics.InflightJobs(s.reg.Inflight())
-	return nil
+	return s.cleanup(ctx, e)
 }
 
 // Reconcile converges the live index with the server. With a recovery
 // reconciler wired it delegates; otherwise it runs the built-in startup
 // convergence (task-mapping §持久化与重建 step 3) over every live entry.
-// The per-node soft cap is refreshed first: its markers are derived state of
-// the live index and must not outlive the load they describe.
+// The per-node soft cap and the inflight gauge are refreshed first: both are
+// derived state of the live index and must not outlive the load they describe.
 func (s *Scheduler) Reconcile(ctx context.Context) error {
 	s.RefreshNodeSaturation(ctx)
+	s.SyncInflight()
 	if s.reconciler != nil {
 		return s.reconciler.Reconcile(ctx)
 	}
@@ -885,6 +892,7 @@ func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) err
 // forward does not land goes to the durable queue, and the terminal entry
 // stays until a round drains it (contract §4).
 func (s *Scheduler) failClaim(ctx context.Context, e registry.TaskEntry, cause error) {
+	defer s.SyncInflight()
 	if _, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, time.Time{}); err != nil {
 		s.log.ErrorContext(ctx, "mark terminal failed", "task_id", e.TaskID, "err", err)
 	}
@@ -905,7 +913,6 @@ func (s *Scheduler) failClaim(ctx context.Context, e registry.TaskEntry, cause e
 	// A report whose forward does not land goes to the durable queue
 	// (场景 #10); the entry stays terminal until a round drains it.
 	_ = s.reportFail(ctx, e, report)
-	s.metrics.InflightJobs(s.reg.Inflight())
 }
 
 // reportFail forwards a synthetic fail report (C10) for a task the daemon
@@ -932,6 +939,7 @@ func (s *Scheduler) reportFail(ctx context.Context, e registry.TaskEntry, report
 // retries it (顺序规则 2); both objects are attempted in either case so one
 // failure cannot leak the other.
 func (s *Scheduler) cleanup(ctx context.Context, e registry.TaskEntry) error {
+	defer s.SyncInflight()
 	if err := s.deleteObjects(ctx, e); err != nil {
 		return err
 	}

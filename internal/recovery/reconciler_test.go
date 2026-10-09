@@ -66,6 +66,7 @@ type fakeSettler struct {
 	settles   []settleCall
 	adopts    []string
 	releases  []string
+	syncs     int
 	err       error
 	// releaseErrs is consumed one error per ReleaseTask call; an empty queue
 	// falls back to err.
@@ -112,6 +113,12 @@ func (f *fakeSettler) ReleaseTask(_ context.Context, taskID string) error {
 		}
 	}
 	return f.err
+}
+
+func (f *fakeSettler) SyncInflight() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.syncs++
 }
 
 func (f *fakeSettler) calls() (int, int, int, int, int) {
