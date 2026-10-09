@@ -3,7 +3,10 @@ package recovery
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"net/http"
 	"testing"
+	"time"
 
 	corev1 "k8s.io/api/core/v1"
 
@@ -102,6 +105,107 @@ func TestIntegrationReconcileRoundHealsStaleInflightGauge(t *testing.T) {
 	if got := reg.Inflight(); got != 0 {
 		t.Fatalf("Registry.Inflight() = %d, want 0", got)
 	}
+}
+
+// AC-10 on a terminal report whose upstream is unreachable: the terminal
+// write lands, the report goes to the durable queue (contract §4) and the
+// gauge must follow the index right there — no round runs on this path, so a
+// refresh registered after the forward would leave the pre-terminal count
+// standing (observability.md §指标: 四源一致).
+func TestIntegrationTerminalReportTransportErrorKeepsInflightGaugeInSync(t *testing.T) {
+	server := newFakeServerClient(map[string]string{"t1": "running"})
+	metrics := observability.NewMetrics()
+	reg, _, sched, pending, _ := setupIntegrationWithMetrics(t, server, "", metrics)
+	ctx := context.Background()
+
+	claimFor(t, sched, "t1")
+	entry, ok := reg.Get("t1")
+	if !ok {
+		t.Fatal("the claim did not register the task")
+	}
+
+	server.setForwardErr(errors.New("dial tcp 10.0.0.1:443: connect: connection refused"))
+	code, _, err := sched.OnReport(ctx, scheduler.EPFail, entry, []byte(`{"error":"boom"}`))
+	if err != nil {
+		t.Fatalf("OnReport: %v", err)
+	}
+	if code != http.StatusBadGateway {
+		t.Fatalf("OnReport status = %d, want 502 (upstream unavailable)", code)
+	}
+	if got := pending.Len(); got != 1 {
+		t.Fatalf("queued reports = %d, want 1", got)
+	}
+	if got := reg.Inflight(); got != 0 {
+		t.Fatalf("Registry.Inflight() = %d, want 0 after the terminal write", got)
+	}
+	if got := scrapeGauge(t, metrics.Handler(), "foreman_inflight_jobs"); got != 0 {
+		t.Fatalf("foreman_inflight_jobs = %v with Registry.Inflight() = 0 — the gauge kept the pre-terminal count", got)
+	}
+}
+
+// A round spends minutes inside its own I/O (a terminal report's 4s→64s
+// retry budget, object deletes), so the round's own re-derivation cannot
+// bound the gauge: the periodic one must run on its own cadence. AC-10's
+// budget is two intervals; this parks a round inside the queue drain and
+// requires the gauge back in sync inside that budget.
+func TestIntegrationInflightGaugeConvergesWhileARoundIsBusy(t *testing.T) {
+	server := newFakeServerClient(map[string]string{"t1": "running"})
+	metrics := observability.NewMetrics()
+	reg, _, sched, pending, newReconciler := setupIntegrationWithMetrics(t, server, "", metrics)
+	const interval = 20 * time.Millisecond
+
+	claimFor(t, sched, "t1")
+	if err := pending.Enqueue("t1", scheduler.EPFail, []byte(`{"error":"boom"}`)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	busy := &stallingSender{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	rec := newReconciler(&fakeObjects{job: runningJob(fakeJobName("t1"))})
+	WithPendingReports(pending, busy)(rec)
+	rec.cfg.ReconcileInterval = interval
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	defer close(busy.release)
+	go func() { _ = rec.Run(ctx) }()
+
+	select {
+	case <-busy.entered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the round never reached the drain")
+	}
+	// A settlement that missed its own refresh — the class the periodic
+	// re-derivation exists for: the index empties, the gauge does not.
+	if err := reg.Delete("t1"); err != nil {
+		t.Fatalf("reg.Delete: %v", err)
+	}
+
+	deadline := time.Now().Add(2 * interval)
+	for time.Now().Before(deadline) {
+		if scrapeGauge(t, metrics.Handler(), "foreman_inflight_jobs") == 0 {
+			return
+		}
+		time.Sleep(interval / 4)
+	}
+	t.Fatalf("foreman_inflight_jobs = %v with Registry.Inflight() = %d after 2 intervals — the busy round left the stale count standing",
+		scrapeGauge(t, metrics.Handler(), "foreman_inflight_jobs"), reg.Inflight())
+}
+
+// stallingSender parks the queue drain of a round until it is released.
+type stallingSender struct {
+	entered chan struct{}
+	release chan struct{}
+}
+
+func (s *stallingSender) Forward(ctx context.Context, _ scheduler.Endpoint, _ string, _ []byte) (int, []byte, error) {
+	select {
+	case s.entered <- struct{}{}:
+	default:
+	}
+	select {
+	case <-s.release:
+	case <-ctx.Done():
+	}
+	return 200, nil, nil
 }
 
 // The boot-timeout path is the control the field report held up as working:

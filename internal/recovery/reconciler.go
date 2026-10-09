@@ -208,12 +208,33 @@ func (r *Reconciler) Run(ctx context.Context) error {
 			}
 		}()
 	}
+	go r.refreshInflight(ctx)
 	for {
 		if err := r.Reconcile(ctx); err != nil {
 			r.log.WarnContext(ctx, "reconcile round finished with failures", "err", err)
 		}
 		if !r.wait(ctx) {
 			return nil
+		}
+	}
+}
+
+// refreshInflight re-derives foreman_inflight_jobs on its own cadence. The
+// round refreshes it too, but a round spends minutes inside its own I/O (a
+// terminal report's 4s→64s retry budget, object deletes), and a value that
+// waits for the round to finish would freeze for exactly that long. This
+// ticker is independent of the round, so the gauge cannot lag the live index
+// by more than one interval whatever the round is doing (observability.md
+// §指标, AC-10; failure-handling 内部结构 Reconciler.Run).
+func (r *Reconciler) refreshInflight(ctx context.Context) {
+	ticker := time.NewTicker(r.cfg.ReconcileInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			r.settler.SyncInflight()
 		}
 	}
 }
@@ -276,9 +297,9 @@ func (r *Reconciler) nextDeadline() (time.Time, bool) {
 // state of settled tasks forgotten. It is the seam the scheduler calls
 // (scheduler.Reconciler) and what Run repeats.
 func (r *Reconciler) Reconcile(ctx context.Context) error {
-	// The inflight gauge is derived state of the live index: re-deriving it
-	// every round bounds a stale value to one interval no matter which
-	// settlement path ran (observability.md §指标).
+	// The inflight gauge is derived state of the live index: re-derive it on
+	// entry so the settlements below start from a fresh value, and let the
+	// independent ticker bound any straggler (observability.md §指标).
 	r.settler.SyncInflight()
 	r.mu.Lock()
 	defer r.mu.Unlock()

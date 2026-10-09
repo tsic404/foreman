@@ -229,8 +229,9 @@ func (s *Scheduler) ClaimBudget() int {
 // SyncInflight re-derives foreman_inflight_jobs from the live index. The
 // gauge is defined as Registry.Inflight() (observability.md §指标), so it is
 // a derived value, never an independently updated one: every settlement path
-// re-derives it on exit, and the recovery round repeats it so no missed
-// branch can freeze a stale count past one interval.
+// re-derives it on exit, and recovery's ticker repeats it every interval.
+// That bound is the ticker's, not the round's — a round can sit in its own
+// I/O (terminal-report retry budgets, object deletes) for minutes.
 func (s *Scheduler) SyncInflight() { s.metrics.InflightJobs(s.reg.Inflight()) }
 
 // RefreshNodeSaturation recomputes the per-node soft cap
@@ -578,6 +579,12 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		// A late start on a terminal entry is still forwarded: the server's
 		// 409 tells the daemon the task is settled.
 	case ep.IsTerminal():
+		// The gauge follows the index on every exit of a terminal report —
+		// including the transport-error exit below, which only queues the
+		// report: the terminal write above already left the index, so a
+		// refresh registered after the forward would leave the pre-terminal
+		// value standing (observability.md §指标, AC-10).
+		defer s.SyncInflight()
 		if !e.IsTerminal() {
 			result := registry.Result(ep.TerminalResult())
 			if _, err := s.reg.MarkTerminal(e.TaskID, result, now); err != nil {
@@ -605,7 +612,6 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		return 0, nil, fmt.Errorf("forward %s for task %s: %w", ep, e.TaskID, err)
 	}
 	if ep.IsTerminal() {
-		defer s.SyncInflight()
 		switch {
 		case code >= 200 && code < 300:
 			s.cleanup(ctx, e)

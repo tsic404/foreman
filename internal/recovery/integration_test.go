@@ -505,7 +505,8 @@ type fakeServerClient struct {
 	mu          sync.Mutex
 	statuses    map[string]string
 	calls       []forwardedCall
-	forwardCode int // 0 → 200
+	forwardCode int   // 0 → 200
+	forwardErr  error // transport-level failure (the proxy's retry budget exhausted)
 }
 
 func newFakeServerClient(statuses map[string]string) *fakeServerClient {
@@ -528,6 +529,9 @@ func (s *fakeServerClient) TaskStatus(_ context.Context, taskID string) (string,
 func (s *fakeServerClient) Forward(_ context.Context, ep scheduler.Endpoint, taskID string, body []byte) (int, []byte, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.forwardErr != nil {
+		return 0, nil, s.forwardErr
+	}
 	call := forwardedCall{ep: ep, taskID: taskID}
 	var payload struct {
 		FailureReason string `json:"failure_reason"`
@@ -550,6 +554,15 @@ func (s *fakeServerClient) setForwardCode(code int) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.forwardCode = code
+}
+
+// setForwardErr programs every following forward to fail at the transport
+// level — what proxy.Client.Forward reports once its retry budget is spent
+// (ErrTerminalUndelivered) or the upstream is unreachable.
+func (s *fakeServerClient) setForwardErr(err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.forwardErr = err
 }
 
 // accepted counts the forwards the server took as a terminal write (2xx).
