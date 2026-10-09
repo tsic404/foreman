@@ -228,6 +228,12 @@ func (c *fakeJobClient) DeleteJob(_ context.Context, name string) error {
 	return nil
 }
 
+func (c *fakeJobClient) GetJob(_ context.Context, name string) (*batchv1.Job, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.jobs[name], nil
+}
+
 func (c *fakeJobClient) CreateSecret(_ context.Context, secret *corev1.Secret) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
