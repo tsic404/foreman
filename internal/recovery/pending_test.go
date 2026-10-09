@@ -259,3 +259,96 @@ func (s *blockingSender) Forward(context.Context, scheduler.Endpoint, string, []
 	<-s.release
 	return 503, nil, nil
 }
+
+// A failed write must not drop the report: it stays staged, counts as
+// undelivered for Queued, never grows the gauge, and the next drain that can
+// write lands it (错误处理表「待发队列目录不可写 → 记 error + gauge 不增长；
+// 退避后重试」).
+func TestEnqueueFailureStagesReportUntilWritable(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "pending-reports")
+	var gauges []int
+	p, err := NewPendingReports(dir, WithPendingReportsGauge(func(n int) { gauges = append(gauges, n) }))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+
+	// Break the queue directory: the write cannot land.
+	if err := os.RemoveAll(dir); err != nil {
+		t.Fatalf("remove dir: %v", err)
+	}
+	if err := os.WriteFile(dir, []byte("not a directory"), 0o600); err != nil {
+		t.Fatalf("break dir: %v", err)
+	}
+	if err := p.Enqueue("task-1", scheduler.EPFail, []byte(`{"failure_reason":"job_failed"}`)); err == nil {
+		t.Fatal("Enqueue against an unwritable queue: want the write error")
+	}
+	if p.Len() != 0 {
+		t.Fatalf("Len = %d, want 0 (nothing is durable yet)", p.Len())
+	}
+	if !p.Queued("task-1") {
+		t.Fatal("a staged report must count as undelivered")
+	}
+	for _, n := range gauges {
+		if n != 0 {
+			t.Fatalf("foreman_pending_reports grew to %d on a failed write", n)
+		}
+	}
+
+	// The directory is writable again: the retry lands the report and one
+	// delivery takes it off the queue.
+	if err := os.Remove(dir); err != nil {
+		t.Fatalf("remove blocker: %v", err)
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatalf("restore dir: %v", err)
+	}
+	sender := &fakeSender{code: 200}
+	remaining, err := p.Drain(context.Background(), sender)
+	if err != nil || remaining != 0 {
+		t.Fatalf("Drain = %d, %v", remaining, err)
+	}
+	if len(sender.sent) != 1 || sender.sent[0] != `task-1:fail:{"failure_reason":"job_failed"}` {
+		t.Fatalf("sent = %v, want the staged report delivered exactly once", sender.sent)
+	}
+	if p.Queued("task-1") || p.Len() != 0 {
+		t.Fatalf("report still queued after delivery: Queued=%v Len=%d", p.Queued("task-1"), p.Len())
+	}
+}
+
+// An id that cannot name a queue file is never a durable entry: Queued
+// answers false without touching the filesystem, and the drain delivers the
+// staged report straight from memory so the terminal callback is not lost.
+func TestDrainDeliversUnstorableTaskIDFromStaging(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "pending-reports")
+	p, err := NewPendingReports(dir)
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	if p.Queued("../escape") {
+		t.Fatal("Queued must not claim an unsafe task id is a queue entry")
+	}
+	if err := p.Enqueue("../escape", scheduler.EPFail, []byte(`{"failure_reason":"invalid_task_id"}`)); err == nil {
+		t.Fatal("Enqueue with an unsafe task id: want an error")
+	}
+	if p.Len() != 0 {
+		t.Fatalf("Len = %d, want 0", p.Len())
+	}
+
+	sender := &fakeSender{code: 200}
+	remaining, err := p.Drain(context.Background(), sender)
+	if err != nil || remaining != 0 {
+		t.Fatalf("Drain = %d, %v", remaining, err)
+	}
+	if len(sender.sent) != 1 || sender.sent[0] != `../escape:fail:{"failure_reason":"invalid_task_id"}` {
+		t.Fatalf("sent = %v, want the staged report delivered from memory", sender.sent)
+	}
+	if _, err := os.Stat(filepath.Join(root, "escape.json")); !os.IsNotExist(err) {
+		t.Fatalf("queue wrote outside its directory: %v", err)
+	}
+	// Nothing left to retry.
+	if remaining, err := p.Drain(context.Background(), sender); err != nil || remaining != 0 || len(sender.sent) != 1 {
+		t.Fatalf("second Drain = %d, %v, sent = %v", remaining, err, sender.sent)
+	}
+}

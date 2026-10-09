@@ -93,12 +93,20 @@ func (k *keyedMutex) Lock(key string) func() {
 	}
 }
 
-// failReport is a synthetic fail report (C10) whose forward has not landed
-// yet; contract §4 forbids dropping a terminal callback, so the entry is
-// retained until a reconcile round delivers it.
+// failReport is a synthetic fail report (C10) for a task the daemon could
+// not settle itself. A forward that does not land hands the very same bytes
+// to the durable pending-report queue (contract §4), so the report is
+// delivered even if this process dies right after.
 type failReport struct {
 	reason  string
 	message string
+}
+
+// encode renders the C10 request body.
+func (r failReport) encode() []byte {
+	// A map[string]string cannot fail to marshal.
+	body, _ := json.Marshal(map[string]string{"error": r.message, "failure_reason": r.reason})
+	return body
 }
 
 // Option customizes a Scheduler.
@@ -116,8 +124,8 @@ func WithReconciler(r Reconciler) Option {
 }
 
 // WithPendingReports wires the recovery module's durable terminal-report
-// queue; terminal forwards that exhaust the proxy's retry budget are
-// enqueued instead of dropped (contract §4).
+// queue; a terminal report whose forward failed outright or exhausted the
+// proxy's retry budget is enqueued instead of dropped (contract §4).
 func WithPendingReports(p PendingReports) Option {
 	return func(s *Scheduler) { s.pendingReports = p }
 }
@@ -142,8 +150,7 @@ type Scheduler struct {
 	pendingReports PendingReports
 	now            func() time.Time
 
-	claimMu     *keyedMutex
-	pendingFail sync.Map // task_id → failReport: terminal reports not yet delivered
+	claimMu *keyedMutex
 
 	// nodeMu serializes the per-node soft cap refresh: concurrent claims
 	// would otherwise interleave the marker replacement and log the same
@@ -170,6 +177,12 @@ func New(cfg Config, reg *registry.Registry, jobs JobClient, builder JobBuilder,
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	// Contract §4: a terminal report the server did not take must have a
+	// durable home. Without the queue the scheduler could only log it and
+	// drop it, so a missing queue is a wiring error, not a mode.
+	if s.pendingReports == nil {
+		return nil, errors.New("pending-report queue is required")
 	}
 	return s, nil
 }
@@ -557,15 +570,12 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 var upstreamUnavailableBody = []byte(`{"error":"upstream unavailable"}`)
 
 // enqueuePending lands a terminal report in the recovery module's durable
-// queue (contract §4: terminal callbacks are never dropped). Without a
-// wired queue the entry stays terminal and reconcile keeps the objects.
+// queue (contract §4: terminal callbacks are never dropped). A write that
+// fails is the queue's own error row: it keeps the report staged and retries
+// it every drain (错误处理表「退避后重试」), and Queued reports it as
+// undelivered so the entry's objects stay put. The error is logged, never
+// acted on — dropping the report here is exactly what §4 forbids.
 func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep Endpoint, body []byte) {
-	if s.pendingReports == nil {
-		s.log.ErrorContext(ctx, "task.forward_undelivered",
-			"task_id", e.TaskID, "endpoint", string(ep),
-			"reason", "no pending-report queue wired")
-		return
-	}
 	if err := s.pendingReports.Enqueue(e.TaskID, ep, body); err != nil {
 		s.log.ErrorContext(ctx, "task.forward_undelivered",
 			"task_id", e.TaskID, "endpoint", string(ep),
@@ -600,14 +610,12 @@ func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
 		"task_id", e.TaskID, "job_name", e.JobName,
 		"failure_reason", FailureReasonJobBootTimeout)
 	report := failReport{reason: FailureReasonJobBootTimeout, message: "job daemon did not start before the boot deadline"}
-	if err := s.reportFail(ctx, taskID, report); err != nil {
-		// Keep the terminal entry: a reconcile round retries the report
-		// before the objects may be deleted (contract §4).
-		s.pendingFail.Store(taskID, report)
-		s.metrics.InflightJobs(s.reg.Inflight())
+	s.metrics.InflightJobs(s.reg.Inflight())
+	if err := s.reportFail(ctx, e, report); err != nil {
+		// The report is in the durable queue now: the entry and its objects
+		// stay until a drain lands it (contract §4).
 		return nil
 	}
-	s.metrics.InflightJobs(s.reg.Inflight())
 	return s.cleanup(ctx, e)
 }
 
@@ -698,12 +706,10 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 		return err
 	}
 	s.metrics.TaskTerminal(string(registry.ResultFailed))
-	// Contract §4: a terminal callback is never dropped. If the report does
-	// not land, keep the terminal entry — a later round retries it before
-	// the objects may be deleted.
 	report := failReport{reason: reason, message: "container ended without a terminal report"}
-	if err := s.reportFail(ctx, e.TaskID, report); err != nil {
-		s.pendingFail.Store(e.TaskID, report)
+	if err := s.reportFail(ctx, e, report); err != nil {
+		// The report is in the durable queue now: the entry and its objects
+		// stay until a drain lands it (contract §4).
 		return nil
 	}
 	e, ok = s.reg.Get(e.TaskID)
@@ -715,19 +721,19 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 
 // SettleTerminal converges an entry the server already holds as terminal
 // (C13 completed/failed/cancelled, or a rebuilt entry whose cleanup is
-// still pending): a synthetic fail report still queued in memory lands
-// first (contract §4), then the entry is marked terminal and the Job/Secret
-// go (顺序规则 1). A report that fails keeps the entry for the next round.
+// still pending): the entry is marked terminal and the Job/Secret go
+// (顺序规则 1). A terminal report still waiting in the durable queue holds
+// the objects back until it lands (contract §4): the recovery loop drains
+// the queue every round and the round that saw it delivered cleans up.
 func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) error {
 	e, ok := s.reg.Get(taskID)
 	if !ok {
 		return nil
 	}
-	if report, ok := s.pendingFail.Load(taskID); ok {
-		if err := s.reportFail(ctx, taskID, report.(failReport)); err != nil {
-			return nil // keep the entry; next round retries
-		}
-		s.pendingFail.Delete(taskID)
+	if s.pendingReports.Queued(taskID) {
+		// 场景 #7/#10: the objects wait for the report — a deleted Job must
+		// never stand in for a delivered one (contract §4).
+		return nil
 	}
 	if !e.IsTerminal() {
 		if _, err := s.reg.MarkTerminal(taskID, registry.Result(result), s.now()); err != nil {
@@ -764,8 +770,6 @@ func (s *Scheduler) ReleaseTask(ctx context.Context, taskID string) error {
 	if !ok {
 		return nil
 	}
-	// A queued synthetic report is moot once the task is released or gone.
-	s.pendingFail.Delete(taskID)
 	if err := s.deleteObjects(ctx, e); err != nil {
 		return err
 	}
@@ -877,9 +881,9 @@ func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) err
 }
 
 // failClaim settles a task whose Job could not be created
-// (pending → terminal, result=failed) and tells the server. A report that
-// does not land is kept in pendingFail; the entry stays until a reconcile
-// round delivers it (contract §4).
+// (pending → terminal, result=failed) and tells the server. A report whose
+// forward does not land goes to the durable queue, and the terminal entry
+// stays until a round drains it (contract §4).
 func (s *Scheduler) failClaim(ctx context.Context, e registry.TaskEntry, cause error) {
 	if _, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, time.Time{}); err != nil {
 		s.log.ErrorContext(ctx, "mark terminal failed", "task_id", e.TaskID, "err", err)
@@ -898,21 +902,19 @@ func (s *Scheduler) failClaim(ctx context.Context, e registry.TaskEntry, cause e
 	s.log.ErrorContext(ctx, "task.failed_compensated",
 		"task_id", e.TaskID, "job_name", e.JobName, "failure_reason", reason, "err", cause.Error())
 	report := failReport{reason: reason, message: cause.Error()}
-	if err := s.reportFail(ctx, e.TaskID, report); err != nil {
-		s.pendingFail.Store(e.TaskID, report)
-	}
+	// A report whose forward does not land goes to the durable queue
+	// (场景 #10); the entry stays terminal until a round drains it.
+	_ = s.reportFail(ctx, e, report)
 	s.metrics.InflightJobs(s.reg.Inflight())
 }
 
 // reportFail forwards a synthetic fail report (C10) for a task the daemon
 // could not settle itself. A 404/409 means the server already settled it, so
-// it counts as delivered; anything else is an error worth retrying.
-func (s *Scheduler) reportFail(ctx context.Context, taskID string, report failReport) error {
-	body, err := json.Marshal(map[string]string{"error": report.message, "failure_reason": report.reason})
-	if err != nil {
-		return fmt.Errorf("encode fail report: %w", err)
-	}
-	code, _, err := s.server.Forward(ctx, EPFail, taskID, body)
+// it counts as delivered. A forward that does not land is handed to the
+// durable queue (场景 #10), so the report survives this process.
+func (s *Scheduler) reportFail(ctx context.Context, e registry.TaskEntry, report failReport) error {
+	body := report.encode()
+	code, _, err := s.server.Forward(ctx, EPFail, e.TaskID, body)
 	if err == nil && ((code >= 200 && code < 300) || code == 404 || code == 409) {
 		return nil
 	}
@@ -920,7 +922,8 @@ func (s *Scheduler) reportFail(ctx context.Context, taskID string, report failRe
 		err = fmt.Errorf("server returned %d", code)
 	}
 	s.log.ErrorContext(ctx, "task.forward_failed",
-		"task_id", taskID, "endpoint", string(EPFail), "status", code, "err", err)
+		"task_id", e.TaskID, "endpoint", string(EPFail), "status", code, "err", err)
+	s.enqueuePending(ctx, e, EPFail, body)
 	return err
 }
 

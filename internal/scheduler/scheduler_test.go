@@ -157,6 +157,7 @@ type fixture struct {
 	builder *fakeBuilder
 	metrics *fakeMetrics
 	sched   *Scheduler
+	pending *fakePendingReports
 	now     time.Time
 }
 
@@ -167,6 +168,7 @@ func newFixture(t *testing.T) *fixture {
 		server:  &fakeServer{},
 		builder: &fakeBuilder{},
 		metrics: &fakeMetrics{},
+		pending: &fakePendingReports{},
 		now:     testNow,
 	}
 	// The registry shares the fixture clock: with the real clock its done
@@ -179,6 +181,7 @@ func newFixture(t *testing.T) *fixture {
 	}
 	s, err := New(cfg, f.reg, f.jobs, f.builder, f.server, f.metrics,
 		WithClock(func() time.Time { return f.now }),
+		WithPendingReports(f.pending),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	)
 	if err != nil {
@@ -609,8 +612,9 @@ func TestOnReportTerminalFailureKeepsObjects(t *testing.T) {
 	f.reg.Put(e)
 	f.server.forwardCode = 500
 
-	// Without a wired PendingReports queue the daemon still gets 502
-	// (proxy.md 转发 switch) and the terminal entry is retained.
+	// The daemon still gets 502 (proxy.md 转发 switch) and the terminal
+	// entry keeps its objects: the report is in the durable queue now, not
+	// dropped.
 	code, _, err := f.sched.OnReport(context.Background(), EPComplete, e, []byte(`{}`))
 	if err != nil || code != 502 {
 		t.Fatalf("OnReport = %d, %v", code, err)
@@ -849,6 +853,7 @@ func TestReconcileDelegatesToRecoveryWhenWired(t *testing.T) {
 	cfg, _ := LoadConfig(func(string) string { return "" })
 	s, err := New(cfg, f.reg, f.jobs, f.builder, f.server, nil,
 		WithReconciler(rec),
+		WithPendingReports(&fakePendingReports{}),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	)
 	if err != nil {
@@ -860,6 +865,18 @@ func TestReconcileDelegatesToRecoveryWhenWired(t *testing.T) {
 	}
 	if rec.calls != 1 {
 		t.Fatalf("reconciler calls = %d", rec.calls)
+	}
+}
+
+// Contract §4: without a durable queue a terminal report could only be
+// logged and dropped, so a scheduler cannot be built without one.
+func TestNewRequiresPendingReports(t *testing.T) {
+	f := newFixture(t)
+	cfg, _ := LoadConfig(func(string) string { return "" })
+	_, err := New(cfg, f.reg, f.jobs, f.builder, f.server, nil,
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	if err == nil {
+		t.Fatal("New without a pending-report queue: want an error")
 	}
 }
 
@@ -952,6 +969,7 @@ func TestConvergeRunningPreservesConcurrentTransition(t *testing.T) {
 
 func TestOnJobGoneFailedReportRetainsEntryUntilDelivered(t *testing.T) {
 	f := newFixture(t)
+	p := f.withPendingReports()
 	e := f.claim(t, "task-1")
 	e.State = registry.StateRunning
 	f.reg.Put(e)
@@ -962,25 +980,33 @@ func TestOnJobGoneFailedReportRetainsEntryUntilDelivered(t *testing.T) {
 	if err := f.sched.OnJobGone(context.Background(), "fm-task-1"); err != nil {
 		t.Fatalf("OnJobGone: %v", err)
 	}
-	// The report did not land: the terminal entry and its handle must stay.
+	// The report did not land: it is in the durable queue, and the terminal
+	// entry keeps its objects until a drain delivers it.
 	e, ok := f.reg.Get("task-1")
 	if !ok || e.State != registry.StateTerminal || e.Result != registry.ResultFailed {
 		t.Fatalf("entry = %+v, %v", e, ok)
 	}
+	if len(p.reports) != 1 || p.reports[0].taskID != "task-1" || p.reports[0].ep != EPFail {
+		t.Fatalf("pending reports = %+v, want the compensated fail report", p.reports)
+	}
 	if len(f.jobs.deletedSecrets) != 1 { // only the claim-time stale sweep
 		t.Fatalf("secret deleted before report landed: %+v", f.jobs.deletedSecrets)
 	}
+	if !f.hasJob("fm-task-1") {
+		t.Fatal("Job deleted before the queued report landed")
+	}
 
-	// Server recovers: the next reconcile redelivers the report, then cleans up.
-	f.server.forwardCode = 200
+	// The drain landed the report: the next round cleans up. The scheduler
+	// never forwards it a second time — the queue owns the redelivery.
+	p.deliver("task-1")
 	if err := f.sched.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	if _, ok := f.reg.Get("task-1"); ok {
 		t.Fatal("entry kept after the pending report landed")
 	}
-	if n := len(f.server.forwards); n != 2 {
-		t.Fatalf("forwards = %d, want 2 (initial + retry)", n)
+	if n := len(f.server.forwards); n != 1 {
+		t.Fatalf("forwards = %d, want 1 (initial attempt only)", n)
 	}
 	if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != "fm-task-1" {
 		t.Fatalf("job deletes = %+v", f.jobs.deletedJobs)
@@ -1040,6 +1066,7 @@ func newCappedScheduler(t *testing.T, f *fixture, maxJobsPerNode int, logw io.Wr
 	}
 	s, err := New(cfg, f.reg, f.jobs, builder, f.server, f.metrics,
 		WithClock(func() time.Time { return f.now }),
+		WithPendingReports(&fakePendingReports{}),
 		WithLogger(slog.New(slog.NewJSONHandler(logw, nil))))
 	if err != nil {
 		t.Fatalf("New: %v", err)

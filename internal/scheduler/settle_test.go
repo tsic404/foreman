@@ -45,6 +45,42 @@ func TestReleaseTaskKeepsEntryUntilObjectsAreGone(t *testing.T) {
 	}
 }
 
+// A terminal entry whose report is still queued keeps its objects: the
+// cleanup waits for the drain that lands it (contract §4).
+func TestSettleTerminalKeepsObjectsWhileReportIsQueued(t *testing.T) {
+	f := newFixture(t)
+	p := f.withPendingReports()
+	f.claim(t, "task-1")
+	if _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, f.now); err != nil {
+		t.Fatalf("MarkTerminal: %v", err)
+	}
+	if err := p.Enqueue("task-1", EPFail, []byte(`{"failure_reason":"job_missing"}`)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	if err := f.sched.SettleTerminal(context.Background(), "task-1", "failed"); err != nil {
+		t.Fatalf("SettleTerminal: %v", err)
+	}
+	if _, ok := f.reg.Get("task-1"); !ok {
+		t.Fatal("the entry must stay while its report is queued")
+	}
+	if !f.hasJob("fm-task-1") {
+		t.Fatal("the Job must survive while its report is queued")
+	}
+
+	// The drain delivered it: the next settle round cleans up.
+	p.deliver("task-1")
+	if err := f.sched.SettleTerminal(context.Background(), "task-1", "failed"); err != nil {
+		t.Fatalf("SettleTerminal after delivery: %v", err)
+	}
+	if _, ok := f.reg.Get("task-1"); ok {
+		t.Fatal("the entry must be dropped once the report landed")
+	}
+	if f.hasJob("fm-task-1") {
+		t.Fatal("the Job must be deleted once the report landed")
+	}
+}
+
 // A terminal entry whose cleanup keeps failing must keep its mapping too:
 // the same retry handle backs SettleTerminal (顺序与幂等规则 1/2).
 func TestSettleTerminalKeepsEntryWhenCleanupFails(t *testing.T) {

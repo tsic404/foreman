@@ -61,11 +61,15 @@ type Reconciler interface {
 }
 
 // PendingReports is the recovery module's durable terminal-report queue
-// (contract §4: terminal callbacks are never dropped). The scheduler
-// enqueues daemon terminal reports whose forward exhausted the proxy's
-// retry budget; recovery drains the queue until the server accepts them.
+// (contract §4: terminal callbacks are never dropped). The scheduler hands
+// it every terminal report whose forward exhausted the proxy's retry budget
+// or failed outright; recovery drains the queue until the server accepts
+// them. A queued report also holds back the object cleanup of its task:
+// a deleted Job must never stand in for a delivered report.
 type PendingReports interface {
 	Enqueue(taskID string, ep Endpoint, body []byte) error
+	// Queued reports whether taskID's terminal report is still undelivered.
+	Queued(taskID string) bool
 }
 
 // noopMetrics keeps every Metrics call site nil-safe.
