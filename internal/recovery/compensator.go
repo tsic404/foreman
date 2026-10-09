@@ -29,6 +29,10 @@ type Settler interface {
 	// ReleaseTask removes the Job/Secret and drops the mapping without a
 	// terminal report (#2 redispatch, #8 cancel timeout, #9 gone).
 	ReleaseTask(ctx context.Context, taskID string) error
+	// SyncInflight re-derives the inflight gauge from the live index. The
+	// round calls it every interval, so a settlement path that missed its own
+	// refresh cannot freeze a stale count past one round.
+	SyncInflight()
 }
 
 // Compensator reports a terminal state on the daemon's behalf

@@ -48,6 +48,14 @@ func fakeJobName(taskID string) string { return "fm-" + taskID }
 // directory; tests that need to break the queue open it themselves.
 func setupIntegration(t *testing.T, server *fakeServerClient, dir string, opts ...PendingReportsOption) (*registry.Registry, *fakeJobClient, *scheduler.Scheduler, *PendingReports, func(ObjectClient) *Reconciler) {
 	t.Helper()
+	return setupIntegrationWithMetrics(t, server, dir, nil, opts...)
+}
+
+// setupIntegrationWithMetrics is setupIntegration with the observability
+// implementation wired into the scheduler, so a test can read the gauge off
+// the exposition the scrape endpoint serves rather than off the seam.
+func setupIntegrationWithMetrics(t *testing.T, server *fakeServerClient, dir string, metrics scheduler.Metrics, opts ...PendingReportsOption) (*registry.Registry, *fakeJobClient, *scheduler.Scheduler, *PendingReports, func(ObjectClient) *Reconciler) {
+	t.Helper()
 	if dir == "" {
 		dir = t.TempDir()
 	}
@@ -58,7 +66,7 @@ func setupIntegration(t *testing.T, server *fakeServerClient, dir string, opts .
 	reg := registry.New(time.Now)
 	jobs := newFakeJobClient()
 	lb := &lateBound{}
-	sched, err := scheduler.New(schedConfig(), reg, jobs, stubBuilder{}, server, nil,
+	sched, err := scheduler.New(schedConfig(), reg, jobs, stubBuilder{}, server, metrics,
 		scheduler.WithReconciler(lb),
 		scheduler.WithPendingReports(pending))
 	if err != nil {

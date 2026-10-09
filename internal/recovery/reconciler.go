@@ -276,6 +276,10 @@ func (r *Reconciler) nextDeadline() (time.Time, bool) {
 // state of settled tasks forgotten. It is the seam the scheduler calls
 // (scheduler.Reconciler) and what Run repeats.
 func (r *Reconciler) Reconcile(ctx context.Context) error {
+	// The inflight gauge is derived state of the live index: re-deriving it
+	// every round bounds a stale value to one interval no matter which
+	// settlement path ran (observability.md §指标).
+	r.settler.SyncInflight()
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.drainPending(ctx)
