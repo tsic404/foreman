@@ -396,10 +396,10 @@ func TestBuildWithValidOverlay(t *testing.T) {
 		t.Errorf("prepare imagePullPolicy = %q, want the overlay's IfNotPresent", pod.InitContainers[0].ImagePullPolicy)
 	}
 
-	// 清单 A: the 16 authoritative env keys survive and the overlay env is added.
+	// 清单 A: the 15 authoritative env keys survive and the overlay env is added.
 	names := envNames(pod.Containers[0].Env)
-	if len(names) != 17 {
-		t.Errorf("agent env count = %d (%v), want 16 authoritative + HTTP_PROXY", len(names), names)
+	if len(names) != 16 {
+		t.Errorf("agent env count = %d (%v), want 15 authoritative + HTTP_PROXY", len(names), names)
 	}
 	httpProxy := envByName(t, pod.Containers[0].Env, "HTTP_PROXY")
 	if httpProxy.Value != "http://proxy.corp:3128" {
@@ -421,7 +421,7 @@ func TestBuildWithValidOverlay(t *testing.T) {
 	// 清单 A: the authoritative fields are byte-identical to the default
 	// template even with the overlay in place (AC-18 不变量不动).
 	agent := pod.Containers[0]
-	if !equalStrings(agent.Command, []string{agentCommand}) || !equalStrings(agent.Args, []string{"daemon", "start", "--foreground"}) {
+	if !equalStrings(agent.Command, []string{agentCommand}) || !equalStrings(agent.Args, []string{"daemon", "start", "--foreground", "--profile", jobProfile}) {
 		t.Errorf("agent entrypoint drifted: %v %v", agent.Command, agent.Args)
 	}
 	if !agent.TTY || agent.WorkingDir != agentWorkingDir {
@@ -434,8 +434,8 @@ func TestBuildWithValidOverlay(t *testing.T) {
 	if credSrc.Secret == nil || credSrc.Secret.SecretName != job.Name+secretCredSuffix {
 		t.Errorf("cred-src volume drifted: %+v", credSrc.VolumeSource)
 	}
-	if path := mountPathByName(t, agent.VolumeMounts, volumeCred); path != mountCred {
-		t.Errorf("cred mountPath = %q, want %q", path, mountCred)
+	if path := mountPathByName(t, agent.VolumeMounts, volumeCred); path != mountCredFile {
+		t.Errorf("cred mountPath = %q, want %q", path, mountCredFile)
 	}
 }
 

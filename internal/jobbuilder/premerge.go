@@ -176,7 +176,7 @@ func checkAgentSecurityContext(v *violations, path string, container map[string]
 	}
 }
 
-// checkAgentEnv: the 16 authoritative env keys must not be touched and new
+// checkAgentEnv: the 15 authoritative env keys must not be touched and new
 // env entries must not use the MULTICA_ prefix.
 func checkAgentEnv(v *violations, containerPath string, container map[string]any) {
 	list, ok := listAt(container, "env")
@@ -192,7 +192,7 @@ func checkAgentEnv(v *violations, containerPath string, container map[string]any
 		name, _ := m["name"].(string)
 		switch {
 		case authoritativeEnvKeys[name]:
-			v.add(fmt.Sprintf("%s.env[%s]", containerPath, name), "清单 A: 16 键权威 env 不得增删改（F5/§5.2）")
+			v.add(fmt.Sprintf("%s.env[%s]", containerPath, name), "清单 A: 15 键权威 env 不得增删改（F5/§5.2）")
 		case strings.HasPrefix(name, "MULTICA_"):
 			v.add(fmt.Sprintf("%s.env[%s]", containerPath, name), "清单 A: 新增 env 不得使用 MULTICA_ 前缀")
 		}

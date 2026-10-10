@@ -41,9 +41,14 @@ const (
 
 	mountHome       = "/home/agent"
 	mountWorkspaces = "/state/workspaces"
-	mountCred       = "/home/agent/cred"
 	mountTmp        = "/tmp"
 	mountCredSrc    = "/cred"
+	// mountCredOut is the prepare-side write end of the cred bucket; the agent
+	// reads the bucket through the single-file mount mountCredFile, which lands
+	// on the profile directory kept on the node-local hostPath home (ADR-013 r2).
+	mountCredOut  = "/credout"
+	profileDir    = profilesDir + "/" + jobProfile
+	mountCredFile = profileDir + "/" + configFileKey
 
 	foremanDomain = "foreman.tsic.top/"
 )
@@ -61,15 +66,32 @@ const (
 	credFileMode      = 0o400
 	secretCredSuffix  = "-cred"
 
-	agentCommand    = "/usr/local/bin/multica"
-	agentWorkingDir = "/home/agent"
+	agentCommand = "/usr/local/bin/multica"
+	// agentWorkingDir is "/" so the upstream task-identity CWD walk never sees
+	// an agent-writable subtree ("guard 第三臂"); HOME stays mountHome (ADR-005).
+	agentWorkingDir = "/"
+
+	// jobProfile is the design constant JOB_PROFILE (ADR-013, 03-contracts
+	// §3.1/§5.2): the daemon runs under this named profile and its config.json,
+	// daemon.pid and daemon.log resolve to profileDir. Distinct from jobAppName
+	// (the runtime display name) — both read "foreman-job" by contract, not by
+	// coupling.
+	jobProfile  = "foreman-job"
+	profilesDir = "/home/agent/.multica/profiles"
 )
 
-// initScript copies the Job Token out of the read-only Secret mount and fixes
-// hostPath ownership; it is the only code that runs as root (ADR-005).
-const initScript = `cp /cred/config.json /home/agent/cred/config.json
-chmod 0400 /home/agent/cred/config.json
-chown -R 1000:1000 /home/agent /state/workspaces
+// initScript copies the Job Token out of the read-only Secret mount into the
+// per-Job cred bucket, heals the node-local profile path and clears a leftover
+// task-context marker before the daemon starts (ADR-013 r3); it is the only
+// code that runs as root (ADR-005). The paths are built from the constants so
+// script and mounts cannot drift apart (AC-20).
+const initScript = `for d in ` + mountHome + `/.multica ` + profilesDir + ` ` + profileDir + `; do
+  [ -d "$d" ] || { rm -f "$d"; mkdir -p "$d"; }
+done
+rm -rf ` + mountHome + `/.multica/daemon_task_context.json
+cp ` + mountCredSrc + `/` + configFileKey + ` ` + mountCredOut + `/` + configFileKey + `
+chmod 0400 ` + mountCredOut + `/` + configFileKey + `
+chown -R 1000:1000 ` + mountHome + ` ` + mountCredOut + `
 `
 
 var (
@@ -214,15 +236,16 @@ func defaultPrepareContainer(cfg Config) corev1.Container {
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: volumeHome, MountPath: mountHome},
 			{Name: volumeWorkspaces, MountPath: mountWorkspaces},
-			{Name: volumeCred, MountPath: mountCred},
+			{Name: volumeCred, MountPath: mountCredOut},
 			{Name: volumeCredSrc, MountPath: mountCredSrc, ReadOnly: true},
 		},
 	}
 }
 
 // defaultAgentContainer is the single business container (ADR-001 收窄口径):
-// the unmodified upstream daemon with its 16-key env set (§5.2). The pull
-// policy is Always so a moved tag reaches every node (ADR-012).
+// the unmodified upstream daemon, started under the named Job profile with its
+// 15-key env set (§5.2). The pull policy is Always so a moved tag reaches
+// every node (ADR-012).
 func defaultAgentContainer(cfg Config) corev1.Container {
 	return corev1.Container{
 		Name:            containerAgent,
@@ -230,7 +253,7 @@ func defaultAgentContainer(cfg Config) corev1.Container {
 		ImagePullPolicy: corev1.PullAlways,
 		WorkingDir:      agentWorkingDir,
 		Command:         []string{agentCommand},
-		Args:            []string{"daemon", "start", "--foreground"},
+		Args:            []string{"daemon", "start", "--foreground", "--profile", jobProfile},
 		TTY:             true, // daemon writes logs to stderr only when it is a terminal
 		SecurityContext: &corev1.SecurityContext{
 			RunAsUser:                new(int64(agentUID)),
@@ -246,21 +269,24 @@ func defaultAgentContainer(cfg Config) corev1.Container {
 		Env: agentEnv(),
 		VolumeMounts: []corev1.VolumeMount{
 			{Name: volumeHome, MountPath: mountHome},
-			{Name: volumeCred, MountPath: mountCred},
+			// Single-file mount: only the Job Token enters the profile dir; the
+			// directory itself stays on the node-local hostPath home (ADR-013 r2).
+			{Name: volumeCred, MountPath: mountCredFile, SubPath: configFileKey, ReadOnly: true},
 			{Name: volumeWorkspaces, MountPath: mountWorkspaces},
 			{Name: volumeTmp, MountPath: mountTmp},
 		},
 	}
 }
 
-// agentEnv is the contract §5.2 env set: exactly 16 entries, fixed order.
+// agentEnv is the contract §5.2 env set: exactly 15 entries, fixed order.
+// Task-identity env never enters the Job (ADR-013): MULTICA_TASK_CONFIG_ROOT
+// in particular makes upstream v0.6.1 refuse `daemon start`.
 func agentEnv() []corev1.EnvVar {
 	fieldRef := func(fieldPath string) *corev1.EnvVarSource {
 		return &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fieldPath}}
 	}
 	return []corev1.EnvVar{
 		{Name: "MULTICA_SERVER_URL", Value: foremanServerURL},
-		{Name: "MULTICA_TASK_CONFIG_ROOT", Value: mountCred},
 		{Name: "MULTICA_DAEMON_ID", ValueFrom: fieldRef("metadata.labels['job-name']")},
 		{Name: "MULTICA_DAEMON_DEVICE_NAME", ValueFrom: fieldRef("spec.nodeName")},
 		{Name: "MULTICA_AGENT_RUNTIME_NAME", Value: jobAppName},
@@ -273,7 +299,7 @@ func agentEnv() []corev1.EnvVar {
 		{Name: "MULTICA_DAEMON_AUTO_UPDATE", Value: "false"},
 		{Name: "MULTICA_DAEMON_AUTO_RELOAD", Value: "false"},
 		{Name: "MULTICA_OMP_PATH", Value: "/usr/local/bin/omp"},
-		{Name: "HOME", Value: agentWorkingDir},
+		{Name: "HOME", Value: mountHome},
 		{Name: "LOG_LEVEL", Value: "info"},
 	}
 }

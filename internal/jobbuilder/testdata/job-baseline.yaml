@@ -63,9 +63,13 @@ spec:
           command: ["/bin/sh", "-ec"]
           args:
             - |
-              cp /cred/config.json /home/agent/cred/config.json
-              chmod 0400 /home/agent/cred/config.json
-              chown -R 1000:1000 /home/agent /state/workspaces
+              for d in /home/agent/.multica /home/agent/.multica/profiles /home/agent/.multica/profiles/foreman-job; do
+                [ -d "$d" ] || { rm -f "$d"; mkdir -p "$d"; }
+              done
+              rm -rf /home/agent/.multica/daemon_task_context.json
+              cp /cred/config.json /credout/config.json
+              chmod 0400 /credout/config.json
+              chown -R 1000:1000 /home/agent /credout
           securityContext:
             runAsUser: 0
             runAsNonRoot: false
@@ -78,15 +82,15 @@ spec:
           volumeMounts:
             - { name: home,       mountPath: /home/agent }
             - { name: workspaces, mountPath: /state/workspaces }
-            - { name: cred,       mountPath: /home/agent/cred }
+            - { name: cred,       mountPath: /credout }
             - { name: cred-src,   mountPath: /cred, readOnly: true }
       containers:
         - name: agent
           image: <job-image>
           imagePullPolicy: Always
-          workingDir: /home/agent
+          workingDir: /
           command: ["/usr/local/bin/multica"]
-          args: ["daemon", "start", "--foreground"]
+          args: ["daemon", "start", "--foreground", "--profile", "foreman-job"]
           tty: true
           securityContext:
             runAsUser: 1000
@@ -99,7 +103,6 @@ spec:
             limits:   { cpu: "4", memory: 8Gi }
           env:
             - { name: MULTICA_SERVER_URL,                  value: "http://foreman.foreman.svc.cluster.local:8080" }
-            - { name: MULTICA_TASK_CONFIG_ROOT,            value: "/home/agent/cred" }
             - { name: MULTICA_DAEMON_ID,                   valueFrom: { fieldRef: { fieldPath: "metadata.labels['job-name']" } } }
             - { name: MULTICA_DAEMON_DEVICE_NAME,          valueFrom: { fieldRef: { fieldPath: "spec.nodeName" } } }
             - { name: MULTICA_AGENT_RUNTIME_NAME,          value: "foreman-job" }
@@ -116,7 +119,7 @@ spec:
             - { name: LOG_LEVEL,                           value: "info" }
           volumeMounts:
             - { name: home,       mountPath: /home/agent }
-            - { name: cred,       mountPath: /home/agent/cred }
+            - { name: cred,       mountPath: /home/agent/.multica/profiles/foreman-job/config.json, subPath: config.json, readOnly: true }
             - { name: workspaces, mountPath: /state/workspaces }
             - { name: tmp,        mountPath: /tmp }
       volumes:

@@ -272,10 +272,10 @@ func TestBuildContainers(t *testing.T) {
 	if agent.ImagePullPolicy != corev1.PullAlways {
 		t.Errorf("agent imagePullPolicy = %q, want Always (ADR-012 movable tag)", agent.ImagePullPolicy)
 	}
-	if agent.WorkingDir != "/home/agent" {
-		t.Errorf("agent workingDir = %q", agent.WorkingDir)
+	if agent.WorkingDir != "/" {
+		t.Errorf("agent workingDir = %q, want / (guard 第三臂)", agent.WorkingDir)
 	}
-	if strings.Join(agent.Command, " ") != "/usr/local/bin/multica" || strings.Join(agent.Args, " ") != "daemon start --foreground" {
+	if strings.Join(agent.Command, " ") != "/usr/local/bin/multica" || strings.Join(agent.Args, " ") != "daemon start --foreground --profile foreman-job" {
 		t.Errorf("agent command/args = %v %v", agent.Command, agent.Args)
 	}
 	if !agent.TTY {
@@ -304,6 +304,14 @@ func TestBuildContainers(t *testing.T) {
 			t.Errorf("agent volumeMount[%d] = %q, want %q", i, agent.VolumeMounts[i].Name, name)
 		}
 	}
+	// ADR-013 r2: the cred bucket reaches the agent as one read-only file on the
+	// node-local profile directory, never as a directory of its own.
+	if m := agent.VolumeMounts[1]; m.MountPath != mountCredFile || m.SubPath != configFileKey || !m.ReadOnly {
+		t.Errorf("agent cred mount = %+v, want single file %s (subPath %s, readOnly)", m, mountCredFile, configFileKey)
+	}
+	if m := spec.InitContainers[0].VolumeMounts[2]; m.Name != volumeCred || m.MountPath != mountCredOut || m.ReadOnly || m.SubPath != "" {
+		t.Errorf("prepare cred mount = %+v, want %s writable (no subPath)", m, mountCredOut)
+	}
 
 	init := spec.InitContainers[0]
 	if init.Name != "prepare" || init.Image != wantImage {
@@ -318,7 +326,13 @@ func TestBuildContainers(t *testing.T) {
 	if strings.Join(init.Command, " ") != "/bin/sh -ec" {
 		t.Errorf("init command = %v", init.Command)
 	}
-	wantScript := "cp /cred/config.json /home/agent/cred/config.json\nchmod 0400 /home/agent/cred/config.json\nchown -R 1000:1000 /home/agent /state/workspaces\n"
+	wantScript := "for d in /home/agent/.multica /home/agent/.multica/profiles /home/agent/.multica/profiles/foreman-job; do\n" +
+		"  [ -d \"$d\" ] || { rm -f \"$d\"; mkdir -p \"$d\"; }\n" +
+		"done\n" +
+		"rm -rf /home/agent/.multica/daemon_task_context.json\n" +
+		"cp /cred/config.json /credout/config.json\n" +
+		"chmod 0400 /credout/config.json\n" +
+		"chown -R 1000:1000 /home/agent /credout\n"
 	if len(init.Args) != 1 || init.Args[0] != wantScript {
 		t.Errorf("init args = %q, want %q", init.Args, wantScript)
 	}
@@ -350,7 +364,6 @@ func TestBuildAgentEnv(t *testing.T) {
 		fieldPath string
 	}{
 		{"MULTICA_SERVER_URL", "http://foreman.foreman.svc.cluster.local:8080", ""},
-		{"MULTICA_TASK_CONFIG_ROOT", "/home/agent/cred", ""},
 		{"MULTICA_DAEMON_ID", "", "metadata.labels['job-name']"},
 		{"MULTICA_DAEMON_DEVICE_NAME", "", "spec.nodeName"},
 		{"MULTICA_AGENT_RUNTIME_NAME", "foreman-job", ""},
