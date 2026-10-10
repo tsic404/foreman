@@ -513,11 +513,11 @@ func checkAuthoritativeEnv(v *violations, base string, env []corev1.EnvVar) {
 	for _, want := range agentEnv() {
 		actual, ok := got[want.Name]
 		if !ok {
-			v.add(base+"["+want.Name+"]", "清单 A: 16 键权威 env 缺失（§5.2）")
+			v.add(base+"["+want.Name+"]", "清单 A: 15 键权威 env 缺失（§5.2）")
 			continue
 		}
 		if !reflect.DeepEqual(actual, want) {
-			v.add(base+"["+want.Name+"]", "清单 A: 16 键权威 env 逐值锁定（F5/§5.2）")
+			v.add(base+"["+want.Name+"]", "清单 A: 15 键权威 env 逐值锁定（F5/§5.2）")
 		}
 		if duplicates[want.Name] {
 			v.add(base+"["+want.Name+"]", "清单 A: env 键重复")
