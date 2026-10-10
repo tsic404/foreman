@@ -25,6 +25,13 @@ const (
 	EnvGCInterval    = "FOREMAN_GC_INTERVAL"
 	EnvGCQuiesce     = "FOREMAN_GC_QUIESCE"
 
+	// EnvAgentStateTTL / EnvAgentMemoryTTL cover the node-local agent state
+	// outside the workspaces tree: profile-relative session/transcript stores,
+	// pi-sessions and the codex session stores (state), and hermes memory
+	// (memory). 0 turns the rule off.
+	EnvAgentStateTTL  = "FOREMAN_AGENT_STATE_TTL"
+	EnvAgentMemoryTTL = "FOREMAN_AGENT_MEMORY_TTL"
+
 	// EnvNodeName carries the node the pod runs on (downward API
 	// spec.nodeName); it is the `node` field of the cache.gc log event.
 	EnvNodeName = "NODE_NAME"
@@ -40,6 +47,10 @@ const (
 	DefaultCacheMaxBytes = 50 << 30 // 50Gi
 	DefaultGCInterval    = 6 * time.Hour
 	DefaultGCQuiesce     = 30 * time.Minute
+	// DefaultAgentStateTTL / DefaultAgentMemoryTTL align with the upstream GC
+	// defaults (14 days for sessions/transcripts, 90 days for memory).
+	DefaultAgentStateTTL  = 336 * time.Hour
+	DefaultAgentMemoryTTL = 2160 * time.Hour
 )
 
 // Config is the gc module's runtime configuration.
@@ -60,6 +71,12 @@ type Config struct {
 	// Quiesce skips a round when the state root was written within it
 	// (FOREMAN_GC_QUIESCE): a round must never race a running Job.
 	Quiesce time.Duration
+	// AgentStateTTL is the retention for node-local agent sessions and
+	// transcripts (FOREMAN_AGENT_STATE_TTL); 0 disables the rule.
+	AgentStateTTL time.Duration
+	// AgentMemoryTTL is the retention for node-local agent memory
+	// (FOREMAN_AGENT_MEMORY_TTL); 0 disables the rule.
+	AgentMemoryTTL time.Duration
 	// Interval is the round cadence (FOREMAN_GC_INTERVAL).
 	Interval time.Duration
 	// LogLevel comes from FOREMAN_LOG_LEVEL.
@@ -77,13 +94,15 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	cfg := Config{
-		StateRoot:     DefaultStateRoot,
-		CacheTTL:      DefaultCacheTTL,
-		TaskDirTTL:    DefaultTaskDirTTL,
-		CacheMaxBytes: DefaultCacheMaxBytes,
-		Quiesce:       DefaultGCQuiesce,
-		Interval:      DefaultGCInterval,
-		LogLevel:      obs.LogLevel,
+		StateRoot:      DefaultStateRoot,
+		CacheTTL:       DefaultCacheTTL,
+		TaskDirTTL:     DefaultTaskDirTTL,
+		CacheMaxBytes:  DefaultCacheMaxBytes,
+		Quiesce:        DefaultGCQuiesce,
+		Interval:       DefaultGCInterval,
+		AgentStateTTL:  DefaultAgentStateTTL,
+		AgentMemoryTTL: DefaultAgentMemoryTTL,
+		LogLevel:       obs.LogLevel,
 	}
 	if v := strings.TrimSpace(getenv(EnvStateRoot)); v != "" {
 		cfg.StateRoot = v
@@ -123,6 +142,22 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			return Config{}, err
 		}
 		cfg.Interval = d
+	}
+	// The agent-state rules accept 0 (rule off); negative values are rejected
+	// as a configuration error, like the quiesce window.
+	if v := strings.TrimSpace(getenv(EnvAgentStateTTL)); v != "" {
+		d, err := nonNegativeDuration(EnvAgentStateTTL, v)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.AgentStateTTL = d
+	}
+	if v := strings.TrimSpace(getenv(EnvAgentMemoryTTL)); v != "" {
+		d, err := nonNegativeDuration(EnvAgentMemoryTTL, v)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.AgentMemoryTTL = d
 	}
 	return cfg, nil
 }

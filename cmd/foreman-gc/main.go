@@ -1,7 +1,8 @@
 // Command foreman-gc is the node-local cache collector. It runs as a
 // DaemonSet (one pod per node) with the node's state root mounted at
 // /state, reclaiming task directories, bare repo caches and orphan task
-// roots by TTL and by the .repos size cap.
+// roots by TTL and by the .repos size cap, plus the node-local agent state
+// (sessions, transcripts and memory) under /state/home.
 //
 // Design: docs/05-modules/job-template.md §节点清理, contracts §5.1,
 // ADR-005 (node-local hostPath), ADR-006 (shared .repos).
@@ -49,6 +50,8 @@ func run() error {
 		"quiesce", cfg.Quiesce.String(),
 		"cache_ttl", cfg.CacheTTL.String(),
 		"task_dir_ttl", cfg.TaskDirTTL.String(),
+		"agent_state_ttl", cfg.AgentStateTTL.String(),
+		"agent_memory_ttl", cfg.AgentMemoryTTL.String(),
 		"cache_max_bytes", cfg.CacheMaxBytes,
 	)
 	if err := gc.New(cfg, log).Run(ctx); err != nil {
