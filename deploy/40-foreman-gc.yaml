@@ -59,6 +59,14 @@ spec:
               value: "720h"
             - name: FOREMAN_TASK_DIR_TTL
               value: "168h"
+            # Node-local agent state under ${FOREMAN_STATE_ROOT}/home: the
+            # session/transcript stores, pi-sessions and codex stores follow
+            # the state TTL, hermes memory the (deliberately long) memory TTL.
+            # "0" turns the corresponding rule off (contract §5.1).
+            - name: FOREMAN_AGENT_STATE_TTL
+              value: "336h"
+            - name: FOREMAN_AGENT_MEMORY_TTL
+              value: "2160h"
             - name: FOREMAN_CACHE_MAX_BYTES
               value: "50Gi"
             - name: FOREMAN_GC_QUIESCE
