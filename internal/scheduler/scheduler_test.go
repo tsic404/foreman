@@ -1393,3 +1393,50 @@ func TestOnClaimDropsAffinityForSaturatedNode(t *testing.T) {
 		})
 	}
 }
+
+// TestOnClaimWithoutIssueContext (AC-23): an autopilot-triggered payload has no
+// issue context and must still reach the Job path — it used to fail with
+// invalid_job_template because the invariant check demanded non-empty issue
+// annotations.
+func TestOnClaimWithoutIssueContext(t *testing.T) {
+	f := newFixture(t)
+	var buf bytes.Buffer
+	sched := newCappedScheduler(t, f, 4, &buf)
+
+	payload := json.RawMessage(`{
+		"id": "t1",
+		"agent_id": "agent-1",
+		"workspace_id": "ws-1",
+		"autopilot_run_id": "run-1",
+		"runtime_id": "real-runtime",
+		"auth_token": "mat_secret"
+	}`)
+	if err := sched.OnClaim(context.Background(), payload); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	if len(f.jobs.createdJobs) != 1 {
+		t.Fatalf("created Jobs = %d, want 1", len(f.jobs.createdJobs))
+	}
+	annos := f.jobs.createdJobs[0].Annotations
+	if annos[registry.AnnoAutopilotRunID] != "run-1" {
+		t.Errorf("autopilot-run-id = %q, want run-1", annos[registry.AnnoAutopilotRunID])
+	}
+	for _, key := range []string{registry.AnnoIssueID, registry.AnnoIssueIdentifier, registry.AnnoChatSessionID} {
+		if value, present := annos[key]; present {
+			t.Errorf("annotation %q = %q, want the key absent", key, value)
+		}
+	}
+	e, ok := f.reg.Get("t1")
+	if !ok || e.State != registry.StateJobCreated {
+		t.Fatalf("entry = %+v, %v", e, ok)
+	}
+	if e.AutopilotRunID != "run-1" || e.IssueID != "" || e.ChatSessionID != "" {
+		t.Fatalf("entry trigger context = %+v", e)
+	}
+	// The claim log carries the entry anchors, so an operator can find a task
+	// that has no issue (observability.md task.claimed).
+	record := findLogRecord(t, buf.Bytes(), "task.claimed")
+	if record["autopilot_run_id"] != "run-1" || record["chat_session_id"] != "" || record["issue_identifier"] != "" {
+		t.Errorf("task.claimed trigger context = %v", record)
+	}
+}

@@ -498,6 +498,114 @@ func TestBuildDropsAffinityForSaturatedNode(t *testing.T) {
 	}
 }
 
+// TestBuildTriggerContextAnnotations (AC-24): the four trigger-context keys are
+// independent conditional blocks — a non-empty field writes its key with that
+// value, an empty field writes no key at all. The issue group carries its two
+// mixed forms as well: §3.1 declares `issue_id` without `issue_identifier` (and
+// the reverse) legal, so neither key may be written from the other's value. The
+// last two cases (autopilot and chat entry, no issue context) are the payload
+// shapes the build path used to refuse (ADR-014).
+func TestBuildTriggerContextAnnotations(t *testing.T) {
+	const (
+		issueID        = "aa10a105-59cf-4b6c-964e-4f857b580bcf"
+		issueKey       = "MULTI-9000"
+		autopilotRunID = "b1c2d3e4-5f60-4a7b-8c9d-0e1f2a3b4c5d"
+		chatSessionID  = "c1d2e3f4-5061-4b8c-9d0e-1f2a3b4c5d6e"
+	)
+	cases := []struct {
+		name   string
+		mutate func(*TaskEntry)
+		want   map[string]string
+	}{
+		{"issue trigger", func(*TaskEntry) {}, map[string]string{
+			annoIssueID:         issueID,
+			annoIssueIdentifier: issueKey,
+		}},
+		{"issue trigger, identifier absent", func(e *TaskEntry) {
+			e.IssueIdentifier = ""
+		}, map[string]string{annoIssueID: issueID}},
+		{"issue trigger, id absent", func(e *TaskEntry) {
+			e.IssueID = ""
+		}, map[string]string{annoIssueIdentifier: issueKey}},
+		{"autopilot trigger", func(e *TaskEntry) {
+			e.IssueID, e.IssueIdentifier, e.AutopilotRunID = "", "", autopilotRunID
+		}, map[string]string{annoAutopilotRunID: autopilotRunID}},
+		{"chat entry trigger", func(e *TaskEntry) {
+			e.IssueID, e.IssueIdentifier, e.ChatSessionID = "", "", chatSessionID
+		}, map[string]string{annoChatSessionID: chatSessionID}},
+		{"no trigger context", func(e *TaskEntry) {
+			e.IssueID, e.IssueIdentifier = "", ""
+		}, map[string]string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			entry := testEntry()
+			tc.mutate(&entry)
+			job, _ := mustBuild(t, testConfig(), entry)
+
+			for _, key := range triggerContextAnnotationKeys {
+				want, wanted := tc.want[key]
+				got, present := job.Annotations[key]
+				switch {
+				case !wanted && present:
+					t.Errorf("annotation %q = %q, want the key absent", key, got)
+				case wanted && (!present || got != want):
+					t.Errorf("annotation %q = %q (present=%v), want %q", key, got, present, want)
+				}
+			}
+			for _, key := range requiredAnnotationKeys {
+				if job.Annotations[key] == "" {
+					t.Errorf("mandatory annotation %q must stay non-empty", key)
+				}
+			}
+			for key, value := range job.Annotations {
+				if strings.HasPrefix(key, foremanDomain) && value == "" {
+					t.Errorf("annotation %q is an empty placeholder", key)
+				}
+			}
+		})
+	}
+}
+
+// TestBuildRejectsEmptyTriggerContextPlaceholder is the invariant half of the
+// conditional block (§3.2 判定面): a missing key passes, a key present with an
+// empty value does not — on the authoritative Job object it is
+// indistinguishable from a lost annotation.
+func TestBuildRejectsEmptyTriggerContextPlaceholder(t *testing.T) {
+	cfg := testConfigWithIssuer()
+	entry := testEntry()
+	entry.IssueID, entry.IssueIdentifier = "", ""
+	entry.AutopilotRunID = "b1c2d3e4-5f60-4a7b-8c9d-0e1f2a3b4c5d"
+	job, _ := mustBuild(t, cfg, entry)
+
+	checker := InvariantChecker{cfg: cfg}
+	if violations := checker.Check(job); len(violations) != 0 {
+		t.Fatalf("conditional blocks must pass the checker: %v", violations)
+	}
+
+	job.Annotations[annoAutopilotRunID] = ""
+	violations := checker.Check(job)
+	if len(violations) != 1 || violations[0].Path != "metadata.annotations["+annoAutopilotRunID+"]" {
+		t.Fatalf("an empty trigger-context placeholder must be the only violation, got %v", violations)
+	}
+}
+
+// TestBuildSkipsAffinityWithoutIssueContext (ADR-014 §软亲和): an entry with no
+// issue context never joins the issue-keyed reuse index, so it carries no
+// preferred affinity — even when the index holds an entry under the empty key.
+func TestBuildSkipsAffinityWithoutIssueContext(t *testing.T) {
+	entry := testEntry()
+	entry.IssueID, entry.IssueIdentifier = "", ""
+	entry.AutopilotRunID = "b1c2d3e4-5f60-4a7b-8c9d-0e1f2a3b4c5d"
+
+	cfg := testConfig()
+	cfg.Nodes = fakeNodes{"": "company-02"}
+	job, _ := mustBuild(t, cfg, entry)
+	if job.Spec.Template.Spec.Affinity != nil {
+		t.Errorf("affinity = %+v, want none for an entry without issue context", job.Spec.Template.Spec.Affinity)
+	}
+}
+
 func TestBuildActiveDeadlineDisabled(t *testing.T) {
 	cfg := testConfig()
 	cfg.TaskMaxDuration = 0

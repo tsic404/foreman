@@ -1,7 +1,9 @@
 # TC-tech-job-01 / AC-20 的权威回归基线。
 # 本文件是 `docs/05-modules/job-template.md` §Job Manifest（默认模板）的测试基线拷贝：
-# 占位符字面保留（替换规则见 job-template.md「占位符与回归基线」）；条件性的 nodeAffinity
-# 块不在基线内（归一化时从实际对象删除，形状由 TC-tech-job-01 单独断言）。
+# 占位符字面保留（替换规则见 job-template.md「占位符与回归基线」）；**条件块不在基线内**——
+# 条件性 nodeAffinity 块与触发上下文注解（issue-id / issue-identifier / autopilot-run-id /
+# chat-session-id）在归一化时从实际对象删除，形状由 TC-tech-job-01（affinity、issue 触发分支）与
+# TC-tech-job-04（autopilot 触发 / 聊天入口触发两个分支）单独断言。
 # 修订 job-template.md 的默认模板必须同 PR 同步本文件。
 apiVersion: batch/v1
 kind: Job
@@ -15,8 +17,6 @@ metadata:
     foreman.tsic.top/agent-id: "<agent_id>"
     foreman.tsic.top/workspace-id: "<workspace_id>"
   annotations:
-    foreman.tsic.top/issue-id: "<issue_id>"
-    foreman.tsic.top/issue-identifier: "<issue-identifier>"
     foreman.tsic.top/daemon-id: "fm-<task_id>"
     foreman.tsic.top/job-runtime-id: "<job runtime uuid>"
     foreman.tsic.top/claimed-at: "<RFC3339>"

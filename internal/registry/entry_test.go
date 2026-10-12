@@ -21,18 +21,18 @@ func jobWithMeta(labels, annos map[string]string) batchv1.Job {
 
 func fullJobMeta() (map[string]string, map[string]string) {
 	return map[string]string{
-		LabelManagedBy:   ManagedByForeman,
-		LabelTaskID:      "task-1",
-		LabelAgentID:     "agent-1",
-		LabelWorkspaceID: "ws-1",
-	}, map[string]string{
-		AnnoIssueID:         "issue-1",
-		AnnoIssueIdentifier: "MULTI-1",
-		AnnoDaemonID:        "fm-task-1",
-		AnnoJobRuntimeID:    "rt-1",
-		AnnoClaimedAt:       "2026-10-04T08:30:00Z",
-		AnnoAttempt:         "3",
-	}
+			LabelManagedBy:   ManagedByForeman,
+			LabelTaskID:      "task-1",
+			LabelAgentID:     "agent-1",
+			LabelWorkspaceID: "ws-1",
+		}, map[string]string{
+			AnnoIssueID:         "issue-1",
+			AnnoIssueIdentifier: "MULTI-1",
+			AnnoDaemonID:        "fm-task-1",
+			AnnoJobRuntimeID:    "rt-1",
+			AnnoClaimedAt:       "2026-10-04T08:30:00Z",
+			AnnoAttempt:         "3",
+		}
 }
 
 func TestTaskEntryFromJobRestoresIdentity(t *testing.T) {
@@ -65,6 +65,39 @@ func TestTaskEntryFromJobRestoresIdentity(t *testing.T) {
 	}
 	if e.Payload != nil {
 		t.Fatal("payload restored from annotations (F3 forbids it)")
+	}
+}
+
+func TestTaskEntryFromJobRestoresTriggerContext(t *testing.T) {
+	labels, annos := fullJobMeta()
+	annos[AnnoAutopilotRunID] = "run-1"
+	e, err := TaskEntryFromJob(jobWithMeta(labels, annos))
+	if err != nil {
+		t.Fatalf("TaskEntryFromJob: %v", err)
+	}
+	if e.AutopilotRunID != "run-1" || e.ChatSessionID != "" {
+		t.Fatalf("trigger context not restored: %+v", e)
+	}
+}
+
+// TestTaskEntryFromJobWithoutIssueContext (ADR-014): the two issue keys are
+// simply absent on an autopilot-triggered Job — a missing conditional-block key
+// means that context does not exist, never a rebuild error.
+func TestTaskEntryFromJobWithoutIssueContext(t *testing.T) {
+	labels, annos := fullJobMeta()
+	delete(annos, AnnoIssueID)
+	delete(annos, AnnoIssueIdentifier)
+	annos[AnnoAutopilotRunID] = "run-1"
+
+	e, err := TaskEntryFromJob(jobWithMeta(labels, annos))
+	if err != nil {
+		t.Fatalf("TaskEntryFromJob: %v", err)
+	}
+	if e.IssueID != "" || e.IssueIdentifier != "" || e.ChatSessionID != "" {
+		t.Fatalf("absent contexts must rebuild empty: %+v", e)
+	}
+	if e.AutopilotRunID != "run-1" {
+		t.Fatalf("autopilot anchor = %q, want run-1", e.AutopilotRunID)
 	}
 }
 

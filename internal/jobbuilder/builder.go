@@ -20,6 +20,8 @@ type TaskEntry struct {
 	AgentID         string
 	IssueID         string
 	IssueIdentifier string
+	AutopilotRunID  string
+	ChatSessionID   string
 	WorkspaceID     string
 	JobRuntimeID    string
 	ClaimedAt       time.Time
@@ -217,11 +219,13 @@ func (b *Builder) checker() InvariantChecker {
 }
 
 // preferredNode returns the soft-affinity node for e's issue, "" when reuse
-// is disabled, no history exists, or the node sits at its concurrency cap:
-// a saturated node must not attract another Job (task-mapping §同节点并发 —
-// the cap lowers the node's priority, it never blocks the Job).
+// is disabled, the entry has no issue context, no history exists, or the node
+// sits at its concurrency cap: a saturated node must not attract another Job
+// (task-mapping §同节点并发 — the cap lowers the node's priority, it never
+// blocks the Job). An entry without an issue never participates in the
+// issue-keyed reuse index (ADR-014 §软亲和).
 func (b *Builder) preferredNode(e TaskEntry) string {
-	if !b.cfg.PreferNodeReuse || b.cfg.Nodes == nil {
+	if !b.cfg.PreferNodeReuse || b.cfg.Nodes == nil || e.IssueID == "" {
 		return ""
 	}
 	node := b.cfg.Nodes.LastNodeForIssue(e.IssueID)

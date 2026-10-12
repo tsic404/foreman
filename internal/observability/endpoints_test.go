@@ -110,6 +110,44 @@ func TestTasksListOmitsPayload(t *testing.T) {
 	}
 }
 
+// TestTasksListKeepsTriggerContextKeys (contract §3.1 / AC-04): the four
+// trigger-context keys are always in the projection — an absent context is an
+// empty string, never a missing key, so consumers can assert `== ""`.
+func TestTasksListKeepsTriggerContextKeys(t *testing.T) {
+	reg := registry.New(time.Now)
+	_ = reg.Put(registry.TaskEntry{
+		TaskID:         "t-1",
+		JobName:        "fm-t-1",
+		State:          registry.StateRunning,
+		AutopilotRunID: "run-1",
+	})
+	rec := do(t, newTestHandler(reg, nil), "/foreman/tasks")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var entries []map[string]any
+	decodeBody(t, rec, &entries)
+	if len(entries) != 1 {
+		t.Fatalf("entries = %d, want 1", len(entries))
+	}
+	want := map[string]any{
+		"issue_id":         "",
+		"issue_identifier": "",
+		"autopilot_run_id": "run-1",
+		"chat_session_id":  "",
+	}
+	for key, value := range want {
+		got, ok := entries[0][key]
+		if !ok {
+			t.Errorf("projection dropped %q: %v", key, entries[0])
+			continue
+		}
+		if got != value {
+			t.Errorf("%s = %v, want %q", key, got, value)
+		}
+	}
+}
+
 func TestTasksListEmptyIsArray(t *testing.T) {
 	rec := do(t, newTestHandler(registry.New(time.Now), nil), "/foreman/tasks")
 	body, _ := io.ReadAll(rec.Result().Body)

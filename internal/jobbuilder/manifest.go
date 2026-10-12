@@ -21,6 +21,8 @@ const (
 
 	annoIssueID         = "foreman.tsic.top/issue-id"
 	annoIssueIdentifier = "foreman.tsic.top/issue-identifier"
+	annoAutopilotRunID  = "foreman.tsic.top/autopilot-run-id"
+	annoChatSessionID   = "foreman.tsic.top/chat-session-id"
 	annoDaemonID        = "foreman.tsic.top/daemon-id"
 	annoJobRuntimeID    = "foreman.tsic.top/job-runtime-id"
 	annoClaimedAt       = "foreman.tsic.top/claimed-at"
@@ -141,17 +143,29 @@ func (b *Builder) identityLabels(e TaskEntry) map[string]string {
 	}
 }
 
-// identityAnnotations is the §3.2 Job annotation set. The task payload never
-// appears here: it stays in Foreman memory only (F3/ADR-007).
+// identityAnnotations is the §3.2 Job annotation set. The four trigger-context
+// keys are conditional blocks (ADR-014): a key appears only when its TaskEntry
+// field is non-empty — an empty placeholder is indistinguishable from a lost
+// annotation on the authoritative Job object. The task payload never appears
+// here: it stays in Foreman memory only (F3/ADR-007).
 func (b *Builder) identityAnnotations(name string, e TaskEntry) map[string]string {
-	return map[string]string{
+	annotations := map[string]string{
+		annoDaemonID:     name,
+		annoJobRuntimeID: e.JobRuntimeID,
+		annoClaimedAt:    e.ClaimedAt.UTC().Format(time.RFC3339),
+		annoAttempt:      strconv.Itoa(e.Attempt),
+	}
+	for key, value := range map[string]string{
 		annoIssueID:         e.IssueID,
 		annoIssueIdentifier: e.IssueIdentifier,
-		annoDaemonID:        name,
-		annoJobRuntimeID:    e.JobRuntimeID,
-		annoClaimedAt:       e.ClaimedAt.UTC().Format(time.RFC3339),
-		annoAttempt:         strconv.Itoa(e.Attempt),
+		annoAutopilotRunID:  e.AutopilotRunID,
+		annoChatSessionID:   e.ChatSessionID,
+	} {
+		if value != "" {
+			annotations[key] = value
+		}
 	}
+	return annotations
 }
 
 func (b *Builder) podTemplate(name string, e TaskEntry) corev1.PodTemplateSpec {
