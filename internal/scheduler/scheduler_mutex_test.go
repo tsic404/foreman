@@ -91,7 +91,7 @@ func TestConcurrentOnClaimLeavesNoMutexEntry(t *testing.T) {
 	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
 		t.Fatalf("OnClaim: %v", err)
 	}
-	if got := f.sched.claimMu.lenEntries(); got != 0 {
-		t.Fatalf("claimMu entries = %d after OnClaim, want 0", got)
+	if got := f.sched.taskMu.lenEntries(); got != 0 {
+		t.Fatalf("taskMu entries = %d after OnClaim, want 0", got)
 	}
 }
