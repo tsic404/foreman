@@ -57,6 +57,12 @@ const (
 	// FailureReasonInvalidTaskID is scenario #0's other half: the task ID
 	// cannot become a legal Job name (05-modules/job-template.md §错误处理).
 	FailureReasonInvalidTaskID = "invalid_task_id"
+	// FailureReasonStaleClaim is the S8 rejection: the server answered the
+	// forwarded start with 409 状态不允许 — the claim is stale or the task
+	// is no longer startable (03-contracts.md §1.2 S8, 05-modules/proxy.md
+	// §转发). Permanent by that switch, so the task cannot run under this
+	// claim and is settled failed instead of being re-dispatched.
+	FailureReasonStaleClaim = "stale_claim"
 )
 
 // claimHead is the subset of the claim payload the scheduler reads to index
@@ -69,9 +75,12 @@ type claimHead struct {
 	WorkspaceID     string `json:"workspace_id"`
 }
 
-// keyedMutex serializes OnClaim per task: two concurrent claims of the same
-// task must not interleave their DeleteSecret→CreateSecret→CreateJob
-// sequence (the loser's AlreadyExists would otherwise fail a healthy task).
+// keyedMutex serializes the per-task state transitions: two concurrent
+// claims of the same task must not interleave their
+// DeleteSecret→CreateSecret→CreateJob sequence (the loser's AlreadyExists
+// would otherwise fail a healthy task), and no settlement path may settle an
+// entry while the S8 round that decides its `running` write is still in
+// flight (failure-handling §判据模型: one decisive fact per transition).
 type keyedMutex struct {
 	mu sync.Mutex
 	m  map[string]*refMutex
@@ -164,7 +173,11 @@ type Scheduler struct {
 	pendingReports PendingReports
 	now            func() time.Time
 
-	claimMu *keyedMutex
+	// taskMu serializes the per-task transitions (OnClaim and every
+	// settlement path): a settlement that ran concurrently with an in-flight
+	// S8 round would decide on a registry snapshot the start is about to
+	// change (failure-handling §判据模型).
+	taskMu *keyedMutex
 
 	// nodeMu serializes the per-node soft cap refresh: concurrent claims
 	// would otherwise interleave the marker replacement and log the same
@@ -187,7 +200,7 @@ func New(cfg Config, reg *registry.Registry, jobs JobClient, builder JobBuilder,
 		log:     slog.Default().With("component", "scheduler"),
 		now:     time.Now,
 
-		claimMu: newKeyedMutex(),
+		taskMu: newKeyedMutex(),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -298,7 +311,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	if head.ID == "" {
 		return errors.New("claim payload has no id")
 	}
-	unlock := s.claimMu.Lock(head.ID)
+	unlock := s.taskMu.Lock(head.ID)
 	defer unlock()
 
 	attempt := 1
@@ -564,21 +577,19 @@ func (s *Scheduler) Deliver(daemonID string, runtimeID string, maxTasks int) ([]
 // OnReport applies the state transition for a forwarded lifecycle callback
 // (S8–S15) and returns the upstream status and body for the daemon. The
 // Job/Secret are deleted only after the terminal report succeeded — never
-// the other way around (task-mapping invariant 3).
+// the other way around (task-mapping invariant 3). S8 is the one endpoint
+// whose transition follows the answer: 2xx marks the entry running, 409
+// settles it through OnStartRejected — and its whole round (forward, answer,
+// transition) runs under the task's lock, so no settlement path can settle
+// the entry while that answer is still outstanding.
 func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEntry, body []byte) (int, []byte, error) {
+	unlock := func() {}
+	if ep == EPStart {
+		unlock = s.taskMu.Lock(e.TaskID)
+	}
+	defer unlock()
 	now := s.now()
-	switch {
-	case ep == EPStart:
-		started, ok := s.reg.MarkStarted(e.TaskID, now)
-		if ok {
-			s.metrics.JobBootSeconds(now.Sub(started.ClaimedAt).Seconds())
-			s.log.InfoContext(ctx, "task.started",
-				"task_id", e.TaskID, "job_name", e.JobName,
-				"boot_seconds", now.Sub(started.ClaimedAt).Seconds())
-		}
-		// A late start on a terminal entry is still forwarded: the server's
-		// 409 tells the daemon the task is settled.
-	case ep.IsTerminal():
+	if ep.IsTerminal() {
 		// The gauge follows the index on every exit of a terminal report —
 		// including the transport-error exit below, which only queues the
 		// report: the terminal write above already left the index, so a
@@ -635,6 +646,32 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		}
 		return code, resp, nil
 	}
+	if ep == EPStart {
+		// The running write waits for the server's answer: marking the entry
+		// running before the forward would leave it running for a task the
+		// server never started (409 状态不允许, §1.2 S8 + proxy.md §转发), and
+		// the re-dispatched task would be re-claimed into another Job that is
+		// refused the same way — an unbounded dispatch loop. A late start on
+		// an already settled entry is still forwarded: the 409 tells the
+		// daemon the task is settled (the settlement below is a no-op then).
+		switch {
+		case code >= 200 && code < 300:
+			if started, ok := s.reg.MarkStarted(e.TaskID, now); ok {
+				s.metrics.JobBootSeconds(now.Sub(started.ClaimedAt).Seconds())
+				s.log.InfoContext(ctx, "task.started",
+					"task_id", e.TaskID, "job_name", e.JobName,
+					"boot_seconds", now.Sub(started.ClaimedAt).Seconds())
+			}
+			return code, resp, nil
+		case code == http.StatusConflict:
+			if err := s.OnStartRejected(ctx, e.TaskID); err != nil {
+				s.log.ErrorContext(ctx, "task.settle_failed",
+					"task_id", e.TaskID, "job_name", e.JobName,
+					"endpoint", string(ep), "err", err)
+			}
+			return code, resp, nil
+		}
+	}
 	if code == 404 {
 		// A non-terminal forward answered 404: the server deleted the task
 		// (proxy.md 转发 switch → failure-handling scenario #9).
@@ -670,6 +707,48 @@ func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep
 	}
 }
 
+// OnStartRejected settles an entry whose S8 start the server refused with
+// 409 (03-contracts.md §1.2 S8 + 05-modules/proxy.md §转发: 状态不允许).
+// 顺序规则 3 puts C13 before the compensation: a 409 says "not startable",
+// not "not running", so running adopts, terminal settles, 404 releases, and
+// only queued/dispatched proves the claim itself stale — that one is settled
+// failed (stale_claim) and its Job/Secret go, ending the re-dispatch loop.
+//
+// The caller holds the task's lock (OnReport's S8 round), so the C13 answer
+// and the transition cannot be overtaken by another settlement path.
+func (s *Scheduler) OnStartRejected(ctx context.Context, taskID string) error {
+	defer s.SyncInflight()
+	e, ok := s.reg.Get(taskID)
+	if !ok || e.IsTerminal() || !e.StartedAt.IsZero() {
+		return nil
+	}
+	st, err := s.server.TaskStatus(ctx, taskID)
+	switch {
+	case errors.Is(err, ErrTaskNotFound):
+		return s.OnTaskVanished(ctx, taskID)
+	case err != nil:
+		return fmt.Errorf("check status of task %s: %w", taskID, err)
+	}
+	s.reg.SetLastStatusSeen(taskID, st)
+	switch {
+	case st == "running":
+		// The start landed after all: keep the Job, wait for the daemon's
+		// reports (failure-handling 场景 #1).
+		return s.AdoptRunning(ctx, taskID)
+	case registry.IsTerminalResult(st):
+		return s.SettleTerminal(ctx, taskID, st)
+	case st == "queued" || st == "dispatched":
+		return s.failEntry(ctx, e, failReport{
+			reason:  FailureReasonStaleClaim,
+			message: "server rejected the task start: task claim is stale or task is no longer startable",
+		})
+	default:
+		// waiting_*: no decisive fact (proxy.md §prepare-lease 保活) — the
+		// daemon's own reports converge this entry.
+		return nil
+	}
+}
+
 // OnTaskVanished handles failure-handling scenario #9: the server deleted
 // the task (C4/C13 404). The Job/Secret are removed and the entry dropped;
 // no terminal report is sent for a task the server no longer knows.
@@ -684,26 +763,21 @@ func (s *Scheduler) OnTaskVanished(ctx context.Context, taskID string) error {
 // OnBootTimeout handles failure-handling scenario #4: the Job's daemon never
 // started within the boot deadline. The task is failed on the daemon's
 // behalf (C10, failure_reason=job_boot_timeout) and the objects removed.
+// The task's lock keeps it from settling an entry whose S8 answer is still
+// outstanding: that answer either lands first (started_at set, this is a
+// no-op) or the start really never happened.
 func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
 	defer s.SyncInflight()
+	unlock := s.taskMu.Lock(taskID)
+	defer unlock()
 	e, ok := s.reg.Get(taskID)
 	if !ok || e.IsTerminal() || !e.StartedAt.IsZero() {
 		return nil
 	}
-	if _, err := s.reg.MarkTerminal(taskID, registry.ResultFailed, s.now()); err != nil {
-		return err
-	}
-	s.metrics.TaskTerminal(string(registry.ResultFailed))
-	s.log.ErrorContext(ctx, "task.failed_compensated",
-		"task_id", e.TaskID, "job_name", e.JobName,
-		"failure_reason", FailureReasonJobBootTimeout)
-	report := failReport{reason: FailureReasonJobBootTimeout, message: "job daemon did not start before the boot deadline"}
-	if err := s.reportFail(ctx, e, report); err != nil {
-		// The report is in the durable queue now: the entry and its objects
-		// stay until a drain lands it (contract §4).
-		return nil
-	}
-	return s.cleanup(ctx, e)
+	return s.failEntry(ctx, e, failReport{
+		reason:  FailureReasonJobBootTimeout,
+		message: "job daemon did not start before the boot deadline",
+	})
 }
 
 // ConvergeLeaseRefused settles an entry whose prepare-lease was refused
@@ -713,6 +787,8 @@ func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
 // lease round (proxy.md §prepare-lease 保活).
 func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) error {
 	defer s.SyncInflight()
+	unlock := s.taskMu.Lock(taskID)
+	defer unlock()
 	e, ok := s.reg.Get(taskID)
 	if !ok || e.IsTerminal() {
 		return nil
@@ -775,6 +851,15 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 	if !ok {
 		return nil
 	}
+	// The key is the task id, so it is resolved before the lock and the
+	// entry re-read under it: a concurrent path must not be settled on a
+	// snapshot it already replaced.
+	unlock := s.taskMu.Lock(e.TaskID)
+	defer unlock()
+	e, ok = s.reg.ByJob(jobName)
+	if !ok {
+		return nil
+	}
 	if e.IsTerminal() {
 		return s.cleanup(ctx, e)
 	}
@@ -790,19 +875,29 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 	if registry.IsTerminalResult(st) {
 		return s.SettleTerminal(ctx, e.TaskID, st)
 	}
+	return s.failEntry(ctx, e, failReport{
+		reason:  reason,
+		message: "container ended without a terminal report",
+	})
+}
+
+// failEntry settles a task as failed on the daemon's behalf: the terminal
+// write first (markTerminal is the single write path, 顺序规则 1), then the
+// C10 report, then the K8s objects. A report that does not land is in the
+// durable queue now, so the entry and its objects stay until a drain lands
+// it (contract §4) — deleting them would let a Job deletion stand in for a
+// delivered report.
+func (s *Scheduler) failEntry(ctx context.Context, e registry.TaskEntry, report failReport) error {
 	s.log.ErrorContext(ctx, "task.failed_compensated",
-		"task_id", e.TaskID, "job_name", e.JobName, "failure_reason", reason)
+		"task_id", e.TaskID, "job_name", e.JobName, "failure_reason", report.reason)
 	if _, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, s.now()); err != nil {
 		return err
 	}
 	s.metrics.TaskTerminal(string(registry.ResultFailed))
-	report := failReport{reason: reason, message: "container ended without a terminal report"}
 	if err := s.reportFail(ctx, e, report); err != nil {
-		// The report is in the durable queue now: the entry and its objects
-		// stay until a drain lands it (contract §4).
 		return nil
 	}
-	e, ok = s.reg.Get(e.TaskID)
+	e, ok := s.reg.Get(e.TaskID)
 	if !ok {
 		return nil
 	}

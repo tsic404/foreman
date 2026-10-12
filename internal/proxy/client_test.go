@@ -391,6 +391,63 @@ func TestForwardNonTerminalNotRetried(t *testing.T) {
 	}
 }
 
+func TestForwardStartTranslatesJobRuntimeToRealRuntime(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stubRegister(stub, "rid-real")
+	stub.on("POST", "/api/daemon/tasks/t1/start", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]string{"status": "running"})
+	})
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+
+	// The daemon names the job runtime it was handed at S6; the claim the
+	// server holds belongs to the real runtime id.
+	body := []byte(`{"capabilities":["x"],"runtime_id":"job-runtime","dispatched_at":"2026-10-12T10:54:12.016974Z"}`)
+	code, _, err := c.Forward(t.Context(), scheduler.EPStart, "t1", body)
+	if err != nil || code != 200 {
+		t.Fatalf("Forward = %d, %v", code, err)
+	}
+	calls := stub.calls("POST", "/api/daemon/tasks/t1/start")
+	if len(calls) != 1 {
+		t.Fatalf("calls = %d", len(calls))
+	}
+	var got struct {
+		Capabilities []string `json:"capabilities"`
+		RuntimeID    string   `json:"runtime_id"`
+		DispatchedAt string   `json:"dispatched_at"`
+	}
+	if err := json.Unmarshal(calls[0].Body, &got); err != nil {
+		t.Fatalf("body not JSON: %s (%v)", calls[0].Body, err)
+	}
+	if got.RuntimeID != "rid-real" {
+		t.Errorf("runtime_id = %q, want the real runtime id (the server's claim carries it)", got.RuntimeID)
+	}
+	if got.DispatchedAt != "2026-10-12T10:54:12.016974Z" {
+		t.Errorf("dispatched_at = %q, want it verbatim (the claim generation)", got.DispatchedAt)
+	}
+	if len(got.Capabilities) != 1 || got.Capabilities[0] != "x" {
+		t.Errorf("capabilities = %v, want the daemon's list verbatim", got.Capabilities)
+	}
+}
+
+func TestForwardStartWithoutRuntimeIdentityIsVerbatim(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stubRegister(stub, "rid-real")
+	stub.on("POST", "/api/daemon/tasks/t1/start", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]string{"status": "running"})
+	})
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+
+	// A start that names no runtime keeps the legacy shape byte-for-byte:
+	// Foreman invents no field the daemon did not send.
+	if _, _, err := c.Forward(t.Context(), scheduler.EPStart, "t1", []byte(`{}`)); err != nil {
+		t.Fatalf("Forward: %v", err)
+	}
+	calls := stub.calls("POST", "/api/daemon/tasks/t1/start")
+	if len(calls) != 1 || string(calls[0].Body) != `{}` {
+		t.Fatalf("body = %s, want {} verbatim", calls[0].Body)
+	}
+}
+
 func TestPassthroughIsVerbatim(t *testing.T) {
 	srv, stub := newStubUpstream(t)
 	stub.on("POST", "/api/issues/42/comments", func(w http.ResponseWriter, _ *http.Request, _ []byte) {

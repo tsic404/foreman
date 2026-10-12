@@ -372,13 +372,24 @@ func endpointPath(ep scheduler.Endpoint, taskID string) string {
 }
 
 // Forward posts a lifecycle callback (C5–C12) with Foreman's server
-// credential and returns the upstream status and body. Terminal endpoints
-// carry the §4 retry budget (4s/8s/16s/32s/64s; 5xx/408/429/network only);
-// exhaustion returns ErrTerminalUndelivered for the PendingReports queue.
+// credential and returns the upstream status and body. S8 is the one
+// callback whose body names a runtime — the daemon names the job runtime it
+// was handed (§1.2 S6), the server knows only the real runtime id its claim
+// was dispatched under — so the identity is translated exactly as S7
+// translates {rid}. Terminal endpoints carry the §4 retry budget
+// (4s/8s/16s/32s/64s; 5xx/408/429/network only); exhaustion returns
+// ErrTerminalUndelivered for the PendingReports queue.
 func (c *Client) Forward(ctx context.Context, ep scheduler.Endpoint, taskID string, body []byte) (int, []byte, error) {
 	path := endpointPath(ep, taskID)
 	if path == "" {
 		return 0, nil, fmt.Errorf("unknown endpoint %q", ep)
+	}
+	if ep == scheduler.EPStart {
+		translated, err := c.translateStartBody(ctx, body)
+		if err != nil {
+			return 0, nil, err
+		}
+		body = translated
 	}
 	if !ep.IsTerminal() {
 		return c.forwardOnce(ctx, ep, path, body)
@@ -402,6 +413,44 @@ func (c *Client) Forward(ctx context.Context, ep scheduler.Endpoint, taskID stri
 		}
 	}
 	return 0, nil, fmt.Errorf("%w: %s %s", ErrTerminalUndelivered, ep, taskID)
+}
+
+// translateStartBody rewrites the runtime identity an S8 body carries: the
+// daemon names the job runtime it was handed at S6, while the server knows
+// only the real runtime id its claim was dispatched under. Forwarded
+// verbatim, the daemon's identity reads as a claim the server no longer
+// holds, and the start is refused (409 状态不允许, §1.2 S8 +
+// 05-modules/proxy.md §转发) — so the field is translated like S7's {rid}.
+// Every other field stays byte-equal, and a body naming no runtime is
+// forwarded verbatim (legacy start shape).
+func (c *Client) translateStartBody(ctx context.Context, body []byte) ([]byte, error) {
+	if len(body) == 0 {
+		return body, nil
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(body, &fields); err != nil {
+		return body, nil
+	}
+	if _, ok := fields["runtime_id"]; !ok {
+		return body, nil
+	}
+	runtimeID, err := c.ensureRuntime(ctx)
+	if err != nil {
+		return nil, err
+	}
+	quoted, err := json.Marshal(runtimeID)
+	if err != nil {
+		return nil, err
+	}
+	if bytes.Equal(fields["runtime_id"], quoted) {
+		return body, nil
+	}
+	fields["runtime_id"] = quoted
+	translated, err := json.Marshal(fields)
+	if err != nil {
+		return body, nil
+	}
+	return translated, nil
 }
 
 func (c *Client) forwardOnce(ctx context.Context, ep scheduler.Endpoint, path string, body []byte) (int, []byte, error) {

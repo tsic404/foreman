@@ -120,6 +120,7 @@ type fakeServer struct {
 
 	forwardCode int
 	forwardErr  error
+	onForward   func() // test hook: fires inside Forward (simulates an in-flight round)
 	forwards    []forwardCall
 }
 
@@ -131,6 +132,9 @@ func (f *fakeServer) TaskStatus(context.Context, string) (string, error) {
 }
 
 func (f *fakeServer) Forward(_ context.Context, ep Endpoint, taskID string, body []byte) (int, []byte, error) {
+	if f.onForward != nil {
+		f.onForward()
+	}
 	f.forwards = append(f.forwards, forwardCall{ep, taskID, string(body)})
 	if f.forwardErr != nil {
 		return 0, nil, f.forwardErr
@@ -734,6 +738,260 @@ func TestOnReportStartMarksRunning(t *testing.T) {
 	}
 }
 
+// A refused start (409 状态不允许, §1.2 S8 + 05-modules/proxy.md §转发)
+// settles the task instead of leaving it running: failed/stale_claim,
+// reported on the daemon's behalf, objects deleted — and the done index
+// stops the re-dispatched task from building another Job whose start would
+// be refused the same way.
+func TestOnReportStart409SettlesStaleClaim(t *testing.T) {
+	f := newFixture(t)
+	e := f.claim(t, "t-409")
+	e.State = registry.StateDelivering
+	if err := f.reg.Put(e); err != nil {
+		t.Fatal(err)
+	}
+	f.server.forwardCode = 409
+	f.server.status = "dispatched" // C13: the claim is still the startable one
+
+	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`))
+	if err != nil || code != 409 {
+		t.Fatalf("OnReport = %d, %v (the daemon keeps the server's 409)", code, err)
+	}
+	if _, ok := f.reg.Get("t-409"); ok {
+		t.Fatal("entry must not stay live after the start was refused")
+	}
+	if !f.reg.IsDone("t-409") {
+		t.Fatal("the terminal write must land in the done index")
+	}
+	if f.hasJob("fm-t-409") {
+		t.Fatal("Job must be deleted after the refused start")
+	}
+	if got := f.metrics.terminal; len(got) != 1 || got[0] != "failed" {
+		t.Fatalf("terminal metric = %v, want one failed", got)
+	}
+	if len(f.server.forwards) != 2 {
+		t.Fatalf("forwards = %+v, want start + fail", f.server.forwards)
+	}
+	if fail := f.server.forwards[1]; fail.ep != EPFail ||
+		!strings.Contains(fail.body, `"failure_reason":"stale_claim"`) {
+		t.Fatalf("fail forward = %+v, want a stale_claim report", fail)
+	}
+
+	// The dispatch loop ends here: no second Job for the re-dispatched task.
+	if err := f.sched.OnClaim(context.Background(), claimPayload("t-409")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	if len(f.jobs.createdJobs) != 1 {
+		t.Fatalf("created jobs = %+v, want no Job for a settled task", f.jobs.createdJobs)
+	}
+}
+
+// 顺序规则 3: a 409 says "not startable", not "not running" — a start whose
+// 200 was lost (transient 502 → daemon retry) must not have its task killed.
+// C13 = running adopts the entry and keeps the Job.
+func TestOnReportStart409RunningAdoptsEntry(t *testing.T) {
+	f := newFixture(t)
+	e := f.claim(t, "t-adopt")
+	e.State = registry.StateDelivering
+	f.reg.Put(e)
+	f.server.forwardCode = 409
+	f.server.status = "running"
+
+	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`))
+	if err != nil || code != 409 {
+		t.Fatalf("OnReport = %d, %v (the daemon keeps the server's 409)", code, err)
+	}
+	got, ok := f.reg.Get("t-adopt")
+	if !ok || got.State != registry.StateRunning || got.StartedAt.IsZero() {
+		t.Fatalf("entry = %+v, want running (the lost 200 must not fail the task)", got)
+	}
+	if !f.hasJob("fm-t-adopt") {
+		t.Fatal("the Job of an adopted running task must be kept")
+	}
+	if len(f.server.forwards) != 1 || f.server.forwards[0].ep != EPStart {
+		t.Fatalf("forwards = %+v, want the start only (no synthesized fail)", f.server.forwards)
+	}
+	if got := f.metrics.terminal; len(got) != 0 {
+		t.Fatalf("terminal metric = %v, want none (顺序规则 4: 不发假终态)", got)
+	}
+}
+
+// C13 = terminal settles the entry to the server's answer: the report the
+// server already holds stands, so no second (false) terminal is sent.
+func TestOnReportStart409TerminalSettlesToServer(t *testing.T) {
+	f := newFixture(t)
+	e := f.claim(t, "t-done")
+	e.State = registry.StateDelivering
+	f.reg.Put(e)
+	f.server.forwardCode = 409
+	f.server.status = "completed"
+
+	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`))
+	if err != nil || code != 409 {
+		t.Fatalf("OnReport = %d, %v", code, err)
+	}
+	if _, ok := f.reg.Get("t-done"); ok {
+		t.Fatal("entry must be settled once the server holds the task terminal")
+	}
+	if !f.reg.IsDone("t-done") {
+		t.Fatal("the terminal write must land in the done index")
+	}
+	if f.hasJob("fm-t-done") {
+		t.Fatal("Job must be deleted after settling to the server's terminal state")
+	}
+	if got := f.metrics.terminal; len(got) != 1 || got[0] != "completed" {
+		t.Fatalf("terminal metric = %v, want one completed (the server's result)", got)
+	}
+	if len(f.server.forwards) != 1 {
+		t.Fatalf("forwards = %+v, want the start only", f.server.forwards)
+	}
+}
+
+// C13 = 404: the server deleted the task — the objects go and no terminal is
+// synthesized for a task nobody holds (failure-handling 场景 #9).
+func TestOnReportStart409VanishedReleases(t *testing.T) {
+	f := newFixture(t)
+	e := f.claim(t, "t-gone")
+	e.State = registry.StateDelivering
+	f.reg.Put(e)
+	f.server.forwardCode = 409
+	f.server.statusErr = ErrTaskNotFound
+
+	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`))
+	if err != nil || code != 409 {
+		t.Fatalf("OnReport = %d, %v", code, err)
+	}
+	if _, ok := f.reg.Get("t-gone"); ok {
+		t.Fatal("entry must be dropped for a task the server no longer has")
+	}
+	if f.hasJob("fm-t-gone") {
+		t.Fatal("Job must be deleted with the vanished task")
+	}
+	if len(f.server.forwards) != 1 {
+		t.Fatalf("forwards = %+v, want the start only (no report for a deleted task)", f.server.forwards)
+	}
+	if got := f.metrics.terminal; len(got) != 0 {
+		t.Fatalf("terminal metric = %v, want none", got)
+	}
+}
+
+// The start round owns the entry: a boot deadline that fires while the S8
+// answer is still outstanding must not settle the task and delete its Job
+// (failure-handling §判据模型 — the in-flight 2xx is the decisive fact).
+func TestBootTimeoutWaitsForInFlightStart(t *testing.T) {
+	f := newFixture(t)
+	e := f.claim(t, "t-race")
+	e.State = registry.StateDelivering
+	f.reg.Put(e)
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	f.server.onForward = func() {
+		close(entered)
+		<-release
+	}
+
+	startDone := make(chan struct{})
+	go func() {
+		defer close(startDone)
+		if _, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`)); err != nil {
+			t.Errorf("OnReport: %v", err)
+		}
+	}()
+	<-entered
+
+	timeoutDone := make(chan struct{})
+	go func() {
+		defer close(timeoutDone)
+		if err := f.sched.OnBootTimeout(context.Background(), "t-race"); err != nil {
+			t.Errorf("OnBootTimeout: %v", err)
+		}
+	}()
+	select {
+	case <-timeoutDone:
+		t.Fatal("the boot deadline settled a task whose S8 answer was still in flight")
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	<-startDone
+	<-timeoutDone
+
+	got, ok := f.reg.Get("t-race")
+	if !ok || got.State != registry.StateRunning || got.StartedAt.IsZero() {
+		t.Fatalf("entry = %+v, want running", got)
+	}
+	if !f.hasJob("fm-t-race") {
+		t.Fatal("the Job must survive a boot deadline that lost the race to the start")
+	}
+	if len(f.jobs.deletedJobs) != 0 {
+		t.Fatalf("job deletes = %+v, want none", f.jobs.deletedJobs)
+	}
+	if len(f.server.forwards) != 1 || f.server.forwards[0].ep != EPStart {
+		t.Fatalf("forwards = %+v, want the start only", f.server.forwards)
+	}
+}
+
+// A late start on an entry that already settled only carries the server's
+// 409 back: no transition is left and the settled result stands.
+func TestOnReportStart409OnSettledEntryKeepsResult(t *testing.T) {
+	f := newFixture(t)
+	e := f.claim(t, "t-late")
+	if _, err := f.reg.MarkTerminal("t-late", registry.ResultCompleted, testNow); err != nil {
+		t.Fatal(err)
+	}
+	f.server.forwardCode = 409
+
+	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`))
+	if err != nil || code != 409 {
+		t.Fatalf("OnReport = %d, %v", code, err)
+	}
+	got, ok := f.reg.Get("t-late")
+	if !ok || got.State != registry.StateTerminal || got.Result != registry.ResultCompleted {
+		t.Fatalf("entry = %+v, want the settled result kept", got)
+	}
+	if len(f.server.forwards) != 1 || f.server.forwards[0].ep != EPStart {
+		t.Fatalf("forwards = %+v, want the start forward only", f.server.forwards)
+	}
+	if got := f.metrics.terminal; len(got) != 0 {
+		t.Fatalf("terminal metric = %v, want no write for a late start", got)
+	}
+	if !f.hasJob("fm-t-late") {
+		t.Fatal("a settled entry's Job is not touched by a late start")
+	}
+}
+
+// A transient start failure (5xx → 502) leaves the entry pre-start: the
+// running write waits for a 2xx, so the daemon's retry can still start the
+// task (05-modules/proxy.md §转发 transient branch).
+func TestOnReportStartTransientKeepsEntryPreStart(t *testing.T) {
+	f := newFixture(t)
+	e := f.claim(t, "t-5xx")
+	e.State = registry.StateDelivering
+	if err := f.reg.Put(e); err != nil {
+		t.Fatal(err)
+	}
+	f.server.forwardCode = 503
+
+	code, resp, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`))
+	if err != nil || code != 502 || !strings.Contains(string(resp), "upstream unavailable") {
+		t.Fatalf("OnReport = %d %s, %v", code, resp, err)
+	}
+	got, ok := f.reg.Get("t-5xx")
+	if !ok || got.State != registry.StateDelivering || !got.StartedAt.IsZero() {
+		t.Fatalf("entry = %+v, want it untouched by the failed forward", got)
+	}
+
+	// The daemon's retry reaches a healthy server: delivering → running.
+	f.server.forwardCode = 200
+	if code, _, err = f.sched.OnReport(context.Background(), EPStart, got, []byte(`{}`)); err != nil || code != 200 {
+		t.Fatalf("retried OnReport = %d, %v", code, err)
+	}
+	if got, _ = f.reg.Get("t-5xx"); got.State != registry.StateRunning || got.StartedAt.IsZero() {
+		t.Fatalf("entry after the retry = %+v, want running", got)
+	}
+}
+
 func TestOnReportTerminalCleansUpAfterSuccess(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "task-1")
@@ -1114,8 +1372,8 @@ func TestConcurrentOnClaimSameTaskBuildsExactlyOneJob(t *testing.T) {
 			t.Fatal("concurrent claim failed a healthy task")
 		}
 	}
-	if got := f.sched.claimMu.lenEntries(); got != 0 {
-		t.Fatalf("claimMu entries = %d after all claims, want 0", got)
+	if got := f.sched.taskMu.lenEntries(); got != 0 {
+		t.Fatalf("taskMu entries = %d after all claims, want 0", got)
 	}
 }
 
