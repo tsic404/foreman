@@ -62,9 +62,19 @@ func TestDefaultTemplateMatchesBaseline(t *testing.T) {
 	}
 }
 
-// jobProjection is the baseline view of a Job: metadata + spec.
+// jobProjection is the baseline view of a Job: metadata + spec with the
+// conditional blocks removed — the trigger-context annotations and the
+// node-reuse affinity — the same normalization TC-tech-job-01 performs with its
+// normalize.jq before the diff. Both shapes are asserted on their own
+// (TestBuildPreferredNodeAffinity, TestBuildTriggerContextAnnotations).
 func jobProjection(job *batchv1.Job) map[string]any {
-	return map[string]any{"metadata": job.ObjectMeta, "spec": job.Spec}
+	metadata := *job.ObjectMeta.DeepCopy()
+	for _, key := range triggerContextAnnotationKeys {
+		delete(metadata.Annotations, key)
+	}
+	spec := *job.Spec.DeepCopy()
+	spec.Template.Spec.Affinity = nil
+	return map[string]any{"metadata": metadata, "spec": spec}
 }
 
 // baselineDocuments reads the baseline, rewrites the documented placeholders
@@ -79,8 +89,6 @@ func baselineDocuments(t *testing.T, entry TaskEntry, jobImage string) [][]byte 
 		"<task_id>":             entry.TaskID,
 		"<agent_id>":            entry.AgentID,
 		"<workspace_id>":        entry.WorkspaceID,
-		"<issue_id>":            entry.IssueID,
-		"<issue-identifier>":    entry.IssueIdentifier,
 		"<job runtime uuid>":    entry.JobRuntimeID,
 		"<RFC3339>":             entry.ClaimedAt.UTC().Format(time.RFC3339),
 		"<job-image>":           jobImage,

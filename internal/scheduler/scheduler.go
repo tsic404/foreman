@@ -60,12 +60,16 @@ const (
 )
 
 // claimHead is the subset of the claim payload the scheduler reads to index
-// the task (proxy.md 数据结构). Everything else passes through opaque.
+// the task (proxy.md 数据结构). Everything else passes through opaque. The
+// trigger-context fields are optional: a missing or empty value means that
+// context does not exist and never rejects the claim (ADR-014).
 type claimHead struct {
 	ID              string `json:"id"`
 	AgentID         string `json:"agent_id"`
 	IssueID         string `json:"issue_id"`
 	IssueIdentifier string `json:"issue_identifier"`
+	AutopilotRunID  string `json:"autopilot_run_id"`
+	ChatSessionID   string `json:"chat_session_id"`
 	WorkspaceID     string `json:"workspace_id"`
 }
 
@@ -325,6 +329,8 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		AgentID:         head.AgentID,
 		IssueID:         head.IssueID,
 		IssueIdentifier: head.IssueIdentifier,
+		AutopilotRunID:  head.AutopilotRunID,
+		ChatSessionID:   head.ChatSessionID,
 		WorkspaceID:     head.WorkspaceID,
 		JobName:         jobName,
 		JobNamespace:    s.cfg.JobNamespace,
@@ -342,7 +348,9 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	}
 	s.log.InfoContext(ctx, "task.claimed",
 		"task_id", e.TaskID, "job_name", e.JobName,
-		"issue_identifier", e.IssueIdentifier, "agent_id", e.AgentID)
+		"issue_identifier", e.IssueIdentifier,
+		"autopilot_run_id", e.AutopilotRunID, "chat_session_id", e.ChatSessionID,
+		"agent_id", e.AgentID)
 
 	// The per-node soft cap is applied right before the Job is rendered
 	// ("下一次 claim 前把该节点从候选里排除", task-mapping §同节点并发): the
@@ -1050,6 +1058,8 @@ func jobbuilderEntry(e registry.TaskEntry) jobbuilder.TaskEntry {
 		AgentID:         e.AgentID,
 		IssueID:         e.IssueID,
 		IssueIdentifier: e.IssueIdentifier,
+		AutopilotRunID:  e.AutopilotRunID,
+		ChatSessionID:   e.ChatSessionID,
 		WorkspaceID:     e.WorkspaceID,
 		JobRuntimeID:    e.JobRuntimeID,
 		ClaimedAt:       e.ClaimedAt,

@@ -43,14 +43,20 @@ func IsTerminalResult(s string) bool {
 	return s == string(ResultCompleted) || s == string(ResultFailed) || s == string(ResultCancelled)
 }
 
-// TaskEntry is the mapping table row (contract §3.1). Payload is the full
-// claim payload kept in process memory only: it carries auth_token and must
-// never be serialized into annotations, Secrets, or logs (F3).
+// TaskEntry is the mapping table row (contract §3.1). The four trigger-context
+// fields (issue/autopilot/chat) are optional: an empty value means that context
+// does not exist and is never an error (ADR-014). The JSON projection keeps all
+// four keys with an empty string instead of omitting them, so consumers can
+// test `== ""` (§3.1). Payload is the full claim payload kept in process memory
+// only: it carries auth_token and must never be serialized into annotations,
+// Secrets, or logs (F3).
 type TaskEntry struct {
 	TaskID             string    `json:"task_id"`
 	AgentID            string    `json:"agent_id"`
 	IssueID            string    `json:"issue_id"`
 	IssueIdentifier    string    `json:"issue_identifier"`
+	AutopilotRunID     string    `json:"autopilot_run_id"`
+	ChatSessionID      string    `json:"chat_session_id"`
 	WorkspaceID        string    `json:"workspace_id"`
 	JobName            string    `json:"job_name"`
 	JobNamespace       string    `json:"job_namespace"`
@@ -100,6 +106,8 @@ const (
 
 	AnnoIssueID         = "foreman.tsic.top/issue-id"
 	AnnoIssueIdentifier = "foreman.tsic.top/issue-identifier"
+	AnnoAutopilotRunID  = "foreman.tsic.top/autopilot-run-id"
+	AnnoChatSessionID   = "foreman.tsic.top/chat-session-id"
 	AnnoDaemonID        = "foreman.tsic.top/daemon-id"
 	AnnoJobRuntimeID    = "foreman.tsic.top/job-runtime-id"
 	AnnoClaimedAt       = "foreman.tsic.top/claimed-at"
@@ -110,6 +118,8 @@ const (
 // (contract §3.2). The state starts at the conservative StateJobCreated and
 // is advanced by the startup C13 convergence; the payload is not restored
 // (it never leaves process memory, so a restarted Foreman cannot re-deliver).
+// The four trigger-context annotations are conditional blocks: a missing key
+// means that context does not exist, never a rebuild error (ADR-014).
 func TaskEntryFromJob(job batchv1.Job) (TaskEntry, error) {
 	labels := job.GetLabels()
 	annos := job.GetAnnotations()
@@ -124,6 +134,8 @@ func TaskEntryFromJob(job batchv1.Job) (TaskEntry, error) {
 
 		IssueID:         annos[AnnoIssueID],
 		IssueIdentifier: annos[AnnoIssueIdentifier],
+		AutopilotRunID:  annos[AnnoAutopilotRunID],
+		ChatSessionID:   annos[AnnoChatSessionID],
 		DaemonID:        annos[AnnoDaemonID],
 		JobRuntimeID:    annos[AnnoJobRuntimeID],
 	}

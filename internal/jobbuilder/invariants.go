@@ -86,9 +86,18 @@ func (c InvariantChecker) checkIdentity(v *violations, job *batchv1.Job) {
 			v.add("metadata.labels["+key+"]", "清单 A: per-task 身份标签缺失")
 		}
 	}
-	for _, key := range []string{annoIssueID, annoIssueIdentifier, annoDaemonID, annoJobRuntimeID, annoClaimedAt, annoAttempt} {
+	for _, key := range requiredAnnotationKeys {
 		if md.Annotations[key] == "" {
 			v.add("metadata.annotations["+key+"]", "清单 A: per-task 身份注解缺失")
+		}
+	}
+	// The trigger-context keys are conditional blocks (ADR-014): a missing key
+	// is legal, but a key present with an empty value is not — on the
+	// authoritative Job object it would be indistinguishable from a lost
+	// annotation. comma-ok, never a value comparison (03-contracts §3.2).
+	for _, key := range triggerContextAnnotationKeys {
+		if value, present := md.Annotations[key]; present && value == "" {
+			v.add("metadata.annotations["+key+"]", "清单 A/C: 触发上下文注解不得空串占位（键缺失合法）")
 		}
 	}
 	if md.Annotations[annoDaemonID] != job.Name {
@@ -110,14 +119,27 @@ func (c InvariantChecker) checkIdentity(v *violations, job *batchv1.Job) {
 	checkDomainKeys(v, "spec.template.metadata.annotations", job.Spec.Template.Annotations, nil)
 }
 
+// requiredAnnotationKeys are the §3.2 keys every Job carries non-empty;
+// triggerContextAnnotationKeys are the conditional-block keys (ADR-014). The
+// checker owns only the binary 「a missing key is legal, a present key must be
+// non-empty」; 「key present ⇔ TaskEntry field non-empty」 is the write path's
+// proposition (03-contracts.md §3.2 判定面).
+var (
+	requiredAnnotationKeys       = []string{annoDaemonID, annoJobRuntimeID, annoClaimedAt, annoAttempt}
+	triggerContextAnnotationKeys = []string{annoIssueID, annoIssueIdentifier, annoAutopilotRunID, annoChatSessionID}
+)
+
 // authoritativeLabelKeys / authoritativeAnnotationKeys / authoritativePodLabelKeys
 // are the §3.2 keys Foreman writes; checkDomainKeys uses them as the allow-list
 // so a reserved key outside them can only have come from the overlay.
 var (
 	authoritativeLabelKeys      = keySet(labelAppName, labelManagedBy, labelTaskID, labelAgentID, labelWorkspaceID)
-	authoritativeAnnotationKeys = keySet(annoIssueID, annoIssueIdentifier, annoDaemonID, annoJobRuntimeID, annoClaimedAt, annoAttempt)
-	authoritativePodLabelKeys   = keySet(labelAppName, labelTaskID)
-	reservedAppKeys             = keySet(labelAppName, labelManagedBy)
+	authoritativeAnnotationKeys = keySet(
+		annoDaemonID, annoJobRuntimeID, annoClaimedAt, annoAttempt,
+		annoIssueID, annoIssueIdentifier, annoAutopilotRunID, annoChatSessionID,
+	)
+	authoritativePodLabelKeys = keySet(labelAppName, labelTaskID)
+	reservedAppKeys           = keySet(labelAppName, labelManagedBy)
 )
 
 func keySet(keys ...string) map[string]bool {
