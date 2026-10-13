@@ -23,6 +23,7 @@ make build-foreman        # bin/foreman      — the scheduler process
 make build-gc             # bin/foreman-gc   — node-local cache collector
 make build-foreman-image  # container image for the Deployment
 make build-job-image      # Job image: upstream multica CLI + omp + foreman-gc
+make build-injectproxy    # bin/injectproxy  — test-env fault-injection access path
 make check                # gofmt + vet + tests + build
 ```
 
@@ -36,6 +37,10 @@ Deployment lives in `deploy/` (namespaces, RBAC, Secrets, Deployment/Service,
 `foreman-gc` DaemonSet) and is applied with `kubectl apply -f deploy/`; see
 `deploy/README.md` for the Secret values, the movable Job image reference and
 the node-local state root.
+
+Test infrastructure is separate from the product: the fault-injection access
+path that fronts the test multica cluster is `testinfra/injectproxy/` (see its
+README), and it is deployed by the test environment, not by `deploy/`.
 
 ## Status
 

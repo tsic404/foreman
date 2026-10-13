@@ -6,6 +6,7 @@ VERSION ?= v0.1.0
 REGISTRY ?= ghcr.io/tsic404
 FOREMAN_IMAGE ?= $(REGISTRY)/foreman:$(VERSION)
 JOB_IMAGE ?= $(REGISTRY)/foreman-job:$(VERSION)
+INJECT_IMAGE ?= $(REGISTRY)/foreman-injectproxy:$(VERSION)
 CONTAINER_TOOL ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
 
 # Upstream release artifacts for the Job image (F1/AC-13): the CLI is taken from
@@ -25,12 +26,13 @@ export MULTICA_CLI_URL MULTICA_CLI_SHA256 OMP_URL OMP_SHA256
 GOFLAGS ?= -trimpath
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build build-foreman build-gc build-foreman-image build-job-image test vet fmt check \
-	print-version resolve-upstream publish-images smoke-job-image
+.PHONY: all build build-foreman build-gc build-injectproxy build-foreman-image build-job-image \
+	build-injectproxy-image test vet fmt check print-version resolve-upstream publish-images \
+	smoke-job-image
 
 all: build
 
-build: build-foreman build-gc
+build: build-foreman build-gc build-injectproxy
 
 build-foreman:
 	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/foreman ./cmd/foreman
@@ -38,11 +40,23 @@ build-foreman:
 build-gc:
 	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/foreman-gc ./cmd/foreman-gc
 
+# Test infrastructure: the fault-injection access path of the test multica
+# cluster (testinfra/injectproxy/README.md). Not part of the Foreman image.
+build-injectproxy:
+	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/injectproxy ./cmd/injectproxy
+
 # Foreman's own image: the single-replica Deployment in deploy/30-foreman.yaml.
 build-foreman-image: build-foreman
 	$(CONTAINER_TOOL) build -f images/foreman.Containerfile \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
 		-t $(FOREMAN_IMAGE) $(BIN_DIR)
+
+# Injector image: deployed next to the test multica cluster by the wiring
+# issue, never in the product's deploy/ manifests.
+build-injectproxy-image: build-injectproxy
+	$(CONTAINER_TOOL) build -f images/injectproxy.Containerfile \
+		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
+		-t $(INJECT_IMAGE) $(BIN_DIR)
 
 # Job image: upstream daemon CLI + omp, plus foreman-gc (the DaemonSet runs
 # this same image). Publishes $(JOB_IMAGE), referenced by movable tag.

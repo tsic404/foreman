@@ -1,0 +1,145 @@
+# Fault-injection access path of the test multica cluster environment
+# (test-cases/_infra/test-multica-cluster.md §4): the transparent data plane
+# that becomes the stable access point, the injection/record control plane on
+# its own port, and the record directory.
+#
+# Apply into the test cluster's namespace, next to the test multica server:
+#
+#   kubectl -n <test-multica-ns> apply -f testinfra/injectproxy/deploy.yaml
+#
+# The namespace is deliberately not pinned here, and the object names are the
+# defaults a fresh deployment can take: the wiring issue owns the access
+# point's name, address and exposure (§2). Two Services are provided because
+# the faces must stay separate — the control plane carries no external
+# exposure at all, the data plane is what Foreman's MULTICA_SERVER_URL points
+# at.
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: injectproxy
+  labels:
+    app.kubernetes.io/name: injectproxy
+spec:
+  replicas: 1
+  # Injection state and the record file live in the process and in a per-Pod
+  # emptyDir: a rolling update would put two Ready Pods behind the two
+  # Services, so POST /inject could land on one while the data plane (or the
+  # record read) is answered by the other.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: injectproxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: injectproxy
+    spec:
+      imagePullSecrets:
+        - name: registry-tsic
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        # The record emptyDir comes up root-owned; without fsGroup the
+        # injector (UID 1000) could not write records.jsonl into it.
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: injectproxy
+          # Published by .github/workflows/injectproxy-image.yml; a locally
+          # built image (`make build-injectproxy-image`) works the same way.
+          image: ghcr.io/tsic404/foreman-injectproxy:latest
+          imagePullPolicy: Always
+          ports:
+            - name: data
+              containerPort: 8080
+            - name: control
+              containerPort: 8081
+          env:
+            # The test multica server itself (§2 直连地址) — the injector's
+            # upstream. Never a production server.
+            - name: INJECT_UPSTREAM_URL
+              value: "http://test-multica-server:8080"
+            - name: INJECT_DATA_ADDR
+              value: ":8080"
+            - name: INJECT_CONTROL_ADDR
+              value: ":8081"
+            - name: INJECT_RECORD_DIR
+              value: "/records"
+            # The response-body face is a deployment setting (§4.3), not a
+            # control-plane parameter. Unset = the contract default
+            # (^/api/daemon/tasks/claim$); `^$` records status codes only.
+            # - name: INJECT_RECORD_RESPONSE_BODIES
+            #   value: "^/api/daemon/tasks/claim$"
+            - name: INJECT_LOG_LEVEL
+              value: "info"
+          readinessProbe:
+            httpGet:
+              path: /inject/state
+              port: control
+            initialDelaySeconds: 1
+            periodSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /inject/state
+              port: control
+            initialDelaySeconds: 5
+            periodSeconds: 15
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 500m
+              memory: 128Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: records
+              mountPath: /records
+      volumes:
+        # Per-run evidence, read over the control plane (GET /record,
+        # GET /record/blob). Replace with a PVC only if the records must
+        # survive a pod restart.
+        - name: records
+          emptyDir: {}
+---
+# Data plane: the stable access point's backend. ClusterIP is enough — the
+# wiring issue decides how the test network reaches it.
+apiVersion: v1
+kind: Service
+metadata:
+  name: injectproxy-data
+  labels:
+    app.kubernetes.io/name: injectproxy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: injectproxy
+  ports:
+    - name: data
+      port: 80
+      targetPort: data
+---
+# Control plane: injection setup/reset and the record face. Same cluster, no
+# external exposure — reachable from the test network only (§2 控制面行).
+apiVersion: v1
+kind: Service
+metadata:
+  name: injectproxy-control
+  labels:
+    app.kubernetes.io/name: injectproxy
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: injectproxy
+  ports:
+    - name: control
+      port: 80
+      targetPort: control
