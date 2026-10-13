@@ -1,0 +1,41 @@
+#!/bin/sh
+# Run the multica CLI against the test cluster's profile.
+#
+# Two things make a bare `multica --profile test-multica …` unreliable on a
+# host that is itself running inside a Multica task pod:
+#
+#   * the platform exports MULTICA_SERVER_URL / MULTICA_WORKSPACE_ID /
+#     MULTICA_TOKEN (and the daemon task variables) into every task process;
+#     the CLI resolves the environment before the profile, so those values
+#     would silently point the command at the production server;
+#   * the CLI refuses a non-task token when it finds a daemon task marker
+#     (.multica/daemon_task_context.json, searched upwards from the working
+#     directory), which every task workdir has.
+#
+# This wrapper clears both and then execs the CLI. Use it for everything the
+# acceptance side runs against the test cluster.
+#
+#   ./multica-test runtime list --output json
+#   ./multica-test autopilot trigger <id>
+#
+# TEST_MULTICA_PROFILE selects the profile (default `test-multica`),
+# TEST_MULTICA_CLI_CWD the directory the CLI starts in (default $HOME).
+
+cd "${TEST_MULTICA_CLI_CWD:-$HOME}" || exit 1
+
+# The test cluster shares its node with the instance under test, so the server
+# can answer slowly; the CLI's default HTTP budget is tuned for a healthy
+# server and would report a timeout instead of a result.
+MULTICA_HTTP_TIMEOUT=${MULTICA_HTTP_TIMEOUT:-120}
+export MULTICA_HTTP_TIMEOUT
+
+exec env \
+	-u MULTICA_SERVER_URL \
+	-u MULTICA_WORKSPACE_ID \
+	-u MULTICA_TOKEN \
+	-u MULTICA_AGENT_ID \
+	-u MULTICA_TASK_ID \
+	-u MULTICA_DAEMON_PORT \
+	-u MULTICA_AGENT_NAME \
+	-u MULTICA_TASK_CONFIG_ROOT \
+	multica --profile "${TEST_MULTICA_PROFILE:-test-multica}" "$@"

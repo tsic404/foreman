@@ -32,6 +32,10 @@ tags; `make resolve-upstream` and `make publish-images` are the local
 equivalents of what that workflow runs, and `make smoke-job-image` verifies a
 published Job image.
 
+The acceptance cases run against their own test multica cluster, deployed from
+`testinfra/test-multica/` (deploy, reset, recycle, CLI profile — see its
+README): a test-environment component, not part of `deploy/`.
+
 Deployment lives in `deploy/` (namespaces, RBAC, Secrets, Deployment/Service,
 `foreman-gc` DaemonSet) and is applied with `kubectl apply -f deploy/`; see
 `deploy/README.md` for the Secret values, the movable Job image reference and

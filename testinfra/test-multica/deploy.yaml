@@ -1,0 +1,479 @@
+# Test multica cluster — the execution environment of the TC-tech cases
+# (test-cases/_infra/test-multica-cluster.md §1/§2/§3/§7).
+#
+# One complete multica deployment: server (backend) + its persistence
+# (postgres) + the frontend entry (web + proxy). It is isolated from
+# production by namespace, database and workspace — no production workspace,
+# token or runtime is ever reused (§1).
+#
+# The version anchor is absolute (§1/§7): every image is pinned to the
+# `v0.6.1` release (multica@2ea01ae4). Upgrade = rebuild this whole
+# environment from a new anchor, never an in-place upgrade.
+#
+# Apply through ./deploy.sh: it renders the __ENTRY_URL__ placeholders (the
+# browser-reachable frontend entry) and creates the Secret, then waits for the
+# rollout. `kubectl apply -f deploy.yaml` on its own leaves the placeholders
+# unrendered.
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: test-cluster
+---
+# Backend (server) configuration. Non-secret values only — JWT_SECRET,
+# POSTGRES_PASSWORD and MULTICA_DEV_VERIFICATION_CODE live in the Secret.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-multica-config
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: backend
+data:
+  PORT: "8080"
+  # development + a fixed verification code = deterministic test login. The
+  # code is ignored when APP_ENV=production (upstream SELF_HOSTING.md), so the
+  # test cluster keeps APP_ENV=development on purpose: it is reachable from the
+  # test network only and its whole dataset is disposable.
+  APP_ENV: "development"
+  ALLOW_SIGNUP: "true"
+  ANALYTICS_DISABLED: "true"
+  # First-party self-host telemetry stays off for a test instance.
+  DO_NOT_TRACK: "1"
+  MULTICA_DATABASE_CONNECT_TIMEOUT: "5s"
+  MULTICA_DATABASE_STARTUP_TIMEOUT: "3m"
+  # Browser-reachable frontend entry (the proxy Service). Rendered by
+  # deploy.sh — login links, redirects and CORS all use this origin, so it
+  # must be the address the test network actually reaches.
+  MULTICA_APP_URL: "__ENTRY_URL__"
+  FRONTEND_ORIGIN: "__ENTRY_URL__"
+  CORS_ALLOWED_ORIGINS: "__ENTRY_URL__"
+---
+# Frontend entry: one origin for the web UI and the /ws upgrade. The Next.js
+# rewrites cannot carry a WebSocket upgrade, so /ws goes straight to the
+# backend and everything else goes to the frontend (§2 前端入口).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-multica-proxy
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: proxy
+data:
+  default.conf: |
+    server {
+        listen 80;
+        server_name _;
+        client_max_body_size 100m;
+
+        # WebSocket upgrade goes straight to the backend: the Next.js rewrites
+        # cannot carry it. `^/ws(/|$)` keeps sibling paths (e.g. /ws-foo) on
+        # the frontend.
+        location ~ ^/ws(/|$) {
+            proxy_pass http://test-multica-server:8080;
+            proxy_http_version 1.1;
+            proxy_set_header Upgrade $http_upgrade;
+            proxy_set_header Connection "upgrade";
+            proxy_set_header Host $host;
+            proxy_read_timeout 3600s;
+            proxy_send_timeout 3600s;
+        }
+
+        location / {
+            proxy_pass http://web:3000;
+            proxy_http_version 1.1;
+            proxy_set_header Host $host;
+            proxy_set_header X-Real-IP $remote_addr;
+            proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+            proxy_set_header X-Forwarded-Proto $scheme;
+        }
+    }
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-data
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: postgres
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: backend-uploads
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: backend
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 2Gi
+---
+# Direct address (§2 直连地址): the test multica server itself, for the
+# environment self-check and for troubleshooting. In-cluster consumers (the
+# fault-injection access path) use `http://test-multica-server:8080`; the test
+# network reaches the same Service through the node port.
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-multica-server
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: backend
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: backend
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      nodePort: 30080
+---
+# Frontend entry (§2): the stable origin for the web UI (board, chat entry,
+# task cancellation).
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-multica-web
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: proxy
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: proxy
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+      nodePort: 30300
+---
+# The frontend (Next.js) itself: the entry proxy's upstream, and the name the
+# web pod is reachable under inside the namespace.
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: web
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: web
+  ports:
+    - name: http
+      port: 3000
+      targetPort: http
+---
+# Database endpoint. Only the backend uses it; the reset entry reaches it
+# through `kubectl exec` (§7 重置).
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: postgres
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: postgres
+  ports:
+    - name: postgres
+      port: 5432
+      targetPort: postgres
+---
+# Persistence layer. `pgvector/pgvector:pg17` is the image the upstream
+# self-host stack uses for the built-in database (SELF_HOSTING.md); the
+# backend's migrations run on startup.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: postgres
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: multica
+      app.kubernetes.io/component: postgres
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: multica
+        app.kubernetes.io/component: postgres
+    spec:
+      containers:
+        - name: postgres
+          image: pgvector/pgvector:pg17
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: POSTGRES_DB
+              value: multica
+            - name: POSTGRES_USER
+              value: multica
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: test-multica-secrets
+                  key: POSTGRES_PASSWORD
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          readinessProbe:
+            exec:
+              command: ["sh", "-c", "exec pg_isready -U \"$POSTGRES_USER\" -d \"$POSTGRES_DB\""]
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 12
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "1"
+              memory: 1Gi
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: postgres-data
+---
+# The test multica server itself. Its Service name is also the in-cluster
+# direct address (`http://test-multica-server:8080`, §2 直连地址) that the
+# fault-injection access path relays to.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: backend
+spec:
+  replicas: 1
+  # Migrations run on startup; a second pod would race them.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: multica
+      app.kubernetes.io/component: backend
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: multica
+        app.kubernetes.io/component: backend
+      # The entry origin is read from the ConfigMap, and env vars are only
+      # resolved when a container starts: stamping the rendered origin into the
+      # pod template makes a moved host roll this Deployment instead of leaving
+      # the server answering with the old origin.
+      annotations:
+        test-multica/entry-url: "__ENTRY_URL__"
+    spec:
+      containers:
+        - name: backend
+          image: ghcr.io/multica-ai/multica-backend:v0.6.1
+          imagePullPolicy: IfNotPresent
+          envFrom:
+            - configMapRef:
+                name: test-multica-config
+          env:
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: test-multica-secrets
+                  key: POSTGRES_PASSWORD
+            - name: JWT_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: test-multica-secrets
+                  key: JWT_SECRET
+            - name: MULTICA_DEV_VERIFICATION_CODE
+              valueFrom:
+                secretKeyRef:
+                  name: test-multica-secrets
+                  key: MULTICA_DEV_VERIFICATION_CODE
+            - name: DATABASE_URL
+              value: postgres://multica:$(POSTGRES_PASSWORD)@postgres:5432/multica?sslmode=disable
+          ports:
+            - name: http
+              containerPort: 8080
+          # /healthz (and /readyz) = ready; /health = the process is alive.
+          # The backend runs its migrations before serving, hence the generous
+          # startup budget.
+          # Probe timeouts are generous on purpose: the test cluster shares its
+          # node with the instance under test, and a 1s budget turns a loaded
+          # node into a restart loop that looks like a server fault.
+          startupProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 30
+            periodSeconds: 30
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+          volumeMounts:
+            - name: uploads
+              mountPath: /app/data/uploads
+      volumes:
+        - name: uploads
+          persistentVolumeClaim:
+            claimName: backend-uploads
+---
+# Frontend (Next.js). Every API call it proxies goes to the server Service, so
+# the browser only ever talks to the entry origin.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: web
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: multica
+      app.kubernetes.io/component: web
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: multica
+        app.kubernetes.io/component: web
+    spec:
+      containers:
+        - name: web
+          image: ghcr.io/multica-ai/multica-web:v0.6.1
+          imagePullPolicy: IfNotPresent
+          env:
+            - name: HOSTNAME
+              value: "0.0.0.0"
+            - name: PORT
+              value: "3000"
+            - name: REMOTE_API_URL
+              value: http://test-multica-server:8080
+          ports:
+            - name: http
+              containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              cpu: "2"
+              memory: 1Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: proxy
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: proxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: multica
+      app.kubernetes.io/component: proxy
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: multica
+        app.kubernetes.io/component: proxy
+    spec:
+      containers:
+        - name: proxy
+          image: nginx:1.27-alpine
+          imagePullPolicy: IfNotPresent
+          ports:
+            - name: http
+              containerPort: 80
+          readinessProbe:
+            httpGet:
+              path: /
+              port: http
+            initialDelaySeconds: 3
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          volumeMounts:
+            - name: conf
+              mountPath: /etc/nginx/conf.d
+              readOnly: true
+      volumes:
+        - name: conf
+          configMap:
+            name: test-multica-proxy
