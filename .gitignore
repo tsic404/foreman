@@ -1,2 +1,5 @@
 # Build output (make build-foreman / make build-gc).
 /bin/
+# Per-platform binaries staged as the image build context (make build-*-image)
+# and the CI release record.
+/dist/

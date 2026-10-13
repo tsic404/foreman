@@ -1,13 +1,18 @@
 # Publish the two images the deploy surface consumes (04-architecture.md
 # §部署/运行方式): `foreman:<version>` (+ `latest`) for the Deployment and
 # `foreman-job:<version>` (+ `latest`) for the Job pods and the foreman-gc
-# DaemonSet. The Job image is consumed by movable tag (ADR-012), so there is no
-# digest backfill into deploy/; the run still records what it published.
+# DaemonSet. Both are multi-platform manifest lists (linux/amd64 + linux/arm64),
+# so a mixed-architecture cluster pulls the platform its node runs.
 #
-# GHCR is the registry (the workspace owner's decision, replacing the private
-# registry the design still names); `GITHUB_TOKEN` authenticates the push via
-# `packages: write`. Every step failure fails the job — a push that never
-# landed or a digest that is not actually served is a red build, never a silent
+# The release path lives entirely in this workflow: no repository scripts, no
+# make targets (the Makefile is local development only). The Job image is
+# consumed by movable tag (ADR-012), so there is no digest backfill into
+# deploy/; the run still records what it published.
+#
+# GHCR is the registry (the workspace owner's decision); `GITHUB_TOKEN`
+# authenticates the push via `packages: write`. Every step failure fails the
+# job — a push that never landed, a manifest missing a platform, or an image
+# whose contents differ from the upstream release is a red build, never a silent
 # half-release.
 name: build-images
 
@@ -18,7 +23,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Version tag to publish (defaults to the newest v*.*.* tag, else the Makefile VERSION)
+        description: Version tag to publish (defaults to the newest v*.*.* tag, else v0.1.0)
         required: false
 
 permissions:
@@ -29,6 +34,14 @@ concurrency:
   group: build-images-${{ github.ref }}
   cancel-in-progress: false
 
+env:
+  # Every release carries both platforms. The Job image's `omp` is a native
+  # binary, so each platform's asset must match the base image's libc.
+  PLATFORMS: linux/amd64,linux/arm64
+  # Version of a `main` push that predates the first v*.*.* tag (the same
+  # default local builds stamp into the binary).
+  DEFAULT_VERSION: v0.1.0
+
 jobs:
   publish:
     # Hosted runners reach GHCR; FOREMAN_RELEASE_RUNNER (JSON label array)
@@ -38,6 +51,10 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0 # the newest reachable v*.*.* tag names the release
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod # the per-platform binaries below build here
 
       - name: Resolve the version
         id: version
@@ -50,7 +67,7 @@ jobs:
           elif [ "$GITHUB_REF_TYPE" = tag ]; then
             version=$GITHUB_REF_NAME
           else
-            version=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || make -s print-version)
+            version=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || echo "$DEFAULT_VERSION")
           fi
           [[ $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
             echo "::error title=Version resolution failed::$version is not a v<major>.<minor>.<patch> tag"
@@ -66,11 +83,52 @@ jobs:
           # set the repo variable, review the release notes, open a PR.
           MULTICA_CLI_VERSION: ${{ vars.MULTICA_CLI_VERSION || '0.6.1' }}
           OMP_VERSION: ${{ vars.OMP_VERSION || '18.6.1' }}
-          # Empty uses the musl default; set the repo variable when
-          # FOREMAN_BASE_IMAGE is a glibc base so `omp` matches its libc —
-          # a custom base must also carry the C++ runtime `omp` links.
-          OMP_ASSET: ${{ vars.OMP_ASSET }}
-        run: scripts/resolve-upstream-artifacts.sh
+          # Empty uses the musl default; a glibc FOREMAN_BASE_IMAGE needs
+          # omp-linux-x64 / omp-linux-arm64, plus a base that carries the C++
+          # runtime `omp` links.
+          OMP_ASSET_AMD64: ${{ vars.OMP_ASSET_AMD64 }}
+          OMP_ASSET_ARM64: ${{ vars.OMP_ASSET_ARM64 }}
+        run: |
+          set -euo pipefail
+          # Both platforms must exist upstream, and each digest comes from the
+          # release's own checksum manifest, never from a constant in this repo
+          # (F1/AC-13 provenance).
+          digest_of() { # <checksum-manifest-url> <asset-name>
+            local sha
+            sha=$(curl -fsSL "$1" | grep -E "[[:space:]]$2$" | cut -d' ' -f1 | head -n1)
+            [[ $sha =~ ^[0-9a-f]{64}$ ]] || {
+              echo "::error title=Upstream artifact missing::no SHA-256 for $2 in $1 (got '$sha')"
+              exit 1
+            }
+            printf '%s' "$sha"
+          }
+          cli_base="https://github.com/multica-ai/multica/releases/download/v${MULTICA_CLI_VERSION}"
+          omp_base="https://github.com/can1357/oh-my-pi/releases/download/v${OMP_VERSION}"
+          for arch in amd64 arm64; do
+            upper=$(printf '%s' "$arch" | tr '[:lower:]' '[:upper:]')
+            cli_asset="multica-cli-${MULTICA_CLI_VERSION}-linux-${arch}.tar.gz"
+            case "$arch" in
+              amd64) omp_asset=${OMP_ASSET_AMD64:-omp-linux-musl-x64} ;;
+              arm64) omp_asset=${OMP_ASSET_ARM64:-omp-linux-musl-arm64} ;;
+            esac
+            # Resolved into variables first: a digest_of failure inside a
+            # command substitution would only exit the subshell, and the step
+            # would carry on with an empty digest.
+            cli_sha=$(digest_of "$cli_base/checksums.txt" "$cli_asset")
+            omp_sha=$(digest_of "$omp_base/SHA256SUMS.txt" "$omp_asset")
+            {
+              printf 'MULTICA_CLI_URL_%s=%s/%s\n' "$upper" "$cli_base" "$cli_asset"
+              printf 'MULTICA_CLI_SHA256_%s=%s\n' "$upper" "$cli_sha"
+              printf 'OMP_URL_%s=%s/%s\n' "$upper" "$omp_base" "$omp_asset"
+              printf 'OMP_SHA256_%s=%s\n' "$upper" "$omp_sha"
+            } >>"$GITHUB_OUTPUT"
+          done
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
 
       - name: Log in to GHCR
         uses: docker/login-action@v3
@@ -78,6 +136,23 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the per-platform binaries
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # The Containerfiles copy dist/<cmd>-linux-<arch>: both platforms sit
+          # side by side in the build context and buildx picks one per platform.
+          for arch in amd64 arm64; do
+            for cmd in foreman foreman-gc; do
+              CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+                -ldflags "-s -w -X main.version=$VERSION" \
+                -o "dist/${cmd}-linux-${arch}" "./cmd/${cmd}"
+            done
+          done
+          ls -l dist
 
       - name: Build and push the images
         id: publish
@@ -87,30 +162,207 @@ jobs:
           BASE_IMAGE: ${{ vars.FOREMAN_BASE_IMAGE || 'alpine:3.20' }}
           # `latest` tracks main only: an older tag build must not move it back.
           PUSH_LATEST: ${{ github.ref_type == 'tag' && '0' || '1' }}
-          MULTICA_CLI_URL: ${{ steps.upstream.outputs.MULTICA_CLI_URL }}
-          MULTICA_CLI_SHA256: ${{ steps.upstream.outputs.MULTICA_CLI_SHA256 }}
-          OMP_URL: ${{ steps.upstream.outputs.OMP_URL }}
-          OMP_SHA256: ${{ steps.upstream.outputs.OMP_SHA256 }}
-        run: scripts/publish-images.sh
-
-      - name: Smoke the pushed Job image
-        env:
-          JOB_IMAGE: ${{ steps.publish.outputs.job_image }}
-          JOB_DIGEST: ${{ steps.publish.outputs.job_digest }}
-          MULTICA_CLI_URL: ${{ steps.upstream.outputs.MULTICA_CLI_URL }}
-          MULTICA_CLI_SHA256: ${{ steps.upstream.outputs.MULTICA_CLI_SHA256 }}
+          MULTICA_CLI_URL_AMD64: ${{ steps.upstream.outputs.MULTICA_CLI_URL_AMD64 }}
+          MULTICA_CLI_SHA256_AMD64: ${{ steps.upstream.outputs.MULTICA_CLI_SHA256_AMD64 }}
+          MULTICA_CLI_URL_ARM64: ${{ steps.upstream.outputs.MULTICA_CLI_URL_ARM64 }}
+          MULTICA_CLI_SHA256_ARM64: ${{ steps.upstream.outputs.MULTICA_CLI_SHA256_ARM64 }}
+          OMP_URL_AMD64: ${{ steps.upstream.outputs.OMP_URL_AMD64 }}
+          OMP_SHA256_AMD64: ${{ steps.upstream.outputs.OMP_SHA256_AMD64 }}
+          OMP_URL_ARM64: ${{ steps.upstream.outputs.OMP_URL_ARM64 }}
+          OMP_SHA256_ARM64: ${{ steps.upstream.outputs.OMP_SHA256_ARM64 }}
         run: |
           set -euo pipefail
-          # AC-13 provenance: the binary inside the image must be the `multica`
-          # member of the verified upstream release archive.
-          curl -fsSL "$MULTICA_CLI_URL" -o /tmp/multica-cli.tar.gz
-          echo "$MULTICA_CLI_SHA256  /tmp/multica-cli.tar.gz" | sha256sum -c -
-          tar -xzf /tmp/multica-cli.tar.gz -C /tmp multica
-          # The tag plus the digest the publish step reported: the smoke resolves
-          # the tag itself, so a tag that moved fails instead of matching itself.
-          scripts/smoke-job-image.sh "$JOB_IMAGE" \
-            --expect-digest "$JOB_DIGEST" \
-            --expect-cli-sha256 "$(sha256sum /tmp/multica | cut -d' ' -f1)"
+          for image in foreman foreman-job; do
+            case "$image" in
+              foreman)
+                containerfile=images/foreman.Containerfile
+                build_args=(--build-arg "BASE_IMAGE=$BASE_IMAGE")
+                ;;
+              foreman-job)
+                containerfile=images/foreman-job.Containerfile
+                build_args=(
+                  --build-arg "BASE_IMAGE=$BASE_IMAGE"
+                  --build-arg "MULTICA_CLI_URL_AMD64=$MULTICA_CLI_URL_AMD64"
+                  --build-arg "MULTICA_CLI_SHA256_AMD64=$MULTICA_CLI_SHA256_AMD64"
+                  --build-arg "MULTICA_CLI_URL_ARM64=$MULTICA_CLI_URL_ARM64"
+                  --build-arg "MULTICA_CLI_SHA256_ARM64=$MULTICA_CLI_SHA256_ARM64"
+                  --build-arg "OMP_URL_AMD64=$OMP_URL_AMD64"
+                  --build-arg "OMP_SHA256_AMD64=$OMP_SHA256_AMD64"
+                  --build-arg "OMP_URL_ARM64=$OMP_URL_ARM64"
+                  --build-arg "OMP_SHA256_ARM64=$OMP_SHA256_ARM64"
+                )
+                ;;
+            esac
+            ref="$REGISTRY/$image:$VERSION"
+            tags=(--tag "$ref")
+            if [ "$PUSH_LATEST" = 1 ]; then
+              tags+=(--tag "$REGISTRY/$image:latest")
+            fi
+            # --provenance=false: the published manifest list carries exactly the
+            # two platform manifests, with no attestation entry beside them.
+            docker buildx build \
+              --file "$containerfile" \
+              --platform "$PLATFORMS" \
+              "${build_args[@]}" "${tags[@]}" \
+              --provenance=false \
+              --push dist
+            digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")
+            [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || {
+              echo "::error title=Push did not land::$ref resolves to '$digest'"
+              exit 1
+            }
+            key=${image//-/_}
+            {
+              printf '%s_image=%s\n' "$key" "$ref"
+              printf '%s_digest=%s\n' "$key" "$digest"
+            } >>"$GITHUB_OUTPUT"
+            echo "published $ref@$digest" >>"$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Verify the published manifests
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
+          FOREMAN_DIGEST: ${{ steps.publish.outputs.foreman_digest }}
+          JOB_DIGEST: ${{ steps.publish.outputs.foreman_job_digest }}
+        run: |
+          set -euo pipefail
+          die() { echo "::error title=Manifest verification failed::$*"; exit 1; }
+          for pair in "foreman $FOREMAN_DIGEST" "foreman-job $JOB_DIGEST"; do
+            image=${pair%% *}; want=${pair##* }
+            ref="$REGISTRY/$image:$VERSION"
+            # The tag must still resolve to the digest this run published:
+            # resolving it here and comparing catches a tag that moved.
+            got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")
+            [ "$got" = "$want" ] || die "$ref resolves to $got, this run published $want"
+            list=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$ref" |
+              jq -r '.manifests[]? | "\(.platform.os)/\(.platform.architecture) \(.digest)"')
+            plats=$(printf '%s\n' "$list" | cut -d' ' -f1 | sort)
+            [ "$plats" = "$(printf 'linux/amd64\nlinux/arm64')" ] ||
+              die "$ref carries '${plats:-<no platform list>}', want linux/amd64 + linux/arm64"
+            printf '%s\n' "$list" | grep -Eq '^linux/amd64 sha256:[0-9a-f]{64}$' ||
+              die "$ref has no digest-pinned linux/amd64 config"
+            printf '%s\n' "$list" | grep -Eq '^linux/arm64 sha256:[0-9a-f]{64}$' ||
+              die "$ref has no digest-pinned linux/arm64 config"
+            printf '%s\n' "$list"
+            printf '| `%s` | `%s` | linux/amd64, linux/arm64 |\n' "$ref" "$want" >>"$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Smoke the published images
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
+          MULTICA_CLI_URL_AMD64: ${{ steps.upstream.outputs.MULTICA_CLI_URL_AMD64 }}
+          MULTICA_CLI_URL_ARM64: ${{ steps.upstream.outputs.MULTICA_CLI_URL_ARM64 }}
+          MULTICA_CLI_SHA256_AMD64: ${{ steps.upstream.outputs.MULTICA_CLI_SHA256_AMD64 }}
+          MULTICA_CLI_SHA256_ARM64: ${{ steps.upstream.outputs.MULTICA_CLI_SHA256_ARM64 }}
+          OMP_SHA256_AMD64: ${{ steps.upstream.outputs.OMP_SHA256_AMD64 }}
+          OMP_SHA256_ARM64: ${{ steps.upstream.outputs.OMP_SHA256_ARM64 }}
+        run: |
+          set -euo pipefail
+          die() { echo "::error title=Image smoke failed::$*"; exit 1; }
+          job="$REGISTRY/foreman-job:$VERSION"
+          foreman="$REGISTRY/foreman:$VERSION"
+          mkdir -p dist/smoke
+          # Pull one platform's config, create the container without starting it
+          # and copy the file out: the runner's own platform is the only one it
+          # can execute, and emulation is not what a release is verified against.
+          extract() { # <ref> <platform> <path-in-image> <dest>
+            local ref=$1 platform=$2 path=$3 dest=$4 cid
+            docker pull --quiet --platform "$platform" "$ref" >/dev/null
+            cid=$(docker create --platform "$platform" "$ref" /bin/true)
+            docker cp "$cid:$path" "$dest" || {
+              docker rm "$cid" >/dev/null
+              die "$ref ($platform) has no $path"
+            }
+            docker rm "$cid" >/dev/null
+          }
+          # AC-13 provenance on both platforms. `omp` ships as a bare binary, so
+          # the image's copy must equal the artifact whose digest the release
+          # manifest carries. The CLI ships as an archive: the archive is checked
+          # against the manifest, then the `multica` member it carries is what
+          # the image must match.
+          for arch in amd64 arm64; do
+            upper=$(printf '%s' "$arch" | tr '[:lower:]' '[:upper:]')
+            cli_url_var="MULTICA_CLI_URL_$upper"; cli_sha_var="MULTICA_CLI_SHA256_$upper"
+            omp_var="OMP_SHA256_$upper"
+            cli_archive="dist/smoke/multica-cli-linux-$arch.tar.gz"
+            extract "$job" "linux/$arch" /usr/local/bin/multica "dist/smoke/multica-linux-$arch"
+            extract "$job" "linux/$arch" /usr/local/bin/omp "dist/smoke/omp-linux-$arch"
+            extract "$job" "linux/$arch" /usr/local/bin/foreman-gc "dist/smoke/foreman-gc-linux-$arch"
+            curl -fsSL "${!cli_url_var}" -o "$cli_archive"
+            echo "${!cli_sha_var}  $cli_archive" | sha256sum -c -
+            tar -xzf "$cli_archive" -C dist/smoke multica
+            mv dist/smoke/multica "dist/smoke/multica-upstream-linux-$arch"
+            got_cli=$(sha256sum "dist/smoke/multica-linux-$arch" | cut -d' ' -f1)
+            want_cli=$(sha256sum "dist/smoke/multica-upstream-linux-$arch" | cut -d' ' -f1)
+            got_omp=$(sha256sum "dist/smoke/omp-linux-$arch" | cut -d' ' -f1)
+            [ "$got_cli" = "$want_cli" ] ||
+              die "multica in $job ($arch) is $got_cli, want the upstream release archive member $want_cli"
+            [ "$got_omp" = "${!omp_var}" ] ||
+              die "omp in $job ($arch) is $got_omp, want the upstream release artifact ${!omp_var}"
+            [ -x "dist/smoke/foreman-gc-linux-$arch" ] ||
+              die "foreman-gc in $job ($arch) is not executable"
+            echo "job image $arch: upstream multica + omp verified, foreman-gc executable" >>"$GITHUB_STEP_SUMMARY"
+          done
+          # The scheduler binary is cross-compiled per platform (CGO_ENABLED=0):
+          # its ELF header must name that platform and it must be static. `file`
+          # reads the header, so this holds for the platform the runner cannot
+          # execute (musl's `ldd` fails on a static binary instead of reporting).
+          for arch in amd64 arm64; do
+            extract "$foreman" "linux/$arch" /usr/local/bin/foreman "dist/smoke/foreman-linux-$arch"
+            described=$(file -b "dist/smoke/foreman-linux-$arch")
+            case "$arch" in
+              amd64) [[ $described == *x86-64* ]] ||
+                die "foreman in $foreman (linux/amd64) is not x86-64: $described" ;;
+              arm64) [[ $described == *aarch64* ]] ||
+                die "foreman in $foreman (linux/arm64) is not aarch64: $described" ;;
+            esac
+            [[ $described == *"statically linked"* ]] ||
+              die "foreman in $foreman ($arch) is not statically linked: $described"
+            echo "foreman image $arch: $described" >>"$GITHUB_STEP_SUMMARY"
+          done
+          # Executable proof on the runner's own platform: the static scheduler
+          # binary starts and prints its flags, and the native binaries the Job
+          # and the DaemonSet exec run in the image (a binary built for another
+          # libc only fails here).
+          usage=$(docker run --rm --platform linux/amd64 --entrypoint sh "$foreman" \
+            -ec '/usr/local/bin/foreman --help 2>&1 || true')
+          [[ $usage == *"-listen"* ]] || die "foreman in $foreman does not execute: $usage"
+          omp_version=$(docker run --rm --platform linux/amd64 --entrypoint omp "$job" --version)
+          echo "job image amd64 runs: omp $omp_version" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Record what this run published
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
+          FOREMAN_IMAGE: ${{ steps.publish.outputs.foreman_image }}
+          FOREMAN_DIGEST: ${{ steps.publish.outputs.foreman_digest }}
+          JOB_IMAGE: ${{ steps.publish.outputs.foreman_job_image }}
+          JOB_DIGEST: ${{ steps.publish.outputs.foreman_job_digest }}
+        run: |
+          set -euo pipefail
+          sha7=$(git rev-parse --short=7 HEAD)
+          mkdir -p dist
+          cat >dist/release-images.env <<EOF
+          # The release record for this run. deploy/ is never backfilled from it
+          # (ADR-012): the Job image is referenced by movable tag.
+          GIT_SHA=$sha7
+          VERSION=$VERSION
+          REGISTRY=$REGISTRY
+          PLATFORMS=$PLATFORMS
+          FOREMAN_IMAGE=$FOREMAN_IMAGE
+          FOREMAN_DIGEST=$FOREMAN_DIGEST
+          JOB_IMAGE=$JOB_IMAGE
+          JOB_DIGEST=$JOB_DIGEST
+          EOF
+          {
+            printf '## Foreman images %s (%s)\n\n' "$VERSION" "$sha7"
+            printf '| Image | Reference | Digest |\n|---|---|---|\n'
+            printf '| foreman | `%s` | `%s` |\n' "$FOREMAN_IMAGE" "$FOREMAN_DIGEST"
+            printf '| foreman-job | `%s` | `%s` |\n' "$JOB_IMAGE" "$JOB_DIGEST"
+            printf '\nBoth are `%s` manifest lists; the Job image is referenced by movable tag (`FOREMAN_JOB_IMAGE`).\n' "$PLATFORMS"
+          } >>"$GITHUB_STEP_SUMMARY"
 
       - uses: actions/upload-artifact@v4
         with:

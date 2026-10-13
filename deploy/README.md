@@ -60,30 +60,36 @@ characters); `MULTICA_TOKEN` must start with `mdt_` or `mul_`.
 Two images come from this repo (`docs/04-architecture.md` §部署/运行方式): the
 scheduler image for the Deployment, and the Job image (upstream multica CLI +
 `omp` + `foreman-gc`) that both the Job pods and the `foreman-gc` DaemonSet run.
+Both are published as **multi-platform manifest lists** (`linux/amd64` +
+`linux/arm64`), so a cluster with nodes of both architectures pulls the platform
+each node runs; nothing in `deploy/` names an architecture.
 
 `.github/workflows/build-images.yml` builds and publishes both to GHCR — on
 every push to `main` and on `v*.*.*` tags:
 
-| Image | Tags |
-|---|---|
-| `ghcr.io/tsic404/foreman` | `<version>`, `latest` |
-| `ghcr.io/tsic404/foreman-job` | `<version>`, `latest` |
+| Image | Tags | Platforms |
+|---|---|---|
+| `ghcr.io/tsic404/foreman` | `<version>`, `latest` | `linux/amd64`, `linux/arm64` |
+| `ghcr.io/tsic404/foreman-job` | `<version>`, `latest` | `linux/amd64`, `linux/arm64` |
 
 `<version>` is the pushed tag; on `main` it is the newest `v*.*.*` tag
-reachable from the commit, falling back to the Makefile `VERSION` (`v0.1.0`).
+reachable from the commit, falling back to the workflow's `DEFAULT_VERSION`
+(`v0.1.0`).
 `latest` follows `main` only: the shipped `FOREMAN_JOB_IMAGE` points at it,
 while the version tags remain the rollback path (ADR-012).
 The workflow needs no secrets for the push (`GITHUB_TOKEN`, `packages: write`)
 and resolves the upstream Job-image artifacts from their release checksum
-manifests; `MULTICA_CLI_VERSION` / `OMP_VERSION` repository variables pin other
-upstream versions than the defaults in the workflow. `omp` is a native binary,
-so the release asset must match the base image's libc: `OMP_ASSET` defaults to
-`omp-linux-musl-x64` for the musl base (`FOREMAN_BASE_IMAGE`, default
-`alpine:3.20`); a glibc base needs `OMP_ASSET=omp-linux-x64` as the repository
-variable (or in the environment for a local build). The base must also carry the
-C++ runtime `omp` links: the image installs Alpine's `libstdc++` package (which
-brings `libgcc`), and a slimmer base that ships neither fails at exec. Both
-mismatches are caught by the smoke step below, which runs `omp`.
+manifests, per platform; `MULTICA_CLI_VERSION` / `OMP_VERSION` repository
+variables pin other upstream versions than the defaults in the workflow. `omp`
+is a native binary, so each platform's asset must match the base image's libc:
+`OMP_ASSET_AMD64` / `OMP_ASSET_ARM64` default to `omp-linux-musl-x64` /
+`omp-linux-musl-arm64` for the musl base (`FOREMAN_BASE_IMAGE`, default
+`alpine:3.20`); a glibc base needs `omp-linux-x64` / `omp-linux-arm64` as the
+repository variables. The base must also carry the C++ runtime `omp` links: the
+image installs Alpine's `libstdc++` package (which brings `libgcc`), and a
+slimmer base that ships neither fails at exec. Both mismatches are caught by the
+workflow's smoke step, which runs `omp` on the runner's platform and checks both
+platforms' `multica` / `omp` against the upstream release checksums.
 
 The Job image is referenced by a **movable tag** in two places that carry the
 same literal (ADR-012):
@@ -106,32 +112,39 @@ CI publishes each run's references and digests (the `release-images-<version>`
 artifact and the workflow summary) as the run's own record — nothing in
 `deploy/` is backfilled from it.
 
-The same commands run by hand against any registry (the delivery entry points
-CI calls); `make build-job-image` is the local equivalent used for staging
-clusters and takes the artifact URL + SHA-256 for the upstream CLI archive and
-for `omp`, so the built image can be checked against the upstream release
-(AC-13 provenance):
+Local builds are for development and staging clusters, never the release path:
+`make build-job-image` builds one platform's image (`linux/$(ARCH)`, the host
+architecture unless `ARCH=` says otherwise) and takes the upstream artifact URL
++ SHA-256 for the CLI archive and for `omp`, so the built image can be checked
+against the upstream release (AC-13 provenance):
 
 ```bash
-make resolve-upstream                   # upstream artifact URL + SHA-256 pairs
-make publish-images                     # build + push both images, print the references
-make smoke-job-image IMAGE=ghcr.io/tsic404/foreman-job:latest
+make build-job-image \
+  MULTICA_CLI_URL=https://github.com/multica-ai/multica/releases/download/v0.6.1/multica-cli-0.6.1-linux-amd64.tar.gz \
+  MULTICA_CLI_SHA256=<sha256 from that release's checksums.txt> \
+  OMP_URL=https://github.com/can1357/oh-my-pi/releases/download/v18.6.1/omp-linux-musl-x64 \
+  OMP_SHA256=<sha256 from that release's SHA256SUMS.txt>
 ```
 
-`smoke-job-image` pulls the image and verifies three things: the upstream
-`multica` binary inside it (AC-13), that the binaries the Job spec and the
-DaemonSet exec are present, and that `omp` actually runs — `test -x` cannot
-catch a binary built for another libc, nor one missing its shared libraries.
-With `--expect-digest` it also resolves the tag and compares the digest with
-the digest the same job's publish step reported, so it takes a tag reference,
-not an `@sha256:…` pin (that form would only compare itself; CI passes the tag
-plus the digest `publish-images` reported).
+What CI verifies about a published image is reproducible with the container CLI
+alone:
 
-Both scripts need only a container CLI on `PATH` (`CONTAINER_TOOL`, default
-`docker`) with a reachable daemon: a CI runner provides one, and a nix shell
-does with `nix-shell -p docker --run 'make smoke-job-image IMAGE=…'` (or
-`nix shell nixpkgs#docker-client` for the client alone, with the daemon on the
-usual socket or `DOCKER_HOST`). The scripts have no nix dependency of their own.
+```bash
+# both platforms in the manifest list, each with its own digest
+docker buildx imagetools inspect ghcr.io/tsic404/foreman-job:latest
+# the platform the runner itself is: run it
+docker run --rm --platform linux/amd64 --entrypoint omp ghcr.io/tsic404/foreman-job:latest --version
+# the other platform's config, read without executing it (no emulation)
+cid=$(docker create --platform linux/arm64 ghcr.io/tsic404/foreman-job:latest /bin/true)
+docker cp "$cid:/usr/local/bin/multica" ./multica && sha256sum ./multica
+docker rm "$cid"
+```
+
+The workflow's smoke step asserts: exactly two platform manifests, each with a
+digest; the tag still resolving to the digest that run published; both
+platforms' `multica` / `omp` matching their upstream release checksum;
+`foreman-gc` present and executable in both configs; and `foreman` static and
+built for the platform whose config carries it.
 
 ## Node-local state
 

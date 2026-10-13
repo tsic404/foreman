@@ -1,4 +1,8 @@
-# Foreman build entry points (docs/04-architecture.md §部署/运行方式).
+# Foreman local build entry points (docs/04-architecture.md §部署/运行方式).
+#
+# Local development only: the release path is `.github/workflows/build-images.yml`,
+# which builds linux/amd64 + linux/arm64 itself and pushes the multi-platform
+# images to GHCR. Nothing here pushes, publishes or stamps a release.
 
 SHELL := /bin/sh
 BIN_DIR ?= bin
@@ -7,26 +11,25 @@ REGISTRY ?= ghcr.io/tsic404
 FOREMAN_IMAGE ?= $(REGISTRY)/foreman:$(VERSION)
 JOB_IMAGE ?= $(REGISTRY)/foreman-job:$(VERSION)
 CONTAINER_TOOL ?= $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+# Platform of the local image builds (CI builds both); the Containerfile picks
+# its per-arch artifact by buildx's TARGETARCH.
+ARCH ?= $(shell go env GOARCH)
+ARCH_UPPER := $(shell printf '%s' '$(ARCH)' | tr '[:lower:]' '[:upper:]')
+BASE_IMAGE ?= alpine:3.20
 
 # Upstream release artifacts for the Job image (F1/AC-13): the CLI is taken from
-# the release archive and both artifacts are checked against their SHA-256.
-# `make resolve-upstream` prints the current URL + digest pairs.
+# the release archive and both artifacts are checked against the SHA-256 from
+# their release's checksum manifest. CI resolves both platforms itself; a local
+# build passes the pair for $(ARCH).
 MULTICA_CLI_URL ?=
 MULTICA_CLI_SHA256 ?=
 OMP_URL ?=
 OMP_SHA256 ?=
-BASE_IMAGE ?= alpine:3.20
-
-# The delivery scripts read their inputs from the environment, so a
-# `make publish-images VERSION=… REGISTRY=…` override reaches them.
-export VERSION REGISTRY BASE_IMAGE CONTAINER_TOOL PUSH_LATEST
-export MULTICA_CLI_URL MULTICA_CLI_SHA256 OMP_URL OMP_SHA256
 
 GOFLAGS ?= -trimpath
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build build-foreman build-gc build-foreman-image build-job-image test vet fmt check \
-	print-version resolve-upstream publish-images smoke-job-image
+.PHONY: all build build-foreman build-gc build-foreman-image build-job-image test vet fmt check
 
 all: build
 
@@ -38,21 +41,29 @@ build-foreman:
 build-gc:
 	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/foreman-gc ./cmd/foreman-gc
 
+# build-linux-binary <package> <output>: the static Linux/$(ARCH) binary the
+# Containerfiles copy, named per platform so both can share a build context.
+define build-linux-binary
+CGO_ENABLED=0 GOOS=linux GOARCH=$(ARCH) go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(2) $(1)
+endef
+
 # Foreman's own image: the single-replica Deployment in deploy/30-foreman.yaml.
-build-foreman-image: build-foreman
-	$(CONTAINER_TOOL) build -f images/foreman.Containerfile \
+build-foreman-image:
+	$(call build-linux-binary,./cmd/foreman,$(BIN_DIR)/foreman-linux-$(ARCH))
+	$(CONTAINER_TOOL) build --platform linux/$(ARCH) -f images/foreman.Containerfile \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
 		-t $(FOREMAN_IMAGE) $(BIN_DIR)
 
 # Job image: upstream daemon CLI + omp, plus foreman-gc (the DaemonSet runs
-# this same image). Publishes $(JOB_IMAGE), referenced by movable tag.
-build-job-image: build-gc
-	$(CONTAINER_TOOL) build -f images/foreman-job.Containerfile \
+# this same image). Tagged as $(JOB_IMAGE), referenced by movable tag.
+build-job-image:
+	$(call build-linux-binary,./cmd/foreman-gc,$(BIN_DIR)/foreman-gc-linux-$(ARCH))
+	$(CONTAINER_TOOL) build --platform linux/$(ARCH) -f images/foreman-job.Containerfile \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
-		--build-arg MULTICA_CLI_URL=$(MULTICA_CLI_URL) \
-		--build-arg MULTICA_CLI_SHA256=$(MULTICA_CLI_SHA256) \
-		--build-arg OMP_URL=$(OMP_URL) \
-		--build-arg OMP_SHA256=$(OMP_SHA256) \
+		--build-arg MULTICA_CLI_URL_$(ARCH_UPPER)=$(MULTICA_CLI_URL) \
+		--build-arg MULTICA_CLI_SHA256_$(ARCH_UPPER)=$(MULTICA_CLI_SHA256) \
+		--build-arg OMP_URL_$(ARCH_UPPER)=$(OMP_URL) \
+		--build-arg OMP_SHA256_$(ARCH_UPPER)=$(OMP_SHA256) \
 		-t $(JOB_IMAGE) $(BIN_DIR)
 
 test:
@@ -65,22 +76,3 @@ fmt:
 	gofmt -l .
 
 check: fmt vet test build
-
-# Delivery chain (deploy/README.md §Images). CI is the release path; these are
-# the same entry points it calls, runnable by hand against any registry.
-print-version:
-	@echo $(VERSION)
-
-# Upstream Job-image artifacts for this platform: URL + the digest from the
-# release's own checksum manifest (F1/AC-13).
-resolve-upstream:
-	scripts/resolve-upstream-artifacts.sh
-
-# Build + push $(FOREMAN_IMAGE) and $(JOB_IMAGE), then report the published
-# references. Needs MULTICA_CLI_URL/_SHA256 and OMP_URL/_SHA256.
-publish-images:
-	scripts/publish-images.sh
-
-# Pull the Job image and verify the digest (and the upstream CLI inside it).
-smoke-job-image:
-	scripts/smoke-job-image.sh $(IMAGE)
