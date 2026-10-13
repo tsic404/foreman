@@ -21,16 +21,17 @@ Multica Server  ◄── fake client ──  Foreman  ── fake server ──
 ```bash
 make build-foreman        # bin/foreman      — the scheduler process
 make build-gc             # bin/foreman-gc   — node-local cache collector
-make build-foreman-image  # container image for the Deployment
+make build-foreman-image  # container image for the Deployment (linux/$(ARCH))
 make build-job-image      # Job image: upstream multica CLI + omp + foreman-gc
 make check                # gofmt + vet + tests + build
 ```
 
-Both images are built and published to GHCR by
-`.github/workflows/build-images.yml` on every push to `main` and on `v*.*.*`
-tags; `make resolve-upstream` and `make publish-images` are the local
-equivalents of what that workflow runs, and `make smoke-job-image` verifies a
-published Job image.
+Both images are built and published to GHCR as multi-platform manifest lists
+(`linux/amd64` + `linux/arm64`) by `.github/workflows/build-images.yml` on every
+push to `main` and on `v*.*.*` tags: that workflow is the whole release path and
+needs nothing from this repo beyond the two Containerfiles. The
+`make build-*-image` targets are the single-platform local equivalents
+(`ARCH=` picks the platform).
 
 The acceptance cases run against their own test multica cluster, deployed from
 `testinfra/test-multica/` (deploy, reset, recycle, CLI profile — see its
