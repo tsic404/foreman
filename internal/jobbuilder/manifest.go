@@ -29,8 +29,9 @@ const (
 	annoAttempt         = "foreman.tsic.top/attempt"
 )
 
-// Container, volume and mount names locked by 清单 A (03-contracts.md §5.4):
-// overlay validation and rendering must agree on them by construction.
+// Container, volume and mount names of the built-in default template
+// (03-contracts.md §5.4). The default template, its AC-20 baseline and the
+// credential path are all built from these constants, so they cannot drift.
 const (
 	containerAgent   = "agent"
 	containerPrepare = "prepare"
@@ -108,8 +109,8 @@ var (
 
 // defaultJob renders the built-in default template (docs/05-modules/job-template.md
 // §Job Manifest) with the §5.1 env tuning applied and the per-task fields
-// already written; the overlay merges on top of it and Build then re-writes
-// the authoritative paths (§5.4 step 6).
+// already written. This is the template-absent path; a deployment template
+// replaces it wholesale.
 func (b *Builder) defaultJob(name string, e TaskEntry) *batchv1.Job {
 	job := &batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{
@@ -219,9 +220,9 @@ func preferredTerm(node string) corev1.PreferredSchedulingTerm {
 	}
 }
 
-// defaultPrepareContainer is the credential-copy init container (ADR-007): the
-// only code that runs as root, with every field locked by 清单 A except
-// imagePullPolicy (§5.4「imagePullPolicy」段).
+// defaultPrepareContainer is the built-in default template's credential-copy
+// init container (ADR-007): the only code that runs as root. A deployment
+// template supplies its own.
 func defaultPrepareContainer(cfg Config) corev1.Container {
 	return corev1.Container{
 		Name:            containerPrepare,
@@ -292,17 +293,31 @@ func defaultAgentContainer(cfg Config) corev1.Container {
 	}
 }
 
+// injectedEnv is the A1.1 set Foreman writes into a template's first container
+// (P-006 §A1.1): the daemon's protocol surface, and the only env keys a
+// deployment template does not get to keep. On the default path the same three
+// keys already carry these values, so the injection is idempotent there.
+func injectedEnv() []corev1.EnvVar {
+	return []corev1.EnvVar{
+		{Name: "MULTICA_SERVER_URL", Value: foremanServerURL},
+		{Name: "MULTICA_DAEMON_ID", ValueFrom: envFieldRef("metadata.labels['job-name']")},
+		{Name: "MULTICA_DAEMON_MAX_CONCURRENT_TASKS", Value: "1"},
+	}
+}
+
+// envFieldRef is the fieldRef form §5.2 uses for the daemon identity keys.
+func envFieldRef(fieldPath string) *corev1.EnvVarSource {
+	return &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fieldPath}}
+}
+
 // agentEnv is the contract §5.2 env set: exactly 15 entries, fixed order.
 // Task-identity env never enters the Job (ADR-013): MULTICA_TASK_CONFIG_ROOT
 // in particular makes upstream v0.6.1 refuse `daemon start`.
 func agentEnv() []corev1.EnvVar {
-	fieldRef := func(fieldPath string) *corev1.EnvVarSource {
-		return &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fieldPath}}
-	}
 	return []corev1.EnvVar{
 		{Name: "MULTICA_SERVER_URL", Value: foremanServerURL},
-		{Name: "MULTICA_DAEMON_ID", ValueFrom: fieldRef("metadata.labels['job-name']")},
-		{Name: "MULTICA_DAEMON_DEVICE_NAME", ValueFrom: fieldRef("spec.nodeName")},
+		{Name: "MULTICA_DAEMON_ID", ValueFrom: envFieldRef("metadata.labels['job-name']")},
+		{Name: "MULTICA_DAEMON_DEVICE_NAME", ValueFrom: envFieldRef("spec.nodeName")},
 		{Name: "MULTICA_AGENT_RUNTIME_NAME", Value: jobAppName},
 		{Name: "MULTICA_DAEMON_MAX_CONCURRENT_TASKS", Value: "1"},
 		{Name: "MULTICA_WORKSPACES_ROOT", Value: mountWorkspaces},
@@ -318,14 +333,13 @@ func agentEnv() []corev1.EnvVar {
 	}
 }
 
-// authoritativeEnvKeys is the §5.2 key set overlay env entries must not touch.
-var authoritativeEnvKeys = func() map[string]bool {
-	keys := map[string]bool{}
-	for _, entry := range agentEnv() {
-		keys[entry.Name] = true
-	}
-	return keys
-}()
+// requiredAnnotationKeys are the §3.2 keys every Job carries; the four
+// trigger-context keys are conditional blocks (ADR-014), present only when
+// their TaskEntry field is non-empty.
+var (
+	requiredAnnotationKeys       = []string{annoDaemonID, annoJobRuntimeID, annoClaimedAt, annoAttempt}
+	triggerContextAnnotationKeys = []string{annoIssueID, annoIssueIdentifier, annoAutopilotRunID, annoChatSessionID}
+)
 
 // volumes is the built-in five-volume set: the two cache volumes follow
 // FOREMAN_REPO_CACHE_MODE (ADR-005), the rest are fixed. jobName feeds the

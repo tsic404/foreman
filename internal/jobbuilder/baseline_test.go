@@ -20,9 +20,9 @@ import (
 // and this copy in the same change.
 const baselinePath = "testdata/job-baseline.yaml"
 
-// TestDefaultTemplateMatchesBaseline renders with no overlay — the AC-20
-// default deployment window — and diffs the objects against the baseline
-// after placeholder substitution.
+// TestDefaultTemplateMatchesBaseline renders with no deployment template — the
+// AC-20 default window — and diffs the objects against the baseline after
+// placeholder substitution.
 func TestDefaultTemplateMatchesBaseline(t *testing.T) {
 	entry := testEntry()
 	cfg := testConfig()

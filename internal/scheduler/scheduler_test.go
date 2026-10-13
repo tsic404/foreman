@@ -320,36 +320,6 @@ func TestOnClaimSecretFailureFailsTaskWithoutJob(t *testing.T) {
 	}
 }
 
-func TestOnClaimInvalidTemplateFailsWithInvalidJobTemplate(t *testing.T) {
-	f := newFixture(t)
-	f.builder.err = &jobbuilder.ValidationError{
-		Source:     "job template",
-		Violations: []jobbuilder.Violation{{Path: "spec.template.spec.initContainers[1].volumeMounts[0].name", Rule: "C-9"}},
-	}
-
-	err := f.sched.OnClaim(context.Background(), claimPayload("task-1"))
-	if err == nil {
-		t.Fatal("OnClaim error swallowed")
-	}
-	e, ok := f.reg.Get("task-1")
-	if !ok || e.State != registry.StateTerminal || e.Result != registry.ResultFailed {
-		t.Fatalf("entry = %+v, %v", e, ok)
-	}
-	if len(f.jobs.createdJobs) != 0 || len(f.jobs.createdSecrets) != 0 {
-		t.Fatalf("objects created for a rejected template: jobs=%d secrets=%d", len(f.jobs.createdJobs), len(f.jobs.createdSecrets))
-	}
-	if len(f.server.forwards) != 1 || f.server.forwards[0].ep != EPFail {
-		t.Fatalf("forwards = %+v", f.server.forwards)
-	}
-	var body map[string]string
-	if err := json.Unmarshal([]byte(f.server.forwards[0].body), &body); err != nil {
-		t.Fatal(err)
-	}
-	if body["failure_reason"] != FailureReasonInvalidJobTemplate {
-		t.Fatalf("failure_reason = %q, want %q (failure-handling #0)", body["failure_reason"], FailureReasonInvalidJobTemplate)
-	}
-}
-
 func TestOnClaimInvalidTaskIDFailsWithInvalidTaskID(t *testing.T) {
 	f := newFixture(t)
 	f.builder.err = fmt.Errorf("%w: %q does not yield a valid Job name", jobbuilder.ErrInvalidTaskID, "TASK-1")
@@ -1653,9 +1623,8 @@ func TestOnClaimDropsAffinityForSaturatedNode(t *testing.T) {
 }
 
 // TestOnClaimWithoutIssueContext (AC-23): an autopilot-triggered payload has no
-// issue context and must still reach the Job path — it used to fail with
-// invalid_job_template because the invariant check demanded non-empty issue
-// annotations.
+// issue context and must still reach the Job path — it used to fail because the
+// invariant check demanded non-empty issue annotations.
 func TestOnClaimWithoutIssueContext(t *testing.T) {
 	f := newFixture(t)
 	var buf bytes.Buffer

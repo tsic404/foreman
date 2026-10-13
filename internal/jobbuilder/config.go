@@ -81,10 +81,10 @@ type Config struct {
 	NodeSelector     map[string]string
 	Tolerations      []corev1.Toleration
 
-	// OverlayPath is where the optional job-overlay.yaml is mounted
+	// TemplatePath is where the optional job-overlay.yaml is mounted
 	// (03-contracts.md §5.4). The Deployment fixes it; §5.4 has no env switch
 	// on purpose, so only tests point it elsewhere.
-	OverlayPath string
+	TemplatePath string
 
 	Issuer TokenIssuer
 	Nodes  NodeIndex
@@ -122,7 +122,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		MemoryLimit:      defaultMemoryLimit,
 		NodeSelector:     map[string]string{"kubernetes.io/os": "linux"},
 		Tolerations:      defaultTolerations,
-		OverlayPath:      OverlayPath,
+		TemplatePath:     TemplatePath,
 	}
 
 	if v := strings.TrimSpace(getenv(EnvJobNamespace)); v != "" {
