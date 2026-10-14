@@ -1,12 +1,12 @@
 # Test multica cluster — the execution environment of the TC-tech cases
-# (test-cases/_infra/test-multica-cluster.md §1/§2/§3/§7).
+# (test-cases/_infra/test-multica-cluster.md §1/§2/§3/§6).
 #
 # One complete multica deployment: server (backend) + its persistence
 # (postgres) + the frontend entry (web + proxy). It is isolated from
 # production by namespace, database and workspace — no production workspace,
 # token or runtime is ever reused (§1).
 #
-# The version anchor is absolute (§1/§7): every image is pinned to the
+# The version anchor is absolute (§1/§6): every image is pinned to the
 # `v0.6.1` release (multica@2ea01ae4). Upgrade = rebuild this whole
 # environment from a new anchor, never an in-place upgrade.
 #
@@ -122,10 +122,11 @@ spec:
     requests:
       storage: 2Gi
 ---
-# Direct address (§2 直连地址): the test multica server itself, for the
-# environment self-check and for troubleshooting. In-cluster consumers (the
-# fault-injection access path) use `http://test-multica-server:8080`; the test
-# network reaches the same Service through the node port.
+# The stable access point (§2 接入点与接线): the test multica server itself,
+# for the environment self-check, the instance under test and troubleshooting —
+# nothing sits in front of it. In-cluster consumers use
+# `http://test-multica-server:8080`; the test network reaches the same Service
+# through the node port.
 apiVersion: v1
 kind: Service
 metadata:
@@ -187,7 +188,7 @@ spec:
       targetPort: http
 ---
 # Database endpoint. Only the backend uses it; the reset entry reaches it
-# through `kubectl exec` (§7 重置).
+# through `kubectl exec` (§6 重置).
 apiVersion: v1
 kind: Service
 metadata:
@@ -272,9 +273,9 @@ spec:
           persistentVolumeClaim:
             claimName: postgres-data
 ---
-# The test multica server itself. Its Service name is also the in-cluster
-# direct address (`http://test-multica-server:8080`, §2 直连地址) that the
-# fault-injection access path relays to.
+# The test multica server itself. Its Service name is also the in-cluster face
+# of the access point (`http://test-multica-server:8080`, §2 接入点与接线) that
+# the instance under test is wired to.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
