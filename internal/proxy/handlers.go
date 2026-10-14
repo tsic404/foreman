@@ -242,13 +242,23 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	_, err := s.client.PrepareLease(r.Context(), tid)
-	if errors.Is(err, scheduler.ErrTaskNotFound) {
+	ready, err := s.client.PrepareLease(r.Context(), tid)
+	switch {
+	case errors.Is(err, scheduler.ErrTaskNotFound):
 		if verr := s.sched.OnTaskVanished(r.Context(), tid); verr != nil {
 			s.log.Error("task vanish settlement failed", "task_id", tid, "err", verr)
 		}
-	} else if err != nil {
+	case err != nil:
 		s.log.Debug("prepare-lease forward failed", "task_id", tid, "job_name", claims.JobName, "err", err)
+	case ready:
+		// Local renewal bookkeeping (proxy.md §请求路由 S7): the daemon's
+		// renewal restamped the same server lease the keeper renews, so the
+		// entry's lease_keep_until advances here too (contract §3.1) and the
+		// same Info observation line is emitted (protocol-lease.md 场景 A).
+		until := time.Now().Add(scheduler.PrepareLeaseTTL)
+		s.reg.SetLeaseKeepUntil(tid, until)
+		s.log.Info("lease.renewed", "task_id", tid, "job_name", claims.JobName,
+			"lease_keep_until", registry.ProjectedTime(until))
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

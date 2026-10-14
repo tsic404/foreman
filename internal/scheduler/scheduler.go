@@ -43,6 +43,14 @@ const jobNameWait = 45 * time.Second
 // re-dispatch, never reported as this task's failure.
 var errJobNameHeld = errors.New("job name still held by a terminating job")
 
+// PrepareLeaseTTL is the server-side prepare lease (§1.1 C3): the claim
+// stamps a 45s lease and every C4 renewal restamps it. An entry's
+// lease_keep_until (§3.1) is its last successful renewal plus this TTL — a
+// local upper bound of the server's own prepare_lease_expires_at, since the
+// renewal response carries no expiry and Foreman projects the deadline with
+// its own clock after the response returns.
+const PrepareLeaseTTL = 45 * time.Second
+
 // Failure reasons carried in the synthesized fail report (C10 body
 // failure_reason) for every compensation path (failure-handling 场景矩阵).
 const (
@@ -396,8 +404,12 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		Attempt:         attempt,
 		ClaimedAt:       now,
 		BootDeadline:    now.Add(s.cfg.JobBootTimeout),
-		Payload:         append(json.RawMessage(nil), task...),
-		PayloadVersion:  1,
+		// The claim just stamped the server's 45s prepare lease (§1.1 C3),
+		// so the entry starts out with a live deadline and never projects
+		// the zero value (contract §3.1).
+		LeaseKeepUntil: now.Add(PrepareLeaseTTL),
+		Payload:        append(json.RawMessage(nil), task...),
+		PayloadVersion: 1,
 		// Memory-only: the session key of the Built Job's affinity item
 		// (ADR-015) — never annotated, never projected.
 		PriorSessionID: head.PriorSessionID,
@@ -459,16 +471,27 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		return err
 	}
 
-	e.State = registry.StateJobCreated
+	placedAt := s.now()
 	// job_created_at is the apiserver's creationTimestamp, never a local
 	// clock reading: it is the instance-filter basis that separates this
 	// Job's pods from a previous instance's when the name is reused
-	// (contract §3.1).
-	e.JobCreatedAt = created.CreationTimestamp.Time
-	placedAt := s.now()
-	if err := s.reg.Put(e); err != nil {
-		return err
+	// (contract §3.1). Recorded in place: this claim's snapshot predates the
+	// Job create, and writing it back wholesale would revert a renewal the
+	// LeaseKeeper landed while the name was held.
+	marked, ok := s.reg.MarkJobCreated(e.TaskID, created.CreationTimestamp.Time)
+	if !ok {
+		// The entry left the registry inside the create window — settled
+		// (e.g. cancelled while the Job name was held) or reclaimed. The
+		// Secret and Job built above then have no owner left, and nothing
+		// else reclaims an entry-less Job: failure-handling #16 skips a Job
+		// that still exists and ListJobs is read only by the startup rebuild
+		// (TaskEntryFromJob), so the objects are rolled back here. The
+		// snapshot still carries the identity those rollbacks need.
+		return errors.Join(
+			fmt.Errorf("task %s settled or vanished before job_created was recorded", e.TaskID),
+			s.deleteObjects(ctx, e))
 	}
+	e = marked
 	s.metrics.TaskClaimed()
 	// The create latency stays on one clock: claimed_at and the observation
 	// are Foreman's, while job_created_at is the apiserver's.

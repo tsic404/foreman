@@ -85,9 +85,12 @@ type TaskEntry struct {
 	DeliveredAt        time.Time `json:"delivered_at"`
 	StartedAt          time.Time `json:"started_at"`
 	BootDeadline       time.Time `json:"boot_deadline"`
-	LeaseKeepUntil     time.Time `json:"lease_keep_until"`
-	LastStatusSeen     string    `json:"last_status_seen"`
-	PayloadVersion     int       `json:"payload_version"`
+	// LeaseKeepUntil is the local upper bound of the server's prepare lease
+	// (contract §3.1): the last successful renewal plus PrepareLeaseTTL,
+	// stamped after the response returned (Registry.SetLeaseKeepUntil).
+	LeaseKeepUntil time.Time `json:"lease_keep_until"`
+	LastStatusSeen string    `json:"last_status_seen"`
+	PayloadVersion int       `json:"payload_version"`
 
 	// Job lifecycle fields (contract §3.1): memory-only — never projected
 	// into /foreman/tasks, never written to annotations, never persisted.
@@ -107,6 +110,24 @@ type TaskEntry struct {
 	// Payload: raw claim payload until MarkDelivering replaces it with the
 	// delivered body — the form the ops preview must serve (S6 / AC-07).
 	Payload json.RawMessage `json:"-"`
+}
+
+// ProjectedTime renders t exactly as the /foreman/tasks projection renders
+// TaskEntry's time fields: through the time.Time JSON encoder that
+// encoding/json uses for them (RFC3339Nano, the value's own location), not
+// through a copy of its layout string. A log field that mirrors a projected
+// field must go through here — observability.md §结构化日志 requires the
+// lease.renewed lease_keep_until to carry the same value the projection does,
+// and a duplicated layout would drift from it silently. An unencodable value
+// (year outside [0,9999]) yields "" — the projection itself cannot encode it
+// either.
+func ProjectedTime(t time.Time) string {
+	b, err := t.MarshalJSON()
+	if err != nil {
+		return ""
+	}
+	// MarshalJSON answers a JSON string: drop the quoting.
+	return string(b[1 : len(b)-1])
 }
 
 // IsTerminal reports whether the entry has reached its terminal state.

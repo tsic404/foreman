@@ -1,12 +1,42 @@
 package registry
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
+
+// TestProjectedTimeMatchesTaskEntryProjection pins the log-side renderer to
+// the projection encoding: observability.md §结构化日志 registers the
+// lease.renewed field as carrying the same value /foreman/tasks projects, so
+// ProjectedTime must go through the encoder the projection uses (not a copy
+// of its layout: RFC3339 truncates the nanoseconds, .UTC() would drop the
+// value's own zone).
+func TestProjectedTimeMatchesTaskEntryProjection(t *testing.T) {
+	for _, tt := range []time.Time{
+		time.Date(2026, 10, 14, 23, 3, 57, 266810347, time.UTC),
+		time.Date(2026, 10, 14, 23, 3, 57, 0, time.FixedZone("UTC+8", 8*3600)),
+		{},
+	} {
+		raw, err := json.Marshal(TaskEntry{LeaseKeepUntil: tt})
+		if err != nil {
+			t.Fatalf("marshal entry: %v", err)
+		}
+		var projected struct {
+			LeaseKeepUntil string `json:"lease_keep_until"`
+		}
+		if err := json.Unmarshal(raw, &projected); err != nil {
+			t.Fatalf("unmarshal entry: %v", err)
+		}
+		if got := ProjectedTime(tt); got != projected.LeaseKeepUntil {
+			t.Errorf("ProjectedTime(%v) = %q, projection = %q", tt, got, projected.LeaseKeepUntil)
+		}
+	}
+}
 
 func jobWithMeta(labels, annos map[string]string) batchv1.Job {
 	return batchv1.Job{
