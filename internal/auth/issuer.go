@@ -7,6 +7,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"time"
@@ -40,14 +41,15 @@ type RequestScope struct {
 // JobLookup is the auth module's read view of the task registry.
 type JobLookup interface {
 	// ByDaemon returns the entry bound to daemonID (= job name); ok is false
-	// when no entry exists.
+	// when no entry exists. Entry existence IS credential validity: an entry
+	// survives its task's verdict for as long as its Job does (draining),
+	// and disappears at the credential reclaim (ADR-017).
 	ByDaemon(daemonID string) (JobEntry, bool)
 }
 
 // JobEntry is the subset of a registry entry that Verify needs.
 type JobEntry struct {
 	JobRuntimeID string
-	IsTerminal   bool
 }
 
 // DoneIndex reports tasks that reached terminal state within the retention
@@ -61,6 +63,7 @@ type DoneIndex interface {
 // Foreman restart keeps validating in-flight Jobs.
 type Issuer struct {
 	key         []byte
+	tokenTTL    time.Duration
 	now         func() time.Time
 	jobs        JobLookup
 	done        DoneIndex
@@ -75,12 +78,16 @@ func WithClock(now func() time.Time) Option {
 	return func(i *Issuer) { i.now = now }
 }
 
-// NewIssuer builds an Issuer from the decoded HMAC key (>= MinKeyBytes).
-func NewIssuer(key []byte, jobs JobLookup, done DoneIndex, opts ...Option) (*Issuer, error) {
+// NewIssuer builds an Issuer from the decoded HMAC key (>= MinKeyBytes) and
+// the issued token TTL, which bounds the revocation window.
+func NewIssuer(key []byte, jobs JobLookup, done DoneIndex, tokenTTL time.Duration, opts ...Option) (*Issuer, error) {
 	if len(key) < MinKeyBytes {
 		return nil, fmt.Errorf("%w: got %d bytes, need >= %d", ErrKeyTooShort, len(key), MinKeyBytes)
 	}
-	i := &Issuer{key: key, now: time.Now, jobs: jobs, done: done}
+	if tokenTTL <= 0 {
+		return nil, errors.New("auth: token TTL must be positive")
+	}
+	i := &Issuer{key: key, tokenTTL: tokenTTL, now: time.Now, jobs: jobs, done: done}
 	for _, opt := range opts {
 		opt(i)
 	}
@@ -141,19 +148,25 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 	if i.now().After(claims.ExpiresAt.Add(ClockSkew)) {
 		return Claims{}, fmt.Errorf("%w: expired at %s", ErrExpired, claims.ExpiresAt.Format(time.RFC3339))
 	}
-	// 4. Revocation set.
-	if i.revocations.IsRevoked(token) {
-		return Claims{}, ErrRevoked
-	}
-	// 5. Registry: the job must exist and be non-terminal; otherwise a done
-	// task on a terminal endpoint is a late replay (200 idempotent).
+	// 4. Entry adjudication — ahead of the revocation check (ADR-017). The
+	// entry's existence is the credential's validity (alive or draining), so
+	// after the reclaim deleted it, "no entry" is the authoritative verdict:
+	// a terminal endpoint retried by a daemon that already reported is a
+	// late replay (200 idempotent), everything else is an unknown Job.
 	entry, ok := i.jobs.ByDaemon(payload.JobName)
-	if !ok || entry.IsTerminal {
+	if !ok {
 		if i.done.IsDone(payload.TaskID) && req.IsTerminalEndpoint {
 			claims.IsLateReplay = true
 			return claims, nil
 		}
 		return Claims{}, fmt.Errorf("%w: %s", ErrUnknownJob, payload.JobName)
+	}
+	// 5. Revocation set — reachable only while the entry exists, which is
+	// exactly the same-name reuse face (a re-dispatched task or a rebuilt Job
+	// brought the entry back): the predecessor's token must never be
+	// accepted again (ADR-017).
+	if i.revocations.IsRevoked(token) {
+		return Claims{}, ErrRevoked
 	}
 	// 6. The request resource must match the token scope.
 	if req.TaskID != "" && req.TaskID != payload.TaskID {
@@ -166,13 +179,24 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 	return claims, nil
 }
 
-// Revoke marks token as revoked until the end of its validity window
-// (expiry plus ClockSkew). Called when the task reaches terminal state.
-func (i *Issuer) Revoke(token string) {
-	payload, _, _, err := parseToken(token)
-	if err != nil {
-		// Unparseable tokens fail Verify step 1 anyway.
-		return
-	}
-	i.revocations.Revoke(token, time.Unix(payload.Expiry, 0).Add(ClockSkew))
+// Hash returns the hex SHA-256 digest of a Job Token. It is the value the
+// entry carries in token_hash and the revocation set is keyed by (ADR-017):
+// the digest travels from the builder to the reclaim path, never the token.
+func (i *Issuer) Hash(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
+}
+
+// Revoke adds a token digest to the in-process revocation set for the rest of
+// the token's validity window. The credential reclaim calls it before deleting
+// the Secret and the entry (ADR-017); see RevocationSet for the face it
+// protects.
+//
+// The window is the *upper bound approximation* of auth.md's "TTL = the
+// token's remaining validity": the reclaim runs after the issue, so the
+// remaining time is ≤ the issued TTL, and `now + TTL + ClockSkew` therefore
+// never expires an entry early (conservative direction — the digest may
+// outlive the token, never the reverse).
+func (i *Issuer) Revoke(tokenHash string) {
+	i.revocations.Revoke(tokenHash, i.now().Add(i.tokenTTL+ClockSkew))
 }

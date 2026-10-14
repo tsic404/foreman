@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"time"
 
 	"github.com/tsic404/foreman/internal/auth"
 	"github.com/tsic404/foreman/internal/registry"
@@ -226,11 +227,12 @@ func (a jobLookup) ByDaemon(daemonID string) (auth.JobEntry, bool) {
 	if !ok {
 		return auth.JobEntry{}, false
 	}
-	return auth.JobEntry{JobRuntimeID: e.JobRuntimeID, IsTerminal: e.IsTerminal()}, true
+	return auth.JobEntry{JobRuntimeID: e.JobRuntimeID}, true
 }
 
 // JobTokenIssuer builds the Job Token issuer over the registry's read view
-// (the auth ↔ registry wiring the Job-facing surfaces share).
-func JobTokenIssuer(key []byte, reg *registry.Registry) (*auth.Issuer, error) {
-	return auth.NewIssuer(key, jobLookup{reg}, reg)
+// (the auth ↔ registry wiring the Job-facing surfaces share). tokenTTL is the
+// issued lifetime; it also bounds the revocation window (ADR-017).
+func JobTokenIssuer(key []byte, reg *registry.Registry, tokenTTL time.Duration) (*auth.Issuer, error) {
+	return auth.NewIssuer(key, jobLookup{reg}, reg, tokenTTL)
 }

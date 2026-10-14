@@ -39,7 +39,12 @@ type JobEventHandler func(JobEvent)
 // JobClient is the scheduler's K8s object access (task-mapping 内部结构).
 // Deletes are idempotent: a missing object counts as success.
 type JobClient interface {
-	CreateJob(ctx context.Context, job *batchv1.Job) error
+	// CreateJob creates the Job and returns the object the apiserver
+	// accepted. Its metadata.creationTimestamp is the instance-filter basis
+	// of the pod evidence (contract §3.1) — never substitute a local clock
+	// reading, or an apiserver clock that lags would filter out this Job's
+	// own pod and read the empty set as "terminated".
+	CreateJob(ctx context.Context, job *batchv1.Job) (*batchv1.Job, error)
 	DeleteJob(ctx context.Context, name string) error
 	// GetJob returns the Job, or nil when it is gone (the recovery
 	// module's ObjectClient uses the same convention).
@@ -48,6 +53,14 @@ type JobClient interface {
 	DeleteSecret(ctx context.Context, name string) error
 	// ListJobs returns the foreman-managed Jobs in the configured namespace.
 	ListJobs(ctx context.Context) ([]batchv1.Job, error)
+	// ListSecrets returns the foreman-managed credential Secrets in the
+	// configured namespace — the list face of the orphan sweep
+	// (failure-handling 场景 #16).
+	ListSecrets(ctx context.Context) ([]corev1.Secret, error)
+	// ListPods returns the pods matching labelSelector in the configured
+	// namespace — the value surface of jobTerminated (task-mapping
+	// §内部结构).
+	ListPods(ctx context.Context, labelSelector string) ([]corev1.Pod, error)
 	// WatchJobs streams Job changes via a client-go informer until ctx ends.
 	WatchJobs(ctx context.Context, handler JobEventHandler) error
 }
@@ -63,21 +76,22 @@ func NewJobClient(client kubernetes.Interface, namespace string) JobClient {
 	return &k8sJobClient{client: client, namespace: namespace}
 }
 
-func (c *k8sJobClient) CreateJob(ctx context.Context, job *batchv1.Job) error {
-	_, err := c.client.BatchV1().Jobs(c.namespace).Create(ctx, job, metav1.CreateOptions{})
-	return err
+func (c *k8sJobClient) CreateJob(ctx context.Context, job *batchv1.Job) (*batchv1.Job, error) {
+	return c.client.BatchV1().Jobs(c.namespace).Create(ctx, job, metav1.CreateOptions{})
 }
 
-// jobDeleteOptions cascades the deletion to the Job's pods. An empty
-// DeleteOptions leaves the policy to the Job strategy, whose default is
-// Orphan: the Job disappears and its pods lose their ownerReferences
-// ("child pods are preserved by default when jobs are deleted"), so they
-// outlive the Job and the ttlSecondsAfterFinished fallback
-// (05-modules/job-template.md). Foreground holds the Job until its
-// dependents are gone — measured 2.3s for a daemon that exits on SIGTERM,
-// bounded by the template's 30s terminationGracePeriodSeconds.
+// jobDeleteOptions deletes the Job with the Background propagation policy.
+// The policy is explicit, never left to the Job strategy: batch/v1 defaults
+// to OrphanDependents (pkg/registry/batch/job/strategy.go ·
+// DefaultGarbageCollectionPolicy, kept for compatibility), so a bare Delete
+// would keep the pods alive without a SIGTERM — the termination evidence
+// would stay false forever, every reclaim would fall to the drain upper
+// bound, and the pods would be left with no reclaim path (ADR-017,
+// contract §1.3). Background removes the Job object at once and lets the GC
+// delete the pods asynchronously (SIGTERM → terminationGracePeriodSeconds),
+// which is why "Job object gone" is not "Job terminated".
 func jobDeleteOptions() metav1.DeleteOptions {
-	return metav1.DeleteOptions{PropagationPolicy: new(metav1.DeletePropagationForeground)}
+	return metav1.DeleteOptions{PropagationPolicy: new(metav1.DeletePropagationBackground)}
 }
 
 func (c *k8sJobClient) DeleteJob(ctx context.Context, name string) error {
@@ -116,6 +130,26 @@ func (c *k8sJobClient) DeleteSecret(ctx context.Context, name string) error {
 func (c *k8sJobClient) ListJobs(ctx context.Context) ([]batchv1.Job, error) {
 	list, err := c.client.BatchV1().Jobs(c.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: managedJobSelector(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return list.Items, nil
+}
+
+func (c *k8sJobClient) ListSecrets(ctx context.Context) ([]corev1.Secret, error) {
+	list, err := c.client.CoreV1().Secrets(c.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: managedJobSelector(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	return list.Items, nil
+}
+
+func (c *k8sJobClient) ListPods(ctx context.Context, labelSelector string) ([]corev1.Pod, error) {
+	list, err := c.client.CoreV1().Pods(c.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labelSelector,
 	})
 	if err != nil {
 		return nil, err

@@ -32,13 +32,17 @@ type fakeJobs struct {
 	createdSecret []string
 	deletedJobs   []string
 	deletedSecret []string
+	// created is the apiserver timestamp stamped on every created Job; the
+	// scheduler reads it as job_created_at (contract §3.1).
+	created time.Time
 }
 
-func (f *fakeJobs) CreateJob(_ context.Context, job *batchv1.Job) error {
+func (f *fakeJobs) CreateJob(_ context.Context, job *batchv1.Job) (*batchv1.Job, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.createdJobs = append(f.createdJobs, job.Name)
-	return nil
+	job.CreationTimestamp = metav1.NewTime(f.created)
+	return job, nil
 }
 
 func (f *fakeJobs) DeleteJob(_ context.Context, name string) error {
@@ -65,6 +69,10 @@ func (f *fakeJobs) DeleteSecret(_ context.Context, name string) error {
 }
 
 func (f *fakeJobs) ListJobs(context.Context) ([]batchv1.Job, error) { return nil, nil }
+func (f *fakeJobs) ListSecrets(context.Context) ([]corev1.Secret, error) {
+	return nil, nil
+}
+func (f *fakeJobs) ListPods(context.Context, string) ([]corev1.Pod, error) { return nil, nil }
 func (f *fakeJobs) WatchJobs(context.Context, scheduler.JobEventHandler) error {
 	return nil
 }
@@ -83,10 +91,23 @@ func (f *fakeJobs) deleted(name string) bool {
 // fakeBuilder renders a bare Job+Secret pair.
 type fakeBuilder struct{}
 
-func (fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, error) {
+func (fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
 	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "fm-" + e.TaskID}}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fm-" + e.TaskID + "-cred"}}
-	return job, secret, nil
+	return job, secret, "sha256:" + e.TaskID, nil
+}
+
+// fakeRevoker records the credential digests the scheduler feeds to the Job
+// Token authority on reclaim (ADR-017).
+type fakeRevoker struct {
+	mu      sync.Mutex
+	revoked []string
+}
+
+func (f *fakeRevoker) Revoke(tokenHash string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revoked = append(f.revoked, tokenHash)
 }
 
 var testTokenKey = bytes.Repeat([]byte{0x42}, 32)
@@ -100,6 +121,7 @@ type testRig struct {
 	sched   *scheduler.Scheduler
 	issuer  *auth.Issuer
 	jobs    *fakeJobs
+	revoker *fakeRevoker
 	metrics *fakeMetrics
 	server  *httptest.Server
 	pending *recovery.PendingReports
@@ -124,7 +146,8 @@ func newTestRig(t *testing.T) *testRig {
 	}
 
 	rig.reg = registry.New(time.Now)
-	rig.jobs = &fakeJobs{}
+	rig.jobs = &fakeJobs{created: time.Now()}
+	rig.revoker = &fakeRevoker{}
 	pending, err := recovery.NewPendingReports(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
@@ -134,13 +157,14 @@ func newTestRig(t *testing.T) *testRig {
 		scheduler.Config{JobNamespace: "test-ns", MaxInflightJobs: 10, ClaimBatchMax: 32, JobBootTimeout: 300 * time.Second},
 		rig.reg, rig.jobs, fakeBuilder{}, rig.client, nil,
 		scheduler.WithPendingReports(pending),
+		scheduler.WithRevoker(rig.revoker),
 	)
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
 	}
 	rig.sched = sched
 
-	issuer, err := JobTokenIssuer(testTokenKey, rig.reg)
+	issuer, err := JobTokenIssuer(testTokenKey, rig.reg, auth.DefaultJobTokenTTL)
 	if err != nil {
 		t.Fatalf("JobTokenIssuer: %v", err)
 	}
@@ -362,7 +386,8 @@ func TestFullLifecycle(t *testing.T) {
 		}
 	}
 
-	// S13: complete forwards C9, then Job/Secret are deleted.
+	// S13: complete forwards C9, then the Job is taken down — the credential
+	// and the entry stay until the reclaim (ADR-017).
 	rig.stub.on("POST", "/api/daemon/tasks/t-life/complete", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
 		writeJSONStub(w, 200, map[string]string{"id": "t-life", "status": "completed"})
 	})
@@ -377,25 +402,60 @@ func TestFullLifecycle(t *testing.T) {
 	if !rig.jobs.deleted("fm-t-life") {
 		t.Error("Job not deleted after terminal report")
 	}
-	if _, ok := rig.reg.Get("t-life"); ok {
-		t.Error("entry still live after terminal report")
+	// The verdict leaves the entry draining: it is still the authorization
+	// row of its Job, and only the reclaim removes it (ADR-017).
+	e, ok = rig.reg.Get("t-life")
+	if !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Fatalf("entry after terminal report = %+v, want it terminal and draining", e)
 	}
 	if !rig.reg.IsDone("t-life") {
 		t.Error("done index not updated")
 	}
 
-	// Late replay: 200 idempotent, no second C9 (proxy.md 迟到重放).
+	// A retry of the same terminal report inside the drain window is a live
+	// Job's report: it is forwarded again and the server's terminal callback
+	// is idempotent (proxy.md 迟到重放 ①).
+	code, _ = rig.call(t, "POST", "/api/daemon/tasks/t-life/complete", tok, completeBody)
+	if code != 200 {
+		t.Fatalf("drain-window retry = %d, want 200", code)
+	}
+	if got := len(rig.stub.calls("POST", "/api/daemon/tasks/t-life/complete")); got != 2 {
+		t.Fatalf("drain-window retry C9 calls = %d, want 2", got)
+	}
+
+	// The Job's pods are gone: the reclaim revokes the digest, deletes the
+	// Secret and drops the entry, in that order (ADR-017).
+	deletedBefore := len(rig.jobs.deletedSecret)
+	if err := rig.sched.OnJobTerminated(t.Context(), "fm-t-life",
+		scheduler.JobTerminationReasonJobTerminated, time.Now(), 0); err != nil {
+		t.Fatalf("OnJobTerminated: %v", err)
+	}
+	if _, ok := rig.reg.Get("t-life"); ok {
+		t.Error("entry must be gone after the reclaim")
+	}
+	if got := rig.jobs.deletedSecret; len(got) != deletedBefore+1 || got[deletedBefore] != "fm-t-life-cred" {
+		t.Errorf("deleted Secrets = %v, want the reclaimed credential appended", got)
+	}
+	if got := rig.revoker.revoked; len(got) != 1 || got[0] != "sha256:t-life" {
+		t.Errorf("revoked digests = %v, want the entry's token hash", got)
+	}
+
+	// Late replay after the reclaim: the entry adjudication falls to the done
+	// index, so the terminal endpoint is a 200 idempotent with no second C9
+	// (proxy.md 迟到重放 ②).
 	code, _ = rig.call(t, "POST", "/api/daemon/tasks/t-life/complete", tok, completeBody)
 	if code != 200 {
 		t.Fatalf("late replay = %d, want 200", code)
 	}
-	if got := len(rig.stub.calls("POST", "/api/daemon/tasks/t-life/complete")); got != 1 {
+	if got := len(rig.stub.calls("POST", "/api/daemon/tasks/t-life/complete")); got != 2 {
 		t.Fatalf("late replay re-forwarded: C9 calls = %d", got)
 	}
-	// A non-terminal endpoint on the settled task is rejected.
+	// A non-terminal endpoint on the reclaimed task is rejected: the entry is
+	// gone and the done index only covers terminal endpoints (auth.Verify
+	// step 4).
 	code, _ = rig.call(t, "POST", "/api/daemon/tasks/t-life/progress", tok, []byte(`{}`))
 	if code != 401 {
-		t.Errorf("non-terminal endpoint after terminal = %d, want 401", code)
+		t.Errorf("non-terminal endpoint after reclaim = %d, want 401", code)
 	}
 }
 
@@ -692,8 +752,12 @@ func TestS7TaskVanishedSettlesLocally(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("S7 = %d", code)
 	}
-	if _, ok := rig.reg.Get("t-vanish"); ok {
-		t.Error("vanished task still in the registry")
+	// The verdict settles the entry locally — terminal and draining, with the
+	// Job object taken down; the credential is reclaimed when the Job's pods
+	// terminate or the drain bound expires (ADR-017).
+	e, ok := rig.reg.Get("t-vanish")
+	if !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Fatalf("vanished task entry = %+v, want it terminal and draining", e)
 	}
 	if !rig.jobs.deleted("fm-t-vanish") {
 		t.Error("vanished task's Job not deleted")
@@ -734,10 +798,12 @@ func TestS9Status404SettlesTaskVanished(t *testing.T) {
 	if code != 404 {
 		t.Fatalf("S9 = %d, want 404", code)
 	}
-	// proxy.md 转发 switch: non-terminal 404 → OnTaskVanished (Job/Secret
-	// removed, mapping dropped) instead of lingering until a restart.
-	if _, ok := rig.reg.Get("t-s9"); ok {
-		t.Error("entry must be dropped after a C13 404")
+	// proxy.md 转发 switch: non-terminal 404 → OnTaskVanished (the Job object
+	// is taken down and the entry settles terminal, still draining until the
+	// reclaim) instead of lingering until a restart.
+	e, ok := rig.reg.Get("t-s9")
+	if !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Fatalf("entry after a C13 404 = %+v, want it terminal and draining", e)
 	}
 	if !rig.jobs.deleted("fm-t-s9") {
 		t.Error("Job must be deleted after a C13 404")
@@ -833,7 +899,7 @@ func TestExpiredAndForgedTokensRejected(t *testing.T) {
 
 	// Expired token → 401. The clock-skew tolerance is 5 minutes, so the
 	// token is issued by a past-dated issuer (expired 30 minutes ago).
-	pastIssuer, err := auth.NewIssuer(testTokenKey, jobLookup{rig.reg}, rig.reg,
+	pastIssuer, err := auth.NewIssuer(testTokenKey, jobLookup{rig.reg}, rig.reg, auth.DefaultJobTokenTTL,
 		auth.WithClock(func() time.Time { return time.Now().Add(-time.Hour) }))
 	if err != nil {
 		t.Fatalf("NewIssuer: %v", err)

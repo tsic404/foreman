@@ -43,6 +43,18 @@ func IsTerminalResult(s string) bool {
 	return s == string(ResultCompleted) || s == string(ResultFailed) || s == string(ResultCancelled)
 }
 
+// JobPhase is the Job lifecycle phase, orthogonal to the task state
+// (contract §3.4). "gone" is expressed by the entry's absence, so only the
+// two live phases are named; the zero value means alive, which is what a
+// rebuilt entry starts from.
+type JobPhase string
+
+// Job lifecycle phases (contract §3.4, exhaustive).
+const (
+	JobPhaseAlive    JobPhase = "alive"
+	JobPhaseDraining JobPhase = "draining"
+)
+
 // TaskEntry is the mapping table row (contract §3.1). The four trigger-context
 // fields (issue/autopilot/chat) are optional: an empty value means that context
 // does not exist and is never an error (ADR-014). The JSON projection keeps all
@@ -76,11 +88,25 @@ type TaskEntry struct {
 	LastStatusSeen     string    `json:"last_status_seen"`
 	PayloadVersion     int       `json:"payload_version"`
 
+	// Job lifecycle fields (contract §3.1): memory-only — never projected
+	// into /foreman/tasks, never written to annotations, never persisted.
+	// The credential stays valid while the entry exists, so an entry in
+	// draining is still the authorization row for its Job (ADR-017).
+	JobPhase      JobPhase  `json:"-"`
+	DrainDeadline time.Time `json:"-"`
+	TokenHash     string    `json:"-"`
+
 	Payload json.RawMessage `json:"-"`
 }
 
 // IsTerminal reports whether the entry has reached its terminal state.
 func (e TaskEntry) IsTerminal() bool { return e.State == StateTerminal }
+
+// IsDraining reports whether the entry's Job is past its task's verdict: the
+// task is terminal, the Job is being torn down, and the credential stays
+// valid until the Job's pods are gone or the drain upper bound expires
+// (ADR-017).
+func (e TaskEntry) IsDraining() bool { return e.JobPhase == JobPhaseDraining }
 
 // JobRuntime is the fake runtime registered to a Job's daemon (contract §3.3).
 type JobRuntime struct {
@@ -131,6 +157,10 @@ func TaskEntryFromJob(job batchv1.Job) (TaskEntry, error) {
 		JobName:      job.GetName(),
 		JobNamespace: job.GetNamespace(),
 		State:        StateJobCreated,
+		// The apiserver timestamp is the instance-filter basis of the pod
+		// evidence (contract §3.1): a rebuilt entry must carry the object's
+		// value, never a local clock reading.
+		JobCreatedAt: job.CreationTimestamp.Time,
 
 		IssueID:         annos[AnnoIssueID],
 		IssueIdentifier: annos[AnnoIssueIdentifier],

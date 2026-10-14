@@ -29,6 +29,9 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.JobBootTimeout != 300*time.Second {
 		t.Fatalf("JobBootTimeout = %v", cfg.JobBootTimeout)
 	}
+	if cfg.JobDrainTimeout != 120*time.Second {
+		t.Fatalf("JobDrainTimeout = %v, want contract default 120s", cfg.JobDrainTimeout)
+	}
 }
 
 func TestLoadConfigOverrides(t *testing.T) {
@@ -37,13 +40,14 @@ func TestLoadConfigOverrides(t *testing.T) {
 		EnvMaxJobsPerNode:       "2",
 		EnvClaimBatchMax:        "5",
 		EnvJobBootTimeout:       "90s",
+		EnvJobDrainTimeout:      "0",
 		"FOREMAN_JOB_NAMESPACE": "agents-x",
 	}))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
 	if cfg.MaxInflightJobs != 7 || cfg.ClaimBatchMax != 5 || cfg.MaxJobsPerNode != 2 ||
-		cfg.JobBootTimeout != 90*time.Second || cfg.JobNamespace != "agents-x" {
+		cfg.JobBootTimeout != 90*time.Second || cfg.JobDrainTimeout != 0 || cfg.JobNamespace != "agents-x" {
 		t.Fatalf("cfg = %+v", cfg)
 	}
 }
@@ -68,6 +72,9 @@ func TestLoadConfigRejectsBadValues(t *testing.T) {
 		{EnvClaimBatchMax: "-1"},
 		{EnvJobBootTimeout: "10"},
 		{EnvJobBootTimeout: "-5s"},
+		// Zero is legal here (reclaim on the next observation point); a
+		// negative bound is not.
+		{EnvJobDrainTimeout: "-1s"},
 	} {
 		if _, err := LoadConfig(envFrom(env)); err == nil {
 			t.Fatalf("env %v accepted", env)

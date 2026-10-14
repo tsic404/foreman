@@ -6,6 +6,8 @@ import (
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/tsic404/foreman/internal/auth"
 )
 
 func envFrom(values map[string]string) func(string) string {
@@ -31,6 +33,20 @@ func TestLoadConfigDefaults(t *testing.T) {
 	}
 	if cfg.TaskMaxDuration != DefaultTaskMaxDuration {
 		t.Errorf("TaskMaxDuration = %s, want %s", cfg.TaskMaxDuration, DefaultTaskMaxDuration)
+	}
+	// The loaded default must be the very value the auth module's startup
+	// budget check validates: jobbuilder signs the token, so a second literal
+	// here could pass the self-check and still expire inside the drain
+	// window (ADR-017). Pin both against the single source.
+	if cfg.JobTokenTTL != auth.DefaultJobTokenTTL {
+		t.Errorf("JobTokenTTL = %s, want auth's %s", cfg.JobTokenTTL, auth.DefaultJobTokenTTL)
+	}
+	if cfg.TaskMaxDuration != auth.DefaultTaskMaxDuration {
+		t.Errorf("TaskMaxDuration = %s, want auth's %s", cfg.TaskMaxDuration, auth.DefaultTaskMaxDuration)
+	}
+	if auth.DefaultJobTokenTTL <= auth.DefaultTaskMaxDuration {
+		t.Errorf("default TTL %s does not cover the task duration %s",
+			auth.DefaultJobTokenTTL, auth.DefaultTaskMaxDuration)
 	}
 	if cfg.JobTTLSeconds != DefaultJobTTLSeconds {
 		t.Errorf("JobTTLSeconds = %d, want %d", cfg.JobTTLSeconds, DefaultJobTTLSeconds)

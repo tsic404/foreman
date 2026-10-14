@@ -37,9 +37,20 @@ type ServerClient interface {
 
 // JobBuilder renders the Job and credential Secret for an entry; satisfied
 // by *jobbuilder.Builder. The task payload is not part of the contract: it
-// never reaches a K8s object (F3/ADR-007).
+// never reaches a K8s object (F3/ADR-007). tokenHash is the digest of the
+// token inside the Secret — OnClaim records it as the entry's token_hash
+// (ADR-017), the only handle the reclaim path has on the credential.
 type JobBuilder interface {
-	Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, error)
+	Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, string, error)
+}
+
+// Revoker feeds a revoked credential digest to the Job Token authority
+// (satisfied by *auth.Issuer). The reclaim path calls it before the Secret
+// and the entry go; a missing revoker is a wiring error, not a mode, because
+// a silent no-op would leave the predecessor's token valid on the
+// same-name-reuse face (ADR-017).
+type Revoker interface {
+	Revoke(tokenHash string)
 }
 
 // Metrics is the observability seam. The observability module provides the
@@ -51,6 +62,10 @@ type Metrics interface {
 	JobCreateSeconds(seconds float64)
 	InflightJobs(n int)
 	DuplicateDispatch()
+	// CredReclaimed counts one credential reclaim by reason
+	// (job_terminated|drain_timeout) and observes the drain duration
+	// (observability.md §指标, ADR-017).
+	CredReclaimed(reason string, drainSeconds float64)
 }
 
 // Reconciler is the recovery module's convergence driver. When wired,
@@ -75,12 +90,13 @@ type PendingReports interface {
 // noopMetrics keeps every Metrics call site nil-safe.
 type noopMetrics struct{}
 
-func (noopMetrics) TaskClaimed()             {}
-func (noopMetrics) TaskTerminal(string)      {}
-func (noopMetrics) JobBootSeconds(float64)   {}
-func (noopMetrics) JobCreateSeconds(float64) {}
-func (noopMetrics) InflightJobs(int)         {}
-func (noopMetrics) DuplicateDispatch()       {}
+func (noopMetrics) TaskClaimed()                  {}
+func (noopMetrics) TaskTerminal(string)           {}
+func (noopMetrics) JobBootSeconds(float64)        {}
+func (noopMetrics) JobCreateSeconds(float64)      {}
+func (noopMetrics) InflightJobs(int)              {}
+func (noopMetrics) DuplicateDispatch()            {}
+func (noopMetrics) CredReclaimed(string, float64) {}
 
 func orNoopMetrics(m Metrics) Metrics {
 	if m == nil {

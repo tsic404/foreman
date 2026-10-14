@@ -31,9 +31,12 @@ type TaskEntry struct {
 	Attempt         int
 }
 
-// TokenIssuer signs per-Job Tokens; satisfied by auth.Issuer.
+// TokenIssuer signs per-Job Tokens; satisfied by auth.Issuer. Hash is the
+// digest of the issued token — the value OnClaim records as token_hash
+// (ADR-017), so the token itself never travels past the Secret.
 type TokenIssuer interface {
 	Issue(jobName, taskID, workspaceID string, ttl time.Duration) (string, error)
+	Hash(token string) string
 }
 
 // NodeIndex reports the node an issue's previous Job ran on; it backs the
@@ -76,25 +79,27 @@ func NewBuilder(cfg Config) (*Builder, error) {
 	return &Builder{cfg: cfg, template: template, templatePresent: present}, nil
 }
 
-// Build renders the Job and its credential Secret for e. An invalid task ID
+// Build renders the Job, its credential Secret and the digest of the token
+// that Secret carries (contract §2: the token_hash OnClaim records is the
+// only handle the reclaim path has on the credential). An invalid task ID
 // fails before any object is produced.
-func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, error) {
+func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
 	name := jobName(e.TaskID)
 	if len(name) > 63 || !dns1123Label.MatchString(name) {
-		return nil, nil, fmt.Errorf("%w: %q does not yield a valid Job name %q", ErrInvalidTaskID, e.TaskID, name)
+		return nil, nil, "", fmt.Errorf("%w: %q does not yield a valid Job name %q", ErrInvalidTaskID, e.TaskID, name)
 	}
 	if b.cfg.Issuer == nil {
-		return nil, nil, fmt.Errorf("Config.Issuer is required")
+		return nil, nil, "", fmt.Errorf("Config.Issuer is required")
 	}
 	job, err := b.render(name, e)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, "", err
 	}
 	token, err := b.cfg.Issuer.Issue(name, e.TaskID, e.WorkspaceID, b.cfg.JobTokenTTL)
 	if err != nil {
-		return nil, nil, fmt.Errorf("issue Job Token: %w", err)
+		return nil, nil, "", fmt.Errorf("issue Job Token: %w", err)
 	}
-	return job, b.credentialSecret(name, e.TaskID, token), nil
+	return job, b.credentialSecret(name, e.TaskID, token), b.cfg.Issuer.Hash(token), nil
 }
 
 // render is the build pipeline: pick the template — the deployment's copy or

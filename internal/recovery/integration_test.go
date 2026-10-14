@@ -16,6 +16,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 
 	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/observability"
@@ -38,15 +39,26 @@ func schedConfig() scheduler.Config {
 		MaxInflightJobs: 10,
 		ClaimBatchMax:   5,
 		JobBootTimeout:  time.Minute,
+		JobDrainTimeout: 2 * time.Minute,
 	}
 }
 
 func fakeJobName(taskID string) string { return "fm-" + taskID }
 
+// drainPod is a pod of the current Job instance: it carries a
+// creationTimestamp at or after the Job's, so the instance filter of the
+// termination evidence keeps it (contract §3.1 — a pod from a reused name's
+// predecessor is filtered out instead).
+func drainPod(jobName string, phase corev1.PodPhase) corev1.Pod {
+	pod := podFor(jobName, func(p *corev1.Pod) { p.Status.Phase = phase })
+	pod.CreationTimestamp = metav1.Now()
+	return pod
+}
+
 // setupIntegration wires the composition root: the real scheduler and the
 // real reconciler over the real durable queue. dir empty means a fresh temp
 // directory; tests that need to break the queue open it themselves.
-func setupIntegration(t *testing.T, server *fakeServerClient, dir string, opts ...PendingReportsOption) (*registry.Registry, *fakeJobClient, *scheduler.Scheduler, *PendingReports, func(ObjectClient) *Reconciler) {
+func setupIntegration(t *testing.T, server *fakeServerClient, dir string, opts ...PendingReportsOption) (*registry.Registry, *fakeJobClient, *scheduler.Scheduler, *PendingReports, *fakeRevoker, func(ObjectClient) *Reconciler) {
 	t.Helper()
 	return setupIntegrationWithMetrics(t, server, dir, nil, opts...)
 }
@@ -54,7 +66,7 @@ func setupIntegration(t *testing.T, server *fakeServerClient, dir string, opts .
 // setupIntegrationWithMetrics is setupIntegration with the observability
 // implementation wired into the scheduler, so a test can read the gauge off
 // the exposition the scrape endpoint serves rather than off the seam.
-func setupIntegrationWithMetrics(t *testing.T, server *fakeServerClient, dir string, metrics scheduler.Metrics, opts ...PendingReportsOption) (*registry.Registry, *fakeJobClient, *scheduler.Scheduler, *PendingReports, func(ObjectClient) *Reconciler) {
+func setupIntegrationWithMetrics(t *testing.T, server *fakeServerClient, dir string, metrics scheduler.Metrics, opts ...PendingReportsOption) (*registry.Registry, *fakeJobClient, *scheduler.Scheduler, *PendingReports, *fakeRevoker, func(ObjectClient) *Reconciler) {
 	t.Helper()
 	if dir == "" {
 		dir = t.TempDir()
@@ -63,16 +75,18 @@ func setupIntegrationWithMetrics(t *testing.T, server *fakeServerClient, dir str
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	reg := registry.New(time.Now)
+	reg := registry.New(time.Now, registry.WithDrainTimeout(schedConfig().JobDrainTimeout))
 	jobs := newFakeJobClient()
 	lb := &lateBound{}
+	revoker := &fakeRevoker{}
 	sched, err := scheduler.New(schedConfig(), reg, jobs, stubBuilder{}, server, metrics,
 		scheduler.WithReconciler(lb),
-		scheduler.WithPendingReports(pending))
+		scheduler.WithPendingReports(pending),
+		scheduler.WithRevoker(revoker))
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
 	}
-	return reg, jobs, sched, pending, func(objs ObjectClient) *Reconciler {
+	return reg, jobs, sched, pending, revoker, func(objs ObjectClient) *Reconciler {
 		rec, err := New(Config{ReconcileInterval: 30 * time.Second}, reg, objs, server, sched,
 			WithMetrics(&fakeMetrics{}),
 			WithPendingReports(pending, server))
@@ -88,7 +102,7 @@ func setupIntegrationWithMetrics(t *testing.T, server *fakeServerClient, dir str
 // failed on the daemon's behalf and the objects are removed.
 func TestIntegrationFailedJobIsCompensated(t *testing.T) {
 	server := newFakeServerClient(map[string]string{"t1": "running"})
-	reg, jobs, sched, _, newReconciler := setupIntegration(t, server, "")
+	reg, jobs, sched, _, revoker, newReconciler := setupIntegration(t, server, "")
 	ctx := context.Background()
 
 	claim := json.RawMessage(`{"id":"t1","agent_id":"a1","issue_id":"i1","issue_identifier":"TSI-1","workspace_id":"w1"}`)
@@ -101,6 +115,9 @@ func TestIntegrationFailedJobIsCompensated(t *testing.T) {
 	}
 	if !jobs.has(fakeJobName("t1")) || !jobs.hasSecret(fakeJobName("t1")+"-cred") {
 		t.Fatal("OnClaim did not create the Job and its Secret")
+	}
+	if entry.TokenHash != "hash-of-t1" {
+		t.Fatalf("token_hash = %q, want the digest the builder returned", entry.TokenHash)
 	}
 	reg.MarkDaemonRegistered(entry.DaemonID, time.Now())
 	if _, err := sched.Deliver(entry.DaemonID, entry.JobRuntimeID, 1); err != nil {
@@ -118,6 +135,9 @@ func TestIntegrationFailedJobIsCompensated(t *testing.T) {
 		})},
 	}
 	rec := newReconciler(objs)
+	// The Job's pod is still alive in the cluster (the Job object is gone,
+	// the container is shutting down): that is the drain window.
+	jobs.setPods(fakeJobName("t1"), drainPod(fakeJobName("t1"), corev1.PodRunning))
 
 	// First round only records the sighting: the daemon gets its window.
 	if err := rec.Reconcile(ctx); err != nil {
@@ -139,11 +159,44 @@ func TestIntegrationFailedJobIsCompensated(t *testing.T) {
 	if !reg.IsDone("t1") {
 		t.Fatal("the task must be settled terminal after the compensation")
 	}
-	if _, ok := reg.Get("t1"); ok {
-		t.Fatal("the mapping must be dropped after the objects are removed")
+	// The verdict deletes the Job but starts the drain: the entry and the
+	// credential Secret stay until the Job terminates (ADR-017).
+	entry, ok = reg.Get("t1")
+	if !ok || !entry.IsTerminal() || !entry.IsDraining() {
+		t.Fatalf("entry = %+v, %v; want a retained draining entry", entry, ok)
 	}
-	if jobs.has(fakeJobName("t1")) || jobs.hasSecret(fakeJobName("t1")+"-cred") {
-		t.Fatal("the Job and its Secret must be deleted after the report lands")
+	if jobs.has(fakeJobName("t1")) {
+		t.Fatal("the Job must be deleted at the verdict (撤下调度与资源)")
+	}
+	if !jobs.hasSecret(fakeJobName("t1") + "-cred") {
+		t.Fatal("the credential Secret must outlive the verdict until the reclaim")
+	}
+
+	// The pod is still alive: the drain holds, the credential stays valid.
+	if err := rec.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile inside the drain window: %v", err)
+	}
+	if _, ok := reg.Get("t1"); !ok {
+		t.Fatal("the credential must survive the drain window while its pod is alive")
+	}
+	if !jobs.hasSecret(fakeJobName("t1") + "-cred") {
+		t.Fatal("the Secret must survive the drain window while its pod is alive")
+	}
+
+	// The pod terminates: the next round reclaims the credential —
+	// revoke, delete the Secret, drop the entry (ADR-017).
+	jobs.setPods(fakeJobName("t1"), drainPod(fakeJobName("t1"), corev1.PodSucceeded))
+	if err := rec.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile after pod termination: %v", err)
+	}
+	if _, ok := reg.Get("t1"); ok {
+		t.Fatal("the entry must be dropped by the credential reclaim")
+	}
+	if jobs.hasSecret(fakeJobName("t1") + "-cred") {
+		t.Fatal("the credential Secret must be deleted by the reclaim")
+	}
+	if !revoker.has("hash-of-t1") {
+		t.Fatalf("revoked = %v, want the task's token digest", revoker.revoked)
 	}
 }
 
@@ -154,7 +207,7 @@ func TestIntegrationFailedJobIsCompensated(t *testing.T) {
 func TestIntegrationCompensatedReportIsQueuedAndDrained(t *testing.T) {
 	server := newFakeServerClient(map[string]string{"t1": "running"})
 	metrics := observability.NewMetrics()
-	reg, jobs, sched, pending, newReconciler := setupIntegration(t, server, "",
+	reg, jobs, sched, pending, _, newReconciler := setupIntegration(t, server, "",
 		WithPendingReportsGauge(metrics.PendingReports))
 	ctx := context.Background()
 
@@ -200,6 +253,10 @@ func TestIntegrationCompensatedReportIsQueuedAndDrained(t *testing.T) {
 	if !jobs.has(fakeJobName("t1")) || !jobs.hasSecret(fakeJobName("t1")+"-cred") {
 		t.Fatal("the objects must stay while the report is queued")
 	}
+	// The daemon's pod is still shutting down (the Job object is gone at the
+	// verdict, the container is not): the drain window is open, so the
+	// credential survives the queued report.
+	jobs.setPods(fakeJobName("t1"), drainPod(fakeJobName("t1"), corev1.PodRunning))
 
 	// Still down one round later: the failed drain keeps the report queued
 	// and the objects held back.
@@ -229,11 +286,30 @@ func TestIntegrationCompensatedReportIsQueuedAndDrained(t *testing.T) {
 	if got := server.accepted(scheduler.EPFail); got != 1 {
 		t.Fatalf("accepted fail reports = %d, want exactly 1 terminal write", got)
 	}
-	if _, ok := reg.Get("t1"); ok {
-		t.Fatal("the mapping must be dropped once the report landed")
+	// The report landed, so the verdict-time deletion runs: the Job goes, the
+	// credential and the entry stay for the still-open drain window (the pod
+	// is alive).
+	if jobs.has(fakeJobName("t1")) {
+		t.Fatal("the Job must be deleted once the report landed")
 	}
-	if jobs.has(fakeJobName("t1")) || jobs.hasSecret(fakeJobName("t1")+"-cred") {
-		t.Fatal("the Job and its Secret must be deleted once the report landed")
+	if _, ok := reg.Get("t1"); !ok {
+		t.Fatal("the entry must stay while the drain window is open")
+	}
+	if !jobs.hasSecret(fakeJobName("t1") + "-cred") {
+		t.Fatal("the Secret must stay while the drain window is open")
+	}
+
+	// The pod terminates: the reclaim closes the drain — revoke, delete the
+	// Secret, drop the entry (ADR-017).
+	jobs.setPods(fakeJobName("t1"), drainPod(fakeJobName("t1"), corev1.PodSucceeded))
+	if err := rec.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile after pod termination: %v", err)
+	}
+	if _, ok := reg.Get("t1"); ok {
+		t.Fatal("the reclaimed entry must leave the live index")
+	}
+	if jobs.hasSecret(fakeJobName("t1") + "-cred") {
+		t.Fatal("the Secret must be gone once the drain closed")
 	}
 }
 
@@ -245,7 +321,7 @@ func TestIntegrationStagedReportSurvivesWriteFailure(t *testing.T) {
 	server := newFakeServerClient(map[string]string{"t1": "running"})
 	queuePath := filepath.Join(t.TempDir(), "pending-reports")
 	metrics := observability.NewMetrics()
-	reg, jobs, sched, pending, newReconciler := setupIntegration(t, server, queuePath,
+	reg, jobs, sched, pending, _, newReconciler := setupIntegration(t, server, queuePath,
 		WithPendingReportsGauge(metrics.PendingReports))
 	ctx := context.Background()
 
@@ -298,6 +374,8 @@ func TestIntegrationStagedReportSurvivesWriteFailure(t *testing.T) {
 	if !jobs.has(fakeJobName("t1")) || !jobs.hasSecret(fakeJobName("t1")+"-cred") {
 		t.Fatal("the objects must stay while the report is staged")
 	}
+	// The daemon's pod is still shutting down: the drain window is open.
+	jobs.setPods(fakeJobName("t1"), drainPod(fakeJobName("t1"), corev1.PodRunning))
 
 	// A later round with the directory still broken keeps both the staged
 	// report and the objects.
@@ -329,11 +407,26 @@ func TestIntegrationStagedReportSurvivesWriteFailure(t *testing.T) {
 	if got := server.accepted(scheduler.EPFail); got != 1 {
 		t.Fatalf("accepted fail reports = %d, want exactly 1 terminal write", got)
 	}
-	if _, ok := reg.Get("t1"); ok {
-		t.Fatal("the mapping must be dropped once the report landed")
+	if jobs.has(fakeJobName("t1")) {
+		t.Fatal("the Job must be deleted once the report landed")
 	}
-	if jobs.has(fakeJobName("t1")) || jobs.hasSecret(fakeJobName("t1")+"-cred") {
-		t.Fatal("the Job and its Secret must be deleted once the report landed")
+	if _, ok := reg.Get("t1"); !ok {
+		t.Fatal("the entry must stay while the drain window is open")
+	}
+	if !jobs.hasSecret(fakeJobName("t1") + "-cred") {
+		t.Fatal("the Secret must stay while the drain window is open")
+	}
+
+	// The pod terminates: the reclaim closes the drain (ADR-017).
+	jobs.setPods(fakeJobName("t1"), drainPod(fakeJobName("t1"), corev1.PodSucceeded))
+	if err := rec.Reconcile(ctx); err != nil {
+		t.Fatalf("Reconcile after pod termination: %v", err)
+	}
+	if _, ok := reg.Get("t1"); ok {
+		t.Fatal("the reclaimed entry must leave the live index")
+	}
+	if jobs.hasSecret(fakeJobName("t1") + "-cred") {
+		t.Fatal("the Secret must be gone once the drain closed")
 	}
 }
 
@@ -341,7 +434,7 @@ func TestIntegrationStagedReportSurvivesWriteFailure(t *testing.T) {
 // released so the server re-dispatches the task — no report, no zombie.
 func TestIntegrationRebuiltPreStartEntryIsReleased(t *testing.T) {
 	server := newFakeServerClient(map[string]string{"t1": "dispatched"})
-	reg, jobs, _, _, newReconciler := setupIntegration(t, server, "")
+	reg, jobs, _, _, _, newReconciler := setupIntegration(t, server, "")
 	ctx := context.Background()
 
 	e := testEntry("t1")
@@ -350,7 +443,7 @@ func TestIntegrationRebuiltPreStartEntryIsReleased(t *testing.T) {
 	if err := reg.Put(e); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	if err := jobs.CreateJob(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: e.JobName}}); err != nil {
+	if _, err := jobs.CreateJob(ctx, &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: e.JobName}}); err != nil {
 		t.Fatalf("CreateJob: %v", err)
 	}
 	if err := jobs.CreateSecret(ctx, &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: e.JobName + "-cred"}}); err != nil {
@@ -376,7 +469,7 @@ func TestIntegrationRebuiltPreStartEntryIsReleased(t *testing.T) {
 // and then removes the objects without a fail report.
 func TestIntegrationCancelWaitsForAckThenReleases(t *testing.T) {
 	server := newFakeServerClient(map[string]string{"t1": "cancelled"})
-	reg, jobs, sched, _, newReconciler := setupIntegration(t, server, "")
+	reg, jobs, sched, _, _, newReconciler := setupIntegration(t, server, "")
 	ctx := context.Background()
 
 	claim := json.RawMessage(`{"id":"t1","agent_id":"a1","issue_id":"i1","issue_identifier":"TSI-1","workspace_id":"w1"}`)
@@ -404,11 +497,15 @@ func TestIntegrationCancelWaitsForAckThenReleases(t *testing.T) {
 	if got := server.forwards(); len(got) != 0 {
 		t.Fatalf("forwards = %+v, want no fail report for a cancelled task", got)
 	}
-	if _, ok := reg.Get("t1"); ok {
-		t.Fatal("the cancelled task must leave the live index")
+	entry, ok := reg.Get("t1")
+	if !ok || !entry.IsTerminal() || entry.Result != registry.ResultCancelled {
+		t.Fatalf("entry = %+v, %v; want a terminal cancelled entry in drain", entry, ok)
 	}
-	if jobs.has("fm-t1") || jobs.hasSecret("fm-t1-cred") {
-		t.Fatal("the Job and its Secret must be removed after the ack timeout")
+	if jobs.has("fm-t1") {
+		t.Fatal("the Job must be removed after the ack timeout")
+	}
+	if !jobs.hasSecret("fm-t1-cred") {
+		t.Fatal("the Secret waits for the drain window (ADR-017)")
 	}
 }
 
@@ -416,26 +513,99 @@ func TestIntegrationCancelWaitsForAckThenReleases(t *testing.T) {
 
 type stubBuilder struct{}
 
-func (stubBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, error) {
+func (stubBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
 	return &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: fakeJobName(e.TaskID)}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: fakeJobName(e.TaskID) + "-cred"}}, nil
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: fakeJobName(e.TaskID) + "-cred"}},
+		"hash-of-" + e.TaskID, nil
+}
+
+// fakeRevoker records the digests the credential reclaim feeds to the Job
+// Token authority.
+type fakeRevoker struct {
+	mu      sync.Mutex
+	revoked []string
+}
+
+func (f *fakeRevoker) Revoke(tokenHash string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revoked = append(f.revoked, tokenHash)
+}
+
+func (f *fakeRevoker) has(tokenHash string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, h := range f.revoked {
+		if h == tokenHash {
+			return true
+		}
+	}
+	return false
 }
 
 type fakeJobClient struct {
 	mu      sync.Mutex
 	jobs    map[string]*batchv1.Job
 	secrets map[string]*corev1.Secret
+	// pods is keyed by Job name: the termination evidence reads it through
+	// ListPods with the job-name selector.
+	pods map[string][]corev1.Pod
 }
 
 func newFakeJobClient() *fakeJobClient {
-	return &fakeJobClient{jobs: map[string]*batchv1.Job{}, secrets: map[string]*corev1.Secret{}}
+	return &fakeJobClient{
+		jobs:    map[string]*batchv1.Job{},
+		secrets: map[string]*corev1.Secret{},
+		pods:    map[string][]corev1.Pod{},
+	}
 }
 
-func (c *fakeJobClient) CreateJob(_ context.Context, job *batchv1.Job) error {
+func (c *fakeJobClient) CreateJob(_ context.Context, job *batchv1.Job) (*batchv1.Job, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.jobs[job.GetName()] = job
-	return nil
+	created := job.DeepCopy()
+	created.CreationTimestamp = metav1.Time{Time: time.Now().Add(-time.Minute)}
+	return created, nil
+}
+
+// setPods replaces the pods of one Job (the termination evidence).
+func (c *fakeJobClient) setPods(jobName string, pods ...corev1.Pod) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(pods) == 0 {
+		delete(c.pods, jobName)
+		return
+	}
+	c.pods[jobName] = pods
+}
+
+func (c *fakeJobClient) ListSecrets(context.Context) ([]corev1.Secret, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := make([]corev1.Secret, 0, len(c.secrets))
+	for _, secret := range c.secrets {
+		out = append(out, *secret)
+	}
+	return out, nil
+}
+
+func (c *fakeJobClient) ListPods(_ context.Context, labelSelector string) ([]corev1.Pod, error) {
+	selector, err := labels.Parse(labelSelector)
+	if err != nil {
+		return nil, err
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []corev1.Pod
+	for _, pods := range c.pods {
+		for i := range pods {
+			if selector.Matches(labels.Set(pods[i].Labels)) {
+				out = append(out, pods[i])
+			}
+		}
+	}
+	return out, nil
 }
 
 func (c *fakeJobClient) DeleteJob(_ context.Context, name string) error {

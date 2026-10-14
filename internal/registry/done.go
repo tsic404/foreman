@@ -31,17 +31,25 @@ func (t *ttlMap) put(key string, at time.Time) {
 
 // has reports whether key was put within the ttl window.
 func (t *ttlMap) has(key string) bool {
+	_, ok := t.at(key)
+	return ok
+}
+
+// at returns the recorded time of key when it is still within the ttl
+// window; it backs the drain duration (verdict → reclaim), which must not be
+// restarted by a repeated terminal report.
+func (t *ttlMap) at(key string) (time.Time, bool) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	at, ok := t.m[key]
 	if !ok {
-		return false
+		return time.Time{}, false
 	}
 	if t.now().Sub(at) > t.ttl {
 		delete(t.m, key)
-		return false
+		return time.Time{}, false
 	}
-	return true
+	return at, true
 }
 
 func (t *ttlMap) sweepLocked() {
