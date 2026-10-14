@@ -26,10 +26,28 @@ import (
 // the complete Job template, not a merge fragment (P-006 §A4).
 const TemplatePath = "/etc/foreman/job-template/job-overlay.yaml"
 
+// The startup log carries three fixed literals from two places in
+// 03-contracts.md §5.4: the risk declaration (§5.4 风险告知) and the hash line
+// plus effect statement (§5.4 运维口径①). The declaration and the hash line are
+// greped verbatim by AC-29 / TC-tech-job-07; the effect statement rests on
+// design text only — no AC or TC protects it. They stay constants so call
+// sites cannot drift from the contract text.
+
 // templateRiskDeclaration is the statement the startup log carries on both
-// paths — template present and absent (P-006 §A5 风险告知): the template is
-// not a security boundary and Foreman does not check it.
-const templateRiskDeclaration = "Foreman 不对 Job 模板做校验，模板内容不构成安全边界"
+// paths — template present and absent (03-contracts.md §5.4 风险告知, restated
+// in ADR-016): the template is not a security boundary, and Foreman does not
+// check it.
+const templateRiskDeclaration = "Foreman 不对 Job 模板做任何校验，模板内容不构成安全边界"
+
+// templateHashLinePrefix starts the hash line, whose fixed literal is
+// `模板内容哈希 sha256=<64 lowercase hex>` over the template file's bytes. The
+// line is a message, not an attr: an attr key carrying this prefix would
+// render `"模板内容哈希 sha256":"<hex>"`, breaking the `=` form the greps fix.
+const templateHashLinePrefix = "模板内容哈希 sha256="
+
+// templateEffectStatement is the 生效状态声明 (§5.4 运维口径①): the file is
+// read once at startup, so a ConfigMap edit takes effect only after a restart.
+const templateEffectStatement = "运行中 CM 变更不生效"
 
 // strictJobSerializer rejects unknown fields instead of dropping them: a
 // misspelled "contianers" must fail loudly rather than render a Job without
@@ -56,29 +74,32 @@ func LoadJobTemplate(cfg Config) (map[string]any, bool, error) {
 	if errors.Is(err, fs.ErrNotExist) {
 		log.Warn("job template absent: using the built-in default template",
 			"template", path, "declaration", templateRiskDeclaration,
-			"effect", "a ConfigMap change takes effect only after a Foreman restart")
+			"effect", templateEffectStatement)
 		return nil, false, nil
 	}
 	if err != nil {
-		log.Error("job template unreadable: refusing to start",
+		// Failure class 1: the file cannot be read, so the hash is out of
+		// reach — the line says so instead of carrying a hash line.
+		log.Error("job template file unreadable: 文件不可读，模板内容哈希不可得",
 			"template", path, "err", err.Error(), "declaration", templateRiskDeclaration)
 		return nil, false, fmt.Errorf("read job template %s: %w", path, err)
 	}
 
 	sum := sha256.Sum256(data)
-	hash := hex.EncodeToString(sum[:])
+	hashLine := templateHashLinePrefix + hex.EncodeToString(sum[:])
 
 	template, err := parseJobTemplate(path, data)
 	if err != nil {
 		log.Error("job template rejected: refusing to start",
-			"template", path, "template_sha256", hash, "err", err.Error(),
-			"declaration", templateRiskDeclaration)
+			"template", path, "err", err.Error(), "declaration", templateRiskDeclaration)
+		log.Error(hashLine, "template", path)
 		return nil, true, err
 	}
 
 	log.Info("job template accepted: used verbatim apart from Foreman's own writes",
-		"template", path, "template_sha256", hash, "declaration", templateRiskDeclaration,
-		"effect", "loaded at startup only; a ConfigMap change takes effect after a restart")
+		"template", path, "declaration", templateRiskDeclaration,
+		"effect", templateEffectStatement)
+	log.Info(hashLine, "template", path)
 	return template, true, nil
 }
 

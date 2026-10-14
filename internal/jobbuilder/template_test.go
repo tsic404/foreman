@@ -2,6 +2,8 @@ package jobbuilder
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"log/slog"
 	"math"
 	"os"
@@ -13,6 +15,8 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/tsic404/foreman/internal/observability"
 )
 
 // statefulSetShapedTemplate is the deployment shape P-006 was filed for: a
@@ -159,7 +163,11 @@ spec:
 `
 
 // templateConfig writes manifest where the Deployment mounts the template and
-// returns the config plus the captured startup log.
+// returns the config plus the captured startup log. The log runs through the
+// production chain (observability.NewLogger: JSON plus redaction, the handler
+// main installs at the Deployment's info level): AC-29 / TC-tech-job-07 judge
+// the deployed log text, so a redaction rule that rewrote a fixed literal must
+// fail here rather than only in the cluster.
 func templateConfig(t *testing.T, manifest string) (Config, *bytes.Buffer) {
 	t.Helper()
 	path := filepath.Join(t.TempDir(), "job-overlay.yaml")
@@ -170,7 +178,7 @@ func templateConfig(t *testing.T, manifest string) (Config, *bytes.Buffer) {
 	cfg := testConfig()
 	cfg.TemplatePath = path
 	cfg.Issuer = &fakeIssuer{token: "fmj_test.sig"}
-	cfg.Logger = slog.New(slog.NewJSONHandler(logs, nil))
+	cfg.Logger = observability.NewLogger(logs, slog.LevelInfo, "")
 	return cfg, logs
 }
 
@@ -187,11 +195,29 @@ func mustBuildTemplate(t *testing.T, manifest string, e TaskEntry, mutate func(*
 
 // ---- startup gate: two failure classes only (P-006 §A4) ----
 
+// The startup log's fixed literals, pinned as text and not read from the
+// production constants: the acceptance test greps them verbatim
+// (test-cases/job-template.md TC-tech-job-07, AC-29), so a typo inside a
+// constant is exactly the defect these assertions have to catch.
+const (
+	wantDeclaration = "Foreman 不对 Job 模板做任何校验，模板内容不构成安全边界"
+	wantEffect      = "运行中 CM 变更不生效"
+	wantHashPrefix  = "模板内容哈希 sha256="
+	wantUnreadable  = "文件不可读"
+	wantNoHash      = "模板内容哈希不可得"
+)
+
+// wantHashLine is the hash line AC-29 fixes for a template file's bytes.
+func wantHashLine(content string) string {
+	sum := sha256.Sum256([]byte(content))
+	return wantHashPrefix + hex.EncodeToString(sum[:])
+}
+
 func TestLoadJobTemplateAbsent(t *testing.T) {
 	cfg := testConfig()
 	cfg.TemplatePath = filepath.Join(t.TempDir(), "job-overlay.yaml")
 	logs := &bytes.Buffer{}
-	cfg.Logger = slog.New(slog.NewJSONHandler(logs, nil))
+	cfg.Logger = observability.NewLogger(logs, slog.LevelInfo, "")
 
 	template, present, err := LoadJobTemplate(cfg)
 	if err != nil {
@@ -200,10 +226,13 @@ func TestLoadJobTemplateAbsent(t *testing.T) {
 	if present || template != nil {
 		t.Fatalf("present=%v template=%v, want the default-template path", present, template)
 	}
-	if !strings.Contains(logs.String(), templateRiskDeclaration) {
+	if !strings.Contains(logs.String(), wantDeclaration) {
 		t.Errorf("startup log must carry the declaration on the absent path: %s", logs.String())
 	}
-	if strings.Contains(logs.String(), "template_sha256") {
+	if !strings.Contains(logs.String(), wantEffect) {
+		t.Errorf("the absent path must still state that a ConfigMap edit needs a restart: %s", logs.String())
+	}
+	if strings.Contains(logs.String(), wantHashPrefix) {
 		t.Errorf("the absent path has no content to hash: %s", logs.String())
 	}
 }
@@ -222,11 +251,14 @@ func TestLoadJobTemplateAcceptsCompleteJob(t *testing.T) {
 		t.Errorf("template header = %v/%v", template["apiVersion"], template["kind"])
 	}
 	log := logs.String()
-	if !strings.Contains(log, templateRiskDeclaration) {
+	if !strings.Contains(log, wantDeclaration) {
 		t.Errorf("startup log must carry the declaration: %s", log)
 	}
-	if !strings.Contains(log, "template_sha256") {
-		t.Errorf("startup log must carry the content hash: %s", log)
+	if !strings.Contains(log, wantHashLine(statefulSetShapedTemplate)) {
+		t.Errorf("startup log must carry the template file's hash line: %s", log)
+	}
+	if !strings.Contains(log, wantEffect) {
+		t.Errorf("startup log must state that a ConfigMap edit needs a restart: %s", log)
 	}
 }
 
@@ -236,7 +268,7 @@ func TestLoadJobTemplateUnreadable(t *testing.T) {
 	cfg := testConfig()
 	cfg.TemplatePath = t.TempDir()
 	logs := &bytes.Buffer{}
-	cfg.Logger = slog.New(slog.NewJSONHandler(logs, nil))
+	cfg.Logger = observability.NewLogger(logs, slog.LevelInfo, "")
 
 	template, present, err := LoadJobTemplate(cfg)
 	if err == nil {
@@ -245,8 +277,18 @@ func TestLoadJobTemplateUnreadable(t *testing.T) {
 	if present {
 		t.Error("a failed read must not report the template as present")
 	}
-	if !strings.Contains(logs.String(), templateRiskDeclaration) {
+	if !strings.Contains(logs.String(), wantDeclaration) {
 		t.Errorf("the unreadable refusal must carry the declaration: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), wantUnreadable) {
+		t.Errorf("the unreadable refusal must name the class (文件不可读): %s", logs.String())
+	}
+	// Class 1 states the hash is out of reach and must not show a hash line.
+	if !strings.Contains(logs.String(), wantNoHash) {
+		t.Errorf("the unreadable refusal must state that no hash is available: %s", logs.String())
+	}
+	if strings.Contains(logs.String(), wantHashPrefix) {
+		t.Errorf("an unreadable file has no hash to report: %s", logs.String())
 	}
 }
 
@@ -280,8 +322,12 @@ func TestLoadJobTemplateRejects(t *testing.T) {
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("error %q must name the failure (%q)", err, tc.want)
 			}
-			if !strings.Contains(logs.String(), templateRiskDeclaration) {
+			if !strings.Contains(logs.String(), wantDeclaration) {
 				t.Errorf("the refusal log must carry the declaration: %s", logs.String())
+			}
+			// Class 2 is readable, so it keeps the hash line (AC-29).
+			if !strings.Contains(logs.String(), wantHashLine(tc.manifest)) {
+				t.Errorf("the refusal log must carry the template file's hash line: %s", logs.String())
 			}
 		})
 	}
