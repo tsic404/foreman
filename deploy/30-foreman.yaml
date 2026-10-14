@@ -174,7 +174,7 @@ spec:
             # terminal-report queue (contract §4) between container restarts.
             - name: state
               mountPath: /var/lib/foreman
-            # §5.4 overlay carrier: optional, so a missing ConfigMap falls back
+            # §5.4 template carrier: optional, so a missing ConfigMap falls back
             # to the built-in default template (AC-20) instead of blocking
             # container creation with CreateContainerConfigError.
             - name: job-template

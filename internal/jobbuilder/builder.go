@@ -1,13 +1,16 @@
 // Package jobbuilder renders a TaskEntry into the Job and credential Secret
-// the scheduler creates, including the deployment overlay pipeline
-// (ConfigMap job-overlay.yaml + two-stage invariant validation). Design:
-// docs/05-modules/job-template.md, contracts §3.2/§5.2/§5.4.
+// the scheduler creates. A deployment may supply a complete Job template
+// (ConfigMap job-overlay.yaml); Foreman uses it verbatim apart from its own
+// writes — the A1.1 env keys, the per-task metadata and the §3.2 key set.
+// Design: docs/05-modules/job-template.md, contracts §3.2/§5.2,
+// proposals/P-006-template-passthrough-env-injection.md.
 package jobbuilder
 
 import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -54,34 +57,27 @@ var ErrInvalidTaskID = errors.New("invalid task id")
 // Builder renders Job/Secret objects; it never talks to the K8s API
 // (creation is the scheduler's job).
 type Builder struct {
-	cfg            Config
-	overlay        map[string]any
-	overlayPresent bool
+	cfg      Config
+	template map[string]any
+	// templatePresent is true when the deployment supplied a template; the
+	// parsed map is then read-only and every Build renders a copy of it.
+	templatePresent bool
 }
 
 // NewBuilder runs the startup gate (job-template.md §关键流程 step 0): it
-// loads and validates the optional overlay, so an illegal template makes main
-// exit non-zero before the listener starts (CrashLoopBackOff under the
-// Deployment) instead of surfacing at the first claim.
+// loads and parses the optional Job template, so an unreadable or unparseable
+// one makes main exit non-zero before the listener starts (CrashLoopBackOff
+// under the Deployment) instead of surfacing at the first claim.
 func NewBuilder(cfg Config) (*Builder, error) {
-	overlay, present, err := LoadAndValidateOverlay(cfg)
+	template, present, err := LoadJobTemplate(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &Builder{cfg: cfg, overlay: overlay, overlayPresent: present}, nil
-}
-
-// NewBuilderWithOverlay injects an overlay that bypassed the startup gate, so
-// tests can drive the build-time InvariantChecker fallback (TC-tech-job-03
-// 「构建期兜底」). Production paths go through NewBuilder.
-func NewBuilderWithOverlay(cfg Config, overlay map[string]any) *Builder {
-	return &Builder{cfg: cfg, overlay: overlay, overlayPresent: true}
+	return &Builder{cfg: cfg, template: template, templatePresent: present}, nil
 }
 
 // Build renders the Job and its credential Secret for e. An invalid task ID
-// fails before any object is produced; a template that breaks the invariants
-// fails with *ValidationError (the scheduler maps it to
-// failure_reason=invalid_job_template and creates nothing).
+// fails before any object is produced.
 func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, error) {
 	name := jobName(e.TaskID)
 	if len(name) > 63 || !dns1123Label.MatchString(name) {
@@ -101,80 +97,141 @@ func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, error) {
 	return job, b.credentialSecret(name, e.TaskID, token), nil
 }
 
-// render is the build pipeline (job-template.md §关键流程 steps 4–8): default
-// template → strategic merge patch → initContainers normalization →
-// authoritative per-task writes → node-reuse affinity → InvariantChecker.
+// render is the build pipeline: pick the template — the deployment's copy or
+// the built-in default — then apply Foreman's writes to it.
 func (b *Builder) render(name string, e TaskEntry) (*batchv1.Job, error) {
-	job := b.defaultJob(name, e)
-	if b.overlayPresent {
-		merged, err := mergeOverlay(job, b.overlay)
+	var job *batchv1.Job
+	if b.templatePresent {
+		rendered, err := renderTemplate(b.template, b.placeholderValues(e))
 		if err != nil {
-			// e.g. an appended initContainers entry without a name: fail
-			// closed instead of dropping the entry (ErrNoMergeKey).
-			return nil, &ValidationError{Source: "job overlay", Violations: []Violation{{
-				Path: "job-overlay.yaml",
-				Rule: "清单 A/§5.4: strategic merge patch failed: " + err.Error(),
-			}}}
+			return nil, err
 		}
-		job = merged
+		job = rendered
+	} else {
+		job = b.defaultJob(name, e)
+		// The built-in default template carries no placeholders: its
+		// node-reuse item is appended directly (AC-20 keeps this path
+		// byte-identical to the baseline).
+		b.applyPreferredNode(job, e)
 	}
-	normalizeInitContainers(job, b.overlay)
-	b.applyAuthoritative(job, name, e)
-	b.applyPreferredNode(job, e)
-	if violations := b.checker().Check(job); len(violations) > 0 {
-		return nil, &ValidationError{Source: "job template", Violations: violations}
-	}
+	b.applyWrites(job, name, e)
 	return job, nil
 }
 
-// applyAuthoritative re-writes the per-task fields after the merge (§5.4 step
-// 3): an overlay value for any of them was already rejected, so the write is
-// the second half of the 权威写入 guarantee rather than a silent override.
-func (b *Builder) applyAuthoritative(job *batchv1.Job, name string, e TaskEntry) {
+// placeholderValues resolves the template placeholders for one task; the
+// preferred node comes from the same soft-affinity decision the default
+// template uses.
+func (b *Builder) placeholderValues(e TaskEntry) placeholderValues {
+	return placeholderValues{
+		taskID:          e.TaskID,
+		agentID:         e.AgentID,
+		workspaceID:     e.WorkspaceID,
+		issueID:         e.IssueID,
+		issueIdentifier: e.IssueIdentifier,
+		autopilotRunID:  e.AutopilotRunID,
+		chatSessionID:   e.ChatSessionID,
+		jobRuntimeID:    e.JobRuntimeID,
+		claimedAt:       e.ClaimedAt.UTC().Format(time.RFC3339),
+		jobImage:        b.cfg.imageRef(),
+		preferredNode:   b.preferredNode(e),
+	}
+}
+
+// applyWrites performs Foreman's own writes on the rendered Job — the only
+// three kinds a template passthrough allows (P-006 §A1.1/A1.2): the env keys on
+// containers[0], the per-task metadata, and the §3.2 key set by side.
+func (b *Builder) applyWrites(job *batchv1.Job, name string, e TaskEntry) {
+	injectContainerEnv(job)
+
 	job.Name = name
 	job.Namespace = b.cfg.JobNamespace
-	if job.Labels == nil {
-		job.Labels = map[string]string{}
-	}
-	if job.Annotations == nil {
-		job.Annotations = map[string]string{}
-	}
-	for key, value := range b.identityLabels(e) {
-		job.Labels[key] = value
-	}
-	for key, value := range b.identityAnnotations(name, e) {
-		job.Annotations[key] = value
-	}
-	template := &job.Spec.Template
-	if template.Labels == nil {
-		template.Labels = map[string]string{}
-	}
-	template.Labels[labelAppName] = jobAppName
-	template.Labels[labelTaskID] = e.TaskID
 
-	for i := range template.Spec.Volumes {
-		if template.Spec.Volumes[i].Name == volumeCredSrc {
-			template.Spec.Volumes[i].VolumeSource = credSrcVolume(name).VolumeSource
+	// foreman.tsic.top/ is Foreman's own domain: clear it before writing, so a
+	// static template key (a hard-coded issue-id above all) cannot survive
+	// into a task it does not describe.
+	clearForemanDomain(job.Labels)
+	clearForemanDomain(job.Annotations)
+	clearForemanDomain(job.Spec.Template.Labels)
+	clearForemanDomain(job.Spec.Template.Annotations)
+
+	job.Labels = setKeys(job.Labels, b.identityLabels(e))
+	job.Annotations = setKeys(job.Annotations, b.identityAnnotations(name, e))
+	// Pod side: the two §3.2 labels only — no annotations, no managed-by
+	// (task-mapping lists Jobs, never pods).
+	job.Spec.Template.Labels = setKeys(job.Spec.Template.Labels, map[string]string{
+		labelAppName: jobAppName,
+		labelTaskID:  e.TaskID,
+	})
+}
+
+// injectContainerEnv writes the A1.1 keys into containers[0] — the template's
+// first entry by writing order, never one matched by name (P-006 §A1.1). Every
+// same-name entry is replaced whole and only one survives: a template may
+// declare the key twice, and the daemon reads the last one (os.Getenv), so
+// leaving the later entry would let the template's value win over Foreman's.
+// A template without containers is left alone — the apiserver rejects the Job
+// and the scheduler reports the existing job_create_failed.
+func injectContainerEnv(job *batchv1.Job) {
+	containers := job.Spec.Template.Spec.Containers
+	if len(containers) == 0 {
+		return
+	}
+	injected := injectedEnv()
+	wanted := make(map[string]corev1.EnvVar, len(injected))
+	for _, entry := range injected {
+		wanted[entry.Name] = entry
+	}
+
+	env := containers[0].Env
+	kept := make([]corev1.EnvVar, 0, len(env)+len(injected))
+	written := make(map[string]bool, len(injected))
+	for _, entry := range env {
+		want, isInjected := wanted[entry.Name]
+		if !isInjected {
+			kept = append(kept, entry)
+			continue
+		}
+		if written[entry.Name] {
+			continue
+		}
+		kept = append(kept, want)
+		written[entry.Name] = true
+	}
+	for _, want := range injected {
+		if !written[want.Name] {
+			kept = append(kept, want)
 		}
 	}
-	for i := range template.Spec.Containers {
-		if template.Spec.Containers[i].Name == containerAgent {
-			template.Spec.Containers[i].Image = b.cfg.imageRef()
-			template.Spec.Containers[i].Env = authoritativeEnv(template.Spec.Containers[i].Env)
-		}
-	}
-	// prepare and agent share one image so the credential-copy script runs
-	// against the same tool set (清单 B).
-	for i := range template.Spec.InitContainers {
-		if template.Spec.InitContainers[i].Name == containerPrepare {
-			template.Spec.InitContainers[i].Image = b.cfg.imageRef()
+	containers[0].Env = kept
+}
+
+// clearForemanDomain drops every key of Foreman's own domain, the half of the
+// §3.2 write that makes the conditional trigger-context keys deletable: an
+// empty TaskEntry field must remove a template's static key, not leave it
+// pointing at the wrong task.
+func clearForemanDomain(keys map[string]string) {
+	for key := range keys {
+		if strings.HasPrefix(key, foremanDomain) {
+			delete(keys, key)
 		}
 	}
 }
 
-// applyPreferredNode appends the node-reuse affinity item (free path, §5.4
-// 「affinity 注入」): appended after the merge so an overlay affinity block is
-// extended, never replaced.
+// setKeys merges keys into dst, allocating it when the template declared none.
+func setKeys(dst map[string]string, keys map[string]string) map[string]string {
+	if dst == nil {
+		dst = make(map[string]string, len(keys))
+	}
+	for key, value := range keys {
+		dst[key] = value
+	}
+	return dst
+}
+
+// applyPreferredNode appends the node-reuse affinity item to the built-in
+// default template (03-contracts §5.4 「affinity 注入」). A deployment template
+// expresses the same decision with the <preferred node> placeholder instead —
+// Foreman never adds an affinity item to it (P-006 §A2).
 func (b *Builder) applyPreferredNode(job *batchv1.Job, e TaskEntry) {
 	node := b.preferredNode(e)
 	if node == "" {
@@ -189,33 +246,6 @@ func (b *Builder) applyPreferredNode(job *batchv1.Job, e TaskEntry) {
 	}
 	pod.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = append(
 		pod.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution, preferredTerm(node))
-}
-
-// authoritativeEnv keeps the 16 §5.2 keys at their contracted values while
-// preserving overlay-added entries (§5.4 清单 A env 保留).
-func authoritativeEnv(existing []corev1.EnvVar) []corev1.EnvVar {
-	want := agentEnv()
-	byName := make(map[string]corev1.EnvVar, len(want))
-	for _, entry := range want {
-		byName[entry.Name] = entry
-	}
-	present := make(map[string]bool, len(want))
-	for i, entry := range existing {
-		if contracted, ok := byName[entry.Name]; ok {
-			existing[i] = contracted
-			present[entry.Name] = true
-		}
-	}
-	for _, contracted := range want {
-		if !present[contracted.Name] {
-			existing = append(existing, contracted)
-		}
-	}
-	return existing
-}
-
-func (b *Builder) checker() InvariantChecker {
-	return InvariantChecker{cfg: b.cfg}
 }
 
 // preferredNode returns the soft-affinity node for e's issue, "" when reuse
@@ -238,22 +268,4 @@ func (b *Builder) preferredNode(e TaskEntry) string {
 // jobName is the single source of the Job/Secret/daemon naming convention.
 func jobName(taskID string) string {
 	return "fm-" + taskID
-}
-
-// The startup gate renders the default template once to reach stage 2; the
-// per-task placeholders are irrelevant to the invariant check and stay out of
-// any real object.
-const dryRunJobName = "fm-overlay-probe"
-
-func dryRunEntry() TaskEntry {
-	return TaskEntry{
-		TaskID:          "overlay-probe",
-		AgentID:         "overlay-probe",
-		IssueID:         "overlay-probe",
-		IssueIdentifier: "overlay-probe",
-		WorkspaceID:     "overlay-probe",
-		JobRuntimeID:    "overlay-probe",
-		ClaimedAt:       time.Unix(0, 0).UTC(),
-		Attempt:         1,
-	}
 }

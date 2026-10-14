@@ -88,11 +88,11 @@ func mustBuild(t *testing.T, cfg Config, e TaskEntry) (*batchv1.Job, *corev1.Sec
 }
 
 // newTestBuilder runs the startup gate over cfg; the test config points at a
-// non-existent overlay path, so present=false (the AC-20 default path).
+// non-existent template path, so present=false (the AC-20 default path).
 func newTestBuilder(t *testing.T, cfg Config) *Builder {
 	t.Helper()
-	if cfg.OverlayPath == "" {
-		cfg.OverlayPath = filepath.Join(t.TempDir(), "job-overlay.yaml")
+	if cfg.TemplatePath == "" {
+		cfg.TemplatePath = filepath.Join(t.TempDir(), "job-overlay.yaml")
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = discardLogger()
@@ -318,7 +318,7 @@ func TestBuildContainers(t *testing.T) {
 		t.Errorf("init container = %q/%q, want prepare/%q", init.Name, init.Image, wantImage)
 	}
 	if init.Image != agent.Image {
-		t.Errorf("prepare image = %q, agent image = %q; both containers share FOREMAN_JOB_IMAGE (清单 B)", init.Image, agent.Image)
+		t.Errorf("prepare image = %q, agent image = %q; both containers share FOREMAN_JOB_IMAGE (§5.2/ADR-012)", init.Image, agent.Image)
 	}
 	if init.ImagePullPolicy != corev1.PullAlways {
 		t.Errorf("prepare imagePullPolicy = %q, want Always (ADR-012 movable tag)", init.ImagePullPolicy)
@@ -567,29 +567,6 @@ func TestBuildTriggerContextAnnotations(t *testing.T) {
 	}
 }
 
-// TestBuildRejectsEmptyTriggerContextPlaceholder is the invariant half of the
-// conditional block (§3.2 判定面): a missing key passes, a key present with an
-// empty value does not — on the authoritative Job object it is
-// indistinguishable from a lost annotation.
-func TestBuildRejectsEmptyTriggerContextPlaceholder(t *testing.T) {
-	cfg := testConfigWithIssuer()
-	entry := testEntry()
-	entry.IssueID, entry.IssueIdentifier = "", ""
-	entry.AutopilotRunID = "b1c2d3e4-5f60-4a7b-8c9d-0e1f2a3b4c5d"
-	job, _ := mustBuild(t, cfg, entry)
-
-	checker := InvariantChecker{cfg: cfg}
-	if violations := checker.Check(job); len(violations) != 0 {
-		t.Fatalf("conditional blocks must pass the checker: %v", violations)
-	}
-
-	job.Annotations[annoAutopilotRunID] = ""
-	violations := checker.Check(job)
-	if len(violations) != 1 || violations[0].Path != "metadata.annotations["+annoAutopilotRunID+"]" {
-		t.Fatalf("an empty trigger-context placeholder must be the only violation, got %v", violations)
-	}
-}
-
 // TestBuildSkipsAffinityWithoutIssueContext (ADR-014 §软亲和): an entry with no
 // issue context never joins the issue-keyed reuse index, so it carries no
 // preferred affinity — even when the index holds an entry under the empty key.
@@ -698,4 +675,24 @@ func testConfigWithIssuer() Config {
 	cfg := testConfig()
 	cfg.Issuer = &fakeIssuer{token: "fmj_test.sig"}
 	return cfg
+}
+
+func capabilityStrings(caps []corev1.Capability) []string {
+	out := make([]string, 0, len(caps))
+	for _, capability := range caps {
+		out = append(out, string(capability))
+	}
+	return out
+}
+
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
 }

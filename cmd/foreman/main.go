@@ -137,8 +137,9 @@ func run() error {
 	jbCfg.Nodes = reg
 	jbCfg.Logger = baseLog
 
-	// Startup gate: an illegal job-overlay.yaml must refuse to serve
-	// (CrashLoopBackOff), never fail at the first claim (03-contracts §5.4).
+	// Startup gate: an unreadable or unparseable job-overlay.yaml must refuse
+	// to serve (CrashLoopBackOff), never fail at the first claim (03-contracts
+	// §5.4).
 	builder, err := jobbuilder.NewBuilder(jbCfg)
 	if err != nil {
 		return fmt.Errorf("job template: %w", err)

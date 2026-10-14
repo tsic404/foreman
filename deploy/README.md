@@ -104,9 +104,8 @@ let the tag itself move. Rolling back uses the version tags CI keeps publishing
 (`v<ver>`) — `latest` alone is never the only published tag. Both containers in
 the Job template default to `imagePullPolicy: Always`, which is what lets a
 moved tag reach a node that already cached the reference; a deployment that
-pins a version tag can set `imagePullPolicy: IfNotPresent` through the job
-template overlay (§5.4「`imagePullPolicy`」段) and accepts that a moved tag then
-skips cached nodes. `foreman-gc` pulls `Always` for the same reason.
+pins a version tag can set `imagePullPolicy: IfNotPresent` in the job template
+(§Job template below) and accepts that a moved tag then skips cached nodes. `foreman-gc` pulls `Always` for the same reason.
 
 CI publishes each run's references and digests (the `release-images-<version>`
 artifact and the workflow summary) as the run's own record — nothing in
@@ -170,27 +169,95 @@ The ones a staging/test cluster usually overrides:
 | `FOREMAN_JOB_BOOT_TIMEOUT` | `60s` | boot-timeout assertions |
 | `FOREMAN_LOG_LEVEL` | `debug` | heartbeat / WS assertions |
 
-## Job template overlay (optional)
+## Job template (optional)
 
 The Deployment mounts the optional ConfigMap `foreman-job-template` at
-`/etc/foreman/job-template/` (`optional: true`, key `job-overlay.yaml`).
-Without the ConfigMap, Jobs render from the built-in default template; with it,
-the deployment's partial `batchv1.Job` is merged in with strategic merge patch
-semantics after a two-stage validation (contract §5.4):
+`/etc/foreman/job-template/` (`optional: true`, key `job-overlay.yaml` — the
+path and key name are kept for deployment compatibility). Without the
+ConfigMap, Jobs render from the built-in default template; with it, the file is
+the **complete `batch/v1 Job`** and Foreman uses it as written (contract §5.4):
 
 ```bash
 kubectl -n foreman create configmap foreman-job-template --from-file=job-overlay.yaml=./job-overlay.yaml
 kubectl -n foreman rollout restart deploy/foreman
 ```
 
+Foreman writes exactly three things into that template:
+
+1. the env keys `MULTICA_SERVER_URL`, `MULTICA_DAEMON_ID` and
+   `MULTICA_DAEMON_MAX_CONCURRENT_TASKS` on `containers[0]` — the first entry in
+   writing order, not a container matched by name; a same-name entry is
+   replaced whole, so those three keys are Foreman's whatever the template
+   says;
+2. the per-task metadata: `metadata.name`, `metadata.namespace`, and the §3.2
+   label/annotation set (the `foreman.tsic.top/` domain is cleared first, and
+   the four trigger-context keys are added or deleted to match the task);
+3. the placeholders below.
+
+Everything else — containers, init containers, `command`/`args`, volumes,
+mounts, `resources`, `securityContext`, `affinity`, `image`,
+`serviceAccountName`, the rest of `env` — is used verbatim. Nothing is checked,
+added or normalized.
+
+| Placeholder | Value |
+|---|---|
+| `<task_id>` / `<agent_id>` / `<workspace_id>` | the task's ids |
+| `<issue_id>` / `<issue-identifier>` / `<autopilot_run_id>` / `<chat_session_id>` | the task's trigger context |
+| `<job runtime uuid>` / `<RFC3339>` | the Job runtime id / the claim time |
+| `<job-image>` | `FOREMAN_JOB_IMAGE` |
+| `<preferred node>` (also spelled `<session node>`) | the soft-affinity node; with no history node or `FOREMAN_PREFER_NODE_REUSE=false` the whole affinity item carrying it is dropped |
+
+Unregistered `<...>` literals stay as written — a template copied from the
+built-in default must have `<job-image>` replaced (a literal `image:
+<job-image>` reaches the apiserver unchanged and the Job never boots).
+
 - The file is read once at startup: an edit needs a Foreman restart, and the
-  startup log records the overlay sha256 plus the applied/refused verdict.
-- An illegal overlay refuses startup (CrashLoopBackOff) and logs each
-  violation as `path: rule`; there is no env switch, the file's existence is
-  the switch.
-- `containers` stays a single container (`agent`): auxiliary containers are
-  appended as `initContainers` entries — native sidecars (`restartPolicy:
-  Always`) and one-shot prepare-init entries (no `restartPolicy`).
+  startup log records the template sha256 plus the accepted/refused verdict.
+- Only two things refuse startup (CrashLoopBackOff): a file that cannot be
+  read, and a file that is not a `batch/v1 Job` — bad YAML, an unknown field
+  (`contianers` is refused, never silently dropped), or a missing/mismatched
+  `apiVersion`/`kind`. There is no env switch: the file's existence is the
+  switch.
+
+### Upgrade and rollback order
+
+The file's meaning changed (incremental overlay → complete template), so the
+two ends move in order:
+
+- **Upgrade**: roll out the new Foreman first, then replace the ConfigMap. A new
+  Foreman reads the old overlay as a complete Job and refuses to start, so the
+  ConfigMap cannot stay as it is.
+- **Rollback**: restore or delete the ConfigMap **and** roll the image back in
+  the same step. Rolling the image back alone leaves the complete template
+  mounted, which the older Foreman rejects at startup → CrashLoopBackOff. An
+  empty or absent ConfigMap returns to the built-in default template.
+
+### Risk disclosure
+
+Nothing in the template is validated, so a template's mistakes surface at
+runtime instead of at startup:
+
+- Job 内负载来自模型输出，等同于在节点上执行不可信代码
+- Foreman 不对 Job 模板做任何校验
+- 模板内容不构成安全边界
+
+A template can therefore grant `privileged`, node paths, the node's container
+runtime socket, `serviceAccountName` or `automountServiceAccountToken`: that is
+the deployment's own decision and its own risk. Three consequences worth knowing
+before copying the default template:
+
+- The Job Token reaches the daemon only if the template mounts the per-task
+  Secret `fm-<task_id>-cred` (or another source of `config.json` at the profile
+  path); without one the task fails with `job_auth_failed` — nothing checks
+  this at startup.
+- A template carrying its own `image` removes the image audit anchor:
+  `/foreman/version` keeps reporting `FOREMAN_JOB_IMAGE`, which is then no
+  longer what the Job runs.
+- `MULTICA_DAEMON_ID` reads the `job-name` label the Job controller sets. A
+  template that sets `manualSelector: true` (or otherwise replaces the Job's
+  selector) stops the controller from adding its own labels, so that fieldRef
+  resolves to an empty string and the daemon registers without an id — nothing
+  checks the selector at startup.
 
 ## Post-install checks
 
