@@ -629,8 +629,10 @@ func (s *Scheduler) Deliver(daemonID string, runtimeID string, maxTasks int) ([]
 		return nil, err
 	}
 
+	// The delivered body is handed to the registry so the entry keeps the
+	// delivered form, not the claim-time one (registry.MarkDelivering).
 	now := s.now()
-	e, ok = s.reg.MarkDelivering(daemonID, now)
+	e, ok = s.reg.MarkDelivering(daemonID, now, out)
 	if !ok {
 		return nil, nil
 	}

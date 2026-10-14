@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"encoding/json"
 	"errors"
 	"testing"
 	"time"
@@ -261,24 +262,37 @@ func TestMarkDelivering(t *testing.T) {
 	e.State = StateDaemonRegistered
 	_ = r.Put(e)
 
-	e, ok := r.MarkDelivering("fm-t1", testNow)
+	// The delivery records the body the daemon received (S6 rewrote
+	// runtime_id), replacing the claim-time payload the ops preview must
+	// never serve.
+	delivered := json.RawMessage(`{"id":"t1","runtime_id":"rt-t1"}`)
+	e, ok := r.MarkDelivering("fm-t1", testNow, delivered)
 	if !ok || e.State != StateDelivering || e.DeliveredAt != testNow {
 		t.Fatalf("MarkDelivering = %v, %v", e, ok)
 	}
+	if string(e.Payload) != string(delivered) {
+		t.Fatalf("payload = %s, want the delivered body", e.Payload)
+	}
 	// At most once.
-	if _, ok := r.MarkDelivering("fm-t1", testNow); ok {
+	if _, ok := r.MarkDelivering("fm-t1", testNow, json.RawMessage(`{"id":"over"}`)); ok {
 		t.Fatal("second delivery accepted")
+	}
+	if stored, _ := r.Get("t1"); string(stored.Payload) != string(delivered) {
+		t.Fatalf("a rejected delivery overwrote the payload: %s", stored.Payload)
 	}
 	// A job_created entry is not deliverable (daemon must register first).
 	_ = r.Put(entryFor("t2"))
 	e2, _ := r.Get("t2")
 	e2.State = StateJobCreated
 	_ = r.Put(e2)
-	if _, ok := r.MarkDelivering("fm-t2", testNow); ok {
+	if _, ok := r.MarkDelivering("fm-t2", testNow, delivered); ok {
 		t.Fatal("job_created entry delivered")
 	}
-	if _, ok := r.MarkDelivering("ghost", testNow); ok {
+	if _, ok := r.MarkDelivering("ghost", testNow, delivered); ok {
 		t.Fatal("unknown daemon delivered")
+	}
+	if stored, _ := r.Get("t2"); stored.Payload != nil {
+		t.Fatalf("a rejected delivery stored a payload: %s", stored.Payload)
 	}
 }
 

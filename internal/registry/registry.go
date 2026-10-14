@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
@@ -266,11 +267,13 @@ func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntr
 	return e, true
 }
 
-// MarkDelivering atomically performs the S6 at-most-once delivery check:
-// only a daemon_registered entry not yet delivered transitions. Without the
+// MarkDelivering atomically performs the S6 at-most-once delivery check and
+// records the delivered body as the entry's payload, so the ops preview serves
+// exactly what the daemon received (observability.md §端点). Only a
+// daemon_registered entry not yet delivered transitions; without the
 // single-lock check, two concurrent claims could both pass a delivered_at
 // test before either writes.
-func (r *Registry) MarkDelivering(daemonID string, at time.Time) (TaskEntry, bool) {
+func (r *Registry) MarkDelivering(daemonID string, at time.Time, delivered json.RawMessage) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.get(r.byDaemon[daemonID])
@@ -279,6 +282,7 @@ func (r *Registry) MarkDelivering(daemonID string, at time.Time) (TaskEntry, boo
 	}
 	e.State = StateDelivering
 	e.DeliveredAt = at
+	e.Payload = delivered
 	r.live[e.TaskID] = e
 	return e, true
 }

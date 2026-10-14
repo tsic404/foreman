@@ -182,30 +182,82 @@ func TestTaskGetUnknown(t *testing.T) {
 	}
 }
 
+// TestPayloadPreview (observability.md §端点 / AC-07 ②): the preview serves
+// the delivered body, including the rewritten runtime_id — and only while the
+// entry is alive.
 func TestPayloadPreview(t *testing.T) {
 	reg := registry.New(time.Now)
-	payload := json.RawMessage(`{"id":"t-1","auth_token":"mat_taskleveltoken"}`)
-	_ = reg.Put(registry.TaskEntry{TaskID: "t-1", State: registry.StateDelivering, Payload: payload})
-	rec := do(t, newTestHandler(reg, nil), "/foreman/tasks/t-1/payload-preview")
+	_ = reg.Put(registry.TaskEntry{
+		TaskID:       "t-1",
+		JobName:      "fm-t-1",
+		DaemonID:     "fm-t-1",
+		JobRuntimeID: "jr-1",
+		State:        registry.StateDaemonRegistered,
+		Payload:      json.RawMessage(`{"id":"t-1","auth_token":"mat_taskleveltoken"}`),
+	})
+	h := newTestHandler(reg, nil)
+	// S6 rewrites runtime_id to the job runtime id and records the result on
+	// the entry; the endpoint reads no other source.
+	delivered := json.RawMessage(`{"id":"t-1","runtime_id":"jr-1","auth_token":"mat_taskleveltoken"}`)
+	if _, ok := reg.MarkDelivering("fm-t-1", time.Now(), delivered); !ok {
+		t.Fatal("MarkDelivering failed")
+	}
+	rec := do(t, h, "/foreman/tasks/t-1/payload-preview")
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	body, _ := io.ReadAll(rec.Result().Body)
-	if string(body) != string(payload) {
-		t.Fatalf("preview = %q, want verbatim payload", body)
+	var body map[string]any
+	decodeBody(t, rec, &body)
+	e, _ := reg.Get("t-1")
+	if body["runtime_id"] != e.JobRuntimeID {
+		t.Fatalf("runtime_id = %v, want job_runtime_id %q", body["runtime_id"], e.JobRuntimeID)
+	}
+	if body["auth_token"] != "mat_taskleveltoken" {
+		t.Fatalf("preview dropped payload fields: %v", body)
+	}
+
+	// Credential reclaim deletes the entry: the window is closed.
+	if err := reg.Delete("t-1"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	rec = do(t, h, "/foreman/tasks/t-1/payload-preview")
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("reclaimed status = %d, want 404", rec.Code)
+	}
+	var notFound map[string]string
+	decodeBody(t, rec, &notFound)
+	if notFound["error"] != "task not found" {
+		t.Fatalf("reclaimed body = %v", notFound)
 	}
 }
 
-func TestPayloadPreviewMissing(t *testing.T) {
+// TestPayloadPreviewNotDelivered (observability.md §端点): the window opens at
+// delivered_at, so an existing entry that was never delivered answers 404 with
+// the contract literal — its claim-time payload is not a delivery body.
+func TestPayloadPreviewNotDelivered(t *testing.T) {
 	reg := registry.New(time.Now)
-	// Rebuilt-after-restart entry: no payload in memory (contract §3.2).
-	_ = reg.Put(registry.TaskEntry{TaskID: "t-1", State: registry.StateJobCreated})
+	_ = reg.Put(registry.TaskEntry{
+		TaskID:       "t-1",
+		JobName:      "fm-t-1",
+		DaemonID:     "fm-t-1",
+		JobRuntimeID: "jr-1",
+		State:        registry.StateDaemonRegistered,
+		Payload:      json.RawMessage(`{"id":"t-1","runtime_id":"real-runtime"}`),
+	})
+	// Rebuilt-after-restart entry: no payload in memory (contract §3.2), also
+	// never delivered.
+	_ = reg.Put(registry.TaskEntry{TaskID: "t-2", State: registry.StateJobCreated})
 	h := newTestHandler(reg, nil)
-	if rec := do(t, h, "/foreman/tasks/t-1/payload-preview"); rec.Code != http.StatusNotFound {
-		t.Fatalf("empty payload status = %d, want 404", rec.Code)
-	}
-	if rec := do(t, h, "/foreman/tasks/nope/payload-preview"); rec.Code != http.StatusNotFound {
-		t.Fatalf("unknown task status = %d, want 404", rec.Code)
+	for _, taskID := range []string{"t-1", "t-2"} {
+		rec := do(t, h, "/foreman/tasks/"+taskID+"/payload-preview")
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("%s status = %d, want 404", taskID, rec.Code)
+		}
+		var body map[string]string
+		decodeBody(t, rec, &body)
+		if body["error"] != "payload unavailable" {
+			t.Fatalf("%s body = %v, want the contract literal", taskID, body)
+		}
 	}
 }
 
