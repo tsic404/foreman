@@ -5,10 +5,10 @@
 #
 #   ./bind-agent.sh [--wait SECONDS]     # default: wait up to 180s
 #
-# Why a separate step: the reset entry leaves the agent unbound, because §1's
-# self-check ③ requires an empty runtime list *before* Foreman starts, while §3
-# requires the agent's runtime to be the one Foreman registers. The two are
-# only both true if the binding happens after registration.
+# Why a separate step: the reset entry leaves the agent unbound, because §2's
+# self-check ② requires an empty runtime list *before* the instance starts,
+# while §3 requires the agent's runtime to be the one Foreman registers. The
+# two are only both true if the binding happens after registration.
 #
 # The autopilot is created here for the same reason: the server refuses an
 # autopilot whose assignee agent has no runtime, so it cannot be part of the

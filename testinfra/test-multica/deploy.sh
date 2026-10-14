@@ -1,6 +1,6 @@
 #!/bin/sh
 # Deploy (or re-deploy) the test multica cluster — the deployment entry of
-# test-cases/_infra/test-multica-cluster.md §7.
+# test-cases/_infra/test-multica-cluster.md §6 运维接口.
 #
 #   ./deploy.sh                              # render + apply + wait
 #   TEST_MULTICA_HOST=10.0.0.5 ./deploy.sh   # pin the entry address

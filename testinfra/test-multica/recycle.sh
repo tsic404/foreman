@@ -1,12 +1,11 @@
 #!/bin/sh
 # Recycle the whole test environment — the recycle entry of
-# test-cases/_infra/test-multica-cluster.md §7.
+# test-cases/_infra/test-multica-cluster.md §6 运维接口.
 #
 #   ./recycle.sh
 #
 # Deletes the test multica namespace, which takes the test server, its
-# database and its frontend entry with it — and the fault-injection access path
-# too when it is deployed next to them (§2). Nothing outside the namespace is
+# database and its frontend entry with it. Nothing outside the namespace is
 # touched: the `foreman` and `multica-agents` namespaces (the instance under
 # test) and any production multica deployment are left alone.
 #
@@ -22,7 +21,7 @@ need kubectl
 for arg in "$@"; do
 	case $arg in
 	-h | --help)
-		sed -n '2,14p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '2,13p' "$0" | sed 's/^# \{0,1\}//'
 		exit 0
 		;;
 	*) die "unknown argument: $arg" ;;

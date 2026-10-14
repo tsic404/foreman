@@ -1,29 +1,32 @@
 #!/bin/sh
 # Reset the test multica cluster to its clean state — the reset entry of
-# test-cases/_infra/test-multica-cluster.md §7, run before every acceptance
-# round.
+# test-cases/_infra/test-multica-cluster.md §6 运维接口, run before every
+# acceptance round.
 #
-#   ./reset.sh                 # wipe runtime/task rows, rebuild §3 objects
+#   ./reset.sh                 # stop the instance, wipe rows, rebuild §3
 #   ./reset.sh --print-token   # …and print the profile's token (wiring input)
 #
 # What it does, in order:
 #
-#   1. credentials — ensure the CLI profile holds a working personal access
+#   1. stop — scale the instance under test to 0: §2 ② is a pre-start assertion
+#      (the runtime list must be empty before the instance starts), and a
+#      running instance would re-register the runtime this entry is about to
+#      wipe;
+#   2. credentials — ensure the CLI profile holds a working personal access
 #      token for the test server (creating the account on first use);
-#   2. workspace — ensure the test workspace exists and is selected;
-#   3. wipe — delete every runtime row and task row of the test workspace, so
-#      the runtime list is empty before Foreman starts (§1 可重置, self-check
-#      ③). The agent rows survive, unbound;
-#   4. rebuild §3 — writable repository, test agent (unbound), chat entry. The
+#   3. workspace — ensure the test workspace exists and is selected;
+#   4. wipe — delete every runtime row and task row of the test workspace
+#      (§1 可重置). The agent rows survive, unbound;
+#   5. rebuild §3 — writable repository, test agent (unbound), chat entry. The
 #      autopilot is not here: the server refuses an autopilot whose assignee
 #      agent has no runtime, and this entry leaves the runtime list empty on
 #      purpose — ./bind-agent.sh creates it once the agent is bound;
-#   5. report — object ids plus the two reset-time assertions (③ empty runtime
-#      list, ④ server_version == the image anchor).
+#   6. gate — ./selfcheck.sh: §2 ①②③ (the instance points at the access point,
+#      the runtime list is empty, the server reports the artifact anchor).
 #
 # It is idempotent: everything is looked up by name and only created when
 # missing. The agent stays unbound on purpose — ./bind-agent.sh binds it to the
-# runtime Foreman registers.
+# runtime the instance registers.
 
 set -eu
 
@@ -38,14 +41,21 @@ for arg in "$@"; do
 	case $arg in
 	--print-token) print_token=1 ;;
 	-h | --help)
-		sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
 		exit 0
 		;;
 	*) die "unknown argument: $arg" ;;
 	esac
 done
 
-# --- 1. credentials ----------------------------------------------------------
+# --- 1. stop the instance under test -----------------------------------------
+
+# The wipe below only sticks while nothing is registered: a running instance
+# re-registers the runtime row it just lost, and §2 ② asserts that list is
+# empty *before* the instance starts.
+stop_instance
+
+# --- 2. credentials ----------------------------------------------------------
 
 # A live code row is required even for the fixed development code, so the login
 # is always send-code → verify-code.
@@ -103,12 +113,12 @@ ensure_credentials() {
 	info "wrote profile $PROFILE ($PROFILE_CONFIG)"
 }
 
-# --- 2. workspace ------------------------------------------------------------
+# --- 3. workspace ------------------------------------------------------------
 
 ensure_workspace() {
 	# A profile that already names a workspace is the fast path — the workspace
 	# list is the slowest endpoint on a loaded server — but the id is only
-	# trusted after it reads back: a rebuilt environment (§7 升级 = 整环境重建)
+	# trusted after it reads back: a rebuilt environment (§6 升级 = 整环境重建)
 	# leaves the profile file behind while the workspace it names is gone.
 	if [ -r "$PROFILE_CONFIG" ]; then
 		ws=$(jq -r '.workspace_id // ""' "$PROFILE_CONFIG")
@@ -131,7 +141,7 @@ ensure_workspace() {
 	jq --arg ws "$ws" '.workspace_id = $ws' "$PROFILE_CONFIG" >"$tmp" && mv "$tmp" "$PROFILE_CONFIG"
 }
 
-# --- 3. wipe -----------------------------------------------------------------
+# --- 4. wipe -----------------------------------------------------------------
 
 wipe_rows() {
 	ws=$(workspace_id)
@@ -153,7 +163,7 @@ wipe_rows() {
 	info "wiped runtime rows and task rows"
 }
 
-# --- 4. §3 objects -----------------------------------------------------------
+# --- 5. §3 objects -----------------------------------------------------------
 
 ensure_repo() {
 	if ! ws=$(api GET "/api/workspaces/$(workspace_id)"); then
@@ -210,28 +220,7 @@ ensure_chat() {
 	info "created chat session $CHAT_TITLE ($id)"
 }
 
-# --- 5. report ---------------------------------------------------------------
-
-self_check() {
-	# ③ reset-time: the runtime list must be empty before Foreman starts.
-	runtimes=$(mcli runtime list --output json)
-	if [ "$(printf '%s' "$runtimes" | jq 'length')" -ne 0 ]; then
-		printf '%s\n' "$runtimes" >&2
-		die "self-check ③: the runtime list is not empty"
-	fi
-	info "self-check ③ ok: runtime list is empty"
-
-	# ④ version anchor (absolute): the server reports the release the images
-	# are pinned to. A missing field is a data-surface mismatch, not a version
-	# mismatch (upstream hides it with omitempty on untagged builds).
-	config=$(curl -fsS -m 30 "$SERVER_URL/api/config")
-	printf '%s' "$config" | jq -e 'has("server_version")' >/dev/null ||
-		die "self-check ④: /api/config has no server_version field"
-	version=$(printf '%s' "$config" | jq -r .server_version)
-	[ "$version" = "v0.6.1" ] ||
-		die "self-check ④: server reports $version, the image anchor is v0.6.1"
-	info "self-check ④ ok: server_version $version"
-}
+# --- 6. gate and report ------------------------------------------------------
 
 info "reset target: $SERVER_URL (namespace $NS, profile $PROFILE)"
 curl -fsS -m 30 "$SERVER_URL/api/config" >/dev/null ||
@@ -243,7 +232,11 @@ wipe_rows
 ensure_repo
 ensure_agent
 ensure_chat
-self_check
+
+# §2 ①②③, the gate every round opens with. Run here, with the instance under
+# test stopped, ② is the reset-time state the design asserts; a blocked
+# environment exits 2 through this call.
+"$TEST_MULTICA_DIR/selfcheck.sh"
 
 printf '\n'
 printf 'workspace:    %s\n' "$(workspace_id)"
@@ -252,8 +245,8 @@ printf 'server:       %s\n' "$SERVER_URL"
 printf 'entry:        %s\n' "$ENTRY_URL"
 printf 'agent:        %s\n' "$AGENT_NAME"
 printf 'chat session: %s\n' "$CHAT_TITLE"
-printf 'next:         ./bind-agent.sh   # after Foreman has registered its runtime\n'
-printf '              (also creates the §3 autopilot %s)\n' "$AUTOPILOT_TITLE"
+printf 'next:         ./wire.sh         # points the instance at the access point and starts it\n'
+printf '              ./bind-agent.sh   # after the instance registered its runtime (creates the §3 autopilot %s)\n' "$AUTOPILOT_TITLE"
 if [ "$print_token" -eq 1 ]; then
 	printf 'token:        %s\n' "$(pat)"
 fi
