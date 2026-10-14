@@ -36,12 +36,22 @@ const (
 
 // Contract defaults (§5.1).
 const (
-	DefaultJobNamespace    = "multica-agents"
-	DefaultJobImage        = "ghcr.io/tsic404/foreman-job:latest"
-	DefaultJobTokenTTL     = 24 * time.Hour
+	DefaultJobNamespace  = "multica-agents"
+	DefaultJobImage      = "ghcr.io/tsic404/foreman-job:latest"
+	DefaultJobTTLSeconds = 600
+	DefaultStateRoot     = "/var/lib/foreman"
+
+	// DefaultJobTokenTTL is the §5.1 value 24h7m = boot 300s + task 86400s +
+	// drain 120s. This module signs the token, while auth runs the startup
+	// budget check on the same env: the two must stay equal, and
+	// TestLoadConfigDefaults pins them against auth's constant — a second
+	// default that drifted lower would pass the self-check and still expire
+	// inside the drain window (the 401 this change removes). The value is
+	// duplicated as a literal on purpose: 04-architecture.md's module
+	// dependency table lists jobbuilder → registry only, so the pin is a test
+	// concern, not a new production dependency.
+	DefaultJobTokenTTL     = 24*time.Hour + 7*time.Minute
 	DefaultTaskMaxDuration = 86400 * time.Second
-	DefaultJobTTLSeconds   = 600
-	DefaultStateRoot       = "/var/lib/foreman"
 )
 
 // Cache modes for FOREMAN_REPO_CACHE_MODE (ADR-005).

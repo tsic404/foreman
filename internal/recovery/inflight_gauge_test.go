@@ -35,7 +35,7 @@ func claimFor(t *testing.T, sched *scheduler.Scheduler, taskID string) {
 func TestIntegrationJobFailedCompensationResetsInflightGauge(t *testing.T) {
 	server := newFakeServerClient(map[string]string{"t1": "running"})
 	metrics := observability.NewMetrics()
-	reg, jobs, sched, _, newReconciler := setupIntegrationWithMetrics(t, server, "", metrics)
+	reg, jobs, sched, _, _, newReconciler := setupIntegrationWithMetrics(t, server, "", metrics)
 	ctx := context.Background()
 
 	claimFor(t, sched, "t1")
@@ -68,11 +68,18 @@ func TestIntegrationJobFailedCompensationResetsInflightGauge(t *testing.T) {
 	if got := reg.Inflight(); got != 0 {
 		t.Fatalf("Registry.Inflight() = %d, want 0", got)
 	}
-	if entries := reg.List(); len(entries) != 0 {
-		t.Fatalf("task snapshot = %+v, want empty", entries)
+	// The verdict deletes the Job but leaves the entry and its credential in
+	// drain (ADR-017): the gauge follows `state != terminal`, so the retained
+	// entry must not be counted.
+	entries := reg.List()
+	if len(entries) != 1 || !entries[0].IsTerminal() || !entries[0].IsDraining() {
+		t.Fatalf("task snapshot = %+v, want one draining entry", entries)
 	}
-	if jobs.has(fakeJobName("t1")) || jobs.hasSecret(fakeJobName("t1")+"-cred") {
-		t.Fatal("the Job and its Secret must be gone once the gauge reads zero")
+	if jobs.has(fakeJobName("t1")) {
+		t.Fatal("the Job must be deleted at the verdict")
+	}
+	if !jobs.hasSecret(fakeJobName("t1") + "-cred") {
+		t.Fatal("the credential Secret outlives the verdict until the reclaim")
 	}
 }
 
@@ -82,7 +89,7 @@ func TestIntegrationJobFailedCompensationResetsInflightGauge(t *testing.T) {
 func TestIntegrationReconcileRoundHealsStaleInflightGauge(t *testing.T) {
 	server := newFakeServerClient(map[string]string{"t1": "running"})
 	metrics := observability.NewMetrics()
-	reg, _, sched, _, newReconciler := setupIntegrationWithMetrics(t, server, "", metrics)
+	reg, _, sched, _, _, newReconciler := setupIntegrationWithMetrics(t, server, "", metrics)
 	ctx := context.Background()
 
 	claimFor(t, sched, "t1")
@@ -115,7 +122,7 @@ func TestIntegrationReconcileRoundHealsStaleInflightGauge(t *testing.T) {
 func TestIntegrationTerminalReportTransportErrorKeepsInflightGaugeInSync(t *testing.T) {
 	server := newFakeServerClient(map[string]string{"t1": "running"})
 	metrics := observability.NewMetrics()
-	reg, _, sched, pending, _ := setupIntegrationWithMetrics(t, server, "", metrics)
+	reg, _, sched, pending, _, _ := setupIntegrationWithMetrics(t, server, "", metrics)
 	ctx := context.Background()
 
 	claimFor(t, sched, "t1")
@@ -151,7 +158,7 @@ func TestIntegrationTerminalReportTransportErrorKeepsInflightGaugeInSync(t *test
 func TestIntegrationInflightGaugeConvergesWhileARoundIsBusy(t *testing.T) {
 	server := newFakeServerClient(map[string]string{"t1": "running"})
 	metrics := observability.NewMetrics()
-	reg, _, sched, pending, newReconciler := setupIntegrationWithMetrics(t, server, "", metrics)
+	reg, _, sched, pending, _, newReconciler := setupIntegrationWithMetrics(t, server, "", metrics)
 	const interval = 20 * time.Millisecond
 
 	claimFor(t, sched, "t1")
@@ -213,7 +220,7 @@ func (s *stallingSender) Forward(ctx context.Context, _ scheduler.Endpoint, _ st
 func TestIntegrationBootTimeoutResetsInflightGauge(t *testing.T) {
 	server := newFakeServerClient(map[string]string{"t1": "running"})
 	metrics := observability.NewMetrics()
-	reg, jobs, sched, _, _ := setupIntegrationWithMetrics(t, server, "", metrics)
+	reg, jobs, sched, _, _, _ := setupIntegrationWithMetrics(t, server, "", metrics)
 	ctx := context.Background()
 
 	claimFor(t, sched, "t1")
@@ -231,10 +238,16 @@ func TestIntegrationBootTimeoutResetsInflightGauge(t *testing.T) {
 	if got := reg.Inflight(); got != 0 {
 		t.Fatalf("Registry.Inflight() = %d, want 0", got)
 	}
-	if entries := reg.List(); len(entries) != 0 {
-		t.Fatalf("task snapshot = %+v, want empty", entries)
+	// Same drain口径 as the job_failed path: the Job goes at the verdict, the
+	// entry and its credential follow the Job (ADR-017).
+	entries := reg.List()
+	if len(entries) != 1 || !entries[0].IsTerminal() || !entries[0].IsDraining() {
+		t.Fatalf("task snapshot = %+v, want one draining entry", entries)
 	}
-	if jobs.has(fakeJobName("t1")) || jobs.hasSecret(fakeJobName("t1")+"-cred") {
-		t.Fatal("the Job and its Secret must be gone once the gauge reads zero")
+	if jobs.has(fakeJobName("t1")) {
+		t.Fatal("the Job must be deleted at the verdict")
+	}
+	if !jobs.hasSecret(fakeJobName("t1") + "-cred") {
+		t.Fatal("the credential Secret outlives the verdict until the reclaim")
 	}
 }

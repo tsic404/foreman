@@ -16,6 +16,7 @@ const (
 	EnvMaxJobsPerNode  = "FOREMAN_MAX_JOBS_PER_NODE"
 	EnvClaimBatchMax   = "FOREMAN_CLAIM_BATCH_MAX"
 	EnvJobBootTimeout  = "FOREMAN_JOB_BOOT_TIMEOUT"
+	EnvJobDrainTimeout = "FOREMAN_JOB_DRAIN_TIMEOUT"
 )
 
 // Contract defaults (§5.1).
@@ -24,6 +25,11 @@ const (
 	DefaultMaxJobsPerNode  = 4
 	DefaultClaimBatchMax   = 32
 	DefaultJobBootTimeout  = 300 * time.Second
+	// DefaultJobDrainTimeout is the credential-reclaim upper bound that
+	// follows a task's verdict (FOREMAN_JOB_DRAIN_TIMEOUT, ADR-017). A
+	// deployment that raises its template's terminationGracePeriodSeconds
+	// must raise this too.
+	DefaultJobDrainTimeout = 120 * time.Second
 
 	// serverClaimBatchCap is the server-side claim batch ceiling
 	// (contract §1.1 C3: max_tasks > 32 is truncated to 32).
@@ -43,6 +49,10 @@ type Config struct {
 	MaxInflightJobs int
 	ClaimBatchMax   int
 	JobBootTimeout  time.Duration
+	// JobDrainTimeout bounds the window between a task's verdict and the
+	// credential reclaim (ADR-017). Zero means "do not wait": the reclaim
+	// still lands on the next observation point.
+	JobDrainTimeout time.Duration
 }
 
 // LoadConfig reads the scheduler configuration from env (os.Getenv when
@@ -57,6 +67,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		MaxInflightJobs: DefaultMaxInflightJobs,
 		ClaimBatchMax:   DefaultClaimBatchMax,
 		JobBootTimeout:  DefaultJobBootTimeout,
+		JobDrainTimeout: DefaultJobDrainTimeout,
 	}
 
 	if v := strings.TrimSpace(getenv(jobbuilder.EnvJobNamespace)); v != "" {
@@ -99,6 +110,18 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("%s must be positive, got %s", EnvJobBootTimeout, d)
 		}
 		cfg.JobBootTimeout = d
+	}
+	// Zero is a legal value here (近似旧语义: reclaim on the next observation
+	// point), so only a negative one is refused.
+	if raw := strings.TrimSpace(getenv(EnvJobDrainTimeout)); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be a duration: %v", EnvJobDrainTimeout, err)
+		}
+		if d < 0 {
+			return Config{}, fmt.Errorf("%s must be >= 0, got %s", EnvJobDrainTimeout, d)
+		}
+		cfg.JobDrainTimeout = d
 	}
 	return cfg, nil
 }

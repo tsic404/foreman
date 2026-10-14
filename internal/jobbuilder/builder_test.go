@@ -1,6 +1,8 @@
 package jobbuilder
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -37,6 +39,17 @@ func (f *fakeIssuer) Issue(jobName, taskID, workspaceID string, ttl time.Duratio
 		return "", f.err
 	}
 	return f.token, nil
+}
+
+// Hash mirrors auth.Issuer.Hash: the hex sha256 of the token, the digest
+// OnClaim records as token_hash (ADR-017).
+func (f *fakeIssuer) Hash(token string) string { return tokenDigest(token) }
+
+// tokenDigest is the digest of a token; the real issuer's Hash is the same
+// hex sha256, so the tests can recompute what Build returns.
+func tokenDigest(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])
 }
 
 type fakeNodes map[string]string
@@ -77,12 +90,23 @@ func mustBuild(t *testing.T, cfg Config, e TaskEntry) (*batchv1.Job, *corev1.Sec
 	t.Helper()
 	issuer := &fakeIssuer{token: "fmj_test.sig"}
 	cfg.Issuer = issuer
-	job, secret, err := newTestBuilder(t, cfg).Build(e)
+	job, secret, tokenHash, err := newTestBuilder(t, cfg).Build(e)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
 	if job == nil || secret == nil {
 		t.Fatalf("Build returned nil objects (job=%v, secret=%v)", job, secret)
+	}
+	// The digest Build returns is the token_hash OnClaim records, so it must
+	// be the digest of the very token the Secret carries (ADR-017).
+	var config struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal([]byte(secret.StringData["config.json"]), &config); err != nil {
+		t.Fatalf("config.json is not valid JSON: %v", err)
+	}
+	if want := issuer.Hash(config.Token); tokenHash != want {
+		t.Fatalf("Build token hash = %q, want the digest %q of the Secret's token", tokenHash, want)
 	}
 	return job, secret
 }
@@ -602,15 +626,15 @@ func TestBuildInvalidTaskID(t *testing.T) {
 	} {
 		entry := testEntry()
 		entry.TaskID = taskID
-		job, secret, err := newTestBuilder(t, testConfigWithIssuer()).Build(entry)
+		job, secret, tokenHash, err := newTestBuilder(t, testConfigWithIssuer()).Build(entry)
 		if err == nil {
 			t.Errorf("taskID %q: expected error, got job=%v", taskID, job != nil)
 		}
 		if !errors.Is(err, ErrInvalidTaskID) {
 			t.Errorf("taskID %q: error must wrap ErrInvalidTaskID (failure_reason=invalid_task_id), got %v", taskID, err)
 		}
-		if job != nil || secret != nil {
-			t.Errorf("taskID %q: objects must be nil on error", taskID)
+		if job != nil || secret != nil || tokenHash != "" {
+			t.Errorf("taskID %q: objects and digest must be zero on error", taskID)
 		}
 	}
 }
@@ -618,13 +642,13 @@ func TestBuildInvalidTaskID(t *testing.T) {
 func TestBuildIssuerError(t *testing.T) {
 	cfg := testConfig()
 	cfg.Issuer = &fakeIssuer{err: errors.New("boom")}
-	if _, _, err := newTestBuilder(t, cfg).Build(testEntry()); err == nil {
+	if _, _, _, err := newTestBuilder(t, cfg).Build(testEntry()); err == nil {
 		t.Fatal("expected issuer error to propagate")
 	}
 }
 
 func TestBuildMissingIssuer(t *testing.T) {
-	if _, _, err := newTestBuilder(t, testConfig()).Build(testEntry()); err == nil {
+	if _, _, _, err := newTestBuilder(t, testConfig()).Build(testEntry()); err == nil {
 		t.Fatal("expected error when Config.Issuer is unset")
 	}
 }
@@ -634,7 +658,7 @@ func TestBuildSecret(t *testing.T) {
 	issuer := &fakeIssuer{token: "fmj_payload.sig"}
 	cfg.Issuer = issuer
 	entry := testEntry()
-	_, secret, err := newTestBuilder(t, cfg).Build(entry)
+	_, secret, tokenHash, err := newTestBuilder(t, cfg).Build(entry)
 	if err != nil {
 		t.Fatalf("Build: %v", err)
 	}
@@ -668,6 +692,11 @@ func TestBuildSecret(t *testing.T) {
 	}
 	if config.Token != "fmj_payload.sig" {
 		t.Errorf("config.json token = %q, want the issued token", config.Token)
+	}
+	// Build returns the digest of that token — the token_hash OnClaim
+	// records (ADR-017).
+	if want := tokenDigest(config.Token); tokenHash != want {
+		t.Errorf("Build token hash = %q, want %q", tokenHash, want)
 	}
 }
 

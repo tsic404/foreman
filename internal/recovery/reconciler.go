@@ -274,7 +274,10 @@ func (r *Reconciler) wake() {
 	}
 }
 
-// nextDeadline is the earliest moment a deferred settlement falls due.
+// nextDeadline is the earliest moment a deferred settlement falls due: the
+// daemon's recheck window, the cancel-ack timeout, or a draining entry's
+// credential upper bound (ADR-017 — the reclaim must not wait out a whole
+// interval past FOREMAN_JOB_DRAIN_TIMEOUT).
 func (r *Reconciler) nextDeadline() (time.Time, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -287,6 +290,19 @@ func (r *Reconciler) nextDeadline() (time.Time, bool) {
 	for _, seen := range r.cancels {
 		if d := seen.Add(r.cancelAckTimeout); next.IsZero() || d.Before(next) {
 			next = d
+		}
+	}
+	now := time.Now()
+	for _, e := range r.reg.List() {
+		// A deadline that has already passed is not a wait source: it would
+		// arm a zero-delay timer and spin the loop (and the K8s API) for as
+		// long as a reclaim keeps failing, since rule 7 retries it without
+		// bound. Such a round rides the regular interval instead.
+		if !e.IsDraining() || !e.DrainDeadline.After(now) {
+			continue
+		}
+		if next.IsZero() || e.DrainDeadline.Before(next) {
+			next = e.DrainDeadline
 		}
 	}
 	return next, !next.IsZero()
@@ -311,8 +327,13 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 }
 
 // round settles every live entry, collecting the first error so one broken
-// task does not hide the rest of the round.
+// task does not hide the rest of the round. The orphan-Secret sweep runs once
+// per round, before the entries (failure-handling 场景 #16): it covers the
+// credentials a reclaim left behind when this process restarted.
 func (r *Reconciler) round(ctx context.Context) error {
+	if err := r.settler.SweepOrphanSecrets(ctx); err != nil {
+		r.log.WarnContext(ctx, "cred.orphan_sweep_failed", "err", err)
+	}
 	entries := r.reg.List()
 	if len(entries) == 0 {
 		return nil
@@ -352,7 +373,9 @@ func (r *Reconciler) round(ctx context.Context) error {
 
 // reconcileOne converges a single task (failure-handling 收敛算法):
 //
-//  0. locally terminal → retry the queued report, then clean the objects up
+//  0. locally terminal → retry the queued report, delete the Job, then close
+//     the drain window once the Job terminated or its upper bound expired
+//     (ADR-017)
 //  1. Job object gone  → the missing-Job compensation (grace + C13)
 //  2. Job object ended → recheck window, then the failure compensation
 //  3. otherwise the server's C13 status decides
@@ -361,10 +384,18 @@ func (r *Reconciler) round(ctx context.Context) error {
 // 时保持等待" is the 判据模型 this ladder encodes.
 func (r *Reconciler) reconcileOne(ctx context.Context, e registry.TaskEntry, pods []corev1.Pod) error {
 	if e.IsTerminal() {
-		// Locally terminal: only a queued report and the objects may still
-		// linger (顺序规则 1: the state was already written).
+		// Locally terminal: only a queued report and the Job deletion may
+		// still linger (顺序规则 1: the state was already written), and the
+		// credential waits for the Job to terminate or the drain upper bound
+		// (ADR-017). Both are attempted: the drain must not stall behind a
+		// deletion that keeps failing.
 		delete(r.ended, e.JobName)
-		return r.settleTerminalEntry(ctx, e)
+		delete(r.missing, e.JobName)
+		err := r.settleTerminalEntry(ctx, e)
+		if rerr := r.reclaimIfDue(ctx, e); rerr != nil && err == nil {
+			err = rerr
+		}
+		return err
 	}
 	if r.releasing[e.TaskID] {
 		// An earlier round began a report-free release but could not finish
@@ -404,12 +435,13 @@ func (r *Reconciler) reconcileOne(ctx context.Context, e registry.TaskEntry, pod
 	return r.settleFromServer(ctx, e)
 }
 
-// release removes the task's objects and mapping without any terminal report
-// (failure-handling 场景 #2/#8/#9). A failed attempt is remembered: the entry
-// is the retry handle, and the next round must finish the release instead of
-// treating the already-deleted Job as an unexpected loss.
+// release discards the objects and mapping of a task that will be re-run,
+// without any terminal report and without entering drain (failure-handling
+// 场景 #2). A failed attempt is remembered: the entry is the retry handle,
+// and the next round must finish the release instead of treating the
+// already-deleted Job as an unexpected loss.
 func (r *Reconciler) release(ctx context.Context, taskID string) error {
-	if err := r.settler.ReleaseTask(ctx, taskID); err != nil {
+	if err := r.settler.DiscardTask(ctx, taskID); err != nil {
 		r.releasing[taskID] = true
 		return err
 	}
@@ -417,12 +449,12 @@ func (r *Reconciler) release(ctx context.Context, taskID string) error {
 	return nil
 }
 
-// settleTerminalEntry retries the object deletion of a terminal entry,
-// bounded per entry (顺序与幂等规则 2). A failed round is counted; once the
-// budget is spent the deletion is not attempted again by this process — the
-// Job is left to its ttlSecondsAfterFinished and the entry stays as the
-// handle a restart picks the retries up with. A pending report that has not
-// landed yet is not a deletion round, so it does not consume the budget.
+// settleTerminalEntry retries the Job deletion of a terminal entry, bounded
+// per entry (顺序与幂等规则 2). A failed round is counted; once the budget is
+// spent the deletion is not attempted again by this process — the Job is left
+// to its ttlSecondsAfterFinished and the entry stays as the handle a restart
+// picks the retries up with. A pending report that has not landed yet is not
+// a deletion round, so it does not consume the budget.
 func (r *Reconciler) settleTerminalEntry(ctx context.Context, e registry.TaskEntry) error {
 	if r.cleanups[e.TaskID] >= cleanupRetryLimit {
 		return nil
@@ -438,6 +470,57 @@ func (r *Reconciler) settleTerminalEntry(ctx context.Context, e registry.TaskEnt
 	}
 	delete(r.cleanups, e.TaskID)
 	return nil
+}
+
+// reclaimIfDue closes the drain window of a settled entry (ADR-017): the
+// credential is reclaimed once the Job's pods have all terminated
+// (job_terminated) or the drain upper bound has expired (drain_timeout),
+// whichever comes first. The termination judgement is the scheduler's single
+// evidence surface; the upper bound closes the window unconditionally, which
+// is what covers an unreachable node, a pod stuck Terminating and a lost
+// informer event.
+//
+// The reclaim's retries are unbounded (顺序与幂等规则 7): the upper bound
+// constrains the credential's lifetime, never the deletion of the objects it
+// leaves behind.
+func (r *Reconciler) reclaimIfDue(ctx context.Context, e registry.TaskEntry) error {
+	if !e.IsDraining() {
+		return nil
+	}
+	since := e.JobCreatedAt
+	// The Job's termination is the primary fact and is read every round: a
+	// Job that already terminated must be reclaimed as job_terminated even
+	// when the upper bound has also expired (the reason must follow the
+	// fact, not the timer).
+	terminated, err := r.settler.JobTerminated(ctx, e.JobName, since)
+	if err != nil {
+		// No fact this round: it is not a verdict, so the empty result is
+		// never read as "terminated"; the upper bound still closes the
+		// window when it expires.
+		r.log.WarnContext(ctx, "job.termination_evidence_failed",
+			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
+	}
+	due := !e.DrainDeadline.IsZero() && !time.Now().Before(e.DrainDeadline)
+	if !terminated && !due {
+		return nil
+	}
+	reason := scheduler.JobTerminationReasonDrainTimeout
+	var podTerminatedAt time.Time
+	if terminated {
+		reason = scheduler.JobTerminationReasonJobTerminated
+		at, err := r.settler.LastPodTerminatedAt(ctx, e.JobName, since)
+		if err != nil {
+			r.log.WarnContext(ctx, "job.termination_evidence_failed",
+				"task_id", e.TaskID, "job_name", e.JobName, "err", err)
+		}
+		podTerminatedAt = at
+	}
+	orphans, err := r.settler.AlivePods(ctx, e.JobName, since)
+	if err != nil {
+		r.log.WarnContext(ctx, "job.termination_evidence_failed",
+			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
+	}
+	return r.settler.OnJobTerminated(ctx, e.JobName, reason, podTerminatedAt, orphans)
 }
 
 // settleEnded compensates a Job whose container ended (场景 #3/#5/#11).
@@ -467,10 +550,12 @@ func (r *Reconciler) settleFromServer(ctx context.Context, e registry.TaskEntry)
 	st, err := r.server.TaskStatus(ctx, e.TaskID)
 	switch {
 	case errors.Is(err, scheduler.ErrTaskNotFound):
-		// 场景 #9: the server deleted the task — remove the objects and
-		// drop the mapping, no terminal report for a task it never knew.
+		// 场景 #9: the server deleted the task — settle it terminal with an
+		// empty result (the only source of result="") and delete the Job, but
+		// send no report for a task it never knew. The credential stays until
+		// the Job is gone (ADR-017).
 		delete(r.cancels, e.TaskID)
-		return r.release(ctx, e.TaskID)
+		return r.settler.OnTaskVanished(ctx, e.TaskID)
 	case err != nil:
 		// C13 failed (5xx/network): truth unknown, change nothing this
 		// round (错误处理表).
@@ -509,8 +594,9 @@ func (r *Reconciler) settleFromServer(ctx context.Context, e registry.TaskEntry)
 // settleCancelled implements 场景 #8: the server cancelled the task while
 // its daemon may still be polling C13 (S9, every 5s) to notice. Foreman
 // waits cancelAckTimeout for the daemon's cancel-ack (forwarded as C11 and
-// cleaned up by the normal report path), then removes the objects without a
-// fail report — cancelled is already terminal server-side.
+// settled by the normal report path), then settles the entry as cancelled
+// without a fail report — the verdict is already server-side — and deletes
+// the Job, leaving the credential to the drain (ADR-017 路径 ④).
 func (r *Reconciler) settleCancelled(ctx context.Context, e registry.TaskEntry) error {
 	first, ok := r.cancels[e.TaskID]
 	if !ok {
@@ -526,7 +612,9 @@ func (r *Reconciler) settleCancelled(ctx context.Context, e registry.TaskEntry) 
 		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 		"cancel_ack_timeout_seconds", r.cancelAckTimeout.Seconds())
 	delete(r.cancels, e.TaskID)
-	return r.release(ctx, e.TaskID)
+	// cancelled is already terminal server-side: no fail report, but the
+	// verdict still starts the drain (ADR-017 路径 ④).
+	return r.settler.SettleTerminal(ctx, e.TaskID, string(registry.ResultCancelled))
 }
 
 // reportSuspects flags every live task whose daemon has been silent on both

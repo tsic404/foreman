@@ -57,20 +57,41 @@ func (f *fakeStatus) TaskStatus(context.Context, string) (string, error) {
 
 type failCall struct{ jobName, reason string }
 type settleCall struct{ taskID, result string }
+type reclaimCall struct {
+	jobName string
+	reason  string
+	at      time.Time
+	orphans int
+}
 
-// fakeSettler records every settlement the reconciler asks for.
+// fakeSettler records every settlement the reconciler asks for. The
+// termination evidence (ADR-017) is programmed per test through the
+// terminated*/alivePods* knobs; the zero values mean "the Job is gone".
 type fakeSettler struct {
 	mu        sync.Mutex
 	onJobGone []string
 	failJobs  []failCall
 	settles   []settleCall
 	adopts    []string
-	releases  []string
+	discards  []string
+	vanished  []string
+	sweeps    int
+	reclaims  []reclaimCall
 	syncs     int
 	err       error
-	// releaseErrs is consumed one error per ReleaseTask call; an empty queue
+	// discardErrs is consumed one error per DiscardTask call; an empty queue
 	// falls back to err.
-	releaseErrs []error
+	discardErrs []error
+
+	// Job termination evidence.
+	terminated       bool
+	terminatedErr    error
+	lastTerminatedAt time.Time
+	lastTermErr      error
+	alivePods        int
+	alivePodsErr     error
+	reclaimErr       error
+	sweepErr         error
 }
 
 func (f *fakeSettler) OnJobGone(_ context.Context, jobName string) error {
@@ -101,18 +122,57 @@ func (f *fakeSettler) AdoptRunning(_ context.Context, taskID string) error {
 	return f.err
 }
 
-func (f *fakeSettler) ReleaseTask(_ context.Context, taskID string) error {
+func (f *fakeSettler) DiscardTask(_ context.Context, taskID string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.releases = append(f.releases, taskID)
-	if len(f.releaseErrs) > 0 {
-		err := f.releaseErrs[0]
-		f.releaseErrs = f.releaseErrs[1:]
+	f.discards = append(f.discards, taskID)
+	if len(f.discardErrs) > 0 {
+		err := f.discardErrs[0]
+		f.discardErrs = f.discardErrs[1:]
 		if err != nil {
 			return err
 		}
 	}
 	return f.err
+}
+
+func (f *fakeSettler) OnTaskVanished(_ context.Context, taskID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.vanished = append(f.vanished, taskID)
+	return f.err
+}
+
+func (f *fakeSettler) SweepOrphanSecrets(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.sweeps++
+	return f.sweepErr
+}
+
+func (f *fakeSettler) JobTerminated(context.Context, string, time.Time) (bool, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.terminated, f.terminatedErr
+}
+
+func (f *fakeSettler) LastPodTerminatedAt(context.Context, string, time.Time) (time.Time, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.lastTerminatedAt, f.lastTermErr
+}
+
+func (f *fakeSettler) AlivePods(context.Context, string, time.Time) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.alivePods, f.alivePodsErr
+}
+
+func (f *fakeSettler) OnJobTerminated(_ context.Context, jobName, reason string, at time.Time, orphans int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reclaims = append(f.reclaims, reclaimCall{jobName, reason, at, orphans})
+	return f.reclaimErr
 }
 
 func (f *fakeSettler) SyncInflight() {
@@ -124,7 +184,15 @@ func (f *fakeSettler) SyncInflight() {
 func (f *fakeSettler) calls() (int, int, int, int, int) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return len(f.onJobGone), len(f.failJobs), len(f.settles), len(f.adopts), len(f.releases)
+	return len(f.onJobGone), len(f.failJobs), len(f.settles), len(f.adopts), len(f.discards)
+}
+
+// drains reports the reclaims and the vanish settlements, the two paths the
+// drain semantics added (ADR-017).
+func (f *fakeSettler) drains() (int, int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.reclaims), len(f.vanished)
 }
 
 type fakeMetrics struct {
@@ -323,7 +391,7 @@ func TestReconcileReleaseSurvivesAPartialDeletion(t *testing.T) {
 	e.Payload = nil // rebuilt entry: nothing to deliver
 	e.State = registry.StateJobCreated
 	reg := newRegistry(t, e)
-	set := &fakeSettler{releaseErrs: []error{errors.New("secret delete failed")}}
+	set := &fakeSettler{discardErrs: []error{errors.New("secret delete failed")}}
 	objs := &fakeObjects{job: runningJob("fm-t1")}
 	r := newTestReconciler(t, reg, objs, &fakeStatus{status: "dispatched"}, set)
 
@@ -339,8 +407,8 @@ func TestReconcileReleaseSurvivesAPartialDeletion(t *testing.T) {
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if len(set.releases) != 2 {
-		t.Fatalf("releases = %v, want the release retried", set.releases)
+	if len(set.discards) != 2 {
+		t.Fatalf("discards = %v, want the discard retried", set.discards)
 	}
 	if len(set.onJobGone) != 0 || len(set.failJobs) != 0 {
 		t.Fatalf("onJobGone=%v failJobs=%v, want no missing-Job compensation for an intentional release",
@@ -358,8 +426,8 @@ func TestReconcileRebuiltPreStartEntryIsReleased(t *testing.T) {
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if len(set.releases) != 1 || set.releases[0] != "t1" {
-		t.Fatalf("releases = %v, want [t1]", set.releases)
+	if len(set.discards) != 1 || set.discards[0] != "t1" {
+		t.Fatalf("discards = %v, want [t1]", set.discards)
 	}
 }
 
@@ -371,8 +439,8 @@ func TestReconcileLivePreStartEntryIsLeftAlone(t *testing.T) {
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if _, _, _, _, releases := set.calls(); releases != 0 {
-		t.Fatalf("releases = %d, want 0 (a live pre-start task must be kept)", releases)
+	if _, _, _, _, discards := set.calls(); discards != 0 {
+		t.Fatalf("discards = %d, want 0 (a live pre-start task must be kept)", discards)
 	}
 }
 
@@ -404,7 +472,10 @@ func TestReconcileTerminalStatusSettles(t *testing.T) {
 
 // ---- scenario #9: task deleted server-side ------------------------------
 
-func TestReconcileDeletedTaskIsReleased(t *testing.T) {
+// A task the server deleted settles terminal with an empty result and
+// enters drain: no report is sent, but the Job is deleted and the credential
+// then follows the Job (ADR-017 path ③).
+func TestReconcileDeletedTaskVanishes(t *testing.T) {
 	reg := newRegistry(t, testEntry("t1"))
 	set := &fakeSettler{}
 
@@ -413,8 +484,11 @@ func TestReconcileDeletedTaskIsReleased(t *testing.T) {
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if len(set.releases) != 1 || set.releases[0] != "t1" {
-		t.Fatalf("releases = %v, want [t1]", set.releases)
+	if len(set.vanished) != 1 || set.vanished[0] != "t1" {
+		t.Fatalf("vanished = %v, want [t1]", set.vanished)
+	}
+	if _, _, _, _, discards := set.calls(); discards != 0 {
+		t.Fatalf("discards = %d, want 0 (a deleted task still drains)", discards)
 	}
 }
 
@@ -554,25 +628,30 @@ func TestReconcileCancelledWaitsForAckThenReleases(t *testing.T) {
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if _, _, _, _, releases := set.calls(); releases != 0 {
-		t.Fatalf("releases = %d, want 0 while the daemon may still ack", releases)
+	if _, _, _, _, discards := set.calls(); discards != 0 {
+		t.Fatalf("discards = %d, want 0 while the daemon may still ack", discards)
 	}
 
 	// Still inside the ack timeout: nothing may be removed yet.
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if _, _, _, _, releases := set.calls(); releases != 0 {
-		t.Fatalf("releases = %d, want 0 before the ack timeout", releases)
+	if _, _, _, _, discards := set.calls(); discards != 0 {
+		t.Fatalf("discards = %d, want 0 before the ack timeout", discards)
 	}
 
-	// The ack timeout has passed: the objects go, without a fail report.
+	// The ack timeout has passed: the entry settles as cancelled without a
+	// fail report, and the Job is deleted — the verdict starts the drain
+	// (ADR-017 path ④).
 	r.cancelAckTimeout = 0
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if len(set.releases) != 1 || set.releases[0] != "t1" {
-		t.Fatalf("releases = %v, want [t1] after the ack timeout", set.releases)
+	if len(set.settles) != 1 || set.settles[0] != (settleCall{"t1", "cancelled"}) {
+		t.Fatalf("settles = %+v, want one settle of t1/cancelled", set.settles)
+	}
+	if _, fails, _, _, _ := set.calls(); fails != 0 {
+		t.Fatalf("failJobs = %d, want no fail report for a cancelled task", fails)
 	}
 }
 
@@ -603,8 +682,8 @@ func TestReconcileCancelledPrunedWhenDaemonAcks(t *testing.T) {
 	if len(r.cancels) != 0 {
 		t.Fatalf("cancels = %d, want the stale sighting pruned", len(r.cancels))
 	}
-	if _, _, _, _, releases := set.calls(); releases != 0 {
-		t.Fatalf("releases = %d, want 0 (the ack path owns the cleanup)", releases)
+	if _, _, _, _, discards := set.calls(); discards != 0 {
+		t.Fatalf("discards = %d, want 0 (the ack path owns the cleanup)", discards)
 	}
 }
 
@@ -631,8 +710,8 @@ func TestSuspectSignalTracksStaleHeartbeats(t *testing.T) {
 	if metrics.last != 1 {
 		t.Fatalf("foreman_heartbeat_suspect = %d, want 1", metrics.last)
 	}
-	if _, fails, _, _, releases := set.calls(); fails+releases != 0 {
-		t.Fatalf("fails=%d releases=%d, want no action on a suspect task", fails, releases)
+	if _, fails, _, _, discards := set.calls(); fails+discards != 0 {
+		t.Fatalf("fails=%d discards=%d, want no action on a suspect task", fails, discards)
 	}
 	if !bytes.Contains(logs.Bytes(), []byte("task.heartbeat_suspect")) {
 		t.Fatalf("missing task.heartbeat_suspect event in %s", logs.String())
@@ -714,8 +793,8 @@ func TestReconcileSkipsRoundWhenK8sIsUnreachable(t *testing.T) {
 	if err == nil {
 		t.Fatal("Reconcile: want an error when the K8s API is unreachable")
 	}
-	if _, _, _, _, releases := set.calls(); releases != 0 {
-		t.Fatalf("releases = %d, want no settlement on a blind round", releases)
+	if _, _, _, _, discards := set.calls(); discards != 0 {
+		t.Fatalf("discards = %d, want no settlement on a blind round", discards)
 	}
 }
 
@@ -728,8 +807,8 @@ func TestReconcileStatusErrorLeavesEntryAlone(t *testing.T) {
 	if err := r.Reconcile(context.Background()); err == nil {
 		t.Fatal("Reconcile: want the C13 error surfaced")
 	}
-	if _, _, _, _, releases := set.calls(); releases != 0 {
-		t.Fatalf("releases = %d, want no compensation without a C13 truth", releases)
+	if _, _, _, _, discards := set.calls(); discards != 0 {
+		t.Fatalf("discards = %d, want no compensation without a C13 truth", discards)
 	}
 }
 

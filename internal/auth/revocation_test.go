@@ -5,16 +5,27 @@ import (
 	"time"
 )
 
+// digest is the key the revocation set stores: the hex SHA-256 of the token
+// (Issuer.Hash). IsRevoked still takes the raw token and hashes it itself.
+func digest(token string) string { return new(Issuer).Hash(token) }
+
 func TestRevocationSetRevokeAndCheck(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	set := NewRevocationSet(fixedClock(now))
 
-	set.Revoke("token-a", now.Add(time.Hour))
+	set.Revoke(digest("token-a"), now.Add(time.Hour))
 	if !set.IsRevoked("token-a") {
 		t.Fatal("token-a should be revoked")
 	}
 	if set.IsRevoked("token-b") {
 		t.Fatal("token-b was never revoked")
+	}
+
+	// The set is keyed by digest, never the raw token: revoking the token
+	// string itself records a different key and must not revoke it.
+	set.Revoke("token-c", now.Add(time.Hour))
+	if set.IsRevoked("token-c") {
+		t.Fatal("revocation must be keyed by digest, not the raw token")
 	}
 }
 
@@ -22,7 +33,7 @@ func TestRevocationSetSkipsExpiredWindow(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	set := NewRevocationSet(fixedClock(now))
 
-	set.Revoke("token-a", now.Add(-time.Minute))
+	set.Revoke(digest("token-a"), now.Add(-time.Minute))
 	if set.IsRevoked("token-a") {
 		t.Fatal("a token past its validity window needs no revocation entry")
 	}
@@ -36,7 +47,7 @@ func TestRevocationSetEvictsExpiredEntries(t *testing.T) {
 	now := start
 	set := NewRevocationSet(func() time.Time { return now })
 
-	set.Revoke("token-a", start.Add(time.Hour))
+	set.Revoke(digest("token-a"), start.Add(time.Hour))
 	now = start.Add(2 * time.Hour)
 	if set.IsRevoked("token-a") {
 		t.Fatal("entry should lapse with the token validity window")
@@ -51,13 +62,13 @@ func TestRevocationSetSweepOnInsert(t *testing.T) {
 	now := start
 	set := NewRevocationSet(func() time.Time { return now })
 
-	set.Revoke("token-a", start.Add(time.Hour))
-	set.Revoke("token-b", start.Add(time.Hour))
+	set.Revoke(digest("token-a"), start.Add(time.Hour))
+	set.Revoke(digest("token-b"), start.Add(time.Hour))
 
 	// Time advances past both windows with no IsRevoked query; the next
 	// insert must sweep the lapsed entries.
 	now = start.Add(2 * time.Hour)
-	set.Revoke("token-c", now.Add(time.Hour))
+	set.Revoke(digest("token-c"), now.Add(time.Hour))
 	if len(set.entries) != 1 {
 		t.Fatalf("entries = %d, want 1 (lapsed entries swept on insert)", len(set.entries))
 	}
@@ -70,7 +81,7 @@ func TestIssuerRevokeUsesTokenValidityWindow(t *testing.T) {
 	issued := time.Unix(1_700_000_000, 0)
 	now := issued
 	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1"}}
-	iss, err := NewIssuer(testKey, jobs, fakeDone{}, WithClock(func() time.Time { return now }))
+	iss, err := NewIssuer(testKey, jobs, fakeDone{}, testTokenTTL, WithClock(func() time.Time { return now }))
 	if err != nil {
 		t.Fatalf("NewIssuer: %v", err)
 	}
@@ -79,7 +90,7 @@ func TestIssuerRevokeUsesTokenValidityWindow(t *testing.T) {
 		t.Fatalf("Issue: %v", err)
 	}
 
-	iss.Revoke(token)
+	iss.Revoke(iss.Hash(token))
 	if !iss.revocations.IsRevoked(token) {
 		t.Fatal("token should be revoked")
 	}

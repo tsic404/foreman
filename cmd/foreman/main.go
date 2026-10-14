@@ -92,6 +92,12 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Startup self-check of the credential budget: the Job Token must cover
+	// claim → boot → task → drain (contract §5.1, ADR-017). Only here are all
+	// three timeouts known, so the check lives on this seam.
+	if err := authCfg.ValidateTokenBudget(schedCfg.JobBootTimeout, schedCfg.JobDrainTimeout); err != nil {
+		return err
+	}
 
 	// One JSON pipeline for the whole process. The shared base carries no
 	// component: every component tags its own (and the modules logging
@@ -109,7 +115,9 @@ func run() error {
 		return fmt.Errorf("kube client: %w", err)
 	}
 
-	reg := registry.New(time.Now)
+	// The drain upper bound is the registry's, because markTerminal writes it
+	// once at the alive → draining transition (ADR-017).
+	reg := registry.New(time.Now, registry.WithDrainTimeout(schedCfg.JobDrainTimeout))
 	metrics := observability.NewMetrics()
 
 	// Fake client: the server credential never leaves this process (F3).
@@ -129,7 +137,7 @@ func run() error {
 		return err
 	}
 
-	issuer, err := proxy.JobTokenIssuer(authCfg.Key, reg)
+	issuer, err := proxy.JobTokenIssuer(authCfg.Key, reg, authCfg.TokenTTL)
 	if err != nil {
 		return err
 	}
@@ -157,6 +165,7 @@ func run() error {
 		metrics,
 		scheduler.WithPendingReports(pending),
 		scheduler.WithReconciler(late),
+		scheduler.WithRevoker(issuer),
 		scheduler.WithLogger(baseLog),
 	)
 	if err != nil {

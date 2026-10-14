@@ -710,7 +710,7 @@ func TestTemplateMisplacedNodePlaceholder(t *testing.T) {
 		if err != nil {
 			t.Fatalf("%s: NewBuilder: %v", name, err)
 		}
-		job, secret, err := builder.Build(entry)
+		job, secret, _, err := builder.Build(entry)
 		if err == nil {
 			t.Fatalf("%s: Build succeeded, want a fail-closed error (job=%v secret=%v)", name, job, secret)
 		}
@@ -727,7 +727,7 @@ func TestTemplateMisplacedNodePlaceholder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewBuilder: %v", err)
 	}
-	job, _, err := builder.Build(entry)
+	job, _, _, err := builder.Build(entry)
 	if err != nil {
 		t.Fatalf("Build with a resolved node: %v", err)
 	}
@@ -870,13 +870,13 @@ func TestTemplateCopyPerBuild(t *testing.T) {
 	}
 
 	first := testEntry()
-	firstJob, _, err := builder.Build(first)
+	firstJob, _, _, err := builder.Build(first)
 	if err != nil {
 		t.Fatalf("Build first: %v", err)
 	}
 	second := testEntry()
 	second.TaskID = "0f1e2d3c-4b5a-4968-8776-655443322110"
-	secondJob, secondSecret, err := builder.Build(second)
+	secondJob, secondSecret, _, err := builder.Build(second)
 	if err != nil {
 		t.Fatalf("Build second: %v", err)
 	}

@@ -18,12 +18,17 @@ var ErrTerminalImmutable = errors.New("terminal entry cannot become non-terminal
 
 // Registry is the in-memory mapping index. The K8s Job objects are the
 // durable truth (ADR-002); nothing here is persisted. Entries stay in the
-// live index until Delete — including terminal entries whose Job/Secret
-// cleanup is still pending — so Inflight counts only non-terminal rows.
+// live index until Delete — including terminal entries in their drain window,
+// whose credential is still valid — so Inflight counts only non-terminal
+// rows.
 type Registry struct {
 	mu   sync.RWMutex
 	now  func() time.Time
 	live map[string]TaskEntry // task_id → entry (until Delete)
+
+	// drainTimeout is FOREMAN_JOB_DRAIN_TIMEOUT: the upper bound written once
+	// at the alive → draining transition (ADR-017).
+	drainTimeout time.Duration
 
 	byJob    map[string]string // job_name → task_id
 	byDaemon map[string]string // daemon_id → task_id
@@ -43,13 +48,27 @@ type Registry struct {
 	runtimeByDaemon map[string]string     // daemon_id → job_runtime_id
 }
 
+// Option customizes a Registry.
+type Option func(*Registry)
+
+// WithDrainTimeout sets the credential-reclaim upper bound written at the
+// alive → draining transition (FOREMAN_JOB_DRAIN_TIMEOUT, ADR-017). Zero
+// means "do not wait": the reclaim still lands on the next observation point.
+func WithDrainTimeout(d time.Duration) Option {
+	return func(r *Registry) {
+		if d > 0 {
+			r.drainTimeout = d
+		}
+	}
+}
+
 // New returns an empty Registry. now defaults to time.Now (tests inject a
 // fixed clock).
-func New(now func() time.Time) *Registry {
+func New(now func() time.Time, opts ...Option) *Registry {
 	if now == nil {
 		now = time.Now
 	}
-	return &Registry{
+	r := &Registry{
 		now:             now,
 		live:            make(map[string]TaskEntry),
 		byJob:           make(map[string]string),
@@ -60,6 +79,10 @@ func New(now func() time.Time) *Registry {
 		runtimes:        make(map[string]JobRuntime),
 		runtimeByDaemon: make(map[string]string),
 	}
+	for _, opt := range opts {
+		opt(r)
+	}
+	return r
 }
 
 // Put inserts or replaces e, keyed by TaskID, and maintains the secondary
@@ -171,9 +194,22 @@ func (r *Registry) IsDone(taskID string) bool {
 	return r.done.has(taskID)
 }
 
+// DoneAt returns the moment the task reached its verdict, as recorded by the
+// single alive → draining transition. The credential reclaim measures the
+// drain duration from it (observability.md §指标 foreman_job_drain_seconds).
+func (r *Registry) DoneAt(taskID string) (time.Time, bool) {
+	return r.done.at(taskID)
+}
+
 // MarkTerminal is the single write path into the terminal state
 // (task-mapping pseudocode markTerminal): it sets state+result atomically
 // with the done-index record. completedAt defaults to now.
+//
+// It is also the drain entry point (ADR-017): the alive → draining transition
+// writes drain_deadline and the done record exactly once, so a repeated
+// terminal report (daemon retries, pending-report replays) only overwrites
+// the result and can neither reset the upper bound nor restart the drain
+// duration.
 func (r *Registry) MarkTerminal(taskID string, result Result, completedAt time.Time) (TaskEntry, error) {
 	if completedAt.IsZero() {
 		completedAt = r.now()
@@ -184,11 +220,31 @@ func (r *Registry) MarkTerminal(taskID string, result Result, completedAt time.T
 	if !ok {
 		return TaskEntry{}, fmt.Errorf("unknown task %s", taskID)
 	}
+	if e.State != StateTerminal {
+		e.JobPhase = JobPhaseDraining
+		e.DrainDeadline = r.now().Add(r.drainTimeout)
+		r.done.put(taskID, completedAt)
+	}
 	e.State = StateTerminal
 	e.Result = result
 	r.live[taskID] = e
-	r.done.put(taskID, completedAt)
 	return e, nil
+}
+
+// SetTokenHash records sha256(token) of the Job's credential. OnClaim is the
+// only writer, right after the builder produced the Secret (ADR-017): the
+// reclaim path feeds it to the revocation set so a re-dispatched task cannot
+// be claimed by its predecessor's pod. A rebuilt entry has no hash — it never
+// leaves memory — and the reclaim degrades visibly instead.
+func (r *Registry) SetTokenHash(taskID, tokenHash string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.live[taskID]
+	if !ok {
+		return
+	}
+	e.TokenHash = tokenHash
+	r.live[taskID] = e
 }
 
 // MarkDaemonRegistered advances job_created → daemon_registered on S4

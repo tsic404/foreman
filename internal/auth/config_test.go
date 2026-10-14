@@ -68,9 +68,9 @@ func TestLoadConfigStartupSelfCheck(t *testing.T) {
 		max     string
 		wantErr bool
 	}{
-		"ttl below default max":          {"1h", "", true},
-		"ttl equal to max":               {"1h", "3600", false},
-		"ttl above max":                  {"24h", "3600", false},
+		"default ttl with default max":   {"", "", false},
+		"ttl below task max":             {"30m", "3600", true},
+		"ttl equal to task max":          {"1h", "3600", false},
 		"max disabled":                   {"1s", "0", false},
 		"zero ttl with max disabled":     {"0s", "0", true},
 		"negative ttl with max disabled": {"-1h", "0", true},
@@ -84,6 +84,34 @@ func TestLoadConfigStartupSelfCheck(t *testing.T) {
 		if (err != nil) != tc.wantErr {
 			t.Errorf("%s: err = %v, wantErr = %v", name, err, tc.wantErr)
 		}
+	}
+}
+
+// TestValidateTokenBudget pins the credential budget self-check of ADR-017:
+// the Job Token must outlive boot + task + drain, so the default TTL exactly
+// covers the default budget and anything shorter refuses startup.
+func TestValidateTokenBudget(t *testing.T) {
+	const boot, drain = 300 * time.Second, 120 * time.Second
+
+	// The default configuration covers the default budget (boot + task + drain).
+	if err := (Config{TokenTTL: DefaultJobTokenTTL, TaskMaxDuration: DefaultTaskMaxDuration}).ValidateTokenBudget(boot, drain); err != nil {
+		t.Fatalf("default budget: %v", err)
+	}
+
+	// TTL == task max leaves no room for boot and drain.
+	tight := Config{TokenTTL: DefaultTaskMaxDuration, TaskMaxDuration: DefaultTaskMaxDuration}
+	if err := tight.ValidateTokenBudget(boot, drain); err == nil {
+		t.Fatal("TTL == task max must not cover boot + drain")
+	}
+
+	// Without a task deadline the budget degrades to boot + drain.
+	noTask := Config{TokenTTL: boot + drain, TaskMaxDuration: 0}
+	if err := noTask.ValidateTokenBudget(boot, drain); err != nil {
+		t.Fatalf("boot + drain with no task: %v", err)
+	}
+	short := Config{TokenTTL: boot + drain - time.Second, TaskMaxDuration: 0}
+	if err := short.ValidateTokenBudget(boot, drain); err == nil {
+		t.Fatal("TTL below boot + drain must be rejected")
 	}
 }
 

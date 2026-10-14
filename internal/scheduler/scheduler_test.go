@@ -18,6 +18,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/tsic404/foreman/internal/jobbuilder"
@@ -25,6 +26,10 @@ import (
 )
 
 var testNow = time.Date(2026, 10, 4, 12, 0, 0, 0, time.UTC)
+
+// testDrainTimeout is the fixture's FOREMAN_JOB_DRAIN_TIMEOUT: the credential
+// reclaim upper bound written at the alive → draining transition (ADR-017).
+const testDrainTimeout = 2 * time.Minute
 
 // ---- fakes ----
 
@@ -39,7 +44,9 @@ type fakeJobs struct {
 	createJobErr    error
 	createSecretErr error
 	deleteJobErr    error
+	deleteSecretErr error
 	getJobErr       error
+	listPodsErr     error
 
 	// existingJobs models Jobs already in the cluster: CreateJob answers
 	// AlreadyExists for their names and GetJob returns them (terminating,
@@ -47,17 +54,29 @@ type fakeJobs struct {
 	existingJobs    map[string]*batchv1.Job
 	terminatingJobs map[string]bool
 	onGetJob        func()
+
+	// secrets and pods back ListSecrets/ListPods: the orphan-Secret sweep
+	// and the Job-termination evidence read them.
+	secrets []corev1.Secret
+	pods    []corev1.Pod
 }
 
-func (f *fakeJobs) CreateJob(_ context.Context, job *batchv1.Job) error {
+// createJobCreationTimestamp is what the fake apiserver stamps on a created
+// Job: the scheduler reads it as job_created_at (the pod instance filter's
+// basis), so it must be non-zero and equal for every instance of a name.
+var createJobCreationTimestamp = testNow.Add(-time.Hour)
+
+func (f *fakeJobs) CreateJob(_ context.Context, job *batchv1.Job) (*batchv1.Job, error) {
 	if f.createJobErr != nil {
-		return f.createJobErr
+		return nil, f.createJobErr
 	}
 	if _, ok := f.existingJobs[job.Name]; ok {
-		return apierrors.NewAlreadyExists(schema.GroupResource{Group: "batch", Resource: "jobs"}, job.Name)
+		return nil, apierrors.NewAlreadyExists(schema.GroupResource{Group: "batch", Resource: "jobs"}, job.Name)
 	}
 	f.createdJobs = append(f.createdJobs, job)
-	return nil
+	created := job.DeepCopy()
+	created.CreationTimestamp = metav1.Time{Time: createJobCreationTimestamp}
+	return created, nil
 }
 
 func (f *fakeJobs) DeleteJob(_ context.Context, name string) error {
@@ -99,11 +118,35 @@ func (f *fakeJobs) CreateSecret(_ context.Context, secret *corev1.Secret) error 
 }
 
 func (f *fakeJobs) DeleteSecret(_ context.Context, name string) error {
+	if f.deleteSecretErr != nil {
+		return f.deleteSecretErr
+	}
 	f.deletedSecrets = append(f.deletedSecrets, name)
 	return nil
 }
 
 func (f *fakeJobs) ListJobs(context.Context) ([]batchv1.Job, error) { return f.jobs, nil }
+
+func (f *fakeJobs) ListSecrets(context.Context) ([]corev1.Secret, error) { return f.secrets, nil }
+
+// ListPods applies the selector the scheduler passes (job-name=<job>), so the
+// tests exercise the same ownership key the informer-based path uses.
+func (f *fakeJobs) ListPods(_ context.Context, labelSelector string) ([]corev1.Pod, error) {
+	if f.listPodsErr != nil {
+		return nil, f.listPodsErr
+	}
+	selector, err := labels.Parse(labelSelector)
+	if err != nil {
+		return nil, err
+	}
+	var out []corev1.Pod
+	for i := range f.pods {
+		if selector.Matches(labels.Set(f.pods[i].Labels)) {
+			out = append(out, f.pods[i])
+		}
+	}
+	return out, nil
+}
 
 func (f *fakeJobs) WatchJobs(context.Context, JobEventHandler) error { return nil }
 
@@ -147,20 +190,21 @@ func (f *fakeServer) Forward(_ context.Context, ep Endpoint, taskID string, body
 }
 
 type fakeBuilder struct {
-	job    *batchv1.Job
-	secret *corev1.Secret
-	err    error
-	got    jobbuilder.TaskEntry
-	delay  time.Duration
+	job       *batchv1.Job
+	secret    *corev1.Secret
+	tokenHash string
+	err       error
+	got       jobbuilder.TaskEntry
+	delay     time.Duration
 }
 
-func (f *fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, error) {
+func (f *fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
 	f.got = e
 	if f.delay > 0 {
 		time.Sleep(f.delay)
 	}
 	if f.err != nil {
-		return nil, nil, f.err
+		return nil, nil, "", f.err
 	}
 	job := f.job
 	if job == nil {
@@ -170,14 +214,20 @@ func (f *fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secre
 	if secret == nil {
 		secret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fm-" + e.TaskID + "-cred"}}
 	}
-	return job, secret, nil
+	hash := f.tokenHash
+	if hash == "" {
+		hash = "hash-of-" + e.TaskID
+	}
+	return job, secret, hash, nil
 }
 
 type fakeMetrics struct {
-	claimed    int
-	terminal   []string
-	inflight   []int
-	duplicates int
+	claimed     int
+	terminal    []string
+	inflight    []int
+	duplicates  int
+	reclaim     []string
+	drainSecond []float64
 }
 
 func (f *fakeMetrics) TaskClaimed()               { f.claimed++ }
@@ -186,6 +236,17 @@ func (f *fakeMetrics) JobBootSeconds(float64)     {}
 func (f *fakeMetrics) JobCreateSeconds(float64)   {}
 func (f *fakeMetrics) InflightJobs(n int)         { f.inflight = append(f.inflight, n) }
 func (f *fakeMetrics) DuplicateDispatch()         { f.duplicates++ }
+func (f *fakeMetrics) CredReclaimed(reason string, drainSeconds float64) {
+	f.reclaim = append(f.reclaim, reason)
+	f.drainSecond = append(f.drainSecond, drainSeconds)
+}
+
+// fakeRevoker records the digests the credential reclaim revokes.
+type fakeRevoker struct {
+	revoked []string
+}
+
+func (f *fakeRevoker) Revoke(tokenHash string) { f.revoked = append(f.revoked, tokenHash) }
 
 // ---- helpers ----
 
@@ -195,6 +256,7 @@ type fixture struct {
 	server  *fakeServer
 	builder *fakeBuilder
 	metrics *fakeMetrics
+	revoker *fakeRevoker
 	sched   *Scheduler
 	pending *fakePendingReports
 	now     time.Time
@@ -207,13 +269,14 @@ func newFixture(t *testing.T) *fixture {
 		server:  &fakeServer{},
 		builder: &fakeBuilder{},
 		metrics: &fakeMetrics{},
+		revoker: &fakeRevoker{},
 		pending: &fakePendingReports{},
 		now:     testNow,
 	}
 	// The registry shares the fixture clock: with the real clock its done
 	// index (TTL 24h) would expire entries stamped at testNow and the suite
 	// would rot with wall time.
-	f.reg = registry.New(func() time.Time { return f.now })
+	f.reg = registry.New(func() time.Time { return f.now }, registry.WithDrainTimeout(testDrainTimeout))
 	cfg, err := LoadConfig(func(string) string { return "" })
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
@@ -221,6 +284,7 @@ func newFixture(t *testing.T) *fixture {
 	s, err := New(cfg, f.reg, f.jobs, f.builder, f.server, f.metrics,
 		WithClock(func() time.Time { return f.now }),
 		WithPendingReports(f.pending),
+		WithRevoker(f.revoker),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	)
 	if err != nil {
@@ -228,6 +292,20 @@ func newFixture(t *testing.T) *fixture {
 	}
 	f.sched = s
 	return f
+}
+
+// testPod is a pod of one Job instance: it carries the ownership label the
+// termination evidence selects on and a creationTimestamp the instance filter
+// keeps.
+func testPod(jobName string, phase corev1.PodPhase) corev1.Pod {
+	return corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              jobName + "-pod",
+			Labels:            map[string]string{podJobNameLabel: jobName},
+			CreationTimestamp: metav1.Time{Time: testNow},
+		},
+		Status: corev1.PodStatus{Phase: phase},
+	}
 }
 
 func claimPayload(id string) json.RawMessage {
@@ -727,8 +805,8 @@ func TestOnReportStart409SettlesStaleClaim(t *testing.T) {
 	if err != nil || code != 409 {
 		t.Fatalf("OnReport = %d, %v (the daemon keeps the server's 409)", code, err)
 	}
-	if _, ok := f.reg.Get("t-409"); ok {
-		t.Fatal("entry must not stay live after the start was refused")
+	if e, ok := f.reg.Get("t-409"); !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Fatalf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
 	if !f.reg.IsDone("t-409") {
 		t.Fatal("the terminal write must land in the done index")
@@ -800,8 +878,8 @@ func TestOnReportStart409TerminalSettlesToServer(t *testing.T) {
 	if err != nil || code != 409 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
-	if _, ok := f.reg.Get("t-done"); ok {
-		t.Fatal("entry must be settled once the server holds the task terminal")
+	if e, ok := f.reg.Get("t-done"); !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Fatalf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
 	if !f.reg.IsDone("t-done") {
 		t.Fatal("the terminal write must land in the done index")
@@ -831,8 +909,8 @@ func TestOnReportStart409VanishedReleases(t *testing.T) {
 	if err != nil || code != 409 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
-	if _, ok := f.reg.Get("t-gone"); ok {
-		t.Fatal("entry must be dropped for a task the server no longer has")
+	if e, ok := f.reg.Get("t-gone"); !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Fatalf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
 	if f.hasJob("fm-t-gone") {
 		t.Fatal("Job must be deleted with the vanished task")
@@ -972,8 +1050,8 @@ func TestOnReportTerminalCleansUpAfterSuccess(t *testing.T) {
 	if err != nil || code != 200 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
-	if _, ok := f.reg.Get("task-1"); ok {
-		t.Fatal("entry kept after terminal cleanup")
+	if e, ok := f.reg.Get("task-1"); !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Fatalf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
 	if !f.reg.IsDone("task-1") {
 		t.Fatal("done index not written")
@@ -981,8 +1059,8 @@ func TestOnReportTerminalCleansUpAfterSuccess(t *testing.T) {
 	if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != "fm-task-1" {
 		t.Fatalf("job deletes = %+v", f.jobs.deletedJobs)
 	}
-	if len(f.jobs.deletedSecrets) != 2 { // 1 stale sweep at claim + 1 terminal delete
-		t.Fatalf("secret deletes = %+v", f.jobs.deletedSecrets)
+	if len(f.jobs.deletedSecrets) != 1 { // only the claim-time stale sweep
+		t.Fatalf("secret deletes = %+v, want the Secret kept until the reclaim", f.jobs.deletedSecrets)
 	}
 	if f.metrics.terminal[0] != "completed" {
 		t.Fatalf("terminal metric = %v", f.metrics.terminal)
@@ -1000,8 +1078,8 @@ func TestOnReportTerminal404StillCleansUp(t *testing.T) {
 	if err != nil || code != 200 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
-	if _, ok := f.reg.Get("task-1"); ok {
-		t.Fatal("entry kept after 404 cleanup")
+	if e, ok := f.reg.Get("task-1"); !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Fatalf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
 	if len(f.jobs.deletedJobs) != 1 {
 		t.Fatalf("job deletes = %+v", f.jobs.deletedJobs)
@@ -1048,8 +1126,8 @@ func TestOnJobGoneCompensatesRunningTask(t *testing.T) {
 	if err := f.sched.OnJobGone(context.Background(), "fm-task-1"); err != nil {
 		t.Fatalf("OnJobGone: %v", err)
 	}
-	if _, ok := f.reg.Get("task-1"); ok {
-		t.Fatal("entry kept after compensation")
+	if e, ok := f.reg.Get("task-1"); !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Fatalf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
 	if len(f.server.forwards) != 1 || f.server.forwards[0].ep != EPFail {
 		t.Fatalf("forwards = %+v", f.server.forwards)
@@ -1085,8 +1163,8 @@ func TestOnJobGoneTaskVanishedServerSide(t *testing.T) {
 	if err := f.sched.OnJobGone(context.Background(), "fm-task-1"); err != nil {
 		t.Fatalf("OnJobGone: %v", err)
 	}
-	if _, ok := f.reg.Get("task-1"); ok {
-		t.Fatal("entry kept for a server-deleted task")
+	if e, ok := f.reg.Get("task-1"); !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Fatalf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
 	if len(f.server.forwards) != 0 {
 		t.Fatal("terminal report sent for a vanished task (scenario #9 forbids it)")
@@ -1200,7 +1278,9 @@ func TestConvergeTerminalAndGoneCleanup(t *testing.T) {
 		wantDone  bool
 	}{
 		{"terminal forwarded", "completed", nil, true},
-		{"task deleted server-side", "", ErrTaskNotFound, false},
+		// The vanish settlement is a verdict too: it writes the done index
+		// (the drain's start) so a late terminal replay stays idempotent.
+		{"task deleted server-side", "", ErrTaskNotFound, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
@@ -1214,8 +1294,8 @@ func TestConvergeTerminalAndGoneCleanup(t *testing.T) {
 			if err := f.sched.Reconcile(context.Background()); err != nil {
 				t.Fatal(err)
 			}
-			if _, ok := f.reg.Get("task-1"); ok {
-				t.Fatal("entry kept")
+			if e, ok := f.reg.Get("task-1"); !ok || !e.IsTerminal() || !e.IsDraining() {
+				t.Fatalf("entry = %+v, %v; want a retained draining entry", e, ok)
 			}
 			if len(f.jobs.deletedJobs) != 1 {
 				t.Fatalf("job deletes = %+v", f.jobs.deletedJobs)
@@ -1257,6 +1337,7 @@ func TestReconcileDelegatesToRecoveryWhenWired(t *testing.T) {
 	s, err := New(cfg, f.reg, f.jobs, f.builder, f.server, nil,
 		WithReconciler(rec),
 		WithPendingReports(&fakePendingReports{}),
+		WithRevoker(&fakeRevoker{}),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	)
 	if err != nil {
@@ -1277,9 +1358,24 @@ func TestNewRequiresPendingReports(t *testing.T) {
 	f := newFixture(t)
 	cfg, _ := LoadConfig(func(string) string { return "" })
 	_, err := New(cfg, f.reg, f.jobs, f.builder, f.server, nil,
+		WithRevoker(&fakeRevoker{}),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err == nil {
 		t.Fatal("New without a pending-report queue: want an error")
+	}
+}
+
+// ADR-017: the credential reclaim must be able to revoke the digest it
+// recorded, so a scheduler cannot be built without a revoker — a no-op one
+// would silently reopen the same-name reuse face.
+func TestNewRequiresRevoker(t *testing.T) {
+	f := newFixture(t)
+	cfg, _ := LoadConfig(func(string) string { return "" })
+	_, err := New(cfg, f.reg, f.jobs, f.builder, f.server, nil,
+		WithPendingReports(&fakePendingReports{}),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	if err == nil {
+		t.Fatal("New without a revoker: want an error")
 	}
 }
 
@@ -1405,8 +1501,8 @@ func TestOnJobGoneFailedReportRetainsEntryUntilDelivered(t *testing.T) {
 	if err := f.sched.Reconcile(context.Background()); err != nil {
 		t.Fatal(err)
 	}
-	if _, ok := f.reg.Get("task-1"); ok {
-		t.Fatal("entry kept after the pending report landed")
+	if e, ok := f.reg.Get("task-1"); !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Fatalf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
 	if n := len(f.server.forwards); n != 1 {
 		t.Fatalf("forwards = %d, want 1 (initial attempt only)", n)
@@ -1448,6 +1544,8 @@ func (testIssuer) Issue(string, string, string, time.Duration) (string, error) {
 	return "fmj_test.token", nil
 }
 
+func (testIssuer) Hash(token string) string { return "hash(" + token + ")" }
+
 // newCappedScheduler builds a scheduler over f's registry whose builder is
 // the real jobbuilder, so Job objects carry the genuine affinity.
 func newCappedScheduler(t *testing.T, f *fixture, maxJobsPerNode int, logw io.Writer) *Scheduler {
@@ -1470,6 +1568,7 @@ func newCappedScheduler(t *testing.T, f *fixture, maxJobsPerNode int, logw io.Wr
 	s, err := New(cfg, f.reg, f.jobs, builder, f.server, f.metrics,
 		WithClock(func() time.Time { return f.now }),
 		WithPendingReports(&fakePendingReports{}),
+		WithRevoker(&fakeRevoker{}),
 		WithLogger(slog.New(slog.NewJSONHandler(logw, nil))))
 	if err != nil {
 		t.Fatalf("New: %v", err)

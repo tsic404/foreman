@@ -18,8 +18,10 @@ const (
 )
 
 const (
-	// DefaultJobTokenTTL matches the contract default (24h).
-	DefaultJobTokenTTL = 24 * time.Hour
+	// DefaultJobTokenTTL matches the contract default (24h7m = 300s boot +
+	// 86400s task + 120s drain, §5.1): the token covers claim → Job boot →
+	// task → the drain window that follows the task's verdict (ADR-017).
+	DefaultJobTokenTTL = 24*time.Hour + 7*time.Minute
 	// DefaultTaskMaxDuration matches the contract default (86400s).
 	DefaultTaskMaxDuration = 86400 * time.Second
 )
@@ -78,16 +80,39 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	return cfg, nil
 }
 
-// Validate runs the startup self-check: the token TTL must be positive and
-// must cover the task max duration, so a running task never outlives its
-// token; a zero max duration disables the task limit but never legitimizes
-// a non-positive TTL. Failing validation must refuse startup.
+// Validate runs the intrinsic self-check: the token TTL must be positive and
+// must at least cover the task itself. The full credential budget — boot and
+// drain included — is checked by ValidateTokenBudget once the scheduler's
+// timeouts are known; both are fail-fast configuration errors.
 func (c Config) Validate() error {
 	if c.TokenTTL <= 0 {
 		return fmt.Errorf("%s must be positive, got %s", EnvJobTokenTTL, c.TokenTTL)
 	}
 	if c.TaskMaxDuration > 0 && c.TokenTTL < c.TaskMaxDuration {
 		return fmt.Errorf("%s (%s) must be >= %s (%s)", EnvJobTokenTTL, c.TokenTTL, EnvTaskMaxDuration, c.TaskMaxDuration)
+	}
+	return nil
+}
+
+// ValidateTokenBudget runs the startup self-check of the credential budget
+// (contract §5.1): the Job Token must outlive the whole Job, i.e.
+//
+//	FOREMAN_JOB_TOKEN_TTL >= boot + task + drain
+//
+// so it is still valid through claim → Job boot → task execution → the drain
+// window that follows the task's verdict (ADR-017). A shorter TTL would
+// expire credentials inside a live window, so it refuses startup instead of
+// degrading silently; a zero task duration (no activeDeadlineSeconds) leaves
+// the inequality as boot + drain.
+func (c Config) ValidateTokenBudget(bootTimeout, drainTimeout time.Duration) error {
+	budget := bootTimeout + c.TaskMaxDuration + drainTimeout
+	if c.TokenTTL < budget {
+		return fmt.Errorf("%s (%s) must cover FOREMAN_JOB_BOOT_TIMEOUT (%s) + %s (%s) + FOREMAN_JOB_DRAIN_TIMEOUT (%s) = %s",
+			EnvJobTokenTTL, c.TokenTTL,
+			bootTimeout,
+			EnvTaskMaxDuration, c.TaskMaxDuration,
+			drainTimeout,
+			budget)
 	}
 	return nil
 }

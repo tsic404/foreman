@@ -66,8 +66,8 @@ func TestOnBootTimeoutFailsAndCleansUp(t *testing.T) {
 	if err := f.sched.OnBootTimeout(context.Background(), "t-boot"); err != nil {
 		t.Fatalf("OnBootTimeout: %v", err)
 	}
-	if _, ok := f.reg.Get("t-boot"); ok {
-		t.Error("entry must be gone after the boot-timeout settlement")
+	if e, ok := f.reg.Get("t-boot"); !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Errorf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
 	if f.hasJob("fm-t-boot") {
 		t.Error("Job must be deleted after the boot-timeout settlement")
@@ -115,8 +115,8 @@ func TestOnBootTimeoutQueuesReportAndKeepsObjects(t *testing.T) {
 	if err := f.sched.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if _, ok := f.reg.Get("t-boot-fail"); ok {
-		t.Error("entry must be gone once the report landed")
+	if e, ok := f.reg.Get("t-boot-fail"); !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Errorf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
 	if f.hasJob("fm-t-boot-fail") {
 		t.Error("Job must be deleted once the report landed")
@@ -149,8 +149,8 @@ func TestOnTaskVanished(t *testing.T) {
 	if err := f.sched.OnTaskVanished(context.Background(), "t-vanish"); err != nil {
 		t.Fatalf("OnTaskVanished: %v", err)
 	}
-	if _, ok := f.reg.Get("t-vanish"); ok {
-		t.Error("entry must be dropped")
+	if e, ok := f.reg.Get("t-vanish"); !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Errorf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
 	if f.hasJob("fm-t-vanish") {
 		t.Error("Job must be deleted")
@@ -187,8 +187,8 @@ func TestConvergeLeaseRefused(t *testing.T) {
 		if err := f.sched.ConvergeLeaseRefused(context.Background(), "t-lt"); err != nil {
 			t.Fatalf("ConvergeLeaseRefused: %v", err)
 		}
-		if _, ok := f.reg.Get("t-lt"); ok {
-			t.Error("terminal entry must be cleaned up")
+		if e, ok := f.reg.Get("t-lt"); !ok || !e.IsTerminal() || !e.IsDraining() {
+			t.Errorf("entry = %+v, %v; want a retained draining entry", e, ok)
 		}
 		if f.hasJob("fm-t-lt") {
 			t.Error("terminal task's Job must be deleted")
@@ -203,8 +203,8 @@ func TestConvergeLeaseRefused(t *testing.T) {
 		if err := f.sched.ConvergeLeaseRefused(context.Background(), "t-lg"); err != nil {
 			t.Fatalf("ConvergeLeaseRefused: %v", err)
 		}
-		if _, ok := f.reg.Get("t-lg"); ok {
-			t.Error("gone task must be dropped")
+		if e, ok := f.reg.Get("t-lg"); !ok || !e.IsTerminal() || !e.IsDraining() {
+			t.Errorf("entry = %+v, %v; want a retained draining entry", e, ok)
 		}
 	})
 
@@ -313,8 +313,8 @@ func TestOnReportNonTerminal404Vanishes(t *testing.T) {
 	if err != nil || code != 404 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
-	if _, ok := f.reg.Get("t-prog404"); ok {
-		t.Error("entry must be dropped when the server deleted the task")
+	if e, ok := f.reg.Get("t-prog404"); !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Errorf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
 	if f.hasJob("fm-t-prog404") {
 		t.Error("Job must be deleted when the server deleted the task")

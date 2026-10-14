@@ -30,6 +30,8 @@ const (
 	metricWSConnected       = "foreman_ws_connected"
 	metricWSReconnectsTotal = "foreman_ws_reconnects_total"
 	metricHeartbeatSuspect  = "foreman_heartbeat_suspect"
+	metricCredReclaimTotal  = "foreman_cred_reclaim_total"
+	metricJobDrainSeconds   = "foreman_job_drain_seconds"
 )
 
 // Terminal result label values (contract §3.1).
@@ -53,7 +55,14 @@ var forwardEndpoints = []string{
 }
 
 // authFailureReasons is the foreman_auth_failures_total label vocabulary.
-var authFailureReasons = []string{"malformed", "signature", "expired", "scope", "unknown_job"}
+// "revoked" is the same-name reuse face: the entry reappeared with a
+// predecessor's token (ADR-017).
+var authFailureReasons = []string{"malformed", "signature", "expired", "scope", "unknown_job", "revoked"}
+
+// credReclaimReasons is the foreman_cred_reclaim_total label vocabulary
+// (ADR-017): the drain window closed on the Job's termination, or on the
+// FOREMAN_JOB_DRAIN_TIMEOUT upper bound.
+var credReclaimReasons = []string{"job_terminated", "drain_timeout"}
 
 // wsSides is the side label vocabulary (ADR-010).
 var wsSides = []string{"server", "job"}
@@ -80,6 +89,8 @@ type Metrics struct {
 	wsConnected       *prometheus.GaugeVec
 	wsReconnects      *prometheus.CounterVec
 	heartbeatSuspect  prometheus.Gauge
+	credReclaims      *prometheus.CounterVec
+	jobDrainSeconds   prometheus.Histogram
 
 	// wsMu guards wsJobs, the authoritative side=job connection count; the
 	// gauge is Set from it so a disconnect without a matching connect (e.g.
@@ -158,12 +169,22 @@ func NewMetrics() *Metrics {
 		Name: metricHeartbeatSuspect,
 		Help: "Tasks with both heartbeat channels silent for over 60s.",
 	})
+	m.credReclaims = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricCredReclaimTotal,
+		Help: "Job Token credential reclaims by reason.",
+	}, []string{"reason"})
+	m.jobDrainSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    metricJobDrainSeconds,
+		Help:    "Task verdict -> credential reclaim duration.",
+		Buckets: []float64{1, 5, 15, 30, 60, 120, 300, 600},
+	})
 
 	collectors := []prometheus.Collector{
 		m.tasksTotal, m.taskClaims, m.claimErrors, m.jobBootSeconds,
 		m.jobCreateSeconds, m.inflightJobs, m.forwardTotal, m.forwardLatency,
 		m.authFailures, m.tokenUsage, m.duplicateDispatch, m.pendingReports,
 		m.wsConnected, m.wsReconnects, m.heartbeatSuspect,
+		m.credReclaims, m.jobDrainSeconds,
 	}
 	for _, c := range collectors {
 		m.reg.MustRegister(c)
@@ -188,6 +209,9 @@ func NewMetrics() *Metrics {
 	for _, side := range wsSides {
 		m.wsConnected.WithLabelValues(side)
 		m.wsReconnects.WithLabelValues(side)
+	}
+	for _, reason := range credReclaimReasons {
+		m.credReclaims.WithLabelValues(reason)
 	}
 	return m
 }
@@ -274,3 +298,12 @@ func (m *Metrics) WSReconnect(side string) { m.wsReconnects.WithLabelValues(side
 // HeartbeatSuspect sets how many tasks currently fail the 60s heartbeat
 // freshness check.
 func (m *Metrics) HeartbeatSuspect(n int) { m.heartbeatSuspect.Set(float64(n)) }
+
+// CredReclaimed counts one credential reclaim by reason (job_terminated or
+// drain_timeout) and observes how long the drain window lasted (ADR-017).
+// drain_timeout > 0 means the upper bound closed the window — a review input,
+// not a failure.
+func (m *Metrics) CredReclaimed(reason string, drainSeconds float64) {
+	m.credReclaims.WithLabelValues(reason).Inc()
+	m.jobDrainSeconds.Observe(drainSeconds)
+}

@@ -73,8 +73,10 @@ spec:
                 secretKeyRef:
                   name: foreman-secret
                   key: FOREMAN_JOB_TOKEN_KEY
+            # Covers boot + task + drain (ADR-017): the startup self-check
+            # refuses a TTL below 300s + 86400s + 120s.
             - name: FOREMAN_JOB_TOKEN_TTL
-              value: "24h"
+              value: "24h7m"
             # --- Job placement / lifecycle ---
             - name: FOREMAN_JOB_NAMESPACE
               value: "multica-agents"
@@ -94,6 +96,11 @@ spec:
               value: "15s"
             - name: FOREMAN_JOB_BOOT_TIMEOUT
               value: "300s"
+            # Credential-reclaim upper bound after a task's verdict; a
+            # deployment that raises the template's
+            # terminationGracePeriodSeconds must raise this too (ADR-017).
+            - name: FOREMAN_JOB_DRAIN_TIMEOUT
+              value: "120s"
             - name: FOREMAN_TASK_MAX_DURATION
               value: "86400"
             - name: FOREMAN_RECONCILE_INTERVAL

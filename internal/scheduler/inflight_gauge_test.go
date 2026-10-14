@@ -31,8 +31,11 @@ func (f *fixture) assertSettled(t *testing.T, taskID string) {
 	if got := f.inflightGauge(t); got != 0 {
 		t.Fatalf("foreman_inflight_jobs = %d, want 0 — the gauge froze at its pre-settlement value", got)
 	}
-	if n := len(f.reg.List()); n != 0 {
-		t.Fatalf("registry entries = %d, want 0", n)
+	// The verdict starts the drain: the entry is retained (terminal) but is
+	// no longer inflight, and its Job is gone (ADR-017).
+	entries := f.reg.List()
+	if len(entries) != 1 || !entries[0].IsTerminal() || !entries[0].IsDraining() {
+		t.Fatalf("registry entries = %+v, want one draining entry", entries)
 	}
 	if f.hasJob("fm-" + taskID) {
 		t.Fatalf("Job fm-%s survives the settlement", taskID)

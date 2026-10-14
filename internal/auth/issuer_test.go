@@ -15,6 +15,10 @@ import (
 
 var testKey = bytes.Repeat([]byte{0x42}, MinKeyBytes)
 
+// testTokenTTL is the issued token TTL the test Issuers are built with; it
+// bounds the revocation window (ADR-017).
+const testTokenTTL = time.Hour
+
 type fakeRegistry map[string]JobEntry
 
 func (f fakeRegistry) ByDaemon(daemonID string) (JobEntry, bool) {
@@ -29,7 +33,7 @@ func (f fakeDone) IsDone(taskID string) bool { return f[taskID] }
 func fixedClock(t time.Time) func() time.Time { return func() time.Time { return t } }
 
 func newTestIssuer(now time.Time, jobs JobLookup, done DoneIndex) *Issuer {
-	i, err := NewIssuer(testKey, jobs, done, WithClock(fixedClock(now)))
+	i, err := NewIssuer(testKey, jobs, done, testTokenTTL, WithClock(fixedClock(now)))
 	if err != nil {
 		panic(err)
 	}
@@ -80,9 +84,17 @@ func TestIssueRejectsBadArgs(t *testing.T) {
 }
 
 func TestNewIssuerRejectsShortKey(t *testing.T) {
-	_, err := NewIssuer([]byte("short"), fakeRegistry{}, fakeDone{})
+	_, err := NewIssuer([]byte("short"), fakeRegistry{}, fakeDone{}, testTokenTTL)
 	if !errors.Is(err, ErrKeyTooShort) {
 		t.Fatalf("err = %v, want ErrKeyTooShort", err)
+	}
+}
+
+func TestNewIssuerRejectsNonPositiveTTL(t *testing.T) {
+	for name, ttl := range map[string]time.Duration{"zero": 0, "negative": -time.Hour} {
+		if _, err := NewIssuer(testKey, fakeRegistry{}, fakeDone{}, ttl); err == nil {
+			t.Errorf("%s TTL: expected error", name)
+		}
 	}
 }
 
@@ -196,19 +208,17 @@ func TestVerifyRevoked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
-	iss.Revoke(token)
+	iss.Revoke(iss.Hash(token))
 	if _, err := iss.Verify(token, RequestScope{}); !errors.Is(err, ErrRevoked) {
 		t.Fatalf("err = %v, want ErrRevoked", err)
 	}
 
-	// Revocation precedes the registry lookup: an unknown job still reports revoked.
-	other, err := iss.Issue("fm-elsewhere", "task-2", "ws-1", time.Hour)
-	if err != nil {
-		t.Fatalf("Issue: %v", err)
-	}
-	iss.Revoke(other)
-	if _, err := iss.Verify(other, RequestScope{}); !errors.Is(err, ErrRevoked) {
-		t.Fatalf("err = %v, want ErrRevoked", err)
+	// Entry adjudication precedes the revocation check: a revoked token whose
+	// entry is gone is rejected as an unknown Job, never as revoked.
+	gone := newTestIssuer(now, fakeRegistry{}, fakeDone{})
+	gone.Revoke(gone.Hash(token))
+	if _, err := gone.Verify(token, RequestScope{}); !errors.Is(err, ErrUnknownJob) {
+		t.Fatalf("err = %v, want ErrUnknownJob (adjudication precedes revocation)", err)
 	}
 }
 
@@ -220,7 +230,7 @@ func TestVerifyExpiredBeatsRevoked(t *testing.T) {
 		t.Fatalf("Issue: %v", err)
 	}
 	later := newTestIssuer(issued.Add(2*time.Hour), jobs, fakeDone{})
-	later.Revoke(token)
+	later.Revoke(later.Hash(token))
 	if _, err := later.Verify(token, RequestScope{}); !errors.Is(err, ErrExpired) {
 		t.Fatalf("err = %v, want ErrExpired (checked before revocation)", err)
 	}
@@ -238,9 +248,9 @@ func TestVerifyUnknownJob(t *testing.T) {
 		done DoneIndex
 		req  RequestScope
 	}{
-		"registry miss":                  {fakeRegistry{}, fakeDone{}, RequestScope{TaskID: "task-1"}},
-		"terminal entry":                 {fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1", IsTerminal: true}}, fakeDone{}, RequestScope{TaskID: "task-1"}},
-		"done but non-terminal endpoint": {fakeRegistry{}, fakeDone{"task-1": true}, RequestScope{TaskID: "task-1"}},
+		"registry miss":                        {fakeRegistry{}, fakeDone{}, RequestScope{TaskID: "task-1"}},
+		"reclaimed entry":                      {fakeRegistry{}, fakeDone{"task-1": true}, RequestScope{TaskID: "task-1"}},
+		"terminal endpoint without done entry": {fakeRegistry{}, fakeDone{}, RequestScope{TaskID: "task-1", IsTerminalEndpoint: true}},
 	}
 	for name, tc := range cases {
 		iss := newTestIssuer(now, tc.jobs, tc.done)
@@ -258,7 +268,8 @@ func TestVerifyLateReplay(t *testing.T) {
 	}
 	req := RequestScope{TaskID: "task-1", IsTerminalEndpoint: true}
 
-	// Entry already removed (mapping deleted after terminal).
+	// Entry already reclaimed after the terminal verdict; the done index still
+	// holds the task, so the terminal-endpoint retry is answered idempotently.
 	iss := newTestIssuer(now, fakeRegistry{}, fakeDone{"task-1": true})
 	claims, err := iss.Verify(token, req)
 	if err != nil {
@@ -268,14 +279,42 @@ func TestVerifyLateReplay(t *testing.T) {
 		t.Fatalf("claims = %+v, want IsLateReplay for task-1", claims)
 	}
 
-	// Entry still present but terminal.
-	iss = newTestIssuer(now, fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1", IsTerminal: true}}, fakeDone{"task-1": true})
+	// Entry still present (task terminal, Job draining): a live entry is
+	// adjudicated normally, so the retry is not a late replay.
+	iss = newTestIssuer(now, fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1"}}, fakeDone{"task-1": true})
 	claims, err = iss.Verify(token, req)
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
 	}
-	if !claims.IsLateReplay {
-		t.Fatalf("claims = %+v, want IsLateReplay", claims)
+	if claims.IsLateReplay {
+		t.Fatalf("claims = %+v, want a live entry to verify normally", claims)
+	}
+}
+
+// TestVerifyDrainWindowEntryStillValid pins ADR-017: an entry that exists
+// while its task is already terminal (the drain window) still authorizes the
+// token, including on non-terminal endpoints.
+func TestVerifyDrainWindowEntryStillValid(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1"}}
+	iss := newTestIssuer(now, jobs, fakeDone{"task-1": true})
+	token, err := iss.Issue("fm-task-1", "task-1", "ws-1", time.Hour)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	for name, req := range map[string]RequestScope{
+		"non-terminal endpoint": {TaskID: "task-1", RuntimeID: "rid-1"},
+		"terminal endpoint":     {TaskID: "task-1", RuntimeID: "rid-1", IsTerminalEndpoint: true},
+	} {
+		claims, err := iss.Verify(token, req)
+		if err != nil {
+			t.Errorf("%s: %v", name, err)
+			continue
+		}
+		if claims.IsLateReplay {
+			t.Errorf("%s: IsLateReplay set for a live entry", name)
+		}
 	}
 }
 
@@ -333,7 +372,7 @@ func TestReason(t *testing.T) {
 		ErrMalformedToken: "malformed",
 		ErrBadSignature:   "signature",
 		ErrExpired:        "expired",
-		ErrRevoked:        "unknown_job",
+		ErrRevoked:        "revoked",
 		ErrUnknownJob:     "unknown_job",
 		ErrScopeMismatch:  "scope",
 		errors.New("x"):   "unknown_job",
@@ -347,10 +386,11 @@ func TestReason(t *testing.T) {
 
 // TestReasonVocabularyIsClosed pins the foreman_auth_failures_total reason
 // label to the closed enum of observability.md §指标
-// (malformed|signature|expired|scope|unknown_job): a sixth value lands on a
-// label the design does not define and splits the counter off-contract.
+// (malformed|signature|expired|scope|unknown_job|revoked): a seventh value
+// lands on a label the design does not define and splits the counter
+// off-contract.
 func TestReasonVocabularyIsClosed(t *testing.T) {
-	want := []string{"malformed", "signature", "expired", "scope", "unknown_job"}
+	want := []string{"malformed", "signature", "expired", "scope", "unknown_job", "revoked"}
 	got := map[string]bool{}
 	for _, err := range []error{
 		ErrMalformedToken, ErrBadSignature, ErrExpired, ErrRevoked,
@@ -368,10 +408,10 @@ func TestReasonVocabularyIsClosed(t *testing.T) {
 	}
 }
 
-func TestRevokeIgnoresMalformedToken(t *testing.T) {
+func TestRevokeIgnoresEmptyDigest(t *testing.T) {
 	iss := newTestIssuer(time.Now(), fakeRegistry{}, fakeDone{})
-	iss.Revoke("not a token")
-	if _, err := iss.Verify("not a token", RequestScope{}); !errors.Is(err, ErrMalformedToken) {
-		t.Fatalf("err = %v, want ErrMalformedToken", err)
+	iss.Revoke("")
+	if len(iss.revocations.entries) != 0 {
+		t.Fatalf("entries = %d, want 0 (empty digest ignored)", len(iss.revocations.entries))
 	}
 }

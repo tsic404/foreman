@@ -302,8 +302,9 @@ func (p *PendingReports) Len() int {
 
 // Queued reports whether taskID still has an undelivered report: one whose
 // file exists, or one a failed write left staged. The scheduler gates the
-// object cleanup of a terminal entry on it, so the Job/Secret go only once
-// the report landed (contract §4).
+// verdict-time Job deletion of a terminal entry on it, so the Job goes only
+// once the report landed (contract §4) — the credential and the entry follow
+// their own drain window (ADR-017).
 //
 // A task id that cannot name a queue file is answered without touching the
 // filesystem: such a report is never a durable queue entry (Drain delivers

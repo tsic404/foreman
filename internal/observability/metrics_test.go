@@ -60,6 +60,8 @@ func TestMetricsCardinalityDiscipline(t *testing.T) {
 	m.WSConnect("job")
 	m.WSReconnect("job")
 	m.HeartbeatSuspect(1)
+	m.AuthFailure("revoked")
+	m.CredReclaimed("job_terminated", 12.5)
 
 	out := scrape(t, m)
 	for _, bad := range []string{"task_id=", "issue_id=", "job_name=", "node_name="} {
@@ -80,6 +82,10 @@ func TestMetricsCardinalityDiscipline(t *testing.T) {
 		`foreman_ws_connected{side="job"} 1`,
 		`foreman_ws_reconnects_total{side="job"} 1`,
 		`foreman_heartbeat_suspect 1`,
+		`foreman_auth_failures_total{reason="revoked"} 1`,
+		`foreman_cred_reclaim_total{reason="job_terminated"} 1`,
+		`foreman_cred_reclaim_total{reason="drain_timeout"} 0`,
+		`foreman_job_drain_seconds_count 1`,
 		`foreman_inflight_jobs 3`,
 		`foreman_task_claims_total 1`,
 	} {
