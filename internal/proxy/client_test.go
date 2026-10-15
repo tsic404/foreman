@@ -17,12 +17,14 @@ import (
 
 // recordedRequest captures one inbound call at the stub upstream.
 type recordedRequest struct {
-	Method      string
-	Path        string
-	EscapedPath string
-	RawQuery    string
-	Body        []byte
-	Header      http.Header
+	Method        string
+	Path          string
+	EscapedPath   string
+	RawQuery      string
+	Body          []byte
+	Header        http.Header
+	Host          string
+	ContentLength int64
 }
 
 // stubUpstream is the controllable fake server (protocol-stub spec).
@@ -44,7 +46,7 @@ func newStubUpstream(t *testing.T) (*httptest.Server, *stubUpstream) {
 			}
 		}
 		stub.mu.Lock()
-		stub.reqs = append(stub.reqs, recordedRequest{r.Method, r.URL.Path, r.URL.EscapedPath(), r.URL.RawQuery, body, r.Header.Clone()})
+		stub.reqs = append(stub.reqs, recordedRequest{r.Method, r.URL.Path, r.URL.EscapedPath(), r.URL.RawQuery, body, r.Header.Clone(), r.Host, r.ContentLength})
 		stub.mu.Unlock()
 		if h, ok := stub.routes[r.Method+" "+r.URL.Path]; ok {
 			h(w, r, body)
@@ -448,9 +450,59 @@ func TestForwardStartWithoutRuntimeIdentityIsVerbatim(t *testing.T) {
 	}
 }
 
+// s29ProbeHeader is the caller header set the S29 probes send: one entry per
+// field the contract rules on, multi-valued where order matters.
+func s29ProbeHeader(contentType string) http.Header {
+	return http.Header{
+		"Authorization": {"Bearer mat_tasktoken"},
+		"Content-Type":  {contentType},
+		"Accept":        {"application/vnd.multica+json"},
+		"User-Agent":    {"s29-probe/1.0"},
+		"X-Probe-Multi": {"a", "b"},
+	}
+}
+
+// multipartProbeBody is a byte-exact multipart/form-data body; the boundary
+// is only meaningful next to the matching Content-Type.
+func multipartProbeBody(boundary string) []byte {
+	return []byte("--" + boundary + "\r\nContent-Disposition: form-data; name=\"f\"; filename=\"p.txt\"\r\n" +
+		"Content-Type: text/plain\r\n\r\nhi\r\n--" + boundary + "--\r\n")
+}
+
+// singleCall returns the stub's only recorded call for the route.
+func singleCall(t *testing.T, stub *stubUpstream, method, path string) recordedRequest {
+	t.Helper()
+	calls := stub.calls(method, path)
+	if len(calls) != 1 {
+		t.Fatalf("upstream calls to %s = %d, want 1", path, len(calls))
+	}
+	return calls[0]
+}
+
+// upstreamFields is a received header set with the field the transport
+// generates for the forwarded body set aside: Content-Length belongs to the
+// proxy's own connection (§1.2 exclusion set), so the caller's set is
+// compared without it.
+func upstreamFields(h http.Header) http.Header {
+	out := make(http.Header, len(h))
+	for k, vv := range h {
+		if k == "Content-Length" {
+			continue
+		}
+		out[k] = append([]string(nil), vv...)
+	}
+	return out
+}
+
+// upstreamAuthority is the Host the stub upstream must see: the proxy's own
+// address is never forwarded (§1.2 exclusion set).
+func upstreamAuthority(srv *httptest.Server) string {
+	return srv.URL[len("http://"):]
+}
+
 func TestPassthroughIsVerbatim(t *testing.T) {
 	srv, stub := newStubUpstream(t)
-	stub.on("POST", "/api/issues/42/comments", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+	stub.on("POST", "/api/upload-file", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(201)
 		_, _ = w.Write([]byte(`{"id":7}`))
@@ -458,33 +510,432 @@ func TestPassthroughIsVerbatim(t *testing.T) {
 	var metrics fakeMetrics
 	c := NewClient(testConfig(srv.URL), "mdt_test", WithMetrics(&metrics))
 
-	code, resp, err := c.Passthrough(t.Context(), "POST", "/api/issues/42/comments", "b=2&a=1", []byte(`{"body":"hi"}`), "Bearer mat_tasktoken")
+	body := multipartProbeBody("----s29probe")
+	header := s29ProbeHeader("multipart/form-data; boundary=----s29probe")
+	code, respHeader, resp, err := c.Passthrough(t.Context(), "POST", "/api/upload-file", "b=2&a=1", header, body)
 	if err != nil || code != 201 {
 		t.Fatalf("Passthrough = %d, %v", code, err)
 	}
-	if string(resp) != `{"id":7}` {
-		t.Errorf("response = %s", resp)
+	if string(resp) != `{"id":7}` || respHeader.Get("Content-Type") != "application/json" {
+		t.Errorf("response = %v %s, want the upstream verdict as-is", respHeader, resp)
 	}
-	calls := stub.calls("POST", "/api/issues/42/comments")
-	if len(calls) != 1 {
-		t.Fatalf("calls = %d", len(calls))
+	got := singleCall(t, stub, "POST", "/api/upload-file")
+	// The upstream sees exactly the caller's set: no field picked out, none
+	// added (no client-library User-Agent/Accept-Encoding, no daemon identity
+	// headers), values and their order untouched.
+	if extra := upstreamFields(got.Header); len(extra) != len(header) {
+		t.Errorf("upstream fields = %v, want exactly %v", extra, header)
 	}
-	got := calls[0]
-	if got.Header.Get("Authorization") != "Bearer mat_tasktoken" {
-		t.Errorf("authorization rewritten: %q", got.Header.Get("Authorization"))
+	for field, want := range header {
+		if gotVals := got.Header.Values(field); !slices.Equal(gotVals, want) {
+			t.Errorf("upstream %s = %v, want %v", field, gotVals, want)
+		}
 	}
-	if got.Header.Get("X-Client-Capabilities") != "" {
-		t.Errorf("daemon identity headers must not be injected: %q", got.Header.Get("X-Client-Capabilities"))
+	if string(got.Body) != string(body) || got.ContentLength != int64(len(body)) {
+		t.Errorf("body = %d bytes (CL %d), want %d bytes", len(got.Body), got.ContentLength, len(body))
 	}
-	// The query is forwarded byte-verbatim (no decode/re-encode reorder).
-	if got.RawQuery != "b=2&a=1" || string(got.Body) != `{"body":"hi"}` {
-		t.Errorf("query/body not verbatim: %q %s", got.RawQuery, got.Body)
+	if got.RawQuery != "b=2&a=1" {
+		t.Errorf("query = %q, want b=2&a=1", got.RawQuery)
+	}
+	if got.Host != upstreamAuthority(srv) {
+		t.Errorf("upstream Host = %q, want the target authority %q", got.Host, upstreamAuthority(srv))
 	}
 	// The S29 forward is metered under the agent-api endpoint label.
 	metrics.mu.Lock()
 	defer metrics.mu.Unlock()
 	if len(metrics.forwards) != 1 || metrics.forwards[0] != EndpointAgentAPI {
 		t.Errorf("forward metric = %v, want [%q]", metrics.forwards, EndpointAgentAPI)
+	}
+}
+
+func TestForwardableHeaderAppliesExclusionSet(t *testing.T) {
+	in := http.Header{
+		"Accept":              {"application/json"},
+		"Authorization":       {"Bearer mat_x"},
+		"Connection":          {"X-Probe-Drop, keep-alive"},
+		"Content-Length":      {"4096"},
+		"Content-Type":        {`multipart/form-data; boundary=----s29probe`},
+		"Host":                {"foreman.foreman.svc.cluster.local:8080"},
+		"Keep-Alive":          {"timeout=5"},
+		"Proxy-Authorization": {"Basic zzz"},
+		"TE":                  {"trailers"},
+		"Trailer":             {"X-Probe-Trailer"},
+		"Transfer-Encoding":   {"chunked"},
+		"Upgrade":             {"h2c"},
+		"X-Probe-Drop":        {"nope"},
+		"X-Probe-Multi":       {"a", "b"},
+	}
+	want := http.Header{
+		"Accept":        {"application/json"},
+		"Authorization": {"Bearer mat_x"},
+		"Content-Type":  {`multipart/form-data; boundary=----s29probe`},
+		"X-Probe-Multi": {"a", "b"},
+	}
+	got := forwardableHeader(in)
+	if len(got) != len(want) {
+		t.Fatalf("forwardable = %v, want exactly %v", got, want)
+	}
+	for field, wantVals := range want {
+		if gotVals := got.Values(field); !slices.Equal(gotVals, wantVals) {
+			t.Errorf("%s = %v, want %v", field, gotVals, wantVals)
+		}
+	}
+	// The caller's set is not mutated on the way through.
+	if !slices.Equal(in["Connection"], []string{"X-Probe-Drop, keep-alive"}) || in["Host"] == nil {
+		t.Errorf("caller header set mutated: %v", in)
+	}
+}
+
+func TestForwardableHeaderCanonicalizesNames(t *testing.T) {
+	// Field-name case is not a fidelity item (§1.2 逐字段裁定): the copy
+	// writes canonical names, so net/http's own lookups (User-Agent, framing
+	// fields) see the same field the caller spelled differently.
+	for _, tt := range []struct{ name, caller string }{
+		{"upper", "User-Agent"},
+		{"lower", "user-agent"},
+		{"mixed", "uSeR-aGeNt"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			got := forwardableHeader(http.Header{
+				tt.caller:       {"probe/1.0"},
+				"content-type":  {"application/json"},
+				"x-probe-multi": {"a", "b"},
+			})
+			want := http.Header{
+				"User-Agent":    {"probe/1.0"},
+				"Content-Type":  {"application/json"},
+				"X-Probe-Multi": {"a", "b"},
+			}
+			if len(got) != len(want) {
+				t.Fatalf("forwardable = %v, want exactly %v", got, want)
+			}
+			for field, wantVals := range want {
+				if gotVals := got.Values(field); !slices.Equal(gotVals, wantVals) {
+					t.Errorf("%s = %v, want %v", field, gotVals, wantVals)
+				}
+			}
+		})
+	}
+	// Excluded fields are dropped however they are spelled.
+	got := forwardableHeader(http.Header{
+		"host":           {"caller.invalid"},
+		"content-length": {"999"},
+		"te":             {"trailers"},
+		"connection":     {"close"},
+	})
+	if len(got) != 0 {
+		t.Errorf("forwardable = %v, want the exclusion set dropped", got)
+	}
+}
+
+func TestPassthroughAddsNoClientDefaults(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stub.on("POST", "/api/daemon/tasks/whatever/status", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]string{"status": "running"})
+	})
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+
+	// A caller that sends no User-Agent and no Accept-Encoding gets exactly
+	// that upstream: the client library may not speak for it.
+	header := http.Header{"Authorization": {"Bearer mat_probe"}}
+	if _, _, _, err := c.Passthrough(t.Context(), "POST", "/api/daemon/tasks/whatever/status", "", header, multipartProbeBody("----s29probe")); err != nil {
+		t.Fatalf("Passthrough: %v", err)
+	}
+	got := singleCall(t, stub, "POST", "/api/daemon/tasks/whatever/status")
+	if got.Header.Get("User-Agent") != "" || got.Header.Get("Accept-Encoding") != "" {
+		t.Errorf("upstream saw invented fields: %v", got.Header)
+	}
+	if extra := upstreamFields(got.Header); len(extra) != 1 {
+		t.Errorf("upstream fields = %v, want only the Authorization the caller sent", extra)
+	}
+}
+
+func TestPassthroughKeepsCallerEncodingNegotiation(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stub.on("GET", "/api/issues/42", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]string{"id": "42"})
+	})
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+
+	header := http.Header{
+		"Authorization":    {"Bearer mat_x"},
+		"Accept-Encoding":  {"gzip"},
+		"User-Agent":       {"probe/1.0"},
+		"Cookie":           {"a=1", "b=2"},
+		"X-Client-Version": {"caller-supplied"},
+	}
+	if _, _, _, err := c.Passthrough(t.Context(), "GET", "/api/issues/42", "", header, nil); err != nil {
+		t.Fatalf("Passthrough: %v", err)
+	}
+	got := singleCall(t, stub, "GET", "/api/issues/42")
+	for field, want := range header {
+		if v := got.Header.Values(field); !slices.Equal(v, want) {
+			t.Errorf("upstream %s = %v, want %v", field, v, want)
+		}
+	}
+	// No Foreman-side identity fields ride along: the proxy neither adds its
+	// own X-Client-* set nor its daemon credential.
+	if caps := got.Header.Get("X-Client-Capabilities"); caps != "" {
+		t.Errorf("X-Client-Capabilities = %q, want it absent (the caller sent none)", caps)
+	}
+}
+
+func TestPassthroughKeepsUpstreamContentEncoding(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	gz := []byte{0x1f, 0x8b, 0x08, 0x00, 0xde, 0xad} // not valid gzip: bytes stay bytes
+	stub.on("GET", "/api/blob", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		w.Header().Set("Content-Encoding", "gzip")
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.WriteHeader(200)
+		_, _ = w.Write(gz)
+	})
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+
+	code, header, body, err := c.Passthrough(t.Context(), "GET", "/api/blob", "", http.Header{"Authorization": {"Bearer mat_x"}, "Accept-Encoding": {"gzip"}}, nil)
+	if err != nil || code != 200 {
+		t.Fatalf("Passthrough = %d, %v", code, err)
+	}
+	// The body is never decoded: the encoding field and the bytes it
+	// describes travel together (§1.2 逐字段裁定).
+	if v := header.Values("Content-Encoding"); !slices.Equal(v, []string{"gzip"}) {
+		t.Errorf("Content-Encoding = %v, want gzip verbatim", v)
+	}
+	if !slices.Equal(body, gz) {
+		t.Errorf("body = %v, want the upstream bytes untouched", body)
+	}
+}
+
+func TestPassthroughDropsExclusionSetOnTheWire(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stub.on("POST", "/api/issues/42/comments", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		w.WriteHeader(204)
+	})
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+
+	header := http.Header{
+		"Authorization": {"Bearer mat_x"},
+		"Connection":    {"X-Probe-Drop"},
+		"TE":            {"trailers"},
+		"Trailer":       {"X-Probe-Trailer"},
+		"X-Probe-Drop":  {"nope"},
+		"X-Probe-Multi": {"a", "b"},
+	}
+	if _, _, _, err := c.Passthrough(t.Context(), "POST", "/api/issues/42/comments", "", header, []byte(`{"body":"hi"}`)); err != nil {
+		t.Fatalf("Passthrough: %v", err)
+	}
+	got := singleCall(t, stub, "POST", "/api/issues/42/comments")
+	for _, field := range []string{"Connection", "TE", "Trailer", "X-Probe-Drop"} {
+		if v := got.Header.Values(field); len(v) != 0 {
+			t.Errorf("excluded field %s reached the upstream: %v", field, v)
+		}
+	}
+	if v := got.Header.Values("X-Probe-Multi"); !slices.Equal(v, []string{"a", "b"}) {
+		t.Errorf("X-Probe-Multi = %v, want [a b]", v)
+	}
+	if got.Host != upstreamAuthority(srv) {
+		t.Errorf("upstream Host = %q, want %q", got.Host, upstreamAuthority(srv))
+	}
+}
+
+func TestPassthroughKeepsResponseHeadersVerbatim(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stub.on("GET", "/api/attachments/7/download", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		h := w.Header()
+		h.Set("Content-Type", "application/octet-stream")
+		h.Set("Content-Disposition", "attachment; filename=probe.bin")
+		h.Set("Cache-Control", "no-store")
+		h.Set("ETag", `"v1"`)
+		h.Add("X-Probe-Resp", "a")
+		h.Add("X-Probe-Resp", "b")
+		h.Add("Set-Cookie", "a=1")
+		h.Add("Set-Cookie", "b=2")
+		h.Set("Connection", "close")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte{0x00, 0x01, 0xff, 0xfe})
+	})
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+
+	code, header, body, err := c.Passthrough(t.Context(), "GET", "/api/attachments/7/download", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil)
+	if err != nil || code != 200 {
+		t.Fatalf("Passthrough = %d, %v", code, err)
+	}
+	for field, want := range map[string][]string{
+		"Content-Type":        {"application/octet-stream"},
+		"Content-Disposition": {"attachment; filename=probe.bin"},
+		"Cache-Control":       {"no-store"},
+		"ETag":                {`"v1"`},
+		"X-Probe-Resp":        {"a", "b"},
+		"Set-Cookie":          {"a=1", "b=2"},
+	} {
+		if got := header.Values(field); !slices.Equal(got, want) {
+			t.Errorf("%s = %v, want %v", field, got, want)
+		}
+	}
+	for _, field := range []string{"Connection", "Content-Length", "Transfer-Encoding", "Trailer"} {
+		if v := header.Values(field); len(v) != 0 {
+			t.Errorf("excluded response field %s survived: %v", field, v)
+		}
+	}
+	if !slices.Equal(body, []byte{0x00, 0x01, 0xff, 0xfe}) {
+		t.Errorf("response body = %v, want the upstream bytes", body)
+	}
+}
+
+// The exclusion set's transport half: fields the proxy's own connection
+// decides (framing, trailers, a Date it did not receive) never reach the
+// caller.
+func TestPassthroughReproducesNoFramingOrTrailers(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stub.on("GET", "/api/plain", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		w.Header()["Date"] = nil // the upstream sends no Date
+		w.Header().Set("Trailer", "X-Probe-Trailer")
+		w.Header().Set("X-Probe-Note", "late")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("plain"))
+		w.Header().Set("X-Probe-Trailer", "trailer-value")
+	})
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+
+	code, header, body, err := c.Passthrough(t.Context(), "GET", "/api/plain", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil)
+	if err != nil || code != 200 || string(body) != "plain" {
+		t.Fatalf("Passthrough = %d %q, %v", code, body, err)
+	}
+	if v := header.Values("Trailer"); len(v) != 0 {
+		t.Errorf("Trailer field survived: %v", v)
+	}
+	if v := header.Values("X-Probe-Trailer"); len(v) != 0 {
+		t.Errorf("trailer value reproduced: %v", v)
+	}
+	if v := header.Values("Date"); len(v) != 0 {
+		t.Errorf("Date = %v, want none: the upstream sent none and the proxy invents none", v)
+	}
+	// An ordinary end-to-end field set before the status line still travels.
+	if v := header.Values("X-Probe-Note"); !slices.Equal(v, []string{"late"}) {
+		t.Errorf("X-Probe-Note = %v, want it forwarded", v)
+	}
+}
+
+func TestPassthroughDoesNotFollowRedirects(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stub.on("GET", "/api/moved", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		w.Header().Set("Location", "https://elsewhere.example/api/moved")
+		w.WriteHeader(302)
+	})
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+
+	code, header, _, err := c.Passthrough(t.Context(), "GET", "/api/moved", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil)
+	if err != nil || code != 302 {
+		t.Fatalf("Passthrough = %d, %v; want the upstream 302 handed to the caller", code, err)
+	}
+	// Location travels verbatim; the caller decides whether to follow.
+	if got := header.Get("Location"); got != "https://elsewhere.example/api/moved" {
+		t.Errorf("Location = %q, want it verbatim", got)
+	}
+}
+
+func TestPassthroughNoContentTypeFallback(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stub.on("POST", "/api/issues/42/comments", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		w.WriteHeader(201)
+	})
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+
+	// A caller that declares no Content-Type gets none upstream: a fallback
+	// would put the proxied request on a different upstream branch than the
+	// same direct request (§1.2 逐字段裁定).
+	if _, _, _, err := c.Passthrough(t.Context(), "POST", "/api/issues/42/comments", "", http.Header{"Authorization": {"Bearer mat_x"}}, []byte(`{"body":"hi"}`)); err != nil {
+		t.Fatalf("Passthrough: %v", err)
+	}
+	got := singleCall(t, stub, "POST", "/api/issues/42/comments")
+	if got.Header.Get("Content-Type") != "" {
+		t.Errorf("Content-Type = %q, want it absent", got.Header.Get("Content-Type"))
+	}
+	if string(got.Body) != `{"body":"hi"}` {
+		t.Errorf("body = %s", got.Body)
+	}
+}
+
+func TestPassthroughMetricCarriesCallerVisibleCode(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stub.on("GET", "/api/boom", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 500, map[string]string{"error": "boom"})
+	})
+	stub.on("GET", "/api/rejected", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 400, map[string]string{"error": "bad"})
+	})
+	var metrics fakeMetrics
+	c := NewClient(testConfig(srv.URL), "mdt_test", WithMetrics(&metrics))
+
+	if code, _, _, _ := c.Passthrough(t.Context(), "GET", "/api/boom", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil); code != 500 {
+		t.Fatalf("upstream 500 = %d", code)
+	}
+	if code, _, _, _ := c.Passthrough(t.Context(), "GET", "/api/rejected", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil); code != 400 {
+		t.Fatalf("upstream 400 = %d", code)
+	}
+	// An unreachable upstream is the third shape: the caller gets 502 and so
+	// does the metric, never a zero.
+	down := NewClient(testConfig("http://127.0.0.1:9"), "mdt_test", WithMetrics(&metrics))
+	if _, _, _, err := down.Passthrough(t.Context(), "GET", "/api/boom", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil); err == nil {
+		t.Fatal("unreachable upstream must report an error")
+	}
+	metrics.mu.Lock()
+	got := append([]int(nil), metrics.codes...)
+	metrics.mu.Unlock()
+	// Upstream 5xx converges to the 502 the caller sees; the upstream's own
+	// code is not the label (observability.md).
+	if !slices.Equal(got, []int{502, 400, 502}) {
+		t.Errorf("metric codes = %v, want [502 400 502]", got)
+	}
+}
+
+// A body the upstream never finishes (truncated/dropped stream) is a
+// transport failure: the caller gets 502, so the agent-api metric must say
+// 502 rather than the upstream's status line.
+func TestPassthroughCountsTruncatedBodyAs502(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		// Promise 64 bytes, deliver 5, then drop the connection.
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 64\r\n\r\nshort")
+		_ = buf.Flush()
+		_ = conn.Close()
+	}))
+	t.Cleanup(srv.Close)
+
+	var metrics fakeMetrics
+	c := NewClient(testConfig(srv.URL), "mdt_test", WithMetrics(&metrics))
+	if _, _, _, err := c.Passthrough(t.Context(), "GET", "/api/truncated", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil); err == nil {
+		t.Fatal("a truncated upstream body must surface as an error")
+	}
+	metrics.mu.Lock()
+	defer metrics.mu.Unlock()
+	if !slices.Equal(metrics.codes, []int{http.StatusBadGateway}) {
+		t.Errorf("metric codes = %v, want [502] (the code the caller sees)", metrics.codes)
+	}
+}
+
+// A DefaultTransport replaced by a foreign RoundTripper must not turn into a
+// startup panic, and the fallback keeps the connection defaults this path
+// relies on.
+func TestPassthroughTransportFallsBackOnForeignDefault(t *testing.T) {
+	saved := http.DefaultTransport
+	http.DefaultTransport = roundTripperFunc(func(*http.Request) (*http.Response, error) {
+		return nil, errors.New("foreign default transport")
+	})
+	t.Cleanup(func() { http.DefaultTransport = saved })
+
+	tr, ok := passthroughTransport().(*http.Transport)
+	if !ok {
+		t.Fatalf("passthroughTransport = %T, want *http.Transport", passthroughTransport())
+	}
+	if !tr.DisableCompression {
+		t.Error("the fallback must not negotiate compression")
+	}
+	if tr.Proxy == nil || !tr.ForceAttemptHTTP2 || tr.DialContext == nil {
+		t.Errorf("fallback lost the defaults: proxy=%v http2=%v dial=%v", tr.Proxy != nil, tr.ForceAttemptHTTP2, tr.DialContext != nil)
 	}
 }
 
@@ -497,7 +948,7 @@ func TestPassthroughKeepsEscapedPathSegments(t *testing.T) {
 	})
 	c := NewClient(testConfig(srv.URL), "mdt_test")
 
-	code, _, err := c.Passthrough(t.Context(), "GET", "/api/issues/a%2Fb", "", nil, "Bearer mat_tasktoken")
+	code, _, _, err := c.Passthrough(t.Context(), "GET", "/api/issues/a%2Fb", "", http.Header{"Authorization": {"Bearer mat_tasktoken"}}, nil)
 	if err != nil || code != 200 {
 		t.Fatalf("Passthrough = %d, %v", code, err)
 	}
@@ -713,16 +1164,18 @@ func TestGCCheckForwardedVerbatim(t *testing.T) {
 type fakeMetrics struct {
 	mu          sync.Mutex
 	forwards    []string
+	codes       []int
 	claimErrors []string
 	authFails   []string
 	wsConnected map[string]int
 	wsReconnect []string
 }
 
-func (m *fakeMetrics) Forward(endpoint string, _ int, _ time.Duration) {
+func (m *fakeMetrics) Forward(endpoint string, code int, _ time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.forwards = append(m.forwards, endpoint)
+	m.codes = append(m.codes, code)
 }
 
 func (m *fakeMetrics) ClaimError(code string) {
@@ -780,3 +1233,9 @@ func (m *fakeMetrics) reconnectCount(side string) int {
 	}
 	return n
 }
+
+// roundTripperFunc adapts a function to http.RoundTripper (test seam for a
+// replaced http.DefaultTransport).
+type roundTripperFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }

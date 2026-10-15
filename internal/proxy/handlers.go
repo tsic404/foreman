@@ -437,22 +437,40 @@ func (s *FakeServer) handleS23(w http.ResponseWriter, r *http.Request) {
 // ---- S29 passthrough ----
 
 // handlePassthrough forwards any non-fmj_ /api/* call to the real server
-// verbatim (§1.2 rule 2): method, raw path, raw query, body and
-// Authorization unchanged. Upstream 5xx and transport failures map to 502;
-// everything else returns verbatim.
+// verbatim (§1.2 rule 2 + ADR-020): the caller's whole header set and body
+// go out as given, the upstream status, header set and body come back as
+// given. This call site neither picks nor adds fields — the exclusion set
+// lives in Passthrough alone. Upstream 5xx and transport failures map to 502.
 func (s *FakeServer) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	body, ok := readBody(w, r)
 	if !ok {
 		return
 	}
-	code, resp, err := s.client.Passthrough(r.Context(), r.Method, r.URL.EscapedPath(), r.URL.RawQuery, body, r.Header.Get("Authorization"))
-	if err != nil {
+	code, header, resp, err := s.client.Passthrough(r.Context(), r.Method, r.URL.EscapedPath(), r.URL.RawQuery, r.Header, body)
+	if err != nil || code >= http.StatusInternalServerError {
 		writeError(w, http.StatusBadGateway, "upstream unavailable")
 		return
 	}
-	if code >= 500 {
-		writeError(w, http.StatusBadGateway, "upstream unavailable")
-		return
+	writeUpstream(w, code, header, resp)
+}
+
+// writeUpstream replays a passthrough response verbatim (§1.2 S29): the
+// upstream's fields, then its status, then its body bytes. It is not the
+// local-response outlet — writeRaw stamps Content-Type: application/json on
+// the responses Foreman synthesizes, which would rewrite this one. Nil
+// values suppress the headers net/http would otherwise add by itself
+// (Content-Type sniffing, Date), so the caller sees exactly what came back.
+func writeUpstream(w http.ResponseWriter, code int, header http.Header, body []byte) {
+	dst := w.Header()
+	for k, vv := range header {
+		dst[k] = append([]string(nil), vv...)
 	}
-	writeRaw(w, code, resp)
+	if _, ok := dst["Content-Type"]; !ok {
+		dst["Content-Type"] = nil
+	}
+	if _, ok := dst["Date"]; !ok {
+		dst["Date"] = nil
+	}
+	w.WriteHeader(code)
+	_, _ = w.Write(body)
 }
