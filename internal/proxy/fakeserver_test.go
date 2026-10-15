@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -890,6 +891,188 @@ func TestS29UpstreamFailureMaps502(t *testing.T) {
 	code, body := rig.call(t, "GET", "/api/issues/1", "mat_tasktoken", nil)
 	if code != 502 || !bytes.Contains(body, []byte("upstream unavailable")) {
 		t.Fatalf("S29 upstream 5xx = %d %s, want 502", code, body)
+	}
+}
+
+// stubAuthority is the authority the upstream must see as Host: the target
+// server's address, never the Foreman address the caller dialed (§1.2
+// exclusion set).
+func (r *testRig) stubAuthority() string {
+	return strings.TrimPrefix(r.client.cfg.ServerURL, "http://")
+}
+
+// callWithHeaders performs one J→F request with an explicit caller header set.
+// The test client mimics a bare caller: no compression negotiation and no
+// User-Agent of its own, so only the caller's set reaches the fake server.
+func (r *testRig) callWithHeaders(t *testing.T, method, path string, header http.Header, body []byte) (int, http.Header, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(method, r.server.URL+path, bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	for k, vv := range header {
+		for _, v := range vv {
+			req.Header.Add(k, v)
+		}
+	}
+	if _, ok := req.Header["User-Agent"]; !ok {
+		req.Header["User-Agent"] = nil
+	}
+	resp, err := bareCaller.Do(req)
+	if err != nil {
+		t.Fatalf("%s %s: %v", method, path, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	return resp.StatusCode, resp.Header, raw
+}
+
+// bareCaller is the J side of the probes: a client that adds nothing of its own.
+var bareCaller = &http.Client{Transport: &http.Transport{DisableCompression: true}}
+
+// The reported defect: a multipart upload through rule 2 (S29) must reach the
+// upstream with the caller's own content type and bytes — a fixed
+// application/json made every multipart call fail upstream.
+func TestPassthroughKeepsMultipartContentType(t *testing.T) {
+	rig := newTestRig(t)
+	const upstreamErr = `{"error":"task_id upload requires a chat task"}`
+	rig.stub.on("POST", "/api/upload-file", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(400)
+		_, _ = w.Write([]byte(upstreamErr))
+	})
+
+	boundary := "----s29probe"
+	body := multipartProbeBody(boundary)
+	contentType := "multipart/form-data; boundary=" + boundary
+	code, respHeader, raw := rig.callWithHeaders(t, "POST", "/api/upload-file", http.Header{
+		"Authorization": {"Bearer mat_tasktoken"},
+		"Content-Type":  {contentType},
+	}, body)
+
+	// The upstream sees the caller's multipart form byte-for-byte.
+	got := singleCall(t, rig.stub, "POST", "/api/upload-file")
+	if v := got.Header.Values("Content-Type"); !slices.Equal(v, []string{contentType}) {
+		t.Errorf("content type to upstream = %v, want %v", v, contentType)
+	}
+	if string(got.Body) != string(body) || got.ContentLength != int64(len(body)) {
+		t.Errorf("body to upstream = %d bytes (CL %d), want %d bytes", len(got.Body), got.ContentLength, len(body))
+	}
+	if extra := upstreamFields(got.Header); len(extra) != 2 {
+		t.Errorf("upstream fields = %v, want exactly the caller's two fields", extra)
+	}
+	// And the upstream verdict comes back to the caller unchanged.
+	if code != 400 || string(raw) != upstreamErr {
+		t.Errorf("caller got %d %s, want 400 %s", code, raw, upstreamErr)
+	}
+	if v := respHeader.Values("Content-Type"); !slices.Equal(v, []string{"application/json"}) {
+		t.Errorf("caller content type = %v, want the upstream's own", v)
+	}
+}
+
+func TestPassthroughReplaysUpstreamResponseHeaders(t *testing.T) {
+	rig := newTestRig(t)
+	rig.stub.on("GET", "/api/attachments/7/download", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		h := w.Header()
+		h.Set("Content-Type", "application/octet-stream")
+		h.Set("Content-Disposition", "attachment; filename=probe.bin")
+		h.Set("ETag", `"v1"`)
+		h.Add("X-Probe-Resp", "a")
+		h.Add("X-Probe-Resp", "b")
+		h.Add("Set-Cookie", "a=1")
+		h.Add("Set-Cookie", "b=2")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte{0x00, 0xff})
+	})
+	rig.stub.on("GET", "/api/no-ctype", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		// The stub must not add one either, or the assertion below would
+		// measure the stub's own sniffing instead of the proxy's.
+		w.Header()["Content-Type"] = nil
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("plain bytes"))
+	})
+	rig.stub.on("GET", "/api/no-date", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		// Likewise for Date: the stub sends none, so Foreman's own server must
+		// not add one on the way back to the caller.
+		w.Header()["Date"] = nil
+		w.Header().Set("X-Probe-Note", "no-date")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("no date"))
+	})
+
+	code, header, body := rig.callWithHeaders(t, "GET", "/api/attachments/7/download",
+		http.Header{"Authorization": {"Bearer mat_tasktoken"}}, nil)
+	if code != 200 || !slices.Equal(body, []byte{0x00, 0xff}) {
+		t.Fatalf("download = %d %v, want the upstream bytes", code, body)
+	}
+	for field, want := range map[string][]string{
+		"Content-Type":        {"application/octet-stream"},
+		"Content-Disposition": {"attachment; filename=probe.bin"},
+		"ETag":                {`"v1"`},
+		"X-Probe-Resp":        {"a", "b"},
+		"Set-Cookie":          {"a=1", "b=2"},
+	} {
+		if got := header.Values(field); !slices.Equal(got, want) {
+			t.Errorf("caller %s = %v, want %v", field, got, want)
+		}
+	}
+	// Upstream gave no Content-Type on this path: the caller sees none either
+	// (the local-response outlet would have stamped application/json, and the
+	// server's sniffing would have invented one).
+	_, header, _ = rig.callWithHeaders(t, "GET", "/api/no-ctype",
+		http.Header{"Authorization": {"Bearer mat_tasktoken"}}, nil)
+	if v := header.Values("Content-Type"); len(v) != 0 {
+		t.Errorf("caller Content-Type = %v, want it absent", v)
+	}
+	// Same for a Date the upstream never sent: net/http adds one unless the
+	// field is present-but-nil, so deleting that line turns this red.
+	_, header, _ = rig.callWithHeaders(t, "GET", "/api/no-date",
+		http.Header{"Authorization": {"Bearer mat_tasktoken"}}, nil)
+	if v := header.Values("X-Probe-Note"); !slices.Equal(v, []string{"no-date"}) {
+		t.Errorf("caller X-Probe-Note = %v, want the upstream's field", v)
+	}
+	if v := header.Values("Date"); len(v) != 0 {
+		t.Errorf("caller Date = %v, want none: the upstream sent none and Foreman invents none", v)
+	}
+}
+
+func TestPassthroughExclusionSetThroughFakeServer(t *testing.T) {
+	rig := newTestRig(t)
+	rig.stub.on("POST", "/api/daemon/tasks/whatever/status", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]string{"status": "running"})
+	})
+
+	code, _, _ := rig.callWithHeaders(t, "POST", "/api/daemon/tasks/whatever/status", http.Header{
+		"Authorization": {"Bearer mat_tasktoken"},
+		"Accept":        {"application/vnd.multica+json"},
+		"Connection":    {"X-Probe-Drop"},
+		"TE":            {"trailers"},
+		"X-Probe-Drop":  {"nope"},
+		"X-Probe-Multi": {"a", "b"},
+	}, []byte("probe"))
+	if code != 200 {
+		t.Fatalf("passthrough = %d", code)
+	}
+	got := singleCall(t, rig.stub, "POST", "/api/daemon/tasks/whatever/status")
+	want := map[string][]string{
+		"Authorization": {"Bearer mat_tasktoken"},
+		"Accept":        {"application/vnd.multica+json"},
+		"X-Probe-Multi": {"a", "b"},
+	}
+	if extra := upstreamFields(got.Header); len(extra) != len(want) {
+		t.Errorf("upstream fields = %v, want exactly %v", extra, want)
+	}
+	for field, wantVals := range want {
+		if v := got.Header.Values(field); !slices.Equal(v, wantVals) {
+			t.Errorf("upstream %s = %v, want %v", field, v, wantVals)
+		}
+	}
+	// Host is the target authority, not the Foreman address the caller dialed.
+	if got.Host != rig.stubAuthority() {
+		t.Errorf("upstream Host = %q, want %q", got.Host, rig.stubAuthority())
 	}
 }
 

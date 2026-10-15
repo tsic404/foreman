@@ -8,8 +8,11 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/textproto"
 	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -24,6 +27,7 @@ type Client struct {
 	token   string
 	ctrl    *http.Client // 30s control plane (§4)
 	lease   *http.Client // 10s prepare-lease (§4)
+	pass    *http.Client // S29: same budget, compression negotiation off
 	metrics Metrics
 	log     *slog.Logger
 
@@ -66,10 +70,19 @@ func WithTerminalRetryWaits(waits []time.Duration) Option {
 // (mdt_/mul_, auth.LoadServerToken); it is never forwarded to Jobs (F3).
 func NewClient(cfg Config, token string, opts ...Option) *Client {
 	c := &Client{
-		cfg:     cfg,
-		token:   token,
-		ctrl:    &http.Client{Timeout: controlTimeout},
-		lease:   &http.Client{Timeout: leaseTimeout},
+		cfg:   cfg,
+		token: token,
+		ctrl:  &http.Client{Timeout: controlTimeout},
+		lease: &http.Client{Timeout: leaseTimeout},
+		pass: &http.Client{
+			Timeout:   controlTimeout,
+			Transport: passthroughTransport(),
+			// A 3xx is the upstream's answer to hand back verbatim: the caller
+			// decides whether to follow it (proxy.md §S29 已知边界).
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 		metrics: noopMetrics{},
 		log:     slog.Default().With("component", "proxy-client"),
 
@@ -462,38 +475,125 @@ func (c *Client) forwardOnce(ctx context.Context, ep scheduler.Endpoint, path st
 
 // ---- S29 passthrough ----
 
+// exclusionFields is the §1.2 exclusion set: the RFC 7230 §6.1 hop-by-hop
+// fields, plus the two the proxy generates for its own connection and body
+// (the target authority as Host, the forwarded body's real length as
+// Content-Length). Every other field travels as the caller gave it.
+var exclusionFields = map[string]bool{
+	"Connection":          true,
+	"Keep-Alive":          true,
+	"Proxy-Authenticate":  true,
+	"Proxy-Authorization": true,
+	"Te":                  true, // TE (§6.1)
+	"Trailer":             true,
+	"Transfer-Encoding":   true,
+	"Upgrade":             true,
+	"Host":                true,
+	"Content-Length":      true,
+}
+
+// forwardableHeader copies a header set minus the §1.2 exclusion set — the
+// fields above plus whatever a Connection value names. Values keep their
+// order and are never merged or dropped beyond that set; field names are
+// written in canonical form (their case is not a fidelity item). This is the
+// single place the exclusions apply.
+func forwardableHeader(h http.Header) http.Header {
+	var named map[string]bool // built only when a Connection value names fields
+	for _, v := range h.Values("Connection") {
+		for _, f := range strings.Split(v, ",") {
+			if f = textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(f)); f != "" {
+				if named == nil {
+					named = map[string]bool{}
+				}
+				named[f] = true
+			}
+		}
+	}
+	out := make(http.Header, len(h))
+	for k, vv := range h {
+		ck := textproto.CanonicalMIMEHeaderKey(k)
+		if exclusionFields[ck] || named[ck] {
+			continue
+		}
+		// A set carrying the same field under two spellings keeps every
+		// value, in arrival order (the spelling itself carries no meaning).
+		out[ck] = append(out[ck], vv...)
+	}
+	return out
+}
+
+// callerVisible is the status the caller of S29 ends up seeing: upstream
+// 5xx converges to 502 (§1.2 失败语义), which is also the code the
+// agent-api metric carries (observability.md).
+func callerVisible(upstream int) int {
+	if upstream >= http.StatusInternalServerError {
+		return http.StatusBadGateway
+	}
+	return upstream
+}
+
+// passthroughTransport is the §1.2 transport for S29: compression
+// negotiation is off, so no Accept-Encoding is invented for a caller that
+// sent none and no upstream-encoded body is transparently decoded. A
+// DefaultTransport that is not an *http.Transport falls back to the same
+// connection defaults instead of panicking at startup over a mutable global.
+func passthroughTransport() http.RoundTripper {
+	base, ok := http.DefaultTransport.(*http.Transport)
+	if !ok {
+		base = &http.Transport{
+			Proxy:                 http.ProxyFromEnvironment,
+			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+			ForceAttemptHTTP2:     true,
+			MaxIdleConns:          100,
+			IdleConnTimeout:       90 * time.Second,
+			TLSHandshakeTimeout:   10 * time.Second,
+			ExpectContinueTimeout: time.Second,
+		}
+	}
+	t := base.Clone()
+	t.DisableCompression = true
+	return t
+}
+
 // Passthrough forwards an agent-API call to the real server verbatim
-// (§1.2 rule 2): method, raw path (EscapedPath, keeping %2F-style
-// segments), raw query (no decode/re-encode), body and Authorization
-// unchanged; Foreman never injects its own credential. The response is
-// returned as-is; mapping upstream 5xx/network failures to 502 is the
-// caller's job.
-func (c *Client) Passthrough(ctx context.Context, method, rawPath, rawQuery string, body []byte, authHeader string) (int, []byte, error) {
+// (§1.2 rule 2 + ADR-020): method, raw path (EscapedPath, keeping %2F-style
+// segments), raw query (no decode/re-encode), the caller's whole header set
+// and body go out as given; the upstream status, whole header set and body
+// come back as given. The exclusion set is applied here, once;
+// application/json is not a fallback and Foreman's own fields never appear.
+func (c *Client) Passthrough(ctx context.Context, method, rawPath, rawQuery string, header http.Header, body []byte) (int, http.Header, []byte, error) {
 	u := c.cfg.ServerURL + rawPath
 	if rawQuery != "" {
 		u += "?" + rawQuery
 	}
 	req, err := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(body))
 	if err != nil {
-		return 0, nil, err
+		return 0, nil, nil, err
 	}
-	req.Header.Set("Authorization", authHeader)
-	if len(body) > 0 {
-		req.Header.Set("Content-Type", "application/json")
+	req.Header = forwardableHeader(header)
+	if _, ok := req.Header["User-Agent"]; !ok {
+		// Present-but-empty suppresses the client library's default value:
+		// net/http only writes a User-Agent the request was given. The copy
+		// above writes canonical names, so the lookup is exact.
+		req.Header["User-Agent"] = nil
 	}
 	start := time.Now()
-	resp, err := c.ctrl.Do(req)
+	resp, err := c.pass.Do(req)
 	if err != nil {
-		c.metrics.Forward(EndpointAgentAPI, 0, time.Since(start))
-		return 0, nil, err
+		c.metrics.Forward(EndpointAgentAPI, http.StatusBadGateway, time.Since(start))
+		return 0, nil, nil, err
 	}
 	defer resp.Body.Close()
 	data, err := io.ReadAll(resp.Body)
-	c.metrics.Forward(EndpointAgentAPI, resp.StatusCode, time.Since(start))
 	if err != nil {
-		return 0, nil, err
+		// A truncated or dropped body is a transport failure: the caller gets
+		// 502, so the agent-api metric records 502 too (observability.md:
+		// code = the status returned to the caller).
+		c.metrics.Forward(EndpointAgentAPI, http.StatusBadGateway, time.Since(start))
+		return 0, nil, nil, err
 	}
-	return resp.StatusCode, data, nil
+	c.metrics.Forward(EndpointAgentAPI, callerVisible(resp.StatusCode), time.Since(start))
+	return resp.StatusCode, forwardableHeader(resp.Header), data, nil
 }
 
 // ---- C13 status / S20 gc-check ----
