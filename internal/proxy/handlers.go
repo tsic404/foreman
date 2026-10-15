@@ -320,6 +320,9 @@ func (s *FakeServer) reportHandler(ep scheduler.Endpoint) http.HandlerFunc {
 		if !ok {
 			return
 		}
+		if learnsSession(ep) {
+			s.learnSession(e, body)
+		}
 		code, resp, err := s.sched.OnReport(r.Context(), ep, e, body)
 		if err != nil {
 			s.log.Error("report forward failed",
@@ -333,6 +336,35 @@ func (s *FakeServer) reportHandler(ep scheduler.Endpoint) http.HandlerFunc {
 		}
 		writeRaw(w, code, resp)
 	}
+}
+
+// learnsSession reports whether ep's body is a learning face of the session
+// index (ADR-015): the terminal reports S13/S14, whose session_id is the id
+// the server later hands back as prior_session_id. S15 carries no session id,
+// and S16 is provider-dependent (a pi-family daemon never pins a session), so
+// neither may teach the index.
+func learnsSession(ep scheduler.Endpoint) bool {
+	return ep == scheduler.EPComplete || ep == scheduler.EPFail
+}
+
+// learnSession records sessionKey(session_id) → the reporting task's node,
+// before the report is forwarded: the learning decision does not depend on
+// the forward result, because a failed forward is retried from the pending
+// queue rather than dropped. A body without a session id, or a task whose pod
+// placement was never observed, teaches nothing — the index holds no key that
+// could not hit.
+func (s *FakeServer) learnSession(e registry.TaskEntry, body []byte) {
+	if e.NodeName == "" {
+		return
+	}
+	var report struct {
+		SessionID string `json:"session_id"`
+	}
+	// Only session_id is read; a body that is not an object simply has none.
+	if err := json.Unmarshal(body, &report); err != nil {
+		return
+	}
+	s.reg.LearnSession(registry.SessionKey(report.SessionID), e.NodeName)
 }
 
 // ---- S18 recover-orphans ----

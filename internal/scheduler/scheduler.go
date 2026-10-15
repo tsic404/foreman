@@ -102,6 +102,9 @@ type claimHead struct {
 	AutopilotRunID  string `json:"autopilot_run_id"`
 	ChatSessionID   string `json:"chat_session_id"`
 	WorkspaceID     string `json:"workspace_id"`
+	// PriorSessionID locates the session this task resumes; it is the soft
+	// affinity key source and belongs to no trigger context (ADR-015).
+	PriorSessionID string `json:"prior_session_id"`
 }
 
 // keyedMutex serializes the per-task state transitions: two concurrent
@@ -395,6 +398,9 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		BootDeadline:    now.Add(s.cfg.JobBootTimeout),
 		Payload:         append(json.RawMessage(nil), task...),
 		PayloadVersion:  1,
+		// Memory-only: the session key of the Built Job's affinity item
+		// (ADR-015) — never annotated, never projected.
+		PriorSessionID: head.PriorSessionID,
 	}
 	if err := s.reg.Put(e); err != nil {
 		return fmt.Errorf("register task %s: %w", e.TaskID, err)
@@ -1500,6 +1506,7 @@ func jobbuilderEntry(e registry.TaskEntry) jobbuilder.TaskEntry {
 		JobRuntimeID:    e.JobRuntimeID,
 		ClaimedAt:       e.ClaimedAt,
 		Attempt:         e.Attempt,
+		PriorSessionID:  e.PriorSessionID,
 	}
 }
 

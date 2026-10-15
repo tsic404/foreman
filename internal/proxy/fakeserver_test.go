@@ -841,6 +841,78 @@ func TestS16SessionReturns204(t *testing.T) {
 	}
 }
 
+// TestTerminalReportLearnsSessionNode (AC-25 学习面, ADR-015): the terminal
+// reports S13/S14 teach the session index — their session_id, normalized by
+// sessionKey, recorded against the node the pod watch observed for that task.
+// Everything else that reaches Foreman carries no learning: S16 is not a face
+// (a pi-family daemon never pins a session), a task whose placement was never
+// observed has no node to record, and the learning is a decision of its own —
+// a report whose forward fails is still learned, because the pending queue
+// retries the report rather than losing it.
+func TestTerminalReportLearnsSessionNode(t *testing.T) {
+	rig := newTestRig(t)
+
+	rig.claimTask(t, "t-learn")
+	rig.reg.SetNode("t-learn", "company-02")
+	rig.stub.on("POST", "/api/daemon/tasks/t-learn/complete", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]string{"status": "completed"})
+	})
+	code, body := rig.call(t, "POST", "/api/daemon/tasks/t-learn/complete", rig.token(t, "t-learn"),
+		[]byte(`{"result":"done","session_id":"/state/home/.multica/pi-sessions/sess-7.jsonl"}`))
+	if code != 200 {
+		t.Fatalf("S13 = %d: %s", code, body)
+	}
+	if got := rig.reg.LastNodeForSession("sess-7"); got != "company-02" {
+		t.Fatalf("learned node = %q, want company-02", got)
+	}
+	// The key is the session, never the issue the task was dispatched from.
+	if got := rig.reg.LastNodeForSession("issue-1"); got != "" {
+		t.Fatalf("issue key learned: %q", got)
+	}
+
+	// S16 carries a session id too, but it must not teach the index.
+	rig.claimTask(t, "t-pin")
+	rig.reg.SetNode("t-pin", "company-03")
+	rig.stub.on("POST", "/api/daemon/tasks/t-pin/session", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		w.WriteHeader(204)
+	})
+	if code, _ := rig.call(t, "POST", "/api/daemon/tasks/t-pin/session", rig.token(t, "t-pin"),
+		[]byte(`{"session_id":"/state/home/.multica/pi-sessions/sess-8.jsonl"}`)); code != 204 {
+		t.Fatalf("S16 = %d, want 204", code)
+	}
+	if got := rig.reg.LastNodeForSession("sess-8"); got != "" {
+		t.Fatalf("S16 learned a session node: %q", got)
+	}
+
+	// No observed placement, no entry to record.
+	rig.claimTask(t, "t-nonode")
+	rig.stub.on("POST", "/api/daemon/tasks/t-nonode/complete", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]string{"status": "completed"})
+	})
+	if code, _ := rig.call(t, "POST", "/api/daemon/tasks/t-nonode/complete", rig.token(t, "t-nonode"),
+		[]byte(`{"session_id":"/state/home/.multica/pi-sessions/sess-9.jsonl"}`)); code != 200 {
+		t.Fatalf("S13 = %d, want 200", code)
+	}
+	if got := rig.reg.LastNodeForSession("sess-9"); got != "" {
+		t.Fatalf("node-less task learned a session: %q", got)
+	}
+
+	// A failed forward still learns: the queue replays the report, so the
+	// learning must not wait for it.
+	rig.claimTask(t, "t-fail")
+	rig.reg.SetNode("t-fail", "company-04")
+	rig.stub.on("POST", "/api/daemon/tasks/t-fail/fail", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 500, map[string]string{"error": "boom"})
+	})
+	if code, _ := rig.call(t, "POST", "/api/daemon/tasks/t-fail/fail", rig.token(t, "t-fail"),
+		[]byte(`{"error":"agent died","session_id":"/state/home/.multica/pi-sessions/sess-10.jsonl"}`)); code != 502 {
+		t.Fatalf("S14 with a failing upstream = %d, want 502", code)
+	}
+	if got := rig.reg.LastNodeForSession("sess-10"); got != "company-04" {
+		t.Fatalf("learned node after a failed forward = %q, want company-04", got)
+	}
+}
+
 func TestS26SkillBundlesResolve(t *testing.T) {
 	rig := newTestRig(t)
 	rig.claimTask(t, "t-skill")

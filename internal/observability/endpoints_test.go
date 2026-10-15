@@ -89,6 +89,7 @@ func TestTasksListOmitsPayload(t *testing.T) {
 		State:           registry.StateRunning,
 		IssueIdentifier: "TSI-1",
 		Payload:         json.RawMessage(`{"auth_token":"mat_secretpayload"}`),
+		PriorSessionID:  "/state/home/.multica/pi-sessions/sess-1.jsonl",
 	})
 	rec := do(t, newTestHandler(reg, nil), "/foreman/tasks")
 	if rec.Code != http.StatusOK {
@@ -107,6 +108,11 @@ func TestTasksListOmitsPayload(t *testing.T) {
 	}
 	if _, ok := e["payload"]; ok {
 		t.Fatalf("payload leaked into tasks list: %v", e)
+	}
+	// The soft-affinity key is payload-derived, not a trigger context: it
+	// stays in memory too (§3.1).
+	if _, ok := e["prior_session_id"]; ok {
+		t.Fatalf("prior_session_id leaked into tasks list: %v", e)
 	}
 }
 

@@ -321,6 +321,22 @@ func claimPayload(id string) json.RawMessage {
 	}`, id))
 }
 
+// resumeClaimPayload is the resume form of claimPayload: the payload names the
+// session file it continues, which is the soft affinity key source (ADR-015).
+func resumeClaimPayload(id, priorSession string) json.RawMessage {
+	return json.RawMessage(fmt.Sprintf(`{
+		"id": %q,
+		"agent_id": "agent-1",
+		"issue_id": "issue-1",
+		"issue_identifier": "MULTI-1",
+		"workspace_id": "ws-1",
+		"runtime_id": "real-runtime",
+		"auth_token": "mat_secret",
+		"prior_session_id": %q,
+		"agent": {"model": "x"}
+	}`, id, priorSession))
+}
+
 // claim runs OnClaim and returns the registered entry.
 func (f *fixture) claim(t *testing.T, taskID string) registry.TaskEntry {
 	t.Helper()
@@ -1703,6 +1719,8 @@ func TestRefreshNodeSaturationLogsLoadAndCap(t *testing.T) {
 }
 
 func TestOnClaimDropsAffinityForSaturatedNode(t *testing.T) {
+	// The claim resumes this session, learned on node-a.
+	const priorSession = "/state/home/.multica/pi-sessions/sess-1.jsonl"
 	for _, tc := range []struct {
 		name         string
 		maxPerNode   int
@@ -1713,13 +1731,13 @@ func TestOnClaimDropsAffinityForSaturatedNode(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
-			// issue-1 (the claim payload's issue) ran on node-a, which
-			// already holds two live Jobs.
-			place(t, f, "t1", "issue-1", "node-a")
+			f.reg.LearnSession(registry.SessionKey(priorSession), "node-a")
+			// node-a already holds two live Jobs.
+			place(t, f, "t1", "issue-a", "node-a")
 			place(t, f, "t2", "issue-b", "node-a")
 			sched := newCappedScheduler(t, f, tc.maxPerNode, io.Discard)
 
-			if err := sched.OnClaim(context.Background(), claimPayload("task-x")); err != nil {
+			if err := sched.OnClaim(context.Background(), resumeClaimPayload("task-x", priorSession)); err != nil {
 				t.Fatalf("OnClaim: %v", err)
 			}
 			// The soft cap never blocks a Job: it only picks its placement.

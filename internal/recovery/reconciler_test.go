@@ -911,6 +911,7 @@ func (w *fakeWatcher) Watch(ctx context.Context, notify func()) error {
 func TestReconcileRecordsPodNodePlacement(t *testing.T) {
 	e := testEntry("t1")
 	e.IssueID = "issue-t1"
+	e.PriorSessionID = "/state/home/.multica/pi-sessions/sess-1.jsonl"
 	reg := newRegistry(t, e)
 	objs := &fakeObjects{
 		job:  runningJob("fm-t1"),
@@ -925,9 +926,10 @@ func TestReconcileRecordsPodNodePlacement(t *testing.T) {
 	if got.NodeName != "company-02" {
 		t.Fatalf("node_name = %q, want company-02", got.NodeName)
 	}
-	// The placement also seeds the soft node-reuse affinity of the issue.
-	if last := reg.LastNodeForIssue("issue-t1"); last != "company-02" {
-		t.Fatalf("LastNodeForIssue = %q, want company-02", last)
+	// Placement feeds the per-node cap and the terminal report, never the
+	// session index: only S13/S14 teach it (ADR-015).
+	if last := reg.LastNodeForSession(registry.SessionKey(e.PriorSessionID)); last != "" {
+		t.Fatalf("LastNodeForSession = %q, want empty before a terminal report", last)
 	}
 }
 
@@ -945,5 +947,32 @@ func TestReconcileLeavesNodeEmptyWhilePodIsPending(t *testing.T) {
 	}
 	if got, _ := reg.Get("t1"); got.NodeName != "" {
 		t.Fatalf("node_name = %q, want empty for an unscheduled pod", got.NodeName)
+	}
+}
+
+// The session index expires on the convergence round alone (ADR-015): the
+// sweep runs before the round looks at live entries, so an index with nothing
+// in flight still converges instead of keeping a stale key until the next
+// claim anywhere.
+func TestReconcileExpiresSessionIndexEntries(t *testing.T) {
+	now := time.Now()
+	reg := registry.New(func() time.Time { return now })
+	reg.LearnSession("sess-stale", "company-02")
+	now = now.Add(2 * time.Hour)
+	reg.LearnSession("sess-fresh", "company-03")
+
+	r, err := New(Config{ReconcileInterval: time.Minute, AgentStateTTL: time.Hour},
+		reg, &fakeObjects{}, &fakeStatus{}, &fakeSettler{})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got := reg.LastNodeForSession("sess-stale"); got != "" {
+		t.Fatalf("expired entry still points at %q", got)
+	}
+	if got := reg.LastNodeForSession("sess-fresh"); got != "company-03" {
+		t.Fatalf("fresh entry = %q, want company-03", got)
 	}
 }

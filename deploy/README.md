@@ -205,7 +205,7 @@ added or normalized.
 | `<issue_id>` / `<issue-identifier>` / `<autopilot_run_id>` / `<chat_session_id>` | the task's trigger context |
 | `<job runtime uuid>` / `<RFC3339>` | the Job runtime id / the claim time |
 | `<job-image>` | `FOREMAN_JOB_IMAGE` |
-| `<preferred node>` (also spelled `<session node>`) | the soft-affinity node; with no history node or `FOREMAN_PREFER_NODE_REUSE=false` the whole affinity item carrying it is dropped |
+| `<preferred node>` (also spelled `<session node>`) | the node holding the resumed session's file (`session_id` of the task's previous run); with no resumed session — a first run — or no known node for it, or `FOREMAN_PREFER_NODE_REUSE=false`, the whole affinity item carrying it is dropped |
 
 Unregistered `<...>` literals stay as written — a template copied from the
 built-in default must have `<job-image>` replaced (a literal `image:

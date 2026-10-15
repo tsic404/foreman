@@ -166,18 +166,17 @@ func TestMarkDaemonRegistered(t *testing.T) {
 	}
 }
 
-func TestNodeIndex(t *testing.T) {
+func TestNodePlacement(t *testing.T) {
 	r := New(fixedClock())
-	if got := r.LastNodeForIssue("issue-t1"); got != "" {
-		t.Fatalf("LastNodeForIssue = %q, want empty", got)
-	}
 	_ = r.Put(entryFor("t1"))
 	r.SetNode("t1", "node-a")
-	if got := r.LastNodeForIssue("issue-t1"); got != "node-a" {
-		t.Fatalf("LastNodeForIssue = %q", got)
-	}
 	if e, _ := r.Get("t1"); e.NodeName != "node-a" {
 		t.Fatalf("entry node = %q", e.NodeName)
+	}
+	// Placement is not a learning point: the soft-affinity index only ever
+	// learns from a terminal report (ADR-015), and it has no issue key.
+	if got := r.LastNodeForSession("issue-t1"); got != "" {
+		t.Fatalf("LastNodeForSession(issue key) = %q, want empty", got)
 	}
 	r.SetNode("ghost", "node-b") // no panic on unknown task
 }
@@ -213,20 +212,20 @@ func TestActiveJobsByNode(t *testing.T) {
 
 func TestNodeSaturationMarkers(t *testing.T) {
 	r := New(fixedClock())
-	if r.NodeSaturated("node-a") {
+	if r.Saturated("node-a") {
 		t.Fatal("fresh registry reports a saturated node")
 	}
 	r.SetSaturatedNodes([]string{"node-b", "node-a", ""})
 	if nodes := r.SaturatedNodes(); len(nodes) != 2 || nodes[0] != "node-a" || nodes[1] != "node-b" {
 		t.Fatalf("SaturatedNodes = %v, want [node-a node-b]", nodes)
 	}
-	if !r.NodeSaturated("node-a") || r.NodeSaturated("node-c") {
+	if !r.Saturated("node-a") || r.Saturated("node-c") {
 		t.Fatalf("marker lookup wrong: %v", r.SaturatedNodes())
 	}
 	// The set is replaced wholesale: a node that fell below the cap must
 	// lose its marker, and stale nodes must not survive.
 	r.SetSaturatedNodes(nil)
-	if r.NodeSaturated("node-a") || len(r.SaturatedNodes()) != 0 {
+	if r.Saturated("node-a") || len(r.SaturatedNodes()) != 0 {
 		t.Fatalf("markers survived an empty replacement: %v", r.SaturatedNodes())
 	}
 }

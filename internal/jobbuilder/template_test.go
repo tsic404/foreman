@@ -540,7 +540,7 @@ func TestTemplatePreferredNodePlaceholder(t *testing.T) {
 	entry := testEntry()
 
 	job, _ := mustBuildTemplate(t, nodeAffinityTemplate, entry, func(cfg *Config) {
-		cfg.Nodes = fakeNodes{entry.IssueID: "company-02"}
+		cfg.Nodes = sessionNodeIndex("company-02")
 	})
 	terms := job.Spec.Template.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
 	if len(terms) != 2 {
@@ -562,7 +562,7 @@ func TestTemplatePreferredNodePlaceholder(t *testing.T) {
 
 	// Reuse switched off behaves like no history.
 	job, _ = mustBuildTemplate(t, nodeAffinityTemplate, entry, func(cfg *Config) {
-		cfg.Nodes = fakeNodes{entry.IssueID: "company-02"}
+		cfg.Nodes = sessionNodeIndex("company-02")
 		cfg.PreferNodeReuse = false
 	})
 	terms = job.Spec.Template.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
@@ -576,7 +576,7 @@ func TestTemplatePreferredNodePlaceholder(t *testing.T) {
 		t.Errorf("affinity = %+v, want none once its only item is dropped", job.Spec.Template.Spec.Affinity)
 	}
 	job, _ = mustBuildTemplate(t, onlyPreferredNodeTemplate, entry, func(cfg *Config) {
-		cfg.Nodes = fakeNodes{entry.IssueID: "company-02"}
+		cfg.Nodes = sessionNodeIndex("company-02")
 	})
 	if got := job.Spec.Template.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution[0].
 		Preference.MatchExpressions[0].Values[0]; got != "company-02" {
@@ -594,7 +594,7 @@ func TestTemplateSessionNodeSpelling(t *testing.T) {
 	manifest := strings.ReplaceAll(onlyPreferredNodeTemplate, "<preferred node>", "<session node>")
 
 	job, _ := mustBuildTemplate(t, manifest, entry, func(cfg *Config) {
-		cfg.Nodes = fakeNodes{entry.IssueID: "company-02"}
+		cfg.Nodes = sessionNodeIndex("company-02")
 	})
 	if got := job.Spec.Template.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution[0].
 		Preference.MatchExpressions[0].Values[0]; got != "company-02" {
@@ -768,7 +768,7 @@ func TestTemplateMisplacedNodePlaceholder(t *testing.T) {
 	// With a node resolved the same template renders the node instead.
 	cfg, _ := templateConfig(t, misplacedNodePlaceholderTemplate)
 	cfg.Issuer = &fakeIssuer{token: "fmj_test.sig"}
-	cfg.Nodes = fakeNodes{entry.IssueID: "company-02"}
+	cfg.Nodes = sessionNodeIndex("company-02")
 	builder, err := NewBuilder(cfg)
 	if err != nil {
 		t.Fatalf("NewBuilder: %v", err)
