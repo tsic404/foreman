@@ -736,6 +736,18 @@ func TestDeliverHandsTaskOnceWithRuntimeRewrite(t *testing.T) {
 	if e.State != registry.StateDelivering || e.DeliveredAt.IsZero() {
 		t.Fatalf("entry = %+v", e)
 	}
+	// The rewrite is retained on the entry: the ops preview reads the entry,
+	// so its payload must be the delivered form, not the claim-time one.
+	var stored map[string]any
+	if err := json.Unmarshal(e.Payload, &stored); err != nil {
+		t.Fatalf("entry payload: %v", err)
+	}
+	if stored["runtime_id"] != e.JobRuntimeID {
+		t.Fatalf("entry runtime_id = %v, want %q", stored["runtime_id"], e.JobRuntimeID)
+	}
+	if stored["auth_token"] != "mat_secret" || stored["agent_id"] != "agent-1" {
+		t.Fatalf("entry payload mangled: %v", stored)
+	}
 	if rt, _ := f.reg.RuntimeByID(e.JobRuntimeID); rt.DeliveredTaskID != "task-1" {
 		t.Fatalf("runtime delivered_task_id = %q", rt.DeliveredTaskID)
 	}

@@ -87,13 +87,18 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 	mux.HandleFunc("GET /foreman/tasks/{taskID}/payload-preview", func(w http.ResponseWriter, r *http.Request) {
 		e, ok := index.Get(r.PathValue("taskID"))
 		if !ok {
+			// A reclaimed entry is indistinguishable from a task that never
+			// existed: the reclaim deletes the row. Sibling endpoints answer
+			// both the same way (observability.md §端点).
 			writeError(w, http.StatusNotFound, "task not found")
 			return
 		}
-		// The payload lives in process memory only; after a restart there is
-		// nothing to preview (contract §3.2).
-		if len(e.Payload) == 0 {
-			writeError(w, http.StatusNotFound, "payload preview unavailable")
+		// The served body is the entry's delivered payload — written by the S6
+		// delivery — and the window is delivered_at until reclaim. An entry
+		// that is not delivered yet holds the claim-time payload, which must
+		// never be exposed as the delivery body (observability.md §端点).
+		if e.DeliveredAt.IsZero() || len(e.Payload) == 0 {
+			writeError(w, http.StatusNotFound, "payload unavailable")
 			return
 		}
 		w.Header().Set("Content-Type", "application/json")

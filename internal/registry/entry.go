@@ -59,9 +59,10 @@ const (
 // fields (issue/autopilot/chat) are optional: an empty value means that context
 // does not exist and is never an error (ADR-014). The JSON projection keeps all
 // four keys with an empty string instead of omitting them, so consumers can
-// test `== ""` (§3.1). Payload is the full claim payload kept in process memory
-// only: it carries auth_token and must never be serialized into annotations,
-// Secrets, or logs (F3).
+// test `== ""` (§3.1). Payload is the task body kept in process memory only —
+// the raw claim payload until delivery, the S6 delivery body (runtime_id
+// rewritten to job_runtime_id) afterwards: it carries auth_token and must never
+// be serialized into annotations, Secrets, or logs (F3).
 type TaskEntry struct {
 	TaskID             string    `json:"task_id"`
 	AgentID            string    `json:"agent_id"`
@@ -96,6 +97,8 @@ type TaskEntry struct {
 	DrainDeadline time.Time `json:"-"`
 	TokenHash     string    `json:"-"`
 
+	// Payload: raw claim payload until MarkDelivering replaces it with the
+	// delivered body — the form the ops preview must serve (S6 / AC-07).
 	Payload json.RawMessage `json:"-"`
 }
 
