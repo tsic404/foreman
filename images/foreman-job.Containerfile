@@ -7,7 +7,11 @@
 #   * a shell + git + CA roots, which the Job's prepare init container and the
 #     daemon's repo cache need,
 #   * the C++ runtime `omp` links (Alpine's `libstdc++` package): the upstream
-#     release binary is dynamically linked, so the bare musl base cannot run it.
+#     release binary is dynamically linked, so the bare musl base cannot run it,
+#   * `dumb-init`, the container PID 1 the Job and probe Job `command`s start
+#     with, so orphans are reaped and SIGTERM is not swallowed (ADR-022),
+#   * `nix`, the tool-building entry point a task may use — the binary only;
+#     its store/daemon/network surface is a separate open decision (ADR-023).
 #
 # The upstream artifacts are inputs, not build logic: the build passes each
 # release artifact URL and the SHA-256 from the release's own checksum manifest,
@@ -36,7 +40,7 @@ RUN set -eux; \
     esac; \
     test -n "$MULTICA_CLI_URL" && test -n "$MULTICA_CLI_SHA256"; \
     test -n "$OMP_URL" && test -n "$OMP_SHA256"; \
-    apk add --no-cache ca-certificates git libstdc++ tzdata; \
+    apk add --no-cache ca-certificates dumb-init git libstdc++ nix tzdata; \
     addgroup -g 1000 agent; \
     adduser -D -u 1000 -G agent -h /home/agent agent; \
     mkdir -p /home/agent /state/workspaces; \
@@ -54,7 +58,9 @@ RUN set -eux; \
 
 COPY foreman-gc-linux-${TARGETARCH} /usr/local/bin/foreman-gc
 
-# No ENTRYPOINT: the Job pod and the DaemonSet both state the command
-# explicitly, so a pod that forgets it fails instead of running something
-# unintended against the node's state root.
+# No ENTRYPOINT and an explicitly empty CMD: the Job pod and the DaemonSet both
+# state the command explicitly, so a pod that forgets it fails at start instead
+# of running the base image's inherited `Cmd=["/bin/sh"]` (contracts §5.3).
+CMD []
+
 WORKDIR /home/agent

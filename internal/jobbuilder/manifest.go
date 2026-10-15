@@ -70,6 +70,10 @@ const (
 	secretCredSuffix  = "-cred"
 
 	agentCommand = "/usr/local/bin/multica"
+	// dumbInitCommand is the container PID 1 both daemon containers start
+	// with: it reaps the orphans the task's tool processes leave behind and
+	// forwards signals to the child's process group (ADR-022).
+	dumbInitCommand = "/usr/bin/dumb-init"
 	// agentWorkingDir is "/" so the upstream task-identity CWD walk never sees
 	// an agent-writable subtree ("guard 第三臂"); HOME stays mountHome (ADR-005).
 	agentWorkingDir = "/"
@@ -267,7 +271,7 @@ func defaultAgentContainer(cfg Config) corev1.Container {
 		Image:           cfg.imageRef(),
 		ImagePullPolicy: corev1.PullAlways,
 		WorkingDir:      agentWorkingDir,
-		Command:         []string{agentCommand},
+		Command:         []string{dumbInitCommand, "--", agentCommand},
 		Args:            []string{"daemon", "start", "--foreground", "--profile", jobProfile},
 		TTY:             true, // daemon writes logs to stderr only when it is a terminal
 		SecurityContext: &corev1.SecurityContext{
