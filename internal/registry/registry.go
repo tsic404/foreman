@@ -35,11 +35,12 @@ type Registry struct {
 	byDaemon map[string]string // daemon_id → task_id
 
 	done *ttlMap // terminal task_id → completion time
-	// issue_id → node_name history feeds jobbuilder's soft node-reuse
-	// affinity; retention is by design (task-mapping §内部结构: the index
-	// covers in-flight AND historical mappings). One string per issue, so
-	// growth tracks distinct issues, not tasks.
-	lastNode map[string]string
+	// session_key → node_name is the soft-affinity index and its one key
+	// (ADR-015): written only by LearnSession, evicted by the reconcile round
+	// once FOREMAN_AGENT_STATE_TTL passed. There is no issue_id → node index
+	// — an issue key would pin every agent of an issue to one node while only
+	// the resuming agent gains anything from it.
+	sessionNode map[string]sessionNodeEntry
 	// Saturation markers of the per-node soft cap (task-mapping §同节点并发,
 	// ADR-006 节流): replaced wholesale by the scheduler's reconcile round,
 	// so the set never outgrows the live node count.
@@ -75,7 +76,7 @@ func New(now func() time.Time, opts ...Option) *Registry {
 		byJob:           make(map[string]string),
 		byDaemon:        make(map[string]string),
 		done:            newTTLMap(DoneIndexTTL, now),
-		lastNode:        make(map[string]string),
+		sessionNode:     make(map[string]sessionNodeEntry),
 		saturated:       make(map[string]bool),
 		runtimes:        make(map[string]JobRuntime),
 		runtimeByDaemon: make(map[string]string),
@@ -306,8 +307,10 @@ func (r *Registry) MarkStarted(taskID string, at time.Time) (TaskEntry, bool) {
 	return e, true
 }
 
-// SetNode records the node a task's pod landed on and feeds the soft
-// node-reuse affinity (NodeIndex) for follow-up tasks of the same issue.
+// SetNode records the node a task's pod landed on. It is the placement fact
+// only: the per-node soft cap counts it, and the entry's terminal report is
+// what feeds the session index (LearnSession) — placement itself never
+// learns, because a Job is built before its pod is scheduled.
 func (r *Registry) SetNode(taskID, nodeName string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -317,16 +320,6 @@ func (r *Registry) SetNode(taskID, nodeName string) {
 	}
 	e.NodeName = nodeName
 	r.live[taskID] = e
-	if e.IssueID != "" {
-		r.lastNode[e.IssueID] = nodeName
-	}
-}
-
-// LastNodeForIssue implements jobbuilder.NodeIndex.
-func (r *Registry) LastNodeForIssue(issueID string) string {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	return r.lastNode[issueID]
 }
 
 // ActiveJobsByNode counts the non-terminal entries placed on each node
@@ -375,10 +368,10 @@ func (r *Registry) SaturatedNodes() []string {
 	return out
 }
 
-// NodeSaturated implements jobbuilder.NodeIndex: the node currently sits at
-// or over the per-node soft cap, so its reuse affinity must be dropped
-// (soft constraint — the Job is still created, no admission control).
-func (r *Registry) NodeSaturated(nodeName string) bool {
+// Saturated implements jobbuilder.NodeIndex: the node currently sits at or
+// over the per-node soft cap, so its reuse affinity must be dropped (soft
+// constraint — the Job is still created, no admission control).
+func (r *Registry) Saturated(nodeName string) bool {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	return r.saturated[nodeName]

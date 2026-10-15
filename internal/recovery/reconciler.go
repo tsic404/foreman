@@ -331,6 +331,13 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 // per round, before the entries (failure-handling 场景 #16): it covers the
 // credentials a reclaim left behind when this process restarted.
 func (r *Reconciler) round(ctx context.Context) error {
+	// The session index expires on this loop alone (ADR-015): its entries are
+	// learned from terminal reports, so this sweep sits ahead of the round's
+	// live-entry check — index-only state must converge too.
+	if dropped := r.reg.PruneExpiredSessions(r.cfg.AgentStateTTL); dropped > 0 {
+		r.log.InfoContext(ctx, "session_index.pruned", "count", dropped,
+			"ttl", r.cfg.AgentStateTTL.String())
+	}
 	if err := r.settler.SweepOrphanSecrets(ctx); err != nil {
 		r.log.WarnContext(ctx, "cred.orphan_sweep_failed", "err", err)
 	}
@@ -352,9 +359,10 @@ func (r *Reconciler) round(ctx context.Context) error {
 			break
 		}
 		// Node placement is the fact the per-node soft cap counts
-		// (FOREMAN_MAX_JOBS_PER_NODE) and the node-reuse affinity keys on
-		// (contract §1.3: Pod 读 spec.nodeName). The pods are already listed
-		// for this round; record the node once it is known.
+		// (FOREMAN_MAX_JOBS_PER_NODE, contract §1.3: Pod 读 spec.nodeName),
+		// and the node_name the terminal report's learning face reads
+		// (ADR-015). The pods are already listed for this round; record the
+		// node once it is known.
 		if e.NodeName == "" {
 			if node := podNodeName(byJob[e.JobName]); node != "" {
 				r.reg.SetNode(e.TaskID, node)

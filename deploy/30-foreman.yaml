@@ -126,6 +126,12 @@ spec:
               value: "6h"
             - name: FOREMAN_GC_QUIESCE
               value: "30m"
+            # Same env as the foreman-gc DaemonSet (contract §5.1): here it
+            # bounds the learned session-index entries of the soft-affinity
+            # key, so one value keeps placement and node GC in step (ADR-015).
+            # "0" disables expiry.
+            - name: FOREMAN_AGENT_STATE_TTL
+              value: "336h"
             # --- Job container resources ---
             - name: FOREMAN_JOB_CPU_REQUEST
               value: "1"

@@ -97,6 +97,13 @@ type TaskEntry struct {
 	DrainDeadline time.Time `json:"-"`
 	TokenHash     string    `json:"-"`
 
+	// PriorSessionID is the claim payload's prior_session_id: where the
+	// resuming session's file lives, hence the soft-affinity key source
+	// (ADR-015). Payload-derived and memory-only like the body itself — not
+	// annotated, not projected, and not rebuilt after a restart, because a
+	// rebuilt entry's Job already exists and never goes through Build.
+	PriorSessionID string `json:"-"`
+
 	// Payload: raw claim payload until MarkDelivering replaces it with the
 	// delivered body — the form the ops preview must serve (S6 / AC-07).
 	Payload json.RawMessage `json:"-"`

@@ -15,6 +15,8 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/tsic404/foreman/internal/registry"
 )
 
 // TaskEntry is the subset of the registry entry (contract §3.1) that Build needs.
@@ -29,6 +31,9 @@ type TaskEntry struct {
 	JobRuntimeID    string
 	ClaimedAt       time.Time
 	Attempt         int
+	// PriorSessionID is the claim payload's session-resume path; its session
+	// key is the only soft-affinity key (ADR-015).
+	PriorSessionID string
 }
 
 // TokenIssuer signs per-Job Tokens; satisfied by auth.Issuer. Hash is the
@@ -39,15 +44,17 @@ type TokenIssuer interface {
 	Hash(token string) string
 }
 
-// NodeIndex reports the node an issue's previous Job ran on; it backs the
-// soft node-reuse affinity (FOREMAN_PREFER_NODE_REUSE).
+// NodeIndex exposes the registry's session index and per-node load markers;
+// it backs the soft node-reuse affinity (FOREMAN_PREFER_NODE_REUSE).
 type NodeIndex interface {
-	LastNodeForIssue(issueID string) string
-	// NodeSaturated reports whether the node currently sits at or over the
+	// LastNodeForSession reports the node a session key was learned on
+	// ("" when unknown); the key is a normalized session key (§3.1).
+	LastNodeForSession(key string) string
+	// Saturated reports whether the node currently sits at or over the
 	// per-node soft cap (FOREMAN_MAX_JOBS_PER_NODE, ADR-006 节流). A
 	// saturated node drops out of the candidate set of the next Job, so the
 	// cap is a placement preference — never admission control.
-	NodeSaturated(nodeName string) bool
+	Saturated(nodeName string) bool
 }
 
 var dns1123Label = regexp.MustCompile(`^[a-z0-9]([-a-z0-9]*[a-z0-9])?$`)
@@ -127,7 +134,7 @@ func (b *Builder) render(name string, e TaskEntry) (*batchv1.Job, error) {
 // preferred node comes from the same soft-affinity decision the default
 // template uses.
 func (b *Builder) placeholderValues(e TaskEntry) placeholderValues {
-	return placeholderValues{
+	v := placeholderValues{
 		taskID:          e.TaskID,
 		agentID:         e.AgentID,
 		workspaceID:     e.WorkspaceID,
@@ -138,8 +145,11 @@ func (b *Builder) placeholderValues(e TaskEntry) placeholderValues {
 		jobRuntimeID:    e.JobRuntimeID,
 		claimedAt:       e.ClaimedAt.UTC().Format(time.RFC3339),
 		jobImage:        b.cfg.imageRef(),
-		preferredNode:   b.preferredNode(e),
 	}
+	if node, ok := b.preferredNode(e); ok {
+		v.preferredNode = node
+	}
+	return v
 }
 
 // applyWrites performs Foreman's own writes on the rendered Job — the only
@@ -238,8 +248,8 @@ func setKeys(dst map[string]string, keys map[string]string) map[string]string {
 // expresses the same decision with the <preferred node> placeholder instead —
 // Foreman never adds an affinity item to it (P-006 §A2).
 func (b *Builder) applyPreferredNode(job *batchv1.Job, e TaskEntry) {
-	node := b.preferredNode(e)
-	if node == "" {
+	node, ok := b.preferredNode(e)
+	if !ok {
 		return
 	}
 	pod := &job.Spec.Template.Spec
@@ -253,21 +263,26 @@ func (b *Builder) applyPreferredNode(job *batchv1.Job, e TaskEntry) {
 		pod.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution, preferredTerm(node))
 }
 
-// preferredNode returns the soft-affinity node for e's issue, "" when reuse
-// is disabled, the entry has no issue context, no history exists, or the node
-// sits at its concurrency cap: a saturated node must not attract another Job
-// (task-mapping §同节点并发 — the cap lowers the node's priority, it never
-// blocks the Job). An entry without an issue never participates in the
-// issue-keyed reuse index (ADR-014 §软亲和).
-func (b *Builder) preferredNode(e TaskEntry) string {
-	if !b.cfg.PreferNodeReuse || b.cfg.Nodes == nil || e.IssueID == "" {
-		return ""
+// preferredNode resolves the single soft-affinity node for e's session: the
+// session key must be non-empty and known to the index, and its node must not
+// sit at the per-node cap (task-mapping §同节点并发 — the cap lowers the
+// node's priority, it never blocks the Job). Reuse off, no resume session, an
+// unknown key and a saturated node all answer (_, false), which drops the
+// item. A task without a prior session has no key at all: `issue_id` is
+// deliberately not one (ADR-015).
+func (b *Builder) preferredNode(e TaskEntry) (string, bool) {
+	if !b.cfg.PreferNodeReuse || b.cfg.Nodes == nil {
+		return "", false
 	}
-	node := b.cfg.Nodes.LastNodeForIssue(e.IssueID)
-	if node == "" || b.cfg.Nodes.NodeSaturated(node) {
-		return ""
+	key := registry.SessionKey(e.PriorSessionID)
+	if key == "" {
+		return "", false
 	}
-	return node
+	node := b.cfg.Nodes.LastNodeForSession(key)
+	if node == "" || b.cfg.Nodes.Saturated(node) {
+		return "", false
+	}
+	return node, true
 }
 
 // jobName is the single source of the Job/Secret/daemon naming convention.

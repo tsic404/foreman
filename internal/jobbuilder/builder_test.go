@@ -14,13 +14,22 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+
+	"github.com/tsic404/foreman/internal/registry"
 )
 
 const (
 	testTaskID  = "3f6b1a2c-9d4e-4a5b-8c7d-0e1f2a3b4c5d"
 	testJobName = "fm-" + testTaskID
 	testDigest  = "sha256:4242424242424242424242424242424242424242424242424242424242424242"
+	// testPriorSession is testEntry's session-resume path, in the shape the
+	// payload carries it: an absolute path to a node-local session file.
+	testPriorSession = "/state/home/.multica/pi-sessions/sess-1.jsonl"
 )
+
+// testSessionKey is the index key of testPriorSession — the key the learning
+// side and the payload side must derive identically (03-contracts §3.1).
+const testSessionKey = "sess-1"
 
 var testClaimedAt = time.Date(2026, 10, 4, 8, 30, 0, 0, time.UTC)
 
@@ -52,10 +61,16 @@ func tokenDigest(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
+// fakeNodes is a NodeIndex keyed by session key, the way the registry stores
+// it, with nothing saturated.
 type fakeNodes map[string]string
 
-func (n fakeNodes) LastNodeForIssue(issueID string) string { return n[issueID] }
-func (n fakeNodes) NodeSaturated(string) bool              { return false }
+func (n fakeNodes) LastNodeForSession(key string) string { return n[key] }
+func (n fakeNodes) Saturated(string) bool                { return false }
+
+// sessionNodeIndex is the index the affinity tests hand to the builder: the
+// test entry's session, learned on node.
+func sessionNodeIndex(node string) fakeNodes { return fakeNodes{testSessionKey: node} }
 
 // saturatedNodes is a node index whose node sits at its per-node soft cap.
 type saturatedNodes struct {
@@ -63,7 +78,7 @@ type saturatedNodes struct {
 	node string
 }
 
-func (n saturatedNodes) NodeSaturated(node string) bool { return node == n.node }
+func (n saturatedNodes) Saturated(node string) bool { return node == n.node }
 
 func testConfig() Config {
 	cfg, err := LoadConfig(envFrom(map[string]string{}))
@@ -83,6 +98,7 @@ func testEntry() TaskEntry {
 		JobRuntimeID:    "5d4c3b2a-1e0f-4a9b-8c7d-6e5f4a3b2c1d",
 		ClaimedAt:       testClaimedAt,
 		Attempt:         1,
+		PriorSessionID:  testPriorSession,
 	}
 }
 
@@ -472,15 +488,15 @@ func TestBuildPreferredNodeAffinity(t *testing.T) {
 	entry := testEntry()
 
 	cfg := testConfig()
-	cfg.Nodes = fakeNodes{entry.IssueID: "company-02"}
+	cfg.Nodes = sessionNodeIndex("company-02")
 	job, _ := mustBuild(t, cfg, entry)
 	affinity := job.Spec.Template.Spec.Affinity
 	if affinity == nil || affinity.NodeAffinity == nil {
-		t.Fatal("affinity missing for known node")
+		t.Fatal("affinity missing for a learned session node")
 	}
 	terms := affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
 	if len(terms) != 1 || terms[0].Weight != 100 {
-		t.Fatalf("preferred terms = %+v, want 1 term weight 100", terms)
+		t.Fatalf("preferred terms = %+v, want exactly 1 term weight 100", terms)
 	}
 	expr := terms[0].Preference.MatchExpressions
 	if len(expr) != 1 || expr[0].Key != "kubernetes.io/hostname" || expr[0].Operator != corev1.NodeSelectorOpIn ||
@@ -498,24 +514,66 @@ func TestBuildPreferredNodeAffinity(t *testing.T) {
 	cfg.Nodes = fakeNodes{}
 	job, _ = mustBuild(t, cfg, entry)
 	if job.Spec.Template.Spec.Affinity != nil {
-		t.Error("affinity must be omitted when no node history exists")
+		t.Error("affinity must be omitted when the session key was never learned")
+	}
+
+	// A first run carries no prior session, so it has no key at all — the
+	// loaded index must not reach it (ADR-015: issue_id is not a key either).
+	firstRun := entry
+	firstRun.PriorSessionID = ""
+	cfg = testConfig()
+	cfg.Nodes = sessionNodeIndex("company-02")
+	job, _ = mustBuild(t, cfg, firstRun)
+	if job.Spec.Template.Spec.Affinity != nil {
+		t.Error("affinity must be omitted for a task with no prior session")
+	}
+
+	// Another session on the same node is not this task's session.
+	otherSession := entry
+	otherSession.PriorSessionID = "/state/home/.multica/pi-sessions/sess-9.jsonl"
+	job, _ = mustBuild(t, cfg, otherSession)
+	if job.Spec.Template.Spec.Affinity != nil {
+		t.Error("affinity must be omitted for an unlearned session key")
+	}
+}
+
+// The two sides of the index derive the key with one function (§3.1): the
+// learning face stored a path under its session key, and a payload naming the
+// same file — a different root directory, as a changed HOME gives it — still
+// resolves it. The real registry is the witness that both sides match.
+func TestBuildPreferredNodeFromLearnedRegistry(t *testing.T) {
+	reg := registry.New(time.Now)
+	reg.LearnSession(registry.SessionKey("/state/home/.multica/pi-sessions/sess-1.jsonl"), "company-02")
+
+	entry := testEntry()
+	entry.PriorSessionID = "/root/.multica/pi-sessions/sess-1.jsonl"
+
+	cfg := testConfig()
+	cfg.Nodes = reg
+	job, _ := mustBuild(t, cfg, entry)
+	terms := job.Spec.Template.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+	if len(terms) != 1 {
+		t.Fatalf("preferred terms = %+v, want the one learned session item", terms)
+	}
+	if got := terms[0].Preference.MatchExpressions[0].Values; len(got) != 1 || got[0] != "company-02" {
+		t.Errorf("resolved node = %v, want company-02", got)
 	}
 }
 
 // A node at FOREMAN_MAX_JOBS_PER_NODE is no longer a candidate for the next
-// Job of the issue (ADR-006 节流); the Job itself is still rendered.
+// Job of the session (ADR-006 节流); the Job itself is still rendered.
 func TestBuildDropsAffinityForSaturatedNode(t *testing.T) {
 	entry := testEntry()
 
 	cfg := testConfig()
-	cfg.Nodes = saturatedNodes{fakeNodes: fakeNodes{entry.IssueID: "company-02"}, node: "company-02"}
+	cfg.Nodes = saturatedNodes{fakeNodes: sessionNodeIndex("company-02"), node: "company-02"}
 	job, _ := mustBuild(t, cfg, entry)
 	if job.Spec.Template.Spec.Affinity != nil {
 		t.Error("affinity must be omitted for a node at its per-node cap")
 	}
 
 	// Another node's saturation leaves the reuse affinity in place.
-	cfg.Nodes = saturatedNodes{fakeNodes: fakeNodes{entry.IssueID: "company-02"}, node: "company-03"}
+	cfg.Nodes = saturatedNodes{fakeNodes: sessionNodeIndex("company-02"), node: "company-03"}
 	job, _ = mustBuild(t, cfg, entry)
 	if job.Spec.Template.Spec.Affinity == nil {
 		t.Error("affinity must survive when only an unrelated node is saturated")
@@ -591,19 +649,28 @@ func TestBuildTriggerContextAnnotations(t *testing.T) {
 	}
 }
 
-// TestBuildSkipsAffinityWithoutIssueContext (ADR-014 §软亲和): an entry with no
-// issue context never joins the issue-keyed reuse index, so it carries no
-// preferred affinity — even when the index holds an entry under the empty key.
-func TestBuildSkipsAffinityWithoutIssueContext(t *testing.T) {
+// TestBuildAffinityWithoutIssueContext (ADR-015): the affinity key is the
+// session, never the trigger context — the no-issue-context entries (chat
+// entry, autopilot) the ADR was written for resume on their session's node.
+// An issue-context gate here would silently re-break exactly that case.
+func TestBuildAffinityWithoutIssueContext(t *testing.T) {
 	entry := testEntry()
 	entry.IssueID, entry.IssueIdentifier = "", ""
 	entry.AutopilotRunID = "b1c2d3e4-5f60-4a7b-8c9d-0e1f2a3b4c5d"
 
 	cfg := testConfig()
-	cfg.Nodes = fakeNodes{"": "company-02"}
+	cfg.Nodes = sessionNodeIndex("company-02")
 	job, _ := mustBuild(t, cfg, entry)
-	if job.Spec.Template.Spec.Affinity != nil {
-		t.Errorf("affinity = %+v, want none for an entry without issue context", job.Spec.Template.Spec.Affinity)
+	affinity := job.Spec.Template.Spec.Affinity
+	if affinity == nil || affinity.NodeAffinity == nil {
+		t.Fatal("affinity missing: the key is the session, not the issue context")
+	}
+	terms := affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+	if len(terms) != 1 {
+		t.Fatalf("preferred terms = %+v, want the one learned session item", terms)
+	}
+	if got := terms[0].Preference.MatchExpressions[0].Values; len(got) != 1 || got[0] != "company-02" {
+		t.Errorf("resolved node = %v, want company-02", got)
 	}
 }
 
