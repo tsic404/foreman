@@ -22,6 +22,7 @@ import (
 	"k8s.io/apimachinery/pkg/runtime/schema"
 
 	"github.com/tsic404/foreman/internal/jobbuilder"
+	"github.com/tsic404/foreman/internal/observability"
 	"github.com/tsic404/foreman/internal/registry"
 )
 
@@ -1706,17 +1707,225 @@ func TestJobCreatedLogsImageReference(t *testing.T) {
 	}
 }
 
-// findLogRecord returns the first JSON log record whose msg equals event.
-func findLogRecord(t *testing.T, raw []byte, event string) map[string]any {
+// newLogScheduler rebuilds the fixture's scheduler over the process logger —
+// observability.NewLogger, so the records carry the contract's fixed fields
+// and redaction — and returns the buffer they land in.
+func newLogScheduler(t *testing.T, f *fixture, level slog.Level) *bytes.Buffer {
 	t.Helper()
+	buf := &bytes.Buffer{}
+	cfg, err := LoadConfig(func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	s, err := New(cfg, f.reg, f.jobs, f.builder, f.server, f.metrics,
+		WithClock(func() time.Time { return f.now }),
+		WithPendingReports(f.pending),
+		WithRevoker(f.revoker),
+		WithLogger(observability.NewLogger(buf, level, "")))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	f.sched = s
+	return buf
+}
+
+// TestJobCreateFailedLogsPhaseForSecretStep (AC-10, TC-tech-observability-03):
+// a claim whose CreateSecret fails records job.create_failed with
+// phase=secret, and the task keeps its settlement event
+// task.failed_compensated on the same chain (ADR-027: the two coexist). The
+// field set is the event table's own — no payload, no credential.
+func TestJobCreateFailedLogsPhaseForSecretStep(t *testing.T) {
+	f := newFixture(t)
+	f.jobs.createSecretErr = errors.New("rbac denied")
+	buf := newLogScheduler(t, f, slog.LevelInfo)
+
+	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err == nil {
+		t.Fatal("OnClaim error swallowed")
+	}
+	record := findLogRecord(t, buf.Bytes(), "job.create_failed")
+	wantFields := map[string]bool{
+		"ts": true, "level": true, "msg": true, "component": true,
+		"task_id": true, "job_name": true, "phase": true, "err": true,
+	}
+	for field := range wantFields {
+		if _, ok := record[field]; !ok {
+			t.Errorf("job.create_failed misses %q: %v", field, record)
+		}
+	}
+	for field := range record {
+		if !wantFields[field] {
+			t.Errorf("job.create_failed carries %q: %v", field, record)
+		}
+	}
+	if record["phase"] != createPhaseSecret {
+		t.Errorf("phase = %v, want %q", record["phase"], createPhaseSecret)
+	}
+	if record["task_id"] != "task-1" || record["job_name"] != "fm-task-1" {
+		t.Errorf("identity fields = %v", record)
+	}
+	if summary, _ := record["err"].(string); !strings.Contains(summary, "rbac denied") {
+		t.Errorf("err = %v, want the cause summary", record["err"])
+	}
+	settled := findLogRecord(t, buf.Bytes(), "task.failed_compensated")
+	if settled["failure_reason"] != FailureReasonJobCreateFailed {
+		t.Errorf("failure_reason = %v, want %q", settled["failure_reason"], FailureReasonJobCreateFailed)
+	}
+}
+
+// TestJobCreateFailedLogsPhaseForJobStep (AC-10, TC-tech-observability-03): a
+// claim whose CreateJob fails records phase=job — the credential Secret was
+// created, the Job object was not — with the same settlement event alongside.
+func TestJobCreateFailedLogsPhaseForJobStep(t *testing.T) {
+	f := newFixture(t)
+	f.jobs.createJobErr = errors.New("quota exceeded")
+	buf := newLogScheduler(t, f, slog.LevelInfo)
+
+	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err == nil {
+		t.Fatal("OnClaim error swallowed")
+	}
+	if got := findLogRecord(t, buf.Bytes(), "job.create_failed")["phase"]; got != createPhaseJob {
+		t.Errorf("phase = %v, want %q", got, createPhaseJob)
+	}
+	settled := findLogRecord(t, buf.Bytes(), "task.failed_compensated")
+	if settled["failure_reason"] != FailureReasonJobCreateFailed {
+		t.Errorf("failure_reason = %v, want %q", settled["failure_reason"], FailureReasonJobCreateFailed)
+	}
+}
+
+// TestOnClaimStaleClearFailureKeepsClaim (task-mapping §OnClaim): the stale
+// Secret sweep is the best-effort half of an idempotent retry — its failure
+// does not settle the claim, and only the CreateSecret that follows can turn
+// it into a phase=secret failure.
+func TestOnClaimStaleClearFailureKeepsClaim(t *testing.T) {
+	f := newFixture(t)
+	f.jobs.deleteSecretErr = errors.New("apiserver unavailable")
+	buf := newLogScheduler(t, f, slog.LevelInfo)
+
+	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	e, ok := f.reg.Get("task-1")
+	if !ok || e.State != registry.StateJobCreated {
+		t.Fatalf("entry = %+v, ok = %v", e, ok)
+	}
+	if len(f.jobs.createdJobs) != 1 || len(f.jobs.createdSecrets) != 1 {
+		t.Fatalf("objects: jobs=%d secrets=%d", len(f.jobs.createdJobs), len(f.jobs.createdSecrets))
+	}
+	if len(f.server.forwards) != 0 {
+		t.Fatalf("claim settled after a failed best-effort clear: %+v", f.server.forwards)
+	}
+	if records := collectLogRecords(t, buf.Bytes(), "job.create_failed"); len(records) != 0 {
+		t.Fatalf("job.create_failed without a create failure: %+v", records)
+	}
+}
+
+// TestOnClaimStaleClearResidueFailsInSecretPhase: a failed clear that leaves
+// the Secret behind (or has its permission denied) surfaces through the
+// CreateSecret right after it — the same phase=secret branch.
+func TestOnClaimStaleClearResidueFailsInSecretPhase(t *testing.T) {
+	f := newFixture(t)
+	f.jobs.deleteSecretErr = errors.New("apiserver unavailable")
+	f.jobs.createSecretErr = errors.New("already exists")
+	buf := newLogScheduler(t, f, slog.LevelInfo)
+
+	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err == nil {
+		t.Fatal("OnClaim error swallowed")
+	}
+	if got := findLogRecord(t, buf.Bytes(), "job.create_failed")["phase"]; got != createPhaseSecret {
+		t.Errorf("phase = %v, want %q", got, createPhaseSecret)
+	}
+}
+
+// TestJobCreateStepTraceAtDebug (AC-10, TC-tech-observability-03 步骤 5): at
+// FOREMAN_LOG_LEVEL=debug the claim chain traces its five steps in order, each
+// with its own duration and without repeating the failure's error field.
+func TestJobCreateStepTraceAtDebug(t *testing.T) {
+	f := newFixture(t)
+	buf := newLogScheduler(t, f, slog.LevelDebug)
+
+	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	want := []string{createStepBuild, createStepClearStaleSecret, createStepCreateSecret, createStepCreateJob, createStepJobCreated}
+	records := collectLogRecords(t, buf.Bytes(), "job.create_step")
+	if len(records) != len(want) {
+		t.Fatalf("job.create_step records = %+v, want the five steps %v", records, want)
+	}
+	for i, record := range records {
+		if record["step"] != want[i] {
+			t.Errorf("step[%d] = %v, want %q", i, record["step"], want[i])
+		}
+		if _, ok := record["duration_ms"]; !ok {
+			t.Errorf("step %v carries no duration_ms: %v", record["step"], record)
+		}
+		if _, repeated := record["err"]; repeated {
+			t.Errorf("step %v repeats the error field: %v", record["step"], record)
+		}
+		if record["task_id"] != "task-1" || record["job_name"] != "fm-task-1" {
+			t.Errorf("step %v identity fields = %v", record["step"], record)
+		}
+	}
+}
+
+// TestJobCreateStepTraceIncludesFailedStep (AC-10): a failing step closes the
+// chain with its own trace line — the failure's reporting stays
+// job.create_failed's subject.
+func TestJobCreateStepTraceIncludesFailedStep(t *testing.T) {
+	f := newFixture(t)
+	f.jobs.createSecretErr = errors.New("rbac denied")
+	buf := newLogScheduler(t, f, slog.LevelDebug)
+
+	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err == nil {
+		t.Fatal("OnClaim error swallowed")
+	}
+	want := []string{createStepBuild, createStepClearStaleSecret, createStepCreateSecret}
+	records := collectLogRecords(t, buf.Bytes(), "job.create_step")
+	if len(records) != len(want) {
+		t.Fatalf("job.create_step records = %+v, want %v", records, want)
+	}
+	if last := records[len(records)-1]; last["step"] != createStepCreateSecret {
+		t.Errorf("last step = %v, want %q", last["step"], createStepCreateSecret)
+	}
+}
+
+// TestJobCreateStepSilentAtInfoLevel (AC-10, TC-tech-observability-03 步骤 4):
+// the step trace is debug-only — the default level keeps it out of the log
+// while the job.created line (the positive anchor) still lands.
+func TestJobCreateStepSilentAtInfoLevel(t *testing.T) {
+	f := newFixture(t)
+	buf := newLogScheduler(t, f, slog.LevelInfo)
+
+	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	if records := collectLogRecords(t, buf.Bytes(), "job.create_step"); len(records) != 0 {
+		t.Fatalf("job.create_step at the default level: %+v", records)
+	}
+	findLogRecord(t, buf.Bytes(), "job.created")
+}
+
+// collectLogRecords returns every JSON log record whose msg equals event, in
+// the order they were written.
+func collectLogRecords(t *testing.T, raw []byte, event string) []map[string]any {
+	t.Helper()
+	var out []map[string]any
 	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
 		var record map[string]any
 		if json.Unmarshal([]byte(line), &record) != nil {
 			continue
 		}
 		if record["msg"] == event {
-			return record
+			out = append(out, record)
 		}
+	}
+	return out
+}
+
+// findLogRecord returns the first JSON log record whose msg equals event.
+func findLogRecord(t *testing.T, raw []byte, event string) map[string]any {
+	t.Helper()
+	if records := collectLogRecords(t, raw, event); len(records) > 0 {
+		return records[0]
 	}
 	t.Fatalf("no %s record in logs:\n%s", event, raw)
 	return nil

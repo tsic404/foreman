@@ -71,6 +71,24 @@ const (
 	FailureReasonStaleClaim = "stale_claim"
 )
 
+// job.create_step step values: the claim chain's five steps, in order
+// (05-modules/observability.md §必须记录的事件). A step's trace line is
+// emitted once the step finished, a failed step included.
+const (
+	createStepBuild            = "build"
+	createStepClearStaleSecret = "clear_stale_secret"
+	createStepCreateSecret     = "create_secret"
+	createStepCreateJob        = "create_job"
+	createStepJobCreated       = "job_created"
+)
+
+// job.create_failed phase values: the step whose failure settled the claim —
+// the credential Secret was never created, or the Job object was not placed.
+const (
+	createPhaseSecret = "secret"
+	createPhaseJob    = "job"
+)
+
 // Credential-reclaim reasons (ADR-017): the drain window closed because the
 // Job's pods all terminated, or because FOREMAN_JOB_DRAIN_TIMEOUT expired
 // first.
@@ -354,6 +372,30 @@ func (s *Scheduler) RefreshNodeSaturation(ctx context.Context) map[string]int {
 	return load
 }
 
+// createSteps traces the claim chain's steps (job.create_step, debug, at
+// FOREMAN_LOG_LEVEL=debug): each call closes the step it names and emits one
+// line carrying that step's own duration. A failed step is traced the same
+// way — job.create_failed is the failure's event, so the step line never
+// repeats its error field.
+func (s *Scheduler) createSteps(ctx context.Context, e registry.TaskEntry) func(step string) {
+	last := s.now()
+	return func(step string) {
+		at := s.now()
+		s.log.DebugContext(ctx, "job.create_step",
+			"task_id", e.TaskID, "job_name", e.JobName,
+			"step", step, "duration_ms", at.Sub(last).Milliseconds())
+		last = at
+	}
+}
+
+// logJobCreateFailed records the claim chain's failure (job.create_failed,
+// error). phase names the step that failed; err carries the summary only —
+// never a payload or a credential.
+func (s *Scheduler) logJobCreateFailed(ctx context.Context, e registry.TaskEntry, phase string, cause error) {
+	s.log.ErrorContext(ctx, "job.create_failed",
+		"task_id", e.TaskID, "job_name", e.JobName, "phase", phase, "err", cause.Error())
+}
+
 // OnClaim registers a freshly claimed task and creates its Secret + Job
 // (pending → job_created). A task the registry already knows goes through
 // the duplicate-claim rule; no second Job is ever created concurrently.
@@ -428,7 +470,9 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	// refresh marks the nodes at their cap so the affinity below skips them.
 	s.RefreshNodeSaturation(ctx)
 
+	trace := s.createSteps(ctx, e)
 	job, secret, tokenHash, err := s.builder.Build(jobbuilderEntry(e))
+	trace(createStepBuild)
 	if err != nil {
 		s.failClaim(ctx, e, err)
 		return err
@@ -443,16 +487,21 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	s.reg.SetTokenHash(e.TaskID, tokenHash)
 	e.TokenHash = tokenHash
 	// An idempotent retry may have left the Secret behind: delete-then-create
-	// (NotFound counts as success inside the JobClient).
-	if err := s.jobs.DeleteSecret(ctx, credName(jobName)); err != nil {
-		s.failClaim(ctx, e, fmt.Errorf("clear stale credential secret: %w", err))
-		return err
-	}
-	if err := s.jobs.CreateSecret(ctx, secret); err != nil {
-		s.failClaim(ctx, e, fmt.Errorf("create credential secret: %w", err))
+	// (NotFound counts as success inside the JobClient). The clear is
+	// best-effort and does not settle the claim — the CreateSecret below
+	// surfaces residue or a denied permission as a phase=secret failure.
+	_ = s.jobs.DeleteSecret(ctx, credName(jobName))
+	trace(createStepClearStaleSecret)
+	err = s.jobs.CreateSecret(ctx, secret)
+	trace(createStepCreateSecret)
+	if err != nil {
+		cause := fmt.Errorf("create credential secret: %w", err)
+		s.logJobCreateFailed(ctx, e, createPhaseSecret, cause)
+		s.failClaim(ctx, e, cause)
 		return err
 	}
 	created, err := s.createJob(ctx, e, job)
+	trace(createStepCreateJob)
 	if err != nil {
 		// Nothing of this claim is left in the cluster: drop the credential
 		// Secret again. A name still held by a terminating predecessor is
@@ -467,7 +516,9 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 				"task_id", e.TaskID, "job_name", e.JobName, "err", err.Error())
 			return err
 		}
-		s.failClaim(ctx, e, fmt.Errorf("create job: %w", err))
+		cause := fmt.Errorf("create job: %w", err)
+		s.logJobCreateFailed(ctx, e, createPhaseJob, cause)
+		s.failClaim(ctx, e, cause)
 		return err
 	}
 
@@ -479,6 +530,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	// Job create, and writing it back wholesale would revert a renewal the
 	// LeaseKeeper landed while the name was held.
 	marked, ok := s.reg.MarkJobCreated(e.TaskID, created.CreationTimestamp.Time)
+	trace(createStepJobCreated)
 	if !ok {
 		// The entry left the registry inside the create window — settled
 		// (e.g. cancelled while the Job name was held) or reclaimed. The
