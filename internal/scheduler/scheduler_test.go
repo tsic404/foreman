@@ -54,6 +54,7 @@ type fakeJobs struct {
 	existingJobs    map[string]*batchv1.Job
 	terminatingJobs map[string]bool
 	onGetJob        func()
+	onCreateJob     func()
 
 	// secrets and pods back ListSecrets/ListPods: the orphan-Secret sweep
 	// and the Job-termination evidence read them.
@@ -67,6 +68,12 @@ type fakeJobs struct {
 var createJobCreationTimestamp = testNow.Add(-time.Hour)
 
 func (f *fakeJobs) CreateJob(_ context.Context, job *batchv1.Job) (*batchv1.Job, error) {
+	// onCreateJob runs before the answer: it lets a test land a concurrent
+	// registry write (e.g. a prepare-lease renewal) inside the claim's
+	// create window.
+	if f.onCreateJob != nil {
+		f.onCreateJob()
+	}
 	if f.createJobErr != nil {
 		return nil, f.createJobErr
 	}
@@ -369,6 +376,12 @@ func TestOnClaimCreatesSecretJobAndEntry(t *testing.T) {
 	if e.BootDeadline != testNow.Add(DefaultJobBootTimeout) {
 		t.Fatalf("boot_deadline = %v", e.BootDeadline)
 	}
+	// The claim stamped the server's 45s prepare lease (§1.1 C3), so the
+	// projected lease_keep_until (§3.1) starts out live — never the zero
+	// value the field would otherwise carry into /foreman/tasks.
+	if want := testNow.Add(PrepareLeaseTTL); !e.LeaseKeepUntil.Equal(want) {
+		t.Fatalf("lease_keep_until = %v, want %v", e.LeaseKeepUntil, want)
+	}
 	if len(f.jobs.createdSecrets) != 1 || f.jobs.createdSecrets[0].Name != wantName+"-cred" {
 		t.Fatalf("secrets created: %+v", f.jobs.createdSecrets)
 	}
@@ -384,6 +397,76 @@ func TestOnClaimCreatesSecretJobAndEntry(t *testing.T) {
 	}
 	if f.metrics.claimed != 1 || f.metrics.inflight[len(f.metrics.inflight)-1] != 1 {
 		t.Fatalf("metrics: %+v", f.metrics)
+	}
+}
+
+// TestClaimKeepsLeaseRenewedDuringJobCreate guards the claim path's second
+// registry write against a lost update: the claim's snapshot predates the Job
+// create — up to jobNameWait long when a terminating predecessor still holds
+// the name — so re-Putting that snapshot wholesale would revert
+// lease_keep_until behind the LeaseKeeper's last renewal, i.e. behind exactly
+// the advance test-cases/protocol-lease.md 场景 A asserts.
+func TestClaimKeepsLeaseRenewedDuringJobCreate(t *testing.T) {
+	f := newFixture(t)
+	renewed := testNow.Add(2 * time.Minute)
+	f.jobs.onCreateJob = func() { f.reg.SetLeaseKeepUntil("task-1", renewed) }
+
+	e := f.claim(t, "task-1")
+
+	if e.State != registry.StateJobCreated {
+		t.Fatalf("state = %v, want job_created", e.State)
+	}
+	if !e.JobCreatedAt.Equal(createJobCreationTimestamp) {
+		t.Fatalf("job_created_at = %v, want %v", e.JobCreatedAt, createJobCreationTimestamp)
+	}
+	if !e.LeaseKeepUntil.Equal(renewed) {
+		t.Fatalf("lease_keep_until = %v, want the concurrent renewal %v", e.LeaseKeepUntil, renewed)
+	}
+}
+
+// TestClaimRollsBackObjectsWhenEntryLeftDuringJobCreate covers the create
+// window's failure branch: once the entry is settled or reclaimed while the
+// Job is being created, the fresh Secret and Job have no owner left, and
+// nothing else reclaims an entry-less Job (failure-handling #16 skips Jobs
+// that exist, ListJobs is read only by the startup rebuild) — so the claim
+// must delete both before returning its error.
+func TestClaimRollsBackObjectsWhenEntryLeftDuringJobCreate(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		leave func(f *fixture)
+	}{
+		{"settled", func(f *fixture) {
+			if _, err := f.reg.MarkTerminal("task-1", registry.ResultCancelled, time.Time{}); err != nil {
+				t.Errorf("MarkTerminal: %v", err)
+			}
+		}},
+		{"reclaimed", func(f *fixture) {
+			if err := f.reg.Delete("task-1"); err != nil {
+				t.Errorf("Delete: %v", err)
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.jobs.onCreateJob = func() { tc.leave(f) }
+
+			err := f.sched.OnClaim(context.Background(), claimPayload("task-1"))
+			if err == nil {
+				t.Fatal("OnClaim must fail once the entry left the registry")
+			}
+			if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != "fm-task-1" {
+				t.Errorf("deletedJobs = %v, want the entry-less Job rolled back", f.jobs.deletedJobs)
+			}
+			// The stale-secret sweep runs before the create, the rollback
+			// after it: the credential Secret is deleted twice in this path.
+			if len(f.jobs.deletedSecrets) != 2 ||
+				f.jobs.deletedSecrets[0] != "fm-task-1-cred" || f.jobs.deletedSecrets[1] != "fm-task-1-cred" {
+				t.Errorf("secret rollback: %v", f.jobs.deletedSecrets)
+			}
+			if _, ok := f.reg.Get("task-1"); ok && tc.name == "reclaimed" {
+				t.Error("reclaimed entry was resurrected")
+			}
+		})
 	}
 }
 

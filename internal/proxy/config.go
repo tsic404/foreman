@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tsic404/foreman/internal/scheduler"
 )
 
 // Environment variable names from the contract config table (§5.1).
@@ -105,8 +107,9 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	}
 	// The server-side prepare lease is 45s (§1.1 C3); refreshing slower
 	// guarantees duplicate dispatch.
-	if cfg.LeaseRefreshInterval >= 45*time.Second {
-		return Config{}, fmt.Errorf("%s must be < 45s (server prepare lease), got %s", EnvLeaseRefreshInterval, cfg.LeaseRefreshInterval)
+	if cfg.LeaseRefreshInterval >= scheduler.PrepareLeaseTTL {
+		return Config{}, fmt.Errorf("%s must be < %s (server prepare lease), got %s",
+			EnvLeaseRefreshInterval, scheduler.PrepareLeaseTTL, cfg.LeaseRefreshInterval)
 	}
 	if raw := strings.TrimSpace(getenv(EnvWSEnabled)); raw != "" {
 		b, perr := strconv.ParseBool(raw)

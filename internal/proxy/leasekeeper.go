@@ -72,7 +72,19 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 		ready, err := k.client.PrepareLease(ctx, e.TaskID)
 		switch {
 		case err == nil && ready:
-			if k.now().After(e.BootDeadline) {
+			// The renewal restamped the server's lease: project the new
+			// deadline (contract §3.1) and emit the observation line
+			// protocol-lease.md 场景 A judges. Info, not debug: that line
+			// carries no level prefix there, i.e. it is read at the design's
+			// default level — unlike daemon.heartbeat, whose debug level the
+			// same file states explicitly.
+			now := k.now()
+			until := now.Add(scheduler.PrepareLeaseTTL)
+			k.reg.SetLeaseKeepUntil(e.TaskID, until)
+			k.log.Info("lease.renewed",
+				"task_id", e.TaskID, "job_name", e.JobName,
+				"lease_keep_until", registry.ProjectedTime(until))
+			if now.After(e.BootDeadline) {
 				if herr := k.hooks.OnBootTimeout(ctx, e.TaskID); herr != nil {
 					k.log.Error("boot-timeout settlement failed", "task_id", e.TaskID, "err", herr)
 				}

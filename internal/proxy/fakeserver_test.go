@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
@@ -722,6 +723,8 @@ func TestS20GCCheckForwarded(t *testing.T) {
 
 func TestS7PrepareLeaseForwardsC4(t *testing.T) {
 	rig := newTestRig(t)
+	var buf bytes.Buffer
+	rig.handler.(*FakeServer).log = slog.New(slog.NewJSONHandler(&buf, nil)).With("component", "fake-server")
 	rig.claimTask(t, "t-lease")
 	tok := rig.token(t, "t-lease")
 	jobRID := rig.registerDaemon(t, "t-lease", tok)
@@ -729,13 +732,50 @@ func TestS7PrepareLeaseForwardsC4(t *testing.T) {
 	rig.stub.on("POST", "/api/daemon/runtimes/rid-real/tasks/t-lease/prepare-lease", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
 		writeJSONStub(w, 200, map[string]string{"status": "ok"})
 	})
+	before, ok := rig.reg.Get("t-lease")
+	if !ok {
+		t.Fatal("entry missing after claim")
+	}
+	start := time.Now()
 	code, body := rig.call(t, "POST", "/api/daemon/runtimes/"+jobRID+"/tasks/t-lease/prepare-lease", tok, []byte(`{}`))
+	end := time.Now()
 	if code != 200 || string(body) != `{"status":"ok"}` {
 		t.Fatalf("S7 = %d %s", code, body)
 	}
 	// C4 ran in the foreground against the REAL runtime id.
 	if got := len(rig.stub.calls("POST", "/api/daemon/runtimes/rid-real/tasks/t-lease/prepare-lease")); got != 1 {
 		t.Fatalf("C4 calls = %d, want 1 (real runtime id)", got)
+	}
+	// S7's local renewal bookkeeping (proxy.md §请求路由): the daemon's
+	// renewal restamped the server lease, so lease_keep_until (§3.1) moves to
+	// the renewal moment plus the 45s TTL.
+	after, ok := rig.reg.Get("t-lease")
+	if !ok {
+		t.Fatal("entry missing after S7")
+	}
+	lo, hi := start.Add(scheduler.PrepareLeaseTTL), end.Add(scheduler.PrepareLeaseTTL)
+	if after.LeaseKeepUntil.Before(lo) || after.LeaseKeepUntil.After(hi) {
+		t.Errorf("lease_keep_until = %v, want within [%v, %v]", after.LeaseKeepUntil, lo, hi)
+	}
+	if !after.LeaseKeepUntil.After(before.LeaseKeepUntil) {
+		t.Errorf("S7 left lease_keep_until unadvanced: before %v, after %v",
+			before.LeaseKeepUntil, after.LeaseKeepUntil)
+	}
+	// S7 leaves the same Info observation line the keeper does
+	// (protocol-lease.md 场景 A): one record per renewal, at a level the
+	// default handler admits.
+	records := logRecords(t, buf.Bytes(), "lease.renewed")
+	if len(records) != 1 {
+		t.Fatalf("lease.renewed records = %d, want 1", len(records))
+	}
+	if got := records[0]["level"]; got != "INFO" {
+		t.Errorf("lease.renewed level = %v, want INFO", got)
+	}
+	if got := records[0]["job_name"]; got != "fm-t-lease" {
+		t.Errorf("lease.renewed job_name = %v, want fm-t-lease", got)
+	}
+	if got, want := records[0]["lease_keep_until"], projectedLeaseKeepUntil(t, after); got != want {
+		t.Errorf("lease.renewed lease_keep_until = %v, projection = %v", got, want)
 	}
 }
 

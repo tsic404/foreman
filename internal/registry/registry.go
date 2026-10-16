@@ -165,6 +165,23 @@ func (r *Registry) SetLastStatusSeen(taskID, status string) {
 	}
 }
 
+// SetLeaseKeepUntil records the task's current prepare-lease deadline
+// (contract §3.1 lease_keep_until): the last successful C4 renewal plus the
+// server's 45s lease TTL. The value is a local upper bound of the server's
+// own prepare_lease_expires_at — it is projected with Foreman's clock and
+// taken after the renewal response returns (local round trip/2 + clock
+// drift), so it never trails the server's expiry. In-place, like
+// SetLastStatusSeen: callers holding a pre-network snapshot must never Put
+// it back wholesale.
+func (r *Registry) SetLeaseKeepUntil(taskID string, until time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.live[taskID]; ok {
+		e.LeaseKeepUntil = until
+		r.live[taskID] = e
+	}
+}
+
 // List returns a snapshot of all live entries, including terminal ones
 // whose K8s cleanup has not finished yet.
 func (r *Registry) List() []TaskEntry {
@@ -247,6 +264,28 @@ func (r *Registry) SetTokenHash(taskID, tokenHash string) {
 	}
 	e.TokenHash = tokenHash
 	r.live[taskID] = e
+}
+
+// MarkJobCreated advances pending → job_created and records the apiserver's
+// creationTimestamp as job_created_at (contract §3.1: the pod instance
+// filter's basis, never a local clock reading). It writes in place — the
+// claim's snapshot predates the Job create, which can wait up to jobNameWait
+// on a name still held by a terminating predecessor, so re-Putting that
+// snapshot would revert a prepare-lease renewal the LeaseKeeper landed in
+// the window (lost update). Returns false once the entry is gone or settled.
+func (r *Registry) MarkJobCreated(taskID string, at time.Time) (TaskEntry, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.live[taskID]
+	if !ok || e.State == StateTerminal {
+		return TaskEntry{}, false
+	}
+	if e.State == StatePending {
+		e.State = StateJobCreated
+	}
+	e.JobCreatedAt = at
+	r.live[taskID] = e
+	return e, true
 }
 
 // MarkDaemonRegistered advances job_created → daemon_registered on S4
