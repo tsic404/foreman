@@ -6,7 +6,7 @@
 package acceptance
 
 import (
-	"encoding/json"
+	"context"
 	"io"
 	"log/slog"
 	"testing"
@@ -22,55 +22,7 @@ func TestStartup04CommandDrivenRelayEndToEnd(t *testing.T) {
 	h.declare(declaredRuntimes())
 
 	const resultBody = `{"status":"completed","models":[{"id":"m1"}]}`
-	commandSeen := make(chan string, 1)
-	// The probe pod's daemon: register (S4), take the command from the S5 ack,
-	// then report it (S27). It runs off the CreateJob call so the scheduler's
-	// start path is not held up by the HTTP round trips.
-	h.jobs.onCreateJob = func(job *batchv1Job) {
-		name := job.Name
-		go func() {
-			token := h.builder.probeToken(name)
-			if token == "" {
-				return
-			}
-			code, body := h.call("POST", "/api/daemon/register", token, []byte(`{
-				"daemon_id": "`+name+`",
-				"cli_version": "0.6.1",
-				"runtimes": [{"name": "foreman-omp", "type": "omp", "version": "0.6.1"}]
-			}`))
-			if code != 200 {
-				t.Errorf("probe S4 = %d: %s", code, body)
-				return
-			}
-			session, ok := h.probes.ProbeByJob(name)
-			if !ok {
-				t.Errorf("probe session %s missing at S4", name)
-				return
-			}
-			code, body = h.call("POST", "/api/daemon/heartbeat", token,
-				[]byte(`{"runtime_id": "`+session.JobRuntime+`"}`))
-			if code != 200 {
-				t.Errorf("probe S5 = %d: %s", code, body)
-				return
-			}
-			var ack struct {
-				PendingModelList *struct {
-					ID string `json:"id"`
-				} `json:"pending_model_list"`
-			}
-			if err := json.Unmarshal(body, &ack); err != nil || ack.PendingModelList == nil {
-				t.Errorf("probe S5 ack carries no command: %s (%v)", body, err)
-				return
-			}
-			commandSeen <- ack.PendingModelList.ID
-			code, body = h.call("POST",
-				"/api/daemon/runtimes/"+session.JobRuntime+"/models/"+ack.PendingModelList.ID+"/result",
-				token, []byte(resultBody))
-			if code != 200 {
-				t.Errorf("probe S27 = %d: %s", code, body)
-			}
-		}()
-	}
+	commandSeen := h.serveProbeDaemon(t, resultBody)
 
 	logs := &writeBuffer{}
 	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.slots, h.metrics,
@@ -128,6 +80,111 @@ func TestStartup04CommandDrivenRelayEndToEnd(t *testing.T) {
 	}
 	if probes := h.probes.ListProbes(); len(probes) != 0 {
 		t.Errorf("the probe session must be removed at teardown: %+v", probes)
+	}
+}
+
+// TestStartup04CachedSlotAnswersThroughTheHeartbeatStream drives the command
+// path through the real C2 stream: the ack carries the server's pending request,
+// the slot of the *heartbeat's* runtime answers it, and the caller's request
+// completes without any probe Job. The ack body's runtime_id is shaped like the
+// real server's (absent, or naming another runtime) — the command must not be
+// re-keyed by it.
+func TestStartup04CachedSlotAnswersThroughTheHeartbeatStream(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		shape ackRuntimeIDShape
+	}{
+		{"ack without runtime_id", ackOmitsRuntimeID},
+		{"ack with a foreign runtime_id", ackForeignRuntimeID},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newHarness(t, true)
+			h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+			h.declare(declaredRuntimes())
+			h.upstream.setAckShape(tc.shape)
+			const cached = `{"status":"completed","models":[{"id":"m1"}]}`
+			h.slots.Put("rid-omp", []byte(cached), time.Now())
+			reporter := h.newReporter(t)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			// The command is pending before the first heartbeat, so the stream's
+			// first ack delivers it.
+			id := h.requestModelList(t, "rid-omp")
+			go func() { _ = proxy.NewHeartbeatLoop(h.client, reporter).Run(ctx) }()
+
+			h.waitModelCompleted(t, id)
+			relayed := h.upstream.calls("POST", "/api/daemon/runtimes/rid-omp/models/"+id+"/result")
+			if len(relayed) != 1 {
+				t.Fatalf("C21 calls = %d, want the cached body replayed exactly once", len(relayed))
+			}
+			if string(relayed[0].Body) != cached {
+				t.Errorf("C21 body = %s, want the cached bytes verbatim", relayed[0].Body)
+			}
+			if jobs := h.jobs.probeJobsCreated(); len(jobs) != 0 {
+				t.Errorf("probe Jobs = %v, want none for a cached slot", jobs)
+			}
+			h.waitCatalogMetrics(t, 1)
+			if codes := h.metrics.codes(); len(codes) != 1 || codes[0] != "200" {
+				t.Errorf("relay metric codes = %v, want one 200 (the replay's C21 answer)", codes)
+			}
+			if secs := h.metrics.seconds(); len(secs) != 1 || secs[0] > 1 {
+				t.Errorf("catalog seconds = %v, want the replay's near-zero duration (no probe round trip)", secs)
+			}
+		})
+	}
+}
+
+// TestStartup04EmptySlotRelaysThroughTheHeartbeatStream is the other half: an
+// empty slot falls back to a probe Job built in *command-driven* mode, and the
+// probe's result reaches the upstream as C21. A startup-discovery probe would
+// absorb the result locally (S27) and the caller's request would run into the
+// server's 60s window instead.
+func TestStartup04EmptySlotRelaysThroughTheHeartbeatStream(t *testing.T) {
+	h := newHarness(t, true)
+	h.useRealBuilder(t)
+	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+	h.declare(declaredRuntimes())
+	h.upstream.setAckShape(ackForeignRuntimeID)
+	const resultBody = `{"status":"completed","models":[{"id":"m1"}]}`
+	commands := h.serveProbeDaemon(t, resultBody)
+	reporter := h.newReporter(t)
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	id := h.requestModelList(t, "rid-omp")
+	go func() { _ = proxy.NewHeartbeatLoop(h.client, reporter).Run(ctx) }()
+
+	select {
+	case got := <-commands:
+		if got != id {
+			t.Fatalf("probe was handed command %q, want the ack's id verbatim", got)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("the probe daemon never received a command (S5 delivery)")
+	}
+	h.waitModelCompleted(t, id)
+	relayed := h.upstream.calls("POST", "/api/daemon/runtimes/rid-omp/models/"+id+"/result")
+	if len(relayed) != 1 || string(relayed[0].Body) != resultBody {
+		t.Fatalf("C21 calls = %d (%s), want the probe's bytes relayed verbatim once", len(relayed), relayed)
+	}
+	// The probe session must be command-driven and bound to the heartbeat's
+	// runtime: a startup-discovery session would absorb the result locally.
+	jobs := h.jobs.probeJobsCreated()
+	if len(jobs) != 1 {
+		t.Fatalf("probe Jobs = %v, want exactly one", jobs)
+	}
+	session, ok := h.probes.ProbeByJob(jobs[0])
+	if !ok {
+		t.Fatalf("probe session %s missing", jobs[0])
+	}
+	if session.SelfMintedID != "" || session.RequestID != id || session.RealRuntimeID != "rid-omp" {
+		t.Fatalf("probe session = {self_minted:%q request:%q real_runtime:%q}, want a command-driven session bound to rid-omp",
+			session.SelfMintedID, session.RequestID, session.RealRuntimeID)
+	}
+	h.waitCatalogMetrics(t, 1)
+	if codes := h.metrics.codes(); len(codes) != 1 || codes[0] != "200" {
+		t.Errorf("relay metric codes = %v, want one 200 (the relayed C21 answer)", codes)
 	}
 }
 
