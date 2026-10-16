@@ -20,6 +20,9 @@ const (
 	EnvClaimIntervalIdle    = "FOREMAN_CLAIM_INTERVAL_IDLE"
 	EnvLeaseRefreshInterval = "FOREMAN_LEASE_REFRESH_INTERVAL"
 	EnvWSEnabled            = "FOREMAN_WS_ENABLED"
+	EnvModelCatalogEnabled  = "FOREMAN_MODEL_CATALOG_ENABLED"
+	EnvModelCatalogTimeout  = "FOREMAN_MODEL_CATALOG_TIMEOUT"
+	EnvModelCatalogCacheTTL = "FOREMAN_MODEL_CATALOG_CACHE_TTL"
 )
 
 // Contract defaults (§5.1).
@@ -31,6 +34,13 @@ const (
 	DefaultClaimIntervalIdle    = 30 * time.Second
 	DefaultLeaseRefreshInterval = 15 * time.Second
 	DefaultWSEnabled            = true
+	DefaultModelCatalogEnabled  = true
+	DefaultModelCatalogTimeout  = 45 * time.Second
+	DefaultModelCatalogCacheTTL = 6 * time.Hour
+
+	// ProbeHeartbeatInterval is the fixed heartbeat interval written into the
+	// catalog probe env; the startup self-check ties ModelCatalogTimeout to it.
+	ProbeHeartbeatInterval = 15 * time.Second
 
 	// ClientCapabilities is the verbatim X-Client-Capabilities header value;
 	// adding or dropping an entry changes server response shapes (§1.1).
@@ -47,18 +57,25 @@ type Config struct {
 	ServerURL   string // MULTICA_SERVER_URL, no trailing slash
 	WorkspaceID string // MULTICA_WORKSPACE_ID
 	DaemonID    string // FOREMAN_DAEMON_ID
-	// Version is sent as X-Client-Version / cli_version; build-time stamped.
+	// Version is sent as X-Client-Version before the startup probe registers,
+	// and for the process identity (§1.1). After C1 it is superseded by the
+	// startup discovery's cli_version (the template CLI's real version).
 	Version string
-	// RuntimeName/RuntimeType/RuntimeVersion describe the single runtime
-	// Foreman registers (C1); the type field pins the omp provider contract.
-	RuntimeName    string
-	RuntimeType    string
-	RuntimeVersion string
 
 	ClaimInterval        time.Duration
 	ClaimIntervalIdle    time.Duration
 	LeaseRefreshInterval time.Duration
 	WSEnabled            bool
+
+	// ModelCatalogEnabled is the path-level switch of the model catalog route
+	// (ack → probe → C21); false disables consumption but not the startup probe.
+	ModelCatalogEnabled bool
+	// ModelCatalogTimeout is one catalog probe's own budget, anchored at the
+	// moment the ack is consumed (§1.1 C21 第 6 条).
+	ModelCatalogTimeout time.Duration
+	// ModelCatalogCacheTTL is the catalog cache staleness threshold: crossing
+	// it only logs a warning, it never stops answering (§5.1).
+	ModelCatalogCacheTTL time.Duration
 }
 
 // LoadConfig reads the proxy configuration from env (os.Getenv when getenv
@@ -71,13 +88,13 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	cfg := Config{
 		DaemonID:             DefaultDaemonID,
 		Version:              "dev",
-		RuntimeName:          "foreman-omp",
-		RuntimeType:          "omp",
-		RuntimeVersion:       "unknown",
 		ClaimInterval:        DefaultClaimInterval,
 		ClaimIntervalIdle:    DefaultClaimIntervalIdle,
 		LeaseRefreshInterval: DefaultLeaseRefreshInterval,
 		WSEnabled:            DefaultWSEnabled,
+		ModelCatalogEnabled:  DefaultModelCatalogEnabled,
+		ModelCatalogTimeout:  DefaultModelCatalogTimeout,
+		ModelCatalogCacheTTL: DefaultModelCatalogCacheTTL,
 	}
 
 	cfg.ServerURL = strings.TrimRight(strings.TrimSpace(getenv(EnvServerURL)), "/")
@@ -117,6 +134,29 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("%s must be a boolean: %v", EnvWSEnabled, perr)
 		}
 		cfg.WSEnabled = b
+	}
+	if raw := strings.TrimSpace(getenv(EnvModelCatalogEnabled)); raw != "" {
+		b, perr := strconv.ParseBool(raw)
+		if perr != nil {
+			return Config{}, fmt.Errorf("%s must be a boolean: %v", EnvModelCatalogEnabled, perr)
+		}
+		cfg.ModelCatalogEnabled = b
+	}
+	if cfg.ModelCatalogTimeout, err = envDuration(getenv, EnvModelCatalogTimeout, cfg.ModelCatalogTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.ModelCatalogCacheTTL, err = envDuration(getenv, EnvModelCatalogCacheTTL, cfg.ModelCatalogCacheTTL); err != nil {
+		return Config{}, err
+	}
+	// §5.1 startup self-check: probeMinBudget (= timeout/3) must cover one
+	// heartbeat period, otherwise a probe started on the minimum budget can
+	// never receive its command before the budget runs out.
+	if cfg.ModelCatalogTimeout < 3*ProbeHeartbeatInterval {
+		return Config{}, fmt.Errorf("%s must be >= 3x the probe heartbeat interval (%s), got %s",
+			EnvModelCatalogTimeout, ProbeHeartbeatInterval, cfg.ModelCatalogTimeout)
+	}
+	if cfg.ModelCatalogCacheTTL <= 0 {
+		return Config{}, fmt.Errorf("%s must be positive", EnvModelCatalogCacheTTL)
 	}
 	return cfg, nil
 }

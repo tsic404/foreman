@@ -105,6 +105,24 @@ spec:
               value: "86400"
             - name: FOREMAN_RECONCILE_INTERVAL
               value: "30s"
+            # --- catalog probe / model catalog route (ADR-019 / ADR-025) ---
+            # Path-level switch (ack → probe → C21); false stops consuming the
+            # server's commands but keeps the startup probe (list/version truth
+            # and the template preflight).
+            - name: FOREMAN_MODEL_CATALOG_ENABLED
+              value: "true"
+            # One catalog probe's own budget, anchored at the moment the ack is
+            # consumed; must stay >= 3x the probe heartbeat interval (45s).
+            - name: FOREMAN_MODEL_CATALOG_TIMEOUT
+              value: "45s"
+            # Catalog cache staleness threshold: crossing it only warns, it
+            # never stops answering.
+            - name: FOREMAN_MODEL_CATALOG_CACHE_TTL
+              value: "6h"
+            # Startup probe window: the first probe must register within it or
+            # Foreman exits non-zero (default = FOREMAN_JOB_BOOT_TIMEOUT).
+            - name: FOREMAN_STARTUP_PROBE_TIMEOUT
+              value: "300s"
             - name: FOREMAN_JOB_TTL_SECONDS
               value: "600"
             # --- node-local state (ADR-005) ---

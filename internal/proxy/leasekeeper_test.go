@@ -14,15 +14,18 @@ import (
 	"github.com/tsic404/foreman/internal/scheduler"
 )
 
-// fakeLeaseClient programs PrepareLease answers per task.
+// fakeLeaseClient programs PrepareLease answers per task and records the
+// runtime each renewal was addressed to.
 type fakeLeaseClient struct {
-	calls []string
-	ready map[string]bool
-	err   map[string]error
+	calls    []string
+	runtimes []string
+	ready    map[string]bool
+	err      map[string]error
 }
 
-func (f *fakeLeaseClient) PrepareLease(_ context.Context, taskID string) (bool, error) {
+func (f *fakeLeaseClient) PrepareLease(_ context.Context, runtimeID, taskID string) (bool, error) {
 	f.calls = append(f.calls, taskID)
+	f.runtimes = append(f.runtimes, runtimeID)
 	if err := f.err[taskID]; err != nil {
 		return false, err
 	}
@@ -53,14 +56,15 @@ func (f *fakeLeaseHooks) OnTaskVanished(_ context.Context, taskID string) error 
 
 func leaseEntry(taskID string, state registry.State, started bool, deadline time.Time) registry.TaskEntry {
 	e := registry.TaskEntry{
-		TaskID:       taskID,
-		WorkspaceID:  "ws-1",
-		JobName:      "fm-" + taskID,
-		DaemonID:     "fm-" + taskID,
-		State:        state,
-		ClaimedAt:    deadline.Add(-time.Minute),
-		BootDeadline: deadline,
-		Payload:      json.RawMessage(`{"id":"` + taskID + `"}`),
+		TaskID:        taskID,
+		WorkspaceID:   "ws-1",
+		JobName:       "fm-" + taskID,
+		DaemonID:      "fm-" + taskID,
+		RealRuntimeID: "rt-real",
+		State:         state,
+		ClaimedAt:     deadline.Add(-time.Minute),
+		BootDeadline:  deadline,
+		Payload:       json.RawMessage(`{"id":"` + taskID + `"}`),
 	}
 	if started {
 		e.StartedAt = deadline.Add(-time.Minute)

@@ -21,7 +21,7 @@ import (
 // test can read (the fixture discards logs).
 func newLoggingScheduler(t *testing.T, f *fixture, logw io.Writer) *Scheduler {
 	t.Helper()
-	cfg, err := LoadConfig(envFrom(map[string]string{}))
+	cfg, err := LoadConfig(testEnv(nil))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
@@ -29,6 +29,7 @@ func newLoggingScheduler(t *testing.T, f *fixture, logw io.Writer) *Scheduler {
 		WithClock(func() time.Time { return f.now }),
 		WithPendingReports(&fakePendingReports{}),
 		WithRevoker(f.revoker),
+		WithProbeRegistry(registry.NewProbeRegistry()),
 		WithLogger(slog.New(slog.NewJSONHandler(logw, nil))),
 	)
 	if err != nil {

@@ -68,6 +68,12 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, auth.HTTPStatus(err), "unauthorized")
 		return
 	}
+	if claims.Role == catalogProbeRole {
+		// S30 is not open to probes: a probe heartbeats over HTTP only, and a
+		// 404 is the daemon's expected answer (§5.1 探针不消费).
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
 	entry, ok := h.reg.ByDaemon(claims.JobName)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")

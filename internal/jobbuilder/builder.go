@@ -1,5 +1,6 @@
 // Package jobbuilder renders a TaskEntry into the Job and credential Secret
-// the scheduler creates. A deployment may supply a complete Job template
+// the scheduler creates, and the catalog-probe Job with its own credential
+// (ADR-019). A deployment may supply a complete Job template
 // (ConfigMap job-overlay.yaml); Foreman uses it verbatim apart from its own
 // writes — the A1.1 env keys, the per-task metadata and the §3.2 key set.
 // Design: docs/05-modules/job-template.md, contracts §3.2/§5.2,
@@ -41,6 +42,10 @@ type TaskEntry struct {
 // (ADR-017), so the token itself never travels past the Secret.
 type TokenIssuer interface {
 	Issue(jobName, taskID, workspaceID string, ttl time.Duration) (string, error)
+	// IssueProbe signs a catalog probe's Job Token (ADR-019): the same
+	// mechanism with a role-marked payload and no task id. requestID is part
+	// of the call's parity with the probe's Start, not of the payload.
+	IssueProbe(jobName, requestID, workspaceID string, ttl time.Duration) (string, error)
 	Hash(token string) string
 }
 

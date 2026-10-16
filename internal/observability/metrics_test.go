@@ -134,3 +134,23 @@ func TestMetricsIsolatedRegistries(t *testing.T) {
 		t.Fatal("metrics instances share registry state")
 	}
 }
+
+// TestModelCatalogRelaySeries records the catalog relay metric: the outcome
+// code is the label and the span lands in the histogram (ADR-019 / ADR-025).
+func TestModelCatalogRelaySeries(t *testing.T) {
+	m := NewMetrics()
+	m.ModelCatalogRelay("200", 1.5)
+	m.ModelCatalogRelay("none", 0.2)
+	out := scrape(t, m)
+	for _, want := range []string{
+		`foreman_model_catalog_relays_total{code="200"} 1`,
+		`foreman_model_catalog_relays_total{code="none"} 1`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing %s in exposition", want)
+		}
+	}
+	if !strings.Contains(out, "foreman_model_catalog_seconds_count 2") {
+		t.Fatalf("catalog span histogram missing: %s", out)
+	}
+}

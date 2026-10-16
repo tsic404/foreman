@@ -69,6 +69,10 @@ const (
 	// §转发). Permanent by that switch, so the task cannot run under this
 	// claim and is settled failed instead of being re-dispatched.
 	FailureReasonStaleClaim = "stale_claim"
+	// FailureReasonDaemonNotRegistered is the S4 refusal: the Job's daemon
+	// declared no runtime for the provider its claim was dispatched under, so
+	// the task is settled instead of waiting out the boot deadline (§1.2 S4).
+	FailureReasonDaemonNotRegistered = "daemon_not_registered"
 )
 
 // Credential-reclaim reasons (ADR-017): the drain window closed because the
@@ -113,6 +117,9 @@ type claimHead struct {
 	// PriorSessionID locates the session this task resumes; it is the soft
 	// affinity key source and belongs to no trigger context (ADR-015).
 	PriorSessionID string `json:"prior_session_id"`
+	// RuntimeID is the real runtime the server dispatched the claim under:
+	// it fixes the Job's provider and addresses C4/C19 (ADR-025).
+	RuntimeID string `json:"runtime_id"`
 }
 
 // keyedMutex serializes the per-task state transitions: two concurrent
@@ -218,6 +225,7 @@ type Scheduler struct {
 	metrics Metrics
 	log     *slog.Logger
 
+	probes         *registry.ProbeRegistry
 	reconciler     Reconciler
 	pendingReports PendingReports
 	now            func() time.Time
@@ -265,6 +273,11 @@ func New(cfg Config, reg *registry.Registry, jobs JobClient, builder JobBuilder,
 	// face.
 	if s.revoker == nil {
 		return nil, errors.New("job token revoker is required")
+	}
+	// The catalog probe's identity, command delivery and result routing all
+	// live in the probe session table; without it a probe could never register.
+	if s.probes == nil {
+		return nil, errors.New("probe session table is required")
 	}
 	return s, nil
 }
@@ -413,6 +426,9 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		// Memory-only: the session key of the Built Job's affinity item
 		// (ADR-015) — never annotated, never projected.
 		PriorSessionID: head.PriorSessionID,
+		// Memory-only: the runtime the server dispatched this claim under,
+		// which addresses C4/C19 and the S8 body translation (ADR-025).
+		RealRuntimeID: head.RuntimeID,
 	}
 	if err := s.reg.Put(e); err != nil {
 		return fmt.Errorf("register task %s: %w", e.TaskID, err)
@@ -1346,6 +1362,12 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 func (s *Scheduler) Reconcile(ctx context.Context) error {
 	s.RefreshNodeSaturation(ctx)
 	s.SyncInflight()
+	// Round-level action, independent of the entry list (failure-handling
+	// scenario #17): probe remnants are found by their labels, not by the
+	// session table, which is empty after a restart.
+	if err := s.SweepStaleProbes(ctx); err != nil {
+		s.log.WarnContext(ctx, "probe sweep failed", "err", err)
+	}
 	if s.reconciler != nil {
 		return s.reconciler.Reconcile(ctx)
 	}
@@ -1372,6 +1394,13 @@ func (s *Scheduler) Rebuild(ctx context.Context) error {
 	}
 	rebuilt := 0
 	for _, job := range jobs {
+		// The task-Job predicate is managed-by ∧ task-id (contract §1.3): a
+		// catalog-probe Job carries no task-id and must never become a
+		// payload-less pseudo entry.
+		if _, ok := job.GetLabels()[registry.LabelTaskID]; !ok {
+			s.log.DebugContext(ctx, "skip non-task job", "job_name", job.GetName())
+			continue
+		}
 		e, err := registry.TaskEntryFromJob(job)
 		if err != nil {
 			s.log.ErrorContext(ctx, "skip malformed job", "job_name", job.GetName(), "err", err)

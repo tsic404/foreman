@@ -17,6 +17,14 @@ const (
 	EnvClaimBatchMax   = "FOREMAN_CLAIM_BATCH_MAX"
 	EnvJobBootTimeout  = "FOREMAN_JOB_BOOT_TIMEOUT"
 	EnvJobDrainTimeout = "FOREMAN_JOB_DRAIN_TIMEOUT"
+	EnvWorkspaceID     = "MULTICA_WORKSPACE_ID"
+	// EnvStartupProbeTimeout names the startup probe window; the design fixes
+	// its semantics (one Job-boot magnitude) but leaves the key to the
+	// implementation (§5.1).
+	EnvStartupProbeTimeout = "FOREMAN_STARTUP_PROBE_TIMEOUT"
+	EnvModelCatalogEnabled = "FOREMAN_MODEL_CATALOG_ENABLED"
+	EnvModelCatalogTimeout = "FOREMAN_MODEL_CATALOG_TIMEOUT"
+	EnvReconcileInterval   = "FOREMAN_RECONCILE_INTERVAL"
 )
 
 // Contract defaults (§5.1).
@@ -30,6 +38,14 @@ const (
 	// deployment that raises its template's terminationGracePeriodSeconds
 	// must raise this too.
 	DefaultJobDrainTimeout = 120 * time.Second
+	// DefaultModelCatalogTimeout is one catalog probe's own budget (§5.1).
+	DefaultModelCatalogTimeout = 45 * time.Second
+	// DefaultModelCatalogEnabled keeps the catalog route on unless a
+	// deployment turns it off explicitly (§5.1).
+	DefaultModelCatalogEnabled = true
+	// DefaultReconcileInterval is the convergence cadence (§5.1); the probe
+	// sweep grace is derived from it.
+	DefaultReconcileInterval = 30 * time.Second
 
 	// serverClaimBatchCap is the server-side claim batch ceiling
 	// (contract §1.1 C3: max_tasks > 32 is truncated to 32).
@@ -53,6 +69,22 @@ type Config struct {
 	// credential reclaim (ADR-017). Zero means "do not wait": the reclaim
 	// still lands on the next observation point.
 	JobDrainTimeout time.Duration
+	// WorkspaceID is the workspace the probe Job Token is bound to
+	// (MULTICA_WORKSPACE_ID); the catalog probe has no task to carry it.
+	WorkspaceID string
+	// StartupProbeTimeout is the startup probe's wait window: the first probe
+	// must register within it or Foreman exits non-zero (§5.1 启动探针窗口,
+	// default = JobBootTimeout — one "schedule + pull + register" magnitude).
+	StartupProbeTimeout time.Duration
+	// ModelCatalogEnabled is the catalog route's path-level switch; with it
+	// off the startup orchestration completes as soon as S4 registered.
+	ModelCatalogEnabled bool
+	// ModelCatalogTimeout is one catalog probe's own budget: the probe sweep
+	// grace is derived from it (§5.1 FOREMAN_MODEL_CATALOG_TIMEOUT).
+	ModelCatalogTimeout time.Duration
+	// ReconcileInterval is the convergence cadence; the probe sweep grace
+	// covers one round on each side (FOREMAN_RECONCILE_INTERVAL).
+	ReconcileInterval time.Duration
 }
 
 // LoadConfig reads the scheduler configuration from env (os.Getenv when
@@ -62,12 +94,15 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		getenv = os.Getenv
 	}
 	cfg := Config{
-		JobNamespace:    jobbuilder.DefaultJobNamespace,
-		MaxJobsPerNode:  DefaultMaxJobsPerNode,
-		MaxInflightJobs: DefaultMaxInflightJobs,
-		ClaimBatchMax:   DefaultClaimBatchMax,
-		JobBootTimeout:  DefaultJobBootTimeout,
-		JobDrainTimeout: DefaultJobDrainTimeout,
+		JobNamespace:        jobbuilder.DefaultJobNamespace,
+		MaxJobsPerNode:      DefaultMaxJobsPerNode,
+		MaxInflightJobs:     DefaultMaxInflightJobs,
+		ClaimBatchMax:       DefaultClaimBatchMax,
+		JobBootTimeout:      DefaultJobBootTimeout,
+		JobDrainTimeout:     DefaultJobDrainTimeout,
+		ModelCatalogEnabled: DefaultModelCatalogEnabled,
+		ModelCatalogTimeout: DefaultModelCatalogTimeout,
+		ReconcileInterval:   DefaultReconcileInterval,
 	}
 
 	if v := strings.TrimSpace(getenv(jobbuilder.EnvJobNamespace)); v != "" {
@@ -122,6 +157,49 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("%s must be >= 0, got %s", EnvJobDrainTimeout, d)
 		}
 		cfg.JobDrainTimeout = d
+	}
+	if cfg.WorkspaceID = strings.TrimSpace(getenv(EnvWorkspaceID)); cfg.WorkspaceID == "" {
+		return Config{}, fmt.Errorf("%s is required", EnvWorkspaceID)
+	}
+	// The startup window defaults to the task Job's boot bound: the same
+	// "schedule + pull + register" magnitude, with no second magic number.
+	cfg.StartupProbeTimeout = cfg.JobBootTimeout
+	if raw := strings.TrimSpace(getenv(EnvStartupProbeTimeout)); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be a duration: %v", EnvStartupProbeTimeout, err)
+		}
+		if d <= 0 {
+			return Config{}, fmt.Errorf("%s must be positive, got %s", EnvStartupProbeTimeout, d)
+		}
+		cfg.StartupProbeTimeout = d
+	}
+	if raw := strings.TrimSpace(getenv(EnvModelCatalogEnabled)); raw != "" {
+		b, err := strconv.ParseBool(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be a boolean: %v", EnvModelCatalogEnabled, err)
+		}
+		cfg.ModelCatalogEnabled = b
+	}
+	if raw := strings.TrimSpace(getenv(EnvModelCatalogTimeout)); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be a duration: %v", EnvModelCatalogTimeout, err)
+		}
+		if d <= 0 {
+			return Config{}, fmt.Errorf("%s must be positive, got %s", EnvModelCatalogTimeout, d)
+		}
+		cfg.ModelCatalogTimeout = d
+	}
+	if raw := strings.TrimSpace(getenv(EnvReconcileInterval)); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be a duration: %v", EnvReconcileInterval, err)
+		}
+		if d <= 0 {
+			return Config{}, fmt.Errorf("%s must be positive, got %s", EnvReconcileInterval, d)
+		}
+		cfg.ReconcileInterval = d
 	}
 	return cfg, nil
 }

@@ -82,7 +82,8 @@ func setupIntegrationWithMetrics(t *testing.T, server *fakeServerClient, dir str
 	sched, err := scheduler.New(schedConfig(), reg, jobs, stubBuilder{}, server, metrics,
 		scheduler.WithReconciler(lb),
 		scheduler.WithPendingReports(pending),
-		scheduler.WithRevoker(revoker))
+		scheduler.WithRevoker(revoker),
+		scheduler.WithProbeRegistry(registry.NewProbeRegistry()))
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
 	}
@@ -517,6 +518,13 @@ func (stubBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, 
 	return &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: fakeJobName(e.TaskID)}},
 		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: fakeJobName(e.TaskID) + "-cred"}},
 		"hash-of-" + e.TaskID, nil
+}
+
+func (stubBuilder) BuildCatalogProbe(requestID, _, _ string, _ time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
+	name := "fm-catalog-" + requestID
+	return &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name + "-cred"}},
+		"hash-of-" + name, nil
 }
 
 // fakeRevoker records the digests the credential reclaim feeds to the Job

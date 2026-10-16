@@ -16,12 +16,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
 )
 
-// Client is the fake client: every F→S call of §1.1 (C1–C19). It injects
+// Client is the fake client: every F→S call of §1.1 (C1–C21). It injects
 // the daemon identity headers and Foreman's server credential, caches the
-// registered real runtime, and owns the terminal-forward retry budget.
+// declared real runtime set, and owns the terminal-forward retry budget.
 type Client struct {
 	cfg     Config
 	token   string
@@ -31,21 +32,31 @@ type Client struct {
 	metrics Metrics
 	log     *slog.Logger
 
+	// startup stages the startup discovery result by provider until C1 binds
+	// it; slots is the per-real-runtime catalog cache (C21).
+	startup *registry.StartupCatalog
+	slots   *CatalogSlots
+	// taskRuntime resolves the real runtime id a task was dispatched under,
+	// which the S8 body needs (§1.2 S8).
+	taskRuntime func(taskID string) string
+
 	mu           sync.RWMutex
-	runtimeID    string
+	disc         registry.Discovery
+	refs         []RuntimeRef
 	repos        json.RawMessage
 	reposVersion string
 	workspace    string // workspace display name from C17
 
-	// runtimeLost records that a 404 "runtime not found" proved the runtime
-	// row deleted (§1.1 failure table); it survives a failed re-register so
-	// the next successful Register is still treated as a rebuild (C15 +
-	// runtime-set signal).
-	runtimeLost bool
+	// lost records, per provider, that a 404 "runtime not found" proved that
+	// row deleted and its re-register failed (§1.1 failure table); it survives
+	// so the next successful C1 still treats that runtime as rebuilt (C15 +
+	// runtime-set signal) — and only that one.
+	lost map[string]bool
 
 	terminalWaits []time.Duration // §4 terminal retry budget
+	relayWaits    []time.Duration // §1.1 C21 relay budget progression (tests)
 
-	runtimeSetCh chan struct{} // cap 1: real runtime replaced → WS reconnect
+	changes chan RuntimeChange // runtime set moved → per-runtime WS reconnect
 }
 
 // Option customizes a Client.
@@ -64,6 +75,12 @@ func WithLogger(l *slog.Logger) Option {
 // WithTerminalRetryWaits overrides the §4 terminal retry budget (tests).
 func WithTerminalRetryWaits(waits []time.Duration) Option {
 	return func(c *Client) { c.terminalWaits = waits }
+}
+
+// WithRelayBackoff overrides the §1.1 C21 relay backoff progression (tests);
+// the production progression is the §4 1s→30s one.
+func WithRelayBackoff(waits []time.Duration) Option {
+	return func(c *Client) { c.relayWaits = waits }
 }
 
 // NewClient builds the fake client. token is Foreman's server credential
@@ -87,27 +104,23 @@ func NewClient(cfg Config, token string, opts ...Option) *Client {
 		log:     slog.Default().With("component", "proxy-client"),
 
 		terminalWaits: terminalRetryWaits,
-		runtimeSetCh:  make(chan struct{}, 1),
+		changes:       make(chan RuntimeChange, 16),
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
+	if c.startup == nil {
+		c.startup = registry.NewStartupCatalog()
+	}
+	if c.slots == nil {
+		c.slots = NewCatalogSlots()
+	}
 	return c
 }
 
-// RuntimeSet returns the channel that receives a signal whenever the real
-// runtime id is replaced (404 → re-register); WSSubscriber reconnects on it.
-func (c *Client) RuntimeSet() <-chan struct{} { return c.runtimeSetCh }
-
-// RuntimeID returns the cached real runtime id ("" before C1).
-func (c *Client) RuntimeID() string {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.runtimeID
-}
-
 // Registration returns the cached C1 response fields the fake server hands
-// to Job daemons (S2/S4): repos verbatim plus repos_version.
+// to Job daemons (S2/S4): repos verbatim plus repos_version. Both are empty in
+// the pre-C1 window, which is what S2 must answer then (§1.2 S2).
 func (c *Client) Registration() (repos json.RawMessage, reposVersion string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -125,19 +138,20 @@ func (c *Client) Workspace() (id, name string) {
 	return c.cfg.WorkspaceID, c.workspace
 }
 
-// ---- C1 register / ensureRuntime ----
+// ---- C1 register (runtime.go) ----
 
 // registerRequest is the C1 body (§1.1; field names strict, type not
-// provider, legacy_daemon_ids empty).
+// provider, legacy_daemon_ids empty). failed_profiles travels verbatim from
+// the startup probe's registration body — Foreman never interprets it.
 type registerRequest struct {
-	WorkspaceID     string           `json:"workspace_id"`
-	DaemonID        string           `json:"daemon_id"`
-	LegacyDaemonIDs []string         `json:"legacy_daemon_ids"`
-	DeviceName      string           `json:"device_name"`
-	CLIVersion      string           `json:"cli_version"`
-	LaunchedBy      string           `json:"launched_by"`
-	Runtimes        []runtimePayload `json:"runtimes"`
-	FailedProfiles  []string         `json:"failed_profiles"`
+	WorkspaceID     string            `json:"workspace_id"`
+	DaemonID        string            `json:"daemon_id"`
+	LegacyDaemonIDs []string          `json:"legacy_daemon_ids"`
+	DeviceName      string            `json:"device_name"`
+	CLIVersion      string            `json:"cli_version"`
+	LaunchedBy      string            `json:"launched_by"`
+	Runtimes        []runtimePayload  `json:"runtimes"`
+	FailedProfiles  []json.RawMessage `json:"failed_profiles"`
 }
 
 type runtimePayload struct {
@@ -149,68 +163,10 @@ type runtimePayload struct {
 }
 
 type registerResponse struct {
-	Runtimes []struct {
-		ID       string `json:"id"`
-		Name     string `json:"name"`
-		Provider string `json:"provider"`
-		Status   string `json:"status"`
-	} `json:"runtimes"`
+	Runtimes     []runtimeAnswer `json:"runtimes"`
 	Repos        json.RawMessage `json:"repos"`
 	ReposVersion string          `json:"repos_version"`
 	Settings     json.RawMessage `json:"settings"`
-}
-
-// Register performs C1 and caches the real runtime id and repos payload.
-// Safe to call again after a 404 "runtime not found" (ensureRuntime).
-func (c *Client) Register(ctx context.Context) error {
-	body := registerRequest{
-		WorkspaceID:     c.cfg.WorkspaceID,
-		DaemonID:        c.cfg.DaemonID,
-		LegacyDaemonIDs: []string{},
-		DeviceName:      "foreman",
-		CLIVersion:      c.cfg.Version,
-		LaunchedBy:      "",
-		Runtimes: []runtimePayload{{
-			Name:      c.cfg.RuntimeName,
-			Type:      c.cfg.RuntimeType,
-			Version:   c.cfg.RuntimeVersion,
-			Status:    "online",
-			ProfileID: "",
-		}},
-		FailedProfiles: []string{},
-	}
-	var resp registerResponse
-	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodPost, "/api/daemon/register", mustMarshal(body))
-	if err != nil {
-		return fmt.Errorf("register: %w", err)
-	}
-	if code < 200 || code >= 300 {
-		return fmt.Errorf("register: %w", &StatusError{Code: code, Body: raw})
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return fmt.Errorf("register: decode response: %w", err)
-	}
-	if len(resp.Runtimes) == 0 || resp.Runtimes[0].ID == "" {
-		return fmt.Errorf("register: response carries no runtime id")
-	}
-	c.mu.Lock()
-	replaced := c.runtimeLost || (c.runtimeID != "" && c.runtimeID != resp.Runtimes[0].ID)
-	c.runtimeID = resp.Runtimes[0].ID
-	c.runtimeLost = false
-	c.repos = resp.Repos
-	c.reposVersion = resp.ReposVersion
-	c.mu.Unlock()
-	if replaced {
-		// The runtime row was rebuilt (§1.1 failure table): recover orphans
-		// (C15) and move the WS subscription to the new runtime.
-		c.log.Warn("runtime.rebuilt", "runtime_id", resp.Runtimes[0].ID)
-		c.recoverOrphans(ctx, resp.Runtimes[0].ID)
-		select {
-		case c.runtimeSetCh <- struct{}{}:
-		default:
-		}
-	}
-	return nil
 }
 
 // recoverOrphans is C15, called only after a real-runtime rebuild (§1.1).
@@ -233,35 +189,16 @@ func (c *Client) recoverOrphans(ctx context.Context, runtimeID string) {
 	}
 }
 
-// ensureRuntime returns the cached real runtime id, registering (C1) when
-// empty. A 404 "runtime not found" from any call clears the cache via
-// noteRuntimeGone so the next ensureRuntime re-registers.
-func (c *Client) ensureRuntime(ctx context.Context) (string, error) {
-	if rid := c.RuntimeID(); rid != "" {
-		return rid, nil
-	}
-	if err := c.Register(ctx); err != nil {
-		return "", err
-	}
-	return c.RuntimeID(), nil
-}
-
-// noteRuntimeGone clears the cached id and marks the rebuild pending: the
-// next successful Register — whenever it lands — is a runtime replacement
-// (C15 + runtime-set signal), even if earlier re-register attempts failed.
-func (c *Client) noteRuntimeGone() {
-	c.mu.Lock()
-	c.runtimeID = ""
-	c.runtimeLost = true
-	c.mu.Unlock()
-}
-
-// Preflight runs the startup checks: C1 register, C17 workspace validation
-// (caches the workspace name for S1), C18 runtime-profiles (404 tolerated),
-// C16 token renew (non-fatal). Callers retry with the §4 backoff.
+// Preflight runs the startup checks: C1 register (unless a live runtime set
+// already exists — the declaration has exactly one trigger per startup, §1.1
+// C1), C17 workspace validation (caches the workspace name for S1), C18
+// runtime-profiles (404 tolerated), C16 token renew (non-fatal). Callers retry
+// with the §4 backoff.
 func (c *Client) Preflight(ctx context.Context) error {
-	if err := c.Register(ctx); err != nil {
-		return err
+	if len(c.RuntimeIDs()) == 0 {
+		if err := c.Register(ctx); err != nil {
+			return err
+		}
 	}
 	if err := c.Workspaces(ctx); err != nil {
 		return fmt.Errorf("workspace check: %w", err)
@@ -273,87 +210,6 @@ func (c *Client) Preflight(ctx context.Context) error {
 		c.log.Warn("token renew failed (non-fatal)", "err", err)
 	}
 	return nil
-}
-
-// ---- C2 heartbeat ----
-
-// Heartbeat is C2 for the cached real runtime. A non-2xx answer is a
-// StatusError — the loop's §4 backoff depends on it (a silently swallowed
-// 401 would let the runtime die unnoticed).
-func (c *Client) Heartbeat(ctx context.Context) error {
-	code, raw, err := c.withRuntime(ctx, c.ctrl, func(rid string) (string, []byte) {
-		body, _ := json.Marshal(map[string]any{"runtime_id": rid, "supports_batch_import": true})
-		return "/api/daemon/heartbeat", body
-	})
-	if err != nil {
-		return fmt.Errorf("heartbeat: %w", err)
-	}
-	if code < 200 || code >= 300 {
-		return fmt.Errorf("heartbeat: %w", &StatusError{Code: code, Body: raw})
-	}
-	c.log.Debug("daemon.heartbeat", "runtime_id", c.RuntimeID(), "status", "ok")
-	return nil
-}
-
-// ---- C3 claim ----
-
-// ClaimTasks is C3: claims up to maxTasks on the real runtime and returns
-// the raw task payloads (opaque; proxy never deserializes them, §数据结构).
-func (c *Client) ClaimTasks(ctx context.Context, maxTasks int) ([]json.RawMessage, error) {
-	if maxTasks < 1 {
-		return nil, nil
-	}
-	code, raw, err := c.withRuntime(ctx, c.ctrl, func(rid string) (string, []byte) {
-		body, _ := json.Marshal(map[string]any{
-			"daemon_id":   c.cfg.DaemonID,
-			"runtime_ids": []string{rid},
-			"max_tasks":   maxTasks,
-		})
-		return "/api/daemon/tasks/claim", body
-	})
-	if err == nil && code >= 200 && code < 300 {
-		var resp struct {
-			Tasks []json.RawMessage `json:"tasks"`
-		}
-		if err = json.Unmarshal(raw, &resp); err == nil {
-			return resp.Tasks, nil
-		}
-	}
-	if err == nil {
-		err = &StatusError{Code: code, Body: raw}
-	}
-	se := new(StatusError)
-	codeLabel := "transport"
-	if errors.As(err, &se) {
-		codeLabel = fmt.Sprintf("%d", se.Code)
-	}
-	c.metrics.ClaimError(codeLabel)
-	return nil, fmt.Errorf("claim: %w", err)
-}
-
-// ---- C4 prepare-lease ----
-
-// PrepareLease is C4. The §1.1 C4 semantics are normalized to ready:
-// 200 → ready=true; 400 → ready=false (not an error: the task left the
-// renewable pre-start state); 404 → scheduler.ErrTaskNotFound.
-func (c *Client) PrepareLease(ctx context.Context, taskID string) (ready bool, err error) {
-	code, _, err := c.withRuntime(ctx, c.lease, func(rid string) (string, []byte) {
-		return fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/prepare-lease",
-			url.PathEscape(rid), url.PathEscape(taskID)), []byte("{}")
-	})
-	if err != nil {
-		return false, err
-	}
-	switch {
-	case code >= 200 && code < 300:
-		return true, nil
-	case code == 400:
-		return false, nil
-	case code == 404:
-		return false, scheduler.ErrTaskNotFound
-	default:
-		return false, &StatusError{Code: code}
-	}
 }
 
 // ---- C5–C12 lifecycle forward ----
@@ -398,7 +254,7 @@ func (c *Client) Forward(ctx context.Context, ep scheduler.Endpoint, taskID stri
 		return 0, nil, fmt.Errorf("unknown endpoint %q", ep)
 	}
 	if ep == scheduler.EPStart {
-		translated, err := c.translateStartBody(ctx, body)
+		translated, err := c.translateStartBody(taskID, body)
 		if err != nil {
 			return 0, nil, err
 		}
@@ -434,9 +290,11 @@ func (c *Client) Forward(ctx context.Context, ep scheduler.Endpoint, taskID stri
 // verbatim, the daemon's identity reads as a claim the server no longer
 // holds, and the start is refused (409 状态不允许, §1.2 S8 +
 // 05-modules/proxy.md §转发) — so the field is translated like S7's {rid}.
-// Every other field stays byte-equal, and a body naming no runtime is
-// forwarded verbatim (legacy start shape).
-func (c *Client) translateStartBody(ctx context.Context, body []byte) ([]byte, error) {
+// The id comes from the task's own dispatch record; a task without one (a
+// rebuilt entry) falls back to the only declared runtime, and a set that is
+// not registered yet leaves the body verbatim. Every other field stays
+// byte-equal, and a body naming no runtime is forwarded verbatim.
+func (c *Client) translateStartBody(taskID string, body []byte) ([]byte, error) {
 	if len(body) == 0 {
 		return body, nil
 	}
@@ -447,9 +305,13 @@ func (c *Client) translateStartBody(ctx context.Context, body []byte) ([]byte, e
 	if _, ok := fields["runtime_id"]; !ok {
 		return body, nil
 	}
-	runtimeID, err := c.ensureRuntime(ctx)
-	if err != nil {
-		return nil, err
+	runtimeID, exact := c.runtimeForTask(taskID)
+	if runtimeID == "" {
+		return body, nil
+	}
+	if !exact {
+		c.log.Warn("task dispatch record unknown; using the first declared runtime",
+			"task_id", taskID, "runtime_id", runtimeID)
 	}
 	quoted, err := json.Marshal(runtimeID)
 	if err != nil {
@@ -630,10 +492,34 @@ func (c *Client) GCCheck(ctx context.Context, taskID string) (int, []byte, error
 // ResolveSkillBundles is C19: forwards the Job daemon's resolve body with
 // the {rid} rewritten to the real runtime id and Foreman's credential (S26).
 func (c *Client) ResolveSkillBundles(ctx context.Context, taskID string, body []byte) (int, []byte, error) {
-	return c.withRuntime(ctx, c.ctrl, func(rid string) (string, []byte) {
-		return fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/skill-bundles/resolve",
-			url.PathEscape(rid), url.PathEscape(taskID)), body
-	})
+	rid, exact := c.runtimeForTask(taskID)
+	if rid == "" {
+		return 0, nil, errors.New("skill bundles: no real runtime registered")
+	}
+	if !exact {
+		c.log.Warn("task dispatch record unknown; using the first declared runtime",
+			"task_id", taskID, "runtime_id", rid)
+	}
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/skill-bundles/resolve",
+		url.PathEscape(rid), url.PathEscape(taskID))
+	return c.doOnce(ctx, c.ctrl, http.MethodPost, path, body)
+}
+
+// runtimeForTask resolves the real runtime id a task was dispatched under. A
+// rebuilt entry carries no dispatch record (the Job is the authority store,
+// ADR-002), so the first declared runtime is the best available answer; exact
+// reports which of the two paths produced the id.
+func (c *Client) runtimeForTask(taskID string) (runtimeID string, exact bool) {
+	if c.taskRuntime != nil {
+		if rid := c.taskRuntime(taskID); rid != "" {
+			return rid, true
+		}
+	}
+	ids := c.RuntimeIDs()
+	if len(ids) == 0 {
+		return "", false
+	}
+	return ids[0], false
 }
 
 // ---- C16/C17/C18 ----
@@ -694,53 +580,7 @@ func (c *Client) RuntimeProfiles(ctx context.Context) error {
 	return nil
 }
 
-// ---- C14 deregister ----
-
-// Deregister is C14 (graceful shutdown; failure-handling scenario #8b).
-func (c *Client) Deregister(ctx context.Context) error {
-	rid := c.RuntimeID()
-	if rid == "" {
-		return nil
-	}
-	body, _ := json.Marshal(map[string]any{"runtime_ids": []string{rid}})
-	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodPost, "/api/daemon/deregister", body)
-	if err != nil {
-		return fmt.Errorf("deregister: %w", err)
-	}
-	if code < 200 || code >= 300 {
-		return fmt.Errorf("deregister: %w", &StatusError{Code: code, Body: raw})
-	}
-	return nil
-}
-
 // ---- transport ----
-
-// withRuntime runs one rid-dependent call: it resolves the real runtime id
-// (registering when needed), and on a 404 "runtime not found" re-registers
-// once and retries against the fresh id (§1.1 failure table).
-func (c *Client) withRuntime(ctx context.Context, hc *http.Client, req func(rid string) (path string, body []byte)) (int, []byte, error) {
-	rid, err := c.ensureRuntime(ctx)
-	if err != nil {
-		return 0, nil, err
-	}
-	path, body := req(rid)
-	code, resp, err := c.doOnce(ctx, hc, http.MethodPost, path, body)
-	if err != nil {
-		return 0, nil, err
-	}
-	if code == 404 && containsRuntimeNotFound(resp) {
-		c.log.Warn("runtime not found; re-registering", "path", path)
-		// Register must see the stale id to detect the replacement; the
-		// cache is only cleared when re-registration itself fails.
-		if rerr := c.Register(ctx); rerr != nil {
-			c.noteRuntimeGone()
-			return 0, nil, fmt.Errorf("re-register after runtime loss: %w", rerr)
-		}
-		path, body = req(c.RuntimeID())
-		return c.doOnce(ctx, hc, http.MethodPost, path, body)
-	}
-	return code, resp, nil
-}
 
 // doOnce is the transport core: one attempt with the daemon identity
 // headers; the response body is returned verbatim.
@@ -767,11 +607,13 @@ func (c *Client) doOnce(ctx context.Context, hc *http.Client, method, path strin
 }
 
 // setHeaders injects the daemon identity (§1.1): the capability string is
-// verbatim and must never gain or lose an entry.
+// verbatim and must never gain or lose an entry. X-Client-Version carries the
+// startup discovery's cli_version once C1 has run, Foreman's own version
+// before that (§1.1 C1 的取值来源与声明域).
 func (c *Client) setHeaders(req *http.Request, hasBody bool) {
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("X-Client-Platform", "daemon")
-	req.Header.Set("X-Client-Version", c.cfg.Version)
+	req.Header.Set("X-Client-Version", c.CLIVersion())
 	req.Header.Set("X-Client-OS", "linux")
 	req.Header.Set("X-Client-Capabilities", ClientCapabilities)
 	if hasBody {

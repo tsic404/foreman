@@ -99,6 +99,16 @@ func (fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, 
 	return job, secret, "sha256:" + e.TaskID, nil
 }
 
+func (fakeBuilder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
+	name := "fm-catalog-" + requestID
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+		Name:   name,
+		Labels: map[string]string{registry.LabelRole: registry.RoleCatalogProbe},
+	}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name + "-cred"}}
+	return job, secret, "sha256:" + jobRuntimeID, nil
+}
+
 // fakeRevoker records the credential digests the scheduler feeds to the Job
 // Token authority on reclaim (ADR-017).
 type fakeRevoker struct {
@@ -120,6 +130,8 @@ type testRig struct {
 	stub    *stubUpstream
 	client  *Client
 	reg     *registry.Registry
+	probes  *registry.ProbeRegistry
+	slots   *CatalogSlots
 	sched   *scheduler.Scheduler
 	issuer  *auth.Issuer
 	jobs    *fakeJobs
@@ -142,7 +154,17 @@ func newTestRig(t *testing.T) *testRig {
 	stub.on("POST", "/api/tokens/current/renew", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
 		writeJSONStub(w, 200, map[string]any{"renewed": true})
 	})
-	rig.client = NewClient(testConfig(upstream.URL), "mdt_foreman", WithTerminalRetryWaits([]time.Duration{0, 0, 0, 0, 0, 0}))
+	rig.probes = registry.NewProbeRegistry()
+	rig.slots = NewCatalogSlots()
+	rig.client = NewClient(testConfig(upstream.URL), "mdt_foreman",
+		WithTerminalRetryWaits([]time.Duration{0, 0, 0, 0, 0, 0}),
+		WithRelayBackoff([]time.Duration{0, 0, 0}),
+		WithStartupCatalog(registry.NewStartupCatalog()),
+		WithCatalogSlots(rig.slots),
+		WithTaskRuntime(func(string) string { return "rid-real" }))
+	if err := rig.client.RegisterWithDiscovery(t.Context(), testDiscovery()); err != nil {
+		t.Fatalf("RegisterWithDiscovery: %v", err)
+	}
 	if err := rig.client.Preflight(t.Context()); err != nil {
 		t.Fatalf("Preflight: %v", err)
 	}
@@ -156,23 +178,31 @@ func newTestRig(t *testing.T) *testRig {
 	}
 	rig.pending = pending
 	sched, err := scheduler.New(
-		scheduler.Config{JobNamespace: "test-ns", MaxInflightJobs: 10, ClaimBatchMax: 32, JobBootTimeout: 300 * time.Second},
+		scheduler.Config{
+			JobNamespace: "test-ns", WorkspaceID: "ws-1",
+			MaxInflightJobs: 10, ClaimBatchMax: 32,
+			JobBootTimeout: 300 * time.Second, JobDrainTimeout: 120 * time.Second,
+			StartupProbeTimeout: 2 * time.Second,
+			ModelCatalogEnabled: true, ModelCatalogTimeout: 45 * time.Second,
+			ReconcileInterval: 30 * time.Second,
+		},
 		rig.reg, rig.jobs, fakeBuilder{}, rig.client, nil,
 		scheduler.WithPendingReports(pending),
 		scheduler.WithRevoker(rig.revoker),
+		scheduler.WithProbeRegistry(rig.probes),
 	)
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
 	}
 	rig.sched = sched
 
-	issuer, err := JobTokenIssuer(testTokenKey, rig.reg, auth.DefaultJobTokenTTL)
+	issuer, err := JobTokenIssuer(testTokenKey, rig.reg, rig.probes, auth.DefaultJobTokenTTL)
 	if err != nil {
 		t.Fatalf("JobTokenIssuer: %v", err)
 	}
 	rig.issuer = issuer
 	rig.metrics = &fakeMetrics{}
-	rig.handler = NewFakeServer(issuer, rig.reg, rig.sched, rig.client, nil, rig.metrics)
+	rig.handler = NewFakeServer(issuer, rig.reg, rig.sched, rig.client, nil, rig.metrics, WithProbeRegistry(rig.probes))
 	rig.server = httptest.NewServer(rig.handler)
 	t.Cleanup(rig.server.Close)
 	return rig

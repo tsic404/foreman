@@ -12,10 +12,11 @@ import (
 
 // LeaseClient is the lease surface of the fake client (C4/C13).
 type LeaseClient interface {
-	// PrepareLease extends the task's prepare lease (C4): ready=false is
-	// the semantic 400 (task left the renewable pre-start state), not an
-	// error; a deleted task returns scheduler.ErrTaskNotFound.
-	PrepareLease(ctx context.Context, taskID string) (ready bool, err error)
+	// PrepareLease extends the task's prepare lease (C4) on the real runtime
+	// the task was dispatched under: ready=false is the semantic 400 (task
+	// left the renewable pre-start state), not an error; a deleted task
+	// returns scheduler.ErrTaskNotFound.
+	PrepareLease(ctx context.Context, runtimeID, taskID string) (ready bool, err error)
 }
 
 // LeaseHooks are the scheduler's settlement entries the LeaseKeeper drives
@@ -69,7 +70,13 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 		if !leaseable(e) {
 			continue
 		}
-		ready, err := k.client.PrepareLease(ctx, e.TaskID)
+		if e.RealRuntimeID == "" {
+			// No dispatch record (rebuilt entry): the startup convergence
+			// owns it, and a lease against the wrong runtime would read as a
+			// vanished task.
+			continue
+		}
+		ready, err := k.client.PrepareLease(ctx, e.RealRuntimeID, e.TaskID)
 		switch {
 		case err == nil && ready:
 			// The renewal restamped the server's lease: project the new

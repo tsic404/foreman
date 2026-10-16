@@ -60,7 +60,9 @@ func TestClaimLoopIterateClaimsUpToBudget(t *testing.T) {
 		}})
 	})
 	sched := &fakeClaimScheduler{budget: 2}
-	loop := NewClaimLoop(testConfig(srv.URL), NewClient(testConfig(srv.URL), "mdt_test"), sched)
+	client := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, client)
+	loop := NewClaimLoop(testConfig(srv.URL), client, sched)
 
 	loop.iterate(t.Context())
 	if sched.claimedCount() != 2 {
@@ -118,7 +120,9 @@ func TestClaimLoopWakeTriggersImmediateIteration(t *testing.T) {
 	cfg := testConfig(srv.URL)
 	cfg.ClaimInterval = time.Hour // polling alone must not fire within the test
 	cfg.ClaimIntervalIdle = time.Hour
-	loop := NewClaimLoop(cfg, NewClient(cfg, "mdt_test"), sched)
+	client := NewClient(cfg, "mdt_test")
+	registerDeclared(t, client)
+	loop := NewClaimLoop(cfg, client, sched)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -169,7 +173,12 @@ func TestClaimLoopStopsOn403(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":"token does not match daemon_id"}`))
 	})
 	sched := &fakeClaimScheduler{budget: 1}
-	loop := NewClaimLoop(testConfig(srv.URL), NewClient(testConfig(srv.URL), "mdt_test"), sched)
+	client := NewClient(testConfig(srv.URL), "mdt_test")
+	// The startup probe declared the runtime set before the loops start; the
+	// loop's preflight therefore re-declares it (and meets the 403).
+	client.disc = testDiscovery()
+	client.refs = declaredRefs(testDiscovery())
+	loop := NewClaimLoop(testConfig(srv.URL), client, sched)
 
 	// §1.1 failure table: 403 is a config error — no blind retry; the loop
 	// exits (CrashLoopBackOff is the alarm surface).
@@ -196,7 +205,9 @@ func TestHeartbeatLoopStopsOn403(t *testing.T) {
 		w.WriteHeader(403)
 		_, _ = w.Write([]byte(`{"error":"forbidden"}`))
 	})
-	loop := NewHeartbeatLoop(NewClient(testConfig(srv.URL), "mdt_test"))
+	client := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, client)
+	loop := NewHeartbeatLoop(client, nil)
 
 	done := make(chan error, 1)
 	go func() { done <- loop.Run(t.Context()) }()
@@ -217,7 +228,9 @@ func TestHeartbeatLoopHeartbeatsImmediately(t *testing.T) {
 	stub.on("POST", "/api/daemon/heartbeat", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
 		writeJSONStub(w, 200, map[string]string{"status": "ok"})
 	})
-	loop := NewHeartbeatLoop(NewClient(testConfig(srv.URL), "mdt_test"))
+	client := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, client)
+	loop := NewHeartbeatLoop(client, nil)
 
 	ctx, cancel := context.WithCancel(t.Context())
 	defer cancel()
@@ -229,5 +242,29 @@ func TestHeartbeatLoopHeartbeatsImmediately(t *testing.T) {
 	}
 	if got := len(stub.calls("POST", "/api/daemon/heartbeat")); got == 0 {
 		t.Fatal("no heartbeat observed")
+	}
+}
+
+// TestClaimLoopRetriesTransientPreflight pins the startup C1's §4 behavior: a
+// transient failure backs off and retries instead of exiting the process.
+func TestClaimLoopRetriesTransientPreflight(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stub.on("POST", "/api/daemon/register", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 503, map[string]string{"error": "boom"})
+	})
+	client := NewClient(testConfig(srv.URL), "mdt_test")
+	client.disc = testDiscovery()
+	client.refs = declaredRefs(testDiscovery())
+	client.terminalWaits = []time.Duration{0}
+	loop := NewClaimLoop(testConfig(srv.URL), client, &fakeClaimScheduler{})
+	loop.backoff = &backoff{min: time.Millisecond, max: time.Millisecond}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 300*time.Millisecond)
+	defer cancel()
+	if err := loop.Run(ctx); err != nil {
+		t.Fatalf("Run = %v, want the loop to keep retrying until ctx ends", err)
+	}
+	if got := len(stub.calls("POST", "/api/daemon/register")); got < 2 {
+		t.Fatalf("C1 attempts = %d, want the preflight to retry a 5xx", got)
 	}
 }

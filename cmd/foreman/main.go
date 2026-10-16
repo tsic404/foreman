@@ -9,10 +9,12 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -118,12 +120,29 @@ func run() error {
 	// The drain upper bound is the registry's, because markTerminal writes it
 	// once at the alive → draining transition (ADR-017).
 	reg := registry.New(time.Now, registry.WithDrainTimeout(schedCfg.JobDrainTimeout))
+	// The catalog probe's identity lives beside the task registry (ADR-019):
+	// it is what the Job Token probe branch, the probe handlers and the probe
+	// lifecycle all read.
+	probes := registry.NewProbeRegistry()
+	startupCatalog := registry.NewStartupCatalog()
+	slots := proxy.NewCatalogSlots()
 	metrics := observability.NewMetrics()
 
 	// Fake client: the server credential never leaves this process (F3).
 	client := proxy.NewClient(proxyCfg, serverToken,
 		proxy.WithMetrics(metrics),
 		proxy.WithLogger(baseLog),
+		proxy.WithStartupCatalog(startupCatalog),
+		proxy.WithCatalogSlots(slots),
+		// C4/C19/S8 address a task by the real runtime it was dispatched
+		// under (ADR-025); the dispatch record is the entry's.
+		proxy.WithTaskRuntime(func(taskID string) string {
+			e, ok := reg.Get(taskID)
+			if !ok {
+				return ""
+			}
+			return e.RealRuntimeID
+		}),
 	)
 
 	// Terminal reports that exhausted the retry budget are queued on the
@@ -137,13 +156,16 @@ func run() error {
 		return err
 	}
 
-	issuer, err := proxy.JobTokenIssuer(authCfg.Key, reg, authCfg.TokenTTL)
+	issuer, err := proxy.JobTokenIssuer(authCfg.Key, reg, probes, authCfg.TokenTTL)
 	if err != nil {
 		return err
 	}
 	jbCfg.Issuer = issuer
 	jbCfg.Nodes = reg
 	jbCfg.Logger = baseLog
+	// The probe Job Token TTL is budget + drain timeout, so the builder needs
+	// the same bound the scheduler reclaims credentials under.
+	jbCfg.JobDrainTimeout = schedCfg.JobDrainTimeout
 
 	// Startup gate: an unreadable or unparseable job-overlay.yaml must refuse
 	// to serve (CrashLoopBackOff), never fail at the first claim (03-contracts
@@ -166,6 +188,7 @@ func run() error {
 		scheduler.WithPendingReports(pending),
 		scheduler.WithReconciler(late),
 		scheduler.WithRevoker(issuer),
+		scheduler.WithProbeRegistry(probes),
 		scheduler.WithLogger(baseLog),
 	)
 	if err != nil {
@@ -195,13 +218,15 @@ func run() error {
 	if proxyCfg.WSEnabled {
 		ws = proxy.NewWSHandler(issuer, reg, metrics)
 	}
-	fakeServer := proxy.NewFakeServer(issuer, reg, sched, client, ws, metrics)
+	fakeServer := proxy.NewFakeServer(issuer, reg, sched, client, ws, metrics, proxy.WithProbeRegistry(probes))
+	reporter := proxy.NewModelCatalogReporter(proxyCfg, client, sched, slots, metrics, proxy.WithReporterLogger(baseLog))
 	ops := observability.NewOpsHandler(metrics, reg, observability.NewK8sPodLogReader(clientset), observability.OpsConfig{
-		Version:   version,
-		JobImage:  jbCfg.JobImage,
-		RuntimeID: client.RuntimeID,
-		StartedAt: started,
-		Logger:    baseLog,
+		Version:        version,
+		JobImage:       jbCfg.JobImage,
+		RuntimeIDs:     client.RuntimeIDs,
+		RegisterSource: registerSourceView(client, slots),
+		StartedAt:      started,
+		Logger:         baseLog,
 	})
 	mux := http.NewServeMux()
 	mux.Handle("/api/", fakeServer)
@@ -229,18 +254,49 @@ func run() error {
 		}()
 	}
 
+	// Startup orchestration (ADR-025): the startup probe runs before C1, so
+	// the server sees the template environment's real runtimes. The listener
+	// must already be serving — the probe daemon registers through it.
+	listener, err := net.Listen("tcp", *listen)
+	if err != nil {
+		return fmt.Errorf("listen %s: %w", *listen, err)
+	}
+	serveErr := make(chan error, 1)
+	go func() { serveErr <- srv.Serve(listener) }()
+
+	discovery, err := sched.RunStartupProbe(ctx)
+	if err != nil {
+		// Fail-fast, visible: no registration inside the window means the
+		// template (or the probe) is not runnable, and Foreman must not
+		// declare a runtime set it never observed (AC-36). The exit record
+		// repeats the event's reason class (observability.md 钉死字段集).
+		fields := []any{"err", err.Error()}
+		var failure *scheduler.StartupProbeFailure
+		if errors.As(err, &failure) {
+			fields = append(fields, "job_name", failure.JobName, "reason", failure.Reason)
+		}
+		log.Error("foreman.startup_aborted", fields...)
+		return err
+	}
+	// The declaration is cached here; the claim loop's preflight sends the one
+	// C1 of this startup (with the §4 backoff, §1.1 C1), so a transient failure
+	// retries instead of exiting.
+	client.Declare(discovery)
+	log.Info("runtime.declared",
+		"runtimes", len(discovery.Runtimes),
+		"cli_version", discovery.CLIVersion,
+		"failed_profiles", len(discovery.FailedProfiles))
+
 	run("scheduler", sched.Run)
 	claimLoop := proxy.NewClaimLoop(proxyCfg, client, sched)
 	run("claim", claimLoop.Run)
-	run("heartbeat", proxy.NewHeartbeatLoop(client).Run)
+	run("heartbeat", proxy.NewHeartbeatLoop(client, reporter).Run)
 	run("lease", proxy.NewLeaseKeeper(client, reg, sched, proxyCfg.LeaseRefreshInterval).Run)
 	if proxyCfg.WSEnabled {
 		run("ws-subscriber", proxy.NewWSSubscriber(client, claimLoop.Wake, metrics).Run)
 	}
 	run("recovery", reconciler.Run)
 
-	serveErr := make(chan error, 1)
-	go func() { serveErr <- srv.ListenAndServe() }()
 	log.Info("foreman.started",
 		"version", version,
 		"listen", *listen,
@@ -290,6 +346,39 @@ func (l *lateReconciler) Reconcile(ctx context.Context) error {
 		return nil
 	}
 	return l.r.Reconcile(ctx)
+}
+
+// registerSourceView builds S31's read-only projection: the startup discovery,
+// the C1 declaration entry by entry, and every real runtime's catalog slot
+// state. It never triggers a discovery or a refresh (ADR-025).
+func registerSourceView(client *proxy.Client, slots *proxy.CatalogSlots) func() any {
+	return func() any {
+		discovery := client.Declaration()
+		refs := client.RuntimeRefs()
+		declaration := make([]map[string]string, 0, len(refs))
+		for _, ref := range refs {
+			declaration = append(declaration, map[string]string{
+				"name":            ref.Name,
+				"provider":        ref.Provider,
+				"real_runtime_id": ref.ID,
+			})
+		}
+		runtimes := discovery.Runtimes
+		if runtimes == nil {
+			runtimes = []registry.DiscoveredRuntime{}
+		}
+		failed := discovery.FailedProfiles
+		if failed == nil {
+			failed = []json.RawMessage{}
+		}
+		return map[string]any{
+			"runtimes":        runtimes,
+			"cli_version":     discovery.CLIVersion,
+			"failed_profiles": failed,
+			"declaration":     declaration,
+			"slots":           slots.Snapshot(refs, time.Now()),
+		}
+	}
 }
 
 // kubeConfig prefers the in-cluster service account (the Deployment path)
