@@ -1800,7 +1800,7 @@ func TestJobCreatedLogsImageReference(t *testing.T) {
 func newLogScheduler(t *testing.T, f *fixture, level slog.Level) *bytes.Buffer {
 	t.Helper()
 	buf := &bytes.Buffer{}
-	cfg, err := LoadConfig(func(string) string { return "" })
+	cfg, err := LoadConfig(testEnv(nil))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
@@ -1808,6 +1808,7 @@ func newLogScheduler(t *testing.T, f *fixture, level slog.Level) *bytes.Buffer {
 		WithClock(func() time.Time { return f.now }),
 		WithPendingReports(f.pending),
 		WithRevoker(f.revoker),
+		WithProbeRegistry(registry.NewProbeRegistry()),
 		WithLogger(observability.NewLogger(buf, level, "")))
 	if err != nil {
 		t.Fatalf("New: %v", err)

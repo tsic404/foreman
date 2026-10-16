@@ -248,6 +248,10 @@ const heartbeatSupervisorInterval = 5 * time.Second
 // the loop.
 func (l *HeartbeatLoop) stream(ctx context.Context, runtimeID string) error {
 	backoff := newBackoff()
+	// The ack body's runtime_id is advisory: the real server's ack does not
+	// reliably echo it, so a mismatch is worth one event per stream — never a
+	// re-key (§1.1「C2 ack 消费」).
+	ackMismatchWarned := false
 	for {
 		ack, err := l.client.Heartbeat(ctx, runtimeID)
 		if err != nil {
@@ -272,7 +276,16 @@ func (l *HeartbeatLoop) stream(ctx context.Context, runtimeID string) error {
 		} else {
 			backoff.reset()
 			if ack.PendingModelList != nil && l.reporter != nil {
-				l.reporter.OnAck(ctx, ack.RuntimeID, ack.PendingModelList.ID)
+				// The command belongs to the runtime this stream heartbeats —
+				// the slot key and the C21 {rid} both come from here. Keying by
+				// the ack body would send the command to another runtime's slot
+				// (or, when the body carries nothing, to none at all).
+				if ack.RuntimeID != "" && ack.RuntimeID != runtimeID && !ackMismatchWarned {
+					ackMismatchWarned = true
+					l.log.Warn("model.catalog_ack_mismatch", "request_id", ack.PendingModelList.ID,
+						"runtime_id", runtimeID, "ack_runtime_id", ack.RuntimeID)
+				}
+				l.reporter.OnAck(ctx, runtimeID, ack.PendingModelList.ID)
 			}
 		}
 		l.maybeRenewToken(ctx)

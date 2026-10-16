@@ -111,6 +111,17 @@ func (r *ModelCatalogReporter) OnAck(ctx context.Context, runtimeID, requestID s
 		r.metrics.ModelCatalogRelay("none", 0)
 		return
 	}
+	if runtimeID == "" {
+		// A command always belongs to a real runtime (§1.1「C2 ack 消费」第 1
+		// 条). Without one the probe would be built in startup-discovery mode,
+		// whose result is absorbed locally and never relayed: the command would
+		// die as an upstream window timeout while the relay metric reported a
+		// success that never reached the server. Fail visibly instead.
+		r.log.Warn("model.catalog_relay_failed", "request_id", requestID,
+			"runtime_id", runtimeID, "reason", "no real runtime for the command")
+		r.metrics.ModelCatalogRelay("none", 0)
+		return
+	}
 	if slot, ok := r.slots.Get(runtimeID); ok {
 		// The answer leaves the heartbeat round: consuming the ack stays
 		// in-round (§1.1 C2 ack 消费 第 3 条), while the replay — which may

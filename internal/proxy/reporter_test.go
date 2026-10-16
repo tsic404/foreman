@@ -313,6 +313,37 @@ func TestReporterStaleCacheStillAnswers(t *testing.T) {
 	}
 }
 
+// TestReporterRejectsACommandWithoutARealRuntime pins the guard that keeps a
+// command-driven request out of the startup-discovery path: with no real
+// runtime the probe would be built in startup-discovery mode, whose result is
+// absorbed locally and never relayed — the command would die as an upstream
+// window timeout while the relay metric reported a success. The visible failure
+// face is the only safe answer.
+func TestReporterRejectsACommandWithoutARealRuntime(t *testing.T) {
+	cfg := testConfig("http://unused")
+	h := newReporterHarness(t, cfg)
+	h.slots.Put("rid-a", []byte(`{"models":[]}`), h.now)
+
+	h.reporter.OnAck(t.Context(), "", "req-1")
+
+	// The rejected path is synchronous; the fallback it replaces would run in
+	// its own goroutine, so give it the chance to show itself before asserting.
+	deadline := time.Now().Add(time.Second)
+	for h.probes.startCount() == 0 && h.metrics.catalogCodeCount("none") == 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	if h.probes.startCount() != 0 {
+		t.Error("no probe may be started without a real runtime")
+	}
+	if got := h.metrics.catalogCodeCount("none"); got != 1 {
+		t.Errorf("abandoned relay metric = %d, want 1", got)
+	}
+	if logs := h.logs.String(); !strings.Contains(logs, "model.catalog_relay_failed") ||
+		!strings.Contains(logs, "no real runtime for the command") {
+		t.Errorf("the wiring failure must be visible: %s", logs)
+	}
+}
+
 func TestReporterDisabledDoesNotConsume(t *testing.T) {
 	cfg := testConfig("http://unused")
 	cfg.ModelCatalogEnabled = false

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"log/slog"
 	"net/http"
 	"sync"
 	"testing"
@@ -266,5 +267,99 @@ func TestClaimLoopRetriesTransientPreflight(t *testing.T) {
 	}
 	if got := len(stub.calls("POST", "/api/daemon/register")); got < 2 {
 		t.Fatalf("C1 attempts = %d, want the preflight to retry a 5xx", got)
+	}
+}
+
+// TestHeartbeatAckConsumesUnderTheStreamsRuntime pins the production failure:
+// the slot key and the C21 {rid} are the heartbeat stream's runtime. The ack
+// body's runtime_id is advisory — the real server's ack does not reliably echo
+// it — so the stream runtime's cached slot must answer the command whatever the
+// body says, and no probe may be started.
+func TestHeartbeatAckConsumesUnderTheStreamsRuntime(t *testing.T) {
+	cases := []struct {
+		name  string
+		shape func(w http.ResponseWriter)
+	}{
+		{"echoed runtime_id", func(w http.ResponseWriter) {
+			writeJSONStub(w, 200, map[string]any{
+				"status": "ok", "runtime_id": "rid-1",
+				"pending_model_list": map[string]string{"id": "req-cmd"},
+			})
+		}},
+		{"absent runtime_id", func(w http.ResponseWriter) {
+			writeJSONStub(w, 200, map[string]any{
+				"status":             "ok",
+				"pending_model_list": map[string]string{"id": "req-cmd"},
+			})
+		}},
+		{"foreign runtime_id", func(w http.ResponseWriter) {
+			writeJSONStub(w, 200, map[string]any{
+				"status": "ok", "runtime_id": "rid-other",
+				"pending_model_list": map[string]string{"id": "req-cmd"},
+			})
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, stub := newStubUpstream(t)
+			stubRegister(stub, "rid-1")
+			stub.on("POST", "/api/daemon/heartbeat", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+				tc.shape(w)
+			})
+			body := []byte(`{"status":"completed","models":[{"id":"m1"}]}`)
+			stub.on("POST", "/api/daemon/runtimes/rid-1/models/req-cmd/result", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+				writeJSONStub(w, 200, map[string]string{"status": "ok"})
+			})
+			cfg := testConfig(srv.URL)
+			client := NewClient(cfg, "mdt_test")
+			registerDeclared(t, client)
+			slots := NewCatalogSlots()
+			slots.Put("rid-1", body, time.Now())
+			probes := &fakeProbe{}
+			reporter := NewModelCatalogReporter(cfg, client, probes, slots, &fakeMetrics{})
+
+			// The mismatch line is a registered event (§1.1「C2 ack 消费」/
+			// observability.md model.catalog_ack_mismatch): exactly one when
+			// the ack echoes a foreign runtime id, none otherwise.
+			logs := &lockedBuffer{}
+			prev := slog.Default()
+			slog.SetDefault(slog.New(slog.NewJSONHandler(logs, nil)))
+			t.Cleanup(func() { slog.SetDefault(prev) })
+
+			ctx, cancel := context.WithCancel(t.Context())
+			defer cancel()
+			go func() { _ = NewHeartbeatLoop(client, reporter).Run(ctx) }()
+
+			const path = "/api/daemon/runtimes/rid-1/models/req-cmd/result"
+			deadline := time.Now().Add(5 * time.Second)
+			for len(stub.calls("POST", path)) == 0 && time.Now().Before(deadline) {
+				time.Sleep(10 * time.Millisecond)
+			}
+			relayed := stub.calls("POST", path)
+			if len(relayed) != 1 {
+				t.Fatalf("C21 calls = %d, want the stream runtime's cached body replayed once", len(relayed))
+			}
+			if string(relayed[0].Body) != string(body) {
+				t.Errorf("C21 body = %s, want the cached bytes verbatim", relayed[0].Body)
+			}
+			if probes.startCount() != 0 {
+				t.Error("a cached slot must never start a probe")
+			}
+			records := logRecords(t, []byte(logs.String()), "model.catalog_ack_mismatch")
+			if tc.name != "foreign runtime_id" {
+				if len(records) != 0 {
+					t.Errorf("model.catalog_ack_mismatch records = %d, want none when the echo is absent or agrees", len(records))
+				}
+				return
+			}
+			if len(records) != 1 {
+				t.Fatalf("model.catalog_ack_mismatch records = %d, want one for a foreign echo", len(records))
+			}
+			for field, want := range map[string]string{"request_id": "req-cmd", "runtime_id": "rid-1", "ack_runtime_id": "rid-other"} {
+				if got := records[0][field]; got != want {
+					t.Errorf("model.catalog_ack_mismatch %s = %v, want %q", field, got, want)
+				}
+			}
+		})
 	}
 }

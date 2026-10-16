@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -55,6 +56,31 @@ type upstreamRequest struct {
 	Header http.Header
 }
 
+// ackRuntimeIDShape is how the stub shapes the heartbeat ack's runtime_id: the
+// real server's ack does not reliably echo it, and the scenarios must hold
+// whatever it says.
+type ackRuntimeIDShape int
+
+const (
+	// ackEchoesRuntimeID echoes the heartbeat's runtime id (the healthy shape).
+	ackEchoesRuntimeID ackRuntimeIDShape = iota
+	// ackOmitsRuntimeID leaves the field out.
+	ackOmitsRuntimeID
+	// ackForeignRuntimeID names another runtime.
+	ackForeignRuntimeID
+)
+
+// modelCommand is one caller-facing model-list request
+// (POST /api/runtimes/{rid}/models): the stub plays the server's own request
+// record — pending until the C21 result lands, delivered at most once through a
+// heartbeat ack (the server delivers a request exactly once).
+type modelCommand struct {
+	id        string
+	runtimeID string
+	delivered bool
+	completed bool
+}
+
 // upstreamStub is the server side of C1–C21 as the scenarios need it.
 type upstreamStub struct {
 	mu sync.Mutex
@@ -66,8 +92,14 @@ type upstreamStub struct {
 	heartbeats map[string]int
 	// modelsStatus is the C21 answer (default 200).
 	modelsStatus int
-	requests     []upstreamRequest
-	server       *httptest.Server
+	// models tracks the caller-facing model-list commands by request id.
+	models map[string]*modelCommand
+	// modelSeq numbers the minted request ids (the real ones are 32 hex digits).
+	modelSeq int
+	// ackShape shapes the heartbeat ack's runtime_id field.
+	ackShape ackRuntimeIDShape
+	requests []upstreamRequest
+	server   *httptest.Server
 }
 
 func newUpstreamStub(t *testing.T) *upstreamStub {
@@ -76,6 +108,7 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		registerIDs:  map[string]string{},
 		heartbeats:   map[string]int{},
 		modelsStatus: 200,
+		models:       map[string]*modelCommand{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/daemon/register", func(w http.ResponseWriter, r *http.Request) {
@@ -120,7 +153,22 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 			_, _ = w.Write([]byte(`{"error":"boom"}`))
 			return
 		}
-		writeJSON(w, status, map[string]string{"status": "ok", "runtime_id": req.RuntimeID})
+		ack := map[string]any{"status": "ok"}
+		switch stub.shapeOfAck() {
+		case ackEchoesRuntimeID:
+			ack["runtime_id"] = req.RuntimeID
+		case ackForeignRuntimeID:
+			ack["runtime_id"] = "rid-foreign"
+		}
+		if cmd := stub.deliverModelCommand(req.RuntimeID); cmd != nil {
+			ack["pending_model_list"] = map[string]string{"id": cmd.id}
+		}
+		writeJSON(w, status, ack)
+	})
+	mux.HandleFunc("POST /api/runtimes/{rid}/models", func(w http.ResponseWriter, r *http.Request) {
+		stub.record(r, r.URL.Path, nil)
+		cmd := stub.newModelCommand(r.PathValue("rid"))
+		writeJSON(w, http.StatusOK, map[string]string{"id": cmd.id, "status": "pending"})
 	})
 	mux.HandleFunc("POST /api/daemon/tasks/claim", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -135,6 +183,7 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 	mux.HandleFunc("POST /api/daemon/runtimes/{rid}/models/{req}/result", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		stub.record(r, r.URL.Path, body)
+		stub.completeModelCommand(r.PathValue("req"))
 		writeJSON(w, stub.modelsStatus, map[string]string{"status": "ok"})
 	})
 	server := httptest.NewServer(mux)
@@ -190,6 +239,107 @@ func (s *upstreamStub) pathCalls(prefix string) []upstreamRequest {
 		}
 	}
 	return found
+}
+
+// setAckShape shapes the heartbeat ack's runtime_id field.
+func (s *upstreamStub) setAckShape(shape ackRuntimeIDShape) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.ackShape = shape
+}
+
+func (s *upstreamStub) shapeOfAck() ackRuntimeIDShape {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.ackShape
+}
+
+// newModelCommand records one caller-facing command and mints its request id.
+func (s *upstreamStub) newModelCommand(runtimeID string) *modelCommand {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.modelSeq++
+	cmd := &modelCommand{id: fmt.Sprintf("%032x", s.modelSeq), runtimeID: runtimeID}
+	s.models[cmd.id] = cmd
+	return cmd
+}
+
+// deliverModelCommand hands the runtime's pending command to one ack — the
+// server delivers a request exactly once.
+func (s *upstreamStub) deliverModelCommand(runtimeID string) *modelCommand {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, cmd := range s.models {
+		if cmd.runtimeID == runtimeID && !cmd.delivered {
+			cmd.delivered = true
+			return cmd
+		}
+	}
+	return nil
+}
+
+// completeModelCommand records the C21 result the server accepted.
+func (s *upstreamStub) completeModelCommand(requestID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cmd, ok := s.models[requestID]; ok {
+		cmd.completed = true
+	}
+}
+
+func (s *upstreamStub) modelCommandState(requestID string) (delivered, completed bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cmd, ok := s.models[requestID]
+	if !ok {
+		return false, false
+	}
+	return cmd.delivered, cmd.completed
+}
+
+// requestModelList is the caller-facing entry point: one model-list command for
+// the runtime, answered with the request id the ack will carry.
+func (h *harness) requestModelList(t *testing.T, runtimeID string) string {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodPost,
+		h.upstream.server.URL+"/api/runtimes/"+runtimeID+"/models", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST /api/runtimes/%s/models: %v", runtimeID, err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("POST /api/runtimes/%s/models = %d: %s", runtimeID, resp.StatusCode, raw)
+	}
+	var answer struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(raw, &answer); err != nil || answer.ID == "" {
+		t.Fatalf("model-list answer %s: %v", raw, err)
+	}
+	return answer.ID
+}
+
+// waitModelCompleted waits for the server's request record to turn completed —
+// the observable end of the caller's request (the alternative is the 60s window
+// timeout).
+func (h *harness) waitModelCompleted(t *testing.T, requestID string) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, completed := h.upstream.modelCommandState(requestID); completed {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("model-list request %s never completed (no C21 result reached the upstream)", requestID)
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {
@@ -462,6 +612,7 @@ func (c *schedulerServerClient) forwarded(ep scheduler.Endpoint) []upstreamReque
 type recordingMetrics struct {
 	mu           sync.Mutex
 	catalogCodes []string
+	catalogSecs  []float64
 }
 
 func (m *recordingMetrics) Forward(string, int, time.Duration) {}
@@ -471,16 +622,24 @@ func (m *recordingMetrics) WSConnect(string)                   {}
 func (m *recordingMetrics) WSDisconnect(string)                {}
 func (m *recordingMetrics) WSReconnect(string)                 {}
 
-func (m *recordingMetrics) ModelCatalogRelay(code string, _ float64) {
+func (m *recordingMetrics) ModelCatalogRelay(code string, seconds float64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.catalogCodes = append(m.catalogCodes, code)
+	m.catalogSecs = append(m.catalogSecs, seconds)
 }
 
 func (m *recordingMetrics) codes() []string {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]string(nil), m.catalogCodes...)
+}
+
+// seconds returns the recorded catalog durations, in observation order.
+func (m *recordingMetrics) seconds() []float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]float64(nil), m.catalogSecs...)
 }
 
 // probeBuilder is the jobbuilder seam plus the test-only credential reader.
@@ -644,6 +803,105 @@ func (h *harness) call(method, path, token string, body []byte) (int, []byte) {
 		h.t.Fatalf("read body: %v", err)
 	}
 	return resp.StatusCode, raw
+}
+
+// waitCatalogMetrics waits until the reporter has recorded n catalog outcomes:
+// the relay metric follows the C21 answer (the probe path observes the session
+// one poll interval later).
+func (h *harness) waitCatalogMetrics(t *testing.T, n int) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if len(h.metrics.codes()) >= n {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+// newReporter builds the catalog reporter the catalog scenarios drive.
+func (h *harness) newReporter(t *testing.T) *proxy.ModelCatalogReporter {
+	t.Helper()
+	return proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.slots, h.metrics,
+		proxy.WithReporterLogger(slog.New(slog.NewJSONHandler(&writeBuffer{}, nil))))
+}
+
+// serveProbeDaemon plays the probe pod's daemon: register (S4), take the command
+// from the S5 ack, then report it (S27). It runs off the CreateJob call so the
+// scheduler's start path is not held up by the HTTP round trips; the returned
+// channel yields the command id the daemon was handed.
+func (h *harness) serveProbeDaemon(t *testing.T, resultBody string) <-chan string {
+	t.Helper()
+	seen := make(chan string, 1)
+	h.jobs.onCreateJob = func(job *batchv1Job) {
+		name := job.Name
+		go func() {
+			token := h.builder.probeToken(name)
+			if token == "" {
+				return
+			}
+			code, body, err := h.probeCall("POST", "/api/daemon/register", token, []byte(`{
+				"daemon_id": "`+name+`",
+				"cli_version": "0.6.1",
+				"runtimes": [{"name": "foreman-omp", "type": "omp", "version": "0.6.1"}]
+			}`))
+			if err != nil || code != 200 {
+				t.Errorf("probe S4 = %d: %s (%v)", code, body, err)
+				return
+			}
+			session, ok := h.probes.ProbeByJob(name)
+			if !ok {
+				t.Errorf("probe session %s missing at S4", name)
+				return
+			}
+			code, body, err = h.probeCall("POST", "/api/daemon/heartbeat", token,
+				[]byte(`{"runtime_id": "`+session.JobRuntime+`"}`))
+			if err != nil || code != 200 {
+				t.Errorf("probe S5 = %d: %s (%v)", code, body, err)
+				return
+			}
+			var ack struct {
+				PendingModelList *struct {
+					ID string `json:"id"`
+				} `json:"pending_model_list"`
+			}
+			if err := json.Unmarshal(body, &ack); err != nil || ack.PendingModelList == nil {
+				t.Errorf("probe S5 ack carries no command: %s (%v)", body, err)
+				return
+			}
+			seen <- ack.PendingModelList.ID
+			code, body, err = h.probeCall("POST",
+				"/api/daemon/runtimes/"+session.JobRuntime+"/models/"+ack.PendingModelList.ID+"/result",
+				token, []byte(resultBody))
+			if err != nil || code != 200 {
+				t.Errorf("probe S27 = %d: %s (%v)", code, body, err)
+			}
+		}()
+	}
+	return seen
+}
+
+// probeCall performs one Job-side request from the probe daemon's own
+// goroutine: t.Fatalf must stay on the test goroutine, so a transport failure
+// comes back as an error and the caller reports it with t.Errorf.
+func (h *harness) probeCall(method, path, token string, body []byte) (int, []byte, error) {
+	req, err := http.NewRequest(method, h.jobsHTTP.URL+path, bytes.NewReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return 0, nil, err
+	}
+	return resp.StatusCode, raw, nil
 }
 
 // events returns the parsed scheduler log lines carrying one msg.
