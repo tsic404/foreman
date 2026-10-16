@@ -61,6 +61,10 @@ type fakeJobs struct {
 	// and the Job-termination evidence read them.
 	secrets []corev1.Secret
 	pods    []corev1.Pod
+
+	// onSecretCreate / onDeleteSecret observe the probe teardown order.
+	onSecretCreate func()
+	onDeleteSecret func()
 }
 
 // createJobCreationTimestamp is what the fake apiserver stamps on a created
@@ -118,6 +122,9 @@ func (f *fakeJobs) GetJob(_ context.Context, name string) (*batchv1.Job, error) 
 }
 
 func (f *fakeJobs) CreateSecret(_ context.Context, secret *corev1.Secret) error {
+	if f.onSecretCreate != nil {
+		f.onSecretCreate()
+	}
 	if f.createSecretErr != nil {
 		return f.createSecretErr
 	}
@@ -126,11 +133,34 @@ func (f *fakeJobs) CreateSecret(_ context.Context, secret *corev1.Secret) error 
 }
 
 func (f *fakeJobs) DeleteSecret(_ context.Context, name string) error {
+	if f.onDeleteSecret != nil {
+		f.onDeleteSecret()
+	}
 	if f.deleteSecretErr != nil {
 		return f.deleteSecretErr
 	}
 	f.deletedSecrets = append(f.deletedSecrets, name)
 	return nil
+}
+
+// deleted / secretDeleted report whether a name went through DeleteJob /
+// DeleteSecret.
+func (f *fakeJobs) deleted(name string) bool {
+	for _, got := range f.deletedJobs {
+		if got == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeJobs) secretDeleted(name string) bool {
+	for _, got := range f.deletedSecrets {
+		if got == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (f *fakeJobs) ListJobs(context.Context) ([]batchv1.Job, error) { return f.jobs, nil }
@@ -204,6 +234,16 @@ type fakeBuilder struct {
 	err       error
 	got       jobbuilder.TaskEntry
 	delay     time.Duration
+
+	// Catalog-probe face: the recorded call and the injected failure.
+	probeRequestID string
+	probeRuntimeID string
+	probeWorkspace string
+	probeBudget    time.Duration
+	probeJob       *batchv1.Job
+	probeSecret    *corev1.Secret
+	probeTokenHash string
+	probeErr       error
 }
 
 func (f *fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
@@ -225,6 +265,30 @@ func (f *fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secre
 	hash := f.tokenHash
 	if hash == "" {
 		hash = "hash-of-" + e.TaskID
+	}
+	return job, secret, hash, nil
+}
+
+// BuildCatalogProbe records the probe call and renders the probe objects a
+// real builder would: Job fm-catalog-<requestID> with its credential Secret.
+func (f *fakeBuilder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
+	f.probeRequestID, f.probeRuntimeID = requestID, jobRuntimeID
+	f.probeWorkspace, f.probeBudget = workspaceID, budget
+	if f.probeErr != nil {
+		return nil, nil, "", f.probeErr
+	}
+	name := "fm-catalog-" + requestID
+	job := f.probeJob
+	if job == nil {
+		job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	}
+	secret := f.probeSecret
+	if secret == nil {
+		secret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name + "-cred"}}
+	}
+	hash := f.probeTokenHash
+	if hash == "" {
+		hash = "hash-of-" + name
 	}
 	return job, secret, hash, nil
 }
@@ -285,7 +349,7 @@ func newFixture(t *testing.T) *fixture {
 	// index (TTL 24h) would expire entries stamped at testNow and the suite
 	// would rot with wall time.
 	f.reg = registry.New(func() time.Time { return f.now }, registry.WithDrainTimeout(testDrainTimeout))
-	cfg, err := LoadConfig(func(string) string { return "" })
+	cfg, err := LoadConfig(testEnv(nil))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
@@ -293,6 +357,7 @@ func newFixture(t *testing.T) *fixture {
 		WithClock(func() time.Time { return f.now }),
 		WithPendingReports(f.pending),
 		WithRevoker(f.revoker),
+		WithProbeRegistry(registry.NewProbeRegistry()),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	)
 	if err != nil {
@@ -1445,11 +1510,12 @@ func (r *recordingReconciler) Reconcile(context.Context) error { r.calls++; retu
 func TestReconcileDelegatesToRecoveryWhenWired(t *testing.T) {
 	f := newFixture(t)
 	rec := &recordingReconciler{}
-	cfg, _ := LoadConfig(func(string) string { return "" })
+	cfg, _ := LoadConfig(testEnv(nil))
 	s, err := New(cfg, f.reg, f.jobs, f.builder, f.server, nil,
 		WithReconciler(rec),
 		WithPendingReports(&fakePendingReports{}),
 		WithRevoker(&fakeRevoker{}),
+		WithProbeRegistry(registry.NewProbeRegistry()),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
 	)
 	if err != nil {
@@ -1468,9 +1534,10 @@ func TestReconcileDelegatesToRecoveryWhenWired(t *testing.T) {
 // logged and dropped, so a scheduler cannot be built without one.
 func TestNewRequiresPendingReports(t *testing.T) {
 	f := newFixture(t)
-	cfg, _ := LoadConfig(func(string) string { return "" })
+	cfg, _ := LoadConfig(testEnv(nil))
 	_, err := New(cfg, f.reg, f.jobs, f.builder, f.server, nil,
 		WithRevoker(&fakeRevoker{}),
+		WithProbeRegistry(registry.NewProbeRegistry()),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err == nil {
 		t.Fatal("New without a pending-report queue: want an error")
@@ -1482,12 +1549,27 @@ func TestNewRequiresPendingReports(t *testing.T) {
 // would silently reopen the same-name reuse face.
 func TestNewRequiresRevoker(t *testing.T) {
 	f := newFixture(t)
-	cfg, _ := LoadConfig(func(string) string { return "" })
+	cfg, _ := LoadConfig(testEnv(nil))
 	_, err := New(cfg, f.reg, f.jobs, f.builder, f.server, nil,
 		WithPendingReports(&fakePendingReports{}),
 		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
 	if err == nil {
 		t.Fatal("New without a revoker: want an error")
+	}
+}
+
+// The catalog probe's identity, command delivery and result routing all read
+// the probe session table, so a scheduler without one could never register a
+// probe: it is a wiring error, not a mode.
+func TestNewRequiresProbeRegistry(t *testing.T) {
+	f := newFixture(t)
+	cfg, _ := LoadConfig(testEnv(nil))
+	_, err := New(cfg, f.reg, f.jobs, f.builder, f.server, nil,
+		WithPendingReports(&fakePendingReports{}),
+		WithRevoker(&fakeRevoker{}),
+		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))))
+	if err == nil {
+		t.Fatal("New without a probe session table: want an error")
 	}
 }
 
@@ -1656,6 +1738,10 @@ func (testIssuer) Issue(string, string, string, time.Duration) (string, error) {
 	return "fmj_test.token", nil
 }
 
+func (testIssuer) IssueProbe(string, string, string, time.Duration) (string, error) {
+	return "fmj_test.probe", nil
+}
+
 func (testIssuer) Hash(token string) string { return "hash(" + token + ")" }
 
 // newCappedScheduler builds a scheduler over f's registry whose builder is
@@ -1669,7 +1755,7 @@ func newCappedScheduler(t *testing.T, f *fixture, maxJobsPerNode int, logw io.Wr
 	jbCfg.Issuer = testIssuer{}
 	jbCfg.Nodes = f.reg
 	jbCfg.Logger = slog.New(slog.NewJSONHandler(logw, nil))
-	cfg, err := LoadConfig(envFrom(map[string]string{EnvMaxJobsPerNode: strconv.Itoa(maxJobsPerNode)}))
+	cfg, err := LoadConfig(testEnv(map[string]string{EnvMaxJobsPerNode: strconv.Itoa(maxJobsPerNode)}))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
@@ -1681,6 +1767,7 @@ func newCappedScheduler(t *testing.T, f *fixture, maxJobsPerNode int, logw io.Wr
 		WithClock(func() time.Time { return f.now }),
 		WithPendingReports(&fakePendingReports{}),
 		WithRevoker(&fakeRevoker{}),
+		WithProbeRegistry(registry.NewProbeRegistry()),
 		WithLogger(slog.New(slog.NewJSONHandler(logw, nil))))
 	if err != nil {
 		t.Fatalf("New: %v", err)

@@ -368,13 +368,11 @@ func (c Config) stateVolume(name string) corev1.Volume {
 }
 
 func emptyDirVolume(name string) corev1.Volume {
-	size := credVolumeSize.DeepCopy()
+	size := credVolumeSize
 	if name == volumeTmp {
-		size = tmpVolumeSize.DeepCopy()
+		size = tmpVolumeSize
 	}
-	return corev1.Volume{Name: name, VolumeSource: corev1.VolumeSource{
-		EmptyDir: &corev1.EmptyDirVolumeSource{SizeLimit: &size},
-	}}
+	return emptyDirVolumeSized(name, size)
 }
 
 // credSrcVolume renders the read-only Secret volume holding the Job Token.

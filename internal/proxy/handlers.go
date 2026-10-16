@@ -43,7 +43,10 @@ func (s *FakeServer) handleRepos(w http.ResponseWriter, r *http.Request) {
 	}
 	repos, version := s.client.Registration()
 	if repos == nil {
-		repos = json.RawMessage("[]")
+		// The register-before window (the startup probe's S1/S2 calls): C1 has
+		// not run yet, so there is nothing cached to hand back — an empty repos
+		// list, which never blocks the registration (§1.2 S2).
+		repos = noRepos
 	}
 	writeRaw(w, http.StatusOK, mustMarshal(map[string]any{
 		"workspace_id":  claims.WorkspaceID,
@@ -57,10 +60,20 @@ func (s *FakeServer) handleRepos(w http.ResponseWriter, r *http.Request) {
 
 type daemonRegisterRequest struct {
 	DaemonID string `json:"daemon_id"`
-	Runtimes []struct {
-		Name string `json:"name"`
-		Type string `json:"type"`
-	} `json:"runtimes"`
+	// CLIVersion is the template CLI's version: the startup probe's value
+	// becomes C1's cli_version (§1.1 C1 的取值来源与声明域).
+	CLIVersion string            `json:"cli_version"`
+	Runtimes   []registerRuntime `json:"runtimes"`
+	// FailedProfiles travels verbatim into C1; Foreman never interprets it.
+	FailedProfiles []json.RawMessage `json:"failed_profiles"`
+}
+
+// registerRuntime is one entry of a daemon's registration body.
+type registerRuntime struct {
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Version   string `json:"version"`
+	ProfileID string `json:"profile_id"`
 }
 
 // handleRegister answers S4 with the single job runtime (the daemon's other
@@ -84,18 +97,41 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "daemon_id does not belong to this job")
 		return
 	}
+	if claims.Role == catalogProbeRole {
+		s.registerProbe(w, r, claims, req)
+		return
+	}
 	e, ok := s.entryFor(w, claims)
 	if !ok {
 		return
 	}
-	name, provider := "foreman-job", "omp"
-	if len(req.Runtimes) > 0 {
-		if req.Runtimes[0].Name != "" {
-			name = req.Runtimes[0].Name
+	// The Job's provider is the provider of the real runtime its claim was
+	// dispatched under; the declared entry of that type is the one echoed
+	// back (§1.2 S4 的选条与拒绝注册面).
+	jobProvider, known := s.client.ProviderForRuntime(e.RealRuntimeID)
+	if !known {
+		// A rebuilt entry has no dispatch record: fall back to the oldest
+		// behaviour (one Job, one provider) instead of refusing a running
+		// Job's daemon.
+		s.log.Warn("job provider unknown at register; using the declared entry as reported",
+			"task_id", e.TaskID, "job_name", e.JobName)
+	}
+	declared, matched := selectDeclaredRuntime(req.Runtimes, jobProvider)
+	if known && !matched {
+		s.log.Error("job declared no runtime for its provider; refusing registration",
+			"task_id", e.TaskID, "job_name", e.JobName, "provider", jobProvider)
+		writeError(w, http.StatusConflict, "runtime provider not declared by this job")
+		if err := s.sched.FailJob(r.Context(), e.JobName, scheduler.FailureReasonDaemonNotRegistered); err != nil {
+			s.log.Error("settle refused registration failed", "task_id", e.TaskID, "err", err)
 		}
-		if req.Runtimes[0].Type != "" {
-			provider = req.Runtimes[0].Type
-		}
+		return
+	}
+	name, provider := declared.Name, declared.Type
+	if name == "" {
+		name = "foreman-job"
+	}
+	if provider == "" {
+		provider = "omp"
 	}
 	s.reg.PutRuntime(registry.JobRuntime{
 		JobRuntimeID:    e.JobRuntimeID,
@@ -155,6 +191,10 @@ func (s *FakeServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid heartbeat body")
 		return
 	}
+	if claims.Role == catalogProbeRole {
+		s.heartbeatProbe(w, claims, req.RuntimeID)
+		return
+	}
 	rt, ok := s.reg.RuntimeByID(req.RuntimeID)
 	if !ok {
 		writeError(w, http.StatusNotFound, "runtime not found")
@@ -175,6 +215,10 @@ func (s *FakeServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 func (s *FakeServer) handleDeregister(w http.ResponseWriter, r *http.Request) {
 	claims, ok := s.authenticate(w, r, auth.RequestScope{})
 	if !ok {
+		return
+	}
+	if claims.Role == catalogProbeRole {
+		s.cancelProbe(w)
 		return
 	}
 	if rt, ok := s.reg.RuntimeByDaemon(claims.JobName); ok {
@@ -211,6 +255,12 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "daemon_id does not belong to this job")
 		return
 	}
+	if claims.Role == catalogProbeRole {
+		// A probe carries no task face: always an empty batch, never a 403
+		// and never a registry lookup (§1.2 S6).
+		writeRaw(w, http.StatusOK, mustMarshal(map[string]any{"tasks": []json.RawMessage{}}))
+		return
+	}
 	runtimeID := ""
 	if len(req.RuntimeIDs) > 0 {
 		runtimeID = req.RuntimeIDs[0]
@@ -242,7 +292,12 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	ready, err := s.client.PrepareLease(r.Context(), tid)
+	entry, ok := s.reg.ByDaemon(claims.JobName)
+	if !ok {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	ready, err := s.client.PrepareLease(r.Context(), entry.RealRuntimeID, tid)
 	switch {
 	case errors.Is(err, scheduler.ErrTaskNotFound):
 		if verr := s.sched.OnTaskVanished(r.Context(), tid); verr != nil {

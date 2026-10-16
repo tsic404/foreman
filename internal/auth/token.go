@@ -17,16 +17,23 @@ func HasJobTokenPrefix(token string) bool {
 
 // tokenPayload is the signed content of a Job Token. Field order matters:
 // encoding/json marshals struct fields in declaration order, keeping the
-// wire format stable.
+// wire format stable. An empty TaskID is omitted so a probe payload
+// {"j":..,"r":"catalog-probe","w":..,"e":..} carries no "t" key at all
+// (a task token always has one, so its shape is unchanged).
 type tokenPayload struct {
 	JobName     string `json:"j"`
-	TaskID      string `json:"t"`
+	TaskID      string `json:"t,omitempty"`
+	Role        string `json:"r,omitempty"`
 	WorkspaceID string `json:"w"`
 	Expiry      int64  `json:"e"`
 }
 
+// valid reports whether the payload carries a usable identity: both token
+// kinds need job/workspace/expiry, and exactly one of the task and role faces
+// must identify the Job (a probe token has no "t").
 func (p tokenPayload) valid() bool {
-	return p.JobName != "" && p.TaskID != "" && p.WorkspaceID != "" && p.Expiry > 0
+	return p.JobName != "" && p.WorkspaceID != "" && p.Expiry > 0 &&
+		(p.TaskID != "" || p.Role != "")
 }
 
 // encodePayload marshals p and base64url-encodes it (RawURLEncoding, no

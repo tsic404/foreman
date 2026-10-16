@@ -276,6 +276,42 @@ before copying the default template:
   resolves to an empty string and the daemon registers without an id — nothing
   checks the selector at startup.
 
+### Catalog probe and model catalog (startup)
+
+Before Foreman registers with Multica Server it runs **one catalog probe Job**:
+the same official daemon, rendered from the same template (ConfigMap present) or
+from the built-in default template (ConfigMap absent). The probe reports which
+runtimes/providers the template environment really has, and that report is what
+Foreman declares to the server; it also doubles as the template preflight.
+
+- `FOREMAN_STARTUP_PROBE_TIMEOUT` (default = `FOREMAN_JOB_BOOT_TIMEOUT`) is the
+  window. **No runtime registers inside it ⇒ Foreman exits non-zero**
+  (`startup.probe_failed` carries the class: `job_create_failed` /
+  `pod_not_started` / `daemon_not_registered` / `discovery_not_landed`). A
+  failure to *land the catalog* is an **error-level** `startup.probe_failed`
+  with `reason=discovery_not_landed`, but it does **not** stop startup:
+  registration (S4) is the only exit criterion. With
+  `FOREMAN_MODEL_CATALOG_ENABLED=false` registration alone completes startup and
+  no failure event is emitted.
+- **Template duty**: the probe needs its own credential and profile, so a
+  template must express them with the two literals Foreman rewrites —
+  profile `foreman-job` → `foreman-catalog`, Secret `fm-<task_id>-cred` →
+  `fm-catalog-<request_id>-cred`. A template that does not means the probe
+  cannot authenticate, so startup exits non-zero (visible, not silent).
+- **Credential duty**: the probe's Job Token sits in the template-shaped pod and
+  the template's own processes can read it — do not add a process to the probe
+  that must not hold it (same rule as the task Jobs).
+- The advertised model catalog is discovered **at startup, on the single node
+  the probe landed on, and replayed from cache** for later server commands
+  (`FOREMAN_MODEL_CATALOG_CACHE_TTL`, default `6h`, stale caches still answer
+  and only raise a warning). Keep the node pool homogeneous and keep the
+  provider configuration under `${FOREMAN_STATE_ROOT}/home`; otherwise the
+  directory you advertise describes a different environment than the task Jobs
+  run in.
+- Operations view: `curl -s localhost:8080/foreman/register-source` prints the
+  discovered list, the declared runtimes and each runtime's catalog slot state
+  (read-only — it never triggers a discovery).
+
 ## Post-install checks
 
 ```bash
@@ -285,5 +321,6 @@ kubectl -n multica-agents get secret registry-tsic
 kubectl -n foreman get secret foreman-secret
 kubectl -n foreman port-forward deploy/foreman 8080:8080 &
 curl -s localhost:8080/foreman/healthz
+curl -s localhost:8080/foreman/register-source
 curl -s localhost:8080/metrics | grep -cE '^foreman_'
 ```

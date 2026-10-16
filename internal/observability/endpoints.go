@@ -28,14 +28,17 @@ type TaskIndex interface {
 }
 
 // OpsConfig carries the static or late-bound values the ops endpoints
-// report. RuntimeID resolves the real runtime id at request time — it is
-// empty until the proxy's first register. Logger defaults to slog.Default.
+// report. RuntimeIDs resolves the declared real runtime ids at request time —
+// empty until C1 answered. RegisterSource resolves the startup discovery view
+// (S31); a nil one keeps the route and answers 404. Logger defaults to
+// slog.Default.
 type OpsConfig struct {
-	Version   string
-	JobImage  string
-	RuntimeID func() string
-	StartedAt time.Time
-	Logger    *slog.Logger
+	Version        string
+	JobImage       string
+	RuntimeIDs     func() []string
+	RegisterSource func() any
+	StartedAt      time.Time
+	Logger         *slog.Logger
 }
 
 // NewOpsHandler mounts the cluster-internal ops surface (contract §1.2
@@ -54,15 +57,17 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 	mux := http.NewServeMux()
 	mux.Handle("GET /metrics", metrics.Handler())
 	mux.HandleFunc("GET /foreman/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		runtimeID := ""
-		if cfg.RuntimeID != nil {
-			runtimeID = cfg.RuntimeID()
+		runtimeIDs := []string{}
+		if cfg.RuntimeIDs != nil {
+			if ids := cfg.RuntimeIDs(); ids != nil {
+				runtimeIDs = ids
+			}
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"status":     "ok",
-			"inflight":   index.Inflight(),
-			"runtime_id": runtimeID,
-			"uptime_s":   int64(time.Since(cfg.StartedAt).Seconds()),
+			"status":      "ok",
+			"inflight":    index.Inflight(),
+			"runtime_ids": runtimeIDs,
+			"uptime_s":    int64(time.Since(cfg.StartedAt).Seconds()),
 		})
 	})
 	mux.HandleFunc("GET /foreman/tasks", func(w http.ResponseWriter, _ *http.Request) {
@@ -104,6 +109,16 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write(e.Payload)
+	})
+	// S31 is read-only by design: it reports the startup discovery, the C1
+	// declaration and the catalog slots, and can never trigger a discovery or
+	// a refresh (ADR-025).
+	mux.HandleFunc("GET /foreman/register-source", func(w http.ResponseWriter, _ *http.Request) {
+		if cfg.RegisterSource == nil {
+			writeError(w, http.StatusNotFound, "register source unavailable")
+			return
+		}
+		writeJSON(w, http.StatusOK, cfg.RegisterSource())
 	})
 	mux.HandleFunc("GET /foreman/version", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{

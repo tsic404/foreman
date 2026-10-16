@@ -16,12 +16,20 @@ import (
 // ClockSkew is the tolerated clock drift between a Job pod and Foreman.
 const ClockSkew = 5 * time.Minute
 
+// RoleCatalogProbe is the payload role of a catalog-probe Job Token
+// (ADR-019). It is the discriminator of the probe branch in Verify: a probe
+// carries no task ID and is adjudicated by the probe session table alone.
+const RoleCatalogProbe = "catalog-probe"
+
 // Claims is the verified content of a Job Token.
 type Claims struct {
 	JobName     string
 	TaskID      string
 	WorkspaceID string
-	ExpiresAt   time.Time
+	// Role is "" for a task Job and RoleCatalogProbe for a catalog probe; a
+	// probe token carries no TaskID.
+	Role      string
+	ExpiresAt time.Time
 	// IsLateReplay marks a terminal-endpoint retry that arrived after the
 	// task reached terminal state; the routing layer answers 200
 	// idempotently and must not run any side effects.
@@ -33,6 +41,10 @@ type Claims struct {
 type RequestScope struct {
 	TaskID    string // path {tid}; empty when the endpoint carries none
 	RuntimeID string // path {rid}; empty when the endpoint carries none
+	// RequestID is the S27 path {req}; empty elsewhere. For a probe it must
+	// match the session's RequestID (command-driven) or SelfMintedID
+	// (startup discovery).
+	RequestID string
 	// IsTerminalEndpoint is true for the terminal report endpoints
 	// (complete / fail / cancel-ack); it gates the late-replay path.
 	IsTerminalEndpoint bool
@@ -58,6 +70,22 @@ type DoneIndex interface {
 	IsDone(taskID string) bool
 }
 
+// ProbeEntry is the subset of a probe session that Verify needs.
+type ProbeEntry struct {
+	JobRuntime   string
+	RequestID    string
+	SelfMintedID string
+	TokenHash    string
+}
+
+// ProbeLookup is the auth module's read view of the probe session table, the
+// authoritative state of catalog-probe Jobs (ADR-019).
+type ProbeLookup interface {
+	// ProbeByJob returns the session bound to jobName (fm-catalog-<req>); ok
+	// is false when no session exists.
+	ProbeByJob(jobName string) (ProbeEntry, bool)
+}
+
 // Issuer signs and verifies Job Tokens. Verification is stateless apart from
 // the registry/done-index seams and the in-process revocation set, so a
 // Foreman restart keeps validating in-flight Jobs.
@@ -67,6 +95,7 @@ type Issuer struct {
 	now         func() time.Time
 	jobs        JobLookup
 	done        DoneIndex
+	probes      ProbeLookup
 	revocations *RevocationSet
 }
 
@@ -76,6 +105,13 @@ type Option func(*Issuer)
 // WithClock overrides the clock (tests).
 func WithClock(now func() time.Time) Option {
 	return func(i *Issuer) { i.now = now }
+}
+
+// WithProbeLookup injects the probe session table; it is required for probe
+// tokens (without it every probe token is an unknown Job) and is never
+// consulted for task tokens.
+func WithProbeLookup(p ProbeLookup) Option {
+	return func(i *Issuer) { i.probes = p }
 }
 
 // NewIssuer builds an Issuer from the decoded HMAC key (>= MinKeyBytes) and
@@ -113,8 +149,38 @@ func (i *Issuer) Issue(jobName, taskID, workspaceID string, ttl time.Duration) (
 	if err != nil {
 		return "", err
 	}
+	return i.assemble(segment), nil
+}
+
+// IssueProbe signs a catalog-probe Job Token: payload
+// {"j":jobName,"r":"catalog-probe","w":workspaceID,"e":exp} with no "t",
+// because a probe never maps to a task (ADR-019). requestID is not part of the
+// payload; it is only validated here to keep the signature at parity with the
+// scheduler's Start.
+func (i *Issuer) IssueProbe(jobName, requestID, workspaceID string, ttl time.Duration) (string, error) {
+	if jobName == "" || requestID == "" || workspaceID == "" {
+		return "", errors.New("auth: job name, request ID and workspace ID are required")
+	}
+	if ttl <= 0 {
+		return "", errors.New("auth: ttl must be positive")
+	}
+	segment, err := encodePayload(tokenPayload{
+		JobName:     jobName,
+		Role:        RoleCatalogProbe,
+		WorkspaceID: workspaceID,
+		Expiry:      i.now().Add(ttl).Unix(),
+	})
+	if err != nil {
+		return "", err
+	}
+	return i.assemble(segment), nil
+}
+
+// assemble builds the wire token "fmj_"+segment+"."+b64url(hmac over the
+// prefix and segment).
+func (i *Issuer) assemble(segment string) string {
 	signingInput := TokenPrefix + segment
-	return signingInput + "." + base64.RawURLEncoding.EncodeToString(i.sign(signingInput)), nil
+	return signingInput + "." + base64.RawURLEncoding.EncodeToString(i.sign(signingInput))
 }
 
 // sign returns HMAC-SHA256(key, input).
@@ -124,10 +190,11 @@ func (i *Issuer) sign(input string) []byte {
 	return mac.Sum(nil)
 }
 
-// Verify runs the fixed seven-step check of the auth module design and
-// returns the token's claims or one of the structured errors. A terminal
-// task in the done index answering a terminal endpoint yields claims with
-// IsLateReplay set and no error.
+// Verify runs the fixed check of the auth module design and returns the
+// token's claims or one of the structured errors. A probe token (payload role
+// catalog-probe) is adjudicated by the probe session table alone (ADR-019); a
+// terminal task in the done index answering a terminal endpoint yields claims
+// with IsLateReplay set and no error.
 func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 	// 1. Prefix / segment / format check.
 	payload, segment, signature, err := parseToken(token)
@@ -153,6 +220,39 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 	// after the reclaim deleted it, "no entry" is the authoritative verdict:
 	// a terminal endpoint retried by a daemon that already reported is a
 	// late replay (200 idempotent), everything else is an unknown Job.
+	//
+	// A probe token takes the probe branch first: the probe session table is
+	// its sole adjudication face, and neither the task registry nor the done
+	// index nor the task-face revocation set is consulted (ADR-019).
+	if payload.Role == RoleCatalogProbe {
+		var session ProbeEntry
+		var found bool
+		if i.probes != nil {
+			session, found = i.probes.ProbeByJob(payload.JobName)
+		}
+		if !found {
+			return Claims{}, fmt.Errorf("%w: %s", ErrUnknownJob, payload.JobName)
+		}
+		if session.TokenHash != "" && i.Hash(token) != session.TokenHash {
+			return Claims{}, ErrRevoked
+		}
+		claims.Role = RoleCatalogProbe
+		// The probe has no task face at all: any {tid} on the path is out of
+		// scope, never a resource to adjudicate (auth.md「目录探针的身份
+		// 面」作用域行). Without this, a probe token could drive the
+		// task-addressed endpoints (S9/S20/S26 forward with Foreman's own
+		// server credential) and even settle an in-flight task via S9's 404.
+		if req.TaskID != "" {
+			return Claims{}, fmt.Errorf("%w: probe carries no task scope, got %s", ErrScopeMismatch, req.TaskID)
+		}
+		if req.RuntimeID != "" && req.RuntimeID != session.JobRuntime {
+			return Claims{}, fmt.Errorf("%w: runtime %s", ErrScopeMismatch, req.RuntimeID)
+		}
+		if req.RequestID != "" && req.RequestID != session.RequestID && req.RequestID != session.SelfMintedID {
+			return Claims{}, fmt.Errorf("%w: request %s", ErrScopeMismatch, req.RequestID)
+		}
+		return claims, nil
+	}
 	entry, ok := i.jobs.ByDaemon(payload.JobName)
 	if !ok {
 		if i.done.IsDone(payload.TaskID) && req.IsTerminalEndpoint {

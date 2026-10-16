@@ -40,10 +40,25 @@ type fakeIssuer struct {
 	ttl         time.Duration
 	token       string
 	err         error
+
+	// The probe face of the same seam (ADR-019): recorded beside the task
+	// call's arguments, so a test can pin the probe's TTL arithmetic.
+	probeJobName     string
+	probeRequestID   string
+	probeWorkspaceID string
+	probeTTL         time.Duration
 }
 
 func (f *fakeIssuer) Issue(jobName, taskID, workspaceID string, ttl time.Duration) (string, error) {
 	f.jobName, f.taskID, f.workspaceID, f.ttl = jobName, taskID, workspaceID, ttl
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.token, nil
+}
+
+func (f *fakeIssuer) IssueProbe(jobName, requestID, workspaceID string, ttl time.Duration) (string, error) {
+	f.probeJobName, f.probeRequestID, f.probeWorkspaceID, f.probeTTL = jobName, requestID, workspaceID, ttl
 	if f.err != nil {
 		return "", f.err
 	}

@@ -107,6 +107,13 @@ type TaskEntry struct {
 	// rebuilt entry's Job already exists and never goes through Build.
 	PriorSessionID string `json:"-"`
 
+	// RealRuntimeID is the real runtime the claim was dispatched under: the
+	// C4 lease, the C19 resolve and the S8 body translation are all addressed
+	// by it when Foreman declares N runtimes. Like the payload it is
+	// memory-only and absent on rebuilt entries, whose Job is already past
+	// its start.
+	RealRuntimeID string `json:"-"`
+
 	// Payload: raw claim payload until MarkDelivering replaces it with the
 	// delivered body — the form the ops preview must serve (S6 / AC-07).
 	Payload json.RawMessage `json:"-"`
@@ -157,6 +164,11 @@ const (
 	LabelManagedBy   = "app.kubernetes.io/managed-by"
 	ManagedByForeman = "foreman"
 
+	// LabelRole and RoleCatalogProbe mark a catalog-probe Job/Secret; they are
+	// the probe domain's discriminator, mutually exclusive with LabelTaskID
+	// (contract §3.2).
+	LabelRole        = "foreman.tsic.top/role"
+	RoleCatalogProbe = "catalog-probe"
 	LabelTaskID      = "foreman.tsic.top/task-id"
 	LabelAgentID     = "foreman.tsic.top/agent-id"
 	LabelWorkspaceID = "foreman.tsic.top/workspace-id"

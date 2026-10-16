@@ -19,6 +19,10 @@ type Metrics interface {
 	WSConnect(side string)
 	WSDisconnect(side string)
 	WSReconnect(side string)
+	// ModelCatalogRelay records one catalog relay outcome: code is the C21
+	// status returned to the probe daemon, or "none" when no relay happened
+	// (observability.md foreman_model_catalog_relays_total).
+	ModelCatalogRelay(code string, seconds float64)
 }
 
 // EndpointAgentAPI is the foreman_forward_total endpoint label for S29
@@ -39,6 +43,7 @@ func (noopMetrics) AuthFailure(string)                 {}
 func (noopMetrics) WSConnect(string)                   {}
 func (noopMetrics) WSDisconnect(string)                {}
 func (noopMetrics) WSReconnect(string)                 {}
+func (noopMetrics) ModelCatalogRelay(string, float64)  {}
 
 func orNoopMetrics(m Metrics) Metrics {
 	if m == nil {

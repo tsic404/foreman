@@ -24,6 +24,9 @@ type TaskScheduler interface {
 	Deliver(daemonID, runtimeID string, maxTasks int) ([]json.RawMessage, error)
 	OnReport(ctx context.Context, ep scheduler.Endpoint, e registry.TaskEntry, body []byte) (int, []byte, error)
 	OnTaskVanished(ctx context.Context, taskID string) error
+	// FailJob settles a Job whose daemon was refused at S4: the entry reaches
+	// terminal/failed without waiting out the boot deadline (§1.2 S4).
+	FailJob(ctx context.Context, jobName, reason string) error
 }
 
 // FakeServer is the J→F face: it speaks the official server protocol to the
@@ -33,6 +36,7 @@ type TaskScheduler interface {
 type FakeServer struct {
 	issuer  *auth.Issuer
 	reg     *registry.Registry
+	probes  *registry.ProbeRegistry // catalog-probe sessions; nil disables the probe face
 	sched   TaskScheduler
 	client  *Client
 	ws      *WSHandler // nil when FOREMAN_WS_ENABLED=false
@@ -41,10 +45,19 @@ type FakeServer struct {
 	mux     *http.ServeMux
 }
 
+// FakeServerOption customizes a FakeServer.
+type FakeServerOption func(*FakeServer)
+
+// WithProbeRegistry wires the catalog-probe session table: it is what makes
+// S4/S5/S19/S27 answer a probe token (§1.2 规则 1 的探针分支).
+func WithProbeRegistry(probes *registry.ProbeRegistry) FakeServerOption {
+	return func(s *FakeServer) { s.probes = probes }
+}
+
 // NewFakeServer builds the handler with the full §1.2 routing table.
 // ws may be nil; the S30 route is then not registered and WS dials get a
 // 404 (the FOREMAN_WS_ENABLED=false degradation, §5.1).
-func NewFakeServer(issuer *auth.Issuer, reg *registry.Registry, sched TaskScheduler, client *Client, ws *WSHandler, metrics Metrics) *FakeServer {
+func NewFakeServer(issuer *auth.Issuer, reg *registry.Registry, sched TaskScheduler, client *Client, ws *WSHandler, metrics Metrics, opts ...FakeServerOption) *FakeServer {
 	s := &FakeServer{
 		issuer:  issuer,
 		reg:     reg,
@@ -54,6 +67,9 @@ func NewFakeServer(issuer *auth.Issuer, reg *registry.Registry, sched TaskSchedu
 		metrics: orNoopMetrics(metrics),
 		log:     slog.Default().With("component", "fake-server"),
 		mux:     http.NewServeMux(),
+	}
+	for _, opt := range opts {
+		opt(s)
 	}
 	s.routes()
 	return s
@@ -93,7 +109,7 @@ func (s *FakeServer) routes() {
 	m.HandleFunc("POST /api/daemon/runtimes/{rid}/tasks/{tid}/prepare-lease", s.handlePrepareLease)         // S7
 	m.HandleFunc("POST /api/daemon/runtimes/{rid}/tasks/{tid}/skill-bundles/resolve", s.handleSkillBundles) // S26
 	m.HandleFunc("POST /api/daemon/runtimes/{rid}/recover-orphans", s.handleRecoverOrphans)                 // S18
-	m.HandleFunc("POST /api/daemon/runtimes/{rid}/models/{req}/result", s.handle404)                        // S27
+	m.HandleFunc("POST /api/daemon/runtimes/{rid}/models/{req}/result", s.handleModelResult)                // S27
 	m.HandleFunc("POST /api/daemon/runtimes/{rid}/local-skills/{req}/result", s.handle404)                  // S27
 	m.HandleFunc("POST /api/daemon/runtimes/{rid}/local-skills/import/{req}/result", s.handle404)           // S27
 	m.HandleFunc("POST /api/daemon/runtimes/{rid}/update/{req}/result", s.handle404)                        // S27
@@ -232,7 +248,29 @@ func (a jobLookup) ByDaemon(daemonID string) (auth.JobEntry, bool) {
 
 // JobTokenIssuer builds the Job Token issuer over the registry's read view
 // (the auth ↔ registry wiring the Job-facing surfaces share). tokenTTL is the
-// issued lifetime; it also bounds the revocation window (ADR-017).
-func JobTokenIssuer(key []byte, reg *registry.Registry, tokenTTL time.Duration) (*auth.Issuer, error) {
-	return auth.NewIssuer(key, jobLookup{reg}, reg, tokenTTL)
+// issued lifetime; it also bounds the revocation window (ADR-017). probes is
+// the catalog-probe session table a probe token is adjudicated against; a nil
+// one leaves probe tokens unverifiable.
+func JobTokenIssuer(key []byte, reg *registry.Registry, probes *registry.ProbeRegistry, tokenTTL time.Duration) (*auth.Issuer, error) {
+	opts := []auth.Option{}
+	if probes != nil {
+		opts = append(opts, auth.WithProbeLookup(probeLookup{probes}))
+	}
+	return auth.NewIssuer(key, jobLookup{reg}, reg, tokenTTL, opts...)
+}
+
+// probeLookup adapts the probe session table to auth's read view.
+type probeLookup struct{ probes *registry.ProbeRegistry }
+
+func (p probeLookup) ProbeByJob(jobName string) (auth.ProbeEntry, bool) {
+	session, ok := p.probes.ProbeByJob(jobName)
+	if !ok {
+		return auth.ProbeEntry{}, false
+	}
+	return auth.ProbeEntry{
+		JobRuntime:   session.JobRuntime,
+		RequestID:    session.RequestID,
+		SelfMintedID: session.SelfMintedID,
+		TokenHash:    session.TokenHash,
+	}, true
 }

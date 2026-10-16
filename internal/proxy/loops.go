@@ -6,6 +6,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"sync"
 	"time"
 )
 
@@ -139,57 +140,160 @@ func (l *ClaimLoop) interval() time.Duration {
 	return l.cfg.ClaimInterval
 }
 
-// HeartbeatLoop keeps the real runtime alive (C2 every 15s) and renews the
-// server token (C16 every 72h, non-fatal). Failures back off per §4; a 403
-// stops the loop (config error). The loop never exits on its own otherwise.
+// HeartbeatLoop keeps every declared real runtime alive: one independent C2
+// stream per runtime, each with its own backoff — a failing runtime never
+// touches the others (§7 多 runtime 的失败面按 runtime 粒度). C16 renews the
+// server token every 72h and is non-fatal. A 403 stops the loop (config error).
+// The heartbeat ack is consumed in the same round it arrives (§1.1「C2 ack
+// 消费」第 3 条).
 type HeartbeatLoop struct {
-	client  *Client
-	log     *slog.Logger
-	backoff *backoff
-	now     func() time.Time
+	client   *Client
+	reporter *ModelCatalogReporter
+	log      *slog.Logger
+	now      func() time.Time
 
 	// lastRenewAttempt clocks the C16 cadence by attempt, not success: a
-	// failing renew must not retry every 15s tick. Seeded at construction —
-	// the preflight has just renewed.
+	// failing renew must not retry every tick. Seeded at construction — the
+	// preflight has just renewed.
 	lastRenewAttempt time.Time
+	// renewMu guards lastRenewAttempt: the per-runtime streams share one
+	// token-renew clock.
+	renewMu sync.Mutex
 }
 
 // NewHeartbeatLoop builds the heartbeat loop.
-func NewHeartbeatLoop(client *Client) *HeartbeatLoop {
+func NewHeartbeatLoop(client *Client, reporter *ModelCatalogReporter) *HeartbeatLoop {
 	return &HeartbeatLoop{
 		client:           client,
+		reporter:         reporter,
 		log:              slog.Default().With("component", "heartbeat-loop"),
-		backoff:          newBackoff(),
 		now:              time.Now,
 		lastRenewAttempt: time.Now(),
 	}
 }
 
-// Run heartbeats until ctx ends or a 403 marks the credential misbound.
+// Run supervises one heartbeat goroutine per declared real runtime until ctx
+// ends or a 403 marks the credential misbound. A runtime whose id moved is
+// restarted on its own; the other streams keep running (§7).
 func (l *HeartbeatLoop) Run(ctx context.Context) error {
+	changes := l.client.Changes()
+	streams := map[string]heartbeatStream{}
+	stopAll := func() {
+		for provider, stream := range streams {
+			stream.cancel()
+			delete(streams, provider)
+		}
+	}
+	defer stopAll()
+	// One slot per stream would be ideal, but reconcile may add streams later;
+	// the send below is ctx-guarded instead, so a stream that exits after Run
+	// returned can never block on a full channel.
+	started := make(chan error, 8)
+	reconcile := func() {
+		declared := map[string]RuntimeRef{}
+		for _, ref := range l.client.RuntimeRefs() {
+			if ref.ID != "" {
+				declared[ref.Provider] = ref
+			}
+		}
+		for provider, stream := range streams {
+			ref, ok := declared[provider]
+			if !ok || ref.ID != stream.runtimeID {
+				stream.cancel()
+				delete(streams, provider)
+			}
+		}
+		for provider, ref := range declared {
+			if _, ok := streams[provider]; ok {
+				continue
+			}
+			streamCtx, cancel := context.WithCancel(ctx)
+			streams[provider] = heartbeatStream{runtimeID: ref.ID, cancel: cancel}
+			go func(runtimeID string) {
+				err := l.stream(streamCtx, runtimeID)
+				select {
+				case started <- err:
+				case <-ctx.Done():
+				}
+			}(ref.ID)
+		}
+	}
 	for {
-		if err := l.client.Heartbeat(ctx); err != nil {
-			if isConfigError(err) {
-				l.log.Error("heartbeat rejected: 403 config error, not retrying", "err", err)
+		reconcile()
+		select {
+		case <-ctx.Done():
+			return nil
+		case err := <-started:
+			if err != nil {
 				return err
 			}
-			wait := l.backoff.next()
-			l.log.Error("heartbeat failed", "err", err, "retry_in", wait)
-			if !sleepOrDone(ctx, wait) {
+		case <-changes:
+		case <-time.After(heartbeatSupervisorInterval):
+		}
+	}
+}
+
+// heartbeatStream is one supervised per-runtime heartbeat goroutine.
+type heartbeatStream struct {
+	runtimeID string
+	cancel    context.CancelFunc
+}
+
+// heartbeatSupervisorInterval re-reads the runtime set even without a change
+// notification (a dropped notification only delays the resync).
+const heartbeatSupervisorInterval = 5 * time.Second
+
+// stream heartbeats one runtime until ctx ends. A nil return means the stream
+// was retired (runtime replaced); a non-nil one is a 403 config error and stops
+// the loop.
+func (l *HeartbeatLoop) stream(ctx context.Context, runtimeID string) error {
+	backoff := newBackoff()
+	for {
+		ack, err := l.client.Heartbeat(ctx, runtimeID)
+		if err != nil {
+			if ctx.Err() != nil {
 				return nil
 			}
-			continue
-		}
-		l.backoff.reset()
-		if l.now().Sub(l.lastRenewAttempt) >= tokenRenewInterval {
-			l.lastRenewAttempt = l.now()
-			if err := l.client.RenewToken(ctx); err != nil {
-				l.log.Warn("token renew failed (non-fatal)", "err", err)
+			if errors.Is(err, errAckUnparsable) {
+				// The pending request is unrecoverable (delivered once); the
+				// server converges it by timeout. Keep the cadence.
+				l.log.Error("heartbeat ack unreadable; continuing without pending work", "runtime_id", runtimeID, "err", err)
+			} else if isConfigError(err) {
+				l.log.Error("heartbeat rejected: 403 config error, not retrying", "runtime_id", runtimeID, "err", err)
+				return err
+			} else {
+				wait := backoff.next()
+				l.log.Error("heartbeat failed", "runtime_id", runtimeID, "err", err, "retry_in", wait)
+				if !sleepOrDone(ctx, wait) {
+					return nil
+				}
+				continue
+			}
+		} else {
+			backoff.reset()
+			if ack.PendingModelList != nil && l.reporter != nil {
+				l.reporter.OnAck(ctx, ack.RuntimeID, ack.PendingModelList.ID)
 			}
 		}
+		l.maybeRenewToken(ctx)
 		if !sleepOrDone(ctx, heartbeatInterval) {
 			return nil
 		}
+	}
+}
+
+func (l *HeartbeatLoop) maybeRenewToken(ctx context.Context) {
+	l.renewMu.Lock()
+	due := l.now().Sub(l.lastRenewAttempt) >= tokenRenewInterval
+	if due {
+		l.lastRenewAttempt = l.now()
+	}
+	l.renewMu.Unlock()
+	if !due {
+		return
+	}
+	if err := l.client.RenewToken(ctx); err != nil {
+		l.log.Warn("token renew failed (non-fatal)", "err", err)
 	}
 }
 

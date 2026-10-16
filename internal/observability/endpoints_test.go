@@ -35,10 +35,10 @@ func (f *fakeLogReader) ReadLogs(_ context.Context, namespace, jobName string, t
 
 func newTestHandler(reg *registry.Registry, logs PodLogReader) http.Handler {
 	return NewOpsHandler(NewMetrics(), reg, logs, OpsConfig{
-		Version:   "v0.1.0",
-		JobImage:  "ghcr.io/tsic404/foreman-job@sha256:abc",
-		RuntimeID: func() string { return "rt-123" },
-		StartedAt: time.Now().Add(-time.Minute),
+		Version:    "v0.1.0",
+		JobImage:   "ghcr.io/tsic404/foreman-job@sha256:abc",
+		RuntimeIDs: func() []string { return []string{"rt-123", "rt-456"} },
+		StartedAt:  time.Now().Add(-time.Minute),
 	})
 }
 
@@ -66,13 +66,13 @@ func TestHealthz(t *testing.T) {
 		t.Fatalf("status = %d", rec.Code)
 	}
 	var body struct {
-		Status    string `json:"status"`
-		Inflight  int    `json:"inflight"`
-		RuntimeID string `json:"runtime_id"`
-		UptimeS   int64  `json:"uptime_s"`
+		Status     string   `json:"status"`
+		Inflight   int      `json:"inflight"`
+		RuntimeIDs []string `json:"runtime_ids"`
+		UptimeS    int64    `json:"uptime_s"`
 	}
 	decodeBody(t, rec, &body)
-	if body.Status != "ok" || body.Inflight != 1 || body.RuntimeID != "rt-123" || body.UptimeS < 59 {
+	if body.Status != "ok" || body.Inflight != 1 || len(body.RuntimeIDs) != 2 || body.RuntimeIDs[0] != "rt-123" || body.UptimeS < 59 {
 		t.Fatalf("healthz = %+v", body)
 	}
 }
@@ -364,5 +364,44 @@ func TestJobLogsForbidden(t *testing.T) {
 	}
 	if !strings.Contains(logBuf.String(), "read job logs forbidden") {
 		t.Fatalf("expected error log, got %q", logBuf.String())
+	}
+}
+
+// TestRegisterSourceEndpoint serves the S31 read-only projection: the startup
+// discovery, the C1 declaration and the catalog slots, never a discovery
+// trigger (ADR-025).
+func TestRegisterSourceEndpoint(t *testing.T) {
+	reg := registry.New(time.Now)
+	view := map[string]any{
+		"runtimes":        []map[string]string{{"name": "n-omp", "type": "omp", "version": "1.0.0"}},
+		"cli_version":     "1.0.0",
+		"failed_profiles": []any{},
+		"declaration":     []map[string]string{{"provider": "omp", "real_runtime_id": "rt-1"}},
+		"slots":           []map[string]any{{"runtime_id": "rt-1", "provider": "omp", "cached": true}},
+	}
+	h := NewOpsHandler(NewMetrics(), reg, nil, OpsConfig{
+		Version:        "v0.1.0",
+		RegisterSource: func() any { return view },
+	})
+	rec := do(t, h, "/foreman/register-source")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var body map[string]any
+	decodeBody(t, rec, &body)
+	if body["cli_version"] != "1.0.0" {
+		t.Errorf("cli_version = %v", body["cli_version"])
+	}
+	if len(body["declaration"].([]any)) != 1 {
+		t.Errorf("declaration = %v", body["declaration"])
+	}
+}
+
+// TestRegisterSourceUnavailableWithoutSeam keeps the route honest when the
+// ops handler was built without a register-source view.
+func TestRegisterSourceUnavailableWithoutSeam(t *testing.T) {
+	h := NewOpsHandler(NewMetrics(), registry.New(time.Now), nil, OpsConfig{Version: "v0.1.0"})
+	if rec := do(t, h, "/foreman/register-source"); rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404", rec.Code)
 	}
 }

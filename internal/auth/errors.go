@@ -42,7 +42,9 @@ func HTTPStatus(err error) int {
 // malformed|signature|expired|scope|unknown_job|revoked) — a seventh value
 // would split the counter into an off-contract series. ErrRevoked is the
 // same-name reuse face (the entry came back with a predecessor's token);
-// every other rejection of a live entry maps to unknown_job.
+// every other rejection of a live entry maps to unknown_job. The probe
+// branch reuses the same labels: a missing session is unknown_job and a hash
+// mismatch is revoked.
 func Reason(err error) string {
 	switch {
 	case errors.Is(err, ErrMalformedToken):

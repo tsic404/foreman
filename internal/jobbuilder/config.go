@@ -32,6 +32,7 @@ const (
 	EnvJobMemoryLimit      = "FOREMAN_JOB_MEMORY_LIMIT"
 	EnvJobNodeSelector     = "FOREMAN_JOB_NODE_SELECTOR"
 	EnvJobTolerations      = "FOREMAN_JOB_TOLERATIONS"
+	EnvJobDrainTimeout     = "FOREMAN_JOB_DRAIN_TIMEOUT"
 )
 
 // Contract defaults (§5.1).
@@ -52,6 +53,18 @@ const (
 	// concern, not a new production dependency.
 	DefaultJobTokenTTL     = 24*time.Hour + 7*time.Minute
 	DefaultTaskMaxDuration = 86400 * time.Second
+
+	// DefaultJobDrainTimeout is the credential-reclaim upper bound that
+	// follows a task's verdict (§5.1, ADR-017). It is also the scheduler
+	// module's default, read from the same env: a probe's Job Token must
+	// outlive the probe's Job by this bound.
+	DefaultJobDrainTimeout = 120 * time.Second
+
+	// DefaultProbeHeartbeatInterval is the probe daemon's S5 heartbeat
+	// interval (§5.1 固定值): Foreman writes the key, never the template, and
+	// the startup self-check keeps FOREMAN_MODEL_CATALOG_TIMEOUT at three
+	// times this value at least.
+	DefaultProbeHeartbeatInterval = 15 * time.Second
 )
 
 // Cache modes for FOREMAN_REPO_CACHE_MODE (ADR-005).
@@ -91,6 +104,15 @@ type Config struct {
 	NodeSelector     map[string]string
 	Tolerations      []corev1.Toleration
 
+	// JobDrainTimeout is FOREMAN_JOB_DRAIN_TIMEOUT: a task's credential-reclaim
+	// bound, and the window past its budget that a probe's Job Token still has
+	// to cover (ADR-017).
+	JobDrainTimeout time.Duration
+	// ProbeHeartbeatInterval is the value Foreman writes into the probe's
+	// MULTICA_DAEMON_HEARTBEAT_INTERVAL (§5.1 固定值): it fixes how late a
+	// server command can reach a probe, so it is not deployer-tunable.
+	ProbeHeartbeatInterval time.Duration
+
 	// TemplatePath is where the optional job-overlay.yaml is mounted
 	// (03-contracts.md §5.4). The Deployment fixes it; §5.4 has no env switch
 	// on purpose, so only tests point it elsewhere.
@@ -108,6 +130,17 @@ func (c Config) logger() *slog.Logger {
 		return c.Logger
 	}
 	return slog.Default()
+}
+
+// probeHeartbeat is the heartbeat interval the probe Job carries. A Config
+// built without LoadConfig has no loaded value, and an empty interval would
+// render "0s" — the daemon would then spin on its heartbeat — so the fixed
+// contract value stands in.
+func (c Config) probeHeartbeat() time.Duration {
+	if c.ProbeHeartbeatInterval <= 0 {
+		return DefaultProbeHeartbeatInterval
+	}
+	return c.ProbeHeartbeatInterval
 }
 
 // LoadConfig reads the jobbuilder configuration from env (os.Getenv when
@@ -133,6 +166,9 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		NodeSelector:     map[string]string{"kubernetes.io/os": "linux"},
 		Tolerations:      defaultTolerations,
 		TemplatePath:     TemplatePath,
+
+		JobDrainTimeout:        DefaultJobDrainTimeout,
+		ProbeHeartbeatInterval: DefaultProbeHeartbeatInterval,
 	}
 
 	if v := strings.TrimSpace(getenv(EnvJobNamespace)); v != "" {
@@ -192,6 +228,19 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	}
 	if v := strings.TrimSpace(getenv(EnvStateRoot)); v != "" {
 		cfg.StateRoot = path.Clean(v)
+	}
+	// Zero is legal (the reclaim lands on the next observation point), so only
+	// a negative bound is refused — the same rule the scheduler module applies
+	// to this env.
+	if raw := strings.TrimSpace(getenv(EnvJobDrainTimeout)); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be a duration: %v", EnvJobDrainTimeout, err)
+		}
+		if d < 0 {
+			return Config{}, fmt.Errorf("%s must be >= 0, got %s", EnvJobDrainTimeout, d)
+		}
+		cfg.JobDrainTimeout = d
 	}
 	if v := strings.TrimSpace(getenv(EnvRepoCacheMode)); v != "" {
 		if v != CacheModeShared && v != CacheModeIsolated {

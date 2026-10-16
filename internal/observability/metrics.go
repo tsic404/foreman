@@ -32,6 +32,10 @@ const (
 	metricHeartbeatSuspect  = "foreman_heartbeat_suspect"
 	metricCredReclaimTotal  = "foreman_cred_reclaim_total"
 	metricJobDrainSeconds   = "foreman_job_drain_seconds"
+	// Catalog relay metrics (ADR-019 / ADR-025): the relay outcome by C21
+	// status code ("none" = abandoned) and the consumption-to-answer span.
+	metricModelCatalogRelays = "foreman_model_catalog_relays_total"
+	metricModelCatalogSecond = "foreman_model_catalog_seconds"
 )
 
 // Terminal result label values (contract §3.1).
@@ -67,6 +71,11 @@ var credReclaimReasons = []string{"job_terminated", "drain_timeout"}
 // wsSides is the side label vocabulary (ADR-010).
 var wsSides = []string{"server", "job"}
 
+// modelCatalogCodes is the foreman_model_catalog_relays_total label
+// vocabulary: the C21 status returned to the probe daemon, or "none" when the
+// relay was abandoned (observability.md 指标口径).
+var modelCatalogCodes = []string{"none", "200", "400", "401", "403", "404", "409", "500", "502", "503"}
+
 // Metrics is the Prometheus implementation of the contract §2 Metrics
 // interface plus the recorders for the remaining designed metrics. It owns
 // a private registry — no global state — so a collector panic is contained
@@ -91,6 +100,8 @@ type Metrics struct {
 	heartbeatSuspect  prometheus.Gauge
 	credReclaims      *prometheus.CounterVec
 	jobDrainSeconds   prometheus.Histogram
+	catalogRelays     *prometheus.CounterVec
+	catalogSeconds    prometheus.Histogram
 
 	// wsMu guards wsJobs, the authoritative side=job connection count; the
 	// gauge is Set from it so a disconnect without a matching connect (e.g.
@@ -179,12 +190,22 @@ func NewMetrics() *Metrics {
 		Buckets: []float64{1, 5, 15, 30, 60, 120, 300, 600},
 	})
 
+	m.catalogRelays = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricModelCatalogRelays,
+		Help: "Model catalog relays by C21 status code; none = abandoned.",
+	}, []string{"code"})
+	m.catalogSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    metricModelCatalogSecond,
+		Help:    "Consume pending_model_list -> relay finished (or abandoned).",
+		Buckets: []float64{0.05, 0.5, 1, 5, 15, 30, 45, 60, 90},
+	})
+
 	collectors := []prometheus.Collector{
 		m.tasksTotal, m.taskClaims, m.claimErrors, m.jobBootSeconds,
 		m.jobCreateSeconds, m.inflightJobs, m.forwardTotal, m.forwardLatency,
 		m.authFailures, m.tokenUsage, m.duplicateDispatch, m.pendingReports,
 		m.wsConnected, m.wsReconnects, m.heartbeatSuspect,
-		m.credReclaims, m.jobDrainSeconds,
+		m.credReclaims, m.jobDrainSeconds, m.catalogRelays, m.catalogSeconds,
 	}
 	for _, c := range collectors {
 		m.reg.MustRegister(c)
@@ -202,6 +223,9 @@ func NewMetrics() *Metrics {
 	}
 	for _, reason := range authFailureReasons {
 		m.authFailures.WithLabelValues(reason)
+	}
+	for _, code := range modelCatalogCodes {
+		m.catalogRelays.WithLabelValues(code)
 	}
 	for _, direction := range []string{"input", "output", "cache_read", "cache_write"} {
 		m.tokenUsage.WithLabelValues("", "", direction)
@@ -303,6 +327,17 @@ func (m *Metrics) HeartbeatSuspect(n int) { m.heartbeatSuspect.Set(float64(n)) }
 // drain_timeout) and observes how long the drain window lasted (ADR-017).
 // drain_timeout > 0 means the upper bound closed the window — a review input,
 // not a failure.
+// ModelCatalogRelay records one catalog relay outcome (ADR-019 / ADR-025):
+// code is the C21 status returned to the probe daemon, or "none" when no relay
+// happened; seconds spans consumption to answer (near zero for a cache replay).
+func (m *Metrics) ModelCatalogRelay(code string, seconds float64) {
+	if code == "" {
+		code = "none"
+	}
+	m.catalogRelays.WithLabelValues(code).Inc()
+	m.catalogSeconds.Observe(seconds)
+}
+
 func (m *Metrics) CredReclaimed(reason string, drainSeconds float64) {
 	m.credReclaims.WithLabelValues(reason).Inc()
 	m.jobDrainSeconds.Observe(drainSeconds)

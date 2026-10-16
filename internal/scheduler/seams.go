@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -42,6 +43,10 @@ type ServerClient interface {
 // (ADR-017), the only handle the reclaim path has on the credential.
 type JobBuilder interface {
 	Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, string, error)
+	// BuildCatalogProbe renders a catalog-probe Job and its credential Secret
+	// (ADR-019): shape source by CM window, budget into the default template's
+	// activeDeadlineSeconds, token TTL = budget + drain timeout.
+	BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error)
 }
 
 // Revoker feeds a revoked credential digest to the Job Token authority

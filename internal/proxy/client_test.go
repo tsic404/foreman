@@ -1,17 +1,21 @@
 package proxy
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
 )
 
@@ -96,14 +100,56 @@ func testConfig(serverURL string) Config {
 		WorkspaceID:          "ws-1",
 		DaemonID:             "foreman",
 		Version:              "0.1.0",
-		RuntimeName:          "foreman-omp",
-		RuntimeType:          "omp",
-		RuntimeVersion:       "18.0.0",
 		ClaimInterval:        time.Second,
 		ClaimIntervalIdle:    time.Second,
 		LeaseRefreshInterval: time.Second,
 		WSEnabled:            true,
+		ModelCatalogEnabled:  true,
+		ModelCatalogTimeout:  45 * time.Second,
+		ModelCatalogCacheTTL: 6 * time.Hour,
 	}
+}
+
+// testDiscovery is the startup discovery the client tests declare: one omp
+// runtime, exactly what the startup probe would report (ADR-025).
+func testDiscovery() registry.Discovery {
+	return registry.Discovery{
+		CLIVersion: "18.0.0",
+		Runtimes: []registry.DiscoveredRuntime{
+			{Name: "foreman-omp", Type: "omp", Version: "18.0.0"},
+		},
+	}
+}
+
+// registerDeclared performs the C1 declaration the startup orchestration hands
+// over (the client never registers without one).
+func registerDeclared(t *testing.T, c *Client) {
+	t.Helper()
+	if err := c.RegisterWithDiscovery(t.Context(), testDiscovery()); err != nil {
+		t.Fatalf("RegisterWithDiscovery: %v", err)
+	}
+	drainChanges(c)
+}
+
+// drainChanges consumes the runtime-set notifications already queued (the
+// appearance of the declared set), so a test observes only later moves.
+func drainChanges(c *Client) {
+	for {
+		select {
+		case <-c.Changes():
+		default:
+			return
+		}
+	}
+}
+
+// firstRuntimeID is the single declared runtime id ("" when unregistered).
+func firstRuntimeID(c *Client) string {
+	ids := c.RuntimeIDs()
+	if len(ids) == 0 {
+		return ""
+	}
+	return ids[0]
 }
 
 // stubRegister answers C1 with the given runtime id.
@@ -125,9 +171,7 @@ func TestRegisterSendsContractBody(t *testing.T) {
 	stubRegister(stub, "rid-1")
 	c := NewClient(testConfig(srv.URL), "mdt_test")
 
-	if err := c.Register(t.Context()); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
+	registerDeclared(t, c)
 	calls := stub.calls("POST", "/api/daemon/register")
 	if len(calls) != 1 {
 		t.Fatalf("register calls = %d, want 1", len(calls))
@@ -145,8 +189,14 @@ func TestRegisterSendsContractBody(t *testing.T) {
 	if got := req.Header.Get("X-Client-OS"); got != "linux" {
 		t.Errorf("os = %q", got)
 	}
-	if got := req.Header.Get("X-Client-Version"); got != "0.1.0" {
-		t.Errorf("version = %q", got)
+	// The request is already past the probe's registration, so the header
+	// carries the template CLI's version — the same value as cli_version
+	// (§1.1 C1 的取值来源与声明域, AC-37).
+	if got := req.Header.Get("X-Client-Version"); got != "18.0.0" {
+		t.Errorf("version = %q, want the discovery's cli_version", got)
+	}
+	if body := string(req.Body); !strings.Contains(body, `"cli_version":"18.0.0"`) {
+		t.Errorf("cli_version must come from the startup discovery: %s", body)
 	}
 	var body map[string]any
 	if err := json.Unmarshal(req.Body, &body); err != nil {
@@ -170,8 +220,11 @@ func TestRegisterSendsContractBody(t *testing.T) {
 	if rt["type"] != "omp" || rt["name"] != "foreman-omp" || rt["status"] != "online" {
 		t.Errorf("runtime payload wrong: %v", rt)
 	}
-	if c.RuntimeID() != "rid-1" {
-		t.Errorf("cached runtime id = %q", c.RuntimeID())
+	if got := firstRuntimeID(c); got != "rid-1" {
+		t.Errorf("cached runtime id = %q", got)
+	}
+	if got := c.CLIVersion(); got != "18.0.0" {
+		t.Errorf("X-Client-Version after C1 = %q, want the discovery's cli_version", got)
 	}
 	repos, version := c.Registration()
 	if version != "abc123" || len(repos) == 0 {
@@ -183,9 +236,7 @@ func TestReRegisterNotifiesRuntimeSetAndRecoversOrphans(t *testing.T) {
 	srv, stub := newStubUpstream(t)
 	stubRegister(stub, "rid-1")
 	c := NewClient(testConfig(srv.URL), "mdt_test")
-	if err := c.Register(t.Context()); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
+	registerDeclared(t, c)
 
 	// The runtime row gets deleted server-side; the next rid-dependent call
 	// re-registers and retries with the fresh id.
@@ -207,14 +258,17 @@ func TestReRegisterNotifiesRuntimeSetAndRecoversOrphans(t *testing.T) {
 	})
 	stubRegister(stub, "rid-2")
 
-	if err := c.Heartbeat(t.Context()); err != nil {
+	if _, err := c.Heartbeat(t.Context(), "rid-1"); err != nil {
 		t.Fatalf("Heartbeat after runtime loss: %v", err)
 	}
-	if c.RuntimeID() != "rid-2" {
-		t.Fatalf("runtime id = %q, want rid-2", c.RuntimeID())
+	if got := firstRuntimeID(c); got != "rid-2" {
+		t.Fatalf("runtime id = %q, want rid-2", got)
 	}
 	select {
-	case <-c.RuntimeSet():
+	case change := <-c.Changes():
+		if change.Provider != "omp" || change.OldID != "rid-1" || change.NewID != "rid-2" {
+			t.Fatalf("runtime change = %+v", change)
+		}
 	default:
 		t.Fatal("runtime-set change not signaled")
 	}
@@ -240,6 +294,7 @@ func TestClaimTasksRequestShape(t *testing.T) {
 		writeJSONStub(w, 200, map[string]any{"tasks": []json.RawMessage{json.RawMessage(`{"id":"t1"}`)}})
 	})
 	c := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, c)
 
 	if _, err := c.ClaimTasks(t.Context(), 0); err != nil {
 		t.Fatalf("ClaimTasks(0): %v", err)
@@ -276,6 +331,7 @@ func TestClaimTasks401Recorded(t *testing.T) {
 	})
 	var metrics fakeMetrics
 	c := NewClient(testConfig(srv.URL), "mdt_test", WithMetrics(&metrics))
+	registerDeclared(t, c)
 
 	_, err := c.ClaimTasks(t.Context(), 1)
 	var se *StatusError
@@ -303,16 +359,17 @@ func TestPrepareLeaseSemantics(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":"task not found"}`))
 	})
 	c := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, c)
 
-	ready, err := c.PrepareLease(t.Context(), "task-ok")
+	ready, err := c.PrepareLease(t.Context(), "rid-1", "task-ok")
 	if err != nil || !ready {
 		t.Errorf("200: ready=%v err=%v, want ready=true", ready, err)
 	}
-	ready, err = c.PrepareLease(t.Context(), "task-not-ready")
+	ready, err = c.PrepareLease(t.Context(), "rid-1", "task-not-ready")
 	if err != nil || ready {
 		t.Errorf("400: ready=%v err=%v, want ready=false without error (semantic)", ready, err)
 	}
-	_, err = c.PrepareLease(t.Context(), "task-gone")
+	_, err = c.PrepareLease(t.Context(), "rid-1", "task-gone")
 	if !errors.Is(err, scheduler.ErrTaskNotFound) {
 		t.Errorf("404: err=%v, want ErrTaskNotFound", err)
 	}
@@ -399,7 +456,9 @@ func TestForwardStartTranslatesJobRuntimeToRealRuntime(t *testing.T) {
 	stub.on("POST", "/api/daemon/tasks/t1/start", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
 		writeJSONStub(w, 200, map[string]string{"status": "running"})
 	})
-	c := NewClient(testConfig(srv.URL), "mdt_test")
+	c := NewClient(testConfig(srv.URL), "mdt_test",
+		WithTaskRuntime(func(string) string { return "rid-real" }))
+	registerDeclared(t, c)
 
 	// The daemon names the job runtime it was handed at S6; the claim the
 	// server holds belongs to the real runtime id.
@@ -438,6 +497,7 @@ func TestForwardStartWithoutRuntimeIdentityIsVerbatim(t *testing.T) {
 		writeJSONStub(w, 200, map[string]string{"status": "running"})
 	})
 	c := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, c)
 
 	// A start that names no runtime keeps the legacy shape byte-for-byte:
 	// Foreman invents no field the daemon did not send.
@@ -966,8 +1026,9 @@ func TestHeartbeatSurfacesNon2xx(t *testing.T) {
 		_, _ = w.Write([]byte(`{"error":"token invalid"}`))
 	})
 	c := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, c)
 
-	err := c.Heartbeat(t.Context())
+	_, err := c.Heartbeat(t.Context(), "rid-1")
 	var se *StatusError
 	if !errors.As(err, &se) || se.Code != 401 {
 		t.Fatalf("Heartbeat = %v, want a 401 StatusError (the loop's backoff depends on it)", err)
@@ -978,9 +1039,7 @@ func TestRebuildSignalSurvivesFailedReregister(t *testing.T) {
 	srv, stub := newStubUpstream(t)
 	stubRegister(stub, "rid-1")
 	c := NewClient(testConfig(srv.URL), "mdt_test")
-	if err := c.Register(t.Context()); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
+	registerDeclared(t, c)
 
 	// The runtime row dies; the first re-register fails (server trouble).
 	stub.on("POST", "/api/daemon/heartbeat", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
@@ -1005,7 +1064,7 @@ func TestRebuildSignalSurvivesFailedReregister(t *testing.T) {
 		writeJSONStub(w, 200, map[string]int{"orphaned": 0, "retried": 0})
 	})
 
-	if err := c.Heartbeat(t.Context()); err == nil {
+	if _, err := c.Heartbeat(t.Context(), "rid-1"); err == nil {
 		t.Fatal("heartbeat must fail while re-registration fails")
 	}
 	// The register failure cleared the cached id but kept the rebuild fact:
@@ -1015,14 +1074,17 @@ func TestRebuildSignalSurvivesFailedReregister(t *testing.T) {
 	if err := c.Register(t.Context()); err != nil {
 		t.Fatalf("second Register: %v", err)
 	}
-	if c.RuntimeID() != "rid-2" {
-		t.Fatalf("runtime id = %q", c.RuntimeID())
+	if got := firstRuntimeID(c); got != "rid-2" {
+		t.Fatalf("runtime id = %q", got)
 	}
 	if got := orphanCalls.Load(); got != 1 {
 		t.Errorf("C15 calls = %d, want 1 (runtime was rebuilt)", got)
 	}
 	select {
-	case <-c.RuntimeSet():
+	case change := <-c.Changes():
+		if change.NewID != "rid-2" {
+			t.Errorf("runtime change = %+v", change)
+		}
 	default:
 		t.Error("runtime-set signal lost across a failed re-register")
 	}
@@ -1061,7 +1123,9 @@ func TestSkillBundlesUsesRealRuntimeAndForemanCredential(t *testing.T) {
 	stub.on("POST", "/api/daemon/runtimes/rid-real/tasks/t1/skill-bundles/resolve", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
 		writeJSONStub(w, 200, map[string]string{"bundle": "data"})
 	})
-	c := NewClient(testConfig(srv.URL), "mdt_test")
+	c := NewClient(testConfig(srv.URL), "mdt_test",
+		WithTaskRuntime(func(string) string { return "rid-real" }))
+	registerDeclared(t, c)
 
 	code, resp, err := c.ResolveSkillBundles(t.Context(), "t1", []byte(`{"skills":["a"]}`))
 	if err != nil || code != 200 {
@@ -1093,6 +1157,9 @@ func TestPreflightCoversC1C16C17C18(t *testing.T) {
 		writeJSONStub(w, 200, map[string]any{"expires_at": time.Now().Add(72 * time.Hour), "renewed": true})
 	})
 	c := NewClient(testConfig(srv.URL), "mdt_test")
+	if err := c.RegisterWithDiscovery(t.Context(), testDiscovery()); err != nil {
+		t.Fatalf("RegisterWithDiscovery: %v", err)
+	}
 
 	if err := c.Preflight(t.Context()); err != nil {
 		t.Fatalf("Preflight: %v", err)
@@ -1116,6 +1183,9 @@ func TestPreflightFailsWhenWorkspaceInvisible(t *testing.T) {
 		writeJSONStub(w, 200, []map[string]string{{"id": "other-ws", "name": "x"}})
 	})
 	c := NewClient(testConfig(srv.URL), "mdt_test")
+	if err := c.RegisterWithDiscovery(t.Context(), testDiscovery()); err != nil {
+		t.Fatalf("RegisterWithDiscovery: %v", err)
+	}
 	if err := c.Preflight(t.Context()); err == nil {
 		t.Fatal("Preflight must fail when the configured workspace is not visible")
 	}
@@ -1128,9 +1198,7 @@ func TestDeregister(t *testing.T) {
 		writeJSONStub(w, 200, map[string]string{"status": "ok"})
 	})
 	c := NewClient(testConfig(srv.URL), "mdt_test")
-	if err := c.Register(t.Context()); err != nil {
-		t.Fatalf("Register: %v", err)
-	}
+	registerDeclared(t, c)
 	if err := c.Deregister(t.Context()); err != nil {
 		t.Fatalf("Deregister: %v", err)
 	}
@@ -1162,13 +1230,15 @@ func TestGCCheckForwardedVerbatim(t *testing.T) {
 
 // fakeMetrics records the proxy metrics seam.
 type fakeMetrics struct {
-	mu          sync.Mutex
-	forwards    []string
-	codes       []int
-	claimErrors []string
-	authFails   []string
-	wsConnected map[string]int
-	wsReconnect []string
+	mu           sync.Mutex
+	forwards     []string
+	codes        []int
+	claimErrors  []string
+	authFails    []string
+	wsConnected  map[string]int
+	wsReconnect  []string
+	catalogCodes []string
+	catalogSpans []float64
 }
 
 func (m *fakeMetrics) Forward(endpoint string, code int, _ time.Duration) {
@@ -1214,6 +1284,26 @@ func (m *fakeMetrics) WSReconnect(side string) {
 	m.wsReconnect = append(m.wsReconnect, side)
 }
 
+func (m *fakeMetrics) ModelCatalogRelay(code string, seconds float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.catalogCodes = append(m.catalogCodes, code)
+	m.catalogSpans = append(m.catalogSpans, seconds)
+}
+
+// catalogCodeCount counts the recorded relay outcomes per code (locked).
+func (m *fakeMetrics) catalogCodeCount(code string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, recorded := range m.catalogCodes {
+		if recorded == code {
+			n++
+		}
+	}
+	return n
+}
+
 // wsCount reads the current connection gauge for a side (locked).
 func (m *fakeMetrics) wsCount(side string) int {
 	m.mu.Lock()
@@ -1239,3 +1329,236 @@ func (m *fakeMetrics) reconnectCount(side string) int {
 type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+// TestFirstDeclarationDoesNotRecoverOrphans pins §1.1 C15: C15 belongs to a
+// rebuilt runtime, never to the rows a first declaration creates.
+func TestFirstDeclarationDoesNotRecoverOrphans(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stubRegister(stub, "rid-1")
+	stub.on("POST", "/api/daemon/runtimes/rid-1/recover-orphans", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		t.Error("a first declaration must not run C15")
+		writeJSONStub(w, 200, map[string]int{"orphaned": 0})
+	})
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, c)
+
+	if got := len(stub.calls("POST", "/api/daemon/runtimes/rid-1/recover-orphans")); got != 0 {
+		t.Fatalf("C15 calls = %d, want 0 on a first declaration", got)
+	}
+}
+
+// TestPreflightSendsSingleC1 pins §1.1 C1's single startup trigger: once the
+// startup declaration has been answered, the claim loop's preflight must not
+// declare again (a second C1 could move ids and orphan the startup discovery).
+func TestPreflightSendsSingleC1(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stubRegister(stub, "rid-1")
+	stub.on("GET", "/api/daemon/workspaces", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, []map[string]string{{"id": "ws-1", "name": "ws-one"}})
+	})
+	stub.on("POST", "/api/tokens/current/renew", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]any{"renewed": true})
+	})
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, c)
+
+	if err := c.Preflight(t.Context()); err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	if got := len(stub.calls("POST", "/api/daemon/register")); got != 1 {
+		t.Fatalf("C1 calls = %d, want exactly the startup one", got)
+	}
+}
+
+// TestDeclareDefersTheSingleC1: Declare caches the startup discovery without a
+// wire call, and the first preflight carries it.
+func TestDeclareDefersTheSingleC1(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stubRegister(stub, "rid-1")
+	stub.on("GET", "/api/daemon/workspaces", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, []map[string]string{{"id": "ws-1", "name": "ws-one"}})
+	})
+	stub.on("POST", "/api/tokens/current/renew", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]any{"renewed": true})
+	})
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+	c.Declare(testDiscovery())
+
+	if got := len(stub.calls("POST", "/api/daemon/register")); got != 0 {
+		t.Fatalf("Declare must not touch the wire, got %d C1 calls", got)
+	}
+	if err := c.Preflight(t.Context()); err != nil {
+		t.Fatalf("Preflight: %v", err)
+	}
+	if got := len(stub.calls("POST", "/api/daemon/register")); got != 1 {
+		t.Fatalf("C1 calls = %d, want 1 (the preflight carries the declaration)", got)
+	}
+	if got := firstRuntimeID(c); got != "rid-1" {
+		t.Errorf("runtime id = %q", got)
+	}
+}
+
+// TestRebuildSkipsReRegisterForAStaleID: when the id is already replaced by a
+// concurrent path, a rebuild must not write another C1 that cannot move
+// anything (that write was the WS 404 loop's registration storm).
+func TestRebuildSkipsReRegisterForAStaleID(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stubRegister(stub, "rid-1")
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, c)
+	calls := len(stub.calls("POST", "/api/daemon/register"))
+
+	fresh, err := c.rebuildRuntime(t.Context(), "rid-already-gone")
+	if err != nil {
+		t.Fatalf("rebuildRuntime: %v", err)
+	}
+	if fresh != "" {
+		t.Errorf("fresh id = %q, want none for an unknown runtime", fresh)
+	}
+	if got := len(stub.calls("POST", "/api/daemon/register")); got != calls {
+		t.Fatalf("C1 calls = %d, want no re-register for a stale id (%d)", got, calls)
+	}
+}
+
+// TestFailedRebuildIsRememberedPerRuntime pins §1.1 C15's granularity: one
+// runtime's failed rebuild must not make every other row look rebuilt on the
+// next successful C1 (each of those would emit a C15 call and a
+// `runtime.rebuilt` line).
+func TestFailedRebuildIsRememberedPerRuntime(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	ids := map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+	var failRegister atomic.Bool
+	stub.on("POST", "/api/daemon/register", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		if failRegister.Load() {
+			writeJSONStub(w, 503, map[string]string{"error": "boom"})
+			return
+		}
+		answers := make([]map[string]string, 0, len(ids))
+		for provider, id := range ids {
+			answers = append(answers, map[string]string{"id": id, "name": "n-" + provider, "provider": provider, "status": "online"})
+		}
+		writeJSONStub(w, 200, map[string]any{
+			"runtimes": answers, "repos": []map[string]string{}, "repos_version": "v1", "settings": nil,
+		})
+	})
+	var c15 []string
+	for _, id := range []string{"rid-omp", "rid-zz"} {
+		id := id
+		stub.on("POST", "/api/daemon/runtimes/"+id+"/recover-orphans", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+			c15 = append(c15, id)
+			writeJSONStub(w, 200, map[string]int{"orphaned": 0})
+		})
+	}
+	logs := &bytes.Buffer{}
+	c := NewClient(testConfig(srv.URL), "mdt_test", WithLogger(slog.New(slog.NewJSONHandler(logs, nil))))
+	disc := registry.Discovery{Runtimes: []registry.DiscoveredRuntime{
+		{Name: "n-omp", Type: "omp", Version: "1"},
+		{Name: "n-zz", Type: "zz", Version: "2"},
+	}}
+	if err := c.RegisterWithDiscovery(t.Context(), disc); err != nil {
+		t.Fatalf("RegisterWithDiscovery: %v", err)
+	}
+	drainChanges(c)
+
+	// The omp row is gone and its re-register fails: only omp is marked lost.
+	failRegister.Store(true)
+	if _, err := c.rebuildRuntime(t.Context(), "rid-omp"); err == nil {
+		t.Fatal("the rebuild must surface the register failure")
+	}
+	failRegister.Store(false)
+	if err := c.Register(t.Context()); err != nil {
+		t.Fatalf("second Register: %v", err)
+	}
+
+	if len(c15) != 1 || c15[0] != "rid-omp" {
+		t.Fatalf("C15 calls = %v, want only the runtime whose row was lost", c15)
+	}
+	if got := strings.Count(logs.String(), "runtime.rebuilt"); got != 1 {
+		t.Errorf("runtime.rebuilt lines = %d, want 1 (per runtime, not per declaration)", got)
+	}
+}
+
+// TestSuccessfulRegisterKeepsAConcurrentLostMark pins §1.1 C15 under a race: a
+// rebuild that fails while another C1 is in flight marks its own provider lost,
+// and the successful C1 consumes only the marks it started with. A global clear
+// would silently drop that row's C15 (`recover-orphans` + `runtime.rebuilt`)
+// even though the row came back — under the same id — and needs the rebuild
+// signal.
+func TestSuccessfulRegisterKeepsAConcurrentLostMark(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	ids := map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+	var fail atomic.Bool
+	var hold atomic.Bool
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	stub.on("POST", "/api/daemon/register", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		if hold.CompareAndSwap(true, false) {
+			// Hold this C1 inside the handler: its ledger snapshot is already
+			// taken, and the rebuild below writes the mark it must not clear.
+			entered <- struct{}{}
+			<-release
+		}
+		if fail.Load() {
+			writeJSONStub(w, 503, map[string]string{"error": "boom"})
+			return
+		}
+		answers := make([]map[string]string, 0, len(ids))
+		for provider, id := range ids {
+			answers = append(answers, map[string]string{"id": id, "name": "n-" + provider, "provider": provider, "status": "online"})
+		}
+		writeJSONStub(w, 200, map[string]any{
+			"runtimes": answers, "repos": []map[string]string{}, "repos_version": "v1", "settings": nil,
+		})
+	})
+	var c15mu sync.Mutex
+	var c15 []string
+	stub.on("POST", "/api/daemon/runtimes/rid-omp/recover-orphans", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		c15mu.Lock()
+		c15 = append(c15, "rid-omp")
+		c15mu.Unlock()
+		writeJSONStub(w, 200, map[string]int{"orphaned": 0})
+	})
+	logs := &lockedBuffer{}
+	c := NewClient(testConfig(srv.URL), "mdt_test", WithLogger(slog.New(slog.NewJSONHandler(logs, nil))))
+	disc := registry.Discovery{Runtimes: []registry.DiscoveredRuntime{
+		{Name: "n-omp", Type: "omp", Version: "1"},
+		{Name: "n-zz", Type: "zz", Version: "2"},
+	}}
+	if err := c.RegisterWithDiscovery(t.Context(), disc); err != nil {
+		t.Fatalf("RegisterWithDiscovery: %v", err)
+	}
+	drainChanges(c)
+
+	hold.Store(true)
+	inFlight := make(chan error, 1)
+	go func() { inFlight <- c.Register(t.Context()) }()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the in-flight register never reached the server")
+	}
+	// omp's own row is proved gone and its rebuild fails: only omp is marked.
+	fail.Store(true)
+	if _, err := c.rebuildRuntime(t.Context(), "rid-omp"); err == nil {
+		t.Fatal("the rebuild must surface the register failure")
+	}
+	fail.Store(false)
+	close(release)
+	if err := <-inFlight; err != nil {
+		t.Fatalf("the in-flight Register: %v", err)
+	}
+
+	// omp answers with the id it already had: the mark still owes a C15.
+	if err := c.Register(t.Context()); err != nil {
+		t.Fatalf("third Register: %v", err)
+	}
+	c15mu.Lock()
+	got := append([]string(nil), c15...)
+	c15mu.Unlock()
+	if len(got) != 1 || got[0] != "rid-omp" {
+		t.Fatalf("C15 calls = %v, want only the runtime whose rebuild failed", got)
+	}
+	if n := strings.Count(logs.String(), "runtime.rebuilt"); n != 1 {
+		t.Errorf("runtime.rebuilt lines = %d, want 1", n)
+	}
+}
