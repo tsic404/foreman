@@ -22,7 +22,7 @@ Multica Server  ◄── fake client ──  Foreman  ── fake server ──
 make build-foreman        # bin/foreman      — the scheduler process
 make build-gc             # bin/foreman-gc   — node-local cache collector
 make build-foreman-image  # container image for the Deployment (linux/$(ARCH))
-make build-job-image      # Job image: upstream multica CLI + omp + foreman-gc
+make build-job-image      # Job image: upstream multica CLI + omp + foreman-gc + dumb-init + nix
 make check                # gofmt + vet + tests + build
 ```
 

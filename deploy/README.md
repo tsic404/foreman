@@ -59,7 +59,8 @@ characters); `MULTICA_TOKEN` must start with `mdt_` or `mul_`.
 
 Two images come from this repo (`docs/04-architecture.md` §部署/运行方式): the
 scheduler image for the Deployment, and the Job image (upstream multica CLI +
-`omp` + `foreman-gc`) that both the Job pods and the `foreman-gc` DaemonSet run.
+`omp` + `foreman-gc` + `dumb-init` + `nix`) that both the Job pods and the
+`foreman-gc` DaemonSet run.
 Both are published as **multi-platform manifest lists** (`linux/amd64` +
 `linux/arm64`), so a cluster with nodes of both architectures pulls the platform
 each node runs; nothing in `deploy/` names an architecture.
@@ -90,6 +91,16 @@ image installs Alpine's `libstdc++` package (which brings `libgcc`), and a
 slimmer base that ships neither fails at exec. Both mismatches are caught by the
 workflow's smoke step, which runs `omp` on the runner's platform and checks both
 platforms' `multica` / `omp` against the upstream release checksums.
+
+Whichever image ends up as `FOREMAN_JOB_IMAGE` must also carry
+`/usr/bin/dumb-init`: every Job `command` starts with `dumb-init --` (it is the
+agent container's PID 1, ADR-022), and the build installs Alpine's `dumb-init`
+package for the default base. A base whose package sources cannot supply it, or
+a custom image named by a job template, leaves the container without it and the
+agent fails at exec (pod `Failed` → `job_failed`). `docs/03-contracts.md` §5.3
+requires the contents, and §5.4's `FOREMAN_JOB_IMAGE` row carries it as a
+deployer constraint. It is not one of the two mismatches the smoke step above
+catches.
 
 The Job image is referenced by a **movable tag** in two places that carry the
 same literal (ADR-012):
@@ -144,6 +155,12 @@ digest; the tag still resolving to the digest that run published; both
 platforms' `multica` / `omp` matching their upstream release checksum;
 `foreman-gc` present and executable in both configs; and `foreman` static and
 built for the platform whose config carries it.
+
+Two assertions §5.3's contents list implies are **not** in that step:
+`/usr/bin/dumb-init` and `/usr/bin/nix` present and executable, and the image's
+`CMD` empty. They belong to the build/publish surface (CI/ops), and this
+workflow never runs on a pull request (pushes to `main`, `v*.*.*` tags, manual
+dispatch) — so a PR cannot carry their result.
 
 ## Node-local state
 

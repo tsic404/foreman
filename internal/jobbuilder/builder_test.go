@@ -315,7 +315,7 @@ func TestBuildContainers(t *testing.T) {
 	if agent.WorkingDir != "/" {
 		t.Errorf("agent workingDir = %q, want / (guard 第三臂)", agent.WorkingDir)
 	}
-	if strings.Join(agent.Command, " ") != "/usr/local/bin/multica" || strings.Join(agent.Args, " ") != "daemon start --foreground --profile foreman-job" {
+	if strings.Join(agent.Command, " ") != "/usr/bin/dumb-init -- /usr/local/bin/multica" || strings.Join(agent.Args, " ") != "daemon start --foreground --profile foreman-job" {
 		t.Errorf("agent command/args = %v %v", agent.Command, agent.Args)
 	}
 	if !agent.TTY {
