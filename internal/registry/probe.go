@@ -44,8 +44,10 @@ type DiscoveredRuntime struct {
 	Version string `json:"version"`
 }
 
-// Discovery is the S4 registration body of the startup probe = the truth
-// source of C1 (03-contracts §1.1「C1 的取值来源与声明域」).
+// Discovery is the S4 registration body of the startup probe = the truth source
+// of C1 (03-contracts §1.1「C1 的取值来源与声明域」): type, version, failed
+// profiles and cli_version travel into C1, the runtime name does not — C1
+// declares Foreman's fixed display name (ADR-031).
 type Discovery struct {
 	CLIVersion     string
 	Runtimes       []DiscoveredRuntime

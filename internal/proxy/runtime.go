@@ -15,8 +15,9 @@ import (
 	"github.com/tsic404/foreman/internal/scheduler"
 )
 
-// RuntimeRef is one declared real runtime: the provider it serves plus the id
-// and name the server answered for it (ID is empty before C1).
+// RuntimeRef is one declared real runtime: the provider it serves, the declared
+// name (Foreman's fixed runtime display name, §1.1 C1), and the id the server
+// answered with (ID is empty before C1).
 type RuntimeRef struct {
 	ID       string
 	Provider string
@@ -137,23 +138,28 @@ func (c *Client) RegisterWithDiscovery(ctx context.Context, d registry.Discovery
 // and never starts a new probe (§1.1 failure table).
 func (c *Client) Register(ctx context.Context) error { return c.register(ctx) }
 
+// declaredRuntimeName is the runtime display name every C1 declaration carries:
+// the Job side's runtime display name (§5.2), never the name the startup probe
+// reported for its own pod — that one drifts with the template and with the node
+// the probe landed on (§1.1 C1 的取值来源与声明域, ADR-031).
+const declaredRuntimeName = "foreman-job"
+
 // declaredRefs turns a discovery into the declared runtime set, deduplicating
-// repeated provider types (a repeat merges into the first entry, §1.1 C1).
+// repeated provider types (a repeat merges into the first entry, §1.1 C1). It is
+// derived from the payloads so the C1 body and the S31 declaration view cannot
+// drift apart on the declared name.
 func declaredRefs(d registry.Discovery) []RuntimeRef {
-	refs := make([]RuntimeRef, 0, len(d.Runtimes))
-	seen := make(map[string]bool, len(d.Runtimes))
-	for _, rt := range d.Runtimes {
-		if rt.Type == "" || seen[rt.Type] {
-			continue
-		}
-		seen[rt.Type] = true
-		refs = append(refs, RuntimeRef{Provider: rt.Type, Name: rt.Name})
+	payloads := runtimePayloads(d)
+	refs := make([]RuntimeRef, 0, len(payloads))
+	for _, p := range payloads {
+		refs = append(refs, RuntimeRef{Provider: p.Type, Name: p.Name})
 	}
 	return refs
 }
 
-// runtimePayloads is the C1 `runtimes[]` array: the startup discovery handed
-// over entry by entry (status = online, profile_id always empty, §1.1 C1).
+// runtimePayloads is the C1 `runtimes[]` array: type and version are handed over
+// entry by entry (status = online, profile_id always empty) while name is
+// Foreman's fixed runtime display name (§1.1 C1 的取值来源与声明域).
 func runtimePayloads(d registry.Discovery) []runtimePayload {
 	payloads := make([]runtimePayload, 0, len(d.Runtimes))
 	seen := make(map[string]bool, len(d.Runtimes))
@@ -163,7 +169,7 @@ func runtimePayloads(d registry.Discovery) []runtimePayload {
 		}
 		seen[rt.Type] = true
 		payloads = append(payloads, runtimePayload{
-			Name:    rt.Name,
+			Name:    declaredRuntimeName,
 			Type:    rt.Type,
 			Version: rt.Version,
 			Status:  "online",

@@ -217,8 +217,11 @@ func TestRegisterSendsContractBody(t *testing.T) {
 		t.Fatalf("runtimes = %v", body["runtimes"])
 	}
 	rt := runtimes[0].(map[string]any)
-	if rt["type"] != "omp" || rt["name"] != "foreman-omp" || rt["status"] != "online" {
-		t.Errorf("runtime payload wrong: %v", rt)
+	// type/version are the discovery's; name is Foreman's fixed runtime display
+	// name — the discovery here says "foreman-omp" (§1.1 C1 的取值来源与声明域,
+	// ADR-031).
+	if rt["type"] != "omp" || rt["name"] != declaredRuntimeName || rt["status"] != "online" {
+		t.Errorf("runtime payload = %v, want type omp, status online and the fixed declared name", rt)
 	}
 	if got := firstRuntimeID(c); got != "rid-1" {
 		t.Errorf("cached runtime id = %q", got)

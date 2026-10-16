@@ -1,7 +1,9 @@
 // TC-tech-startup-02 / TC-tech-startup-05 exercise the declaration chain with
-// the production builder: C1 declares exactly what the startup probe reported
-// (AC-37), and the register-before window answers empty repos without blocking
-// the registration (AC-40). The whole path runs here — real jobbuilder (CM
+// the production builder: C1 declares what the startup probe reported entry by
+// entry — its runtime type/version, cli_version and failed profiles — while the
+// runtime name is Foreman's fixed display name (AC-37), and the
+// register-before window answers empty repos without blocking the
+// registration (AC-40). The whole path runs here — real jobbuilder (CM
 // absent), real probe Job and credential, real fake server, real scheduler —
 // which is also the smoke run for this change (the cluster-level parts of
 // AC-37's read-back, e.g. the server-side runtime rows, are registered as
@@ -14,6 +16,10 @@ import (
 	"testing"
 	"time"
 )
+
+// declaredRuntimeName is §5.2's runtime display name: every C1 declaration
+// carries it, never the name a probe pod reported for itself (ADR-031).
+const declaredRuntimeName = "foreman-job"
 
 // TestStartupDeclarationComesFromProbeRegistration drives one startup probe
 // through the production render path and asserts the three faces of the
@@ -124,6 +130,12 @@ func TestStartupDeclarationComesFromProbeRegistration(t *testing.T) {
 		if rt.Type != want.Type || rt.Version != want.Version || rt.Status != "online" {
 			t.Errorf("C1 runtime[%d] = %+v, want %+v carried verbatim with status online", i, rt, want)
 		}
+		// The probe reported its own pod's runtime name ("foreman-omp"); the
+		// declaration carries Foreman's fixed display name instead (§1.1 C1
+		// 的取值来源与声明域, AC-37, ADR-031).
+		if rt.Name != declaredRuntimeName {
+			t.Errorf("C1 runtime[%d] name = %q, want the fixed runtime display name %q", i, rt.Name, declaredRuntimeName)
+		}
 	}
 	if len(body.FailedProfiles) != 1 || body.FailedProfiles[0].ProfileID != "pf-1" ||
 		body.FailedProfiles[0].CommandName != "foreman-zz" || body.FailedProfiles[0].Reason != "no such binary" {
@@ -131,6 +143,22 @@ func TestStartupDeclarationComesFromProbeRegistration(t *testing.T) {
 	}
 	if got := h.client.RuntimeIDs(); len(got) != 2 || got[0] != "rid-omp" || got[1] != "rid-zz" {
 		t.Fatalf("real runtime ids = %v, want both declared runtimes", got)
+	}
+	// S31's take-off face (§1.2 S31, TC-tech-startup-02): the declaration side
+	// carries the fixed name while the startup discovery keeps what the probe
+	// reported for its own pod — the two sides differ on `name` and that is the
+	// assertion.
+	refs := h.client.RuntimeRefs()
+	if len(refs) != len(discovery.Runtimes) {
+		t.Fatalf("declaration = %+v, want one entry per discovered runtime", refs)
+	}
+	for i, ref := range refs {
+		if ref.Name != declaredRuntimeName {
+			t.Errorf("declaration[%d] name = %q, want the fixed runtime display name", i, ref.Name)
+		}
+		if got := h.client.Declaration().Runtimes[i].Name; got != discovery.Runtimes[i].Name || got == declaredRuntimeName {
+			t.Errorf("startup discovery[%d] name = %q, want the probe's own reported name %q", i, got, discovery.Runtimes[i].Name)
+		}
 	}
 	if got := h.client.CLIVersion(); got != cliVersion {
 		t.Errorf("X-Client-Version after C1 = %q, want the declaration's cli_version", got)
