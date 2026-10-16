@@ -17,7 +17,12 @@ const (
 	EnvClaimBatchMax   = "FOREMAN_CLAIM_BATCH_MAX"
 	EnvJobBootTimeout  = "FOREMAN_JOB_BOOT_TIMEOUT"
 	EnvJobDrainTimeout = "FOREMAN_JOB_DRAIN_TIMEOUT"
-	EnvWorkspaceID     = "MULTICA_WORKSPACE_ID"
+	// EnvDeliveryConfirmTimeout names the S6 delivery confirmation window
+	// (ADR-030): the bound after which a committed delivery without a start
+	// fact is judged undelivered. It must stay under JobBootTimeout, so it
+	// lives beside it rather than in the proxy's config.
+	EnvDeliveryConfirmTimeout = "FOREMAN_DELIVERY_CONFIRM_TIMEOUT"
+	EnvWorkspaceID            = "MULTICA_WORKSPACE_ID"
 	// EnvStartupProbeTimeout names the startup probe window; the design fixes
 	// its semantics (one Job-boot magnitude) but leaves the key to the
 	// implementation (§5.1).
@@ -33,6 +38,11 @@ const (
 	DefaultMaxJobsPerNode  = 4
 	DefaultClaimBatchMax   = 32
 	DefaultJobBootTimeout  = 300 * time.Second
+	// DefaultDeliveryConfirmTimeout is the S6 delivery confirmation window
+	// (§5.1, ADR-030): comfortably above the upstream daemon's own claim
+	// budget (seconds, plus its retry margin) and well under the boot bound,
+	// so the lost-response form settles long before the boot window expires.
+	DefaultDeliveryConfirmTimeout = 30 * time.Second
 	// DefaultJobDrainTimeout is the credential-reclaim upper bound that
 	// follows a task's verdict (FOREMAN_JOB_DRAIN_TIMEOUT, ADR-017). A
 	// deployment that raises its template's terminationGracePeriodSeconds
@@ -65,6 +75,12 @@ type Config struct {
 	MaxInflightJobs int
 	ClaimBatchMax   int
 	JobBootTimeout  time.Duration
+	// DeliveryConfirmTimeout is the S6 delivery confirmation window
+	// (FOREMAN_DELIVERY_CONFIRM_TIMEOUT, ADR-030): after a committed
+	// delivery, an entry still without a start fact is judged undelivered.
+	// Zero leaves the window unarmed, so that form converges through the boot
+	// bound alone; a non-zero value must stay under JobBootTimeout.
+	DeliveryConfirmTimeout time.Duration
 	// JobDrainTimeout bounds the window between a task's verdict and the
 	// credential reclaim (ADR-017). Zero means "do not wait": the reclaim
 	// still lands on the next observation point.
@@ -94,15 +110,17 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		getenv = os.Getenv
 	}
 	cfg := Config{
-		JobNamespace:        jobbuilder.DefaultJobNamespace,
-		MaxJobsPerNode:      DefaultMaxJobsPerNode,
-		MaxInflightJobs:     DefaultMaxInflightJobs,
-		ClaimBatchMax:       DefaultClaimBatchMax,
-		JobBootTimeout:      DefaultJobBootTimeout,
-		JobDrainTimeout:     DefaultJobDrainTimeout,
-		ModelCatalogEnabled: DefaultModelCatalogEnabled,
-		ModelCatalogTimeout: DefaultModelCatalogTimeout,
-		ReconcileInterval:   DefaultReconcileInterval,
+		JobNamespace:    jobbuilder.DefaultJobNamespace,
+		MaxJobsPerNode:  DefaultMaxJobsPerNode,
+		MaxInflightJobs: DefaultMaxInflightJobs,
+		ClaimBatchMax:   DefaultClaimBatchMax,
+		JobBootTimeout:  DefaultJobBootTimeout,
+		JobDrainTimeout: DefaultJobDrainTimeout,
+		// Refined below, where the boot bound it must stay under is known.
+		DeliveryConfirmTimeout: DefaultDeliveryConfirmTimeout,
+		ModelCatalogEnabled:    DefaultModelCatalogEnabled,
+		ModelCatalogTimeout:    DefaultModelCatalogTimeout,
+		ReconcileInterval:      DefaultReconcileInterval,
 	}
 
 	if v := strings.TrimSpace(getenv(jobbuilder.EnvJobNamespace)); v != "" {
@@ -145,6 +163,25 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("%s must be positive, got %s", EnvJobBootTimeout, d)
 		}
 		cfg.JobBootTimeout = d
+	}
+	// The delivery confirmation window is the second pre-start bound, and its
+	// whole point is to fire before the boot one: a window at or above
+	// JobBootTimeout would leave the lost-response form settling as
+	// job_boot_timeout again (ADR-030). Zero is legal by §5.1: it disarms the
+	// convergence exit.
+	if raw := strings.TrimSpace(getenv(EnvDeliveryConfirmTimeout)); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be a duration: %v", EnvDeliveryConfirmTimeout, err)
+		}
+		if d < 0 {
+			return Config{}, fmt.Errorf("%s must be >= 0, got %s", EnvDeliveryConfirmTimeout, d)
+		}
+		if d > 0 && d >= cfg.JobBootTimeout {
+			return Config{}, fmt.Errorf("%s (%s) must be below %s (%s): the delivery confirmation window has to fire before the boot bound",
+				EnvDeliveryConfirmTimeout, d, EnvJobBootTimeout, cfg.JobBootTimeout)
+		}
+		cfg.DeliveryConfirmTimeout = d
 	}
 	// Zero is a legal value here (近似旧语义: reclaim on the next observation
 	// point), so only a negative one is refused.

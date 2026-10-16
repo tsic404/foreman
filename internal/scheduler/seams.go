@@ -71,6 +71,10 @@ type Metrics interface {
 	// (job_terminated|drain_timeout) and observes the drain duration
 	// (observability.md §指标, ADR-017).
 	CredReclaimed(reason string, drainSeconds float64)
+	// DeliveryUnconfirmed counts one S6 delivery the confirmation window
+	// judged undelivered (observability.md §指标
+	// foreman_delivery_unconfirmed_total, ADR-030).
+	DeliveryUnconfirmed()
 }
 
 // Reconciler is the recovery module's convergence driver. When wired,
@@ -102,6 +106,7 @@ func (noopMetrics) JobCreateSeconds(float64)      {}
 func (noopMetrics) InflightJobs(int)              {}
 func (noopMetrics) DuplicateDispatch()            {}
 func (noopMetrics) CredReclaimed(string, float64) {}
+func (noopMetrics) DeliveryUnconfirmed()          {}
 
 func orNoopMetrics(m Metrics) Metrics {
 	if m == nil {

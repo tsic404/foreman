@@ -64,27 +64,36 @@ const (
 // rewritten to job_runtime_id) afterwards: it carries auth_token and must never
 // be serialized into annotations, Secrets, or logs (F3).
 type TaskEntry struct {
-	TaskID             string    `json:"task_id"`
-	AgentID            string    `json:"agent_id"`
-	IssueID            string    `json:"issue_id"`
-	IssueIdentifier    string    `json:"issue_identifier"`
-	AutopilotRunID     string    `json:"autopilot_run_id"`
-	ChatSessionID      string    `json:"chat_session_id"`
-	WorkspaceID        string    `json:"workspace_id"`
-	JobName            string    `json:"job_name"`
-	JobNamespace       string    `json:"job_namespace"`
-	DaemonID           string    `json:"daemon_id"`
-	JobRuntimeID       string    `json:"job_runtime_id"`
-	NodeName           string    `json:"node_name"`
-	State              State     `json:"state"`
-	Result             Result    `json:"result"`
+	TaskID          string `json:"task_id"`
+	AgentID         string `json:"agent_id"`
+	IssueID         string `json:"issue_id"`
+	IssueIdentifier string `json:"issue_identifier"`
+	AutopilotRunID  string `json:"autopilot_run_id"`
+	ChatSessionID   string `json:"chat_session_id"`
+	WorkspaceID     string `json:"workspace_id"`
+	JobName         string `json:"job_name"`
+	JobNamespace    string `json:"job_namespace"`
+	DaemonID        string `json:"daemon_id"`
+	JobRuntimeID    string `json:"job_runtime_id"`
+	NodeName        string `json:"node_name"`
+	State           State  `json:"state"`
+	Result          Result `json:"result"`
+	// FailureReason is the externally observable attribution of a terminal
+	// failure Foreman judged itself (contract §3.1): empty for a verdict the
+	// server made (S13/S14/S15 or C13) and for non-failed results.
+	FailureReason      string    `json:"failure_reason"`
 	Attempt            int       `json:"attempt"`
 	ClaimedAt          time.Time `json:"claimed_at"`
 	JobCreatedAt       time.Time `json:"job_created_at"`
 	DaemonRegisteredAt time.Time `json:"daemon_registered_at"`
 	DeliveredAt        time.Time `json:"delivered_at"`
-	StartedAt          time.Time `json:"started_at"`
-	BootDeadline       time.Time `json:"boot_deadline"`
+	// ClaimsAfterDelivery counts the S6 claim calls answered with an empty
+	// batch after this entry's delivery was committed (contract §3.1): > 0
+	// means the daemon kept asking, i.e. the request arrived and the response
+	// was lost, rather than the request never arriving.
+	ClaimsAfterDelivery int       `json:"claims_after_delivery"`
+	StartedAt           time.Time `json:"started_at"`
+	BootDeadline        time.Time `json:"boot_deadline"`
 	// LeaseKeepUntil is the local upper bound of the server's prepare lease
 	// (contract §3.1): the last successful renewal plus PrepareLeaseTTL,
 	// stamped after the response returned (Registry.SetLeaseKeepUntil).
@@ -99,6 +108,17 @@ type TaskEntry struct {
 	JobPhase      JobPhase  `json:"-"`
 	DrainDeadline time.Time `json:"-"`
 	TokenHash     string    `json:"-"`
+
+	// DeliveryDeadline is the S6 delivery confirmation window's expiry
+	// (contract §1.2, ADR-030): written once at the delivery commit from
+	// FOREMAN_DELIVERY_CONFIRM_TIMEOUT. Zero means no window is armed — the
+	// entry then converges through the boot upper bound alone.
+	DeliveryDeadline time.Time `json:"-"`
+
+	// CompletedAt is the verdict instant, the stamp the settled index keeps
+	// (registry.DoneAt). Memory-only, like the rest of the drain bookkeeping:
+	// the projection's timestamp keys keep their existing set.
+	CompletedAt time.Time `json:"-"`
 
 	// PriorSessionID is the claim payload's prior_session_id: where the
 	// resuming session's file lives, hence the soft-affinity key source

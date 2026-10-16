@@ -73,6 +73,12 @@ const (
 	// declared no runtime for the provider its claim was dispatched under, so
 	// the task is settled instead of waiting out the boot deadline (§1.2 S4).
 	FailureReasonDaemonNotRegistered = "daemon_not_registered"
+	// FailureReasonDeliveryUnconfirmed is the S6 lost-response form: the
+	// delivery was committed but no start fact arrived within the delivery
+	// confirmation window, so the payload never reached the daemon
+	// (03-contracts.md §1.2, ADR-030). It is a transport verdict, not a Job
+	// one — the Job was created, its pod ran and its daemon registered.
+	FailureReasonDeliveryUnconfirmed = "delivery_unconfirmed"
 )
 
 // job.create_step step values: the claim chain's five steps, in order
@@ -768,7 +774,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		defer s.SyncInflight()
 		if !e.IsTerminal() {
 			result := registry.Result(ep.TerminalResult())
-			if _, err := s.reg.MarkTerminal(e.TaskID, result, now); err != nil {
+			if _, err := s.reg.MarkTerminal(e.TaskID, result, "", now); err != nil {
 				return 0, nil, err
 			}
 			e.State = registry.StateTerminal
@@ -939,6 +945,38 @@ func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
 	})
 }
 
+// OnDeliveryUnconfirmed handles the S6 lost-response form (failure-handling
+// scenario #18, ADR-030): the delivery was committed but the confirmation
+// window expired without a start fact, so the payload never reached the
+// daemon. The task is failed on the daemon's behalf (C10,
+// failure_reason=delivery_unconfirmed) and the objects removed — the same
+// shape as OnBootTimeout, at a much earlier bound, and with the attribution
+// the form actually deserves. The task's lock keeps it from settling an entry
+// whose S8 answer is still outstanding.
+//
+// The delivery is never retried: "at most once" is a delivery invariant
+// (contract §1.2), and the lost-response premise is not decidable from here
+// (ADR-030).
+func (s *Scheduler) OnDeliveryUnconfirmed(ctx context.Context, taskID string) error {
+	defer s.SyncInflight()
+	unlock := s.taskMu.Lock(taskID)
+	defer unlock()
+	e, ok := s.reg.Get(taskID)
+	if !ok || e.IsTerminal() || !e.StartedAt.IsZero() || e.DeliveredAt.IsZero() {
+		return nil
+	}
+	s.metrics.DeliveryUnconfirmed()
+	s.log.WarnContext(ctx, "task.delivery_unconfirmed",
+		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+		"delivered_at", registry.ProjectedTime(e.DeliveredAt),
+		"window_seconds", e.DeliveryDeadline.Sub(e.DeliveredAt).Seconds(),
+		"claims_after_delivery", e.ClaimsAfterDelivery)
+	return s.failEntry(ctx, e, failReport{
+		reason:  FailureReasonDeliveryUnconfirmed,
+		message: "task delivery was never confirmed by the job daemon",
+	})
+}
+
 // ConvergeLeaseRefused settles an entry whose prepare-lease was refused
 // (C4 400: the task left the renewable pre-start state). C13 decides:
 // running marks the entry started (leasing stops), terminal settles and
@@ -967,7 +1005,7 @@ func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) err
 		s.reg.MarkStarted(taskID, s.now())
 		return nil
 	case registry.IsTerminalResult(st):
-		if _, err := s.reg.MarkTerminal(taskID, registry.Result(st), s.now()); err != nil {
+		if _, err := s.reg.MarkTerminal(taskID, registry.Result(st), "", s.now()); err != nil {
 			return err
 		}
 		return s.deleteJob(ctx, e)
@@ -1053,7 +1091,7 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 func (s *Scheduler) failEntry(ctx context.Context, e registry.TaskEntry, report failReport) error {
 	s.log.ErrorContext(ctx, "task.failed_compensated",
 		"task_id", e.TaskID, "job_name", e.JobName, "failure_reason", report.reason)
-	if _, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, s.now()); err != nil {
+	if _, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, report.reason, s.now()); err != nil {
 		return err
 	}
 	s.metrics.TaskTerminal(string(registry.ResultFailed))
@@ -1087,7 +1125,7 @@ func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) e
 		return nil
 	}
 	if !e.IsTerminal() {
-		if _, err := s.reg.MarkTerminal(taskID, registry.Result(result), s.now()); err != nil {
+		if _, err := s.reg.MarkTerminal(taskID, registry.Result(result), "", s.now()); err != nil {
 			return err
 		}
 		s.metrics.TaskTerminal(result)
@@ -1149,7 +1187,7 @@ func (s *Scheduler) OnTaskVanished(ctx context.Context, taskID string) error {
 	if !e.IsTerminal() {
 		s.log.InfoContext(ctx, "task.vanished",
 			"task_id", e.TaskID, "job_name", e.JobName)
-		if _, err := s.reg.MarkTerminal(taskID, "", s.now()); err != nil {
+		if _, err := s.reg.MarkTerminal(taskID, "", "", s.now()); err != nil {
 			return err
 		}
 	}
@@ -1528,16 +1566,16 @@ func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) err
 // stays until a round drains it (contract §4).
 func (s *Scheduler) failClaim(ctx context.Context, e registry.TaskEntry, cause error) {
 	defer s.SyncInflight()
-	if _, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, time.Time{}); err != nil {
-		s.log.ErrorContext(ctx, "mark terminal failed", "task_id", e.TaskID, "err", err)
-	}
-	s.metrics.TaskTerminal(string(registry.ResultFailed))
 	// An invalid task ID is not a create failure: the Job must not be
 	// retried, the operator has to fix the task (failure-handling #0).
 	reason := FailureReasonJobCreateFailed
 	if errors.Is(cause, jobbuilder.ErrInvalidTaskID) {
 		reason = FailureReasonInvalidTaskID
 	}
+	if _, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, reason, time.Time{}); err != nil {
+		s.log.ErrorContext(ctx, "mark terminal failed", "task_id", e.TaskID, "err", err)
+	}
+	s.metrics.TaskTerminal(string(registry.ResultFailed))
 	s.log.ErrorContext(ctx, "task.failed_compensated",
 		"task_id", e.TaskID, "job_name", e.JobName, "failure_reason", reason, "err", cause.Error())
 	report := failReport{reason: reason, message: cause.Error()}

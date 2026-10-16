@@ -69,7 +69,7 @@ func TestInflightCountsOnlyNonTerminal(t *testing.T) {
 	if n := r.Inflight(); n != 2 {
 		t.Fatalf("Inflight = %d, want 2", n)
 	}
-	if _, err := r.MarkTerminal("t1", ResultCompleted, testNow); err != nil {
+	if _, err := r.MarkTerminal("t1", ResultCompleted, "", testNow); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	if n := r.Inflight(); n != 1 {
@@ -84,7 +84,7 @@ func TestInflightCountsOnlyNonTerminal(t *testing.T) {
 func TestMarkTerminalWritesDoneIndexAndIsImmutable(t *testing.T) {
 	r := New(fixedClock())
 	_ = r.Put(entryFor("t1"))
-	e, err := r.MarkTerminal("t1", ResultFailed, testNow)
+	e, err := r.MarkTerminal("t1", ResultFailed, "", testNow)
 	if err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
@@ -98,7 +98,7 @@ func TestMarkTerminalWritesDoneIndexAndIsImmutable(t *testing.T) {
 	if err := r.Put(e); !errors.Is(err, ErrTerminalImmutable) {
 		t.Fatalf("terminal regression accepted: %v", err)
 	}
-	if _, err := r.MarkTerminal("unknown", ResultFailed, testNow); err == nil {
+	if _, err := r.MarkTerminal("unknown", ResultFailed, "", testNow); err == nil {
 		t.Fatal("MarkTerminal on unknown task accepted")
 	}
 }
@@ -106,7 +106,7 @@ func TestMarkTerminalWritesDoneIndexAndIsImmutable(t *testing.T) {
 func TestDeleteKeepsDoneRecord(t *testing.T) {
 	r := New(fixedClock())
 	_ = r.Put(entryFor("t1"))
-	_, _ = r.MarkTerminal("t1", ResultCompleted, testNow)
+	_, _ = r.MarkTerminal("t1", ResultCompleted, "", testNow)
 	if err := r.Delete("t1"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -130,7 +130,7 @@ func TestDoneIndexExpires(t *testing.T) {
 	now := testNow
 	r := New(func() time.Time { return now })
 	_ = r.Put(entryFor("t1"))
-	_, _ = r.MarkTerminal("t1", ResultCompleted, now)
+	_, _ = r.MarkTerminal("t1", ResultCompleted, "", now)
 	now = now.Add(DoneIndexTTL + time.Minute)
 	if r.IsDone("t1") {
 		t.Fatal("done record past TTL still reported")
@@ -197,7 +197,7 @@ func TestActiveJobsByNode(t *testing.T) {
 		t.Fatalf("ActiveJobsByNode = %v, want node-a=2 node-b=1", load)
 	}
 	// Terminal Jobs do not hold node capacity: their pod is on its way out.
-	if _, err := r.MarkTerminal("t2", ResultCompleted, testNow); err != nil {
+	if _, err := r.MarkTerminal("t2", ResultCompleted, "", testNow); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	if load = r.ActiveJobsByNode(); load["node-a"] != 1 {
@@ -246,7 +246,7 @@ func TestMarkStarted(t *testing.T) {
 		t.Fatalf("started_at overwritten: %v", e.StartedAt)
 	}
 	// Terminal wins over a late start.
-	_, _ = r.MarkTerminal("t1", ResultCompleted, testNow)
+	_, _ = r.MarkTerminal("t1", ResultCompleted, "", testNow)
 	if _, ok := r.MarkStarted("t1", testNow); ok {
 		t.Fatal("late start regressed a terminal entry")
 	}
@@ -354,4 +354,74 @@ func TestRuntimeIndex(t *testing.T) {
 		t.Fatalf("heartbeat = %v", got.LastHeartbeatAt)
 	}
 	r.TouchHeartbeat("ghost", testNow) // no panic
+}
+
+// TestSettledRecordRetainsVerdictAndDropsSecrets guards ADR-030's retention
+// face: the settled index keeps the terminal projection the ops endpoint
+// answers with after the credential reclaim deleted the live row, without the
+// payload body or the token digest, and only for the retention window.
+func TestSettledRecordRetainsVerdictAndDropsSecrets(t *testing.T) {
+	now := testNow
+	r := New(func() time.Time { return now }, WithDrainTimeout(time.Minute), WithDeliveryConfirmTimeout(30*time.Second))
+
+	secret := json.RawMessage(`{"id":"t1","auth_token":"mat_secret"}`)
+	e := entryFor("t1")
+	e.State = StateDaemonRegistered
+	e.Payload = secret
+	e.TokenHash = "sha256:deadbeef"
+	if err := r.Put(e); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	delivered, ok := r.MarkDelivering("fm-t1", now, secret)
+	if !ok || delivered.DeliveryDeadline != now.Add(30*time.Second) {
+		t.Fatalf("delivery window = %v (ok %v), want the commit plus 30s", delivered.DeliveryDeadline, ok)
+	}
+	if _, err := r.MarkTerminal("t1", ResultFailed, "delivery_unconfirmed", time.Time{}); err != nil {
+		t.Fatalf("MarkTerminal: %v", err)
+	}
+	record, ok := r.Settled("t1")
+	if !ok {
+		t.Fatal("no settled record after the verdict")
+	}
+	if record.FailureReason != "delivery_unconfirmed" {
+		t.Errorf("retained reason = %q, want the verdict's attribution", record.FailureReason)
+	}
+	if record.Payload != nil || record.TokenHash != "" {
+		t.Errorf("the retained record kept the payload or the token digest: %+v", record)
+	}
+
+	// A repeated terminal report overwrites the result but must not erase the
+	// attribution that started the drain.
+	if _, err := r.MarkTerminal("t1", ResultFailed, "", time.Time{}); err != nil {
+		t.Fatalf("repeated MarkTerminal: %v", err)
+	}
+	if again, _ := r.Settled("t1"); again.FailureReason != "delivery_unconfirmed" {
+		t.Errorf("a reasonless replay erased the attribution: %q", again.FailureReason)
+	}
+
+	// Past the retention window the record is gone, and a reclaimed task is
+	// once more indistinguishable from one that never existed.
+	now = now.Add(DoneIndexTTL + time.Second)
+	if _, ok := r.Settled("t1"); ok {
+		t.Error("the record outlived its retention window")
+	}
+}
+
+// TestDeliveryWindowUnarmedWithoutTheOption guards the "0 = off" form: without
+// the option no delivery deadline is written, so the lost-response form falls
+// back to the boot upper bound alone.
+func TestDeliveryWindowUnarmedWithoutTheOption(t *testing.T) {
+	r := New(fixedClock())
+	e := entryFor("t1")
+	e.State = StateDaemonRegistered
+	if err := r.Put(e); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	delivered, ok := r.MarkDelivering("fm-t1", testNow, json.RawMessage(`{"id":"t1"}`))
+	if !ok {
+		t.Fatal("delivery rejected")
+	}
+	if !delivered.DeliveryDeadline.IsZero() {
+		t.Fatalf("delivery deadline = %v, want none without the option", delivered.DeliveryDeadline)
+	}
 }

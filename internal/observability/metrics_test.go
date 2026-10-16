@@ -34,6 +34,7 @@ func TestMetricsExposeAllDesignedNames(t *testing.T) {
 		metricForwardTotal, metricForwardLatency, metricAuthFailuresTotal,
 		metricTokenUsageTotal, metricDuplicateDispatch, metricPendingReports,
 		metricWSConnected, metricWSReconnectsTotal, metricHeartbeatSuspect,
+		metricDeliveryClaimsTotal, metricDeliveryLatency, metricDeliveryUnconfirmedTotal,
 	} {
 		if !strings.Contains(out, name) {
 			t.Fatalf("metric %s missing from exposition:\n%s", name, out)

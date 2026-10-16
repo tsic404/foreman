@@ -265,6 +265,14 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 	if len(req.RuntimeIDs) > 0 {
 		runtimeID = req.RuntimeIDs[0]
 	}
+	// Read the delivery face before the delivery attempt: an empty batch that
+	// answers an already-committed delivery is the lost-response signature
+	// (ADR-030), and the state that tells the two kinds of empty batch apart
+	// is gone once the entry settles. A decided entry's empty batches are the
+	// designed ones (drain never delivers), so they stay plain empties.
+	pending, pendingOK := s.reg.ByDaemon(req.DaemonID)
+	unconfirmed := pendingOK && !pending.IsTerminal() &&
+		!pending.DeliveredAt.IsZero() && pending.StartedAt.IsZero()
 	tasks, err := s.sched.Deliver(req.DaemonID, runtimeID, req.MaxTasks)
 	if err != nil {
 		if errors.Is(err, scheduler.ErrUnknownDaemon) || errors.Is(err, scheduler.ErrRuntimeMismatch) {
@@ -274,6 +282,21 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("deliver failed", "daemon_id", req.DaemonID, "err", err)
 		writeError(w, http.StatusInternalServerError, "deliver failed")
 		return
+	}
+	switch {
+	case len(tasks) > 0:
+		s.metrics.DeliveryClaim(DeliveryClaimDelivered)
+		if pendingOK {
+			s.metrics.DeliveryLatency(time.Since(pending.ClaimedAt).Seconds())
+		}
+	case unconfirmed:
+		// The daemon keeps asking although the delivery is committed: the
+		// request arrived and the response was lost, which is what the
+		// per-entry counter records for the post-hoc query face.
+		s.metrics.DeliveryClaim(DeliveryClaimEmptyUnconfirmed)
+		s.reg.NoteClaimAfterDelivery(pending.TaskID)
+	default:
+		s.metrics.DeliveryClaim(DeliveryClaimEmpty)
 	}
 	if tasks == nil {
 		tasks = []json.RawMessage{}

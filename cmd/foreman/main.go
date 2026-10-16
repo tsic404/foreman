@@ -118,8 +118,12 @@ func run() error {
 	}
 
 	// The drain upper bound is the registry's, because markTerminal writes it
-	// once at the alive → draining transition (ADR-017).
-	reg := registry.New(time.Now, registry.WithDrainTimeout(schedCfg.JobDrainTimeout))
+	// once at the alive → draining transition (ADR-017); the delivery
+	// confirmation window is too, because markDelivering arms it once at the
+	// delivery commit (ADR-030).
+	reg := registry.New(time.Now,
+		registry.WithDrainTimeout(schedCfg.JobDrainTimeout),
+		registry.WithDeliveryConfirmTimeout(schedCfg.DeliveryConfirmTimeout))
 	// The catalog probe's identity lives beside the task registry (ADR-019):
 	// it is what the Job Token probe branch, the probe handlers and the probe
 	// lifecycle all read.

@@ -23,6 +23,10 @@ const (
 // *registry.Registry.
 type TaskIndex interface {
 	Get(taskID string) (registry.TaskEntry, bool)
+	// Settled returns the retained terminal record of an already-reclaimed
+	// task (contract §3.1, ADR-030): the single-task endpoint answers with it
+	// inside the retention window.
+	Settled(taskID string) (registry.TaskEntry, bool)
 	List() []registry.TaskEntry
 	Inflight() int
 }
@@ -79,7 +83,16 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 		writeJSON(w, http.StatusOK, entries)
 	})
 	mux.HandleFunc("GET /foreman/tasks/{taskID}", func(w http.ResponseWriter, r *http.Request) {
-		e, ok := index.Get(r.PathValue("taskID"))
+		taskID := r.PathValue("taskID")
+		e, ok := index.Get(taskID)
+		if !ok {
+			// A reclaimed task keeps answering with its terminal record until
+			// the retention window expires (observability.md §端点, ADR-030):
+			// the convergence instant is no longer the end of the evidence
+			// window. Beyond it, a reclaimed task and one that never existed
+			// are again indistinguishable.
+			e, ok = index.Settled(taskID)
+		}
 		if !ok {
 			writeError(w, http.StatusNotFound, "task not found")
 			return
@@ -92,9 +105,10 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 	mux.HandleFunc("GET /foreman/tasks/{taskID}/payload-preview", func(w http.ResponseWriter, r *http.Request) {
 		e, ok := index.Get(r.PathValue("taskID"))
 		if !ok {
-			// A reclaimed entry is indistinguishable from a task that never
-			// existed: the reclaim deletes the row. Sibling endpoints answer
-			// both the same way (observability.md §端点).
+			// A reclaimed entry's terminal record is still answerable, but the
+			// payload is not part of it: the record drops the body at the
+			// verdict (registry.settledRecord), and this window has always
+			// been the live entry alone (observability.md §端点).
 			writeError(w, http.StatusNotFound, "task not found")
 			return
 		}
