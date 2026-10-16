@@ -6,6 +6,7 @@
 package acceptance
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"encoding/json"
@@ -13,6 +14,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -20,6 +23,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 
 	"github.com/tsic404/foreman/internal/auth"
 	"github.com/tsic404/foreman/internal/jobbuilder"
@@ -30,9 +34,63 @@ import (
 
 var testKey = bytes.Repeat([]byte{0x24}, 32)
 
+// harnessJobImage is the image reference the real builder renders into a Job:
+// the <job-image> placeholder's value in this suite.
+const harnessJobImage = "ghcr.io/tsic404/foreman-job:test"
+
 // Named aliases keep the scenario files free of repeated import qualifiers.
 type schedulerConfig = scheduler.Config
 type batchv1Job = batchv1.Job
+
+// yamlDocuments reads one repo file and returns its YAML documents, so a test
+// can assert against a manifest the deployment actually applies.
+func yamlDocuments(t *testing.T, path string) [][]byte {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	reader := utilyaml.NewYAMLReader(bufio.NewReader(bytes.NewReader(raw)))
+	var docs [][]byte
+	for {
+		doc, err := reader.Read()
+		if err != nil {
+			break
+		}
+		if len(bytes.TrimSpace(doc)) > 0 {
+			docs = append(docs, doc)
+		}
+	}
+	return docs
+}
+
+// createdJob returns the Job the harness recorded under name.
+func (h *harness) createdJob(t *testing.T, name string) *batchv1Job {
+	t.Helper()
+	h.jobs.mu.Lock()
+	defer h.jobs.mu.Unlock()
+	for _, job := range h.jobs.createdJobs {
+		if job.Name == name {
+			return job
+		}
+	}
+	t.Fatalf("Job %s not recorded", name)
+	return nil
+}
+
+// createdSecret returns the Secret the harness recorded under name.
+func (h *harness) createdSecret(t *testing.T, name string) *corev1.Secret {
+	t.Helper()
+	h.jobs.mu.Lock()
+	defer h.jobs.mu.Unlock()
+	for _, secret := range h.jobs.createdSecrets {
+		if secret.Name == name {
+			return secret
+		}
+	}
+	t.Fatalf("Secret %s not recorded", name)
+	return nil
+}
 
 // declaredRuntimes is the startup discovery the acceptance scenarios declare:
 // two providers, exactly what a template with two CLI providers reports.
@@ -360,7 +418,7 @@ func (b *builder) probeToken(jobName string) string {
 	return b.tokens[jobName]
 }
 
-// realBuilder drives the production jobbuilder (default template, CM absent),
+// realBuilder drives the production jobbuilder over the deployment's template,
 // so a scenario exercises the real probe render path and its credential.
 type realBuilder struct {
 	inner *jobbuilder.Builder
@@ -399,15 +457,53 @@ func (b realBuilder) probeToken(jobName string) string {
 	return ""
 }
 
-// useRealBuilder swaps the canned builder for the production one.
+// deployedTemplatePath writes the ConfigMap's job-overlay.yaml content — the
+// reference template the Deployment mounts — to a file and returns its path,
+// so the real builder runs through the same required-template gate a cluster
+// deployment does (ADR-030).
+func deployedTemplatePath(t *testing.T) string {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join("..", "..", "deploy", "25-job-template.yaml"))
+	if err != nil {
+		t.Fatalf("read deploy/25-job-template.yaml: %v", err)
+	}
+	jsonBytes, err := utilyaml.ToJSON(raw)
+	if err != nil {
+		t.Fatalf("decode deploy/25-job-template.yaml: %v", err)
+	}
+	var configMap corev1.ConfigMap
+	if err := json.Unmarshal(jsonBytes, &configMap); err != nil {
+		t.Fatalf("decode the template ConfigMap: %v", err)
+	}
+	content := configMap.Data["job-overlay.yaml"]
+	if content == "" {
+		t.Fatal("the template ConfigMap carries no job-overlay.yaml key")
+	}
+	path := filepath.Join(t.TempDir(), "job-overlay.yaml")
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+	return path
+}
+
+// useRealBuilder swaps the canned builder for the production one, driven by the
+// template the Deployment publishes.
 func (h *harness) useRealBuilder(t *testing.T) {
+	t.Helper()
+	h.useRealBuilderWithTemplate(t, deployedTemplatePath(t))
+}
+
+// useRealBuilderWithTemplate swaps the canned builder for the production one
+// over a test-owned template file (the custom-template window).
+func (h *harness) useRealBuilderWithTemplate(t *testing.T, templatePath string) {
 	t.Helper()
 	jbCfg, err := jobbuilder.LoadConfig(func(string) string { return "" })
 	if err != nil {
 		t.Fatalf("jobbuilder.LoadConfig: %v", err)
 	}
+	jbCfg.TemplatePath = templatePath
 	jbCfg.JobNamespace = "multica-agents"
-	jbCfg.JobImage = "ghcr.io/tsic404/foreman-job:test"
+	jbCfg.JobImage = harnessJobImage
 	jbCfg.Issuer = h.issuer
 	jbCfg.Nodes = h.reg
 	jbCfg.Logger = slog.New(slog.NewJSONHandler(io.Discard, nil))

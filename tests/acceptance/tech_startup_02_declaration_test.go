@@ -171,7 +171,7 @@ func TestStartupProbeRenderIsProbeShaped(t *testing.T) {
 	if len(probes) != 1 {
 		t.Fatalf("probe Jobs = %v, want exactly one", probes)
 	}
-	job := h.probeJob(t, probes[0])
+	job := h.createdJob(t, probes[0])
 	if job.Labels["foreman.tsic.top/role"] != "catalog-probe" {
 		t.Errorf("probe labels = %v", job.Labels)
 	}
@@ -206,18 +206,4 @@ func TestStartupProbeRenderIsProbeShaped(t *testing.T) {
 	if !foundServerURL {
 		t.Error("probe env must point the daemon at Foreman")
 	}
-}
-
-// probeJob returns the created probe Job by name.
-func (h *harness) probeJob(t *testing.T, name string) *batchv1Job {
-	t.Helper()
-	h.jobs.mu.Lock()
-	defer h.jobs.mu.Unlock()
-	for _, job := range h.jobs.createdJobs {
-		if job.Name == name {
-			return job
-		}
-	}
-	t.Fatalf("probe Job %s not recorded", name)
-	return nil
 }

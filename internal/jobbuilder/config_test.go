@@ -5,8 +5,6 @@ import (
 	"testing"
 	"time"
 
-	corev1 "k8s.io/api/core/v1"
-
 	"github.com/tsic404/foreman/internal/auth"
 )
 
@@ -25,14 +23,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.JobImage != DefaultJobImage {
 		t.Errorf("JobImage = %q, want %q", cfg.JobImage, DefaultJobImage)
 	}
-	if len(cfg.ImagePullSecrets) != 1 || cfg.ImagePullSecrets[0] != "registry-tsic" {
-		t.Errorf("ImagePullSecrets = %v", cfg.ImagePullSecrets)
-	}
 	if cfg.JobTokenTTL != DefaultJobTokenTTL {
 		t.Errorf("JobTokenTTL = %s, want %s", cfg.JobTokenTTL, DefaultJobTokenTTL)
-	}
-	if cfg.TaskMaxDuration != DefaultTaskMaxDuration {
-		t.Errorf("TaskMaxDuration = %s, want %s", cfg.TaskMaxDuration, DefaultTaskMaxDuration)
 	}
 	// The loaded default must be the very value the auth module's startup
 	// budget check validates: jobbuilder signs the token, so a second literal
@@ -41,34 +33,45 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.JobTokenTTL != auth.DefaultJobTokenTTL {
 		t.Errorf("JobTokenTTL = %s, want auth's %s", cfg.JobTokenTTL, auth.DefaultJobTokenTTL)
 	}
-	if cfg.TaskMaxDuration != auth.DefaultTaskMaxDuration {
-		t.Errorf("TaskMaxDuration = %s, want auth's %s", cfg.TaskMaxDuration, auth.DefaultTaskMaxDuration)
-	}
 	if auth.DefaultJobTokenTTL <= auth.DefaultTaskMaxDuration {
 		t.Errorf("default TTL %s does not cover the task duration %s",
 			auth.DefaultJobTokenTTL, auth.DefaultTaskMaxDuration)
 	}
-	if cfg.JobTTLSeconds != DefaultJobTTLSeconds {
-		t.Errorf("JobTTLSeconds = %d, want %d", cfg.JobTTLSeconds, DefaultJobTTLSeconds)
-	}
-	if cfg.StateRoot != DefaultStateRoot {
-		t.Errorf("StateRoot = %q, want %q", cfg.StateRoot, DefaultStateRoot)
-	}
-	if cfg.RepoCacheMode != CacheModeShared {
-		t.Errorf("RepoCacheMode = %q, want %q", cfg.RepoCacheMode, CacheModeShared)
-	}
 	if !cfg.PreferNodeReuse {
 		t.Error("PreferNodeReuse must default to true")
 	}
-	if cfg.CPURequest.String() != "1" || cfg.MemoryRequest.String() != "2Gi" ||
-		cfg.CPULimit.String() != "4" || cfg.MemoryLimit.String() != "8Gi" {
-		t.Errorf("resources = %s/%s %s/%s", cfg.CPURequest.String(), cfg.MemoryRequest.String(), cfg.CPULimit.String(), cfg.MemoryLimit.String())
+	if cfg.TemplatePath != TemplatePath {
+		t.Errorf("TemplatePath = %q, want the fixed %q", cfg.TemplatePath, TemplatePath)
 	}
-	if len(cfg.NodeSelector) != 1 || cfg.NodeSelector["kubernetes.io/os"] != "linux" {
-		t.Errorf("NodeSelector = %v", cfg.NodeSelector)
+	if cfg.JobDrainTimeout != DefaultJobDrainTimeout || cfg.ProbeHeartbeatInterval != DefaultProbeHeartbeatInterval {
+		t.Errorf("drain/heartbeat = %s/%s, want %s/%s",
+			cfg.JobDrainTimeout, cfg.ProbeHeartbeatInterval, DefaultJobDrainTimeout, DefaultProbeHeartbeatInterval)
 	}
-	if len(cfg.Tolerations) != 2 || cfg.Tolerations[0].Key != "unreachable" || cfg.Tolerations[1].Key != "maybe_unreachable" {
-		t.Errorf("Tolerations = %v", cfg.Tolerations)
+}
+
+// TestLoadConfigIgnoresTemplateShapeKeys: the template is the only Job shape
+// source (ADR-030), so the keys that used to tune the deleted built-in
+// template must not be read at all. An arbitrary value — an illegal one
+// included — is ignored and never refuses startup; the five resource/placement
+// keys are the idle entries whose deletion follows P-012 / P-013.
+func TestLoadConfigIgnoresTemplateShapeKeys(t *testing.T) {
+	cfg, err := LoadConfig(envFrom(map[string]string{
+		"FOREMAN_JOB_IMAGE_PULL_SECRETS": `["a"]`,
+		"FOREMAN_JOB_TOLERATIONS":        `[`,
+		"FOREMAN_JOB_TTL_SECONDS":        "x",
+		"FOREMAN_REPO_CACHE_MODE":        "isolated",
+		"FOREMAN_JOB_CPU_REQUEST":        "lots",
+		"FOREMAN_JOB_MEMORY_REQUEST":     "lots",
+		"FOREMAN_JOB_CPU_LIMIT":          "lots",
+		"FOREMAN_JOB_MEMORY_LIMIT":       "lots",
+		"FOREMAN_JOB_NODE_SELECTOR":      `{`,
+		"FOREMAN_TASK_MAX_DURATION":      "-1",
+	}))
+	if err != nil {
+		t.Fatalf("LoadConfig with template-shape keys set: %v", err)
+	}
+	if cfg.JobNamespace != DefaultJobNamespace || cfg.JobImage != DefaultJobImage {
+		t.Errorf("the ignored keys changed namespace/image to %q/%q", cfg.JobNamespace, cfg.JobImage)
 	}
 }
 
@@ -91,29 +94,16 @@ func TestLoadConfigJobImageVerbatim(t *testing.T) {
 		if cfg.JobImage != ref {
 			t.Errorf("JobImage = %q, want the verbatim %q", cfg.JobImage, ref)
 		}
-		if cfg.imageRef() != ref {
-			t.Errorf("imageRef() = %q, want %q", cfg.imageRef(), ref)
-		}
 	}
 }
 
 func TestLoadConfigOverrides(t *testing.T) {
 	cfg, err := LoadConfig(envFrom(map[string]string{
-		EnvJobNamespace:        "agents",
-		EnvJobImage:            "registry.example.com/foreman-job:v2",
-		EnvJobImagePullSecrets: `["a","b"]`,
-		EnvJobTokenTTL:         "12h",
-		EnvTaskMaxDuration:     "3600",
-		EnvJobTTLSeconds:       "300",
-		EnvStateRoot:           "/data/foreman",
-		EnvRepoCacheMode:       CacheModeIsolated,
-		EnvPreferNodeReuse:     "false",
-		EnvJobCPURequest:       "500m",
-		EnvJobMemoryRequest:    "1Gi",
-		EnvJobCPULimit:         "2",
-		EnvJobMemoryLimit:      "4Gi",
-		EnvJobNodeSelector:     `{"kubernetes.io/os":"linux","pool":"agents"}`,
-		EnvJobTolerations:      `[{"key":"dedicated","operator":"Equal","value":"agents","effect":"NoSchedule"}]`,
+		EnvJobNamespace:    "agents",
+		EnvJobImage:        "registry.example.com/foreman-job:v2",
+		EnvJobTokenTTL:     "12h",
+		EnvPreferNodeReuse: "false",
+		EnvJobDrainTimeout: "90s",
 	}))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
@@ -121,46 +111,8 @@ func TestLoadConfigOverrides(t *testing.T) {
 	if cfg.JobNamespace != "agents" || cfg.JobImage != "registry.example.com/foreman-job:v2" {
 		t.Errorf("namespace/image = %q/%q", cfg.JobNamespace, cfg.JobImage)
 	}
-	if len(cfg.ImagePullSecrets) != 2 || cfg.ImagePullSecrets[1] != "b" {
-		t.Errorf("ImagePullSecrets = %v", cfg.ImagePullSecrets)
-	}
-	if cfg.JobTokenTTL != 12*time.Hour || cfg.TaskMaxDuration != time.Hour || cfg.JobTTLSeconds != 300 {
-		t.Errorf("durations = %s/%s ttl %d", cfg.JobTokenTTL, cfg.TaskMaxDuration, cfg.JobTTLSeconds)
-	}
-	if cfg.StateRoot != "/data/foreman" || cfg.RepoCacheMode != CacheModeIsolated || cfg.PreferNodeReuse {
-		t.Errorf("state/mode/reuse = %q/%q/%v", cfg.StateRoot, cfg.RepoCacheMode, cfg.PreferNodeReuse)
-	}
-	if cfg.CPURequest.String() != "500m" || cfg.MemoryRequest.String() != "1Gi" ||
-		cfg.CPULimit.String() != "2" || cfg.MemoryLimit.String() != "4Gi" {
-		t.Errorf("resources = %s/%s %s/%s", cfg.CPURequest.String(), cfg.MemoryRequest.String(), cfg.CPULimit.String(), cfg.MemoryLimit.String())
-	}
-	if len(cfg.NodeSelector) != 2 || cfg.NodeSelector["pool"] != "agents" {
-		t.Errorf("NodeSelector = %v", cfg.NodeSelector)
-	}
-	if len(cfg.Tolerations) != 1 || cfg.Tolerations[0].Key != "dedicated" || cfg.Tolerations[0].Operator != corev1.TolerationOpEqual {
-		t.Errorf("Tolerations = %v", cfg.Tolerations)
-	}
-}
-
-func TestLoadConfigRejectsOverflow(t *testing.T) {
-	// Boundary values: one past the limit must fail, the limit itself must pass.
-	cases := []struct {
-		env  string
-		pass string
-		fail string
-	}{
-		{EnvTaskMaxDuration, "9223372036", "9223372037"}, // math.MaxInt64 / int64(time.Second)
-		{EnvJobTTLSeconds, "2147483647", "2147483648"},   // math.MaxInt32
-	}
-	for _, tc := range cases {
-		env := map[string]string{tc.env: tc.fail}
-		if _, err := LoadConfig(envFrom(env)); err == nil || !strings.Contains(err.Error(), tc.env) {
-			t.Errorf("%s=%s: err = %v, want a %s error", tc.env, tc.fail, err, tc.env)
-		}
-		env[tc.env] = tc.pass
-		if _, err := LoadConfig(envFrom(env)); err != nil {
-			t.Errorf("%s=%s: unexpected error %v", tc.env, tc.pass, err)
-		}
+	if cfg.JobTokenTTL != 12*time.Hour || cfg.JobDrainTimeout != 90*time.Second || cfg.PreferNodeReuse {
+		t.Errorf("ttl/drain/reuse = %s/%s/%v", cfg.JobTokenTTL, cfg.JobDrainTimeout, cfg.PreferNodeReuse)
 	}
 }
 
@@ -168,31 +120,20 @@ func TestLoadConfigRejectsBadValues(t *testing.T) {
 	cases := []struct {
 		name string
 		env  string
-		want string
+		bad  string
 	}{
-		{"bad token ttl", EnvJobTokenTTL, EnvJobTokenTTL},
-		{"bad max duration", EnvTaskMaxDuration, EnvTaskMaxDuration},
-		{"bad job ttl", EnvJobTTLSeconds, EnvJobTTLSeconds},
-		{"bad cache mode", EnvRepoCacheMode, EnvRepoCacheMode},
-		{"bad reuse flag", EnvPreferNodeReuse, EnvPreferNodeReuse},
-		{"bad cpu request", EnvJobCPURequest, EnvJobCPURequest},
-		{"bad node selector", EnvJobNodeSelector, EnvJobNodeSelector},
-		{"bad tolerations", EnvJobTolerations, EnvJobTolerations},
-	}
-	bad := map[string]string{
-		EnvJobTokenTTL:     "abc",
-		EnvTaskMaxDuration: "-1",
-		EnvJobTTLSeconds:   "x",
-		EnvRepoCacheMode:   "weird",
-		EnvPreferNodeReuse: "maybe",
-		EnvJobCPURequest:   "lots",
-		EnvJobNodeSelector: `{`,
-		EnvJobTolerations:  `[`,
+		{"bad token ttl", EnvJobTokenTTL, "abc"},
+		{"negative token ttl", EnvJobTokenTTL, "-1h"},
+		{"bad reuse flag", EnvPreferNodeReuse, "maybe"},
+		{"bad drain bound", EnvJobDrainTimeout, "soon"},
+		{"negative drain bound", EnvJobDrainTimeout, "-1s"},
 	}
 	for _, tc := range cases {
-		env := map[string]string{tc.env: bad[tc.env]}
-		if _, err := LoadConfig(envFrom(env)); err == nil || !strings.Contains(err.Error(), tc.want) {
-			t.Errorf("%s: err = %v, want a %s error", tc.name, err, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			env := map[string]string{tc.env: tc.bad}
+			if _, err := LoadConfig(envFrom(env)); err == nil || !strings.Contains(err.Error(), tc.env) {
+				t.Errorf("%s=%s: err = %v, want a %s error", tc.env, tc.bad, err, tc.env)
+			}
+		})
 	}
 }

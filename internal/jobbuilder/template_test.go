@@ -193,7 +193,7 @@ func mustBuildTemplate(t *testing.T, manifest string, e TaskEntry, mutate func(*
 	return job, logs
 }
 
-// ---- startup gate: two failure classes only (P-006 §A4) ----
+// ---- startup gate: the template is required, three failure classes (03-contracts §5.4) ----
 
 // The startup log's fixed literals, pinned as text and not read from the
 // production constants: the acceptance test greps them verbatim
@@ -203,6 +203,7 @@ const (
 	wantDeclaration = "Foreman 不对 Job 模板做任何校验，模板内容不构成安全边界"
 	wantEffect      = "运行中 CM 变更不生效"
 	wantHashPrefix  = "模板内容哈希 sha256="
+	wantMissing     = "模板文件不存在"
 	wantUnreadable  = "文件不可读"
 	wantNoHash      = "模板内容哈希不可得"
 )
@@ -213,39 +214,48 @@ func wantHashLine(content string) string {
 	return wantHashPrefix + hex.EncodeToString(sum[:])
 }
 
-func TestLoadJobTemplateAbsent(t *testing.T) {
+// TestLoadJobTemplateMissing is failure class 1: the file does not exist (the
+// ConfigMap exists but has no job-overlay.yaml key). The template is a required
+// deployment artifact, so this refuses startup — never a fallback (ADR-030).
+func TestLoadJobTemplateMissing(t *testing.T) {
 	cfg := testConfig()
 	cfg.TemplatePath = filepath.Join(t.TempDir(), "job-overlay.yaml")
 	logs := &bytes.Buffer{}
 	cfg.Logger = observability.NewLogger(logs, slog.LevelInfo, "")
 
-	template, present, err := LoadJobTemplate(cfg)
-	if err != nil {
-		t.Fatalf("a missing template is not an error: %v", err)
+	template, err := LoadJobTemplate(cfg)
+	if err == nil {
+		t.Fatalf("a missing template must refuse startup, got template=%v", template)
 	}
-	if present || template != nil {
-		t.Fatalf("present=%v template=%v, want the default-template path", present, template)
+	if template != nil {
+		t.Errorf("template = %v, want none", template)
+	}
+	if !strings.Contains(err.Error(), cfg.TemplatePath) {
+		t.Errorf("error %q must name the path", err)
 	}
 	if !strings.Contains(logs.String(), wantDeclaration) {
-		t.Errorf("startup log must carry the declaration on the absent path: %s", logs.String())
+		t.Errorf("the refusal log must carry the declaration: %s", logs.String())
 	}
-	if !strings.Contains(logs.String(), wantEffect) {
-		t.Errorf("the absent path must still state that a ConfigMap edit needs a restart: %s", logs.String())
+	if !strings.Contains(logs.String(), wantMissing) {
+		t.Errorf("the refusal log must name the class (%s): %s", wantMissing, logs.String())
+	}
+	if !strings.Contains(logs.String(), cfg.TemplatePath) {
+		t.Errorf("the refusal log must carry the path: %s", logs.String())
 	}
 	if strings.Contains(logs.String(), wantHashPrefix) {
-		t.Errorf("the absent path has no content to hash: %s", logs.String())
+		t.Errorf("a missing file has no content to hash: %s", logs.String())
 	}
 }
 
 func TestLoadJobTemplateAcceptsCompleteJob(t *testing.T) {
 	cfg, logs := templateConfig(t, statefulSetShapedTemplate)
 
-	template, present, err := LoadJobTemplate(cfg)
+	template, err := LoadJobTemplate(cfg)
 	if err != nil {
 		t.Fatalf("LoadJobTemplate: %v", err)
 	}
-	if !present || template == nil {
-		t.Fatalf("present=%v template=%v, want the parsed template", present, template)
+	if template == nil {
+		t.Fatalf("template = %v, want the parsed template", template)
 	}
 	if template["apiVersion"] != "batch/v1" || template["kind"] != "Job" {
 		t.Errorf("template header = %v/%v", template["apiVersion"], template["kind"])
@@ -262,7 +272,7 @@ func TestLoadJobTemplateAcceptsCompleteJob(t *testing.T) {
 	}
 }
 
-// TestLoadJobTemplateUnreadable is failure class 1: the file exists but cannot
+// TestLoadJobTemplateUnreadable is failure class 2: the file exists but cannot
 // be read (a directory is the portable stand-in for an unreadable path).
 func TestLoadJobTemplateUnreadable(t *testing.T) {
 	cfg := testConfig()
@@ -270,12 +280,12 @@ func TestLoadJobTemplateUnreadable(t *testing.T) {
 	logs := &bytes.Buffer{}
 	cfg.Logger = observability.NewLogger(logs, slog.LevelInfo, "")
 
-	template, present, err := LoadJobTemplate(cfg)
+	template, err := LoadJobTemplate(cfg)
 	if err == nil {
 		t.Fatalf("unreadable template accepted: %v", template)
 	}
-	if present {
-		t.Error("a failed read must not report the template as present")
+	if template != nil {
+		t.Errorf("template = %v, want none", template)
 	}
 	if !strings.Contains(logs.String(), wantDeclaration) {
 		t.Errorf("the unreadable refusal must carry the declaration: %s", logs.String())
@@ -283,7 +293,7 @@ func TestLoadJobTemplateUnreadable(t *testing.T) {
 	if !strings.Contains(logs.String(), wantUnreadable) {
 		t.Errorf("the unreadable refusal must name the class (文件不可读): %s", logs.String())
 	}
-	// Class 1 states the hash is out of reach and must not show a hash line.
+	// Class 2 states the hash is out of reach and must not show a hash line.
 	if !strings.Contains(logs.String(), wantNoHash) {
 		t.Errorf("the unreadable refusal must state that no hash is available: %s", logs.String())
 	}
@@ -292,9 +302,9 @@ func TestLoadJobTemplateUnreadable(t *testing.T) {
 	}
 }
 
-// TestLoadJobTemplateRejects is failure class 2: the content is not a
+// TestLoadJobTemplateRejects is failure class 3: the content is not a
 // batch/v1 Job. A bare manifest fragment lands here too — it has no
-// apiVersion/kind, so it cannot be the complete template P-006 defines.
+// apiVersion/kind, so it cannot be the complete template §5.4 requires.
 func TestLoadJobTemplateRejects(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -312,12 +322,9 @@ func TestLoadJobTemplateRejects(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			cfg, logs := templateConfig(t, tc.manifest)
 
-			template, present, err := LoadJobTemplate(cfg)
+			template, err := LoadJobTemplate(cfg)
 			if err == nil {
 				t.Fatalf("template accepted: %v", template)
-			}
-			if !present {
-				t.Error("the file existed, so present must stay true")
 			}
 			if !strings.Contains(err.Error(), tc.want) {
 				t.Errorf("error %q must name the failure (%q)", err, tc.want)
@@ -325,7 +332,7 @@ func TestLoadJobTemplateRejects(t *testing.T) {
 			if !strings.Contains(logs.String(), wantDeclaration) {
 				t.Errorf("the refusal log must carry the declaration: %s", logs.String())
 			}
-			// Class 2 is readable, so it keeps the hash line (AC-29).
+			// Class 3 is readable, so it keeps the hash line (AC-29).
 			if !strings.Contains(logs.String(), wantHashLine(tc.manifest)) {
 				t.Errorf("the refusal log must carry the template file's hash line: %s", logs.String())
 			}
@@ -584,29 +591,6 @@ func TestTemplatePreferredNodePlaceholder(t *testing.T) {
 	}
 }
 
-// TestTemplateSessionNodeSpelling: the design corpus writes the node-reuse
-// placeholder two ways — <preferred node> (P-006 §A1.2, 03-contracts §5.4) and
-// <session node> (job-template.md's built-in manifest and placeholder table).
-// They name one conditional block, so a template copied from either resolves
-// the node and drops the item exactly the same way.
-func TestTemplateSessionNodeSpelling(t *testing.T) {
-	entry := testEntry()
-	manifest := strings.ReplaceAll(onlyPreferredNodeTemplate, "<preferred node>", "<session node>")
-
-	job, _ := mustBuildTemplate(t, manifest, entry, func(cfg *Config) {
-		cfg.Nodes = sessionNodeIndex("company-02")
-	})
-	if got := job.Spec.Template.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution[0].
-		Preference.MatchExpressions[0].Values[0]; got != "company-02" {
-		t.Errorf("resolved node = %q, want company-02", got)
-	}
-
-	job, _ = mustBuildTemplate(t, manifest, entry, nil)
-	if job.Spec.Template.Spec.Affinity != nil {
-		t.Errorf("affinity = %+v, want none once its only item is dropped", job.Spec.Template.Spec.Affinity)
-	}
-}
-
 // duplicateEnvTemplate declares the injected key twice: the daemon reads the
 // last entry (os.Getenv), so keeping either template copy would let it win.
 const duplicateEnvTemplate = `
@@ -737,49 +721,95 @@ func TestTemplateInjectsA1EnvOnce(t *testing.T) {
 	}
 }
 
-// TestTemplateMisplacedNodePlaceholder (P-006 §A1.2): the conditional deletion
-// covers the preferred-affinity item only. Anywhere else the placeholder has no
-// value to write when no node resolves, so the Build fails instead of dropping
-// the key or element that carried it.
-func TestTemplateMisplacedNodePlaceholder(t *testing.T) {
+// TestTemplateNodeLiteralOutsideRecognitionSite: §5.4 registers <preferred node>
+// as the substitution set's one exception — only its recognition site consumes
+// it (「识别位与执行顺序」: the values entry reading *exactly* the literal). Every
+// other position keeps the literal verbatim: no replacement, no deletion, no
+// Build error; whether such a position can take the literal is the apiserver's
+// judgment at Job creation (§5.4「占位符替换」第 4 条).
+func TestTemplateNodeLiteralOutsideRecognitionSite(t *testing.T) {
 	entry := testEntry()
-	sessionSpelling := strings.Replace(misplacedNodePlaceholderTemplate, "<preferred node>", "<session node>", 1)
+	containerArgs := strings.Replace(statefulSetShapedTemplate,
+		`"exec multica daemon start --foreground --profile foreman-job"`,
+		`"exec multica daemon start --node <preferred node>"`, 1)
+	substringValues := strings.Replace(onlyPreferredNodeTemplate,
+		`values: ["<preferred node>"]`, `values: ["zone-<preferred node>"]`, 1)
 
-	for name, template := range map[string]string{
-		"required node affinity": misplacedNodePlaceholderTemplate,
-		"session node spelling":  sessionSpelling,
-		"container args":         strings.Replace(statefulSetShapedTemplate, `"exec multica daemon start --foreground --profile foreman-job"`, `"exec multica daemon start --node <preferred node>"`, 1),
-	} {
-		cfg, _ := templateConfig(t, template)
-		cfg.Issuer = &fakeIssuer{token: "fmj_test.sig"}
-		builder, err := NewBuilder(cfg)
-		if err != nil {
-			t.Fatalf("%s: NewBuilder: %v", name, err)
-		}
-		job, secret, _, err := builder.Build(entry)
-		if err == nil {
-			t.Fatalf("%s: Build succeeded, want a fail-closed error (job=%v secret=%v)", name, job, secret)
-		}
-		if !strings.Contains(err.Error(), "preferred-affinity item") {
-			t.Errorf("%s: error %q must name the misplaced placeholder", name, err)
-		}
+	cases := []struct {
+		name     string
+		template string
+		check    func(t *testing.T, job *batchv1.Job)
+	}{
+		{
+			name:     "required node affinity",
+			template: misplacedNodePlaceholderTemplate,
+			check: func(t *testing.T, job *batchv1.Job) {
+				t.Helper()
+				got := job.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.
+					NodeSelectorTerms[0].MatchExpressions[0].Values[0]
+				if got != placeholderPreferredNode {
+					t.Errorf("required node affinity value = %q, want the literal verbatim", got)
+				}
+			},
+		},
+		{
+			name:     "substring in the recognition path",
+			template: substringValues,
+			check: func(t *testing.T, job *batchv1.Job) {
+				t.Helper()
+				terms := job.Spec.Template.Spec.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+				if len(terms) != 1 {
+					t.Fatalf("preferred terms = %+v, want the item kept (a substring is not a recognition element)", terms)
+				}
+				if got := terms[0].Preference.MatchExpressions[0].Values[0]; got != "zone-"+placeholderPreferredNode {
+					t.Errorf("preferred value = %q, want the substring form verbatim", got)
+				}
+			},
+		},
+		{
+			name:     "container args",
+			template: containerArgs,
+			check: func(t *testing.T, job *batchv1.Job) {
+				t.Helper()
+				args := strings.Join(job.Spec.Template.Spec.Containers[0].Args, " ")
+				if !strings.Contains(args, placeholderPreferredNode) {
+					t.Errorf("agent args = %q, want the literal verbatim", args)
+				}
+			},
+		},
 	}
 
-	// With a node resolved the same template renders the node instead.
-	cfg, _ := templateConfig(t, misplacedNodePlaceholderTemplate)
-	cfg.Issuer = &fakeIssuer{token: "fmj_test.sig"}
-	cfg.Nodes = sessionNodeIndex("company-02")
-	builder, err := NewBuilder(cfg)
-	if err != nil {
-		t.Fatalf("NewBuilder: %v", err)
-	}
-	job, _, _, err := builder.Build(entry)
-	if err != nil {
-		t.Fatalf("Build with a resolved node: %v", err)
-	}
-	if got := job.Spec.Template.Spec.Affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution.
-		NodeSelectorTerms[0].MatchExpressions[0].Values[0]; got != "company-02" {
-		t.Errorf("required node affinity value = %q, want the resolved node", got)
+	for _, tc := range cases {
+		for _, node := range []string{"", "company-02"} {
+			name := tc.name + "/node=" + node
+			if node == "" {
+				name = tc.name + "/no node"
+			}
+			t.Run(name, func(t *testing.T) {
+				cfg, _ := templateConfig(t, tc.template)
+				cfg.Issuer = &fakeIssuer{token: "fmj_test.sig"}
+				if node != "" {
+					cfg.Nodes = sessionNodeIndex(node)
+				}
+				builder, err := NewBuilder(cfg)
+				if err != nil {
+					t.Fatalf("NewBuilder: %v", err)
+				}
+				job, secret, _, err := builder.Build(entry)
+				if err != nil {
+					t.Fatalf("Build: %v (a literal outside the recognition site is not an error)", err)
+				}
+				if job == nil || secret == nil {
+					t.Fatalf("Build returned nil objects (job=%v secret=%v)", job, secret)
+				}
+				tc.check(t, job)
+				if node != "" {
+					if rendered := canonicalJSON(job); strings.Contains(rendered, `"`+node+`"`) {
+						t.Errorf("the node leaked outside the recognition site:\n%s", rendered)
+					}
+				}
+			})
+		}
 	}
 }
 

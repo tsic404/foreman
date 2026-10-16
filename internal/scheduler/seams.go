@@ -44,8 +44,9 @@ type ServerClient interface {
 type JobBuilder interface {
 	Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, string, error)
 	// BuildCatalogProbe renders a catalog-probe Job and its credential Secret
-	// (ADR-019): shape source by CM window, budget into the default template's
-	// activeDeadlineSeconds, token TTL = budget + drain timeout.
+	// (ADR-019): shape = the template copy plus the probe write face, budget
+	// into the probe's activeDeadlineSeconds, token TTL = budget + drain
+	// timeout.
 	BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error)
 }
 
