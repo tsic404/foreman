@@ -31,10 +31,19 @@ type Registry struct {
 	// at the alive → draining transition (ADR-017).
 	drainTimeout time.Duration
 
+	// deliveryConfirm is FOREMAN_DELIVERY_CONFIRM_TIMEOUT: the S6 delivery
+	// confirmation window stamped once at the delivery commit (ADR-030).
+	// Zero leaves the window unarmed.
+	deliveryConfirm time.Duration
+
 	byJob    map[string]string // job_name → task_id
 	byDaemon map[string]string // daemon_id → task_id
 
-	done *ttlMap // terminal task_id → completion time
+	// done is the settled index: terminal task_id → the entry's terminal
+	// projection (contract §3.1). It backs the late-replay dedup, the drain
+	// duration and — after the credential reclaim deletes the live row — the
+	// retained terminal record the ops endpoint still answers with.
+	done *ttlMap[TaskEntry]
 	// session_key → node_name is the soft-affinity index and its one key
 	// (ADR-015): written only by LearnSession, evicted by the reconcile round
 	// once FOREMAN_AGENT_STATE_TTL passed. There is no issue_id → node index
@@ -64,6 +73,19 @@ func WithDrainTimeout(d time.Duration) Option {
 	}
 }
 
+// WithDeliveryConfirmTimeout sets the S6 delivery confirmation window
+// (FOREMAN_DELIVERY_CONFIRM_TIMEOUT, ADR-030): the bound written once at the
+// delivery commit, after which an entry still without a start fact is judged
+// undelivered. Zero (the default) leaves the window unarmed, so that form
+// converges through the boot upper bound alone.
+func WithDeliveryConfirmTimeout(d time.Duration) Option {
+	return func(r *Registry) {
+		if d > 0 {
+			r.deliveryConfirm = d
+		}
+	}
+}
+
 // New returns an empty Registry. now defaults to time.Now (tests inject a
 // fixed clock).
 func New(now func() time.Time, opts ...Option) *Registry {
@@ -75,7 +97,7 @@ func New(now func() time.Time, opts ...Option) *Registry {
 		live:            make(map[string]TaskEntry),
 		byJob:           make(map[string]string),
 		byDaemon:        make(map[string]string),
-		done:            newTTLMap(DoneIndexTTL, now),
+		done:            newTTLMap[TaskEntry](DoneIndexTTL, now),
 		sessionNode:     make(map[string]sessionNodeEntry),
 		saturated:       make(map[string]bool),
 		runtimes:        make(map[string]JobRuntime),
@@ -217,19 +239,33 @@ func (r *Registry) IsDone(taskID string) bool {
 // single alive → draining transition. The credential reclaim measures the
 // drain duration from it (observability.md §指标 foreman_job_drain_seconds).
 func (r *Registry) DoneAt(taskID string) (time.Time, bool) {
-	return r.done.at(taskID)
+	_, at, ok := r.done.get(taskID)
+	return at, ok
+}
+
+// Settled returns the retained terminal record of taskID (contract §3.1):
+// the entry's terminal projection, still answerable after the credential
+// reclaim deleted the live row, until the retention window expires. It backs
+// the ops endpoint's post-hoc query face (ADR-030); the record never carries
+// the payload body or the token digest.
+func (r *Registry) Settled(taskID string) (TaskEntry, bool) {
+	e, _, ok := r.done.get(taskID)
+	return e, ok
 }
 
 // MarkTerminal is the single write path into the terminal state
 // (task-mapping pseudocode markTerminal): it sets state+result atomically
-// with the done-index record. completedAt defaults to now.
+// with the settled record. completedAt defaults to now. reason is the
+// externally observable attribution of a failure Foreman judged itself; an
+// empty one leaves any recorded attribution in place, and the server's own
+// verdicts carry none (contract §3.1).
 //
 // It is also the drain entry point (ADR-017): the alive → draining transition
-// writes drain_deadline and the done record exactly once, so a repeated
-// terminal report (daemon retries, pending-report replays) only overwrites
-// the result and can neither reset the upper bound nor restart the drain
-// duration.
-func (r *Registry) MarkTerminal(taskID string, result Result, completedAt time.Time) (TaskEntry, error) {
+// writes drain_deadline, the completion time and the settled record exactly
+// once, so a repeated terminal report (daemon retries, pending-report
+// replays) only overwrites the result and can neither reset the upper bound
+// nor restart the drain duration.
+func (r *Registry) MarkTerminal(taskID string, result Result, reason string, completedAt time.Time) (TaskEntry, error) {
 	if completedAt.IsZero() {
 		completedAt = r.now()
 	}
@@ -239,15 +275,34 @@ func (r *Registry) MarkTerminal(taskID string, result Result, completedAt time.T
 	if !ok {
 		return TaskEntry{}, fmt.Errorf("unknown task %s", taskID)
 	}
-	if e.State != StateTerminal {
+	first := e.State != StateTerminal
+	if first {
 		e.JobPhase = JobPhaseDraining
 		e.DrainDeadline = r.now().Add(r.drainTimeout)
-		r.done.put(taskID, completedAt)
+		e.CompletedAt = completedAt
 	}
 	e.State = StateTerminal
 	e.Result = result
+	if reason != "" {
+		e.FailureReason = reason
+	}
+	if first {
+		// The settled record is the projection at the verdict instant: it is
+		// what the ops endpoint keeps answering with once the credential
+		// reclaim deletes the live row (ADR-030).
+		r.done.put(taskID, e.CompletedAt, settledRecord(e))
+	}
 	r.live[taskID] = e
 	return e, nil
+}
+
+// settledRecord strips the memory-only secrets from the entry the settled
+// index retains: the retention window must never hold a payload body (F3) or
+// a token digest (ADR-017).
+func settledRecord(e TaskEntry) TaskEntry {
+	e.Payload = nil
+	e.TokenHash = ""
+	return e
 }
 
 // SetTokenHash records sha256(token) of the Job's credential. OnClaim is the
@@ -312,7 +367,9 @@ func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntr
 // exactly what the daemon received (observability.md §端点). Only a
 // daemon_registered entry not yet delivered transitions; without the
 // single-lock check, two concurrent claims could both pass a delivered_at
-// test before either writes.
+// test before either writes. It also arms the delivery confirmation window
+// (ADR-030): the entry's delivery deadline is the commit instant plus
+// FOREMAN_DELIVERY_CONFIRM_TIMEOUT, written here and never rewritten.
 func (r *Registry) MarkDelivering(daemonID string, at time.Time, delivered json.RawMessage) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -323,8 +380,25 @@ func (r *Registry) MarkDelivering(daemonID string, at time.Time, delivered json.
 	e.State = StateDelivering
 	e.DeliveredAt = at
 	e.Payload = delivered
+	if r.deliveryConfirm > 0 {
+		e.DeliveryDeadline = at.Add(r.deliveryConfirm)
+	}
 	r.live[e.TaskID] = e
 	return e, true
+}
+
+// NoteClaimAfterDelivery records one S6 claim answered with an empty batch
+// while the entry's delivery was committed and still unconfirmed (contract
+// §3.1). The count is the per-task discriminator between "the request never
+// arrived" and "the response was lost": the daemon keeps asking only when it
+// never got the payload.
+func (r *Registry) NoteClaimAfterDelivery(taskID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if e, ok := r.live[taskID]; ok {
+		e.ClaimsAfterDelivery++
+		r.live[taskID] = e
+	}
 }
 
 // MarkStarted records S8 under the registry lock so a concurrent terminal

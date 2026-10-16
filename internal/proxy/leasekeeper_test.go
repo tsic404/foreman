@@ -35,8 +35,14 @@ func (f *fakeLeaseClient) PrepareLease(_ context.Context, runtimeID, taskID stri
 // fakeLeaseHooks records the settlements the keeper drives.
 type fakeLeaseHooks struct {
 	bootTimeout []string
+	unconfirmed []string
 	converge    []string
 	vanished    []string
+}
+
+func (f *fakeLeaseHooks) OnDeliveryUnconfirmed(_ context.Context, taskID string) error {
+	f.unconfirmed = append(f.unconfirmed, taskID)
+	return nil
 }
 
 func (f *fakeLeaseHooks) OnBootTimeout(_ context.Context, taskID string) error {
@@ -285,5 +291,46 @@ func TestLeaseKeeperSkipsRebuiltEntries(t *testing.T) {
 	}
 	if len(hooks.bootTimeout) != 0 {
 		t.Errorf("a zero boot deadline must not trigger OnBootTimeout: %v", hooks.bootTimeout)
+	}
+}
+
+// TestLeaseKeeperDeliveryWindowPrecedesBootBound guards ADR-030's gate: an
+// entry whose delivery was committed and whose confirmation window expired
+// settles as undelivered, and the boot bound keeps owning the entries that
+// never armed a window — judged in the same round, never the same entry.
+//
+// The third entry is the ordering the config relation cannot promise: the
+// window is delivery-relative and the boot bound claim-relative, so an entry
+// can reach its boot bound while its window is still open (a delivery late in
+// the claim window). It must keep its own attribution: neither bound fires,
+// and the boot branch never steals the verdict.
+func TestLeaseKeeperDeliveryWindowPrecedesBootBound(t *testing.T) {
+	now := time.Now()
+	reg := registry.New(time.Now)
+	client := &fakeLeaseClient{ready: map[string]bool{"t-armed": true, "t-unarmed": true, "t-inverted": true}}
+	hooks := &fakeLeaseHooks{}
+
+	armed := leaseEntry("t-armed", registry.StateDelivering, false, now.Add(-time.Second))
+	armed.DeliveredAt = now.Add(-time.Minute)
+	armed.DeliveryDeadline = now.Add(-time.Second)
+	unarmed := leaseEntry("t-unarmed", registry.StateDelivering, false, now.Add(-time.Second))
+	unarmed.DeliveredAt = now.Add(-time.Minute)
+	inverted := leaseEntry("t-inverted", registry.StateDelivering, false, now.Add(-time.Second))
+	inverted.DeliveredAt = now.Add(-time.Second)
+	inverted.DeliveryDeadline = now.Add(time.Minute)
+	for _, e := range []registry.TaskEntry{armed, unarmed, inverted} {
+		if err := reg.Put(e); err != nil {
+			t.Fatalf("Put %s: %v", e.TaskID, err)
+		}
+	}
+
+	k := NewLeaseKeeper(client, reg, hooks, time.Minute)
+	k.round(t.Context())
+
+	if len(hooks.unconfirmed) != 1 || hooks.unconfirmed[0] != "t-armed" {
+		t.Errorf("unconfirmed = %v, want only the entry whose window expired", hooks.unconfirmed)
+	}
+	if len(hooks.bootTimeout) != 1 || hooks.bootTimeout[0] != "t-unarmed" {
+		t.Errorf("bootTimeout = %v, want only the entry without an armed window", hooks.bootTimeout)
 	}
 }

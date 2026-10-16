@@ -114,6 +114,42 @@ func TestLoadConfigClampsClaimBatchToServerCeiling(t *testing.T) {
 	}
 }
 
+// TestLoadConfigDeliveryConfirmWindow guards §5.1's window semantics
+// (ADR-030): 30s by default, an explicit lower value accepted, and 0 legal —
+// it disarms the convergence exit.
+func TestLoadConfigDeliveryConfirmWindow(t *testing.T) {
+	cfg, err := LoadConfig(testEnv(nil))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.DeliveryConfirmTimeout != DefaultDeliveryConfirmTimeout {
+		t.Fatalf("DeliveryConfirmTimeout = %v, want %v", cfg.DeliveryConfirmTimeout, DefaultDeliveryConfirmTimeout)
+	}
+
+	cfg, err = LoadConfig(testEnv(map[string]string{EnvDeliveryConfirmTimeout: "5s"}))
+	if err != nil || cfg.DeliveryConfirmTimeout != 5*time.Second {
+		t.Fatalf("explicit window = %v (%v), want 5s", cfg.DeliveryConfirmTimeout, err)
+	}
+
+	cfg, err = LoadConfig(testEnv(map[string]string{EnvDeliveryConfirmTimeout: "0"}))
+	if err != nil || cfg.DeliveryConfirmTimeout != 0 {
+		t.Fatalf("window 0 = %v (%v), want the disabled form", cfg.DeliveryConfirmTimeout, err)
+	}
+
+	// The ordering premise is checked against the configured boot bound, not
+	// the default one.
+	if _, err := LoadConfig(testEnv(map[string]string{
+		EnvJobBootTimeout: "10s", EnvDeliveryConfirmTimeout: "20s",
+	})); err == nil {
+		t.Fatal("a window above a shortened boot bound must be refused")
+	}
+	if _, err := LoadConfig(testEnv(map[string]string{
+		EnvJobBootTimeout: "10s", EnvDeliveryConfirmTimeout: "5s",
+	})); err != nil {
+		t.Fatalf("a window below the configured boot bound must be accepted: %v", err)
+	}
+}
+
 func TestLoadConfigRejectsBadValues(t *testing.T) {
 	for _, env := range []map[string]string{
 		{EnvMaxInflightJobs: "0"},
@@ -132,6 +168,12 @@ func TestLoadConfigRejectsBadValues(t *testing.T) {
 		{EnvModelCatalogEnabled: "yes"},
 		{EnvModelCatalogTimeout: "0s"},
 		{EnvReconcileInterval: "-1s"},
+		// The delivery confirmation window has to fire before the boot bound
+		// (ADR-030): a negative one is meaningless, one at the bound is the
+		// form the window exists to replace.
+		{EnvDeliveryConfirmTimeout: "-1s"},
+		{EnvDeliveryConfirmTimeout: "300s"},
+		{EnvDeliveryConfirmTimeout: "10m"},
 	} {
 		if _, err := LoadConfig(testEnv(env)); err == nil {
 			t.Fatalf("env %v accepted", env)

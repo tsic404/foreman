@@ -147,7 +147,7 @@ func TestCredReclaimedEvidenceCarriesClockDomain(t *testing.T) {
 	var logs bytes.Buffer
 	s := newLoggingScheduler(t, f, &logs)
 	f.claim(t, "task-1")
-	if _, err := f.reg.MarkTerminal("task-1", registry.ResultCompleted, f.now); err != nil {
+	if _, err := f.reg.MarkTerminal("task-1", registry.ResultCompleted, "", f.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	finished := f.now.Add(-20 * time.Second)
@@ -173,7 +173,7 @@ func TestCredReclaimedEvidenceCarriesClockDomain(t *testing.T) {
 	var logs2 bytes.Buffer
 	s2 := newLoggingScheduler(t, f2, &logs2)
 	f2.claim(t, "task-2")
-	if _, err := f2.reg.MarkTerminal("task-2", registry.ResultCompleted, f2.now); err != nil {
+	if _, err := f2.reg.MarkTerminal("task-2", registry.ResultCompleted, "", f2.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	if err := s2.OnJobTerminated(context.Background(), "fm-task-2",
@@ -193,7 +193,7 @@ func TestCredReclaimedEvidenceCarriesClockDomain(t *testing.T) {
 	var logs3 bytes.Buffer
 	s3 := newLoggingScheduler(t, f3, &logs3)
 	f3.claim(t, "task-3")
-	if _, err := f3.reg.MarkTerminal("task-3", registry.ResultFailed, f3.now); err != nil {
+	if _, err := f3.reg.MarkTerminal("task-3", registry.ResultFailed, "", f3.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	if err := s3.OnJobTerminated(context.Background(), "fm-task-3",
@@ -238,7 +238,7 @@ func TestReclaimGatesTheJobDeletionOnTheQueuedReport(t *testing.T) {
 	p := f.withPendingReports()
 	f.claim(t, "task-1")
 	f.jobs.deletedSecrets = nil
-	if _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, f.now); err != nil {
+	if _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, "", f.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	if err := p.Enqueue("task-1", EPFail, []byte(`{"failure_reason":"job_missing"}`)); err != nil {
@@ -266,7 +266,7 @@ func TestReclaimGatesTheJobDeletionOnTheQueuedReport(t *testing.T) {
 	// for the ordinary path, where the verdict already did).
 	f2 := newFixture(t)
 	f2.claim(t, "task-2")
-	if _, err := f2.reg.MarkTerminal("task-2", registry.ResultCompleted, f2.now); err != nil {
+	if _, err := f2.reg.MarkTerminal("task-2", registry.ResultCompleted, "", f2.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	if err := f2.sched.OnJobTerminated(context.Background(), "fm-task-2",
@@ -313,7 +313,7 @@ func TestSweepOrphanSecretsCriterion(t *testing.T) {
 	f.claim(t, "task-live")
 	// An entry in drain: the Secret must stay too — the reclaim owns it.
 	f.claim(t, "task-draining")
-	if _, err := f.reg.MarkTerminal("task-draining", registry.ResultFailed, f.now); err != nil {
+	if _, err := f.reg.MarkTerminal("task-draining", registry.ResultFailed, "", f.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	// A genuine orphan: no entry, no Job.

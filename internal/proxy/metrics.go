@@ -23,11 +23,29 @@ type Metrics interface {
 	// status returned to the probe daemon, or "none" when no relay happened
 	// (observability.md foreman_model_catalog_relays_total).
 	ModelCatalogRelay(code string, seconds float64)
+	// DeliveryClaim records one task Job's S6 claim by result
+	// (observability.md foreman_delivery_claims_total, ADR-030). A catalog
+	// probe's claim carries no task face and is not counted.
+	DeliveryClaim(result string)
+	// DeliveryLatency observes one committed S6 delivery's latency, from the
+	// task's claim to the delivery commit (observability.md
+	// foreman_delivery_latency_seconds).
+	DeliveryLatency(seconds float64)
 }
 
 // EndpointAgentAPI is the foreman_forward_total endpoint label for S29
 // agent-API passthrough (observability.md).
 const EndpointAgentAPI = "agent-api"
+
+// S6 claim result label values (observability.md foreman_delivery_claims_total,
+// ADR-030): delivered = the payload was handed over; empty = an empty batch;
+// empty_unconfirmed = an empty batch answering an entry whose delivery was
+// already committed but not yet confirmed — the lost-response signature.
+const (
+	DeliveryClaimDelivered        = "delivered"
+	DeliveryClaimEmpty            = "empty"
+	DeliveryClaimEmptyUnconfirmed = "empty_unconfirmed"
+)
 
 // WS side label values (observability.md foreman_ws_connected).
 const (
@@ -44,6 +62,8 @@ func (noopMetrics) WSConnect(string)                   {}
 func (noopMetrics) WSDisconnect(string)                {}
 func (noopMetrics) WSReconnect(string)                 {}
 func (noopMetrics) ModelCatalogRelay(string, float64)  {}
+func (noopMetrics) DeliveryClaim(string)               {}
+func (noopMetrics) DeliveryLatency(float64)            {}
 
 func orNoopMetrics(m Metrics) Metrics {
 	if m == nil {

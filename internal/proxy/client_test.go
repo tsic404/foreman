@@ -1230,15 +1230,17 @@ func TestGCCheckForwardedVerbatim(t *testing.T) {
 
 // fakeMetrics records the proxy metrics seam.
 type fakeMetrics struct {
-	mu           sync.Mutex
-	forwards     []string
-	codes        []int
-	claimErrors  []string
-	authFails    []string
-	wsConnected  map[string]int
-	wsReconnect  []string
-	catalogCodes []string
-	catalogSpans []float64
+	mu             sync.Mutex
+	forwards       []string
+	codes          []int
+	claimErrors    []string
+	authFails      []string
+	wsConnected    map[string]int
+	wsReconnect    []string
+	catalogCodes   []string
+	catalogSpans   []float64
+	deliveryClaims []string
+	deliverSpans   []float64
 }
 
 func (m *fakeMetrics) Forward(endpoint string, code int, _ time.Duration) {
@@ -1289,6 +1291,31 @@ func (m *fakeMetrics) ModelCatalogRelay(code string, seconds float64) {
 	defer m.mu.Unlock()
 	m.catalogCodes = append(m.catalogCodes, code)
 	m.catalogSpans = append(m.catalogSpans, seconds)
+}
+
+func (m *fakeMetrics) DeliveryClaim(result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deliveryClaims = append(m.deliveryClaims, result)
+}
+
+func (m *fakeMetrics) DeliveryLatency(seconds float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deliverSpans = append(m.deliverSpans, seconds)
+}
+
+// deliveryClaimCount counts the recorded S6 claim outcomes per result.
+func (m *fakeMetrics) deliveryClaimCount(result string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, recorded := range m.deliveryClaims {
+		if recorded == result {
+			n++
+		}
+	}
+	return n
 }
 
 // catalogCodeCount counts the recorded relay outcomes per code (locked).

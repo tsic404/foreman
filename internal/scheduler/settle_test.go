@@ -87,7 +87,7 @@ func TestSettleTerminalKeepsJobWhileReportIsQueued(t *testing.T) {
 	f := newFixture(t)
 	p := f.withPendingReports()
 	f.claim(t, "task-1")
-	if _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, f.now); err != nil {
+	if _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, "", f.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	if err := p.Enqueue("task-1", EPFail, []byte(`{"failure_reason":"job_missing"}`)); err != nil {
@@ -129,7 +129,7 @@ func TestSettleTerminalKeepsJobWhileReportIsQueued(t *testing.T) {
 func TestSettleTerminalKeepsEntryWhenJobDeletionFails(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
-	if _, err := f.reg.MarkTerminal("task-1", registry.ResultCompleted, f.now); err != nil {
+	if _, err := f.reg.MarkTerminal("task-1", registry.ResultCompleted, "", f.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 
@@ -189,7 +189,7 @@ func TestOnJobTerminatedByDrainTimeoutReportsOrphans(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
 	f.jobs.deletedSecrets = nil
-	if _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, f.now); err != nil {
+	if _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, "", f.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	f.jobs.pods = []corev1.Pod{testPod("fm-task-1", corev1.PodRunning)}
@@ -218,7 +218,7 @@ func TestOnJobTerminatedKeepsEntryWhenSecretDeletionFails(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
 	f.jobs.deletedSecrets = nil
-	if _, err := f.reg.MarkTerminal("task-1", registry.ResultCompleted, f.now); err != nil {
+	if _, err := f.reg.MarkTerminal("task-1", registry.ResultCompleted, "", f.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	f.jobs.deleteSecretErr = errors.New("apiserver unavailable")

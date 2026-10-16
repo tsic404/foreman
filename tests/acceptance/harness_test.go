@@ -175,6 +175,14 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		stub.record(r, "/api/daemon/tasks/claim", body)
 		writeJSON(w, http.StatusOK, map[string]any{"tasks": []any{}})
 	})
+	// C4: the lease keeper's renewal. Without this route the stub's 404 would
+	// read as "the server deleted the task" and settle every pre-start entry
+	// as vanished.
+	mux.HandleFunc("POST /api/daemon/runtimes/{rid}/tasks/{tid}/prepare-lease", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		stub.record(r, r.URL.Path, body)
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
 	mux.HandleFunc("POST /api/daemon/deregister", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		stub.record(r, "/api/daemon/deregister", body)
@@ -449,6 +457,18 @@ func (c *jobClient) jobCreated(name string) bool {
 	return false
 }
 
+// jobDeleted reports whether the Job object was deleted.
+func (c *jobClient) jobDeleted(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, deleted := range c.deletedJobs {
+		if deleted == name {
+			return true
+		}
+	}
+	return false
+}
+
 func (c *jobClient) probeJobsCreated() []string {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -608,11 +628,14 @@ func (c *schedulerServerClient) forwarded(ep scheduler.Endpoint) []upstreamReque
 	return found
 }
 
-// recordingMetrics implements proxy.Metrics and records the catalog outcomes.
+// recordingMetrics implements proxy.Metrics and the scheduler's metric seam,
+// recording the catalog outcomes and the S6 delivery face.
 type recordingMetrics struct {
-	mu           sync.Mutex
-	catalogCodes []string
-	catalogSecs  []float64
+	mu            sync.Mutex
+	catalogCodes  []string
+	catalogSecs   []float64
+	deliveryKinds []string
+	unconfirmed   int
 }
 
 func (m *recordingMetrics) Forward(string, int, time.Duration) {}
@@ -622,11 +645,36 @@ func (m *recordingMetrics) WSConnect(string)                   {}
 func (m *recordingMetrics) WSDisconnect(string)                {}
 func (m *recordingMetrics) WSReconnect(string)                 {}
 
+// The scheduler's own seam: recorded only where a scenario reads it, no-ops
+// otherwise (the scheduler must never change behaviour because a metric
+// changed).
+func (m *recordingMetrics) TaskClaimed()                  {}
+func (m *recordingMetrics) TaskTerminal(string)           {}
+func (m *recordingMetrics) JobBootSeconds(float64)        {}
+func (m *recordingMetrics) JobCreateSeconds(float64)      {}
+func (m *recordingMetrics) InflightJobs(int)              {}
+func (m *recordingMetrics) DuplicateDispatch()            {}
+func (m *recordingMetrics) CredReclaimed(string, float64) {}
+
 func (m *recordingMetrics) ModelCatalogRelay(code string, seconds float64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.catalogCodes = append(m.catalogCodes, code)
 	m.catalogSecs = append(m.catalogSecs, seconds)
+}
+
+func (m *recordingMetrics) DeliveryClaim(result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deliveryKinds = append(m.deliveryKinds, result)
+}
+
+func (m *recordingMetrics) DeliveryLatency(float64) {}
+
+func (m *recordingMetrics) DeliveryUnconfirmed() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.unconfirmed++
 }
 
 func (m *recordingMetrics) codes() []string {
@@ -640,6 +688,27 @@ func (m *recordingMetrics) seconds() []float64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return append([]float64(nil), m.catalogSecs...)
+}
+
+// deliveryClaimCount counts the recorded S6 claim outcomes per result.
+func (m *recordingMetrics) deliveryClaimCount(result string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, recorded := range m.deliveryKinds {
+		if recorded == result {
+			n++
+		}
+	}
+	return n
+}
+
+// deliveryUnconfirmedCount reports how many entries the confirmation window
+// judged undelivered.
+func (m *recordingMetrics) deliveryUnconfirmedCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.unconfirmed
 }
 
 // probeBuilder is the jobbuilder seam plus the test-only credential reader.
@@ -671,10 +740,18 @@ type harness struct {
 	schedCfg scheduler.Config
 }
 
+// Delivery confirmation window and lease cadence the scenarios run with: the
+// window is short enough for a bounded wait in a test, and the keeper cadence
+// sits far below it (production defaults are 30s / 15s).
+const (
+	deliveryConfirmWindow = 300 * time.Millisecond
+	leaseKeeperInterval   = 20 * time.Millisecond
+)
+
 func newHarness(t *testing.T, catalogEnabled bool) *harness {
 	t.Helper()
 	upstream := newUpstreamStub(t)
-	reg := registry.New(time.Now)
+	reg := registry.New(time.Now, registry.WithDeliveryConfirmTimeout(deliveryConfirmWindow))
 	probes := registry.NewProbeRegistry()
 	startup := registry.NewStartupCatalog()
 	slots := proxy.NewCatalogSlots()
@@ -714,18 +791,19 @@ func newHarness(t *testing.T, catalogEnabled bool) *harness {
 	server := &schedulerServerClient{}
 	metrics := &recordingMetrics{}
 	schedCfg := scheduler.Config{
-		JobNamespace:        "multica-agents",
-		WorkspaceID:         "ws-1",
-		MaxInflightJobs:     10,
-		ClaimBatchMax:       32,
-		JobBootTimeout:      300 * time.Second,
-		JobDrainTimeout:     120 * time.Second,
-		StartupProbeTimeout: 3 * time.Second,
-		ModelCatalogEnabled: catalogEnabled,
-		ModelCatalogTimeout: 45 * time.Second,
-		ReconcileInterval:   30 * time.Second,
+		JobNamespace:           "multica-agents",
+		WorkspaceID:            "ws-1",
+		MaxInflightJobs:        10,
+		ClaimBatchMax:          32,
+		JobBootTimeout:         300 * time.Second,
+		JobDrainTimeout:        120 * time.Second,
+		DeliveryConfirmTimeout: deliveryConfirmWindow,
+		StartupProbeTimeout:    3 * time.Second,
+		ModelCatalogEnabled:    catalogEnabled,
+		ModelCatalogTimeout:    45 * time.Second,
+		ReconcileInterval:      30 * time.Second,
 	}
-	sched, err := scheduler.New(schedCfg, reg, jobs, bld, server, nil,
+	sched, err := scheduler.New(schedCfg, reg, jobs, bld, server, metrics,
 		scheduler.WithPendingReports(noReports{}),
 		scheduler.WithRevoker(noRevoker{}),
 		scheduler.WithProbeRegistry(probes),
@@ -752,7 +830,7 @@ func (h *harness) rebuildScheduler(t *testing.T, mutate func(*scheduler.Config))
 	t.Helper()
 	cfg := h.schedCfg
 	mutate(&cfg)
-	sched, err := scheduler.New(cfg, h.reg, h.jobs, h.builder, h.server, nil,
+	sched, err := scheduler.New(cfg, h.reg, h.jobs, h.builder, h.server, h.metrics,
 		scheduler.WithPendingReports(noReports{}),
 		scheduler.WithRevoker(noRevoker{}),
 		scheduler.WithProbeRegistry(h.probes),
@@ -763,6 +841,28 @@ func (h *harness) rebuildScheduler(t *testing.T, mutate func(*scheduler.Config))
 	}
 	h.sched = sched
 	h.schedCfg = cfg
+}
+
+// startLeaseKeeper runs the production lease keeper from the call onward for
+// the rest of the test, so a scenario can observe a pre-start bound firing
+// (delivery confirmation window / boot deadline) without waiting out the
+// production cadence. When it starts is part of a scenario's construction:
+// starting it before the state a scenario is about to build turns that state
+// into a race against the keeper's rounds. It is called once per scenario, and
+// it is built from the scheduler in place at that moment.
+func (h *harness) startLeaseKeeper(t *testing.T) {
+	t.Helper()
+	keeper := proxy.NewLeaseKeeper(h.client, h.reg, h.sched, leaseKeeperInterval)
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = keeper.Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
 }
 
 // declare performs C1 with the scenario's discovery.

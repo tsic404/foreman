@@ -15,23 +15,28 @@ import (
 // are forbidden as labels (cardinality discipline); use logs to locate a
 // task.
 const (
-	metricTasksTotal        = "foreman_tasks_total"
-	metricTaskClaimsTotal   = "foreman_task_claims_total"
-	metricClaimErrorsTotal  = "foreman_claim_errors_total"
-	metricJobBootSeconds    = "foreman_job_boot_seconds"
-	metricJobCreateSeconds  = "foreman_job_create_seconds"
-	metricInflightJobs      = "foreman_inflight_jobs"
-	metricForwardTotal      = "foreman_forward_total"
-	metricForwardLatency    = "foreman_forward_latency_seconds"
-	metricAuthFailuresTotal = "foreman_auth_failures_total"
-	metricTokenUsageTotal   = "foreman_token_usage_total"
-	metricDuplicateDispatch = "foreman_duplicate_dispatch_total"
-	metricPendingReports    = "foreman_pending_reports"
-	metricWSConnected       = "foreman_ws_connected"
-	metricWSReconnectsTotal = "foreman_ws_reconnects_total"
-	metricHeartbeatSuspect  = "foreman_heartbeat_suspect"
-	metricCredReclaimTotal  = "foreman_cred_reclaim_total"
-	metricJobDrainSeconds   = "foreman_job_drain_seconds"
+	metricTasksTotal       = "foreman_tasks_total"
+	metricTaskClaimsTotal  = "foreman_task_claims_total"
+	metricClaimErrorsTotal = "foreman_claim_errors_total"
+	// S6 delivery face (ADR-030): the claim requests by result, the delivery
+	// latency and the deliveries the confirmation window judged undelivered.
+	metricDeliveryClaimsTotal      = "foreman_delivery_claims_total"
+	metricDeliveryLatency          = "foreman_delivery_latency_seconds"
+	metricDeliveryUnconfirmedTotal = "foreman_delivery_unconfirmed_total"
+	metricJobBootSeconds           = "foreman_job_boot_seconds"
+	metricJobCreateSeconds         = "foreman_job_create_seconds"
+	metricInflightJobs             = "foreman_inflight_jobs"
+	metricForwardTotal             = "foreman_forward_total"
+	metricForwardLatency           = "foreman_forward_latency_seconds"
+	metricAuthFailuresTotal        = "foreman_auth_failures_total"
+	metricTokenUsageTotal          = "foreman_token_usage_total"
+	metricDuplicateDispatch        = "foreman_duplicate_dispatch_total"
+	metricPendingReports           = "foreman_pending_reports"
+	metricWSConnected              = "foreman_ws_connected"
+	metricWSReconnectsTotal        = "foreman_ws_reconnects_total"
+	metricHeartbeatSuspect         = "foreman_heartbeat_suspect"
+	metricCredReclaimTotal         = "foreman_cred_reclaim_total"
+	metricJobDrainSeconds          = "foreman_job_drain_seconds"
 	// Catalog relay metrics (ADR-019 / ADR-025): the relay outcome by C21
 	// status code ("none" = abandoned) and the consumption-to-answer span.
 	metricModelCatalogRelays = "foreman_model_catalog_relays_total"
@@ -56,6 +61,22 @@ const (
 var forwardEndpoints = []string{
 	"start", "progress", "messages", "usage", "complete", "fail",
 	"cancel-ack", "session", "wait-local-directory", ForwardAgentAPI,
+}
+
+// Delivery claim result label values (ADR-030; the proxy passes these
+// through its own Metrics seam): a committed delivery, a plain empty batch,
+// and an empty batch answering an entry whose delivery was committed but
+// never confirmed — the lost-response signature.
+const (
+	DeliveryClaimDelivered        = "delivered"
+	DeliveryClaimEmpty            = "empty"
+	DeliveryClaimEmptyUnconfirmed = "empty_unconfirmed"
+)
+
+// deliveryClaimResults pre-initializes the foreman_delivery_claims_total
+// series so every designed label value is visible from boot.
+var deliveryClaimResults = []string{
+	DeliveryClaimDelivered, DeliveryClaimEmpty, DeliveryClaimEmptyUnconfirmed,
 }
 
 // authFailureReasons is the foreman_auth_failures_total label vocabulary.
@@ -86,6 +107,9 @@ type Metrics struct {
 	tasksTotal        *prometheus.CounterVec
 	taskClaims        prometheus.Counter
 	claimErrors       *prometheus.CounterVec
+	deliveryClaims    *prometheus.CounterVec
+	deliveryLatency   prometheus.Histogram
+	deliveryUnconfirm prometheus.Counter
 	jobBootSeconds    prometheus.Histogram
 	jobCreateSeconds  prometheus.Histogram
 	inflightJobs      prometheus.Gauge
@@ -129,6 +153,19 @@ func NewMetrics() *Metrics {
 		Name: metricClaimErrorsTotal,
 		Help: "Claim failures by HTTP status code or transport.",
 	}, []string{"code"})
+	m.deliveryClaims = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricDeliveryClaimsTotal,
+		Help: "S6 task claims by result (delivered|empty|empty_unconfirmed).",
+	}, []string{"result"})
+	m.deliveryLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    metricDeliveryLatency,
+		Help:    "claim -> committed S6 delivery latency.",
+		Buckets: []float64{0.05, 0.25, 1, 2.5, 5, 10, 30, 60, 120},
+	})
+	m.deliveryUnconfirm = prometheus.NewCounter(prometheus.CounterOpts{
+		Name: metricDeliveryUnconfirmedTotal,
+		Help: "Deliveries the confirmation window judged undelivered.",
+	})
 	m.jobBootSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    metricJobBootSeconds,
 		Help:    "claim -> daemon start latency.",
@@ -202,6 +239,7 @@ func NewMetrics() *Metrics {
 
 	collectors := []prometheus.Collector{
 		m.tasksTotal, m.taskClaims, m.claimErrors, m.jobBootSeconds,
+		m.deliveryClaims, m.deliveryLatency, m.deliveryUnconfirm,
 		m.jobCreateSeconds, m.inflightJobs, m.forwardTotal, m.forwardLatency,
 		m.authFailures, m.tokenUsage, m.duplicateDispatch, m.pendingReports,
 		m.wsConnected, m.wsReconnects, m.heartbeatSuspect,
@@ -236,6 +274,9 @@ func NewMetrics() *Metrics {
 	}
 	for _, reason := range credReclaimReasons {
 		m.credReclaims.WithLabelValues(reason)
+	}
+	for _, result := range deliveryClaimResults {
+		m.deliveryClaims.WithLabelValues(result)
 	}
 	return m
 }
@@ -279,6 +320,20 @@ func (m *Metrics) JobCreateSeconds(seconds float64) { m.jobCreateSeconds.Observe
 // ClaimError counts a failed claim cycle; code is an HTTP status or
 // "transport".
 func (m *Metrics) ClaimError(code string) { m.claimErrors.WithLabelValues(code).Inc() }
+
+// DeliveryClaim counts one task Job's S6 claim by result (ADR-030). result is
+// one of the deliveryClaimResults values, passed through the proxy's seam.
+func (m *Metrics) DeliveryClaim(result string) {
+	m.deliveryClaims.WithLabelValues(result).Inc()
+}
+
+// DeliveryLatency observes one committed S6 delivery's claim -> commit span
+// (ADR-030).
+func (m *Metrics) DeliveryLatency(seconds float64) { m.deliveryLatency.Observe(seconds) }
+
+// DeliveryUnconfirmed counts one delivery the confirmation window judged
+// undelivered (ADR-030).
+func (m *Metrics) DeliveryUnconfirmed() { m.deliveryUnconfirm.Inc() }
 
 // DuplicateDispatch counts a server re-dispatch of a known task.
 func (m *Metrics) DuplicateDispatch() { m.duplicateDispatch.Inc() }

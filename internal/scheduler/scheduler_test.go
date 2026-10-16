@@ -298,6 +298,7 @@ type fakeMetrics struct {
 	terminal    []string
 	inflight    []int
 	duplicates  int
+	unconfirmed int
 	reclaim     []string
 	drainSecond []float64
 }
@@ -308,6 +309,7 @@ func (f *fakeMetrics) JobBootSeconds(float64)     {}
 func (f *fakeMetrics) JobCreateSeconds(float64)   {}
 func (f *fakeMetrics) InflightJobs(n int)         { f.inflight = append(f.inflight, n) }
 func (f *fakeMetrics) DuplicateDispatch()         { f.duplicates++ }
+func (f *fakeMetrics) DeliveryUnconfirmed()       { f.unconfirmed++ }
 func (f *fakeMetrics) CredReclaimed(reason string, drainSeconds float64) {
 	f.reclaim = append(f.reclaim, reason)
 	f.drainSecond = append(f.drainSecond, drainSeconds)
@@ -502,7 +504,7 @@ func TestClaimRollsBackObjectsWhenEntryLeftDuringJobCreate(t *testing.T) {
 		leave func(f *fixture)
 	}{
 		{"settled", func(f *fixture) {
-			if _, err := f.reg.MarkTerminal("task-1", registry.ResultCancelled, time.Time{}); err != nil {
+			if _, err := f.reg.MarkTerminal("task-1", registry.ResultCancelled, "", time.Time{}); err != nil {
 				t.Errorf("MarkTerminal: %v", err)
 			}
 		}},
@@ -842,7 +844,7 @@ func TestDuplicateClaimAgainstTerminalEntryNeverRebuilds(t *testing.T) {
 func TestOnClaimDropsTaskInDoneIndex(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
-	if _, err := f.reg.MarkTerminal("task-1", registry.ResultCompleted, testNow); err != nil {
+	if _, err := f.reg.MarkTerminal("task-1", registry.ResultCompleted, "", testNow); err != nil {
 		t.Fatal(err)
 	}
 	if err := f.reg.Delete("task-1"); err != nil {
@@ -1162,7 +1164,7 @@ func TestBootTimeoutWaitsForInFlightStart(t *testing.T) {
 func TestOnReportStart409OnSettledEntryKeepsResult(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "t-late")
-	if _, err := f.reg.MarkTerminal("t-late", registry.ResultCompleted, testNow); err != nil {
+	if _, err := f.reg.MarkTerminal("t-late", registry.ResultCompleted, "", testNow); err != nil {
 		t.Fatal(err)
 	}
 	f.server.forwardCode = 409
@@ -2069,7 +2071,7 @@ func TestRefreshNodeSaturationMarksNodesAtCap(t *testing.T) {
 	}
 
 	// A node that drops below the cap must lose its marker again.
-	if _, err := f.reg.MarkTerminal("t1", registry.ResultCompleted, testNow); err != nil {
+	if _, err := f.reg.MarkTerminal("t1", registry.ResultCompleted, "", testNow); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	if load = sched.RefreshNodeSaturation(context.Background()); load["node-a"] != 1 {
