@@ -343,3 +343,42 @@ func TestLeaseKeeperBootBoundSplitsTheDeliveryAttribution(t *testing.T) {
 		t.Errorf("bootTimeout = %v, want only the never-delivered entry", hooks.bootTimeout)
 	}
 }
+
+// A switched-off boot bound (FOREMAN_JOB_BOOT_TIMEOUT=0, §5.1) leaves the
+// entry's deadline unset while the entry is still this process's claim: the
+// renewals must continue — otherwise the server's prepare lease lapses and it
+// redispatches the task (contract §3.1) — and no settlement may fire on the
+// renewal path: `now.After(zero)` is true for every clock, so an unguarded
+// check would fail a healthy pre-start task, and the attribution split needs a
+// bound to hold against (ADR-026: the bound's presence and the payload's
+// availability are separate criteria).
+func TestLeaseKeeperRenewsWithoutBootBound(t *testing.T) {
+	reg := registry.New(time.Now)
+	client := &fakeLeaseClient{ready: map[string]bool{
+		"t-unbounded": true, "t-unbounded-delivered": true,
+	}}
+	hooks := &fakeLeaseHooks{}
+	e := leaseEntry("t-unbounded", registry.StatePending, false, time.Time{})
+	// A delivered entry with no bound either: the renewal path has nothing to
+	// attribute against, the claim path re-delivers.
+	delivered := leaseEntry("t-unbounded-delivered", registry.StateDelivering, false, time.Time{})
+	delivered.DeliveredAt = time.Now().Add(-time.Minute)
+	for _, entry := range []registry.TaskEntry{e, delivered} {
+		if err := reg.Put(entry); err != nil {
+			t.Fatalf("Put %s: %v", entry.TaskID, err)
+		}
+	}
+
+	k := NewLeaseKeeper(client, reg, hooks, time.Minute)
+	k.round(t.Context())
+
+	if len(client.calls) != 2 {
+		t.Fatalf("unbounded pre-start claims must still be renewed, calls = %v", client.calls)
+	}
+	if len(hooks.bootTimeout) != 0 {
+		t.Errorf("no upper bound means no boot timeout: %v", hooks.bootTimeout)
+	}
+	if len(hooks.unconfirmed) != 0 {
+		t.Errorf("no upper bound means no delivery attribution: %v", hooks.unconfirmed)
+	}
+}

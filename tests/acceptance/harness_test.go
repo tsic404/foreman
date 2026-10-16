@@ -450,6 +450,9 @@ func (c *jobClient) CreateJob(_ context.Context, job *batchv1.Job) (*batchv1.Job
 	c.createdJobs = append(c.createdJobs, job)
 	created := job.DeepCopy()
 	created.CreationTimestamp = metav1.NewTime(time.Now())
+	// The list face the startup rebuild reads: a created Job is visible to
+	// ListJobs, exactly as the apiserver's object is.
+	c.jobs = append(c.jobs, *created)
 	return created, nil
 }
 
@@ -457,6 +460,15 @@ func (c *jobClient) DeleteJob(_ context.Context, name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.deletedJobs = append(c.deletedJobs, name)
+	// A deleted object leaves the list face too, or a "delete then restart"
+	// scenario would rebuild a ghost entry from it.
+	kept := c.jobs[:0]
+	for _, job := range c.jobs {
+		if job.Name != name {
+			kept = append(kept, job)
+		}
+	}
+	c.jobs = kept
 	return nil
 }
 
@@ -703,6 +715,17 @@ func (c *schedulerServerClient) TaskStatus(_ context.Context, taskID string) (st
 		return "", scheduler.ErrTaskNotFound
 	}
 	return status, nil
+}
+
+// setStatus programs the C13 answer for one task: once any task has one, an
+// unprogrammed task reads as deleted (ErrTaskNotFound).
+func (c *schedulerServerClient) setStatus(taskID, status string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statuses == nil {
+		c.statuses = map[string]string{}
+	}
+	c.statuses[taskID] = status
 }
 
 func (c *schedulerServerClient) Forward(_ context.Context, ep scheduler.Endpoint, taskID string, body []byte) (int, []byte, error) {
