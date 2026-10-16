@@ -57,8 +57,11 @@ spec:
               protocol: TCP
           env:
             # --- server identity / credentials (§5.1) ---
+            # The base must answer /api/* directly: the plain-HTTP entry redirects,
+            # and a 3xx is handed back to the caller verbatim (proxy.md §S29 已知边界),
+            # whose follow-up leaves the passthrough and drops the caller's credential.
             - name: MULTICA_SERVER_URL
-              value: "http://multica.tsic.top"
+              value: "https://multica.tsic.top"
             - name: MULTICA_WORKSPACE_ID
               value: "f311e8ff-e026-4c6e-b267-dcc004f08782"
             - name: MULTICA_TOKEN
