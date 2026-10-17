@@ -140,6 +140,21 @@ type TaskEntry struct {
 	// rebuilt entry's Job already exists and never goes through Build.
 	PriorSessionID string `json:"-"`
 
+	// AgentName is the claim payload's agent.name — the policy keyspace's
+	// agent side (ADR-035) and the <agent-name> / <agent-segment> source.
+	// Memory-only like PriorSessionID; empty means the identity is
+	// unavailable, which degrades the axes rather than failing the task.
+	AgentName string `json:"-"`
+
+	// ProjectName is the task's project identity (contract §3.1 项目身份):
+	// read at claim time from the payload's structured project key, or from
+	// the read-only reverse lookup by issue id. Memory-only: never annotated,
+	// never projected, never rebuilt.
+	ProjectName string `json:"-"`
+	// ProjectSource records where ProjectName came from (payload / api /
+	// none); policy.applied projects it, nothing else reads it.
+	ProjectSource string `json:"-"`
+
 	// RealRuntimeID is the real runtime the claim was dispatched under: the
 	// C4 lease, the C19 resolve and the S8 body translation are all addressed
 	// by it when Foreman declares N runtimes. Like the payload it is

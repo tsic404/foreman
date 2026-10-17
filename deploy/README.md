@@ -9,6 +9,7 @@ Everything is plain YAML — `kubectl apply -f deploy/` installs it in one pass.
 | `10-secrets.yaml` | `Secret foreman-secret` (ns foreman), `Secret registry-tsic` (ns multica-agents + ns foreman) |
 | `20-rbac.yaml` | `ServiceAccount foreman` + `Role`/`RoleBinding` (ns multica-agents), `ServiceAccount multica-omp`, `ServiceAccount foreman-gc` |
 | `25-job-template.yaml` | `ConfigMap foreman-job-template` (ns foreman) — the required Job template, mounted by the Deployment |
+| `26-job-policy.yaml` | `ConfigMap foreman-job-policy` (ns foreman) — the **optional** three-axis job policy, mounted by the Deployment |
 | `30-foreman.yaml` | `Deployment foreman` (1 replica) + `Service foreman` (ClusterIP :8080) |
 | `40-foreman-gc.yaml` | `DaemonSet foreman-gc` (ns multica-agents) |
 | `optional/servicemonitor.yaml` | `ServiceMonitor foreman` — needs the Prometheus Operator CRDs |
@@ -186,6 +187,8 @@ The ones a staging/test cluster usually overrides:
 | `FOREMAN_MAX_INFLIGHT_JOBS` | `2` | concurrency assertions |
 | `FOREMAN_JOB_BOOT_TIMEOUT` | `60s` | boot-timeout assertions |
 | `FOREMAN_LOG_LEVEL` | `debug` | heartbeat / WS assertions |
+| `FOREMAN_POLICY_NAME_RESOLUTION_TIMEOUT` | `2s` | bounds the startup resolution of the policy file's keys (default `5s`); a window that runs out reads as `unavailable` |
+| `FOREMAN_PROJECT_LOOKUP_TIMEOUT` | `1s` | bounds one read-only project lookup by issue id (default `2s`), keeping the claim → Job budget |
 
 ## Job template (required)
 
@@ -209,17 +212,27 @@ refuses startup, and the ConfigMap object itself missing blocks the pod before
 Foreman's process ever runs (`CreateContainerConfigError`): deploy the ConfigMap
 **before** upgrading Foreman (ADR-030).
 
-Foreman writes exactly three things into that template:
+Foreman writes exactly four things into that template:
 
 1. the env keys `MULTICA_SERVER_URL`, `MULTICA_DAEMON_ID` and
    `MULTICA_DAEMON_MAX_CONCURRENT_TASKS` on `containers[0]` — the first entry in
    writing order, not a container matched by name; a same-name entry is
    replaced whole, so those three keys are Foreman's whatever the template
-   says;
-2. the per-task metadata: `metadata.name`, `metadata.namespace`, and the §3.2
-   label/annotation set (the `foreman.tsic.top/` domain is cleared first, and
-   the four trigger-context keys are added or deleted to match the task);
-3. the placeholders below.
+   says. `MULTICA_DAEMON_ID` reads the pod-template label
+   `foreman.tsic.top/daemon-id`;
+2. the name and the per-task metadata: `metadata.name` is the template's name
+   **format** rendered per task (empty ⇒ `fm-<task_id>`), `metadata.namespace`
+   is `FOREMAN_JOB_NAMESPACE`, and the §3.2 label/annotation set is written
+   after clearing the `foreman.tsic.top/` domain (the four trigger-context keys
+   are added or deleted to match the task). The **identity** name
+   `fm-<task_id>` — the `daemon-id` label and annotation, the credential Secret
+   `fm-<task_id>-cred` and the Job Token's `j` claim — never follows that
+   display name;
+3. the placeholders below;
+4. the three-axis **policy** of `26-job-policy.yaml` when an axis hits:
+   `containers[0].resources` (replaced as one block), the capability `add` list
+   of `containers[0]` (appended to, `drop` kept), and the pod template's
+   `nodeSelector` (merged key by key). Misses change nothing.
 
 Everything else — containers, init containers, `command`/`args`, volumes,
 mounts, `resources`, `securityContext`, `affinity`, `image`,
@@ -232,7 +245,10 @@ added or normalized.
 | `<issue_id>` / `<issue-identifier>` / `<autopilot_run_id>` / `<chat_session_id>` | the task's trigger context |
 | `<job runtime uuid>` / `<RFC3339>` | the Job runtime id / the claim time |
 | `<job-image>` | `FOREMAN_JOB_IMAGE` |
-| `<preferred node>` | the node holding the resumed session's file (`session_id` of the task's previous run); with no resumed session — a first run — or no known node for it, or `FOREMAN_PREFER_NODE_REUSE=false`, the whole affinity item carrying it is dropped. This literal is the substitution set's **one exception**: it is consumed only where it is *recognized* — a `values` entry of a preferred-affinity `matchExpressions` reading exactly this literal — so anywhere else it stays verbatim, and the apiserver judges that position at Job creation |
+| `<job-name>` / `<daemon-id>` | the final display name / the identity name `fm-<task_id>` |
+| `<agent-name>` | the payload's raw `agent.name` (any characters; only the name face normalizes it) |
+| `<preferred node>` | the node holding the resumed session's file (`session_id` of the task's previous run); with no resumed session — a first run — or no known node for it, or `FOREMAN_PREFER_NODE_REUSE=false`, or a `nodeSelector` policy hit, the whole affinity item carrying it is dropped. This literal is the substitution set's **one exception**: it is consumed only where it is *recognized* — a `values` entry of a preferred-affinity `matchExpressions` reading exactly this literal — so anywhere else it stays verbatim, and the apiserver judges that position at Job creation |
+| `<issue-segment>` / `<agent-segment>` / `<task-key>` | **only inside `metadata.name`**: normalized (lowercase, non-`[a-z0-9]` runs folded to `-`, trimmed, truncated to 20 / 24 / 12) issue and agent segments, and the task id's dashes-stripped last 12 characters. Anywhere else they stay verbatim |
 
 Unregistered `<...>` literals stay as written, so a template that writes
 `image: <job-image>` reaches the apiserver unchanged and the Job never boots;
@@ -240,12 +256,32 @@ the reference template has the placeholder in both container images.
 
 - The file is read once at startup: an edit needs a Foreman restart, and the
   startup log records the template sha256 plus the accepted/refused verdict.
-- Three things refuse startup (CrashLoopBackOff), each logged as its own class:
+- Four things refuse startup (CrashLoopBackOff), each logged as its own class:
   a file that does not exist (the ConfigMap is there but has no
-  `job-overlay.yaml` key), a file that cannot be read, and a file that is not a
+  `job-overlay.yaml` key), a file that cannot be read, a file that is not a
   `batch/v1 Job` — bad YAML, an unknown field (`contianers` is refused, never
-  silently dropped), or a missing/mismatched `apiVersion`/`kind`. Nothing else
-  is checked. There is no env switch and no fallback.
+  silently dropped), or a missing/mismatched `apiVersion`/`kind` — and a
+  `metadata.name` that is not a legal name format. Nothing else is checked.
+  There is no env switch and no fallback.
+
+### Name format (`metadata.name`)
+
+`metadata.name` is a format string, not a static name. Its character-level
+closure is the four variables above plus lowercase letters, digits and `-`; it
+must carry `<task-key>` or `<task_id>` (the unique task segment), render at most
+63 characters at the worst case, and stay DNS-1123 at its minimum values. An
+empty or absent `metadata.name` means the fallback `fm-<task_id>`. A non-empty
+format outside the closure **refuses startup** rather than falling back — a
+silent rewrite would let a deployer believe the custom format took effect.
+
+`fm-<issue-segment>-<agent-segment>-<task-key>` is the readable shape the
+reference template's comments suggest; the shipped reference template itself
+keeps `fm-<task_id>`, which renders exactly the names of previous releases.
+
+The name is **not a locator**: Foreman finds Jobs by the
+`foreman.tsic.top/task-id` label (mapping rebuild, deletion, Secret sweeps, pod
+ownership), never by name, so a custom format changes nothing but what
+`kubectl get jobs` shows.
 
 ### Upgrade and rollback order
 
@@ -281,11 +317,12 @@ before copying the reference template:
 - A template carrying its own `image` removes the image audit anchor:
   `/foreman/version` keeps reporting `FOREMAN_JOB_IMAGE`, which is then no
   longer what the Job runs.
-- `MULTICA_DAEMON_ID` reads the `job-name` label the Job controller sets. A
-  template that sets `manualSelector: true` (or otherwise replaces the Job's
-  selector) stops the controller from adding its own labels, so that fieldRef
-  resolves to an empty string and the daemon registers without an id — nothing
-  checks the selector at startup.
+- `MULTICA_DAEMON_ID` reads the pod-template label `foreman.tsic.top/daemon-id`,
+  which Foreman writes with the identity name `fm-<task_id>`. A template that
+  sets `manualSelector: true` (or otherwise replaces the Job's selector) makes
+  the apiserver reject the Job at creation (`job_create_failed`) rather than
+  producing an id-less daemon — the identity no longer depends on the Job
+  controller's `job-name` label.
 
 ### Catalog probe and model catalog (startup)
 
@@ -322,6 +359,63 @@ Foreman declares to the server; it also doubles as the template preflight.
   discovered list, the declared runtimes and each runtime's catalog slot state
   (read-only — it never triggers a discovery).
 
+## Job policy (optional)
+
+`26-job-policy.yaml` ships a comment-only `policy.yaml`; the Deployment mounts
+the ConfigMap at `/etc/foreman/policy/` as an **optional** read-only volume.
+The file is a legal default when absent: all three axes read `None`, nothing is
+injected, and the startup log carries a warn plus the fixed sentence
+`策略文件在启动期一次性加载，运行中变更不生效`.
+
+```yaml
+agents:                      # keys are agent names (agent.name), exact match
+  omp-default:
+    resourcePolicy: projectWithAgent   # None | project | agent | projectWithAgent
+    capPolicy: agent
+    nodeSelectorPolicy: agent
+    resources:               # this agent's definition bodies
+      requests: { cpu: "1", memory: 2Gi }
+      limits:   { cpu: "4", memory: 8Gi }
+    capabilities:
+      add: ["SYS_ADMIN"]     # appended to the container's own add list
+    nodeSelector: { kubernetes.io/os: linux }
+projects:                    # keys are project names; definitions only
+  foreman:
+    resources:
+      requests: { cpu: "500m" }
+    capabilities: { add: ["NET_ADMIN"] }
+    nodeSelector: { disktype: ssd }
+```
+
+The three axes are independent, each reads its own policy field, and a miss
+changes nothing:
+
+| Axis | Hit ⇒ written to | Merge |
+|---|---|---|
+| resource | `containers[0].resources` | one block replaced; `projectWithAgent` merges the two definitions key by key, the agent winning a shared key |
+| capability | `containers[0].securityContext.capabilities.add` | appended to the template's list, deduplicated; `drop` and every other `securityContext` field stay the template's |
+| nodeSelector | the pod template's `nodeSelector` | merged key by key, the policy winning a shared key; a hit also drops the `<preferred node>` item (a hard constraint cannot be checked against the session's node) |
+
+`initContainers` are never touched, and the catalog probe never reads the file.
+`GET /foreman/tasks/{taskID}` plus the `policy.applied` log line carry the
+per-task attribution (`resource_policy` / `cap_policy` / `node_selector_policy`,
+the `*_source` outcome, `project_source`, `name_source`, `overridden_keys`,
+`template_written_faces`, `soft_affinity_suppressed`).
+
+Startup expects a present policy file to be well formed:
+
+- **Refuses startup** (CrashLoopBackOff, logged by class): an unreadable file, a
+  file that does not parse under strict decoding (an unknown key is refused), a
+  definition that writes `capabilities.drop` (`Foreman` is the one writing
+  capabilities, so an ignored `drop` would be a security intent that never took
+  effect), and a key the platform reports absent or ambiguous.
+- **Warns and continues**: a definition no axis references (dead config), a key
+  the platform cannot resolve (unreachable / timeout / no such query — the
+  runtime match stays exact-name), and a missing file.
+
+The file is loaded once: editing the ConfigMap needs a Foreman restart, and the
+startup log records its sha256.
+
 ## Post-install checks
 
 ```bash
@@ -329,6 +423,7 @@ kubectl get ns foreman multica-agents
 kubectl -n multica-agents get sa multica-omp
 kubectl -n multica-agents get secret registry-tsic
 kubectl -n foreman get secret foreman-secret
+kubectl -n foreman get configmap foreman-job-template foreman-job-policy
 kubectl -n foreman port-forward deploy/foreman 8080:8080 &
 curl -s localhost:8080/foreman/healthz
 curl -s localhost:8080/foreman/register-source

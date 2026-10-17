@@ -1,0 +1,54 @@
+# ConfigMap foreman-job-policy (contracts §5.3/§5.4「策略文件」): the optional
+# carrier of the three-axis job policy (resourcePolicy / capPolicy /
+# nodeSelectorPolicy). The Deployment mounts it as an *optional* read-only
+# volume at /etc/foreman/policy/, so deleting this object (or applying the
+# manifest with its key stripped) is a supported deployment: an absent file
+# means all three axes read None, and Foreman starts with a warn.
+#
+# The file is loaded once at startup — editing this ConfigMap needs a Foreman
+# restart (the startup log says so, and records the file's sha256).
+# A file that is present must be well formed: an unreadable or unparseable one,
+# a definition that writes `capabilities.drop`, or a key the platform's
+# authority reports absent/ambiguous refuses startup (CrashLoopBackOff).
+#
+# The skeleton below is comment-only on purpose: it decodes to an empty policy,
+# which is the same "no axis configured" default as an absent file. Replace it
+# with real entries — see deploy/README.md §Job policy — for example:
+#
+#   agents:
+#     omp-default:
+#       resourcePolicy: projectWithAgent
+#       capPolicy: agent
+#       nodeSelectorPolicy: agent
+#       resources:
+#         requests: { cpu: "1", memory: 2Gi }
+#         limits:   { cpu: "4", memory: 8Gi }
+#       capabilities:
+#         add: ["SYS_ADMIN"]
+#       nodeSelector:
+#         kubernetes.io/os: linux
+#   projects:
+#     foreman:
+#       resources:
+#         requests: { cpu: "500m" }
+#       capabilities:
+#         add: ["NET_ADMIN"]
+#       nodeSelector:
+#         disktype: ssd
+#
+# Keys are names (agent.name / the project name), compared by exact equality —
+# a UUID-shaped key never matches, and the startup name resolution reports it.
+# The capability axis only appends to the container's `add` list and keeps the
+# template's `drop` list: the policy file is not a security boundary and the
+# capability names are not whitelisted (see README.md §Risk disclosure).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: foreman-job-policy
+  namespace: foreman
+  labels:
+    app.kubernetes.io/name: foreman
+    app.kubernetes.io/component: job-policy
+data:
+  policy.yaml: |
+    # No axes configured: all three read None (the legal default).

@@ -49,6 +49,7 @@ type fakeJobs struct {
 	deleteJobErr    error
 	deleteSecretErr error
 	getJobErr       error
+	listJobsErr     error
 	listPodsErr     error
 
 	// existingJobs models Jobs already in the cluster: CreateJob answers
@@ -165,7 +166,12 @@ func (f *fakeJobs) secretDeleted(name string) bool {
 	return false
 }
 
-func (f *fakeJobs) ListJobs(context.Context) ([]batchv1.Job, error) { return f.jobs, nil }
+func (f *fakeJobs) ListJobs(context.Context) ([]batchv1.Job, error) {
+	if f.listJobsErr != nil {
+		return nil, f.listJobsErr
+	}
+	return f.jobs, nil
+}
 
 func (f *fakeJobs) ListSecrets(context.Context) ([]corev1.Secret, error) { return f.secrets, nil }
 
@@ -270,6 +276,15 @@ func (f *fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secre
 	}
 	return job, secret, hash, nil
 }
+
+// ResolveName mirrors the production shape for the fallback template the fake
+// stands in for: no format expressed, so the identity name.
+func (f *fakeBuilder) ResolveName(e jobbuilder.TaskEntry) (string, error) {
+	return "fm-" + e.TaskID, nil
+}
+
+// RequiresProjectIdentity keeps the fake's claims out of the platform lookup.
+func (f *fakeBuilder) RequiresProjectIdentity(jobbuilder.TaskEntry) bool { return false }
 
 // BuildCatalogProbe records the probe call and renders the probe objects a
 // real builder would: Job fm-catalog-<requestID> with its credential Secret.

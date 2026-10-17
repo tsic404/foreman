@@ -338,18 +338,18 @@ func TestSweepOrphanSecretsCriterion(t *testing.T) {
 	}
 }
 
-// A GetJob that fails is not a NotFound: the criterion demands an explicit
-// one, so the Secret survives the round.
+// A ListJobs that fails is not a NotFound: the criterion demands an explicit
+// absence, so the Secret survives the round.
 func TestSweepOrphanSecretsKeepsSecretOnAPIError(t *testing.T) {
 	f := newFixture(t)
 	f.jobs.secrets = []corev1.Secret{secretObject("fm-task-orphan-cred", "task-orphan")}
-	f.jobs.getJobErr = errors.New("apiserver unavailable")
+	f.jobs.listJobsErr = errors.New("apiserver unavailable")
 
 	if err := f.sched.SweepOrphanSecrets(context.Background()); err == nil {
 		t.Fatal("SweepOrphanSecrets: want the read error surfaced")
 	}
 	if len(f.jobs.deletedSecrets) != 0 {
-		t.Fatalf("deleted secrets = %v, want none without an explicit NotFound", f.jobs.deletedSecrets)
+		t.Fatalf("deleted secrets = %v, want none without an explicit absence", f.jobs.deletedSecrets)
 	}
 }
 

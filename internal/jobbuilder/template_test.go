@@ -403,7 +403,7 @@ func TestTemplateInjectsA1Env(t *testing.T) {
 	}
 	daemonID := envByName(t, agent.Env, "MULTICA_DAEMON_ID")
 	if daemonID.ValueFrom == nil || daemonID.ValueFrom.FieldRef == nil ||
-		daemonID.ValueFrom.FieldRef.FieldPath != "metadata.labels['job-name']" || daemonID.Value != "" {
+		daemonID.ValueFrom.FieldRef.FieldPath != "metadata.labels['foreman.tsic.top/daemon-id']" || daemonID.Value != "" {
 		t.Errorf("MULTICA_DAEMON_ID = %+v, want the job-name fieldRef only", daemonID)
 	}
 	if got := envByName(t, agent.Env, "MULTICA_DAEMON_MAX_CONCURRENT_TASKS").Value; got != "1" {
@@ -478,11 +478,12 @@ func TestTemplatePerTaskWrites(t *testing.T) {
 	}
 
 	podLabels := job.Spec.Template.Labels
-	if len(podLabels) != 3 {
-		t.Fatalf("pod labels = %v, want the two §3.2 labels plus the template's own", podLabels)
+	if len(podLabels) != 4 {
+		t.Fatalf("pod labels = %v, want the three §3.2 labels plus the template's own", podLabels)
 	}
-	if podLabels["app.kubernetes.io/name"] != "foreman-job" || podLabels["foreman.tsic.top/task-id"] != testTaskID {
-		t.Errorf("pod labels = %v, want the two §3.2 labels", podLabels)
+	if podLabels["app.kubernetes.io/name"] != "foreman-job" || podLabels["foreman.tsic.top/task-id"] != testTaskID ||
+		podLabels[labelDaemonID] != testJobName {
+		t.Errorf("pod labels = %v, want the three §3.2 labels", podLabels)
 	}
 	if podLabels["cost-center"] != "platform" {
 		t.Errorf("pod labels = %v, the template's free label must survive", podLabels)
@@ -655,12 +656,14 @@ spec:
 
 // conflictingMetadataTemplate writes its own per-task metadata and its own
 // §3.2 keys: every one of them is Foreman's to overwrite or delete, so the
-// assertions below fail if the A1.2 write is removed.
+// assertions below fail if the A1.2 write is removed. The name is a format
+// string now (ADR-034), so the template expresses one instead of a static
+// name — a static name is itself a startup refusal.
 const conflictingMetadataTemplate = `
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fm-static
+  name: fm-<task-key>
   namespace: static-ns
   labels:
     app.kubernetes.io/name: not-foreman
@@ -711,7 +714,7 @@ func TestTemplateInjectsA1EnvOnce(t *testing.T) {
 		case "MULTICA_DAEMON_ID":
 			daemonIDs++
 			if entry.Value != "" || entry.ValueFrom == nil || entry.ValueFrom.FieldRef == nil ||
-				entry.ValueFrom.FieldRef.FieldPath != "metadata.labels['job-name']" {
+				entry.ValueFrom.FieldRef.FieldPath != "metadata.labels['foreman.tsic.top/daemon-id']" {
 				t.Errorf("MULTICA_DAEMON_ID = %+v, want the job-name fieldRef only", entry)
 			}
 		}
@@ -832,8 +835,9 @@ func TestTemplateAuthoritativeMetadataWins(t *testing.T) {
 	entry := testEntry()
 	job, _ := mustBuildTemplate(t, conflictingMetadataTemplate, entry, nil)
 
-	if job.Name != jobName(entry.TaskID) || job.Namespace != DefaultJobNamespace {
-		t.Errorf("job %q/%q, want %q/%q", job.Namespace, job.Name, DefaultJobNamespace, jobName(entry.TaskID))
+	wantName := "fm-" + taskKeyOf(entry.TaskID)
+	if job.Name != wantName || job.Namespace != DefaultJobNamespace {
+		t.Errorf("job %q/%q, want %q/%q", job.Namespace, job.Name, DefaultJobNamespace, wantName)
 	}
 	wantLabels := map[string]string{
 		"app.kubernetes.io/name":        jobAppName,
@@ -851,7 +855,7 @@ func TestTemplateAuthoritativeMetadataWins(t *testing.T) {
 		}
 	}
 	wantAnnotations := map[string]string{
-		annoDaemonID:        jobName(entry.TaskID),
+		annoDaemonID:        daemonIDFor(entry.TaskID),
 		annoJobRuntimeID:    entry.JobRuntimeID,
 		annoClaimedAt:       entry.ClaimedAt.UTC().Format(time.RFC3339),
 		annoAttempt:         strconv.Itoa(entry.Attempt),
@@ -868,13 +872,16 @@ func TestTemplateAuthoritativeMetadataWins(t *testing.T) {
 	}
 
 	podLabels := job.Spec.Template.Labels
-	if len(podLabels) != 3 || podLabels["app.kubernetes.io/name"] != jobAppName || podLabels[labelTaskID] != entry.TaskID {
-		t.Errorf("pod labels = %v, want the two authoritative labels plus the template's own", podLabels)
+	if len(podLabels) != 3 || podLabels["app.kubernetes.io/name"] != jobAppName ||
+		podLabels[labelTaskID] != entry.TaskID || podLabels[labelDaemonID] != daemonIDFor(entry.TaskID) {
+		t.Errorf("pod labels = %v, want exactly the three §3.2 labels", podLabels)
 	}
-	// managed-by is a Job-side §3.2 key; on the pod side the template's own
-	// value is not Foreman's to overwrite (P-006 §A2 不写).
-	if podLabels["app.kubernetes.io/managed-by"] != "someone-else" {
-		t.Errorf("pod managed-by = %q, want the template's value left alone", podLabels["app.kubernetes.io/managed-by"])
+	// app.kubernetes.io/managed-by is a Job-side §3.2 key: Foreman owns both
+	// app.kubernetes.io keys, and the pod side's key set does not carry
+	// managed-by, so the template's same-name value is discarded rather than
+	// left standing (ADR-034 decision 7).
+	if _, ok := podLabels[labelManagedBy]; ok {
+		t.Errorf("pod managed-by = %q, want the key dropped (it is Job-side only)", podLabels[labelManagedBy])
 	}
 }
 
@@ -957,17 +964,17 @@ func TestTemplateCopyPerBuild(t *testing.T) {
 		t.Fatalf("Build second: %v", err)
 	}
 
-	wantSecond := jobName(second.TaskID) + "-cred"
+	wantSecond := daemonIDFor(second.TaskID) + "-cred"
 	if got := volumeByName(t, secondJob.Spec.Template.Spec.Volumes, "cred-src").Secret.SecretName; got != wantSecond {
 		t.Errorf("second Job cred-src = %q, want %q", got, wantSecond)
 	}
-	if secondSecret.Name != wantSecond || secondJob.Annotations[annoDaemonID] != jobName(second.TaskID) {
+	if secondSecret.Name != wantSecond || secondJob.Annotations[annoDaemonID] != daemonIDFor(second.TaskID) {
 		t.Errorf("second Job/Secret = %q/%q, want the second task's", secondSecret.Name, secondJob.Annotations[annoDaemonID])
 	}
 	if got := canonicalJSON(secondJob); strings.Contains(got, first.TaskID) {
 		t.Errorf("second Job carries the first task's values:\n%s", got)
 	}
-	if got := volumeByName(t, firstJob.Spec.Template.Spec.Volumes, "cred-src").Secret.SecretName; got != jobName(first.TaskID)+"-cred" {
+	if got := volumeByName(t, firstJob.Spec.Template.Spec.Volumes, "cred-src").Secret.SecretName; got != daemonIDFor(first.TaskID)+"-cred" {
 		t.Errorf("first Job cred-src = %q, want it left alone by the second Build", got)
 	}
 	if got := canonicalJSON(firstJob); strings.Contains(got, second.TaskID) {
