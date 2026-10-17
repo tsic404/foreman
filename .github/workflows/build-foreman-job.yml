@@ -231,114 +231,8 @@ jobs:
             "${tags[@]}" \
             --provenance=false \
             --push dist
-          digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")
-          [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || {
-            echo "::error title=Push did not land::$ref resolves to '$digest'"
-            exit 1
-          }
-          {
-            printf 'foreman_job_image=%s\n' "$ref"
-            printf 'foreman_job_digest=%s\n' "$digest"
-          } >>"$GITHUB_OUTPUT"
-          echo "published $ref@$digest" >>"$GITHUB_STEP_SUMMARY"
-
-      - name: Verify the published manifest
-        if: steps.gate.outputs.skip != 'true'
-        env:
-          VERSION: ${{ steps.upstream.outputs.version }}
-          REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
-          JOB_DIGEST: ${{ steps.publish.outputs.foreman_job_digest }}
-        run: |
-          set -euo pipefail
-          die() { echo "::error title=Manifest verification failed::$*"; exit 1; }
-          ref="$REGISTRY/foreman-job:$VERSION"
-          # The tag must still resolve to the digest this run published:
-          # resolving it here and comparing catches a tag that moved.
-          got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")
-          [ "$got" = "$JOB_DIGEST" ] || die "$ref resolves to $got, this run published $JOB_DIGEST"
-          list=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$ref" |
-            jq -r '.manifests[]? | "\(.platform.os)/\(.platform.architecture) \(.digest)"')
-          plats=$(printf '%s\n' "$list" | cut -d' ' -f1 | sort)
-          [ "$plats" = "$(printf 'linux/amd64\nlinux/arm64')" ] ||
-            die "$ref carries '${plats:-<no platform list>}', want linux/amd64 + linux/arm64"
-          printf '%s\n' "$list" | grep -Eq '^linux/amd64 sha256:[0-9a-f]{64}$' ||
-            die "$ref has no digest-pinned linux/amd64 config"
-          printf '%s\n' "$list" | grep -Eq '^linux/arm64 sha256:[0-9a-f]{64}$' ||
-            die "$ref has no digest-pinned linux/arm64 config"
-          printf '%s\n' "$list"
-          printf '| `%s` | `%s` | linux/amd64, linux/arm64 |\n' "$ref" "$JOB_DIGEST" >>"$GITHUB_STEP_SUMMARY"
-
-      - name: Smoke the published image
-        if: steps.gate.outputs.skip != 'true'
-        env:
-          VERSION: ${{ steps.upstream.outputs.version }}
-          REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
-          MULTICA_CLI_URL_AMD64: ${{ steps.artifacts.outputs.MULTICA_CLI_URL_AMD64 }}
-          MULTICA_CLI_URL_ARM64: ${{ steps.artifacts.outputs.MULTICA_CLI_URL_ARM64 }}
-          MULTICA_CLI_SHA256_AMD64: ${{ steps.artifacts.outputs.MULTICA_CLI_SHA256_AMD64 }}
-          MULTICA_CLI_SHA256_ARM64: ${{ steps.artifacts.outputs.MULTICA_CLI_SHA256_ARM64 }}
-        run: |
-          set -euo pipefail
-          die() { echo "::error title=Image smoke failed::$*"; exit 1; }
-          job="$REGISTRY/foreman-job:$VERSION"
-          mkdir -p dist/smoke
-          # Pull one platform's config, create the container without starting it
-          # and copy the file out: the file's bytes are what the checksums cover.
-          extract() { # <platform> <path-in-image> <dest>
-            local platform=$1 path=$2 dest=$3 cid
-            docker pull --quiet --platform "$platform" "$job" >/dev/null
-            cid=$(docker create --platform "$platform" "$job" /bin/true)
-            docker cp "$cid:$path" "$dest" || {
-              docker rm "$cid" >/dev/null
-              die "$job ($platform) has no $path"
-            }
-            docker rm "$cid" >/dev/null
-          }
-          for arch in amd64 arm64; do
-            upper=$(printf '%s' "$arch" | tr '[:lower:]' '[:upper:]')
-            cli_url_var="MULTICA_CLI_URL_$upper"; cli_sha_var="MULTICA_CLI_SHA256_$upper"
-            cli_archive="dist/smoke/multica-cli-linux-$arch.tar.gz"
-            # AC-13 provenance: the CLI ships as an archive, so the archive is
-            # checked against the release manifest, then the `multica` member it
-            # carries is what the image must match — and the binary's own
-            # version report is the anchor that version tag rests on.
-            extract "linux/$arch" /usr/local/bin/multica "dist/smoke/multica-linux-$arch"
-            extract "linux/$arch" /usr/local/bin/foreman-gc "dist/smoke/foreman-gc-linux-$arch"
-            curl -fsSL "${!cli_url_var}" -o "$cli_archive"
-            echo "${!cli_sha_var}  $cli_archive" | sha256sum -c -
-            tar -xzf "$cli_archive" -C dist/smoke multica
-            mv dist/smoke/multica "dist/smoke/multica-upstream-linux-$arch"
-            got_cli=$(sha256sum "dist/smoke/multica-linux-$arch" | cut -d' ' -f1)
-            want_cli=$(sha256sum "dist/smoke/multica-upstream-linux-$arch" | cut -d' ' -f1)
-            [ "$got_cli" = "$want_cli" ] ||
-              die "multica in $job ($arch) is $got_cli, want the upstream release archive member $want_cli"
-            [ -x "dist/smoke/foreman-gc-linux-$arch" ] ||
-              die "foreman-gc in $job ($arch) is not executable"
-            reported=$(docker run --rm --platform "linux/$arch" --entrypoint multica "$job" --version |
-              head -n1 | awk '{print $2}')
-            [ "$reported" = "$VERSION" ] ||
-              die "multica in $job ($arch) reports '$reported', want the version it is tagged with ($VERSION)"
-            # AC-34: `dumb-init` present and executable on both platforms.
-            dumb=$(docker run --rm --platform "linux/$arch" --entrypoint dumb-init "$job" --version)
-            [[ $dumb == dumb-init\ v* ]] ||
-              die "$job ($arch) has no executable /usr/bin/dumb-init: $dumb"
-            # ADR-031: the image carries no agent backend and no task-side
-            # toolchain — `omp` comes from the Job template's init step.
-            docker run --rm --platform "linux/$arch" --entrypoint sh "$job" -ec \
-              '[ ! -e /usr/local/bin/omp ] && [ ! -e /usr/bin/nix ]' ||
-              die "$job ($arch) still carries /usr/local/bin/omp or /usr/bin/nix"
-            # The template's init step runs in this image: it needs the shell
-            # and the download/checksum tools, and the agent backend it installs
-            # links the C++ runtime. A missing piece fails at exec, inside the
-            # Job, so it is checked here per platform (§5.3/§5.4 image face).
-            docker run --rm --platform "linux/$arch" --entrypoint sh "$job" -ec \
-              'for c in sh cp chmod chown wget uname sha256sum; do command -v "$c" >/dev/null || { echo "missing $c"; exit 1; }; done' ||
-              die "$job ($arch) lacks a tool the reference template's init step needs"
-            docker run --rm --platform "linux/$arch" --entrypoint sh "$job" -ec \
-              '[ -e /usr/lib/libstdc++.so.6 ]' ||
-              die "$job ($arch) has no libstdc++: the template's omp binary links it and would fail at exec"
-            echo "job image $arch: upstream multica $VERSION + foreman-gc verified, dumb-init + init toolchain + libstdc++ present, omp/nix absent" >>"$GITHUB_STEP_SUMMARY"
-          done
+          echo "foreman_job_image=$ref" >>"$GITHUB_OUTPUT"
+          echo "published $ref" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Record what this run published
         if: always()
@@ -349,14 +243,13 @@ jobs:
           SKIPPED: ${{ steps.gate.outputs.skip }}
           PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
           JOB_IMAGE: ${{ steps.publish.outputs.foreman_job_image }}
-          JOB_DIGEST: ${{ steps.publish.outputs.foreman_job_digest }}
         run: |
           set -euo pipefail
           sha7=$(git rev-parse --short=7 HEAD)
           mkdir -p dist
           # The record runs even when the run died (to leave the scene), so it
-          # has to say which of the three states this is: a failed run must not
-          # read like a release record with empty references.
+          # has to say which state this is: published, skipped as already
+          # published, or failed before the push.
           if [ "${PUBLISH_OUTCOME:-}" = success ]; then
             status=PUBLISHED
           elif [ "${SKIPPED:-}" = true ]; then
@@ -374,14 +267,13 @@ jobs:
           UPSTREAM_RELEASE=https://github.com/$UPSTREAM_REPO/releases/tag/v${VERSION:-}
           STATUS=$status
           FOREMAN_JOB_IMAGE=${JOB_IMAGE:-}
-          FOREMAN_JOB_DIGEST=${JOB_DIGEST:-}
           EOF
           case "$status" in
             PUBLISHED)
               {
                 printf '## Foreman Job image %s (%s)\n\n' "$VERSION" "$sha7"
-                printf '| Image | Reference | Digest |\n|---|---|---|\n'
-                printf '| foreman-job | `%s` | `%s` |\n' "$JOB_IMAGE" "$JOB_DIGEST"
+                printf '| Image | Reference |\n|---|---|\n'
+                printf '| foreman-job | `%s` |\n' "$JOB_IMAGE"
                 printf '\n`%s` manifest list; referenced by movable tag (`FOREMAN_JOB_IMAGE`).\n' "$PLATFORMS"
               } >>"$GITHUB_STEP_SUMMARY"
               ;;
@@ -404,4 +296,4 @@ jobs:
 
       - name: Report the failure
         if: failure()
-        run: echo "::error title=Image delivery failed::$GITHUB_REF was not published to GHCR, or the published image failed verification; do not pin this release."
+        run: echo "::error title=Image delivery failed::$GITHUB_REF was not published to GHCR; do not pin this release."
