@@ -25,7 +25,7 @@ type LeaseHooks interface {
 	// OnDeliveryUnconfirmed settles the S6 lost-response form: the entry
 	// reached the boot bound on a committed delivery without a start fact, so
 	// no delivery attempt was ever confirmed (failure-handling scenario #18,
-	// ADR-030).
+	// ADR-032).
 	OnDeliveryUnconfirmed(ctx context.Context, taskID string) error
 	// OnBootTimeout fails the task (failure-handling scenario #4).
 	OnBootTimeout(ctx context.Context, taskID string) error
@@ -39,7 +39,7 @@ type LeaseHooks interface {
 // yet started, every FOREMAN_LEASE_REFRESH_INTERVAL (must stay < the 45s
 // server lease, §1.1 C3). It also enforces the pre-start terminal bound, the
 // boot deadline (scenario #4), with the S6 delivery attribution split
-// (scenario #18, ADR-030); the delivery confirmation window itself is not a
+// (scenario #18, ADR-032); the delivery confirmation window itself is not a
 // bound here — it releases the delivery for another attempt on the claim
 // path.
 type LeaseKeeper struct {
@@ -103,7 +103,7 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 			// One terminal bound for the pre-start forms: the boot deadline,
 			// claim-relative. The delivery confirmation window no longer ends
 			// an entry — passing it with no start fact releases the delivery
-			// for another attempt on the daemon's next claim (ADR-030), so an
+			// for another attempt on the daemon's next claim (ADR-032), so an
 			// entry whose daemon is preparing a payload it did receive is not
 			// killed by it. The attribution splits on whether a delivery was
 			// ever committed: an entry that was handed the payload and never

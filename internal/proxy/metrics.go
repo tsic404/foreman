@@ -24,7 +24,7 @@ type Metrics interface {
 	// (observability.md foreman_model_catalog_relays_total).
 	ModelCatalogRelay(code string, seconds float64)
 	// DeliveryClaim records one task Job's S6 claim by result
-	// (observability.md foreman_delivery_claims_total, ADR-030). A catalog
+	// (observability.md foreman_delivery_claims_total, ADR-032). A catalog
 	// probe's claim carries no task face and is not counted.
 	DeliveryClaim(result string)
 	// DeliveryLatency observes one committed S6 delivery's latency, from the
@@ -38,7 +38,7 @@ type Metrics interface {
 const EndpointAgentAPI = "agent-api"
 
 // S6 claim result label values (observability.md foreman_delivery_claims_total,
-// ADR-030): delivered = the payload was handed over; redelivered = the payload
+// ADR-032): delivered = the payload was handed over; redelivered = the payload
 // was handed over again after the confirmation window released a delivery that
 // went unconfirmed; empty = an empty batch; empty_unconfirmed = an empty batch
 // answering an entry whose delivery was committed and is still inside its

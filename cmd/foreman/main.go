@@ -120,7 +120,7 @@ func run() error {
 	// The drain upper bound is the registry's, because markTerminal writes it
 	// once at the alive → draining transition (ADR-017); the delivery
 	// confirmation window is too, because markDelivering arms it once at the
-	// delivery commit (ADR-030).
+	// delivery commit (ADR-032).
 	reg := registry.New(time.Now,
 		registry.WithDrainTimeout(schedCfg.JobDrainTimeout),
 		registry.WithDeliveryConfirmTimeout(schedCfg.DeliveryConfirmTimeout))

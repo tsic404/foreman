@@ -74,7 +74,7 @@ type Metrics interface {
 	CredReclaimed(reason string, drainSeconds float64)
 	// DeliveryUnconfirmed counts one S6 delivery the confirmation window
 	// judged undelivered (observability.md §指标
-	// foreman_delivery_unconfirmed_total, ADR-030).
+	// foreman_delivery_unconfirmed_total, ADR-032).
 	DeliveryUnconfirmed()
 }
 

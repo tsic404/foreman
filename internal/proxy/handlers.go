@@ -267,7 +267,7 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	// Read the delivery face before the delivery attempt: an empty batch that
 	// answers an already-committed delivery is the lost-response signature
-	// (ADR-030), and the face that tells the kinds of empty batch apart is gone
+	// (ADR-032), and the face that tells the kinds of empty batch apart is gone
 	// once the entry settles. A decided entry's empty batches are the designed
 	// ones (drain never delivers), so they stay plain empties. The commit count
 	// is the classification's monotone fact — a commit that is not the first one

@@ -172,6 +172,89 @@ func TestDelivery02LostResponseLeavesMetricsEventsAndRetainedRecord(t *testing.T
 	}
 }
 
+// TestDelivery02ClaimsAfterDeliveryAccumulateAcrossRearms drives the form the
+// cumulative reading of the counter is the only distinguishing one for: three
+// commits with an empty-batch window between them. A per-window reading would
+// report the second rearm with the claims of its own window alone, so after a
+// later commit the entry would read as a daemon that stopped asking — the
+// other branch of the diagnostic (contract §3.1, AC-47 ②).
+func TestDelivery02ClaimsAfterDeliveryAccumulateAcrossRearms(t *testing.T) {
+	// Two full windows have to fit under the boot bound, the form's only
+	// terminal bound; the window keeps its scenario cadence.
+	h := newDeliveryHarnessWith(t, 6*deliveryConfirmWindow, deliveryConfirmWindow)
+	h.startLeaseKeeper(t)
+	if err := h.sched.OnClaim(t.Context(), deliveryPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	token := issueJobToken(t, h, "task-1")
+	registerTaskDaemon(t, h, "task-1", token)
+
+	// Window 1: one hand-over, then two empty batches answered inside it.
+	if got := claimTask(t, h, "task-1", token); !bytes.Contains(got, []byte(`"id":"task-1"`)) {
+		t.Fatalf("first S6 claim = %s, want the task payload", got)
+	}
+	for i := range 2 {
+		if got := claimTask(t, h, "task-1", token); !bytes.Contains(got, []byte(`"tasks":[]`)) {
+			t.Fatalf("in-window claim %d = %s, want an empty batch", i+1, got)
+		}
+	}
+	// Window 2: the expired window releases the payload, one empty claim
+	// answers that commit.
+	time.Sleep(deliveryConfirmWindow + 2*leaseKeeperInterval)
+	if got := claimTask(t, h, "task-1", token); !bytes.Contains(got, []byte(`"id":"task-1"`)) {
+		t.Fatalf("re-delivery claim = %s, want the payload again", got)
+	}
+	if got := claimTask(t, h, "task-1", token); !bytes.Contains(got, []byte(`"tasks":[]`)) {
+		t.Fatalf("in-window claim = %s, want an empty batch", got)
+	}
+	// Window 3: the second release commits the payload a third time, and two
+	// more empty batches follow before the boot bound closes the form.
+	time.Sleep(deliveryConfirmWindow + 2*leaseKeeperInterval)
+	if got := claimTask(t, h, "task-1", token); !bytes.Contains(got, []byte(`"id":"task-1"`)) {
+		t.Fatalf("second re-delivery claim = %s, want the payload again", got)
+	}
+	for i := range 2 {
+		if got := claimTask(t, h, "task-1", token); !bytes.Contains(got, []byte(`"tasks":[]`)) {
+			t.Fatalf("post-rearm claim %d = %s, want an empty batch", i+1, got)
+		}
+	}
+
+	// The event face: one rearm per released commit, and the second one's
+	// counter carries the running total — the two claims of the first window
+	// plus the one of the second. A per-window reading reports the second
+	// window alone (1), which is what the post-hoc query face must never see.
+	rearmed := h.events("task.delivery_rearmed")
+	if len(rearmed) != 2 {
+		t.Fatalf("task.delivery_rearmed events = %d, want 2 (one per released commit)", len(rearmed))
+	}
+	if n, _ := rearmed[0]["claims_after_delivery"].(float64); n != 2 {
+		t.Errorf("first rearm claims_after_delivery = %v, want 2", rearmed[0]["claims_after_delivery"])
+	}
+	if n, _ := rearmed[1]["claims_after_delivery"].(float64); n != 3 {
+		t.Errorf("second rearm claims_after_delivery = %v, want 3 (both windows' empty claims)",
+			rearmed[1]["claims_after_delivery"])
+	}
+	if n, _ := rearmed[1]["deliveries"].(float64); n != 3 {
+		t.Errorf("second rearm deliveries = %v, want 3", rearmed[1]["deliveries"])
+	}
+
+	// The boot bound settles the form; the live entry keeps the whole count.
+	settled := waitTerminal(t, h, "task-1")
+	if settled.FailureReason != scheduler.FailureReasonDeliveryUnconfirmed {
+		t.Fatalf("reason = %q, want %q", settled.FailureReason, scheduler.FailureReasonDeliveryUnconfirmed)
+	}
+	if settled.Deliveries != 3 || settled.ClaimsAfterDelivery != 5 {
+		t.Fatalf("settled entry = deliveries %d, claims_after_delivery %d; want 3 and 5 (2+1+2 empty batches)",
+			settled.Deliveries, settled.ClaimsAfterDelivery)
+	}
+	if n := h.metrics.deliveryClaimCount(proxy.DeliveryClaimEmptyUnconfirmed); n != 5 {
+		t.Errorf("empty_unconfirmed claim count = %d, want 5 (every empty batch kept asking)", n)
+	}
+	if n := h.metrics.deliveryClaimCount(proxy.DeliveryClaimRedelivered); n != 2 {
+		t.Errorf("redelivered claim count = %d, want 2", n)
+	}
+}
+
 func httpGet(t *testing.T, url string) (int, []byte) {
 	t.Helper()
 	resp, err := http.Get(url)

@@ -295,7 +295,7 @@ func TestMarkDelivering(t *testing.T) {
 	}
 }
 
-// TestMarkDeliveringRearmsAfterTheWindow guards ADR-030's re-delivery gate:
+// TestMarkDeliveringRearmsAfterTheWindow guards ADR-032's re-delivery gate:
 // an expired confirmation window releases the payload for one more commit
 // only while the entry still has no start fact, and a registry without a
 // window commits the delivery exactly once.
@@ -368,6 +368,70 @@ func TestMarkDeliveringRearmsAfterTheWindow(t *testing.T) {
 	}
 }
 
+// TestClaimsAfterDeliveryAccumulatesAcrossDeliveries guards the counter's
+// cumulative reading (contract §3.1): it answers how many empty S6 claims
+// followed a delivery commit in total, not how many followed the last one. A
+// per-window reading would report zero right after a re-delivery commit, i.e.
+// the diagnostic's other branch ("the daemon stopped asking" instead of "the
+// response was lost"), which is the one distinction the projection exists for.
+func TestClaimsAfterDeliveryAccumulatesAcrossDeliveries(t *testing.T) {
+	window := 30 * time.Second
+	r := New(fixedClock(), WithDeliveryConfirmTimeout(window))
+	e := entryFor("t1")
+	e.State = StateDaemonRegistered
+	if err := r.Put(e); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	body := json.RawMessage(`{"id":"t1","runtime_id":"rt-t1"}`)
+
+	// First window: the commit, then two empty claims answered inside it.
+	if _, ok := r.MarkDelivering("fm-t1", testNow, body); !ok {
+		t.Fatal("first delivery refused")
+	}
+	r.NoteClaimAfterDelivery("t1")
+	r.NoteClaimAfterDelivery("t1")
+
+	// The expired window releases the payload again: the commit of a
+	// re-delivery must keep the claims the earlier window counted.
+	second := testNow.Add(window + time.Second)
+	if _, ok := r.MarkDelivering("fm-t1", second, body); !ok {
+		t.Fatal("the expired window did not release the delivery")
+	}
+	if got, _ := r.Get("t1"); got.ClaimsAfterDelivery != 2 {
+		t.Fatalf("claims_after_delivery after the second commit = %d, want 2 (the commit keeps the count)",
+			got.ClaimsAfterDelivery)
+	}
+	r.NoteClaimAfterDelivery("t1")
+
+	// The third commit is the one a per-window reading cannot survive: every
+	// claim of the windows before it would be dropped.
+	third := second.Add(window + time.Second)
+	got, ok := r.MarkDelivering("fm-t1", third, body)
+	if !ok {
+		t.Fatal("the second expired window did not release the delivery")
+	}
+	if got.Deliveries != 3 {
+		t.Fatalf("deliveries = %d, want 3 (three commits, none confirmed)", got.Deliveries)
+	}
+	if got.ClaimsAfterDelivery != 3 {
+		t.Fatalf("claims_after_delivery at the third commit = %d, want 3 (both windows' empty claims)",
+			got.ClaimsAfterDelivery)
+	}
+	r.NoteClaimAfterDelivery("t1")
+	if got, _ := r.Get("t1"); got.ClaimsAfterDelivery != 4 {
+		t.Fatalf("claims_after_delivery after another empty claim = %d, want 4", got.ClaimsAfterDelivery)
+	}
+
+	// The start fact settles the delivery face; the diagnostic the settled
+	// record answers with keeps its whole count.
+	if _, ok := r.MarkStarted("t1", third.Add(time.Second)); !ok {
+		t.Fatal("MarkStarted")
+	}
+	if settled, _ := r.Get("t1"); settled.ClaimsAfterDelivery != 4 {
+		t.Errorf("claims_after_delivery after the start fact = %d, want 4", settled.ClaimsAfterDelivery)
+	}
+}
+
 func TestDeleteCascadesRuntimeIndex(t *testing.T) {
 	r := New(fixedClock())
 	e := entryFor("t1")
@@ -429,7 +493,7 @@ func TestRuntimeIndex(t *testing.T) {
 	r.TouchHeartbeat("ghost", testNow) // no panic
 }
 
-// TestSettledRecordRetainsVerdictAndDropsSecrets guards ADR-030's retention
+// TestSettledRecordRetainsVerdictAndDropsSecrets guards ADR-032's retention
 // face: the settled index keeps the terminal projection the ops endpoint
 // answers with after the credential reclaim deleted the live row, without the
 // payload body or the token digest, and only for the retention window.

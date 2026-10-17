@@ -76,7 +76,7 @@ const (
 	// FailureReasonDeliveryUnconfirmed is the S6 lost-response form: the
 	// delivery was committed but no start fact arrived within the delivery
 	// confirmation window, so the payload never reached the daemon
-	// (03-contracts.md §1.2, ADR-030). It is a transport verdict, not a Job
+	// (03-contracts.md §1.2, ADR-032). It is a transport verdict, not a Job
 	// one — the Job was created, its pod ran and its daemon registered.
 	FailureReasonDeliveryUnconfirmed = "delivery_unconfirmed"
 )
@@ -751,7 +751,7 @@ func (s *Scheduler) Deliver(daemonID string, runtimeID string, maxTasks int) ([]
 		"task_id", e.TaskID, "job_name", e.JobName,
 		"deliver_latency_ms", now.Sub(e.ClaimedAt).Milliseconds())
 	if e.Deliveries > 1 {
-		// The window's exit (ADR-030): the delivery committed at
+		// The window's exit (ADR-032): the delivery committed at
 		// delivered_at was never confirmed, and this claim released it. The
 		// claim itself is the evidence that the daemon is not holding that
 		// copy — a Job daemon claims only with a free task slot, and it holds
@@ -963,7 +963,7 @@ func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
 }
 
 // OnDeliveryUnconfirmed handles the S6 lost-response form (failure-handling
-// scenario #18, ADR-030) at its terminal bound: the entry reached the boot
+// scenario #18, ADR-032) at its terminal bound: the entry reached the boot
 // deadline on a committed delivery with no start fact, so the payload never
 // took — every attempt the confirmation window released went unconfirmed too.
 // The task is failed on the daemon's behalf (C10,

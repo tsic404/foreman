@@ -295,7 +295,7 @@ func TestLeaseKeeperSkipsRebuiltEntries(t *testing.T) {
 	}
 }
 
-// TestLeaseKeeperBootBoundSplitsTheDeliveryAttribution guards ADR-030's bound
+// TestLeaseKeeperBootBoundSplitsTheDeliveryAttribution guards ADR-032's bound
 // model: the boot deadline is the entry's only terminal bound, and the
 // confirmation window is not one — an expired window releases the delivery on
 // the claim path, it never settles an entry here. The attribution splits on

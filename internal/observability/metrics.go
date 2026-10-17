@@ -18,7 +18,7 @@ const (
 	metricTasksTotal       = "foreman_tasks_total"
 	metricTaskClaimsTotal  = "foreman_task_claims_total"
 	metricClaimErrorsTotal = "foreman_claim_errors_total"
-	// S6 delivery face (ADR-030): the claim requests by result, the delivery
+	// S6 delivery face (ADR-032): the claim requests by result, the delivery
 	// latency and the deliveries the confirmation window judged undelivered.
 	metricDeliveryClaimsTotal      = "foreman_delivery_claims_total"
 	metricDeliveryLatency          = "foreman_delivery_latency_seconds"
@@ -63,7 +63,7 @@ var forwardEndpoints = []string{
 	"cancel-ack", "session", "wait-local-directory", ForwardAgentAPI,
 }
 
-// Delivery claim result label values (ADR-030; the proxy passes these
+// Delivery claim result label values (ADR-032; the proxy passes these
 // through its own Metrics seam): a committed delivery, a delivered payload
 // handed over again once the confirmation window released it — the
 // lost-response signature that recovered — a plain empty batch, and an empty
@@ -325,18 +325,18 @@ func (m *Metrics) JobCreateSeconds(seconds float64) { m.jobCreateSeconds.Observe
 // "transport".
 func (m *Metrics) ClaimError(code string) { m.claimErrors.WithLabelValues(code).Inc() }
 
-// DeliveryClaim counts one task Job's S6 claim by result (ADR-030). result is
+// DeliveryClaim counts one task Job's S6 claim by result (ADR-032). result is
 // one of the deliveryClaimResults values, passed through the proxy's seam.
 func (m *Metrics) DeliveryClaim(result string) {
 	m.deliveryClaims.WithLabelValues(result).Inc()
 }
 
 // DeliveryLatency observes one committed S6 delivery's claim -> commit span
-// (ADR-030).
+// (ADR-032).
 func (m *Metrics) DeliveryLatency(seconds float64) { m.deliveryLatency.Observe(seconds) }
 
 // DeliveryUnconfirmed counts one entry that reached the boot bound on a
-// committed delivery the daemon never confirmed (ADR-030): the window
+// committed delivery the daemon never confirmed (ADR-032): the window
 // released the payload for another attempt, and no attempt was started.
 func (m *Metrics) DeliveryUnconfirmed() { m.deliveryUnconfirm.Inc() }
 
