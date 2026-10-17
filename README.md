@@ -22,16 +22,20 @@ Multica Server  ◄── fake client ──  Foreman  ── fake server ──
 make build-foreman        # bin/foreman      — the scheduler process
 make build-gc             # bin/foreman-gc   — node-local cache collector
 make build-foreman-image  # container image for the Deployment (linux/$(ARCH))
-make build-job-image      # Job image: upstream multica CLI + omp + foreman-gc + dumb-init + nix
+make build-job-image      # Job image: upstream multica CLI + foreman-gc + dumb-init
 make check                # gofmt + vet + tests + build
 ```
 
 Both images are built and published to GHCR as multi-platform manifest lists
-(`linux/amd64` + `linux/arm64`) by `.github/workflows/build-images.yml` on every
-push to `main` and on `v*.*.*` tags: that workflow is the whole release path and
-needs nothing from this repo beyond the two Containerfiles. The
-`make build-*-image` targets are the single-platform local equivalents
-(`ARCH=` picks the platform).
+(`linux/amd64` + `linux/arm64`) by the workflows in `.github/workflows/`, each
+on its own release line: `build-foreman.yml` publishes `foreman` (tagged with
+this repo's `v*.*.*` version, `latest` from `main`), `build-foreman-job.yml`
+publishes `foreman-job` (tagged with the upstream daemon version it carries,
+resolved from upstream's newest release at build time, `latest` from the newest
+release) and skips a version that is already published. `.github/workflows/` is
+the whole release path and needs nothing from this repo beyond the two
+Containerfiles. The `make build-*-image` targets are the single-platform local
+equivalents (`ARCH=` picks the platform).
 
 The acceptance cases run against their own test multica cluster, deployed from
 `testinfra/test-multica/` (deploy, reset, recycle, CLI profile — see its

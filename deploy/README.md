@@ -60,81 +60,99 @@ characters); `MULTICA_TOKEN` must start with `mdt_` or `mul_`.
 
 Two images come from this repo (`docs/04-architecture.md` §部署/运行方式): the
 scheduler image for the Deployment, and the Job image (upstream multica CLI +
-`omp` + `foreman-gc` + `dumb-init` + `nix`) that both the Job pods and the
-`foreman-gc` DaemonSet run.
-Both are published as **multi-platform manifest lists** (`linux/amd64` +
-`linux/arm64`), so a cluster with nodes of both architectures pulls the platform
-each node runs; nothing in `deploy/` names an architecture.
+`foreman-gc` + `dumb-init`) that both the Job pods and the `foreman-gc`
+DaemonSet run. Neither image carries an agent backend: the Job template's init
+step installs `omp` into every Job at start-up (ADR-031), which is why the
+shipped template mounts it at the `MULTICA_OMP_PATH` the daemon reads. Both are
+published as **multi-platform manifest lists** (`linux/amd64` + `linux/arm64`),
+so a cluster with nodes of both architectures pulls the platform each node runs;
+nothing in `deploy/` names an architecture.
 
-`.github/workflows/build-images.yml` builds and publishes both to GHCR — on
-every push to `main` and on `v*.*.*` tags:
+Each image has its own release line and its own version semantics:
 
-| Image | Tags | Platforms |
-|---|---|---|
-| `ghcr.io/tsic404/foreman` | `<version>`, `latest` | `linux/amd64`, `linux/arm64` |
-| `ghcr.io/tsic404/foreman-job` | `<version>`, `latest` | `linux/amd64`, `linux/arm64` |
+| Workflow | Image | Tags | Triggers |
+|---|---|---|---|
+| `.github/workflows/build-foreman.yml` | `ghcr.io/tsic404/foreman` | `<repo version>`, `latest` | `main` push, `v*.*.*` tag |
+| `.github/workflows/build-foreman-job.yml` | `ghcr.io/tsic404/foreman-job` | `<multica daemon version>`, `latest` | `main` push, hourly schedule, manual dispatch |
 
-`<version>` is the pushed tag; on `main` it is the newest `v*.*.*` tag
-reachable from the commit, falling back to the workflow's `DEFAULT_VERSION`
-(`v0.1.0`).
-`latest` follows `main` only: the shipped `FOREMAN_JOB_IMAGE` points at it,
-while the version tags remain the rollback path (ADR-012).
-The workflow needs no secrets for the push (`GITHUB_TOKEN`, `packages: write`)
-and resolves the upstream Job-image artifacts from their release checksum
-manifests, per platform; `MULTICA_CLI_VERSION` / `OMP_VERSION` repository
-variables pin other upstream versions than the defaults in the workflow. `omp`
-is a native binary, so each platform's asset must match the base image's libc:
-`OMP_ASSET_AMD64` / `OMP_ASSET_ARM64` default to `omp-linux-musl-x64` /
-`omp-linux-musl-arm64` for the musl base (`FOREMAN_BASE_IMAGE`, default
-`alpine:3.20`); a glibc base needs `omp-linux-x64` / `omp-linux-arm64` as the
-repository variables. The base must also carry the C++ runtime `omp` links: the
-image installs Alpine's `libstdc++` package (which brings `libgcc`), and a
-slimmer base that ships neither fails at exec. Both mismatches are caught by the
-workflow's smoke step, which runs `omp` on the runner's platform and checks both
-platforms' `multica` / `omp` against the upstream release checksums.
+`foreman`'s `<version>` is the newest `v*.*.*` tag reachable from the commit
+(falling back to `v0.1.0`); `foreman-job`'s `<version>` is the upstream daemon
+version the image carries, resolved at build time from upstream's newest release
+(never from a repository variable) and verified against that release's checksums.
 
-Whichever image ends up as `FOREMAN_JOB_IMAGE` must also carry
-`/usr/bin/dumb-init`: every Job `command` starts with `dumb-init --` (it is the
-agent container's PID 1, ADR-022), and the build installs Alpine's `dumb-init`
-package for the default base. A base whose package sources cannot supply it, or
-a custom image named by a job template, leaves the container without it and the
-agent fails at exec (pod `Failed` → `job_failed`). `docs/03-contracts.md` §5.3
-requires the contents, and §5.4's `FOREMAN_JOB_IMAGE` row carries it as a
-deployer constraint. It is not one of the two mismatches the smoke step above
-catches.
+**`latest` never moves backwards**, in either line: it is pushed only by a run
+that publishes a version at least as new as the line's newest release — for
+`foreman` the newest `v*.*.*` tag (and never from a tag push), for `foreman-job`
+exactly upstream's newest release. Both images are referenced by movable tag
+with `imagePullPolicy: Always` (`FOREMAN_JOB_IMAGE` defaults to
+`foreman-job:latest`), so a build of an older version would otherwise roll the
+whole cluster back. The two lines are independent: a `foreman` tag push never
+changes the Job image's version, and a Job-image run never builds the scheduler
+image.
+
+A Job-image run whose version is already published **skips** the build and the
+push, so the schedule and `main` pushes normally cost one registry query. That
+also means the automatic path never re-publishes an existing version tag: when a
+`foreman-gc` change has to ship under an unchanged daemon version, run the
+workflow manually with `force` — the version tag is republished, `latest` stays
+where it is (this version is not upstream's newest release):
+
+```bash
+gh workflow run build-foreman-job.yml -f version=0.6.1 -f force=true
+```
+
+Both workflows need no secrets for the push (`GITHUB_TOKEN`, `packages: write`)
+and resolve the upstream CLI artifact from its release checksum manifest, per
+platform. Whichever image ends up as `FOREMAN_JOB_IMAGE` must carry:
+
+- `/usr/bin/dumb-init` — every Job `command` starts with `dumb-init --` (it is
+  the agent container's PID 1, ADR-022), and the build installs Alpine's
+  `dumb-init` package for the default base. A base whose package sources cannot
+  supply it, or a custom image named by a job template, leaves the container
+  without it and the agent fails at exec (pod `Failed` → `job_failed`);
+- the runtime the template's `omp` needs — the musl `omp` build links
+  `libstdc++`/`libgcc_s`, so the image installs Alpine's `libstdc++` package
+  (default base); a slimmer base that ships neither fails at exec;
+- the busybox applets the reference template's init step uses (`wget`, `uname`,
+  `sha256sum`) plus `sh`/`cp`/`chmod`/`chown` for `prepare` — the stock Alpine
+  base has all of them.
+
+`docs/03-contracts.md` §5.3 requires those contents, and §5.4 carries them as
+deployer constraints; the Job-image workflow's smoke step asserts them on the
+published image, both platforms.
 
 The Job image is referenced by a **movable tag** in two places that carry the
 same literal (ADR-012):
 
-- `FOREMAN_JOB_IMAGE` in `30-foreman.yaml` (written verbatim into every Job's
-  `agent` and `prepare` containers — no digest concatenation), and
+- `FOREMAN_JOB_IMAGE` in `30-foreman.yaml` (written verbatim into every Job
+  container's `image` — no digest concatenation), and
 - the `image:` of the `foreman-gc` DaemonSet in `40-foreman-gc.yaml`
   (the DaemonSet runs the same image as the Job pods).
 
 Rolling forward is one step: point `FOREMAN_JOB_IMAGE` at the new reference, or
 let the tag itself move. Rolling back uses the version tags CI keeps publishing
-(`v<ver>`) — `latest` alone is never the only published tag. Both containers in
-the Job template default to `imagePullPolicy: Always`, which is what lets a
-moved tag reach a node that already cached the reference; a deployment that
-pins a version tag can set `imagePullPolicy: IfNotPresent` in the job template
-(§Job template below) and accepts that a moved tag then skips cached nodes. `foreman-gc` pulls `Always` for the same reason.
+— the scheduler's `v<ver>` and the Job image's `<multica version>`; `latest`
+alone is never the only published tag. Every container in the Job template
+defaults to `imagePullPolicy: Always`, which is what lets a moved tag reach a
+node that already cached the reference; a deployment that pins a version tag can
+set `imagePullPolicy: IfNotPresent` in the job template (§Job template below)
+and accepts that a moved tag then skips cached nodes. `foreman-gc` pulls
+`Always` for the same reason.
 
-CI publishes each run's references and digests (the `release-images-<version>`
+CI publishes each run's references and digests (the `release-<image>-<version>`
 artifact and the workflow summary) as the run's own record — nothing in
 `deploy/` is backfilled from it.
 
 Local builds are for development and staging clusters, never the release path:
 `make build-job-image` builds one platform's image (`linux/$(ARCH)`, the host
-architecture unless `ARCH=` says otherwise) and takes the upstream artifact URL
-+ SHA-256 for the CLI archive and for `omp`, so the built image can be checked
-against the upstream release (AC-13 provenance):
+architecture unless `ARCH=` says otherwise) and takes the upstream CLI archive
+URL + SHA-256, so the built image can be checked against the upstream release
+(AC-13 provenance):
 
 ```bash
 make build-job-image \
   MULTICA_CLI_URL=https://github.com/multica-ai/multica/releases/download/v0.6.1/multica-cli-0.6.1-linux-amd64.tar.gz \
-  MULTICA_CLI_SHA256=<sha256 from that release's checksums.txt> \
-  OMP_URL=https://github.com/can1357/oh-my-pi/releases/download/v18.6.1/omp-linux-musl-x64 \
-  OMP_SHA256=<sha256 from that release's SHA256SUMS.txt>
+  MULTICA_CLI_SHA256=<sha256 from that release's checksums.txt>
 ```
 
 What CI verifies about a published image is reproducible with the container CLI
@@ -143,25 +161,30 @@ alone:
 ```bash
 # both platforms in the manifest list, each with its own digest
 docker buildx imagetools inspect ghcr.io/tsic404/foreman-job:latest
-# the platform the runner itself is: run it
-docker run --rm --platform linux/amd64 --entrypoint omp ghcr.io/tsic404/foreman-job:latest --version
+# the daemon version the image carries (the version tag it should be published
+# under)
+docker run --rm --platform linux/amd64 --entrypoint multica ghcr.io/tsic404/foreman-job:latest --version
 # the other platform's config, read without executing it (no emulation)
 cid=$(docker create --platform linux/arm64 ghcr.io/tsic404/foreman-job:latest /bin/true)
 docker cp "$cid:/usr/local/bin/multica" ./multica && sha256sum ./multica
 docker rm "$cid"
 ```
 
-The workflow's smoke step asserts: exactly two platform manifests, each with a
-digest; the tag still resolving to the digest that run published; both
-platforms' `multica` / `omp` matching their upstream release checksum;
-`foreman-gc` present and executable in both configs; and `foreman` static and
-built for the platform whose config carries it.
+The Job-image workflow's smoke step asserts, **per platform** (inside one
+`for arch in amd64 arm64` loop): exactly two platform manifests, each with a
+digest; the tag still resolving to the digest that run published; `multica`
+matching the upstream release archive member, with the binary's self-reported
+version equal to the tag; `foreman-gc` present and executable; `/usr/bin/dumb-init`
+present and executable; `/usr/local/bin/omp` and `/usr/bin/nix` absent
+(ADR-031); the shell plus the download/checksum tools the reference template's
+init step uses (`sh`, `cp`, `chmod`, `chown`, `wget`, `uname`, `sha256sum`); and
+the C++ runtime that template-installed `omp` links. The scheduler workflow
+asserts the same manifest shape and that `foreman` is static and built for the
+platform whose config carries it.
 
-Two assertions §5.3's contents list implies are **not** in that step:
-`/usr/bin/dumb-init` and `/usr/bin/nix` present and executable, and the image's
-`CMD` empty. They belong to the build/publish surface (CI/ops), and this
-workflow never runs on a pull request (pushes to `main`, `v*.*.*` tags, manual
-dispatch) — so a PR cannot carry their result.
+One assertion §5.3's contents list implies is **not** in either step: the
+image's `CMD` empty. It belongs to the build/publish surface (CI/ops), and the
+workflows never run on a pull request — so a PR cannot carry its result.
 
 ## Node-local state
 
@@ -236,7 +259,25 @@ added or normalized.
 
 Unregistered `<...>` literals stay as written, so a template that writes
 `image: <job-image>` reaches the apiserver unchanged and the Job never boots;
-the reference template has the placeholder in both container images.
+the reference template has the placeholder in every container it declares
+(`agent`, `omp`, `prepare`).
+
+**The template also provides the agent backend.** The Job image carries no
+`omp` (ADR-031), so the shipped reference template's `omp` init container
+fetches the architecture's musl build from upstream's newest release, verifies
+it against that release's `SHA256SUMS.txt`, and leaves it where the agent
+container mounts it as the `MULTICA_OMP_PATH` file. A deployer's own template
+does the same job its own way — that is the template's choice, and nothing
+checks it. Consequences to size for:
+
+- every Job boot pays the download (the reference template takes the newest
+  release each time), so `FOREMAN_JOB_BOOT_TIMEOUT` (default `300s`, §5.4) must
+  cover a multi-minute fetch on a cold or slow link;
+- the Job image must keep the runtime that binary links (`libstdc++` /
+  `libgcc_s`); `docs/03-contracts.md` §5.3 lists it as an image content;
+- a `MULTICA_OMP_PATH` that exists in neither the image nor a mounted volume
+  leaves the daemon with no runtime to discover, which the startup probe reports
+  as a failed profile.
 
 - The file is read once at startup: an edit needs a Foreman restart, and the
   startup log records the template sha256 plus the accepted/refused verdict.

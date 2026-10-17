@@ -21,7 +21,9 @@ data:
     # TC-tech-job-01 / AC-20 的权威回归基线；**其 Job 文档 = 随仓发布的参考模板内容的唯一权威源**
     # （部署清单把本文件的 Job 文档发布为 ConfigMap `foreman-job-template` 的 `job-overlay.yaml`；模板为必选部署物，ADR-030）。
     # 本文件与 `docs/05-modules/job-template.md` §Job Manifest 是**同一份模板**的两种呈现（字面一致）：
-    #   · `<job-image>` **逐字保留**在两容器 `image`（消费面见 03-contracts §5.1 / §5.4）；
+    #   · `<job-image>` **逐字保留**在三处容器 `image`（agent / omp / prepare；消费面见 03-contracts §5.1 / §5.4）；
+    #   · `omp` 由 `omp` init 容器在启动期按架构下载并校验后落到 `agent-bin` 卷，agent 容器以单文件挂载取到
+    #     `MULTICA_OMP_PATH` 取值处（镜像不再内置 omp；init 耗时计入 FOREMAN_JOB_BOOT_TIMEOUT）；
     #   · `<preferred node>` **识别位属参考模板内容**（软亲和的取值/删除对象；缺该位则 AC-25 / AC-26 无判定对象）——
     #     由 TC-tech-job-01 步骤 3a 的「CM 内容自证」断言。
     # 占位符替换规则见 job-template.md「占位符与回归基线」。**条件块不在基线内**：触发上下文注解（issue-id /
@@ -89,6 +91,36 @@ data:
               labelSelector:
                 matchLabels: { app.kubernetes.io/name: foreman-job }
           initContainers:
+            - name: omp
+              image: <job-image>
+              imagePullPolicy: Always
+              command: ["/bin/sh", "-ec"]
+              args:
+                - |
+                  case "$(uname -m)" in
+                    x86_64)  asset=omp-linux-musl-x64 ;;
+                    aarch64) asset=omp-linux-musl-arm64 ;;
+                    *) echo "unsupported machine: $(uname -m)" >&2; exit 1 ;;
+                  esac
+                  base=https://github.com/can1357/oh-my-pi/releases/latest/download
+                  wget -q -O /agent-bin/SHA256SUMS.txt "$base/SHA256SUMS.txt"
+                  wget -q -O /agent-bin/omp "$base/$asset"
+                  want=$(grep -E "[[:space:]]$asset\$" /agent-bin/SHA256SUMS.txt | cut -d' ' -f1)
+                  got=$(sha256sum /agent-bin/omp | cut -d' ' -f1)
+                  [ -n "$want" ] && [ "$want" = "$got" ] || { echo "checksum mismatch for $asset: want $want, got $got" >&2; exit 1; }
+                  chmod 0755 /agent-bin/omp
+                  rm -f /agent-bin/SHA256SUMS.txt
+              securityContext:
+                runAsUser: 1000
+                runAsNonRoot: true
+                allowPrivilegeEscalation: false
+                readOnlyRootFilesystem: true
+                capabilities: { drop: ["ALL"] }
+              resources:
+                requests: { cpu: 20m, memory: 32Mi }
+                limits:   { cpu: "1", memory: 256Mi }
+              volumeMounts:
+                - { name: agent-bin, mountPath: /agent-bin }
             - name: prepare
               image: <job-image>
               imagePullPolicy: Always
@@ -154,6 +186,7 @@ data:
                 - { name: cred,       mountPath: /home/agent/.multica/profiles/foreman-job/config.json, subPath: config.json, readOnly: true }
                 - { name: workspaces, mountPath: /state/workspaces }
                 - { name: tmp,        mountPath: /tmp }
+                - { name: agent-bin,  mountPath: /usr/local/bin/omp, subPath: omp, readOnly: true }
           volumes:
             - name: home
               hostPath: { path: /var/lib/foreman/home, type: DirectoryOrCreate }
@@ -161,6 +194,8 @@ data:
               hostPath: { path: /var/lib/foreman/workspaces, type: DirectoryOrCreate }
             - name: tmp
               emptyDir: { sizeLimit: 2Gi }
+            - name: agent-bin
+              emptyDir: { sizeLimit: 1Gi }
             - name: cred
               emptyDir: { sizeLimit: 16Mi }
             - name: cred-src

@@ -48,7 +48,7 @@ spec:
         - name: foreman
           image: ghcr.io/tsic404/foreman:latest
           # A moving tag: always pull so a rollout restart picks up the release
-          # the build-images workflow just published.
+          # the build-foreman workflow just published.
           imagePullPolicy: Always
           args: ["-listen=:8080"]
           ports:
@@ -94,6 +94,9 @@ spec:
               value: "15s"
             - name: FOREMAN_JOB_BOOT_TIMEOUT
               value: "300s"
+            # Boot window: claim → daemon start, including every init step the
+            # template runs — the reference template fetches the agent backend
+            # there, so a slow or cold link needs a larger value (§5.4).
             # Credential-reclaim upper bound after a task's verdict; a
             # deployment that raises the template's
             # terminationGracePeriodSeconds must raise this too (ADR-017).

@@ -1,8 +1,9 @@
 # Foreman local build entry points (docs/04-architecture.md §部署/运行方式).
 #
-# Local development only: the release path is `.github/workflows/build-images.yml`,
-# which builds linux/amd64 + linux/arm64 itself and pushes the multi-platform
-# images to GHCR. Nothing here pushes, publishes or stamps a release.
+# Local development only: the release path is the two workflows in
+# `.github/workflows/` (build-foreman.yml, build-foreman-job.yml), which build
+# linux/amd64 + linux/arm64 themselves and push the multi-platform images to
+# GHCR. Nothing here pushes, publishes or stamps a release.
 
 SHELL := /bin/sh
 BIN_DIR ?= bin
@@ -17,14 +18,13 @@ ARCH ?= $(shell go env GOARCH)
 ARCH_UPPER := $(shell printf '%s' '$(ARCH)' | tr '[:lower:]' '[:upper:]')
 BASE_IMAGE ?= alpine:3.20
 
-# Upstream release artifacts for the Job image (F1/AC-13): the CLI is taken from
-# the release archive and both artifacts are checked against the SHA-256 from
-# their release's checksum manifest. CI resolves both platforms itself; a local
-# build passes the pair for $(ARCH).
+# Upstream release artifact for the Job image (F1/AC-13): the CLI is taken from
+# the release archive and checked against the SHA-256 from that release's
+# checksum manifest. CI resolves both platforms itself; a local build passes the
+# pair for $(ARCH). The agent backend `omp` is not an image input — the Job
+# template installs it at start-up (ADR-031).
 MULTICA_CLI_URL ?=
 MULTICA_CLI_SHA256 ?=
-OMP_URL ?=
-OMP_SHA256 ?=
 
 GOFLAGS ?= -trimpath
 LDFLAGS := -s -w -X main.version=$(VERSION)
@@ -54,16 +54,16 @@ build-foreman-image:
 		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
 		-t $(FOREMAN_IMAGE) $(BIN_DIR)
 
-# Job image: upstream daemon CLI + omp, plus foreman-gc (the DaemonSet runs
-# this same image). Tagged as $(JOB_IMAGE), referenced by movable tag.
+# Job image: the upstream daemon CLI plus foreman-gc (the DaemonSet runs this
+# same image) — no omp and no nix (ADR-031; the Job template's init step
+# installs the agent binary). Tagged as $(JOB_IMAGE), referenced by movable tag;
+# in CI its version tag is the carried daemon version.
 build-job-image:
 	$(call build-linux-binary,./cmd/foreman-gc,$(BIN_DIR)/foreman-gc-linux-$(ARCH))
 	$(CONTAINER_TOOL) build --platform linux/$(ARCH) -f images/foreman-job.Containerfile \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
 		--build-arg MULTICA_CLI_URL_$(ARCH_UPPER)=$(MULTICA_CLI_URL) \
 		--build-arg MULTICA_CLI_SHA256_$(ARCH_UPPER)=$(MULTICA_CLI_SHA256) \
-		--build-arg OMP_URL_$(ARCH_UPPER)=$(OMP_URL) \
-		--build-arg OMP_SHA256_$(ARCH_UPPER)=$(OMP_SHA256) \
 		-t $(JOB_IMAGE) $(BIN_DIR)
 
 test:
