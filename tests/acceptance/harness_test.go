@@ -851,7 +851,7 @@ func newHarness(t *testing.T, catalogEnabled bool) *harness {
 
 // newHarnessWithWindow is newHarness with the S6 confirmation window chosen by
 // the scenario. Zero turns the re-delivery exit off — the form whose scenario
-// is "delivered exactly once" (ADR-030 / AC-46) — and the registry and the
+// is "delivered exactly once" (ADR-032 / AC-46) — and the registry and the
 // scheduler config must agree on it, as they do in a deployment.
 func newHarnessWithWindow(t *testing.T, catalogEnabled bool, window time.Duration) *harness {
 	t.Helper()

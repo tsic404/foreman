@@ -24,7 +24,7 @@ const (
 type TaskIndex interface {
 	Get(taskID string) (registry.TaskEntry, bool)
 	// Settled returns the retained terminal record of an already-reclaimed
-	// task (contract §3.1, ADR-030): the single-task endpoint answers with it
+	// task (contract §3.1, ADR-032): the single-task endpoint answers with it
 	// inside the retention window.
 	Settled(taskID string) (registry.TaskEntry, bool)
 	List() []registry.TaskEntry
@@ -87,7 +87,7 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 		e, ok := index.Get(taskID)
 		if !ok {
 			// A reclaimed task keeps answering with its terminal record until
-			// the retention window expires (observability.md §端点, ADR-030):
+			// the retention window expires (observability.md §端点, ADR-032):
 			// the convergence instant is no longer the end of the evidence
 			// window. Beyond it, a reclaimed task and one that never existed
 			// are again indistinguishable.

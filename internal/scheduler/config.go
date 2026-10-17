@@ -18,7 +18,7 @@ const (
 	EnvJobBootTimeout  = "FOREMAN_JOB_BOOT_TIMEOUT"
 	EnvJobDrainTimeout = "FOREMAN_JOB_DRAIN_TIMEOUT"
 	// EnvDeliveryConfirmTimeout names the S6 delivery confirmation window
-	// (ADR-030): the span a committed delivery is withheld for, after which
+	// (ADR-032): the span a committed delivery is withheld for, after which
 	// the entry without a start fact releases it for one more attempt. It
 	// must stay under JobBootTimeout, so it lives beside it rather than in
 	// the proxy's config.
@@ -40,7 +40,7 @@ const (
 	DefaultClaimBatchMax   = 32
 	DefaultJobBootTimeout  = 300 * time.Second
 	// DefaultDeliveryConfirmTimeout is the S6 delivery confirmation window
-	// (§5.1, ADR-030): comfortably above the upstream daemon's own claim
+	// (§5.1, ADR-032): comfortably above the upstream daemon's own claim
 	// budget (seconds, plus its retry margin), so a released delivery can
 	// never race a response still in flight, and well under the boot bound,
 	// which stays the entry's terminal bound.
@@ -78,7 +78,7 @@ type Config struct {
 	ClaimBatchMax   int
 	JobBootTimeout  time.Duration
 	// DeliveryConfirmTimeout is the S6 delivery confirmation window
-	// (FOREMAN_DELIVERY_CONFIRM_TIMEOUT, ADR-030): a committed delivery still
+	// (FOREMAN_DELIVERY_CONFIRM_TIMEOUT, ADR-032): a committed delivery still
 	// without a start fact once it elapses releases the payload for one more
 	// attempt on the daemon's next claim. Zero leaves the window unarmed —
 	// the delivery is committed once and the boot bound owns the entry; a
@@ -170,7 +170,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	// The delivery confirmation window is the second pre-start bound, and its
 	// whole point is to fire before the boot one: a window at or above
 	// JobBootTimeout would leave the lost-response form settling as
-	// job_boot_timeout again (ADR-030). Zero is legal by §5.1: it disarms the
+	// job_boot_timeout again (ADR-032). Zero is legal by §5.1: it disarms the
 	// convergence exit.
 	if raw := strings.TrimSpace(getenv(EnvDeliveryConfirmTimeout)); raw != "" {
 		d, err := time.ParseDuration(raw)

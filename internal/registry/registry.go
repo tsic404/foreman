@@ -32,7 +32,7 @@ type Registry struct {
 	drainTimeout time.Duration
 
 	// deliveryConfirm is FOREMAN_DELIVERY_CONFIRM_TIMEOUT: the S6 delivery
-	// confirmation window stamped at each accepted delivery commit (ADR-030).
+	// confirmation window stamped at each accepted delivery commit (ADR-032).
 	// Zero leaves the window unarmed — the delivery is then committed once
 	// and the re-delivery exit is off.
 	deliveryConfirm time.Duration
@@ -75,7 +75,7 @@ func WithDrainTimeout(d time.Duration) Option {
 }
 
 // WithDeliveryConfirmTimeout sets the S6 delivery confirmation window
-// (FOREMAN_DELIVERY_CONFIRM_TIMEOUT, ADR-030): the span each accepted delivery
+// (FOREMAN_DELIVERY_CONFIRM_TIMEOUT, ADR-032): the span each accepted delivery
 // commit withholds the payload for. Passing it without a start fact releases
 // the delivery for one more attempt on the daemon's next claim, so the window
 // bounds the re-delivery and the boot upper bound stays the entry's terminal
@@ -249,7 +249,7 @@ func (r *Registry) DoneAt(taskID string) (time.Time, bool) {
 // Settled returns the retained terminal record of taskID (contract §3.1):
 // the entry's terminal projection, still answerable after the credential
 // reclaim deleted the live row, until the retention window expires. It backs
-// the ops endpoint's post-hoc query face (ADR-030); the record never carries
+// the ops endpoint's post-hoc query face (ADR-032); the record never carries
 // the payload body or the token digest.
 func (r *Registry) Settled(taskID string) (TaskEntry, bool) {
 	e, _, ok := r.done.get(taskID)
@@ -301,7 +301,7 @@ func (r *Registry) MarkTerminal(taskID string, result Result, reason string, com
 	if first {
 		// The settled record is the projection at the verdict instant: it is
 		// what the ops endpoint keeps answering with once the credential
-		// reclaim deletes the live row (ADR-030).
+		// reclaim deletes the live row (ADR-032).
 		r.done.put(taskID, e.CompletedAt, settledRecord(e))
 	}
 	r.live[taskID] = e
@@ -379,7 +379,7 @@ func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntr
 // what the daemon received (observability.md §端点). Only a claim gate the
 // entry passes transitions (deliverable); without the single-lock check, two
 // concurrent claims could both pass the test before either writes. It also
-// (re-)arms the delivery confirmation window (ADR-030): the entry's delivery
+// (re-)arms the delivery confirmation window (ADR-032): the entry's delivery
 // deadline is the commit instant plus FOREMAN_DELIVERY_CONFIRM_TIMEOUT, and
 // each accepted delivery stamps its own window.
 func (r *Registry) MarkDelivering(daemonID string, at time.Time, delivered json.RawMessage) (TaskEntry, bool) {
@@ -403,7 +403,7 @@ func (r *Registry) MarkDelivering(daemonID string, at time.Time, delivered json.
 // deliverable is the S6 gate: the entry's first delivery, or the re-delivery
 // an expired confirmation window released. A started, terminal or draining
 // entry is never deliverable, and so is a delivered entry whose window is
-// still open — the commit the daemon has not answered yet (ADR-030).
+// still open — the commit the daemon has not answered yet (ADR-032).
 func deliverable(e TaskEntry, at time.Time) bool {
 	if e.State == StateDaemonRegistered && e.DeliveredAt.IsZero() {
 		return true

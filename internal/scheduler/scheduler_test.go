@@ -936,7 +936,7 @@ func TestDeliverHandsTaskOnceWithRuntimeRewrite(t *testing.T) {
 	}
 }
 
-// TestDeliverRearmsAnUnconfirmedDelivery guards ADR-030's recovery: the
+// TestDeliverRearmsAnUnconfirmedDelivery guards ADR-032's recovery: the
 // confirmation window withholds a committed delivery, and once it expires the
 // same single delivery path hands the same body over again on the daemon's
 // next claim — the lost-response form recovers instead of failing the task.

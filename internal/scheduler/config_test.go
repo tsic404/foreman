@@ -115,7 +115,7 @@ func TestLoadConfigClampsClaimBatchToServerCeiling(t *testing.T) {
 }
 
 // TestLoadConfigDeliveryConfirmWindow guards §5.1's window semantics
-// (ADR-030): 30s by default, an explicit lower value accepted, and 0 legal —
+// (ADR-032): 30s by default, an explicit lower value accepted, and 0 legal —
 // it disarms the convergence exit.
 func TestLoadConfigDeliveryConfirmWindow(t *testing.T) {
 	cfg, err := LoadConfig(testEnv(nil))
@@ -169,7 +169,7 @@ func TestLoadConfigRejectsBadValues(t *testing.T) {
 		{EnvModelCatalogTimeout: "0s"},
 		{EnvReconcileInterval: "-1s"},
 		// The delivery confirmation window has to fire before the boot bound
-		// (ADR-030): a negative one is meaningless, one at the bound is the
+		// (ADR-032): a negative one is meaningless, one at the bound is the
 		// form the window exists to replace.
 		{EnvDeliveryConfirmTimeout: "-1s"},
 		{EnvDeliveryConfirmTimeout: "300s"},

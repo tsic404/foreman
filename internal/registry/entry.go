@@ -94,7 +94,7 @@ type TaskEntry struct {
 	DeliveredAt time.Time `json:"delivered_at"`
 	// Deliveries counts the delivery commits this entry accepted: 1 for the
 	// single-delivery form, more when expired confirmation windows released
-	// the payload for another attempt (contract §3.1, ADR-030).
+	// the payload for another attempt (contract §3.1, ADR-032).
 	Deliveries int `json:"deliveries"`
 	// ClaimsAfterDelivery counts the S6 claim calls answered with an empty
 	// batch after this entry's delivery was committed (contract §3.1): > 0
@@ -120,7 +120,7 @@ type TaskEntry struct {
 	TokenHash     string    `json:"-"`
 
 	// DeliveryDeadline is the S6 delivery confirmation window's expiry
-	// (contract §1.2, ADR-030): stamped at each accepted delivery commit from
+	// (contract §1.2, ADR-032): stamped at each accepted delivery commit from
 	// FOREMAN_DELIVERY_CONFIRM_TIMEOUT. Passing it with no start fact
 	// releases the delivery for another attempt (the re-arm), so the window
 	// bounds the re-delivery rather than the entry. Zero means no window is
@@ -180,7 +180,7 @@ func (e TaskEntry) IsTerminal() bool { return e.State == StateTerminal }
 func (e TaskEntry) IsDraining() bool { return e.JobPhase == JobPhaseDraining }
 
 // DeliveryRearmable reports whether an expired confirmation window released
-// this entry's delivery for another attempt (ADR-030): the entry still stands
+// this entry's delivery for another attempt (ADR-032): the entry still stands
 // on a committed delivery, no start fact arrived, and the armed window has
 // passed. It is the S6 gate's re-delivery term — and the one place that says
 // the commit the daemon never answered may be handed over again.
