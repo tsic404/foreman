@@ -734,6 +734,10 @@ func (s *Scheduler) Deliver(daemonID string, runtimeID string, maxTasks int) ([]
 
 	// The delivered body is handed to the registry so the entry keeps the
 	// delivered form, not the claim-time one (registry.MarkDelivering).
+	// The entry's pre-commit face is the one that says whether this claim is
+	// the first hand-over or a re-delivery the expired window released.
+	prevDelivered := e.DeliveredAt
+	prevClaims := e.ClaimsAfterDelivery
 	now := s.now()
 	e, ok = s.reg.MarkDelivering(daemonID, now, out)
 	if !ok {
@@ -746,6 +750,19 @@ func (s *Scheduler) Deliver(daemonID string, runtimeID string, maxTasks int) ([]
 	s.log.Info("task.delivered",
 		"task_id", e.TaskID, "job_name", e.JobName,
 		"deliver_latency_ms", now.Sub(e.ClaimedAt).Milliseconds())
+	if e.Deliveries > 1 {
+		// The window's exit (ADR-030): the delivery committed at
+		// delivered_at was never confirmed, and this claim released it. The
+		// claim itself is the evidence that the daemon is not holding that
+		// copy — a Job daemon claims only with a free task slot, and it holds
+		// one for the whole task.
+		s.log.Warn("task.delivery_rearmed",
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+			"delivered_at", registry.ProjectedTime(prevDelivered),
+			"window_seconds", e.DeliveryDeadline.Sub(e.DeliveredAt).Seconds(),
+			"claims_after_delivery", prevClaims,
+			"deliveries", e.Deliveries)
+	}
 	return []json.RawMessage{out}, nil
 }
 
@@ -946,17 +963,18 @@ func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
 }
 
 // OnDeliveryUnconfirmed handles the S6 lost-response form (failure-handling
-// scenario #18, ADR-030): the delivery was committed but the confirmation
-// window expired without a start fact, so the payload never reached the
-// daemon. The task is failed on the daemon's behalf (C10,
-// failure_reason=delivery_unconfirmed) and the objects removed — the same
-// shape as OnBootTimeout, at a much earlier bound, and with the attribution
-// the form actually deserves. The task's lock keeps it from settling an entry
-// whose S8 answer is still outstanding.
+// scenario #18, ADR-030) at its terminal bound: the entry reached the boot
+// deadline on a committed delivery with no start fact, so the payload never
+// took — every attempt the confirmation window released went unconfirmed too.
+// The task is failed on the daemon's behalf (C10,
+// failure_reason=delivery_unconfirmed) and the objects removed, with the
+// attribution the form actually deserves rather than the boot face's. The
+// task's lock keeps it from settling an entry whose S8 answer is still
+// outstanding.
 //
-// The delivery is never retried: "at most once" is a delivery invariant
-// (contract §1.2), and the lost-response premise is not decidable from here
-// (ADR-030).
+// The window itself never fails an entry: it releases the delivery for
+// another attempt on the daemon's next claim. The boot bound is what ends the
+// form, and it is claim-relative, so the number of attempts is bounded by it.
 func (s *Scheduler) OnDeliveryUnconfirmed(ctx context.Context, taskID string) error {
 	defer s.SyncInflight()
 	unlock := s.taskMu.Lock(taskID)
@@ -970,7 +988,8 @@ func (s *Scheduler) OnDeliveryUnconfirmed(ctx context.Context, taskID string) er
 		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 		"delivered_at", registry.ProjectedTime(e.DeliveredAt),
 		"window_seconds", e.DeliveryDeadline.Sub(e.DeliveredAt).Seconds(),
-		"claims_after_delivery", e.ClaimsAfterDelivery)
+		"claims_after_delivery", e.ClaimsAfterDelivery,
+		"deliveries", e.Deliveries)
 	return s.failEntry(ctx, e, failReport{
 		reason:  FailureReasonDeliveryUnconfirmed,
 		message: "task delivery was never confirmed by the job daemon",

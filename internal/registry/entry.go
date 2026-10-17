@@ -86,11 +86,21 @@ type TaskEntry struct {
 	ClaimedAt          time.Time `json:"claimed_at"`
 	JobCreatedAt       time.Time `json:"job_created_at"`
 	DaemonRegisteredAt time.Time `json:"daemon_registered_at"`
-	DeliveredAt        time.Time `json:"delivered_at"`
+	// DeliveredAt is the commit instant of the delivery that stands on the
+	// entry: the first one, or the latest re-delivery once an expired
+	// confirmation window released the payload again. Once non-zero it never
+	// goes back to zero, so it also answers "was this entry ever delivered"
+	// (contract §3.1).
+	DeliveredAt time.Time `json:"delivered_at"`
+	// Deliveries counts the delivery commits this entry accepted: 1 for the
+	// single-delivery form, more when expired confirmation windows released
+	// the payload for another attempt (contract §3.1, ADR-030).
+	Deliveries int `json:"deliveries"`
 	// ClaimsAfterDelivery counts the S6 claim calls answered with an empty
 	// batch after this entry's delivery was committed (contract §3.1): > 0
-	// means the daemon kept asking, i.e. the request arrived and the response
-	// was lost, rather than the request never arriving.
+	// means the daemon kept asking inside the confirmation window, i.e. the
+	// request arrived and the response was lost, rather than the request
+	// never arriving.
 	ClaimsAfterDelivery int       `json:"claims_after_delivery"`
 	StartedAt           time.Time `json:"started_at"`
 	BootDeadline        time.Time `json:"boot_deadline"`
@@ -110,9 +120,12 @@ type TaskEntry struct {
 	TokenHash     string    `json:"-"`
 
 	// DeliveryDeadline is the S6 delivery confirmation window's expiry
-	// (contract §1.2, ADR-030): written once at the delivery commit from
-	// FOREMAN_DELIVERY_CONFIRM_TIMEOUT. Zero means no window is armed — the
-	// entry then converges through the boot upper bound alone.
+	// (contract §1.2, ADR-030): stamped at each accepted delivery commit from
+	// FOREMAN_DELIVERY_CONFIRM_TIMEOUT. Passing it with no start fact
+	// releases the delivery for another attempt (the re-arm), so the window
+	// bounds the re-delivery rather than the entry. Zero means no window is
+	// armed: either nothing was delivered yet, or the re-delivery exit is
+	// configured off and the boot bound alone owns the entry.
 	DeliveryDeadline time.Time `json:"-"`
 
 	// CompletedAt is the verdict instant, the stamp the settled index keeps
@@ -165,6 +178,27 @@ func (e TaskEntry) IsTerminal() bool { return e.State == StateTerminal }
 // valid until the Job's pods are gone or the drain upper bound expires
 // (ADR-017).
 func (e TaskEntry) IsDraining() bool { return e.JobPhase == JobPhaseDraining }
+
+// DeliveryRearmable reports whether an expired confirmation window released
+// this entry's delivery for another attempt (ADR-030): the entry still stands
+// on a committed delivery, no start fact arrived, and the armed window has
+// passed. It is the S6 gate's re-delivery term — and the one place that says
+// the commit the daemon never answered may be handed over again.
+func (e TaskEntry) DeliveryRearmable(at time.Time) bool {
+	return e.State == StateDelivering && e.StartedAt.IsZero() &&
+		!e.DeliveredAt.IsZero() && !e.DeliveryDeadline.IsZero() &&
+		at.After(e.DeliveryDeadline)
+}
+
+// DeliveryUnconfirmed reports a delivered entry still without a start fact
+// that this claim may not re-deliver: the window is open (the response may be
+// in flight and the daemon may still be preparing the payload it received) or
+// no window is configured at all. An empty batch answering it is the
+// lost-response signature (observability.md §指标 result=empty_unconfirmed).
+func (e TaskEntry) DeliveryUnconfirmed(at time.Time) bool {
+	return e.State == StateDelivering && e.StartedAt.IsZero() &&
+		!e.DeliveredAt.IsZero() && !e.DeliveryRearmable(at)
+}
 
 // JobRuntime is the fake runtime registered to a Job's daemon (contract §3.3).
 type JobRuntime struct {

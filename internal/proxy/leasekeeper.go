@@ -22,9 +22,10 @@ type LeaseClient interface {
 // LeaseHooks are the scheduler's settlement entries the LeaseKeeper drives
 // (proxy.md §prepare-lease 保活).
 type LeaseHooks interface {
-	// OnDeliveryUnconfirmed settles the S6 lost-response form: the delivery
-	// was committed but the confirmation window expired without a start fact
-	// (failure-handling scenario #18, ADR-030).
+	// OnDeliveryUnconfirmed settles the S6 lost-response form: the entry
+	// reached the boot bound on a committed delivery without a start fact, so
+	// no delivery attempt was ever confirmed (failure-handling scenario #18,
+	// ADR-030).
 	OnDeliveryUnconfirmed(ctx context.Context, taskID string) error
 	// OnBootTimeout fails the task (failure-handling scenario #4).
 	OnBootTimeout(ctx context.Context, taskID string) error
@@ -36,9 +37,11 @@ type LeaseHooks interface {
 
 // LeaseKeeper renews prepare leases (C4) for tasks that are claimed but not
 // yet started, every FOREMAN_LEASE_REFRESH_INTERVAL (must stay < the 45s
-// server lease, §1.1 C3). It also enforces both pre-start bounds: the S6
-// delivery confirmation window (scenario #18, ADR-030) and the boot deadline
-// (scenario #4).
+// server lease, §1.1 C3). It also enforces the pre-start terminal bound, the
+// boot deadline (scenario #4), with the S6 delivery attribution split
+// (scenario #18, ADR-030); the delivery confirmation window itself is not a
+// bound here — it releases the delivery for another attempt on the claim
+// path.
 type LeaseKeeper struct {
 	client   LeaseClient
 	reg      *registry.Registry
@@ -97,22 +100,23 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 			k.log.Info("lease.renewed",
 				"task_id", e.TaskID, "job_name", e.JobName,
 				"lease_keep_until", registry.ProjectedTime(until))
-			// Two pre-start bounds, in firing order. The delivery
-			// confirmation window is the earlier one for a delivered entry,
-			// but that ordering is per entry, not a property of the config
-			// relation: the window is delivery-relative and the boot bound is
-			// claim-relative, so a late delivery can put the boot bound first.
-			// Hence the boot branch owns only entries whose window was never
-			// armed — never delivered, or the exit is off — and a delivered
-			// entry always keeps its own attribution (ADR-030).
+			// One terminal bound for the pre-start forms: the boot deadline,
+			// claim-relative. The delivery confirmation window no longer ends
+			// an entry — passing it with no start fact releases the delivery
+			// for another attempt on the daemon's next claim (ADR-030), so an
+			// entry whose daemon is preparing a payload it did receive is not
+			// killed by it. The attribution splits on whether a delivery was
+			// ever committed: an entry that was handed the payload and never
+			// started it did not fail to boot, its delivery never landed.
 			switch {
-			case !e.DeliveryDeadline.IsZero() && now.After(e.DeliveryDeadline):
-				if herr := k.hooks.OnDeliveryUnconfirmed(ctx, e.TaskID); herr != nil {
-					k.log.Error("delivery-unconfirmed settlement failed", "task_id", e.TaskID, "err", herr)
-				}
-			case e.DeliveryDeadline.IsZero() && now.After(e.BootDeadline):
+			case !now.After(e.BootDeadline):
+			case e.DeliveredAt.IsZero():
 				if herr := k.hooks.OnBootTimeout(ctx, e.TaskID); herr != nil {
 					k.log.Error("boot-timeout settlement failed", "task_id", e.TaskID, "err", herr)
+				}
+			default:
+				if herr := k.hooks.OnDeliveryUnconfirmed(ctx, e.TaskID); herr != nil {
+					k.log.Error("delivery-unconfirmed settlement failed", "task_id", e.TaskID, "err", herr)
 				}
 			}
 		case err == nil && !ready:

@@ -295,6 +295,79 @@ func TestMarkDelivering(t *testing.T) {
 	}
 }
 
+// TestMarkDeliveringRearmsAfterTheWindow guards ADR-030's re-delivery gate:
+// an expired confirmation window releases the payload for one more commit
+// only while the entry still has no start fact, and a registry without a
+// window commits the delivery exactly once.
+func TestMarkDeliveringRearmsAfterTheWindow(t *testing.T) {
+	window := 30 * time.Second
+	r := New(fixedClock(), WithDeliveryConfirmTimeout(window))
+	e := entryFor("t1")
+	e.State = StateDaemonRegistered
+	if err := r.Put(e); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	first := json.RawMessage(`{"id":"t1","runtime_id":"rt-t1"}`)
+	got, ok := r.MarkDelivering("fm-t1", testNow, first)
+	if !ok || got.Deliveries != 1 || got.DeliveryDeadline != testNow.Add(window) {
+		t.Fatalf("first delivery = %v (%v), want one commit with the window armed", got, ok)
+	}
+	if !got.DeliveryUnconfirmed(testNow.Add(window)) || got.DeliveryRearmable(testNow.Add(window)) {
+		t.Errorf("inside the window the commit must stand, not be released: %v", got)
+	}
+	// The boundary is exclusive: the commit holds until the deadline passes.
+	if _, ok := r.MarkDelivering("fm-t1", testNow.Add(window), first); ok {
+		t.Fatal("a claim at the window's deadline re-delivered")
+	}
+
+	// Past the window the payload is released, with a fresh window and the
+	// preview serving the latest body.
+	released := testNow.Add(window + time.Second)
+	second := json.RawMessage(`{"id":"t1","runtime_id":"rt-t1","attempt":2}`)
+	got, ok = r.MarkDelivering("fm-t1", released, second)
+	if !ok {
+		t.Fatal("the expired window did not release the delivery")
+	}
+	if got.Deliveries != 2 || got.DeliveredAt != released || got.DeliveryDeadline != released.Add(window) {
+		t.Fatalf("re-delivery = %+v, want a second commit with its own window", got)
+	}
+	if string(got.Payload) != string(second) {
+		t.Errorf("payload = %s, want the re-delivered body", got.Payload)
+	}
+	if !got.DeliveryUnconfirmed(released.Add(window)) || got.DeliveryRearmable(released.Add(window)) {
+		t.Errorf("the re-delivery must re-open the window: %v", got)
+	}
+
+	// A start fact settles the delivery for good: no window releases it.
+	if _, ok := r.MarkStarted("t1", released.Add(time.Millisecond)); !ok {
+		t.Fatal("MarkStarted")
+	}
+	if _, ok := r.MarkDelivering("fm-t1", released.Add(window+time.Second), second); ok {
+		t.Fatal("a started entry was re-delivered")
+	}
+
+	// No window configured: the exit is off and the delivery is committed once.
+	r2 := New(fixedClock())
+	e2 := entryFor("t2")
+	e2.State = StateDaemonRegistered
+	if err := r2.Put(e2); err != nil {
+		t.Fatalf("Put t2: %v", err)
+	}
+	if _, ok := r2.MarkDelivering("fm-t2", testNow, first); !ok {
+		t.Fatal("first delivery refused without a window")
+	}
+	if _, ok := r2.MarkDelivering("fm-t2", testNow.Add(time.Hour), first); ok {
+		t.Fatal("a registry without a confirmation window re-delivered")
+	}
+	// Without a window the commit can never be released — it stays the
+	// unconfirmed delivery the boot bound owns.
+	stored, _ := r2.Get("t2")
+	if !stored.DeliveryUnconfirmed(testNow.Add(time.Hour)) || stored.DeliveryRearmable(testNow.Add(time.Hour)) {
+		t.Errorf("an unwindowed delivery must stay unconfirmed, not re-deliverable: %v", stored)
+	}
+}
+
 func TestDeleteCascadesRuntimeIndex(t *testing.T) {
 	r := New(fixedClock())
 	e := entryFor("t1")

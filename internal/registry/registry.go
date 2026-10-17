@@ -32,8 +32,9 @@ type Registry struct {
 	drainTimeout time.Duration
 
 	// deliveryConfirm is FOREMAN_DELIVERY_CONFIRM_TIMEOUT: the S6 delivery
-	// confirmation window stamped once at the delivery commit (ADR-030).
-	// Zero leaves the window unarmed.
+	// confirmation window stamped at each accepted delivery commit (ADR-030).
+	// Zero leaves the window unarmed — the delivery is then committed once
+	// and the re-delivery exit is off.
 	deliveryConfirm time.Duration
 
 	byJob    map[string]string // job_name → task_id
@@ -74,10 +75,12 @@ func WithDrainTimeout(d time.Duration) Option {
 }
 
 // WithDeliveryConfirmTimeout sets the S6 delivery confirmation window
-// (FOREMAN_DELIVERY_CONFIRM_TIMEOUT, ADR-030): the bound written once at the
-// delivery commit, after which an entry still without a start fact is judged
-// undelivered. Zero (the default) leaves the window unarmed, so that form
-// converges through the boot upper bound alone.
+// (FOREMAN_DELIVERY_CONFIRM_TIMEOUT, ADR-030): the span each accepted delivery
+// commit withholds the payload for. Passing it without a start fact releases
+// the delivery for one more attempt on the daemon's next claim, so the window
+// bounds the re-delivery and the boot upper bound stays the entry's terminal
+// bound. Zero (the default) leaves the window unarmed: the delivery is
+// committed exactly once and no re-delivery happens.
 func WithDeliveryConfirmTimeout(d time.Duration) Option {
 	return func(r *Registry) {
 		if d > 0 {
@@ -253,6 +256,15 @@ func (r *Registry) Settled(taskID string) (TaskEntry, bool) {
 	return e, ok
 }
 
+// Now is the registry's own clock. The S6 claim path reads it to classify an
+// empty batch (empty_unconfirmed vs empty); the delivery commit instant and its
+// confirmation deadline come from the caller's stamp instead — the scheduler
+// passes its own clock into MarkDelivering. The two sources must therefore be
+// the same one: the process wires both to time.Now and a test injects one clock
+// into both. They are not interchangeable — a second source would let the
+// deadline test and the stamp disagree at the boundary.
+func (r *Registry) Now() time.Time { return r.now() }
+
 // MarkTerminal is the single write path into the terminal state
 // (task-mapping pseudocode markTerminal): it sets state+result atomically
 // with the settled record. completedAt defaults to now. reason is the
@@ -362,29 +374,41 @@ func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntr
 	return e, true
 }
 
-// MarkDelivering atomically performs the S6 at-most-once delivery check and
-// records the delivered body as the entry's payload, so the ops preview serves
-// exactly what the daemon received (observability.md §端点). Only a
-// daemon_registered entry not yet delivered transitions; without the
-// single-lock check, two concurrent claims could both pass a delivered_at
-// test before either writes. It also arms the delivery confirmation window
-// (ADR-030): the entry's delivery deadline is the commit instant plus
-// FOREMAN_DELIVERY_CONFIRM_TIMEOUT, written here and never rewritten.
+// MarkDelivering atomically performs the S6 delivery check and records the
+// delivered body as the entry's payload, so the ops preview serves exactly
+// what the daemon received (observability.md §端点). Only a claim gate the
+// entry passes transitions (deliverable); without the single-lock check, two
+// concurrent claims could both pass the test before either writes. It also
+// (re-)arms the delivery confirmation window (ADR-030): the entry's delivery
+// deadline is the commit instant plus FOREMAN_DELIVERY_CONFIRM_TIMEOUT, and
+// each accepted delivery stamps its own window.
 func (r *Registry) MarkDelivering(daemonID string, at time.Time, delivered json.RawMessage) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.get(r.byDaemon[daemonID])
-	if !ok || e.State != StateDaemonRegistered || !e.DeliveredAt.IsZero() {
+	if !ok || !deliverable(e, at) {
 		return TaskEntry{}, false
 	}
 	e.State = StateDelivering
 	e.DeliveredAt = at
+	e.Deliveries++
 	e.Payload = delivered
 	if r.deliveryConfirm > 0 {
 		e.DeliveryDeadline = at.Add(r.deliveryConfirm)
 	}
 	r.live[e.TaskID] = e
 	return e, true
+}
+
+// deliverable is the S6 gate: the entry's first delivery, or the re-delivery
+// an expired confirmation window released. A started, terminal or draining
+// entry is never deliverable, and so is a delivered entry whose window is
+// still open — the commit the daemon has not answered yet (ADR-030).
+func deliverable(e TaskEntry, at time.Time) bool {
+	if e.State == StateDaemonRegistered && e.DeliveredAt.IsZero() {
+		return true
+	}
+	return e.DeliveryRearmable(at)
 }
 
 // NoteClaimAfterDelivery records one S6 claim answered with an empty batch

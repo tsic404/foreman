@@ -18,9 +18,10 @@ const (
 	EnvJobBootTimeout  = "FOREMAN_JOB_BOOT_TIMEOUT"
 	EnvJobDrainTimeout = "FOREMAN_JOB_DRAIN_TIMEOUT"
 	// EnvDeliveryConfirmTimeout names the S6 delivery confirmation window
-	// (ADR-030): the bound after which a committed delivery without a start
-	// fact is judged undelivered. It must stay under JobBootTimeout, so it
-	// lives beside it rather than in the proxy's config.
+	// (ADR-030): the span a committed delivery is withheld for, after which
+	// the entry without a start fact releases it for one more attempt. It
+	// must stay under JobBootTimeout, so it lives beside it rather than in
+	// the proxy's config.
 	EnvDeliveryConfirmTimeout = "FOREMAN_DELIVERY_CONFIRM_TIMEOUT"
 	EnvWorkspaceID            = "MULTICA_WORKSPACE_ID"
 	// EnvStartupProbeTimeout names the startup probe window; the design fixes
@@ -40,8 +41,9 @@ const (
 	DefaultJobBootTimeout  = 300 * time.Second
 	// DefaultDeliveryConfirmTimeout is the S6 delivery confirmation window
 	// (§5.1, ADR-030): comfortably above the upstream daemon's own claim
-	// budget (seconds, plus its retry margin) and well under the boot bound,
-	// so the lost-response form settles long before the boot window expires.
+	// budget (seconds, plus its retry margin), so a released delivery can
+	// never race a response still in flight, and well under the boot bound,
+	// which stays the entry's terminal bound.
 	DefaultDeliveryConfirmTimeout = 30 * time.Second
 	// DefaultJobDrainTimeout is the credential-reclaim upper bound that
 	// follows a task's verdict (FOREMAN_JOB_DRAIN_TIMEOUT, ADR-017). A
@@ -76,10 +78,11 @@ type Config struct {
 	ClaimBatchMax   int
 	JobBootTimeout  time.Duration
 	// DeliveryConfirmTimeout is the S6 delivery confirmation window
-	// (FOREMAN_DELIVERY_CONFIRM_TIMEOUT, ADR-030): after a committed
-	// delivery, an entry still without a start fact is judged undelivered.
-	// Zero leaves the window unarmed, so that form converges through the boot
-	// bound alone; a non-zero value must stay under JobBootTimeout.
+	// (FOREMAN_DELIVERY_CONFIRM_TIMEOUT, ADR-030): a committed delivery still
+	// without a start fact once it elapses releases the payload for one more
+	// attempt on the daemon's next claim. Zero leaves the window unarmed —
+	// the delivery is committed once and the boot bound owns the entry; a
+	// non-zero value must stay under JobBootTimeout.
 	DeliveryConfirmTimeout time.Duration
 	// JobDrainTimeout bounds the window between a task's verdict and the
 	// credential reclaim (ADR-017). Zero means "do not wait": the reclaim

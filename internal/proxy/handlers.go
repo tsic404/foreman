@@ -267,12 +267,14 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	// Read the delivery face before the delivery attempt: an empty batch that
 	// answers an already-committed delivery is the lost-response signature
-	// (ADR-030), and the state that tells the two kinds of empty batch apart
-	// is gone once the entry settles. A decided entry's empty batches are the
-	// designed ones (drain never delivers), so they stay plain empties.
+	// (ADR-030), and the face that tells the kinds of empty batch apart is gone
+	// once the entry settles. A decided entry's empty batches are the designed
+	// ones (drain never delivers), so they stay plain empties. The commit count
+	// is the classification's monotone fact — a commit that is not the first one
+	// is the re-delivery the expired window released — while the window test
+	// itself stays in the registry's gate (one clock, one decision).
 	pending, pendingOK := s.reg.ByDaemon(req.DaemonID)
-	unconfirmed := pendingOK && !pending.IsTerminal() &&
-		!pending.DeliveredAt.IsZero() && pending.StartedAt.IsZero()
+	unconfirmed := pendingOK && pending.DeliveryUnconfirmed(s.reg.Now())
 	tasks, err := s.sched.Deliver(req.DaemonID, runtimeID, req.MaxTasks)
 	if err != nil {
 		if errors.Is(err, scheduler.ErrUnknownDaemon) || errors.Is(err, scheduler.ErrRuntimeMismatch) {
@@ -284,14 +286,19 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
+	case len(tasks) > 0 && pendingOK && pending.Deliveries > 0:
+		// The window's exit: the delivery committed at delivered_at was never
+		// confirmed, and this claim exercised the re-delivery the registry's
+		// gate released (the scheduler records the event).
+		s.metrics.DeliveryClaim(DeliveryClaimRedelivered)
 	case len(tasks) > 0:
 		s.metrics.DeliveryClaim(DeliveryClaimDelivered)
 		if pendingOK {
 			s.metrics.DeliveryLatency(time.Since(pending.ClaimedAt).Seconds())
 		}
 	case unconfirmed:
-		// The daemon keeps asking although the delivery is committed: the
-		// request arrived and the response was lost, which is what the
+		// The daemon keeps asking inside the window (or with the exit off):
+		// the request arrived and the response was lost, which is what the
 		// per-entry counter records for the post-hoc query face.
 		s.metrics.DeliveryClaim(DeliveryClaimEmptyUnconfirmed)
 		s.reg.NoteClaimAfterDelivery(pending.TaskID)

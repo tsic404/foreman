@@ -38,11 +38,14 @@ type Metrics interface {
 const EndpointAgentAPI = "agent-api"
 
 // S6 claim result label values (observability.md foreman_delivery_claims_total,
-// ADR-030): delivered = the payload was handed over; empty = an empty batch;
-// empty_unconfirmed = an empty batch answering an entry whose delivery was
-// already committed but not yet confirmed — the lost-response signature.
+// ADR-030): delivered = the payload was handed over; redelivered = the payload
+// was handed over again after the confirmation window released a delivery that
+// went unconfirmed; empty = an empty batch; empty_unconfirmed = an empty batch
+// answering an entry whose delivery was committed and is still inside its
+// confirmation window — the lost-response signature.
 const (
 	DeliveryClaimDelivered        = "delivered"
+	DeliveryClaimRedelivered      = "redelivered"
 	DeliveryClaimEmpty            = "empty"
 	DeliveryClaimEmptyUnconfirmed = "empty_unconfirmed"
 )

@@ -338,6 +338,13 @@ type fixture struct {
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
+	return newFixtureWith(t)
+}
+
+// newFixtureWith is newFixture plus extra registry options, e.g. the S6
+// delivery confirmation window a re-delivery scenario needs armed.
+func newFixtureWith(t *testing.T, opts ...registry.Option) *fixture {
+	t.Helper()
 	f := &fixture{
 		jobs:    &fakeJobs{},
 		server:  &fakeServer{},
@@ -350,7 +357,8 @@ func newFixture(t *testing.T) *fixture {
 	// The registry shares the fixture clock: with the real clock its done
 	// index (TTL 24h) would expire entries stamped at testNow and the suite
 	// would rot with wall time.
-	f.reg = registry.New(func() time.Time { return f.now }, registry.WithDrainTimeout(testDrainTimeout))
+	f.reg = registry.New(func() time.Time { return f.now },
+		append([]registry.Option{registry.WithDrainTimeout(testDrainTimeout)}, opts...)...)
 	cfg, err := LoadConfig(testEnv(nil))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
@@ -923,6 +931,76 @@ func TestDeliverHandsTaskOnceWithRuntimeRewrite(t *testing.T) {
 	got, err = f.sched.Deliver(e.DaemonID, e.JobRuntimeID, 1)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("second Deliver = %v, %v", got, err)
+	}
+}
+
+// TestDeliverRearmsAnUnconfirmedDelivery guards ADR-030's recovery: the
+// confirmation window withholds a committed delivery, and once it expires the
+// same single delivery path hands the same body over again on the daemon's
+// next claim — the lost-response form recovers instead of failing the task.
+// The window is the only thing holding the payload back, so it is also the
+// re-delivery's interval, and a start fact settles it for good.
+func TestDeliverRearmsAnUnconfirmedDelivery(t *testing.T) {
+	window := 30 * time.Second
+	f := newFixtureWith(t, registry.WithDeliveryConfirmTimeout(window))
+	logs := newLogScheduler(t, f, slog.LevelDebug)
+	e := f.claim(t, "task-1")
+	if _, ok := f.reg.MarkDaemonRegistered(e.DaemonID, testNow); !ok {
+		t.Fatal("MarkDaemonRegistered failed")
+	}
+
+	first, err := f.sched.Deliver(e.DaemonID, e.JobRuntimeID, 1)
+	if err != nil || len(first) != 1 {
+		t.Fatalf("first Deliver = %v, %v", first, err)
+	}
+	if entry, _ := f.reg.Get("task-1"); entry.Deliveries != 1 {
+		t.Fatalf("deliveries = %d, want 1", entry.Deliveries)
+	}
+
+	// Inside the window the commit stands: the response may still be in
+	// flight, so the daemon's claim is answered empty.
+	f.now = testNow.Add(window - time.Second)
+	if got, err := f.sched.Deliver(e.DaemonID, e.JobRuntimeID, 1); err != nil || len(got) != 0 {
+		t.Fatalf("in-window Deliver = %v, %v, want an empty batch", got, err)
+	}
+
+	// Past the window the payload is released: the next claim is the
+	// re-delivery, byte-identical to the first hand-over.
+	f.now = testNow.Add(window + time.Second)
+	second, err := f.sched.Deliver(e.DaemonID, e.JobRuntimeID, 1)
+	if err != nil || len(second) != 1 {
+		t.Fatalf("re-delivery = %v, %v, want the payload again", second, err)
+	}
+	if !bytes.Equal(first[0], second[0]) {
+		t.Fatalf("re-delivered body = %s, want the first delivery's %s", second[0], first[0])
+	}
+	entry, _ := f.reg.Get("task-1")
+	if entry.Deliveries != 2 || entry.State != registry.StateDelivering || !entry.StartedAt.IsZero() {
+		t.Fatalf("entry after the re-delivery = %+v, want two commits and no start fact", entry)
+	}
+
+	// The anomaly is witnessed once, with the commit it recovered.
+	record := findLogRecord(t, logs.Bytes(), "task.delivery_rearmed")
+	if got := record["task_id"]; got != "task-1" {
+		t.Errorf("task_id = %v", got)
+	}
+	if got, _ := record["deliveries"].(float64); got != 2 {
+		t.Errorf("deliveries = %v, want 2", record["deliveries"])
+	}
+	if got, _ := record["delivered_at"].(string); got != registry.ProjectedTime(testNow) {
+		t.Errorf("delivered_at = %v, want the unconfirmed commit %s", record["delivered_at"], registry.ProjectedTime(testNow))
+	}
+	if n := len(collectLogRecords(t, logs.Bytes(), "task.delivery_rearmed")); n != 1 {
+		t.Errorf("task.delivery_rearmed records = %d, want 1", n)
+	}
+
+	// A start fact settles the delivery: the window never releases it again.
+	if _, ok := f.reg.MarkStarted("task-1", f.now); !ok {
+		t.Fatal("MarkStarted failed")
+	}
+	f.now = f.now.Add(window + time.Second)
+	if got, err := f.sched.Deliver(e.DaemonID, e.JobRuntimeID, 1); err != nil || len(got) != 0 {
+		t.Fatalf("post-start Deliver = %v, %v, want an empty batch", got, err)
 	}
 }
 
