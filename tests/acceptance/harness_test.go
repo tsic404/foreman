@@ -494,10 +494,11 @@ type builder struct {
 }
 
 func (b *builder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
-	name := "fm-" + e.TaskID
-	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name}}
-	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name + "-cred"}}
-	return job, secret, "hash-" + name, nil
+	// Mirror the production builder: the scheduler derives the Job name and
+	// hands it in; the Secret is that name's credential.
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: e.JobName}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: registry.CredName(e.JobName)}}
+	return job, secret, "hash-" + e.JobName, nil
 }
 
 func (b *builder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
@@ -747,6 +748,15 @@ const (
 	deliveryConfirmWindow = 300 * time.Millisecond
 	leaseKeeperInterval   = 20 * time.Millisecond
 )
+
+// derivedJobName is the Job name the scheduler derives for the acceptance
+// claim payloads: they carry neither an issue_identifier nor an agent.name, so
+// both readable segments take their fallbacks (contract §3.1). Deriving it
+// through the production helper keeps every token, daemon_id and cleanup
+// assertion on the name the scheduler actually chose.
+func derivedJobName(taskID string) string {
+	return registry.JobName(taskID, "", "")
+}
 
 func newHarness(t *testing.T, catalogEnabled bool) *harness {
 	t.Helper()

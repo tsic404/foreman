@@ -47,6 +47,7 @@ type fakeJobs struct {
 	deleteJobErr    error
 	deleteSecretErr error
 	getJobErr       error
+	listJobsErr     error
 	listPodsErr     error
 
 	// existingJobs models Jobs already in the cluster: CreateJob answers
@@ -163,7 +164,12 @@ func (f *fakeJobs) secretDeleted(name string) bool {
 	return false
 }
 
-func (f *fakeJobs) ListJobs(context.Context) ([]batchv1.Job, error) { return f.jobs, nil }
+func (f *fakeJobs) ListJobs(context.Context) ([]batchv1.Job, error) {
+	if f.listJobsErr != nil {
+		return nil, f.listJobsErr
+	}
+	return f.jobs, nil
+}
 
 func (f *fakeJobs) ListSecrets(context.Context) ([]corev1.Secret, error) { return f.secrets, nil }
 
@@ -256,11 +262,11 @@ func (f *fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secre
 	}
 	job := f.job
 	if job == nil {
-		job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "fm-" + e.TaskID}}
+		job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: e.JobName}}
 	}
 	secret := f.secret
 	if secret == nil {
-		secret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fm-" + e.TaskID + "-cred"}}
+		secret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: registry.CredName(e.JobName)}}
 	}
 	hash := f.tokenHash
 	if hash == "" {
@@ -404,6 +410,11 @@ func claimPayload(id string) json.RawMessage {
 	}`, id))
 }
 
+// derivedJobName is the Job name the scheduler derives from claimPayload for
+// taskID: issue_identifier MULTI-1 and no agent name (contract §3.1). Tests
+// that assert on an OnClaim-built name use it instead of a literal.
+func derivedJobName(taskID string) string { return registry.JobName(taskID, "MULTI-1", "") }
+
 // resumeClaimPayload is the resume form of claimPayload: the payload names the
 // session file it continues, which is the soft affinity key source (ADR-015).
 func resumeClaimPayload(id, priorSession string) json.RawMessage {
@@ -442,7 +453,8 @@ func TestOnClaimCreatesSecretJobAndEntry(t *testing.T) {
 	if e.State != registry.StateJobCreated {
 		t.Fatalf("state = %v, want job_created", e.State)
 	}
-	wantName := "fm-task-1"
+	wantName := derivedJobName("task-1")
+	wantCred := registry.CredName(wantName)
 	if e.JobName != wantName || e.DaemonID != wantName || e.JobNamespace != "multica-agents" {
 		t.Fatalf("identity fields: %+v", e)
 	}
@@ -458,14 +470,14 @@ func TestOnClaimCreatesSecretJobAndEntry(t *testing.T) {
 	if want := testNow.Add(PrepareLeaseTTL); !e.LeaseKeepUntil.Equal(want) {
 		t.Fatalf("lease_keep_until = %v, want %v", e.LeaseKeepUntil, want)
 	}
-	if len(f.jobs.createdSecrets) != 1 || f.jobs.createdSecrets[0].Name != wantName+"-cred" {
+	if len(f.jobs.createdSecrets) != 1 || f.jobs.createdSecrets[0].Name != wantCred {
 		t.Fatalf("secrets created: %+v", f.jobs.createdSecrets)
 	}
 	if len(f.jobs.createdJobs) != 1 || f.jobs.createdJobs[0].Name != wantName {
 		t.Fatalf("jobs created: %+v", f.jobs.createdJobs)
 	}
 	// Stale-secret sweep happens before create (idempotent retry path).
-	if len(f.jobs.deletedSecrets) != 1 || f.jobs.deletedSecrets[0] != wantName+"-cred" {
+	if len(f.jobs.deletedSecrets) != 1 || f.jobs.deletedSecrets[0] != wantCred {
 		t.Fatalf("stale secret sweep: %+v", f.jobs.deletedSecrets)
 	}
 	if f.builder.got.TaskID != "task-1" || f.builder.got.WorkspaceID != "ws-1" {
@@ -473,6 +485,41 @@ func TestOnClaimCreatesSecretJobAndEntry(t *testing.T) {
 	}
 	if f.metrics.claimed != 1 || f.metrics.inflight[len(f.metrics.inflight)-1] != 1 {
 		t.Fatalf("metrics: %+v", f.metrics)
+	}
+}
+
+// TestOnClaimPurgesForeignJob covers contract §1.3「旧名残留」: a
+// previous naming rule may have left this task's Job/Secret behind under a
+// name the current derivation would never build. OnClaim finds it by the
+// task-id label — the identity face — and removes it with its credential;
+// another task's Job and the Job already at the derived name are untouched.
+func TestOnClaimPurgesForeignJob(t *testing.T) {
+	f := newFixture(t)
+	stale := "fm-legacy-task1"
+	foreign := "fm-legacy-other"
+	derived := derivedJobName("task-1")
+	f.jobs.jobs = []batchv1.Job{
+		{ObjectMeta: metav1.ObjectMeta{Name: stale, Labels: map[string]string{registry.LabelTaskID: "task-1"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: foreign, Labels: map[string]string{registry.LabelTaskID: "task-2"}}},
+		{ObjectMeta: metav1.ObjectMeta{Name: derived, Labels: map[string]string{registry.LabelTaskID: "task-1"}}},
+	}
+
+	e := f.claim(t, "task-1")
+	if e.JobName != derived {
+		t.Fatalf("job name = %q, want %q", e.JobName, derived)
+	}
+	if !f.jobs.deleted(stale) {
+		t.Errorf("stale Job %s not deleted: %v", stale, f.jobs.deletedJobs)
+	}
+	if !f.jobs.secretDeleted(registry.CredName(stale)) {
+		t.Errorf("the stale Job's Secret not deleted: %v", f.jobs.deletedSecrets)
+	}
+	if f.jobs.deleted(foreign) || f.jobs.secretDeleted(registry.CredName(foreign)) {
+		t.Errorf("another task's objects purged: jobs=%v secrets=%v",
+			f.jobs.deletedJobs, f.jobs.deletedSecrets)
+	}
+	if f.jobs.deleted(derived) {
+		t.Errorf("the derived-name Job was purged: %v", f.jobs.deletedJobs)
 	}
 }
 
@@ -530,13 +577,15 @@ func TestClaimRollsBackObjectsWhenEntryLeftDuringJobCreate(t *testing.T) {
 			if err == nil {
 				t.Fatal("OnClaim must fail once the entry left the registry")
 			}
-			if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != "fm-task-1" {
+			wantJob := derivedJobName("task-1")
+			wantCred := registry.CredName(wantJob)
+			if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != wantJob {
 				t.Errorf("deletedJobs = %v, want the entry-less Job rolled back", f.jobs.deletedJobs)
 			}
 			// The stale-secret sweep runs before the create, the rollback
 			// after it: the credential Secret is deleted twice in this path.
 			if len(f.jobs.deletedSecrets) != 2 ||
-				f.jobs.deletedSecrets[0] != "fm-task-1-cred" || f.jobs.deletedSecrets[1] != "fm-task-1-cred" {
+				f.jobs.deletedSecrets[0] != wantCred || f.jobs.deletedSecrets[1] != wantCred {
 				t.Errorf("secret rollback: %v", f.jobs.deletedSecrets)
 			}
 			if _, ok := f.reg.Get("task-1"); ok && tc.name == "reclaimed" {
@@ -647,7 +696,7 @@ func TestDuplicateClaimPreStartReplacesEntry(t *testing.T) {
 	if len(f.jobs.createdJobs) != 2 {
 		t.Fatalf("jobs created = %d, want 2", len(f.jobs.createdJobs))
 	}
-	if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != "fm-task-1" {
+	if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != derivedJobName("task-1") {
 		t.Fatalf("old Job not deleted: %+v", f.jobs.deletedJobs)
 	}
 	e, _ := f.reg.Get("task-1")
@@ -665,13 +714,14 @@ func TestDuplicateClaimWaitsForTerminatingJobName(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
 	f.server.status = "dispatched"
-	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
-	f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
+	name := derivedJobName("task-1")
+	f.jobs.existingJobs = map[string]*batchv1.Job{name: {ObjectMeta: metav1.ObjectMeta{Name: name}}}
+	f.jobs.terminatingJobs = map[string]bool{name: true}
 	probes := 0
 	f.jobs.onGetJob = func() {
 		probes++
 		if probes >= 2 {
-			delete(f.jobs.existingJobs, "fm-task-1") // the cascade finished
+			delete(f.jobs.existingJobs, name) // the cascade finished
 		}
 	}
 
@@ -697,8 +747,9 @@ func TestClaimDefersWhileJobNameStillHeld(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
 	f.server.status = "dispatched"
-	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
-	f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
+	name := derivedJobName("task-1")
+	f.jobs.existingJobs = map[string]*batchv1.Job{name: {ObjectMeta: metav1.ObjectMeta{Name: name}}}
+	f.jobs.terminatingJobs = map[string]bool{name: true}
 	f.jobs.onGetJob = func() { f.now = f.now.Add(jobNameWait + time.Second) }
 
 	err := f.sched.OnClaim(context.Background(), claimPayload("task-1"))
@@ -721,8 +772,9 @@ func TestClaimDefersWhileJobNameStillHeld(t *testing.T) {
 // job_created without waiting.
 func TestClaimKeepsReplayedJobOnAlreadyExists(t *testing.T) {
 	f := newFixture(t)
-	f.jobs.createJobErr = apierrors.NewAlreadyExists(schema.GroupResource{Group: "batch", Resource: "jobs"}, "fm-task-1")
-	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
+	name := derivedJobName("task-1")
+	f.jobs.createJobErr = apierrors.NewAlreadyExists(schema.GroupResource{Group: "batch", Resource: "jobs"}, name)
+	f.jobs.existingJobs = map[string]*batchv1.Job{name: {ObjectMeta: metav1.ObjectMeta{Name: name}}}
 
 	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
 		t.Fatalf("OnClaim: %v", err)
@@ -745,8 +797,9 @@ func TestClaimProbeErrorDoesNotFailTask(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
 	f.server.status = "dispatched"
-	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
-	f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
+	name := derivedJobName("task-1")
+	f.jobs.existingJobs = map[string]*batchv1.Job{name: {ObjectMeta: metav1.ObjectMeta{Name: name}}}
+	f.jobs.terminatingJobs = map[string]bool{name: true}
 	f.jobs.getJobErr = errors.New("apiserver unavailable")
 	f.jobs.onGetJob = func() { f.now = f.now.Add(jobNameWait + time.Second) }
 
@@ -769,15 +822,16 @@ func TestClaimProbeErrorClearsAndJobIsCreated(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
 	f.server.status = "dispatched"
-	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
-	f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
+	name := derivedJobName("task-1")
+	f.jobs.existingJobs = map[string]*batchv1.Job{name: {ObjectMeta: metav1.ObjectMeta{Name: name}}}
+	f.jobs.terminatingJobs = map[string]bool{name: true}
 	f.jobs.getJobErr = errors.New("apiserver unavailable")
 	probes := 0
 	f.jobs.onGetJob = func() {
 		probes++
 		if probes >= 2 {
 			f.jobs.getJobErr = nil
-			delete(f.jobs.existingJobs, "fm-task-1")
+			delete(f.jobs.existingJobs, name)
 		}
 	}
 
@@ -1068,7 +1122,7 @@ func TestOnReportStart409SettlesStaleClaim(t *testing.T) {
 	if !f.reg.IsDone("t-409") {
 		t.Fatal("the terminal write must land in the done index")
 	}
-	if f.hasJob("fm-t-409") {
+	if f.hasJob(derivedJobName("t-409")) {
 		t.Fatal("Job must be deleted after the refused start")
 	}
 	if got := f.metrics.terminal; len(got) != 1 || got[0] != "failed" {
@@ -1110,7 +1164,7 @@ func TestOnReportStart409RunningAdoptsEntry(t *testing.T) {
 	if !ok || got.State != registry.StateRunning || got.StartedAt.IsZero() {
 		t.Fatalf("entry = %+v, want running (the lost 200 must not fail the task)", got)
 	}
-	if !f.hasJob("fm-t-adopt") {
+	if !f.hasJob(derivedJobName("t-adopt")) {
 		t.Fatal("the Job of an adopted running task must be kept")
 	}
 	if len(f.server.forwards) != 1 || f.server.forwards[0].ep != EPStart {
@@ -1141,7 +1195,7 @@ func TestOnReportStart409TerminalSettlesToServer(t *testing.T) {
 	if !f.reg.IsDone("t-done") {
 		t.Fatal("the terminal write must land in the done index")
 	}
-	if f.hasJob("fm-t-done") {
+	if f.hasJob(derivedJobName("t-done")) {
 		t.Fatal("Job must be deleted after settling to the server's terminal state")
 	}
 	if got := f.metrics.terminal; len(got) != 1 || got[0] != "completed" {
@@ -1169,7 +1223,7 @@ func TestOnReportStart409VanishedReleases(t *testing.T) {
 	if e, ok := f.reg.Get("t-gone"); !ok || !e.IsTerminal() || !e.IsDraining() {
 		t.Fatalf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
-	if f.hasJob("fm-t-gone") {
+	if f.hasJob(derivedJobName("t-gone")) {
 		t.Fatal("Job must be deleted with the vanished task")
 	}
 	if len(f.server.forwards) != 1 {
@@ -1226,7 +1280,7 @@ func TestBootTimeoutWaitsForInFlightStart(t *testing.T) {
 	if !ok || got.State != registry.StateRunning || got.StartedAt.IsZero() {
 		t.Fatalf("entry = %+v, want running", got)
 	}
-	if !f.hasJob("fm-t-race") {
+	if !f.hasJob(derivedJobName("t-race")) {
 		t.Fatal("the Job must survive a boot deadline that lost the race to the start")
 	}
 	if len(f.jobs.deletedJobs) != 0 {
@@ -1261,7 +1315,7 @@ func TestOnReportStart409OnSettledEntryKeepsResult(t *testing.T) {
 	if got := f.metrics.terminal; len(got) != 0 {
 		t.Fatalf("terminal metric = %v, want no write for a late start", got)
 	}
-	if !f.hasJob("fm-t-late") {
+	if !f.hasJob(derivedJobName("t-late")) {
 		t.Fatal("a settled entry's Job is not touched by a late start")
 	}
 }
@@ -1313,7 +1367,7 @@ func TestOnReportTerminalCleansUpAfterSuccess(t *testing.T) {
 	if !f.reg.IsDone("task-1") {
 		t.Fatal("done index not written")
 	}
-	if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != "fm-task-1" {
+	if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != derivedJobName("task-1") {
 		t.Fatalf("job deletes = %+v", f.jobs.deletedJobs)
 	}
 	if len(f.jobs.deletedSecrets) != 1 { // only the claim-time stale sweep
@@ -1380,7 +1434,7 @@ func TestOnJobGoneCompensatesRunningTask(t *testing.T) {
 	f.now = testNow.Add(2 * time.Minute) // past the visibility grace
 	f.server.status = "running"
 
-	if err := f.sched.OnJobGone(context.Background(), "fm-task-1"); err != nil {
+	if err := f.sched.OnJobGone(context.Background(), derivedJobName("task-1")); err != nil {
 		t.Fatalf("OnJobGone: %v", err)
 	}
 	if e, ok := f.reg.Get("task-1"); !ok || !e.IsTerminal() || !e.IsDraining() {
@@ -1403,7 +1457,7 @@ func TestOnJobGoneWithinGracePeriodWaits(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1") // claimed at testNow, still fresh
 
-	if err := f.sched.OnJobGone(context.Background(), "fm-task-1"); err != nil {
+	if err := f.sched.OnJobGone(context.Background(), derivedJobName("task-1")); err != nil {
 		t.Fatalf("OnJobGone: %v", err)
 	}
 	if len(f.server.forwards) != 0 || len(f.jobs.deletedJobs) != 0 {
@@ -1417,7 +1471,7 @@ func TestOnJobGoneTaskVanishedServerSide(t *testing.T) {
 	f.now = testNow.Add(2 * time.Minute)
 	f.server.statusErr = ErrTaskNotFound
 
-	if err := f.sched.OnJobGone(context.Background(), "fm-task-1"); err != nil {
+	if err := f.sched.OnJobGone(context.Background(), derivedJobName("task-1")); err != nil {
 		t.Fatalf("OnJobGone: %v", err)
 	}
 	if e, ok := f.reg.Get("task-1"); !ok || !e.IsTerminal() || !e.IsDraining() {
@@ -1750,7 +1804,7 @@ func TestOnJobGoneFailedReportRetainsEntryUntilDelivered(t *testing.T) {
 	f.server.status = "running"
 	f.server.forwardCode = 500
 
-	if err := f.sched.OnJobGone(context.Background(), "fm-task-1"); err != nil {
+	if err := f.sched.OnJobGone(context.Background(), derivedJobName("task-1")); err != nil {
 		t.Fatalf("OnJobGone: %v", err)
 	}
 	// The report did not land: it is in the durable queue, and the terminal
@@ -1765,7 +1819,7 @@ func TestOnJobGoneFailedReportRetainsEntryUntilDelivered(t *testing.T) {
 	if len(f.jobs.deletedSecrets) != 1 { // only the claim-time stale sweep
 		t.Fatalf("secret deleted before report landed: %+v", f.jobs.deletedSecrets)
 	}
-	if !f.hasJob("fm-task-1") {
+	if !f.hasJob(derivedJobName("task-1")) {
 		t.Fatal("Job deleted before the queued report landed")
 	}
 
@@ -1781,7 +1835,7 @@ func TestOnJobGoneFailedReportRetainsEntryUntilDelivered(t *testing.T) {
 	if n := len(f.server.forwards); n != 1 {
 		t.Fatalf("forwards = %d, want 1 (initial attempt only)", n)
 	}
-	if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != "fm-task-1" {
+	if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != derivedJobName("task-1") {
 		t.Fatalf("job deletes = %+v", f.jobs.deletedJobs)
 	}
 }
@@ -1928,7 +1982,7 @@ func TestJobCreateFailedLogsPhaseForSecretStep(t *testing.T) {
 	if record["phase"] != createPhaseSecret {
 		t.Errorf("phase = %v, want %q", record["phase"], createPhaseSecret)
 	}
-	if record["task_id"] != "task-1" || record["job_name"] != "fm-task-1" {
+	if record["task_id"] != "task-1" || record["job_name"] != derivedJobName("task-1") {
 		t.Errorf("identity fields = %v", record)
 	}
 	if summary, _ := record["err"].(string); !strings.Contains(summary, "rbac denied") {
@@ -2029,7 +2083,7 @@ func TestJobCreateStepTraceAtDebug(t *testing.T) {
 		if _, repeated := record["err"]; repeated {
 			t.Errorf("step %v repeats the error field: %v", record["step"], record)
 		}
-		if record["task_id"] != "task-1" || record["job_name"] != "fm-task-1" {
+		if record["task_id"] != "task-1" || record["job_name"] != derivedJobName("task-1") {
 			t.Errorf("step %v identity fields = %v", record["step"], record)
 		}
 	}

@@ -13,6 +13,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/tsic404/foreman/internal/registry"
 )
 
 // The catalog probe's fixed names and values (ADR-019 / ADR-025, 03-contracts.md
@@ -54,7 +56,7 @@ var (
 // taskCredSecretLiteral is a template's per-task credential Secret name: the
 // literal A1.4 ④ substitutes for the probe's own Secret, beside the task
 // profile literal (jobProfile) it renames to the probe profile.
-var taskCredSecretLiteral = jobName(placeholderTaskID) + secretCredSuffix
+var taskCredSecretLiteral = registry.CredName(placeholderJobName)
 
 // probeInitScript is initScript under the probe profile: the probe owns its
 // profile directory, so the script's recursive chown and its credential copy
@@ -120,7 +122,7 @@ func (b *Builder) renderProbe(name, requestID, jobRuntimeID string, budget time.
 		rendered, err := renderProbeTemplate(b.template, probeValues{
 			jobImage:     b.cfg.imageRef(),
 			jobRuntimeID: jobRuntimeID,
-			credSecret:   name + secretCredSuffix,
+			credSecret:   registry.CredName(name),
 		})
 		if err != nil {
 			return nil, err
@@ -300,7 +302,7 @@ func (b *Builder) probeCredentialSecret(name, token string) *corev1.Secret {
 	configJSON := `{"token":` + strconv.Quote(token) + `}`
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name + secretCredSuffix,
+			Name:      registry.CredName(name),
 			Namespace: b.cfg.JobNamespace,
 			Labels:    probeLabels(),
 		},

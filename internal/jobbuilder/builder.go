@@ -22,8 +22,13 @@ import (
 
 // TaskEntry is the subset of the registry entry (contract §3.1) that Build needs.
 type TaskEntry struct {
-	TaskID          string
-	AgentID         string
+	TaskID  string
+	AgentID string
+	// JobName is the task Job's name, derived once by the caller from the
+	// claim payload (registry.JobName, contract §3.1「任务 Job 名」). Build
+	// renders this value instead of re-deriving it: the template's
+	// <job-name> placeholder and metadata.name must be the same string.
+	JobName         string
 	IssueID         string
 	IssueIdentifier string
 	AutopilotRunID  string
@@ -93,12 +98,13 @@ func NewBuilder(cfg Config) (*Builder, error) {
 
 // Build renders the Job, its credential Secret and the digest of the token
 // that Secret carries (contract §2: the token_hash OnClaim records is the
-// only handle the reclaim path has on the credential). An invalid task ID
-// fails before any object is produced.
+// only handle the reclaim path has on the credential). The name is rendered
+// as handed in (§3.1 derives it from the payload); a name that is empty or
+// not a ≤63-character DNS-1123 label fails before any object is produced.
 func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
-	name := jobName(e.TaskID)
-	if len(name) > 63 || !dns1123Label.MatchString(name) {
-		return nil, nil, "", fmt.Errorf("%w: %q does not yield a valid Job name %q", ErrInvalidTaskID, e.TaskID, name)
+	name := e.JobName
+	if name == "" || len(name) > 63 || !dns1123Label.MatchString(name) {
+		return nil, nil, "", fmt.Errorf("%w: task %q does not yield a valid Job name %q", ErrInvalidTaskID, e.TaskID, name)
 	}
 	if b.cfg.Issuer == nil {
 		return nil, nil, "", fmt.Errorf("Config.Issuer is required")
@@ -119,7 +125,7 @@ func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, string, erro
 func (b *Builder) render(name string, e TaskEntry) (*batchv1.Job, error) {
 	var job *batchv1.Job
 	if b.templatePresent {
-		rendered, err := renderTemplate(b.template, b.placeholderValues(e))
+		rendered, err := renderTemplate(b.template, b.placeholderValues(name, e))
 		if err != nil {
 			return nil, err
 		}
@@ -137,9 +143,10 @@ func (b *Builder) render(name string, e TaskEntry) (*batchv1.Job, error) {
 
 // placeholderValues resolves the template placeholders for one task; the
 // preferred node comes from the same soft-affinity decision the default
-// template uses.
-func (b *Builder) placeholderValues(e TaskEntry) placeholderValues {
+// template uses, and the job name is the value A1.2 writes into metadata.name.
+func (b *Builder) placeholderValues(name string, e TaskEntry) placeholderValues {
 	v := placeholderValues{
+		jobName:         name,
 		taskID:          e.TaskID,
 		agentID:         e.AgentID,
 		workspaceID:     e.WorkspaceID,
@@ -288,9 +295,4 @@ func (b *Builder) preferredNode(e TaskEntry) (string, bool) {
 		return "", false
 	}
 	return node, true
-}
-
-// jobName is the single source of the Job/Secret/daemon naming convention.
-func jobName(taskID string) string {
-	return "fm-" + taskID
 }

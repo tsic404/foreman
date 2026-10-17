@@ -38,14 +38,14 @@ func TestStartup03FailRegisterRefusedOnProviderMiss(t *testing.T) {
 	if !ok || entry.RealRuntimeID != "rid-zz" {
 		t.Fatalf("entry = %+v, want the dispatch record rid-zz", entry)
 	}
-	token, err := h.issuer.Issue("fm-task-1", "task-1", "ws-1", time.Hour)
+	token, err := h.issuer.Issue(derivedJobName("task-1"), "task-1", "ws-1", time.Hour)
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
 
 	// The daemon reports an `omp`-only runtime set: zero hits for `zz`.
 	code, body := h.call("POST", "/api/daemon/register", token, []byte(`{
-		"daemon_id": "fm-task-1",
+		"daemon_id": "`+derivedJobName("task-1")+`",
 		"runtimes": [{"name": "foreman-omp", "type": "omp", "version": "0.6.1"}]
 	}`))
 	if code != 409 {
@@ -84,12 +84,12 @@ func TestStartup03FailRegisterAcceptsMatchingProvider(t *testing.T) {
 	if err := h.sched.OnClaim(t.Context(), payload); err != nil {
 		t.Fatalf("OnClaim: %v", err)
 	}
-	token, err := h.issuer.Issue("fm-task-2", "task-2", "ws-1", time.Hour)
+	token, err := h.issuer.Issue(derivedJobName("task-2"), "task-2", "ws-1", time.Hour)
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
 	code, body := h.call("POST", "/api/daemon/register", token, []byte(`{
-		"daemon_id": "fm-task-2",
+		"daemon_id": "`+derivedJobName("task-2")+`",
 		"runtimes": [
 			{"name": "foreman-omp", "type": "omp", "version": "0.6.1"},
 			{"name": "foreman-zz", "type": "zz", "version": "3.1.4"}

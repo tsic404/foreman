@@ -9,7 +9,7 @@
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fm-<task_id>
+  name: <job-name>
   namespace: multica-agents
   labels:
     app.kubernetes.io/name: foreman-job
@@ -18,7 +18,7 @@ metadata:
     foreman.tsic.top/agent-id: "<agent_id>"
     foreman.tsic.top/workspace-id: "<workspace_id>"
   annotations:
-    foreman.tsic.top/daemon-id: "fm-<task_id>"
+    foreman.tsic.top/daemon-id: "<job-name>"
     foreman.tsic.top/job-runtime-id: "<job runtime uuid>"
     foreman.tsic.top/claimed-at: "<RFC3339>"
     foreman.tsic.top/attempt: "1"
@@ -133,12 +133,12 @@ spec:
         - name: cred
           emptyDir: { sizeLimit: 16Mi }
         - name: cred-src
-          secret: { secretName: fm-<task_id>-cred, defaultMode: 0400 }
+          secret: { secretName: <job-name>-cred, defaultMode: 0400 }
 ---
 apiVersion: v1
 kind: Secret
 metadata:
-  name: fm-<task_id>-cred
+  name: <job-name>-cred
   namespace: multica-agents
   labels: { app.kubernetes.io/managed-by: foreman, foreman.tsic.top/task-id: "<task_id>" }
 type: Opaque

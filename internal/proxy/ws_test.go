@@ -185,7 +185,7 @@ func TestWSHandlerTaskAvailablePush(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "done")
 	_ = readFrame(t, conn) // catch-up push
 
-	h.NotifyTaskAvailable("fm-t-wspush", "t-wspush")
+	h.NotifyTaskAvailable(derivedJobName("t-wspush"), "t-wspush")
 	frame := readFrame(t, conn)
 	if frame.Type != FrameDaemonTaskAvailable {
 		t.Fatalf("push = %s", frame.Type)
@@ -197,7 +197,7 @@ func TestWSHandlerTaskAvailablePush(t *testing.T) {
 	}
 
 	// Terminal closes the connection (S30).
-	h.CloseJob("fm-t-wspush")
+	h.CloseJob(derivedJobName("t-wspush"))
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if _, _, err := conn.Read(ctx); err == nil {

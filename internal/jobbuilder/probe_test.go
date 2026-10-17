@@ -32,7 +32,7 @@ const probeTemplate = `
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fm-<task_id>
+  name: <job-name>
   namespace: other-namespace
   labels:
     app.kubernetes.io/name: foreman-job
@@ -40,7 +40,7 @@ metadata:
     foreman.tsic.top/task-id: "<task_id>"
     cost-center: platform
   annotations:
-    foreman.tsic.top/daemon-id: "fm-<task_id>"
+    foreman.tsic.top/daemon-id: "<job-name>"
     example.com/note: keep-me
     example.com/runtime: "<job runtime uuid>"
 spec:
@@ -56,7 +56,7 @@ spec:
         foreman.tsic.top/task-id: "<task_id>"
         cost-center: platform
       annotations:
-        foreman.tsic.top/daemon-id: "fm-<task_id>"
+        foreman.tsic.top/daemon-id: "<job-name>"
         example.com/note: keep-me
     spec:
       restartPolicy: Never
@@ -82,7 +82,7 @@ spec:
             - { name: cred, mountPath: /home/agent/.multica/profiles/foreman-job/config.json, subPath: config.json, readOnly: true }
       volumes:
         - name: cred-src
-          secret: { secretName: fm-<task_id>-cred, defaultMode: 0400 }
+          secret: { secretName: <job-name>-cred, defaultMode: 0400 }
 `
 
 // mustBuildProbe renders a probe with the fake issuer recording the probe

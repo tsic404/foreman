@@ -69,7 +69,7 @@ func TestOnBootTimeoutFailsAndCleansUp(t *testing.T) {
 	if e, ok := f.reg.Get("t-boot"); !ok || !e.IsTerminal() || !e.IsDraining() {
 		t.Errorf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
-	if f.hasJob("fm-t-boot") {
+	if f.hasJob(derivedJobName("t-boot")) {
 		t.Error("Job must be deleted after the boot-timeout settlement")
 	}
 	if !f.reg.IsDone("t-boot") {
@@ -105,7 +105,7 @@ func TestOnBootTimeoutQueuesReportAndKeepsObjects(t *testing.T) {
 	if !strings.Contains(p.reports[0].body, "job_boot_timeout") {
 		t.Errorf("queued body = %s, want the C10 fail body", p.reports[0].body)
 	}
-	if !f.hasJob("fm-t-boot-fail") {
+	if !f.hasJob(derivedJobName("t-boot-fail")) {
 		t.Error("Job must survive until the queued report lands")
 	}
 
@@ -118,7 +118,7 @@ func TestOnBootTimeoutQueuesReportAndKeepsObjects(t *testing.T) {
 	if e, ok := f.reg.Get("t-boot-fail"); !ok || !e.IsTerminal() || !e.IsDraining() {
 		t.Errorf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
-	if f.hasJob("fm-t-boot-fail") {
+	if f.hasJob(derivedJobName("t-boot-fail")) {
 		t.Error("Job must be deleted once the report landed")
 	}
 	if n := len(f.server.forwards); n != 1 {
@@ -137,7 +137,7 @@ func TestOnBootTimeoutIgnoresStartedOrTerminal(t *testing.T) {
 	if len(f.server.forwards) != 0 {
 		t.Errorf("a started task must not be failed, forwards = %+v", f.server.forwards)
 	}
-	if !f.hasJob("fm-t-started") {
+	if !f.hasJob(derivedJobName("t-started")) {
 		t.Error("a started task's Job must survive")
 	}
 }
@@ -152,7 +152,7 @@ func TestOnTaskVanished(t *testing.T) {
 	if e, ok := f.reg.Get("t-vanish"); !ok || !e.IsTerminal() || !e.IsDraining() {
 		t.Errorf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
-	if f.hasJob("fm-t-vanish") {
+	if f.hasJob(derivedJobName("t-vanish")) {
 		t.Error("Job must be deleted")
 	}
 	// Scenario #9: no terminal report for a task the server deleted.
@@ -174,7 +174,7 @@ func TestConvergeLeaseRefused(t *testing.T) {
 		if e.State != registry.StateRunning || e.StartedAt.IsZero() {
 			t.Errorf("entry = %+v, want running with started_at", e)
 		}
-		if !f.hasJob("fm-t-lr") {
+		if !f.hasJob(derivedJobName("t-lr")) {
 			t.Error("running task's Job must survive")
 		}
 	})
@@ -190,7 +190,7 @@ func TestConvergeLeaseRefused(t *testing.T) {
 		if e, ok := f.reg.Get("t-lt"); !ok || !e.IsTerminal() || !e.IsDraining() {
 			t.Errorf("entry = %+v, %v; want a retained draining entry", e, ok)
 		}
-		if f.hasJob("fm-t-lt") {
+		if f.hasJob(derivedJobName("t-lt")) {
 			t.Error("terminal task's Job must be deleted")
 		}
 	})
@@ -220,7 +220,7 @@ func TestConvergeLeaseRefused(t *testing.T) {
 		if !ok || e.IsTerminal() {
 			t.Errorf("entry = %+v, want retained non-terminal", e)
 		}
-		if !f.hasJob("fm-t-ld") {
+		if !f.hasJob(derivedJobName("t-ld")) {
 			t.Error("a dispatched task's Job must survive (server will redispatch)")
 		}
 	})
@@ -263,7 +263,7 @@ func TestOnReportTerminalFailureEnqueuesPendingReport(t *testing.T) {
 	if !ok || !entry.IsTerminal() {
 		t.Errorf("entry = %+v, want retained terminal", entry)
 	}
-	if !f.hasJob("fm-t-pend") {
+	if !f.hasJob(derivedJobName("t-pend")) {
 		t.Error("Job must survive until the report lands")
 	}
 }
@@ -281,7 +281,7 @@ func TestOnReportTerminalPermanent4xxNotEnqueued(t *testing.T) {
 	if len(p.reports) != 0 {
 		t.Errorf("4xx is permanent: no queue entry expected, got %+v", p.reports)
 	}
-	if !f.hasJob("fm-t-perm") {
+	if !f.hasJob(derivedJobName("t-perm")) {
 		t.Error("Job must stay for inspection on a permanent failure")
 	}
 }
@@ -299,7 +299,7 @@ func TestOnReportTerminal404IsIdempotentSuccess(t *testing.T) {
 	if len(p.reports) != 0 {
 		t.Errorf("404 terminal is moot, not queued: %+v", p.reports)
 	}
-	if f.hasJob("fm-t-404") {
+	if f.hasJob(derivedJobName("t-404")) {
 		t.Error("Job must be cleaned up on a terminal 404")
 	}
 }
@@ -316,7 +316,7 @@ func TestOnReportNonTerminal404Vanishes(t *testing.T) {
 	if e, ok := f.reg.Get("t-prog404"); !ok || !e.IsTerminal() || !e.IsDraining() {
 		t.Errorf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
-	if f.hasJob("fm-t-prog404") {
+	if f.hasJob(derivedJobName("t-prog404")) {
 		t.Error("Job must be deleted when the server deleted the task")
 	}
 	// The vanish settlement refreshes the inflight gauge: the entry count

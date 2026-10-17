@@ -9,6 +9,8 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
+	"github.com/tsic404/foreman/internal/registry"
 )
 
 // Label and annotation keys (contract §3.2, verbatim).
@@ -67,7 +69,6 @@ const (
 	foremanServerURL  = "http://foreman.foreman.svc.cluster.local:8080"
 	configFileKey     = "config.json"
 	credFileMode      = 0o400
-	secretCredSuffix  = "-cred"
 
 	agentCommand = "/usr/local/bin/multica"
 	// dumbInitCommand is the container PID 1 both daemon containers start
@@ -378,7 +379,7 @@ func emptyDirVolume(name string) corev1.Volume {
 // credSrcVolume renders the read-only Secret volume holding the Job Token.
 func credSrcVolume(jobName string) corev1.Volume {
 	return corev1.Volume{Name: volumeCredSrc, VolumeSource: corev1.VolumeSource{
-		Secret: &corev1.SecretVolumeSource{SecretName: jobName + secretCredSuffix, DefaultMode: new(int32(credFileMode))},
+		Secret: &corev1.SecretVolumeSource{SecretName: registry.CredName(jobName), DefaultMode: new(int32(credFileMode))},
 	}}
 }
 
@@ -400,7 +401,7 @@ func (b *Builder) credentialSecret(name, taskID, token string) *corev1.Secret {
 	configJSON := `{"token":` + strconv.Quote(token) + `}`
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name + secretCredSuffix,
+			Name:      registry.CredName(name),
 			Namespace: b.cfg.JobNamespace,
 			Labels: map[string]string{
 				labelManagedBy: managedByForeman,

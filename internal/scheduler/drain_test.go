@@ -146,13 +146,13 @@ func TestCredReclaimedEvidenceCarriesClockDomain(t *testing.T) {
 	f := newFixture(t)
 	var logs bytes.Buffer
 	s := newLoggingScheduler(t, f, &logs)
-	f.claim(t, "task-1")
+	e := f.claim(t, "task-1")
 	if _, err := f.reg.MarkTerminal("task-1", registry.ResultCompleted, "", f.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	finished := f.now.Add(-20 * time.Second)
 
-	if err := s.OnJobTerminated(context.Background(), "fm-task-1",
+	if err := s.OnJobTerminated(context.Background(), e.JobName,
 		JobTerminationReasonJobTerminated, finished, 0); err != nil {
 		t.Fatalf("OnJobTerminated: %v", err)
 	}
@@ -172,11 +172,11 @@ func TestCredReclaimedEvidenceCarriesClockDomain(t *testing.T) {
 	f2 := newFixture(t)
 	var logs2 bytes.Buffer
 	s2 := newLoggingScheduler(t, f2, &logs2)
-	f2.claim(t, "task-2")
+	e2 := f2.claim(t, "task-2")
 	if _, err := f2.reg.MarkTerminal("task-2", registry.ResultCompleted, "", f2.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
-	if err := s2.OnJobTerminated(context.Background(), "fm-task-2",
+	if err := s2.OnJobTerminated(context.Background(), e2.JobName,
 		JobTerminationReasonJobTerminated, time.Time{}, 0); err != nil {
 		t.Fatalf("OnJobTerminated: %v", err)
 	}
@@ -192,11 +192,11 @@ func TestCredReclaimedEvidenceCarriesClockDomain(t *testing.T) {
 	f3 := newFixture(t)
 	var logs3 bytes.Buffer
 	s3 := newLoggingScheduler(t, f3, &logs3)
-	f3.claim(t, "task-3")
+	e3 := f3.claim(t, "task-3")
 	if _, err := f3.reg.MarkTerminal("task-3", registry.ResultFailed, "", f3.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
-	if err := s3.OnJobTerminated(context.Background(), "fm-task-3",
+	if err := s3.OnJobTerminated(context.Background(), e3.JobName,
 		JobTerminationReasonDrainTimeout, time.Time{}, 2); err != nil {
 		t.Fatalf("OnJobTerminated: %v", err)
 	}
@@ -236,7 +236,7 @@ func decodeLogEvent(t *testing.T, logs *bytes.Buffer, msg string) map[string]any
 func TestReclaimGatesTheJobDeletionOnTheQueuedReport(t *testing.T) {
 	f := newFixture(t)
 	p := f.withPendingReports()
-	f.claim(t, "task-1")
+	e := f.claim(t, "task-1")
 	f.jobs.deletedSecrets = nil
 	if _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, "", f.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
@@ -245,14 +245,14 @@ func TestReclaimGatesTheJobDeletionOnTheQueuedReport(t *testing.T) {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
-	if err := f.sched.OnJobTerminated(context.Background(), "fm-task-1",
+	if err := f.sched.OnJobTerminated(context.Background(), e.JobName,
 		JobTerminationReasonDrainTimeout, time.Time{}, 1); err != nil {
 		t.Fatalf("OnJobTerminated: %v", err)
 	}
 	if len(f.jobs.deletedJobs) != 0 {
 		t.Fatalf("deletedJobs = %v, want the Job left to ttlSecondsAfterFinished while the report is queued", f.jobs.deletedJobs)
 	}
-	if f.hasJob("fm-task-1") != true {
+	if !f.hasJob(e.JobName) {
 		t.Fatal("the Job object must survive the reclaim while its report is queued")
 	}
 	if _, ok := f.reg.Get("task-1"); ok {
@@ -265,15 +265,15 @@ func TestReclaimGatesTheJobDeletionOnTheQueuedReport(t *testing.T) {
 	// The report landed: the next reclaim catch-up deletes the Job (idempotent
 	// for the ordinary path, where the verdict already did).
 	f2 := newFixture(t)
-	f2.claim(t, "task-2")
+	e2 := f2.claim(t, "task-2")
 	if _, err := f2.reg.MarkTerminal("task-2", registry.ResultCompleted, "", f2.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
-	if err := f2.sched.OnJobTerminated(context.Background(), "fm-task-2",
+	if err := f2.sched.OnJobTerminated(context.Background(), e2.JobName,
 		JobTerminationReasonJobTerminated, f2.now, 0); err != nil {
 		t.Fatalf("OnJobTerminated: %v", err)
 	}
-	if len(f2.jobs.deletedJobs) != 1 || f2.jobs.deletedJobs[0] != "fm-task-2" {
+	if len(f2.jobs.deletedJobs) != 1 || f2.jobs.deletedJobs[0] != e2.JobName {
 		t.Fatalf("deletedJobs = %v, want the catch-up deletion", f2.jobs.deletedJobs)
 	}
 }
@@ -317,15 +317,20 @@ func TestSweepOrphanSecretsCriterion(t *testing.T) {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	// A genuine orphan: no entry, no Job.
+	liveName := derivedJobName("task-live")
+	drainingName := derivedJobName("task-draining")
+	orphanName := derivedJobName("task-orphan")
 	f.jobs.secrets = []corev1.Secret{
-		secretObject("fm-task-live-cred", "task-live"),
-		secretObject("fm-task-draining-cred", "task-draining"),
-		secretObject("fm-task-orphan-cred", "task-orphan"),
+		secretObject(registry.CredName(liveName), "task-live"),
+		secretObject(registry.CredName(drainingName), "task-draining"),
+		secretObject(registry.CredName(orphanName), "task-orphan"),
 	}
-	// The orphan's Job is gone; the drained task's Job is still there.
-	f.jobs.existingJobs = map[string]*batchv1.Job{
-		"fm-task-draining": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-draining"}},
-	}
+	// The orphan's Job is gone; the drained task's Job is still there. The
+	// Job half of the criterion is the ListJobs task-id label.
+	f.jobs.jobs = []batchv1.Job{{ObjectMeta: metav1.ObjectMeta{
+		Name:   drainingName,
+		Labels: map[string]string{registry.LabelTaskID: "task-draining"},
+	}}}
 	// The claims above ran their own delete-then-create sweep: only the
 	// round's deletions matter here.
 	f.jobs.deletedSecrets = nil
@@ -333,23 +338,23 @@ func TestSweepOrphanSecretsCriterion(t *testing.T) {
 	if err := f.sched.SweepOrphanSecrets(context.Background()); err != nil {
 		t.Fatalf("SweepOrphanSecrets: %v", err)
 	}
-	if len(f.jobs.deletedSecrets) != 1 || f.jobs.deletedSecrets[0] != "fm-task-orphan-cred" {
+	if len(f.jobs.deletedSecrets) != 1 || f.jobs.deletedSecrets[0] != registry.CredName(orphanName) {
 		t.Fatalf("deleted secrets = %v, want only the orphan", f.jobs.deletedSecrets)
 	}
 }
 
-// A GetJob that fails is not a NotFound: the criterion demands an explicit
-// one, so the Secret survives the round.
+// A ListJobs that fails is not "no Job": the sweep cannot resolve the Job
+// half of the criterion, so it surfaces the error and deletes nothing.
 func TestSweepOrphanSecretsKeepsSecretOnAPIError(t *testing.T) {
 	f := newFixture(t)
-	f.jobs.secrets = []corev1.Secret{secretObject("fm-task-orphan-cred", "task-orphan")}
-	f.jobs.getJobErr = errors.New("apiserver unavailable")
+	f.jobs.secrets = []corev1.Secret{secretObject(registry.CredName(derivedJobName("task-orphan")), "task-orphan")}
+	f.jobs.listJobsErr = errors.New("apiserver unavailable")
 
 	if err := f.sched.SweepOrphanSecrets(context.Background()); err == nil {
 		t.Fatal("SweepOrphanSecrets: want the read error surfaced")
 	}
 	if len(f.jobs.deletedSecrets) != 0 {
-		t.Fatalf("deleted secrets = %v, want none without an explicit NotFound", f.jobs.deletedSecrets)
+		t.Fatalf("deleted secrets = %v, want none while the Job half is unknown", f.jobs.deletedSecrets)
 	}
 }
 

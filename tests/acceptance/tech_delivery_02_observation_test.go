@@ -114,7 +114,7 @@ func TestDelivery02LostResponseLeavesMetricsEventsAndRetainedRecord(t *testing.T
 
 	// ③ The retention face: the credential reclaim deletes the live entry and
 	// leaves the terminal record behind, the delivery counts included.
-	if err := h.sched.OnJobTerminated(t.Context(), "fm-task-1", scheduler.JobTerminationReasonJobTerminated, time.Now(), 0); err != nil {
+	if err := h.sched.OnJobTerminated(t.Context(), derivedJobName("task-1"), scheduler.JobTerminationReasonJobTerminated, time.Now(), 0); err != nil {
 		t.Fatalf("OnJobTerminated: %v", err)
 	}
 	if _, ok := h.reg.Get("task-1"); ok {

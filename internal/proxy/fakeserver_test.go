@@ -94,8 +94,10 @@ func (f *fakeJobs) deleted(name string) bool {
 type fakeBuilder struct{}
 
 func (fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
-	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "fm-" + e.TaskID}}
-	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fm-" + e.TaskID + "-cred"}}
+	// Mirror the production builder: the scheduler hands the entry its Job
+	// name, and the credential Secret is that name's -cred.
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: e.JobName}}
+	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: registry.CredName(e.JobName)}}
 	return job, secret, "sha256:" + e.TaskID, nil
 }
 
@@ -208,15 +210,28 @@ func newTestRig(t *testing.T) *testRig {
 	return rig
 }
 
+// claimIssueIdentifier is the issue identifier claimTask's payload carries.
+// The scheduler derives the Job name from that payload (agent.name is absent,
+// so its segment is the fallback), and every token/daemon_id/assertion in
+// these tests names that derived Job.
+const claimIssueIdentifier = "TSI-1"
+
+// derivedJobName is the Job name the scheduler derives for claimTask's
+// payload: the SAME derivation production uses, so a naming change keeps the
+// tests honest instead of pinning a literal.
+func derivedJobName(taskID string) string {
+	return registry.JobName(taskID, claimIssueIdentifier, "")
+}
+
 // claimTask seeds one claimed task through the scheduler (job created).
 func (r *testRig) claimTask(t *testing.T, taskID string) {
 	t.Helper()
 	payload := json.RawMessage(fmt.Sprintf(`{
 		"id": %q, "agent_id": "agent-1", "issue_id": "issue-1",
-		"issue_identifier": "TSI-1", "workspace_id": "ws-1",
+		"issue_identifier": %q, "workspace_id": "ws-1",
 		"runtime_id": "rid-real", "auth_token": "mat_tasktoken",
 		"agent": {"model": "k3"}, "trigger_kind": "assign"
-	}`, taskID))
+	}`, taskID, claimIssueIdentifier))
 	if err := r.sched.OnClaim(t.Context(), payload); err != nil {
 		t.Fatalf("OnClaim: %v", err)
 	}
@@ -225,7 +240,7 @@ func (r *testRig) claimTask(t *testing.T, taskID string) {
 // token issues a Job Token for the job.
 func (r *testRig) token(t *testing.T, taskID string) string {
 	t.Helper()
-	tok, err := r.issuer.Issue("fm-"+taskID, taskID, "ws-1", time.Hour)
+	tok, err := r.issuer.Issue(derivedJobName(taskID), taskID, "ws-1", time.Hour)
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -259,7 +274,7 @@ func (r *testRig) call(t *testing.T, method, path, token string, body []byte) (i
 func (r *testRig) registerDaemon(t *testing.T, taskID, token string) string {
 	t.Helper()
 	code, body := r.call(t, "POST", "/api/daemon/register", token, []byte(`{
-		"daemon_id": "fm-`+taskID+`",
+		"daemon_id": "`+derivedJobName(taskID)+`",
 		"runtimes": [{"name": "foreman-job", "type": "omp"}]
 	}`))
 	if code != 200 {
@@ -344,7 +359,7 @@ func TestFullLifecycle(t *testing.T) {
 	rig.stub.on("POST", "/api/daemon/runtimes/"+jobRID+"/tasks/t-life/prepare-lease", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
 		writeJSONStub(w, 200, map[string]string{"status": "ok"})
 	})
-	claimBody := []byte(`{"daemon_id":"fm-t-life","runtime_ids":["` + jobRID + `"],"max_tasks":1}`)
+	claimBody := []byte(`{"daemon_id":"` + derivedJobName("t-life") + `","runtime_ids":["` + jobRID + `"],"max_tasks":1}`)
 	code, body = rig.call(t, "POST", "/api/daemon/tasks/claim", tok, claimBody)
 	if code != 200 {
 		t.Fatalf("S6 = %d: %s", code, body)
@@ -431,7 +446,7 @@ func TestFullLifecycle(t *testing.T) {
 	if got := rig.stub.calls("POST", "/api/daemon/tasks/t-life/complete"); len(got) != 1 || !bytes.Equal(got[0].Body, completeBody) {
 		t.Fatalf("C9 not verbatim: %+v", got)
 	}
-	if !rig.jobs.deleted("fm-t-life") {
+	if !rig.jobs.deleted(derivedJobName("t-life")) {
 		t.Error("Job not deleted after terminal report")
 	}
 	// The verdict leaves the entry draining: it is still the authorization
@@ -458,14 +473,14 @@ func TestFullLifecycle(t *testing.T) {
 	// The Job's pods are gone: the reclaim revokes the digest, deletes the
 	// Secret and drops the entry, in that order (ADR-017).
 	deletedBefore := len(rig.jobs.deletedSecret)
-	if err := rig.sched.OnJobTerminated(t.Context(), "fm-t-life",
+	if err := rig.sched.OnJobTerminated(t.Context(), derivedJobName("t-life"),
 		scheduler.JobTerminationReasonJobTerminated, time.Now(), 0); err != nil {
 		t.Fatalf("OnJobTerminated: %v", err)
 	}
 	if _, ok := rig.reg.Get("t-life"); ok {
 		t.Error("entry must be gone after the reclaim")
 	}
-	if got := rig.jobs.deletedSecret; len(got) != deletedBefore+1 || got[deletedBefore] != "fm-t-life-cred" {
+	if got := rig.jobs.deletedSecret; len(got) != deletedBefore+1 || got[deletedBefore] != registry.CredName(derivedJobName("t-life")) {
 		t.Errorf("deleted Secrets = %v, want the reclaimed credential appended", got)
 	}
 	if got := rig.revoker.revoked; len(got) != 1 || got[0] != "sha256:t-life" {
@@ -513,7 +528,7 @@ func TestTerminalForwardFailureLandsInPendingReports(t *testing.T) {
 	if _, ok := rig.reg.Get("t-pend"); !ok {
 		t.Error("terminal entry dropped before the report landed")
 	}
-	if rig.jobs.deleted("fm-t-pend") {
+	if rig.jobs.deleted(derivedJobName("t-pend")) {
 		t.Error("Job deleted before the terminal report landed")
 	}
 
@@ -546,7 +561,7 @@ func TestCrossJobScopeIsForbidden(t *testing.T) {
 	}
 	// B's token claiming as A's daemon → 403.
 	code, _ = rig.call(t, "POST", "/api/daemon/tasks/claim", tokB,
-		[]byte(`{"daemon_id":"fm-t-a","runtime_ids":["x"],"max_tasks":1}`))
+		[]byte(`{"daemon_id":"`+derivedJobName("t-a")+`","runtime_ids":["x"],"max_tasks":1}`))
 	if code != 403 {
 		t.Errorf("cross-daemon claim = %d, want 403", code)
 	}
@@ -601,7 +616,7 @@ func TestS4ResponseShape(t *testing.T) {
 	e, _ := rig.reg.Get("t-reg")
 
 	code, body := rig.call(t, "POST", "/api/daemon/register", tok, []byte(`{
-		"daemon_id": "fm-t-reg",
+		"daemon_id": "`+derivedJobName("t-reg")+`",
 		"runtimes": [{"name": "foreman-job", "type": "omp"}, {"name": "extra", "type": "other"}]
 	}`))
 	if code != 200 {
@@ -801,8 +816,8 @@ func TestS7PrepareLeaseForwardsC4(t *testing.T) {
 	if got := records[0]["level"]; got != "INFO" {
 		t.Errorf("lease.renewed level = %v, want INFO", got)
 	}
-	if got := records[0]["job_name"]; got != "fm-t-lease" {
-		t.Errorf("lease.renewed job_name = %v, want fm-t-lease", got)
+	if got := records[0]["job_name"]; got != derivedJobName("t-lease") {
+		t.Errorf("lease.renewed job_name = %v, want %s", got, derivedJobName("t-lease"))
 	}
 	if got, want := records[0]["lease_keep_until"], projectedLeaseKeepUntil(t, after); got != want {
 		t.Errorf("lease.renewed lease_keep_until = %v, projection = %v", got, want)
@@ -830,7 +845,7 @@ func TestS7TaskVanishedSettlesLocally(t *testing.T) {
 	if !ok || !e.IsTerminal() || !e.IsDraining() {
 		t.Fatalf("vanished task entry = %+v, want it terminal and draining", e)
 	}
-	if !rig.jobs.deleted("fm-t-vanish") {
+	if !rig.jobs.deleted(derivedJobName("t-vanish")) {
 		t.Error("vanished task's Job not deleted")
 	}
 }
@@ -876,7 +891,7 @@ func TestS9Status404SettlesTaskVanished(t *testing.T) {
 	if !ok || !e.IsTerminal() || !e.IsDraining() {
 		t.Fatalf("entry after a C13 404 = %+v, want it terminal and draining", e)
 	}
-	if !rig.jobs.deleted("fm-t-s9") {
+	if !rig.jobs.deleted(derivedJobName("t-s9")) {
 		t.Error("Job must be deleted after a C13 404")
 	}
 }
@@ -1229,7 +1244,7 @@ func TestExpiredAndForgedTokensRejected(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewIssuer: %v", err)
 	}
-	expired, err := pastIssuer.Issue("fm-t-auth", "t-auth", "ws-1", 30*time.Minute)
+	expired, err := pastIssuer.Issue(derivedJobName("t-auth"), "t-auth", "ws-1", 30*time.Minute)
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
@@ -1237,7 +1252,7 @@ func TestExpiredAndForgedTokensRejected(t *testing.T) {
 		t.Errorf("expired token = %d, want 401", code)
 	}
 	// Forged signature → 401.
-	payloadSeg := base64.RawURLEncoding.EncodeToString([]byte(`{"j":"fm-t-auth","t":"t-auth","w":"ws-1","e":9999999999}`))
+	payloadSeg := base64.RawURLEncoding.EncodeToString([]byte(`{"j":"` + derivedJobName("t-auth") + `","t":"t-auth","w":"ws-1","e":9999999999}`))
 	forged := "fmj_" + payloadSeg + "." + base64.RawURLEncoding.EncodeToString([]byte("0123456789abcdef0123456789abcdef"))
 	if code, _ := rig.call(t, "GET", "/api/daemon/workspaces", forged, nil); code != 401 {
 		t.Errorf("forged token = %d, want 401", code)

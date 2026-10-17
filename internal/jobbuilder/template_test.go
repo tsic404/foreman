@@ -17,6 +17,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/tsic404/foreman/internal/observability"
+	"github.com/tsic404/foreman/internal/registry"
 )
 
 // statefulSetShapedTemplate is the deployment shape P-006 was filed for: a
@@ -28,7 +29,7 @@ const statefulSetShapedTemplate = `
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fm-<task_id>
+  name: <job-name>
   namespace: multica-agents
   labels:
     app.kubernetes.io/name: foreman-job
@@ -38,7 +39,7 @@ metadata:
     foreman.tsic.top/workspace-id: "<workspace_id>"
     cost-center: platform
   annotations:
-    foreman.tsic.top/daemon-id: "fm-<task_id>"
+    foreman.tsic.top/daemon-id: "<job-name>"
     foreman.tsic.top/job-runtime-id: "<job runtime uuid>"
     foreman.tsic.top/claimed-at: "<RFC3339>"
     foreman.tsic.top/attempt: "1"
@@ -109,7 +110,7 @@ spec:
         - name: omp
           emptyDir: {}
         - name: cred-src
-          secret: { secretName: fm-<task_id>-cred, defaultMode: 0400 }
+          secret: { secretName: <job-name>-cred, defaultMode: 0400 }
 `
 
 // nodeAffinityTemplate carries the <preferred node> conditional block next to
@@ -118,7 +119,7 @@ const nodeAffinityTemplate = `
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fm-<task_id>
+  name: <job-name>
 spec:
   template:
     spec:
@@ -145,7 +146,7 @@ const onlyPreferredNodeTemplate = `
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fm-<task_id>
+  name: <job-name>
 spec:
   template:
     spec:
@@ -419,7 +420,7 @@ func TestTemplateInjectsA1Env(t *testing.T) {
 // TestTemplateWithoutContainers: the injection is skipped, the Job is left for
 // the apiserver to reject (job_create_failed on the scheduler side).
 func TestTemplateWithoutContainers(t *testing.T) {
-	manifest := "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: fm-<task_id>\nspec:\n  template:\n    spec:\n      restartPolicy: Never\n"
+	manifest := "apiVersion: batch/v1\nkind: Job\nmetadata:\n  name: <job-name>\nspec:\n  template:\n    spec:\n      restartPolicy: Never\n"
 	job, _ := mustBuildTemplate(t, manifest, testEntry(), nil)
 	if len(job.Spec.Template.Spec.Containers) != 0 {
 		t.Fatalf("containers = %v, want none", containerNames(job.Spec.Template.Spec.Containers))
@@ -613,7 +614,7 @@ const duplicateEnvTemplate = `
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fm-<task_id>
+  name: <job-name>
 spec:
   template:
     spec:
@@ -635,7 +636,7 @@ const misplacedNodePlaceholderTemplate = `
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fm-<task_id>
+  name: <job-name>
 spec:
   template:
     spec:
@@ -657,7 +658,7 @@ const largeIntegerTemplate = `
 apiVersion: batch/v1
 kind: Job
 metadata:
-  name: fm-<task_id>
+  name: <job-name>
 spec:
   activeDeadlineSeconds: 9223372036854775807
   template:
@@ -802,8 +803,8 @@ func TestTemplateAuthoritativeMetadataWins(t *testing.T) {
 	entry := testEntry()
 	job, _ := mustBuildTemplate(t, conflictingMetadataTemplate, entry, nil)
 
-	if job.Name != jobName(entry.TaskID) || job.Namespace != DefaultJobNamespace {
-		t.Errorf("job %q/%q, want %q/%q", job.Namespace, job.Name, DefaultJobNamespace, jobName(entry.TaskID))
+	if job.Name != entry.JobName || job.Namespace != DefaultJobNamespace {
+		t.Errorf("job %q/%q, want %q/%q", job.Namespace, job.Name, DefaultJobNamespace, entry.JobName)
 	}
 	wantLabels := map[string]string{
 		"app.kubernetes.io/name":        jobAppName,
@@ -821,7 +822,7 @@ func TestTemplateAuthoritativeMetadataWins(t *testing.T) {
 		}
 	}
 	wantAnnotations := map[string]string{
-		annoDaemonID:        jobName(entry.TaskID),
+		annoDaemonID:        entry.JobName,
 		annoJobRuntimeID:    entry.JobRuntimeID,
 		annoClaimedAt:       entry.ClaimedAt.UTC().Format(time.RFC3339),
 		annoAttempt:         strconv.Itoa(entry.Attempt),
@@ -922,22 +923,23 @@ func TestTemplateCopyPerBuild(t *testing.T) {
 	}
 	second := testEntry()
 	second.TaskID = "0f1e2d3c-4b5a-4968-8776-655443322110"
+	second.JobName = registry.JobName(second.TaskID, second.IssueIdentifier, "")
 	secondJob, secondSecret, _, err := builder.Build(second)
 	if err != nil {
 		t.Fatalf("Build second: %v", err)
 	}
 
-	wantSecond := jobName(second.TaskID) + "-cred"
+	wantSecond := second.JobName + "-cred"
 	if got := volumeByName(t, secondJob.Spec.Template.Spec.Volumes, "cred-src").Secret.SecretName; got != wantSecond {
 		t.Errorf("second Job cred-src = %q, want %q", got, wantSecond)
 	}
-	if secondSecret.Name != wantSecond || secondJob.Annotations[annoDaemonID] != jobName(second.TaskID) {
+	if secondSecret.Name != wantSecond || secondJob.Annotations[annoDaemonID] != second.JobName {
 		t.Errorf("second Job/Secret = %q/%q, want the second task's", secondSecret.Name, secondJob.Annotations[annoDaemonID])
 	}
 	if got := canonicalJSON(secondJob); strings.Contains(got, first.TaskID) {
 		t.Errorf("second Job carries the first task's values:\n%s", got)
 	}
-	if got := volumeByName(t, firstJob.Spec.Template.Spec.Volumes, "cred-src").Secret.SecretName; got != jobName(first.TaskID)+"-cred" {
+	if got := volumeByName(t, firstJob.Spec.Template.Spec.Volumes, "cred-src").Secret.SecretName; got != first.JobName+"-cred" {
 		t.Errorf("first Job cred-src = %q, want it left alone by the second Build", got)
 	}
 	if got := canonicalJSON(firstJob); strings.Contains(got, second.TaskID) {

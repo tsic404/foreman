@@ -19,13 +19,16 @@ import (
 )
 
 const (
-	testTaskID  = "3f6b1a2c-9d4e-4a5b-8c7d-0e1f2a3b4c5d"
-	testJobName = "fm-" + testTaskID
-	testDigest  = "sha256:4242424242424242424242424242424242424242424242424242424242424242"
+	testTaskID = "3f6b1a2c-9d4e-4a5b-8c7d-0e1f2a3b4c5d"
+	testDigest = "sha256:4242424242424242424242424242424242424242424242424242424242424242"
 	// testPriorSession is testEntry's session-resume path, in the shape the
 	// payload carries it: an absolute path to a node-local session file.
 	testPriorSession = "/state/home/.multica/pi-sessions/sess-1.jsonl"
 )
+
+// testJobName is the name the scheduler derives for testEntry (contract §3.1):
+// no agent name in that fixture, so the agent segment takes its fallback.
+var testJobName = registry.JobName(testTaskID, "MULTI-9000", "")
 
 // testSessionKey is the index key of testPriorSession — the key the learning
 // side and the payload side must derive identically (03-contracts §3.1).
@@ -107,6 +110,7 @@ func testEntry() TaskEntry {
 	return TaskEntry{
 		TaskID:          testTaskID,
 		AgentID:         "0a1b2c3d-4e5f-4a6b-9c8d-7e6f5a4b3c2d",
+		JobName:         testJobName,
 		IssueID:         "aa10a105-59cf-4b6c-964e-4f857b580bcf",
 		IssueIdentifier: "MULTI-9000",
 		WorkspaceID:     "c20ff019-2980-4936-8cb0-22d79d694e71",
@@ -698,25 +702,29 @@ func TestBuildActiveDeadlineDisabled(t *testing.T) {
 	}
 }
 
-func TestBuildInvalidTaskID(t *testing.T) {
-	for _, taskID := range []string{
+// TestBuildInvalidJobName pins the one refusal Build still owns: the name it
+// is handed must be a ≤63-character DNS-1123 label. The derivation itself is
+// exercised in registry (JobName); the scheduler settles an underivable task
+// id before Build, with the same failure_reason (failure-handling #0).
+func TestBuildInvalidJobName(t *testing.T) {
+	for _, name := range []string{
 		"",
 		"UPPER-CASE",
 		"has space",
 		"underscore_ok_no",
-		strings.Repeat("a", 62), // fm- + 62 chars exceeds the 63-char DNS-1123 label limit
+		strings.Repeat("a", 64), // over the 63-char DNS-1123 label limit
 	} {
 		entry := testEntry()
-		entry.TaskID = taskID
+		entry.JobName = name
 		job, secret, tokenHash, err := newTestBuilder(t, testConfigWithIssuer()).Build(entry)
 		if err == nil {
-			t.Errorf("taskID %q: expected error, got job=%v", taskID, job != nil)
+			t.Errorf("job name %q: expected error, got job=%v", name, job != nil)
 		}
 		if !errors.Is(err, ErrInvalidTaskID) {
-			t.Errorf("taskID %q: error must wrap ErrInvalidTaskID (failure_reason=invalid_task_id), got %v", taskID, err)
+			t.Errorf("job name %q: error must wrap ErrInvalidTaskID (failure_reason=invalid_task_id), got %v", name, err)
 		}
 		if job != nil || secret != nil || tokenHash != "" {
-			t.Errorf("taskID %q: objects and digest must be zero on error", taskID)
+			t.Errorf("job name %q: objects and digest must be zero on error", name)
 		}
 	}
 }

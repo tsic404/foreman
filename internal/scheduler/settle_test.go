@@ -16,7 +16,9 @@ import (
 // or leak the Secret (failure-handling 顺序与幂等规则 2).
 func TestDiscardTaskKeepsEntryUntilObjectsAreGone(t *testing.T) {
 	f := newFixture(t)
-	f.claim(t, "task-1")
+	e := f.claim(t, "task-1")
+	wantJob := e.JobName
+	wantCred := registry.CredName(wantJob)
 
 	secretsBefore := len(f.jobs.deletedSecrets)
 	f.jobs.deleteJobErr = errors.New("apiserver unavailable")
@@ -31,8 +33,8 @@ func TestDiscardTaskKeepsEntryUntilObjectsAreGone(t *testing.T) {
 	}
 	// The Secret delete is still attempted: one failure must not leak the
 	// other object, and the entry keeps the Job for the retry.
-	if got := f.jobs.deletedSecrets[secretsBefore:]; len(got) != 1 || got[0] != "fm-task-1-cred" {
-		t.Fatalf("secret deletes since discard = %v, want [fm-task-1-cred]", got)
+	if got := f.jobs.deletedSecrets[secretsBefore:]; len(got) != 1 || got[0] != wantCred {
+		t.Fatalf("secret deletes since discard = %v, want [%s]", got, wantCred)
 	}
 
 	// The retry succeeds: only then does the mapping go.
@@ -43,8 +45,8 @@ func TestDiscardTaskKeepsEntryUntilObjectsAreGone(t *testing.T) {
 	if _, ok := f.reg.Get("task-1"); ok {
 		t.Fatal("the entry must be dropped once every object is gone")
 	}
-	if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != "fm-task-1" {
-		t.Fatalf("deletedJobs = %v, want [fm-task-1]", f.jobs.deletedJobs)
+	if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != wantJob {
+		t.Fatalf("deletedJobs = %v, want [%s]", f.jobs.deletedJobs, wantJob)
 	}
 }
 
@@ -100,7 +102,7 @@ func TestSettleTerminalKeepsJobWhileReportIsQueued(t *testing.T) {
 	if _, ok := f.reg.Get("task-1"); !ok {
 		t.Fatal("the entry must stay while its report is queued")
 	}
-	if !f.hasJob("fm-task-1") {
+	if !f.hasJob(derivedJobName("task-1")) {
 		t.Fatal("the Job must survive while its report is queued")
 	}
 	if len(f.jobs.deletedSecrets) != 1 { // only the claim-time stale sweep
@@ -116,7 +118,7 @@ func TestSettleTerminalKeepsJobWhileReportIsQueued(t *testing.T) {
 	if _, ok := f.reg.Get("task-1"); !ok {
 		t.Fatal("the entry stays until the credential reclaim")
 	}
-	if f.hasJob("fm-task-1") {
+	if f.hasJob(derivedJobName("task-1")) {
 		t.Fatal("the Job must be deleted once the report landed")
 	}
 	if len(f.jobs.deletedSecrets) != 1 {
@@ -148,8 +150,8 @@ func TestSettleTerminalKeepsEntryWhenJobDeletionFails(t *testing.T) {
 	if _, ok := f.reg.Get("task-1"); !ok {
 		t.Fatal("the entry stays until the credential reclaim")
 	}
-	if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != "fm-task-1" {
-		t.Fatalf("deletedJobs = %v, want [fm-task-1]", f.jobs.deletedJobs)
+	if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != derivedJobName("task-1") {
+		t.Fatalf("deletedJobs = %v, want [%s]", f.jobs.deletedJobs, derivedJobName("task-1"))
 	}
 }
 
@@ -171,7 +173,7 @@ func TestOnTaskVanishedEntersDrain(t *testing.T) {
 	if len(f.server.forwards) != 0 {
 		t.Fatalf("forwards = %+v, want none for a task the server no longer knows", f.server.forwards)
 	}
-	if f.hasJob("fm-task-1") {
+	if f.hasJob(derivedJobName("task-1")) {
 		t.Fatal("the Job must be deleted at the verdict")
 	}
 	if len(f.jobs.deletedSecrets) != 0 {
@@ -187,21 +189,21 @@ func TestOnTaskVanishedEntersDrain(t *testing.T) {
 // an orphan (ADR-017 兜底上界).
 func TestOnJobTerminatedByDrainTimeoutReportsOrphans(t *testing.T) {
 	f := newFixture(t)
-	f.claim(t, "task-1")
+	e := f.claim(t, "task-1")
 	f.jobs.deletedSecrets = nil
 	if _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, "", f.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
-	f.jobs.pods = []corev1.Pod{testPod("fm-task-1", corev1.PodRunning)}
+	f.jobs.pods = []corev1.Pod{testPod(e.JobName, corev1.PodRunning)}
 
-	if err := f.sched.OnJobTerminated(context.Background(), "fm-task-1",
+	if err := f.sched.OnJobTerminated(context.Background(), e.JobName,
 		JobTerminationReasonDrainTimeout, time.Time{}, 1); err != nil {
 		t.Fatalf("OnJobTerminated: %v", err)
 	}
 	if _, ok := f.reg.Get("task-1"); ok {
 		t.Fatal("the reclaimed entry must leave the live index")
 	}
-	if len(f.jobs.deletedSecrets) != 1 || f.jobs.deletedSecrets[0] != "fm-task-1-cred" {
+	if len(f.jobs.deletedSecrets) != 1 || f.jobs.deletedSecrets[0] != registry.CredName(e.JobName) {
 		t.Fatalf("secret deletes = %v, want the credential Secret", f.jobs.deletedSecrets)
 	}
 	if len(f.revoker.revoked) != 1 || f.revoker.revoked[0] != "hash-of-task-1" {
@@ -223,7 +225,7 @@ func TestOnJobTerminatedKeepsEntryWhenSecretDeletionFails(t *testing.T) {
 	}
 	f.jobs.deleteSecretErr = errors.New("apiserver unavailable")
 
-	if err := f.sched.OnJobTerminated(context.Background(), "fm-task-1",
+	if err := f.sched.OnJobTerminated(context.Background(), derivedJobName("task-1"),
 		JobTerminationReasonJobTerminated, f.now, 0); err == nil {
 		t.Fatal("OnJobTerminated: want the Secret deletion error surfaced")
 	}
@@ -235,7 +237,7 @@ func TestOnJobTerminatedKeepsEntryWhenSecretDeletionFails(t *testing.T) {
 	}
 
 	f.jobs.deleteSecretErr = nil
-	if err := f.sched.OnJobTerminated(context.Background(), "fm-task-1",
+	if err := f.sched.OnJobTerminated(context.Background(), derivedJobName("task-1"),
 		JobTerminationReasonJobTerminated, f.now, 0); err != nil {
 		t.Fatalf("OnJobTerminated retry: %v", err)
 	}
@@ -254,7 +256,7 @@ func TestOnJobTerminatedIgnoresLiveEntries(t *testing.T) {
 	f.claim(t, "task-1")
 	f.jobs.deletedSecrets = nil
 
-	if err := f.sched.OnJobTerminated(context.Background(), "fm-task-1",
+	if err := f.sched.OnJobTerminated(context.Background(), derivedJobName("task-1"),
 		JobTerminationReasonJobTerminated, f.now, 0); err != nil {
 		t.Fatalf("OnJobTerminated: %v", err)
 	}

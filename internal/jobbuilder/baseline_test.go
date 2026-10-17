@@ -86,6 +86,7 @@ func baselineDocuments(t *testing.T, entry TaskEntry, jobImage string) [][]byte 
 		t.Fatalf("read baseline: %v", err)
 	}
 	substitutions := map[string]string{
+		"<job-name>":            entry.JobName,
 		"<task_id>":             entry.TaskID,
 		"<agent_id>":            entry.AgentID,
 		"<workspace_id>":        entry.WorkspaceID,

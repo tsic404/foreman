@@ -46,8 +46,8 @@ func TestIntegrationJobFailedCompensationResetsInflightGauge(t *testing.T) {
 	// The Job's container ended without a daemon report (场景 #3): the
 	// reconciler compensates with failure_reason=job_failed.
 	rec := newReconciler(&fakeObjects{
-		job: failedJob(fakeJobName("t1"), "BackoffLimitExceeded"),
-		pods: []corev1.Pod{podFor(fakeJobName("t1"), func(p *corev1.Pod) {
+		job: failedJob(derivedJobName("t1"), "BackoffLimitExceeded"),
+		pods: []corev1.Pod{podFor(derivedJobName("t1"), func(p *corev1.Pod) {
 			p.Status.Phase = corev1.PodFailed
 		})},
 	})
@@ -75,10 +75,10 @@ func TestIntegrationJobFailedCompensationResetsInflightGauge(t *testing.T) {
 	if len(entries) != 1 || !entries[0].IsTerminal() || !entries[0].IsDraining() {
 		t.Fatalf("task snapshot = %+v, want one draining entry", entries)
 	}
-	if jobs.has(fakeJobName("t1")) {
+	if jobs.has(derivedJobName("t1")) {
 		t.Fatal("the Job must be deleted at the verdict")
 	}
-	if !jobs.hasSecret(fakeJobName("t1") + "-cred") {
+	if !jobs.hasSecret(derivedJobName("t1") + "-cred") {
 		t.Fatal("the credential Secret outlives the verdict until the reclaim")
 	}
 }
@@ -166,7 +166,7 @@ func TestIntegrationInflightGaugeConvergesWhileARoundIsBusy(t *testing.T) {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	busy := &stallingSender{entered: make(chan struct{}, 1), release: make(chan struct{})}
-	rec := newReconciler(&fakeObjects{job: runningJob(fakeJobName("t1"))})
+	rec := newReconciler(&fakeObjects{job: runningJob(derivedJobName("t1"))})
 	WithPendingReports(pending, busy)(rec)
 	rec.cfg.ReconcileInterval = interval
 
@@ -244,10 +244,10 @@ func TestIntegrationBootTimeoutResetsInflightGauge(t *testing.T) {
 	if len(entries) != 1 || !entries[0].IsTerminal() || !entries[0].IsDraining() {
 		t.Fatalf("task snapshot = %+v, want one draining entry", entries)
 	}
-	if jobs.has(fakeJobName("t1")) {
+	if jobs.has(derivedJobName("t1")) {
 		t.Fatal("the Job must be deleted at the verdict")
 	}
-	if !jobs.hasSecret(fakeJobName("t1") + "-cred") {
+	if !jobs.hasSecret(derivedJobName("t1") + "-cred") {
 		t.Fatal("the credential Secret outlives the verdict until the reclaim")
 	}
 }

@@ -37,8 +37,8 @@ func (f *fixture) assertSettled(t *testing.T, taskID string) {
 	if len(entries) != 1 || !entries[0].IsTerminal() || !entries[0].IsDraining() {
 		t.Fatalf("registry entries = %+v, want one draining entry", entries)
 	}
-	if f.hasJob("fm-" + taskID) {
-		t.Fatalf("Job fm-%s survives the settlement", taskID)
+	if f.hasJob(derivedJobName(taskID)) {
+		t.Fatalf("Job %s survives the settlement", derivedJobName(taskID))
 	}
 }
 
@@ -50,7 +50,7 @@ func TestFailJobResetsInflightGauge(t *testing.T) {
 	f.claim(t, "task-1")
 	f.server.status = "running"
 
-	if err := f.sched.FailJob(context.Background(), "fm-task-1", FailureReasonJobMissing); err != nil {
+	if err := f.sched.FailJob(context.Background(), derivedJobName("task-1"), FailureReasonJobMissing); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	f.assertSettled(t, "task-1")
@@ -65,7 +65,7 @@ func TestFailJobResetsInflightGaugeWhenTheReportIsRetained(t *testing.T) {
 	f.server.status = "running"
 	f.server.forwardErr = errors.New("transport down")
 
-	if err := f.sched.FailJob(context.Background(), "fm-task-1", FailureReasonJobMissing); err != nil {
+	if err := f.sched.FailJob(context.Background(), derivedJobName("task-1"), FailureReasonJobMissing); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	e, ok := f.reg.Get("task-1")
@@ -75,7 +75,7 @@ func TestFailJobResetsInflightGaugeWhenTheReportIsRetained(t *testing.T) {
 	if got := f.inflightGauge(t); got != 0 {
 		t.Fatalf("foreman_inflight_jobs = %d, want 0 with Registry.Inflight() = %d", got, f.reg.Inflight())
 	}
-	if !f.hasJob("fm-task-1") {
+	if !f.hasJob(derivedJobName("task-1")) {
 		t.Fatal("the Job must survive as the retry handle until the report lands")
 	}
 }

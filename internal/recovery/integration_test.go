@@ -43,7 +43,10 @@ func schedConfig() scheduler.Config {
 	}
 }
 
-func fakeJobName(taskID string) string { return "fm-" + taskID }
+// derivedJobName is the Job name the scheduler derives for a claim published
+// with the fixtures' issue identifier and no agent name (contract §3.1) — the
+// shape both integration fixtures use.
+func derivedJobName(taskID string) string { return registry.JobName(taskID, "TSI-1", "") }
 
 // drainPod is a pod of the current Job instance: it carries a
 // creationTimestamp at or after the Job's, so the instance filter of the
@@ -114,7 +117,7 @@ func TestIntegrationFailedJobIsCompensated(t *testing.T) {
 	if !ok {
 		t.Fatal("the claim did not register the task")
 	}
-	if !jobs.has(fakeJobName("t1")) || !jobs.hasSecret(fakeJobName("t1")+"-cred") {
+	if !jobs.has(derivedJobName("t1")) || !jobs.hasSecret(derivedJobName("t1")+"-cred") {
 		t.Fatal("OnClaim did not create the Job and its Secret")
 	}
 	if entry.TokenHash != "hash-of-t1" {
@@ -130,15 +133,15 @@ func TestIntegrationFailedJobIsCompensated(t *testing.T) {
 	}
 
 	objs := &fakeObjects{
-		job: failedJob(fakeJobName("t1"), "BackoffLimitExceeded"),
-		pods: []corev1.Pod{podFor(fakeJobName("t1"), func(p *corev1.Pod) {
+		job: failedJob(derivedJobName("t1"), "BackoffLimitExceeded"),
+		pods: []corev1.Pod{podFor(derivedJobName("t1"), func(p *corev1.Pod) {
 			p.Status.Phase = corev1.PodFailed
 		})},
 	}
 	rec := newReconciler(objs)
 	// The Job's pod is still alive in the cluster (the Job object is gone,
 	// the container is shutting down): that is the drain window.
-	jobs.setPods(fakeJobName("t1"), drainPod(fakeJobName("t1"), corev1.PodRunning))
+	jobs.setPods(derivedJobName("t1"), drainPod(derivedJobName("t1"), corev1.PodRunning))
 
 	// First round only records the sighting: the daemon gets its window.
 	if err := rec.Reconcile(ctx); err != nil {
@@ -166,10 +169,10 @@ func TestIntegrationFailedJobIsCompensated(t *testing.T) {
 	if !ok || !entry.IsTerminal() || !entry.IsDraining() {
 		t.Fatalf("entry = %+v, %v; want a retained draining entry", entry, ok)
 	}
-	if jobs.has(fakeJobName("t1")) {
+	if jobs.has(derivedJobName("t1")) {
 		t.Fatal("the Job must be deleted at the verdict (撤下调度与资源)")
 	}
-	if !jobs.hasSecret(fakeJobName("t1") + "-cred") {
+	if !jobs.hasSecret(derivedJobName("t1") + "-cred") {
 		t.Fatal("the credential Secret must outlive the verdict until the reclaim")
 	}
 
@@ -180,20 +183,20 @@ func TestIntegrationFailedJobIsCompensated(t *testing.T) {
 	if _, ok := reg.Get("t1"); !ok {
 		t.Fatal("the credential must survive the drain window while its pod is alive")
 	}
-	if !jobs.hasSecret(fakeJobName("t1") + "-cred") {
+	if !jobs.hasSecret(derivedJobName("t1") + "-cred") {
 		t.Fatal("the Secret must survive the drain window while its pod is alive")
 	}
 
 	// The pod terminates: the next round reclaims the credential —
 	// revoke, delete the Secret, drop the entry (ADR-017).
-	jobs.setPods(fakeJobName("t1"), drainPod(fakeJobName("t1"), corev1.PodSucceeded))
+	jobs.setPods(derivedJobName("t1"), drainPod(derivedJobName("t1"), corev1.PodSucceeded))
 	if err := rec.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile after pod termination: %v", err)
 	}
 	if _, ok := reg.Get("t1"); ok {
 		t.Fatal("the entry must be dropped by the credential reclaim")
 	}
-	if jobs.hasSecret(fakeJobName("t1") + "-cred") {
+	if jobs.hasSecret(derivedJobName("t1") + "-cred") {
 		t.Fatal("the credential Secret must be deleted by the reclaim")
 	}
 	if !revoker.has("hash-of-t1") {
@@ -218,8 +221,8 @@ func TestIntegrationCompensatedReportIsQueuedAndDrained(t *testing.T) {
 	}
 
 	objs := &fakeObjects{
-		job: failedJob(fakeJobName("t1"), "BackoffLimitExceeded"),
-		pods: []corev1.Pod{podFor(fakeJobName("t1"), func(p *corev1.Pod) {
+		job: failedJob(derivedJobName("t1"), "BackoffLimitExceeded"),
+		pods: []corev1.Pod{podFor(derivedJobName("t1"), func(p *corev1.Pod) {
 			p.Status.Phase = corev1.PodFailed
 		})},
 	}
@@ -251,13 +254,13 @@ func TestIntegrationCompensatedReportIsQueuedAndDrained(t *testing.T) {
 	if !ok || !entry.IsTerminal() {
 		t.Fatalf("entry = %+v, %v; want a retained terminal entry", entry, ok)
 	}
-	if !jobs.has(fakeJobName("t1")) || !jobs.hasSecret(fakeJobName("t1")+"-cred") {
+	if !jobs.has(derivedJobName("t1")) || !jobs.hasSecret(derivedJobName("t1")+"-cred") {
 		t.Fatal("the objects must stay while the report is queued")
 	}
 	// The daemon's pod is still shutting down (the Job object is gone at the
 	// verdict, the container is not): the drain window is open, so the
 	// credential survives the queued report.
-	jobs.setPods(fakeJobName("t1"), drainPod(fakeJobName("t1"), corev1.PodRunning))
+	jobs.setPods(derivedJobName("t1"), drainPod(derivedJobName("t1"), corev1.PodRunning))
 
 	// Still down one round later: the failed drain keeps the report queued
 	// and the objects held back.
@@ -267,7 +270,7 @@ func TestIntegrationCompensatedReportIsQueuedAndDrained(t *testing.T) {
 	if got := pending.Len(); got != 1 {
 		t.Fatalf("queued reports after a failed drain = %d, want 1", got)
 	}
-	if !jobs.has(fakeJobName("t1")) {
+	if !jobs.has(derivedJobName("t1")) {
 		t.Fatal("the Job must survive a failed drain")
 	}
 
@@ -290,26 +293,26 @@ func TestIntegrationCompensatedReportIsQueuedAndDrained(t *testing.T) {
 	// The report landed, so the verdict-time deletion runs: the Job goes, the
 	// credential and the entry stay for the still-open drain window (the pod
 	// is alive).
-	if jobs.has(fakeJobName("t1")) {
+	if jobs.has(derivedJobName("t1")) {
 		t.Fatal("the Job must be deleted once the report landed")
 	}
 	if _, ok := reg.Get("t1"); !ok {
 		t.Fatal("the entry must stay while the drain window is open")
 	}
-	if !jobs.hasSecret(fakeJobName("t1") + "-cred") {
+	if !jobs.hasSecret(derivedJobName("t1") + "-cred") {
 		t.Fatal("the Secret must stay while the drain window is open")
 	}
 
 	// The pod terminates: the reclaim closes the drain — revoke, delete the
 	// Secret, drop the entry (ADR-017).
-	jobs.setPods(fakeJobName("t1"), drainPod(fakeJobName("t1"), corev1.PodSucceeded))
+	jobs.setPods(derivedJobName("t1"), drainPod(derivedJobName("t1"), corev1.PodSucceeded))
 	if err := rec.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile after pod termination: %v", err)
 	}
 	if _, ok := reg.Get("t1"); ok {
 		t.Fatal("the reclaimed entry must leave the live index")
 	}
-	if jobs.hasSecret(fakeJobName("t1") + "-cred") {
+	if jobs.hasSecret(derivedJobName("t1") + "-cred") {
 		t.Fatal("the Secret must be gone once the drain closed")
 	}
 }
@@ -340,8 +343,8 @@ func TestIntegrationStagedReportSurvivesWriteFailure(t *testing.T) {
 		t.Fatalf("OnClaim: %v", err)
 	}
 	objs := &fakeObjects{
-		job: failedJob(fakeJobName("t1"), "BackoffLimitExceeded"),
-		pods: []corev1.Pod{podFor(fakeJobName("t1"), func(p *corev1.Pod) {
+		job: failedJob(derivedJobName("t1"), "BackoffLimitExceeded"),
+		pods: []corev1.Pod{podFor(derivedJobName("t1"), func(p *corev1.Pod) {
 			p.Status.Phase = corev1.PodFailed
 		})},
 	}
@@ -372,18 +375,18 @@ func TestIntegrationStagedReportSurvivesWriteFailure(t *testing.T) {
 	if !ok || !entry.IsTerminal() {
 		t.Fatalf("entry = %+v, %v; want a retained terminal entry", entry, ok)
 	}
-	if !jobs.has(fakeJobName("t1")) || !jobs.hasSecret(fakeJobName("t1")+"-cred") {
+	if !jobs.has(derivedJobName("t1")) || !jobs.hasSecret(derivedJobName("t1")+"-cred") {
 		t.Fatal("the objects must stay while the report is staged")
 	}
 	// The daemon's pod is still shutting down: the drain window is open.
-	jobs.setPods(fakeJobName("t1"), drainPod(fakeJobName("t1"), corev1.PodRunning))
+	jobs.setPods(derivedJobName("t1"), drainPod(derivedJobName("t1"), corev1.PodRunning))
 
 	// A later round with the directory still broken keeps both the staged
 	// report and the objects.
 	if err := rec.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if !pending.Queued("t1") || !jobs.has(fakeJobName("t1")) {
+	if !pending.Queued("t1") || !jobs.has(derivedJobName("t1")) {
 		t.Fatal("a failing write must neither drop the report nor free the objects")
 	}
 
@@ -408,25 +411,25 @@ func TestIntegrationStagedReportSurvivesWriteFailure(t *testing.T) {
 	if got := server.accepted(scheduler.EPFail); got != 1 {
 		t.Fatalf("accepted fail reports = %d, want exactly 1 terminal write", got)
 	}
-	if jobs.has(fakeJobName("t1")) {
+	if jobs.has(derivedJobName("t1")) {
 		t.Fatal("the Job must be deleted once the report landed")
 	}
 	if _, ok := reg.Get("t1"); !ok {
 		t.Fatal("the entry must stay while the drain window is open")
 	}
-	if !jobs.hasSecret(fakeJobName("t1") + "-cred") {
+	if !jobs.hasSecret(derivedJobName("t1") + "-cred") {
 		t.Fatal("the Secret must stay while the drain window is open")
 	}
 
 	// The pod terminates: the reclaim closes the drain (ADR-017).
-	jobs.setPods(fakeJobName("t1"), drainPod(fakeJobName("t1"), corev1.PodSucceeded))
+	jobs.setPods(derivedJobName("t1"), drainPod(derivedJobName("t1"), corev1.PodSucceeded))
 	if err := rec.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile after pod termination: %v", err)
 	}
 	if _, ok := reg.Get("t1"); ok {
 		t.Fatal("the reclaimed entry must leave the live index")
 	}
-	if jobs.hasSecret(fakeJobName("t1") + "-cred") {
+	if jobs.hasSecret(derivedJobName("t1") + "-cred") {
 		t.Fatal("the Secret must be gone once the drain closed")
 	}
 }
@@ -478,15 +481,16 @@ func TestIntegrationCancelWaitsForAckThenReleases(t *testing.T) {
 		t.Fatalf("OnClaim: %v", err)
 	}
 	reg.MarkStarted("t1", time.Now())
+	jobName := derivedJobName("t1")
 
-	rec := newReconciler(&fakeObjects{job: runningJob("fm-t1")})
+	rec := newReconciler(&fakeObjects{job: runningJob(jobName)})
 	if err := rec.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	if got := server.forwards(); len(got) != 0 {
 		t.Fatalf("forwards = %+v, want none while the daemon may still ack", got)
 	}
-	if !jobs.has("fm-t1") {
+	if !jobs.has(jobName) {
 		t.Fatal("the Job must be kept until the cancel-ack timeout")
 	}
 
@@ -502,10 +506,10 @@ func TestIntegrationCancelWaitsForAckThenReleases(t *testing.T) {
 	if !ok || !entry.IsTerminal() || entry.Result != registry.ResultCancelled {
 		t.Fatalf("entry = %+v, %v; want a terminal cancelled entry in drain", entry, ok)
 	}
-	if jobs.has("fm-t1") {
+	if jobs.has(jobName) {
 		t.Fatal("the Job must be removed after the ack timeout")
 	}
-	if !jobs.hasSecret("fm-t1-cred") {
+	if !jobs.hasSecret(registry.CredName(jobName)) {
 		t.Fatal("the Secret waits for the drain window (ADR-017)")
 	}
 }
@@ -515,8 +519,8 @@ func TestIntegrationCancelWaitsForAckThenReleases(t *testing.T) {
 type stubBuilder struct{}
 
 func (stubBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
-	return &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: fakeJobName(e.TaskID)}},
-		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: fakeJobName(e.TaskID) + "-cred"}},
+	return &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: e.JobName}},
+		&corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: registry.CredName(e.JobName)}},
 		"hash-of-" + e.TaskID, nil
 }
 

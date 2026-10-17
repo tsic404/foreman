@@ -12,6 +12,7 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -138,6 +139,12 @@ type claimHead struct {
 	AutopilotRunID  string `json:"autopilot_run_id"`
 	ChatSessionID   string `json:"chat_session_id"`
 	WorkspaceID     string `json:"workspace_id"`
+	// Agent is the payload's agent object, read for its name only: the name
+	// feeds the Job name's readable agent segment (`agent.name`, contract
+	// §3.1). Everything else in the object stays opaque.
+	Agent struct {
+		Name string `json:"name"`
+	} `json:"agent"`
 	// PriorSessionID locates the session this task resumes; it is the soft
 	// affinity key source and belongs to no trigger context (ADR-015).
 	PriorSessionID string `json:"prior_session_id"`
@@ -448,7 +455,12 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	}
 
 	now := s.now()
-	jobName := jobNameFor(head.ID)
+	// The name is a one-way derivation from the payload (contract §3.1): an
+	// empty answer means this task id cannot become a legal Job name, which is
+	// the invalid_task_id lane rather than a create failure (failure-handling
+	// #0). The same task always lands on the same name — the pre-start
+	// redispatch rule depends on that ("same name = same task").
+	jobName := registry.JobName(head.ID, head.IssueIdentifier, head.Agent.Name)
 	e := registry.TaskEntry{
 		TaskID:          head.ID,
 		AgentID:         head.AgentID,
@@ -508,11 +520,18 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	// (cred.revoke_unavailable).
 	s.reg.SetTokenHash(e.TaskID, tokenHash)
 	e.TokenHash = tokenHash
+	// A name-form change (contract §1.3「旧名残留」) leaves the previous
+	// version's objects behind under a name this process would never build:
+	// deleting by name alone would miss them and the same task would end up
+	// with two Jobs. They are found by the task-id label — the identity face —
+	// and a Job the startup rebuild already adopted never reaches this path
+	// (its task has an entry, so OnClaim returned above).
+	s.purgeForeignTaskJobs(ctx, e)
 	// An idempotent retry may have left the Secret behind: delete-then-create
 	// (NotFound counts as success inside the JobClient). The clear is
 	// best-effort and does not settle the claim — the CreateSecret below
 	// surfaces residue or a denied permission as a phase=secret failure.
-	_ = s.jobs.DeleteSecret(ctx, credName(jobName))
+	_ = s.jobs.DeleteSecret(ctx, registry.CredName(jobName))
 	trace(createStepClearStaleSecret)
 	err = s.jobs.CreateSecret(ctx, secret)
 	trace(createStepCreateSecret)
@@ -530,7 +549,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		// not this task's failure — the entry goes and the server
 		// re-dispatches the task once the lease lapses, the same recovery
 		// as an undeliverable claim (failure-handling 场景 #1/#2).
-		_ = s.jobs.DeleteSecret(ctx, credName(jobName))
+		_ = s.jobs.DeleteSecret(ctx, registry.CredName(jobName))
 		if errors.Is(err, errJobNameHeld) {
 			_ = s.reg.Delete(e.TaskID)
 			s.metrics.InflightJobs(s.reg.Inflight())
@@ -1278,7 +1297,7 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 	s.revokeCredential(ctx, e)
 	// ② The Secret is the credential's carrier; a failure here keeps the
 	// entry as the retry handle (顺序与幂等规则 7).
-	if err := s.jobs.DeleteSecret(ctx, credName(jobName)); err != nil {
+	if err := s.jobs.DeleteSecret(ctx, registry.CredName(jobName)); err != nil {
 		s.log.ErrorContext(ctx, "cred.reclaim_failed",
 			"task_id", e.TaskID, "job_name", jobName, "err", err)
 		return err
@@ -1419,38 +1438,43 @@ func podTerminated(pod *corev1.Pod) bool {
 
 // SweepOrphanSecrets deletes credential Secrets left behind by a reclaim a
 // restart interrupted (failure-handling 场景 #16). The criterion is
-// two-sided: the registry holds no entry for the task-id (any state) AND
-// GetJob explicitly answers NotFound. Either half alone would delete a
-// Secret that is still needed — the OnClaim CreateSecret → CreateJob window
-// has the entry but no Job yet, and a Job without its Secret boots into a
-// silent job_auth_failed.
+// two-sided: the registry holds no entry for the task-id (any state) AND no
+// Job carries that task-id label. Either half alone would delete a Secret
+// that is still needed — the OnClaim CreateSecret → CreateJob window has the
+// entry but no Job yet, and a Job without its Secret boots into a silent
+// job_auth_failed. The Job half is resolved by the task-id label, never by
+// the Secret's name: the name carries only the task's tail key (contract
+// §3.1), so there is nothing to reverse-derive a Job name from.
 func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 	secrets, err := s.jobs.ListSecrets(ctx)
 	if err != nil {
 		return fmt.Errorf("list credential secrets: %w", err)
 	}
+	// One list answers the Job half for every candidate: a task with a Job
+	// object owns its Secret, whatever that Job is called.
+	jobs, err := s.jobs.ListJobs(ctx)
+	if err != nil {
+		return fmt.Errorf("list jobs: %w", err)
+	}
+	withJob := make(map[string]bool, len(jobs))
+	for i := range jobs {
+		if taskID := jobs[i].Labels[registry.LabelTaskID]; taskID != "" {
+			withJob[taskID] = true
+		}
+	}
 	var firstErr error
 	for _, secret := range secrets {
 		taskID := secret.Labels[registry.LabelTaskID]
-		if taskID == "" {
+		if taskID == "" || !strings.HasSuffix(secret.Name, "-cred") {
 			continue
 		}
 		if _, ok := s.reg.Get(taskID); ok {
 			continue
 		}
-		jobName := jobNameFor(taskID)
-		job, err := s.jobs.GetJob(ctx, jobName)
-		if err != nil {
-			// An API error is not a NotFound: the criterion demands an
-			// explicit one, so the Secret stays this round.
-			if firstErr == nil {
-				firstErr = err
-			}
+		if withJob[taskID] {
 			continue
 		}
-		if job != nil {
-			continue
-		}
+		jobName := strings.TrimSuffix(secret.Name, "-cred")
 		if err := s.jobs.DeleteSecret(ctx, secret.Name); err != nil {
 			if firstErr == nil {
 				firstErr = err
@@ -1461,6 +1485,41 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 			"task_id", taskID, "job_name", jobName, "secret", secret.Name)
 	}
 	return firstErr
+}
+
+// purgeForeignTaskJobs removes Job/Secret objects that carry this task's
+// identity under a name the current naming rule would not produce — the
+// leftover of a name-form change (contract §1.3「旧名残留」). Deleting by name
+// cannot see them, and letting them live would give the task two Jobs at
+// once. Identity and lookup are both the task-id label; the objects are found
+// best-effort, because a listing failure must not settle an otherwise healthy
+// claim (the next claim of the same task retries).
+func (s *Scheduler) purgeForeignTaskJobs(ctx context.Context, e registry.TaskEntry) {
+	jobs, err := s.jobs.ListJobs(ctx)
+	if err != nil {
+		s.log.WarnContext(ctx, "job.foreign_purge_failed",
+			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
+		return
+	}
+	for i := range jobs {
+		job := jobs[i]
+		if job.Labels[registry.LabelTaskID] != e.TaskID || job.GetName() == e.JobName {
+			continue
+		}
+		stale := job.GetName()
+		if err := s.jobs.DeleteSecret(ctx, registry.CredName(stale)); err != nil {
+			s.log.WarnContext(ctx, "job.foreign_purge_failed",
+				"task_id", e.TaskID, "job_name", stale, "err", err)
+			return
+		}
+		if err := s.jobs.DeleteJob(ctx, stale); err != nil {
+			s.log.WarnContext(ctx, "job.foreign_purge_failed",
+				"task_id", e.TaskID, "job_name", stale, "err", err)
+			return
+		}
+		s.log.InfoContext(ctx, "job.foreign_removed",
+			"task_id", e.TaskID, "job_name", stale, "current_job_name", e.JobName)
+	}
 }
 
 // Reconcile converges the live index with the server. With a recovery
@@ -1646,10 +1705,10 @@ func (s *Scheduler) deleteObjects(ctx context.Context, e registry.TaskEntry) err
 			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
 		errs = append(errs, fmt.Errorf("delete job %s: %w", e.JobName, err))
 	}
-	if err := s.jobs.DeleteSecret(ctx, credName(e.JobName)); err != nil {
+	if err := s.jobs.DeleteSecret(ctx, registry.CredName(e.JobName)); err != nil {
 		s.log.ErrorContext(ctx, "job.delete_failed",
 			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
-		errs = append(errs, fmt.Errorf("delete secret %s: %w", credName(e.JobName), err))
+		errs = append(errs, fmt.Errorf("delete secret %s: %w", registry.CredName(e.JobName), err))
 	}
 	return errors.Join(errs...)
 }
@@ -1659,6 +1718,7 @@ func jobbuilderEntry(e registry.TaskEntry) jobbuilder.TaskEntry {
 	return jobbuilder.TaskEntry{
 		TaskID:          e.TaskID,
 		AgentID:         e.AgentID,
+		JobName:         e.JobName,
 		IssueID:         e.IssueID,
 		IssueIdentifier: e.IssueIdentifier,
 		AutopilotRunID:  e.AutopilotRunID,
@@ -1669,17 +1729,6 @@ func jobbuilderEntry(e registry.TaskEntry) jobbuilder.TaskEntry {
 		Attempt:         e.Attempt,
 		PriorSessionID:  e.PriorSessionID,
 	}
-}
-
-// jobNameFor is the single source of the Job name shape (task-mapping
-// invariant 2: job_name = daemon_id = fm-<task_id>).
-func jobNameFor(taskID string) string {
-	return "fm-" + taskID
-}
-
-// credName is the credential Secret of a Job (contract §1.3: fm-<taskid>-cred).
-func credName(jobName string) string {
-	return jobName + "-cred"
 }
 
 // jobImage extracts the agent container's image reference for the job.created

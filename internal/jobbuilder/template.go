@@ -143,7 +143,7 @@ func parseJobTemplate(path string, data []byte) (map[string]any, error) {
 // renderTemplate renders one task from the startup-parsed template: a fresh
 // deep copy per Build (P-006 §A1.3), the placeholder substitution, then the
 // typed Job. Reusing the parsed object would carry task A's per-task values —
-// above all the fm-<task_id>-cred Secret reference — into task B.
+// above all the <job-name>-cred Secret reference — into task B.
 func renderTemplate(template map[string]any, v placeholderValues) (*batchv1.Job, error) {
 	rendered := deepCopyTemplate(template)
 	dropPreferredAffinityItems(rendered, v.preferredNode)
@@ -166,6 +166,7 @@ func renderTemplate(template map[string]any, v placeholderValues) (*batchv1.Job,
 // Anything else written as <...> stays verbatim — an unregistered literal is
 // never guessed at, so a typo cannot silently become a value.
 const (
+	placeholderJobName         = "<job-name>"
 	placeholderTaskID          = "<task_id>"
 	placeholderAgentID         = "<agent_id>"
 	placeholderWorkspaceID     = "<workspace_id>"
@@ -190,7 +191,7 @@ var preferredNodePlaceholders = []string{placeholderPreferredNode, placeholderSe
 // placeholderRegistry is the substitution set in one place, so the walk and the
 // documented table cannot drift.
 var placeholderRegistry = []string{
-	placeholderTaskID, placeholderAgentID, placeholderWorkspaceID,
+	placeholderJobName, placeholderTaskID, placeholderAgentID, placeholderWorkspaceID,
 	placeholderIssueID, placeholderIssueIdentifier, placeholderAutopilotRunID,
 	placeholderChatSessionID, placeholderJobRuntimeID, placeholderClaimedAt,
 	placeholderJobImage, placeholderPreferredNode, placeholderSessionNode,
@@ -198,6 +199,10 @@ var placeholderRegistry = []string{
 
 // placeholderValues resolves each registered placeholder for one task.
 type placeholderValues struct {
+	// jobName is the rendered Job name: the same value A1.2 writes into
+	// metadata.name, so a template's <job-name>-cred reference cannot point
+	// anywhere else.
+	jobName         string
 	taskID          string
 	agentID         string
 	workspaceID     string
@@ -216,6 +221,8 @@ type placeholderValues struct {
 
 func (v placeholderValues) replacement(placeholder string) string {
 	switch placeholder {
+	case placeholderJobName:
+		return v.jobName
 	case placeholderTaskID:
 		return v.taskID
 	case placeholderAgentID:

@@ -193,8 +193,8 @@ func (s *Scheduler) DeleteProbe(ctx context.Context, h ProbeHandle) error {
 	if err := s.probes.DeleteProbe(h.JobName); err != nil {
 		errs = append(errs, fmt.Errorf("remove probe session %s: %w", h.JobName, err))
 	}
-	if err := s.jobs.DeleteSecret(ctx, credName(h.JobName)); err != nil {
-		errs = append(errs, fmt.Errorf("delete probe secret %s: %w", credName(h.JobName), err))
+	if err := s.jobs.DeleteSecret(ctx, registry.CredName(h.JobName)); err != nil {
+		errs = append(errs, fmt.Errorf("delete probe secret %s: %w", registry.CredName(h.JobName), err))
 	}
 	if err := s.jobs.DeleteJob(ctx, h.JobName); err != nil {
 		errs = append(errs, fmt.Errorf("delete probe job %s: %w", h.JobName, err))
@@ -232,7 +232,7 @@ func (s *Scheduler) SweepStaleProbes(ctx context.Context) error {
 			continue
 		}
 		s.log.InfoContext(ctx, "probe.swept", "job_name", job.GetName(), "age_seconds", s.now().Sub(job.CreationTimestamp.Time).Seconds())
-		if derr := s.jobs.DeleteSecret(ctx, credName(job.GetName())); derr != nil {
+		if derr := s.jobs.DeleteSecret(ctx, registry.CredName(job.GetName())); derr != nil {
 			record(derr)
 		}
 		if derr := s.jobs.DeleteJob(ctx, job.GetName()); derr != nil {

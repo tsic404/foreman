@@ -117,6 +117,9 @@ func TestDelivery01LostResponseIsRedeliveredToTheDaemon(t *testing.T) {
 	if n := len(h.server.forwarded(scheduler.EPFail)); n != 0 {
 		t.Errorf("C10 reports = %d, want 0", n)
 	}
+	if !h.jobs.jobDeleted(derivedJobName("task-1")) {
+		t.Error("the Job must be deleted with the verdict")
+	}
 
 	// The claim face: one first hand-over, one recovered one, and the empty
 	// batches inside each window as the lost-response signature.
@@ -274,7 +277,7 @@ func TestDelivery01DeliveredEntryKeepsItsAttributionAtTheBootBound(t *testing.T)
 		t.Errorf("compensated reason = %q, want %q (the boot branch stole the attribution)",
 			reason, scheduler.FailureReasonDeliveryUnconfirmed)
 	}
-	if !h.jobs.jobDeleted("fm-task-1") {
+	if !h.jobs.jobDeleted(derivedJobName("task-1")) {
 		t.Error("the Job must be deleted with the verdict")
 	}
 }
@@ -385,9 +388,9 @@ func deliveryPayload(taskID string) json.RawMessage {
 // issueJobToken issues the Job Token the task's daemon authenticates with.
 func issueJobToken(t *testing.T, h *harness, taskID string) string {
 	t.Helper()
-	token, err := h.issuer.Issue("fm-"+taskID, taskID, "ws-1", time.Hour)
+	token, err := h.issuer.Issue(derivedJobName(taskID), taskID, "ws-1", time.Hour)
 	if err != nil {
-		t.Fatalf("Issue(fm-%s): %v", taskID, err)
+		t.Fatalf("Issue(%s): %v", derivedJobName(taskID), err)
 	}
 	return token
 }
@@ -397,7 +400,7 @@ func issueJobToken(t *testing.T, h *harness, taskID string) string {
 func registerTaskDaemon(t *testing.T, h *harness, taskID, token string) {
 	t.Helper()
 	code, body := h.call("POST", "/api/daemon/register", token, []byte(`{
-		"daemon_id": "fm-`+taskID+`",
+		"daemon_id": "`+derivedJobName(taskID)+`",
 		"runtimes": [{"name": "foreman-zz", "type": "zz", "version": "3.1.4"}]
 	}`))
 	if code != 200 {
@@ -414,7 +417,7 @@ func claimTask(t *testing.T, h *harness, taskID, token string) []byte {
 		t.Fatalf("entry %s missing", taskID)
 	}
 	body, err := json.Marshal(map[string]any{
-		"daemon_id":   "fm-" + taskID,
+		"daemon_id":   derivedJobName(taskID),
 		"runtime_ids": []string{entry.JobRuntimeID},
 		"max_tasks":   4,
 	})
