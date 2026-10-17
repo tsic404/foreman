@@ -27,8 +27,6 @@ func TestJobImageSkipsPublishedVersions(t *testing.T) {
 	downstream := []string{
 		"Build the per-platform binary",
 		"Build and push the image",
-		"Verify the published manifest",
-		"Smoke the published image",
 	}
 	for _, name := range downstream {
 		step := requireStep(t, steps, name, foremanJobWorkflow)

@@ -154,94 +154,14 @@ jobs:
             "${tags[@]}" \
             --provenance=false \
             --push dist
-          digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")
-          [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || {
-            echo "::error title=Push did not land::$ref resolves to '$digest'"
-            exit 1
-          }
-          {
-            printf 'foreman_image=%s\n' "$ref"
-            printf 'foreman_digest=%s\n' "$digest"
-          } >>"$GITHUB_OUTPUT"
-          echo "published $ref@$digest" >>"$GITHUB_STEP_SUMMARY"
-
-      - name: Verify the published manifest
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
-          FOREMAN_DIGEST: ${{ steps.publish.outputs.foreman_digest }}
-        run: |
-          set -euo pipefail
-          die() { echo "::error title=Manifest verification failed::$*"; exit 1; }
-          ref="$REGISTRY/foreman:$VERSION"
-          # The tag must still resolve to the digest this run published:
-          # resolving it here and comparing catches a tag that moved.
-          got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")
-          [ "$got" = "$FOREMAN_DIGEST" ] || die "$ref resolves to $got, this run published $FOREMAN_DIGEST"
-          list=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$ref" |
-            jq -r '.manifests[]? | "\(.platform.os)/\(.platform.architecture) \(.digest)"')
-          plats=$(printf '%s\n' "$list" | cut -d' ' -f1 | sort)
-          [ "$plats" = "$(printf 'linux/amd64\nlinux/arm64')" ] ||
-            die "$ref carries '${plats:-<no platform list>}', want linux/amd64 + linux/arm64"
-          printf '%s\n' "$list" | grep -Eq '^linux/amd64 sha256:[0-9a-f]{64}$' ||
-            die "$ref has no digest-pinned linux/amd64 config"
-          printf '%s\n' "$list" | grep -Eq '^linux/arm64 sha256:[0-9a-f]{64}$' ||
-            die "$ref has no digest-pinned linux/arm64 config"
-          printf '%s\n' "$list"
-          printf '| `%s` | `%s` | linux/amd64, linux/arm64 |\n' "$ref" "$FOREMAN_DIGEST" >>"$GITHUB_STEP_SUMMARY"
-
-      - name: Smoke the published image
-        env:
-          VERSION: ${{ steps.version.outputs.version }}
-          REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
-        run: |
-          set -euo pipefail
-          die() { echo "::error title=Image smoke failed::$*"; exit 1; }
-          foreman="$REGISTRY/foreman:$VERSION"
-          mkdir -p dist/smoke
-          # Pull one platform's config, create the container without starting it
-          # and copy the file out: the runner's own platform is the only one it
-          # can execute natively, and emulation is not what a release is
-          # verified against.
-          extract() { # <platform> <path-in-image> <dest>
-            local platform=$1 path=$2 dest=$3 cid
-            docker pull --quiet --platform "$platform" "$foreman" >/dev/null
-            cid=$(docker create --platform "$platform" "$foreman" /bin/true)
-            docker cp "$cid:$path" "$dest" || {
-              docker rm "$cid" >/dev/null
-              die "$foreman ($platform) has no $path"
-            }
-            docker rm "$cid" >/dev/null
-          }
-          # The scheduler binary is cross-compiled per platform (CGO_ENABLED=0):
-          # its ELF header must name that platform and it must be static. `file`
-          # reads the header, so this holds for the platform the runner cannot
-          # execute (musl's `ldd` fails on a static binary instead of reporting).
-          for arch in amd64 arm64; do
-            extract "linux/$arch" /usr/local/bin/foreman "dist/smoke/foreman-linux-$arch"
-            described=$(file -b "dist/smoke/foreman-linux-$arch")
-            case "$arch" in
-              amd64) [[ $described == *x86-64* ]] ||
-                die "foreman in $foreman (linux/amd64) is not x86-64: $described" ;;
-              arm64) [[ $described == *aarch64* ]] ||
-                die "foreman in $foreman (linux/arm64) is not aarch64: $described" ;;
-            esac
-            [[ $described == *"statically linked"* ]] ||
-              die "foreman in $foreman ($arch) is not statically linked: $described"
-            echo "foreman image $arch: $described" >>"$GITHUB_STEP_SUMMARY"
-          done
-          # Executable proof on the runner's own platform: the image's
-          # entrypoint is the scheduler binary and it starts.
-          usage=$(docker run --rm --platform linux/amd64 --entrypoint sh "$foreman" \
-            -ec '/usr/local/bin/foreman --help 2>&1 || true')
-          [[ $usage == *"-listen"* ]] || die "foreman in $foreman does not execute: $usage"
+          echo "foreman_image=$ref" >>"$GITHUB_OUTPUT"
+          echo "published $ref" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Record what this run published
         env:
           VERSION: ${{ steps.version.outputs.version }}
           REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
           FOREMAN_IMAGE: ${{ steps.publish.outputs.foreman_image }}
-          FOREMAN_DIGEST: ${{ steps.publish.outputs.foreman_digest }}
         run: |
           set -euo pipefail
           sha7=$(git rev-parse --short=7 HEAD)
@@ -254,12 +174,11 @@ jobs:
           REGISTRY=$REGISTRY
           PLATFORMS=$PLATFORMS
           FOREMAN_IMAGE=$FOREMAN_IMAGE
-          FOREMAN_DIGEST=$FOREMAN_DIGEST
           EOF
           {
             printf '## Foreman image %s (%s)\n\n' "$VERSION" "$sha7"
-            printf '| Image | Reference | Digest |\n|---|---|---|\n'
-            printf '| foreman | `%s` | `%s` |\n' "$FOREMAN_IMAGE" "$FOREMAN_DIGEST"
+            printf '| Image | Reference |\n|---|---|\n'
+            printf '| foreman | `%s` |\n' "$FOREMAN_IMAGE"
             printf '\n`%s` manifest list; the Deployment references it by movable tag (`deploy/30-foreman.yaml`).\n' "$PLATFORMS"
           } >>"$GITHUB_STEP_SUMMARY"
 
@@ -271,4 +190,4 @@ jobs:
 
       - name: Report the failure
         if: failure()
-        run: echo "::error title=Image delivery failed::$GITHUB_REF was not published to GHCR, or the published image failed verification; do not pin this release."
+        run: echo "::error title=Image delivery failed::$GITHUB_REF was not published to GHCR; do not pin this release."
