@@ -1,0 +1,274 @@
+# Publish the scheduler image (04-architecture.md §部署/运行方式):
+# `foreman:<version>` (+ `latest`) for the Deployment, as a multi-platform
+# manifest list (linux/amd64 + linux/arm64), so a mixed-architecture cluster
+# pulls the platform its node runs.
+#
+# The release path lives entirely in this workflow: no repository scripts, no
+# make targets (the Makefile is local development only). This line's version
+# semantics are this repository's: `<version>` is the newest reachable
+# `v*.*.*` tag (a manual dispatch may name one), and a `main` push also moves
+# `latest` — an older tag build never moves it back.
+#
+# The Job image has its own line (build-foreman-job.yml) and its own version
+# semantics (the upstream daemon's). The two are independent: this workflow
+# never builds the Job image, and a Job-image run never builds this one.
+#
+# Every step failure fails the job — a push that never landed, a manifest
+# missing a platform, or a binary built for another architecture is a red
+# build, never a silent half-release.
+name: build-foreman
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*.*.*"]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version tag to publish (defaults to the newest v*.*.* tag, else v0.1.0)
+        required: false
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-foreman-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # Every release carries both platforms.
+  PLATFORMS: linux/amd64,linux/arm64
+  # Version of a `main` push that predates the first v*.*.* tag (the same
+  # default local builds stamp into the binary).
+  DEFAULT_VERSION: v0.1.0
+
+jobs:
+  publish:
+    # Hosted runners reach GHCR; FOREMAN_RELEASE_RUNNER (JSON label array)
+    # overrides them when the images must be built behind the tailnet.
+    runs-on: ${{ fromJSON(vars.FOREMAN_RELEASE_RUNNER || '["ubuntu-latest"]') }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # the newest reachable v*.*.* tag names the release
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod # the per-platform binaries below build here
+
+      - name: Resolve the version
+        id: version
+        env:
+          INPUT_VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          if [ -n "$INPUT_VERSION" ]; then
+            version=$INPUT_VERSION
+          elif [ "$GITHUB_REF_TYPE" = tag ]; then
+            version=$GITHUB_REF_NAME
+          else
+            version=$(git describe --tags --abbrev=0 --match 'v[0-9]*.[0-9]*.[0-9]*' 2>/dev/null || echo "$DEFAULT_VERSION")
+          fi
+          [[ $version =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+            echo "::error title=Version resolution failed::$version is not a v<major>.<minor>.<patch> tag"
+            exit 1
+          }
+          # `latest` tracks this repository's releases, so a run publishing an
+          # older version must not move it back: a manual dispatch naming one
+          # (`-f version=v0.1.0`) or a build of an old tag would otherwise roll
+          # the Deployment back. The ordering source is this repo's v*.*.* tags;
+          # with none published yet there is no ordering to violate, so a branch
+          # run still moves `latest`. Decided here, after the version is known,
+          # and never from a tag push.
+          newest=$(git tag --sort=-v:refname --list 'v[0-9]*.[0-9]*.[0-9]*' | sed -n '1p')
+          push_latest=0
+          if [ "$GITHUB_REF_TYPE" != tag ]; then
+            if [ -z "$newest" ] || [ "$(printf '%s\n%s\n' "$version" "$newest" | sort -V | tail -n1)" = "$version" ]; then
+              push_latest=1
+            fi
+          fi
+          {
+            printf 'version=%s\n' "$version"
+            printf 'newest=%s\n' "$newest"
+            printf 'push_latest=%s\n' "$push_latest"
+          } >>"$GITHUB_OUTPUT"
+          printf 'publishing foreman %s from %s (newest v*.*.* tag: %s; latest: %s)\n' \
+            "$version" "$GITHUB_SHA" "${newest:-<none>}" \
+            "$([ "$push_latest" = 1 ] && echo moves || echo stays)" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the per-platform binary
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          # The Containerfile copies dist/foreman-linux-<arch>: both platforms
+          # sit side by side in the build context and buildx picks one per
+          # platform.
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.version=$VERSION" \
+              -o "dist/foreman-linux-${arch}" ./cmd/foreman
+          done
+          ls -l dist
+
+      - name: Build and push the image
+        id: publish
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          NEWEST_TAG: ${{ steps.version.outputs.newest }}
+          REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
+          BASE_IMAGE: ${{ vars.FOREMAN_BASE_IMAGE || 'alpine:3.20' }}
+          # `latest` moves only for a run publishing a version not older than the
+          # newest v*.*.* tag, and never from a tag push (see the resolve step).
+          PUSH_LATEST: ${{ steps.version.outputs.push_latest }}
+        run: |
+          set -euo pipefail
+          ref="$REGISTRY/foreman:$VERSION"
+          tags=(--tag "$ref")
+          if [ "$PUSH_LATEST" = 1 ]; then
+            tags+=(--tag "$REGISTRY/foreman:latest")
+          else
+            echo "\`$REGISTRY/foreman:latest\` left alone: this run publishes $VERSION, the newest v*.*.* tag is ${NEWEST_TAG:-<none>}." >>"$GITHUB_STEP_SUMMARY"
+          fi
+          # --provenance=false: the published manifest list carries exactly the
+          # two platform manifests, with no attestation entry beside them.
+          docker buildx build \
+            --file images/foreman.Containerfile \
+            --platform "$PLATFORMS" \
+            --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+            "${tags[@]}" \
+            --provenance=false \
+            --push dist
+          digest=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")
+          [[ $digest =~ ^sha256:[0-9a-f]{64}$ ]] || {
+            echo "::error title=Push did not land::$ref resolves to '$digest'"
+            exit 1
+          }
+          {
+            printf 'foreman_image=%s\n' "$ref"
+            printf 'foreman_digest=%s\n' "$digest"
+          } >>"$GITHUB_OUTPUT"
+          echo "published $ref@$digest" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Verify the published manifest
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
+          FOREMAN_DIGEST: ${{ steps.publish.outputs.foreman_digest }}
+        run: |
+          set -euo pipefail
+          die() { echo "::error title=Manifest verification failed::$*"; exit 1; }
+          ref="$REGISTRY/foreman:$VERSION"
+          # The tag must still resolve to the digest this run published:
+          # resolving it here and comparing catches a tag that moved.
+          got=$(docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$ref")
+          [ "$got" = "$FOREMAN_DIGEST" ] || die "$ref resolves to $got, this run published $FOREMAN_DIGEST"
+          list=$(docker buildx imagetools inspect --format '{{json .Manifest}}' "$ref" |
+            jq -r '.manifests[]? | "\(.platform.os)/\(.platform.architecture) \(.digest)"')
+          plats=$(printf '%s\n' "$list" | cut -d' ' -f1 | sort)
+          [ "$plats" = "$(printf 'linux/amd64\nlinux/arm64')" ] ||
+            die "$ref carries '${plats:-<no platform list>}', want linux/amd64 + linux/arm64"
+          printf '%s\n' "$list" | grep -Eq '^linux/amd64 sha256:[0-9a-f]{64}$' ||
+            die "$ref has no digest-pinned linux/amd64 config"
+          printf '%s\n' "$list" | grep -Eq '^linux/arm64 sha256:[0-9a-f]{64}$' ||
+            die "$ref has no digest-pinned linux/arm64 config"
+          printf '%s\n' "$list"
+          printf '| `%s` | `%s` | linux/amd64, linux/arm64 |\n' "$ref" "$FOREMAN_DIGEST" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Smoke the published image
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
+        run: |
+          set -euo pipefail
+          die() { echo "::error title=Image smoke failed::$*"; exit 1; }
+          foreman="$REGISTRY/foreman:$VERSION"
+          mkdir -p dist/smoke
+          # Pull one platform's config, create the container without starting it
+          # and copy the file out: the runner's own platform is the only one it
+          # can execute natively, and emulation is not what a release is
+          # verified against.
+          extract() { # <platform> <path-in-image> <dest>
+            local platform=$1 path=$2 dest=$3 cid
+            docker pull --quiet --platform "$platform" "$foreman" >/dev/null
+            cid=$(docker create --platform "$platform" "$foreman" /bin/true)
+            docker cp "$cid:$path" "$dest" || {
+              docker rm "$cid" >/dev/null
+              die "$foreman ($platform) has no $path"
+            }
+            docker rm "$cid" >/dev/null
+          }
+          # The scheduler binary is cross-compiled per platform (CGO_ENABLED=0):
+          # its ELF header must name that platform and it must be static. `file`
+          # reads the header, so this holds for the platform the runner cannot
+          # execute (musl's `ldd` fails on a static binary instead of reporting).
+          for arch in amd64 arm64; do
+            extract "linux/$arch" /usr/local/bin/foreman "dist/smoke/foreman-linux-$arch"
+            described=$(file -b "dist/smoke/foreman-linux-$arch")
+            case "$arch" in
+              amd64) [[ $described == *x86-64* ]] ||
+                die "foreman in $foreman (linux/amd64) is not x86-64: $described" ;;
+              arm64) [[ $described == *aarch64* ]] ||
+                die "foreman in $foreman (linux/arm64) is not aarch64: $described" ;;
+            esac
+            [[ $described == *"statically linked"* ]] ||
+              die "foreman in $foreman ($arch) is not statically linked: $described"
+            echo "foreman image $arch: $described" >>"$GITHUB_STEP_SUMMARY"
+          done
+          # Executable proof on the runner's own platform: the image's
+          # entrypoint is the scheduler binary and it starts.
+          usage=$(docker run --rm --platform linux/amd64 --entrypoint sh "$foreman" \
+            -ec '/usr/local/bin/foreman --help 2>&1 || true')
+          [[ $usage == *"-listen"* ]] || die "foreman in $foreman does not execute: $usage"
+
+      - name: Record what this run published
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
+          FOREMAN_IMAGE: ${{ steps.publish.outputs.foreman_image }}
+          FOREMAN_DIGEST: ${{ steps.publish.outputs.foreman_digest }}
+        run: |
+          set -euo pipefail
+          sha7=$(git rev-parse --short=7 HEAD)
+          mkdir -p dist
+          cat >dist/release-foreman.env <<EOF
+          # The release record for this run. deploy/ is never backfilled from it
+          # (ADR-012): the image is referenced by movable tag.
+          GIT_SHA=$sha7
+          VERSION=$VERSION
+          REGISTRY=$REGISTRY
+          PLATFORMS=$PLATFORMS
+          FOREMAN_IMAGE=$FOREMAN_IMAGE
+          FOREMAN_DIGEST=$FOREMAN_DIGEST
+          EOF
+          {
+            printf '## Foreman image %s (%s)\n\n' "$VERSION" "$sha7"
+            printf '| Image | Reference | Digest |\n|---|---|---|\n'
+            printf '| foreman | `%s` | `%s` |\n' "$FOREMAN_IMAGE" "$FOREMAN_DIGEST"
+            printf '\n`%s` manifest list; the Deployment references it by movable tag (`deploy/30-foreman.yaml`).\n' "$PLATFORMS"
+          } >>"$GITHUB_STEP_SUMMARY"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-foreman-${{ steps.version.outputs.version }}
+          path: dist/release-foreman.env
+          retention-days: 90
+
+      - name: Report the failure
+        if: failure()
+        run: echo "::error title=Image delivery failed::$GITHUB_REF was not published to GHCR, or the published image failed verification; do not pin this release."

@@ -42,12 +42,16 @@ func TestJob01ReferenceTemplateMatchesBaseline(t *testing.T) {
 			authority, published)
 	}
 
-	// Step 3a's content self-proof: the two <job-image> placeholders and the
-	// recognition item the soft-affinity cases need.
+	// Step 3a's content self-proof: every container the template declares
+	// carries the verbatim <job-image> placeholder (agent, omp, prepare), and
+	// the recognition item the soft-affinity cases need is present.
 	templateJob := decodeJob(t, []byte(published))
-	images := []string{
-		templateJob.Spec.Template.Spec.Containers[0].Image,
-		templateJob.Spec.Template.Spec.InitContainers[0].Image,
+	var images []string
+	for _, container := range templateJob.Spec.Template.Spec.InitContainers {
+		images = append(images, container.Image)
+	}
+	for _, container := range templateJob.Spec.Template.Spec.Containers {
+		images = append(images, container.Image)
 	}
 	for i, image := range images {
 		if image != "<job-image>" {
