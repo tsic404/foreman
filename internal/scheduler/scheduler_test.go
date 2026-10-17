@@ -8,6 +8,8 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"sync"
@@ -1824,6 +1826,41 @@ func (testIssuer) IssueProbe(string, string, string, time.Duration) (string, err
 
 func (testIssuer) Hash(token string) string { return "hash(" + token + ")" }
 
+// schedulerTestTemplate is the minimal template the placement tests build
+// through: they read the node-reuse item and the image placeholder, nothing
+// else — the reference shape is asserted in the jobbuilder package (AC-20).
+const schedulerTestTemplate = `
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fm-<task_id>
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      affinity:
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - { key: kubernetes.io/hostname, operator: In, values: ["<preferred node>"] }
+      containers:
+        - name: agent
+          image: <job-image>
+`
+
+// writeTemplate writes schedulerTestTemplate where the builder reads it: the
+// template is a required deployment artifact (ADR-030).
+func writeTemplate(t *testing.T) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "job-overlay.yaml")
+	if err := os.WriteFile(path, []byte(schedulerTestTemplate), 0o600); err != nil {
+		t.Fatalf("write template: %v", err)
+	}
+	return path
+}
+
 // newCappedScheduler builds a scheduler over f's registry whose builder is
 // the real jobbuilder, so Job objects carry the genuine affinity.
 func newCappedScheduler(t *testing.T, f *fixture, maxJobsPerNode int, logw io.Writer) *Scheduler {
@@ -1832,6 +1869,7 @@ func newCappedScheduler(t *testing.T, f *fixture, maxJobsPerNode int, logw io.Wr
 	if err != nil {
 		t.Fatalf("jobbuilder.LoadConfig: %v", err)
 	}
+	jbCfg.TemplatePath = writeTemplate(t)
 	jbCfg.Issuer = testIssuer{}
 	jbCfg.Nodes = f.reg
 	jbCfg.Logger = slog.New(slog.NewJSONHandler(logw, nil))

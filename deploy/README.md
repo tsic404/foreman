@@ -8,6 +8,7 @@ Everything is plain YAML — `kubectl apply -f deploy/` installs it in one pass.
 | `00-namespaces.yaml` | `Namespace foreman`, `Namespace multica-agents` |
 | `10-secrets.yaml` | `Secret foreman-secret` (ns foreman), `Secret registry-tsic` (ns multica-agents + ns foreman) |
 | `20-rbac.yaml` | `ServiceAccount foreman` + `Role`/`RoleBinding` (ns multica-agents), `ServiceAccount multica-omp`, `ServiceAccount foreman-gc` |
+| `25-job-template.yaml` | `ConfigMap foreman-job-template` (ns foreman) — the required Job template, mounted by the Deployment |
 | `30-foreman.yaml` | `Deployment foreman` (1 replica) + `Service foreman` (ClusterIP :8080) |
 | `40-foreman-gc.yaml` | `DaemonSet foreman-gc` (ns multica-agents) |
 | `optional/servicemonitor.yaml` | `ServiceMonitor foreman` — needs the Prometheus Operator CRDs |
@@ -186,18 +187,27 @@ The ones a staging/test cluster usually overrides:
 | `FOREMAN_JOB_BOOT_TIMEOUT` | `60s` | boot-timeout assertions |
 | `FOREMAN_LOG_LEVEL` | `debug` | heartbeat / WS assertions |
 
-## Job template (optional)
+## Job template (required)
 
-The Deployment mounts the optional ConfigMap `foreman-job-template` at
-`/etc/foreman/job-template/` (`optional: true`, key `job-overlay.yaml` — the
-path and key name are kept for deployment compatibility). Without the
-ConfigMap, Jobs render from the built-in default template; with it, the file is
-the **complete `batch/v1 Job`** and Foreman uses it as written (contract §5.4):
+The Job's shape comes from one place: the ConfigMap `foreman-job-template`,
+which `25-job-template.yaml` ships and the Deployment mounts at
+`/etc/foreman/job-template/` as a **non-optional** read-only volume (key
+`job-overlay.yaml`). The shipped content is the **reference template** — a byte
+copy of the design repo's `test-cases/_infra/job-baseline.yaml` Job document,
+the AC-20 authority — and a deployer replaces it with their own complete
+`batch/v1 Job` (contract §5.4):
 
 ```bash
-kubectl -n foreman create configmap foreman-job-template --from-file=job-overlay.yaml=./job-overlay.yaml
+# The shipped reference template (this repo's deploy/25-job-template.yaml) is
+# applied with everything else; to install a different one:
+kubectl -n foreman create configmap foreman-job-template --from-file=job-overlay.yaml=./job-overlay.yaml --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n foreman rollout restart deploy/foreman
 ```
+
+**There is no built-in template.** A missing, unreadable or unparseable file
+refuses startup, and the ConfigMap object itself missing blocks the pod before
+Foreman's process ever runs (`CreateContainerConfigError`): deploy the ConfigMap
+**before** upgrading Foreman (ADR-030).
 
 Foreman writes exactly three things into that template:
 
@@ -222,32 +232,31 @@ added or normalized.
 | `<issue_id>` / `<issue-identifier>` / `<autopilot_run_id>` / `<chat_session_id>` | the task's trigger context |
 | `<job runtime uuid>` / `<RFC3339>` | the Job runtime id / the claim time |
 | `<job-image>` | `FOREMAN_JOB_IMAGE` |
-| `<preferred node>` (also spelled `<session node>`) | the node holding the resumed session's file (`session_id` of the task's previous run); with no resumed session — a first run — or no known node for it, or `FOREMAN_PREFER_NODE_REUSE=false`, the whole affinity item carrying it is dropped |
+| `<preferred node>` | the node holding the resumed session's file (`session_id` of the task's previous run); with no resumed session — a first run — or no known node for it, or `FOREMAN_PREFER_NODE_REUSE=false`, the whole affinity item carrying it is dropped. This literal is the substitution set's **one exception**: it is consumed only where it is *recognized* — a `values` entry of a preferred-affinity `matchExpressions` reading exactly this literal — so anywhere else it stays verbatim, and the apiserver judges that position at Job creation |
 
-Unregistered `<...>` literals stay as written — a template copied from the
-built-in default must have `<job-image>` replaced (a literal `image:
-<job-image>` reaches the apiserver unchanged and the Job never boots).
+Unregistered `<...>` literals stay as written, so a template that writes
+`image: <job-image>` reaches the apiserver unchanged and the Job never boots;
+the reference template has the placeholder in both container images.
 
 - The file is read once at startup: an edit needs a Foreman restart, and the
   startup log records the template sha256 plus the accepted/refused verdict.
-- Only two things refuse startup (CrashLoopBackOff): a file that cannot be
-  read, and a file that is not a `batch/v1 Job` — bad YAML, an unknown field
-  (`contianers` is refused, never silently dropped), or a missing/mismatched
-  `apiVersion`/`kind`. There is no env switch: the file's existence is the
-  switch.
+- Three things refuse startup (CrashLoopBackOff), each logged as its own class:
+  a file that does not exist (the ConfigMap is there but has no
+  `job-overlay.yaml` key), a file that cannot be read, and a file that is not a
+  `batch/v1 Job` — bad YAML, an unknown field (`contianers` is refused, never
+  silently dropped), or a missing/mismatched `apiVersion`/`kind`. Nothing else
+  is checked. There is no env switch and no fallback.
 
 ### Upgrade and rollback order
 
-The file's meaning changed (incremental overlay → complete template), so the
-two ends move in order:
+The template is a required deployment artifact, so the ConfigMap moves first:
 
-- **Upgrade**: roll out the new Foreman first, then replace the ConfigMap. A new
-  Foreman reads the old overlay as a complete Job and refuses to start, so the
-  ConfigMap cannot stay as it is.
-- **Rollback**: restore or delete the ConfigMap **and** roll the image back in
-  the same step. Rolling the image back alone leaves the complete template
-  mounted, which the older Foreman rejects at startup → CrashLoopBackOff. An
-  empty or absent ConfigMap returns to the built-in default template.
+- **Upgrade**: create/update the ConfigMap (the shipped reference template, or
+  the deployer's own) **before** rolling out the new Foreman. A Foreman whose
+  template is absent refuses to start — and with the ConfigMap object itself
+  missing, kubelet blocks the pod before that.
+- **Rollback**: roll the image back; the ConfigMap can stay. An older Foreman
+  reads the same complete template, so no ConfigMap change is needed.
 
 ### Risk disclosure
 
@@ -257,11 +266,13 @@ runtime instead of at startup:
 - Job 内负载来自模型输出，等同于在节点上执行不可信代码
 - Foreman 不对 Job 模板做任何校验
 - 模板内容不构成安全边界
+- Foreman 按策略文件向 Job 写入资源与能力字段，该提权面由 Foreman 自身写入
+- 策略文件内容不构成安全边界
 
 A template can therefore grant `privileged`, node paths, the node's container
 runtime socket, `serviceAccountName` or `automountServiceAccountToken`: that is
 the deployment's own decision and its own risk. Three consequences worth knowing
-before copying the default template:
+before copying the reference template:
 
 - The Job Token reaches the daemon only if the template mounts the per-task
   Secret `fm-<task_id>-cred` (or another source of `config.json` at the profile
@@ -279,8 +290,7 @@ before copying the default template:
 ### Catalog probe and model catalog (startup)
 
 Before Foreman registers with Multica Server it runs **one catalog probe Job**:
-the same official daemon, rendered from the same template (ConfigMap present) or
-from the built-in default template (ConfigMap absent). The probe reports which
+the same official daemon, rendered from the same template. The probe reports which
 runtimes/providers the template environment really has, and that report is what
 Foreman declares to the server; it also doubles as the template preflight.
 

@@ -1,11 +1,15 @@
-# TC-tech-job-01 / AC-20 的权威回归基线。
-# 本文件是 `docs/05-modules/job-template.md` §Job Manifest（默认模板）的测试基线拷贝：
-# 占位符字面保留（替换规则见 job-template.md「占位符与回归基线」）；**条件块不在基线内**——
-# 条件性 nodeAffinity 块与触发上下文注解（issue-id / issue-identifier / autopilot-run-id /
-# chat-session-id）在归一化时从实际对象删除，形状由 TC-tech-job-01（affinity 单项形状、issue 触发分支）与
-# TC-tech-job-04（autopilot 触发 / 聊天入口触发的**首跑**分支）单独断言；**软亲和键（唯一键 = 会话键）的
-# 命中与落点**由 TC-tech-cache-05/06 断言（ADR-015）。
-# 修订 job-template.md 的默认模板必须同 PR 同步本文件。
+# TC-tech-job-01 / AC-20 的权威回归基线；**其 Job 文档 = 随仓发布的参考模板内容的唯一权威源**
+# （部署清单把本文件的 Job 文档发布为 ConfigMap `foreman-job-template` 的 `job-overlay.yaml`；模板为必选部署物，ADR-030）。
+# 本文件与 `docs/05-modules/job-template.md` §Job Manifest 是**同一份模板**的两种呈现（字面一致）：
+#   · `<job-image>` **逐字保留**在两容器 `image`（消费面见 03-contracts §5.1 / §5.4）；
+#   · `<preferred node>` **识别位属参考模板内容**（软亲和的取值/删除对象；缺该位则 AC-25 / AC-26 无判定对象）——
+#     由 TC-tech-job-01 步骤 3a 的「CM 内容自证」断言。
+# 占位符替换规则见 job-template.md「占位符与回归基线」。**条件块不在基线内**：触发上下文注解（issue-id /
+# issue-identifier / autopilot-run-id / chat-session-id）由 A1.2 先清 `foreman.tsic.top/*` 域再按字段增删 ⇒ CM 写不写都不影响产物，
+# 故基线（= CM 字面）不含；归一化时从实际对象删除，形状由 TC-tech-job-01（issue 触发分支）与 TC-tech-job-04（**首跑**分支）单独断言。
+# **软亲和项在渲染面上的取舍（取值 → 恰一项 / 不满足条件 → 删项并上收空结构）由 TC-tech-job-01 步骤 3b 与 TC-tech-cache-05/06 断言（ADR-015）。**
+# 修订 job-template.md 的参考模板必须同 PR 同步本文件（两份 = 同一份模板，不得漂移）。
+# 末段 Secret 文档是该夹具的**凭据回归面**，不是模板内容（模板 = 单份 `batch/v1 Job`）。
 apiVersion: batch/v1
 kind: Job
 metadata:
@@ -51,6 +55,13 @@ spec:
       tolerations:
         - { key: unreachable, operator: Exists, effect: NoExecute }
         - { key: maybe_unreachable, operator: Exists, effect: NoExecute }
+      affinity:                                   # 参考模板内容的一部分：软亲和识别位（TC-tech-job-01 步骤 3a 自证）
+        nodeAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              preference:
+                matchExpressions:
+                  - { key: kubernetes.io/hostname, operator: In, values: ["<preferred node>"] }
       topologySpreadConstraints:
         - maxSkew: 3
           topologyKey: kubernetes.io/hostname

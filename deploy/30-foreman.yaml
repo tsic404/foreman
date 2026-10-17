@@ -82,8 +82,6 @@ spec:
               value: "multica-agents"
             - name: FOREMAN_JOB_IMAGE
               value: "ghcr.io/tsic404/foreman-job:latest"
-            - name: FOREMAN_JOB_IMAGE_PULL_SECRETS
-              value: '["registry-tsic"]'
             - name: FOREMAN_MAX_INFLIGHT_JOBS
               value: "100"
             - name: FOREMAN_CLAIM_BATCH_MAX
@@ -123,13 +121,9 @@ spec:
             # Foreman exits non-zero (default = FOREMAN_JOB_BOOT_TIMEOUT).
             - name: FOREMAN_STARTUP_PROBE_TIMEOUT
               value: "300s"
-            - name: FOREMAN_JOB_TTL_SECONDS
-              value: "600"
             # --- node-local state (ADR-005) ---
             - name: FOREMAN_STATE_ROOT
               value: "/var/lib/foreman"
-            - name: FOREMAN_REPO_CACHE_MODE
-              value: "shared"
             - name: FOREMAN_PREFER_NODE_REUSE
               value: "true"
             - name: FOREMAN_MAX_JOBS_PER_NODE
@@ -150,7 +144,11 @@ spec:
             # "0" disables expiry.
             - name: FOREMAN_AGENT_STATE_TTL
               value: "336h"
-            # --- Job container resources ---
+            # --- Job shape: template-only (ADR-030) ---
+            # The five keys below are idle contract entries: the Job's
+            # resources and nodeSelector come from the template, and Foreman
+            # reads none of them (an arbitrary value, an illegal one included,
+            # is ignored). Their deletion follows P-012 / P-013.
             - name: FOREMAN_JOB_CPU_REQUEST
               value: "1"
             - name: FOREMAN_JOB_MEMORY_REQUEST
@@ -161,8 +159,6 @@ spec:
               value: "8Gi"
             - name: FOREMAN_JOB_NODE_SELECTOR
               value: '{"kubernetes.io/os":"linux"}'
-            - name: FOREMAN_JOB_TOLERATIONS
-              value: '[{"key":"unreachable","operator":"Exists","effect":"NoExecute"},{"key":"maybe_unreachable","operator":"Exists","effect":"NoExecute"}]'
             # --- observability ---
             - name: FOREMAN_LOG_LEVEL
               value: "info"
@@ -205,9 +201,10 @@ spec:
             # terminal-report queue (contract §4) between container restarts.
             - name: state
               mountPath: /var/lib/foreman
-            # §5.4 template carrier: optional, so a missing ConfigMap falls back
-            # to the built-in default template (AC-20) instead of blocking
-            # container creation with CreateContainerConfigError.
+            # §5.4 template carrier: required, so a missing ConfigMap blocks
+            # pod creation with CreateContainerConfigError (the container-layer
+            # half of the fail-fast pair) instead of starting a Foreman with
+            # nothing to render from. Content: 25-job-template.yaml.
             - name: job-template
               mountPath: /etc/foreman/job-template
               readOnly: true
@@ -217,7 +214,7 @@ spec:
         - name: job-template
           configMap:
             name: foreman-job-template
-            optional: true
+            optional: false
 ---
 # Job-side entry point: the Job daemon's MULTICA_SERVER_URL resolves to
 # foreman.foreman.svc.cluster.local:8080 (contract §1.2/§5.2).

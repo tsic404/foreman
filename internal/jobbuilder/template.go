@@ -19,30 +19,30 @@ import (
 )
 
 // TemplatePath is the fixed template carrier location (03-contracts.md §5.4):
-// the Deployment mounts the optional ConfigMap foreman-job-template here with
-// key job-overlay.yaml. Enablement is file existence only — there is no env
-// switch, so a setting cannot point at a file the Deployment never mounted.
-// Path and key keep their names for deployment compatibility; the content is
-// the complete Job template, not a merge fragment (P-006 §A4).
+// the Deployment mounts the required ConfigMap foreman-job-template here with
+// key job-overlay.yaml, as a non-optional read-only volume. There is no env
+// switch — the file's presence is the deployment's contract, so a setting
+// cannot point at a file the Deployment never mounted.
 const TemplatePath = "/etc/foreman/job-template/job-overlay.yaml"
 
-// The startup log carries three fixed literals from two places in
-// 03-contracts.md §5.4: the risk declaration (§5.4 风险告知) and the hash line
-// plus effect statement (§5.4 运维口径①). The declaration and the hash line are
-// greped verbatim by AC-29 / TC-tech-job-07; the effect statement rests on
-// design text only — no AC or TC protects it. They stay constants so call
-// sites cannot drift from the contract text.
+// The startup log carries fixed literals from two places in 03-contracts.md
+// §5.4: the risk declaration (§5.4 风险告知) and the hash line plus effect
+// statement (§5.4 运维口径①). The declaration and the hash line are greped
+// verbatim by AC-29 / TC-tech-job-07; the effect statement rests on design text
+// only — no AC or TC protects it. They stay constants so call sites cannot
+// drift from the contract text.
 
-// templateRiskDeclaration is the statement the startup log carries on both
-// paths — template present and absent (03-contracts.md §5.4 风险告知, restated
-// in ADR-016): the template is not a security boundary, and Foreman does not
-// check it.
+// templateRiskDeclaration is the statement the startup log always carries
+// (03-contracts.md §5.4 风险告知): the template is not a security boundary,
+// and Foreman does not check it.
 const templateRiskDeclaration = "Foreman 不对 Job 模板做任何校验，模板内容不构成安全边界"
 
 // templateHashLinePrefix starts the hash line, whose fixed literal is
 // `模板内容哈希 sha256=<64 lowercase hex>` over the template file's bytes. The
 // line is a message, not an attr: an attr key carrying this prefix would
 // render `"模板内容哈希 sha256":"<hex>"`, breaking the `=` form the greps fix.
+// It is printed only when the file was readable — the missing and unreadable
+// paths say the hash is out of reach instead.
 const templateHashLinePrefix = "模板内容哈希 sha256="
 
 // templateEffectStatement is the 生效状态声明 (§5.4 运维口径①): the file is
@@ -51,19 +51,22 @@ const templateEffectStatement = "运行中 CM 变更不生效"
 
 // strictJobSerializer rejects unknown fields instead of dropping them: a
 // misspelled "contianers" must fail loudly rather than render a Job without
-// containers (P-006 §A4).
+// containers (03-contracts §5.4 启动期判定).
 var strictJobSerializer = jsonserializer.NewSerializerWithOptions(
 	jsonserializer.DefaultMetaFactory, scheme.Scheme, scheme.Scheme,
 	jsonserializer.SerializerOptions{Yaml: false, Strict: true},
 )
 
 // LoadJobTemplate is the startup gate (called by NewBuilder): it reads the
-// optional Job template and parses it. A missing file means present=false —
-// the built-in default template (AC-20 regression), never an error. Only two
-// failures exist (P-006 §A4): the file cannot be read, or its content is not a
-// batch/v1 Job — a YAML parse error, an unknown field under strict decoding,
-// or an apiVersion/kind that is not the Job's.
-func LoadJobTemplate(cfg Config) (map[string]any, bool, error) {
+// required Job template and parses it. The template is a required deployment
+// artifact, so every failure refuses startup — there is no fallback and no
+// default template (ADR-030). Three failure classes, each logged on its own
+// line: the file does not exist, the file cannot be read (the hash is out of
+// reach — the line says so), or the content is not a batch/v1 Job (a YAML
+// parse error, an unknown field under strict decoding, or an apiVersion/kind
+// that is not the Job's — the hash line is printed here, the bytes being
+// readable). Nothing else about the template is judged.
+func LoadJobTemplate(cfg Config) (map[string]any, error) {
 	path := cfg.TemplatePath
 	if path == "" {
 		path = TemplatePath
@@ -71,18 +74,15 @@ func LoadJobTemplate(cfg Config) (map[string]any, bool, error) {
 	log := cfg.logger()
 
 	data, err := os.ReadFile(path)
-	if errors.Is(err, fs.ErrNotExist) {
-		log.Warn("job template absent: using the built-in default template",
-			"template", path, "declaration", templateRiskDeclaration,
-			"effect", templateEffectStatement)
-		return nil, false, nil
-	}
-	if err != nil {
-		// Failure class 1: the file cannot be read, so the hash is out of
-		// reach — the line says so instead of carrying a hash line.
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		log.Error("job template file missing: 模板文件不存在，拒绝启动",
+			"template", path, "declaration", templateRiskDeclaration)
+		return nil, fmt.Errorf("job template %s does not exist: %w", path, err)
+	case err != nil:
 		log.Error("job template file unreadable: 文件不可读，模板内容哈希不可得",
 			"template", path, "err", err.Error(), "declaration", templateRiskDeclaration)
-		return nil, false, fmt.Errorf("read job template %s: %w", path, err)
+		return nil, fmt.Errorf("read job template %s: %w", path, err)
 	}
 
 	sum := sha256.Sum256(data)
@@ -93,22 +93,22 @@ func LoadJobTemplate(cfg Config) (map[string]any, bool, error) {
 		log.Error("job template rejected: refusing to start",
 			"template", path, "err", err.Error(), "declaration", templateRiskDeclaration)
 		log.Error(hashLine, "template", path)
-		return nil, true, err
+		return nil, err
 	}
 
 	log.Info("job template accepted: used verbatim apart from Foreman's own writes",
 		"template", path, "declaration", templateRiskDeclaration,
 		"effect", templateEffectStatement)
 	log.Info(hashLine, "template", path)
-	return template, true, nil
+	return template, nil
 }
 
 // parseJobTemplate decodes the template file into the raw map each Build
-// copies. It decides the two class-2 rules the file can break: the document
-// must declare the Job's apiVersion/kind (a bare manifest fragment is not a
-// template), and strict decoding must accept every field. Numbers are kept as
-// json.Number: the map is written back per Build, and a float64 round trip
-// would silently rewrite int64 fields above 2^53.
+// copies. It decides the two rules of failure class 3 the file can break: the
+// document must declare the Job's apiVersion/kind (a bare manifest fragment is
+// not a template), and strict decoding must accept every field. Numbers are
+// kept as json.Number: the map is written back per Build, and a float64 round
+// trip would silently rewrite int64 fields above 2^53.
 func parseJobTemplate(path string, data []byte) (map[string]any, error) {
 	jsonBytes, err := utilyaml.ToJSON(data)
 	if err != nil {
@@ -141,15 +141,15 @@ func parseJobTemplate(path string, data []byte) (map[string]any, error) {
 }
 
 // renderTemplate renders one task from the startup-parsed template: a fresh
-// deep copy per Build (P-006 §A1.3), the placeholder substitution, then the
-// typed Job. Reusing the parsed object would carry task A's per-task values —
-// above all the fm-<task_id>-cred Secret reference — into task B.
+// deep copy per Build (A1.3), the registered placeholders (step 6a — they never
+// consume the node literal), then the node-reuse recognition site (step 7, the
+// literal's only consumer), then the typed Job. Reusing the parsed object would
+// carry task A's per-task values — above all the fm-<task_id>-cred Secret
+// reference — into task B.
 func renderTemplate(template map[string]any, v placeholderValues) (*batchv1.Job, error) {
 	rendered := deepCopyTemplate(template)
-	dropPreferredAffinityItems(rendered, v.preferredNode)
-	if _, err := substituteValue(rendered, v); err != nil {
-		return nil, err
-	}
+	substituteValue(rendered, v)
+	resolvePreferredNode(rendered, v.preferredNode)
 
 	raw, err := json.Marshal(rendered)
 	if err != nil {
@@ -165,6 +165,8 @@ func renderTemplate(template map[string]any, v placeholderValues) (*batchv1.Job,
 // Registered template placeholders (05-modules/job-template.md 占位符与回归基线).
 // Anything else written as <...> stays verbatim — an unregistered literal is
 // never guessed at, so a typo cannot silently become a value.
+// placeholderPreferredNode is registered too, but as the substitution set's one
+// exception: it is consumed by its recognition site, never by the generic walk.
 const (
 	placeholderTaskID          = "<task_id>"
 	placeholderAgentID         = "<agent_id>"
@@ -177,23 +179,19 @@ const (
 	placeholderClaimedAt       = "<RFC3339>"
 	placeholderJobImage        = "<job-image>"
 	placeholderPreferredNode   = "<preferred node>"
-	placeholderSessionNode     = "<session node>"
 )
 
-// preferredNodePlaceholders are the two spellings of the one conditional block
-// the design corpus carries for the node-reuse affinity item: P-006 §A1.2 and
-// 03-contracts §5.4 write <preferred node>, the built-in default template and
-// the placeholder table in 05-modules/job-template.md write <session node>.
-// Both name the same decision and drop their item together when none resolves.
-var preferredNodePlaceholders = []string{placeholderPreferredNode, placeholderSessionNode}
-
 // placeholderRegistry is the substitution set in one place, so the walk and the
-// documented table cannot drift.
+// documented table cannot drift. <preferred node> is deliberately absent: the
+// design registers it as the substitution set's one exception (03-contracts
+// §5.4「占位符替换」第 1 条) — only its recognition site takes a value or drops
+// its item (resolvePreferredNode), and anywhere else the literal stays verbatim
+// like any other unregistered one.
 var placeholderRegistry = []string{
 	placeholderTaskID, placeholderAgentID, placeholderWorkspaceID,
 	placeholderIssueID, placeholderIssueIdentifier, placeholderAutopilotRunID,
 	placeholderChatSessionID, placeholderJobRuntimeID, placeholderClaimedAt,
-	placeholderJobImage, placeholderPreferredNode, placeholderSessionNode,
+	placeholderJobImage,
 }
 
 // placeholderValues resolves each registered placeholder for one task.
@@ -236,76 +234,59 @@ func (v placeholderValues) replacement(placeholder string) string {
 		return v.claimedAt
 	case placeholderJobImage:
 		return v.jobImage
-	case placeholderPreferredNode, placeholderSessionNode:
-		return v.preferredNode
 	default:
 		return ""
 	}
 }
 
 // substituteValue rewrites the registered placeholders in every string value
-// of the template — map values and list elements alike (P-006 §A1.2 作用域).
-// An unresolved node-reuse placeholder outside the preferred affinity item is
-// an error rather than a deletion: P-006 §A1.2 的条件删除只覆盖那个 affinity
-// 项，别处的占位符若靠删除承载键来「解决」，args/env 整条会静默消失。
-func substituteValue(node any, v placeholderValues) (any, error) {
+// of the template — map values and list elements alike (§5.4「占位符替换」
+// 第 2/3 条: substring matching over the whole object's string values).
+func substituteValue(node any, v placeholderValues) any {
 	switch value := node.(type) {
 	case map[string]any:
 		for key, child := range value {
-			replaced, err := substituteValue(child, v)
-			if err != nil {
-				return nil, err
-			}
-			value[key] = replaced
+			value[key] = substituteValue(child, v)
 		}
-		return value, nil
+		return value
 	case []any:
 		for i, child := range value {
-			replaced, err := substituteValue(child, v)
-			if err != nil {
-				return nil, err
-			}
-			value[i] = replaced
+			value[i] = substituteValue(child, v)
 		}
-		return value, nil
+		return value
 	case string:
 		return substituteString(value, v)
 	default:
-		return node, nil
+		return node
 	}
 }
 
 // substituteString rewrites the registered placeholders inside one string
-// value. A node-reuse placeholder with no resolved node has no value to write:
-// dropPreferredAffinityItems has already removed the items it may delete, so
-// reaching here means the template put it somewhere else — fail closed.
-func substituteString(value string, v placeholderValues) (string, error) {
-	if v.preferredNode == "" && containsPreferredNode(value) {
-		return "", fmt.Errorf("job template: %s (%s) outside a preferred-affinity item has no value: no soft-affinity node was resolved for this task",
-			placeholderPreferredNode, placeholderSessionNode)
-	}
+// value. The node-reuse literal is not among them: it is handled at its
+// recognition site only, so a template that writes it elsewhere keeps it
+// verbatim — the apiserver, not this walk, is what refuses such a position
+// (§5.4「占位符替换」第 4 条).
+func substituteString(value string, v placeholderValues) string {
 	if !strings.Contains(value, "<") {
-		return value, nil
+		return value
 	}
 	for _, placeholder := range placeholderRegistry {
 		if strings.Contains(value, placeholder) {
 			value = strings.ReplaceAll(value, placeholder, v.replacement(placeholder))
 		}
 	}
-	return value, nil
+	return value
 }
 
-// dropPreferredAffinityItems removes the preferred-affinity items carrying a
-// node-reuse placeholder when no node was resolved. The placeholder's home is
-// the whole item: dropping only the placeholder string would leave an "In"
-// term with an empty values list, which the apiserver rejects. Structures the
-// deletion empties are pruned — the item, its list, nodeAffinity, affinity —
-// so a template whose only affinity was that item ends up without one, exactly
-// like the built-in default template's conditional block.
-func dropPreferredAffinityItems(template map[string]any, node string) {
-	if node != "" {
-		return
-	}
+// resolvePreferredNode writes the node-reuse decision into the template's
+// recognition site (03-contracts §5.4「识别位与执行顺序」): every values entry
+// reading exactly "<preferred node>" at
+// affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[*]
+// .preference.matchExpressions[*].values takes the resolved node's name, or —
+// when no node resolved — its whole item is dropped and the structures the
+// deletion empties are collapsed. The literal elsewhere is untouched: no
+// replacement, no deletion, no error.
+func resolvePreferredNode(template map[string]any, node string) {
 	spec := nestedMap(template, "spec", "template", "spec")
 	affinity, _ := spec["affinity"].(map[string]any)
 	nodeAffinity, _ := affinity["nodeAffinity"].(map[string]any)
@@ -314,11 +295,15 @@ func dropPreferredAffinityItems(template map[string]any, node string) {
 	kept := make([]any, 0, len(items))
 	dropped := false
 	for _, item := range items {
-		if containsPreferredNode(item) {
+		switch {
+		case node != "" && nameRecognitionElement(item, node):
+			// The item carries the recognition element and now names the node.
+			kept = append(kept, item)
+		case node == "" && hasRecognitionElement(item):
 			dropped = true
-			continue
+		default:
+			kept = append(kept, item)
 		}
-		kept = append(kept, item)
 	}
 	if !dropped {
 		return
@@ -327,6 +312,8 @@ func dropPreferredAffinityItems(template map[string]any, node string) {
 		nodeAffinity["preferredDuringSchedulingIgnoredDuringExecution"] = kept
 		return
 	}
+	// The empty-structure collapse is part of「删除该项」: the item, its list,
+	// nodeAffinity, affinity — until something non-empty is left.
 	delete(nodeAffinity, "preferredDuringSchedulingIgnoredDuringExecution")
 	if len(nodeAffinity) == 0 {
 		delete(affinity, "nodeAffinity")
@@ -336,30 +323,56 @@ func dropPreferredAffinityItems(template map[string]any, node string) {
 	}
 }
 
-// containsPreferredNode reports whether node is, or contains, either spelling
-// of the node-reuse placeholder.
-func containsPreferredNode(node any) bool {
-	switch value := node.(type) {
-	case map[string]any:
-		for _, child := range value {
-			if containsPreferredNode(child) {
-				return true
+// nameRecognitionElement rewrites every recognition element of one preferred
+// item to the resolved node, reporting whether the item carried one.
+func nameRecognitionElement(item any, node string) bool {
+	found := false
+	for _, values := range recognitionValueLists(item) {
+		for i, raw := range values {
+			if literal, ok := raw.(string); ok && literal == placeholderPreferredNode {
+				values[i] = node
+				found = true
 			}
 		}
-	case []any:
-		for _, child := range value {
-			if containsPreferredNode(child) {
-				return true
-			}
-		}
-	case string:
-		for _, placeholder := range preferredNodePlaceholders {
-			if strings.Contains(value, placeholder) {
+	}
+	return found
+}
+
+// hasRecognitionElement reports whether one preferred item carries a
+// recognition element.
+func hasRecognitionElement(item any) bool {
+	for _, values := range recognitionValueLists(item) {
+		for _, raw := range values {
+			if literal, ok := raw.(string); ok && literal == placeholderPreferredNode {
 				return true
 			}
 		}
 	}
 	return false
+}
+
+// recognitionValueLists walks one preferred item down to the values lists the
+// recognition site names: preference.matchExpressions[*].values. An entry whose
+// value merely contains the literal is not a recognition element — the design
+// pins an exact value — so it is left to the apiserver's own judgment.
+func recognitionValueLists(item any) [][]any {
+	entry, ok := item.(map[string]any)
+	if !ok {
+		return nil
+	}
+	preference, _ := entry["preference"].(map[string]any)
+	expressions, _ := preference["matchExpressions"].([]any)
+	var lists [][]any
+	for _, raw := range expressions {
+		expression, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		if values, ok := expression["values"].([]any); ok {
+			lists = append(lists, values)
+		}
+	}
+	return lists
 }
 
 // nestedMap walks a chain of map keys, returning nil when any step is absent

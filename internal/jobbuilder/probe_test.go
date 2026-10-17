@@ -2,7 +2,6 @@ package jobbuilder
 
 import (
 	"errors"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -112,197 +111,7 @@ func probeTemplateConfig(t *testing.T) (Config, *fakeIssuer) {
 	return cfg, issuer
 }
 
-// ---- CM-absent window: the built-in default probe Job ----
-
-func TestBuildCatalogProbeDefaultShape(t *testing.T) {
-	cfg := testConfig()
-	budget := 45 * time.Second
-	job, secret, tokenHash, issuer := mustBuildProbe(t, cfg, testRequestID, testProbeRuntime, testWorkspaceID, budget)
-
-	if job.Name != testProbeName {
-		t.Errorf("job name = %q, want %q", job.Name, testProbeName)
-	}
-	if job.Namespace != DefaultJobNamespace {
-		t.Errorf("namespace = %q, want %q", job.Namespace, DefaultJobNamespace)
-	}
-	wantLabels := map[string]string{
-		"app.kubernetes.io/name":       "foreman-job",
-		"app.kubernetes.io/managed-by": "foreman",
-		"foreman.tsic.top/role":        "catalog-probe",
-	}
-	if len(job.Labels) != len(wantLabels) {
-		t.Fatalf("job labels = %v, want exactly %v (no task-id)", job.Labels, wantLabels)
-	}
-	for key, want := range wantLabels {
-		if job.Labels[key] != want {
-			t.Errorf("label %q = %q, want %q", key, job.Labels[key], want)
-		}
-	}
-	if _, ok := job.Labels["foreman.tsic.top/task-id"]; ok {
-		t.Error("probe Job carries foreman.tsic.top/task-id: it would enter the task mapping")
-	}
-	// A probe maps no task, so it carries none of the §3.2 annotations.
-	if len(job.Annotations) != 0 {
-		t.Errorf("annotations = %v, want none", job.Annotations)
-	}
-
-	spec := job.Spec
-	if *spec.BackoffLimit != 0 || *spec.Completions != 1 || *spec.Parallelism != 1 {
-		t.Errorf("backoff/completions/parallelism = %d/%d/%d, want 0/1/1",
-			*spec.BackoffLimit, *spec.Completions, *spec.Parallelism)
-	}
-	if *spec.TTLSecondsAfterFinished != 300 {
-		t.Errorf("ttlSecondsAfterFinished = %d, want the probe's fixed 300", *spec.TTLSecondsAfterFinished)
-	}
-	if *spec.ActiveDeadlineSeconds != int64(budget/time.Second) {
-		t.Errorf("activeDeadlineSeconds = %d, want the remaining budget %d", *spec.ActiveDeadlineSeconds, int64(budget/time.Second))
-	}
-
-	pod := spec.Template
-	wantPodLabels := map[string]string{
-		"app.kubernetes.io/name": "foreman-job",
-		"foreman.tsic.top/role":  "catalog-probe",
-	}
-	if len(pod.Labels) != len(wantPodLabels) {
-		t.Fatalf("pod labels = %v, want exactly %v", pod.Labels, wantPodLabels)
-	}
-	for key, want := range wantPodLabels {
-		if pod.Labels[key] != want {
-			t.Errorf("pod label %q = %q, want %q", key, pod.Labels[key], want)
-		}
-	}
-	if pod.Spec.RestartPolicy != corev1.RestartPolicyNever {
-		t.Errorf("restartPolicy = %q, want Never", pod.Spec.RestartPolicy)
-	}
-	if pod.Spec.ServiceAccountName != "multica-omp" {
-		t.Errorf("serviceAccountName = %q, want multica-omp", pod.Spec.ServiceAccountName)
-	}
-	if pod.Spec.AutomountServiceAccountToken == nil || *pod.Spec.AutomountServiceAccountToken {
-		t.Errorf("automountServiceAccountToken = %v, want false", pod.Spec.AutomountServiceAccountToken)
-	}
-	if pod.Spec.Affinity != nil {
-		t.Errorf("affinity = %+v, want none: a probe has no soft affinity", pod.Spec.Affinity)
-	}
-	if len(pod.Spec.TopologySpreadConstraints) != 0 {
-		t.Errorf("topologySpreadConstraints = %v, want none", pod.Spec.TopologySpreadConstraints)
-	}
-
-	if len(pod.Spec.Containers) != 1 {
-		t.Fatalf("containers = %v, want the daemon alone", containerNames(pod.Spec.Containers))
-	}
-	daemon := pod.Spec.Containers[0]
-	if daemon.Name != "daemon" {
-		t.Errorf("container name = %q, want daemon", daemon.Name)
-	}
-	if daemon.Image != cfg.JobImage || daemon.ImagePullPolicy != corev1.PullAlways {
-		t.Errorf("daemon image/policy = %q/%q, want %q/Always", daemon.Image, daemon.ImagePullPolicy, cfg.JobImage)
-	}
-	if got := strings.Join(daemon.Command, " "); got != "/usr/bin/dumb-init -- /usr/local/bin/multica" {
-		t.Errorf("daemon command = %v, want the dumb-init PID 1 prefix", daemon.Command)
-	}
-	if got := strings.Join(daemon.Args, " "); got != "daemon start --foreground --profile foreman-catalog" {
-		t.Errorf("daemon args = %v, want the probe profile", daemon.Args)
-	}
-	if !daemon.TTY {
-		t.Error("daemon tty = false, want true (the daemon logs to stderr when it is a terminal)")
-	}
-	wantRequests := map[corev1.ResourceName]string{corev1.ResourceCPU: "100m", corev1.ResourceMemory: "256Mi"}
-	wantLimits := map[corev1.ResourceName]string{corev1.ResourceCPU: "1", corev1.ResourceMemory: "1Gi"}
-	for name, want := range wantRequests {
-		quantity := daemon.Resources.Requests[name]
-		if got := quantity.String(); got != want {
-			t.Errorf("daemon request %s = %s, want %s", name, got, want)
-		}
-	}
-	for name, want := range wantLimits {
-		quantity := daemon.Resources.Limits[name]
-		if got := quantity.String(); got != want {
-			t.Errorf("daemon limit %s = %s, want %s", name, got, want)
-		}
-	}
-
-	// The 15 daemon keys verbatim, then the probe's heartbeat key.
-	wantEnv := append(envNames(agentEnv()), "MULTICA_DAEMON_HEARTBEAT_INTERVAL")
-	if got := envNames(daemon.Env); !slices.Equal(got, wantEnv) {
-		t.Errorf("daemon env = %v, want the task daemon set plus the heartbeat key %v", got, wantEnv)
-	}
-	if got := envByName(t, daemon.Env, "MULTICA_DAEMON_HEARTBEAT_INTERVAL").Value; got != "15s" {
-		t.Errorf("heartbeat = %q, want the fixed 15s", got)
-	}
-
-	// The credential is mounted single-file where the probe profile reads it.
-	wantCredMount := "/home/agent/.multica/profiles/foreman-catalog/config.json"
-	if got := mountPathByName(t, daemon.VolumeMounts, volumeCred); got != wantCredMount {
-		t.Errorf("cred mount = %q, want %q", got, wantCredMount)
-	}
-	for _, mount := range daemon.VolumeMounts {
-		if mount.Name == volumeCred && (mount.SubPath != configFileKey || !mount.ReadOnly) {
-			t.Errorf("cred mount = %+v, want subPath %s readOnly", mount, configFileKey)
-		}
-	}
-	if got := mountPathByName(t, daemon.VolumeMounts, volumeWorkspaces); got != "/state/workspaces" {
-		t.Errorf("workspaces mount = %q, want /state/workspaces", got)
-	}
-
-	if len(pod.Spec.InitContainers) != 1 {
-		t.Fatalf("initContainers = %v, want the prepare container", containerNames(pod.Spec.InitContainers))
-	}
-	prepare := pod.Spec.InitContainers[0]
-	if prepare.Name != containerPrepare || prepare.Image != cfg.JobImage {
-		t.Errorf("prepare = %q/%q, want %s/%s", prepare.Name, prepare.Image, containerPrepare, cfg.JobImage)
-	}
-	script := strings.Join(prepare.Args, "\n")
-	if !strings.Contains(script, probeProfileDir) {
-		t.Errorf("prepare script does not target the probe profile:\n%s", script)
-	}
-	if strings.Contains(script, profileDir) {
-		t.Errorf("prepare script still targets the task profile:\n%s", script)
-	}
-
-	// Volumes: the node-local home, a probe-private workspaces emptyDir, and
-	// the credential Secret under the probe's own name.
-	home := volumeByName(t, pod.Spec.Volumes, volumeHome)
-	if home.HostPath == nil || home.HostPath.Path != "/var/lib/foreman/home" {
-		t.Errorf("home volume = %+v, want the state root's hostPath", home.VolumeSource)
-	}
-	for name, want := range map[string]string{volumeTmp: "1Gi", volumeCred: "16Mi", volumeWorkspaces: "1Gi"} {
-		vol := volumeByName(t, pod.Spec.Volumes, name)
-		if vol.EmptyDir == nil || vol.EmptyDir.SizeLimit.String() != want {
-			t.Errorf("volume %s = %+v, want an emptyDir of %s", name, vol.VolumeSource, want)
-		}
-	}
-	credSrc := volumeByName(t, pod.Spec.Volumes, volumeCredSrc)
-	if credSrc.Secret == nil || credSrc.Secret.SecretName != testProbeName+"-cred" {
-		t.Errorf("cred-src = %+v, want Secret %s-cred", credSrc.VolumeSource, testProbeName)
-	}
-	if credSrc.Secret.DefaultMode == nil || *credSrc.Secret.DefaultMode != 0o400 {
-		t.Errorf("cred-src defaultMode = %v, want 0400", credSrc.Secret.DefaultMode)
-	}
-
-	// The Secret: one Job Token, probe-labelled, never task-labelled.
-	if secret.Name != testProbeName+"-cred" || secret.Namespace != DefaultJobNamespace {
-		t.Errorf("secret = %s/%s, want %s/%s", secret.Namespace, secret.Name, DefaultJobNamespace, testProbeName+"-cred")
-	}
-	if len(secret.Labels) != len(wantLabels) {
-		t.Fatalf("secret labels = %v, want exactly %v", secret.Labels, wantLabels)
-	}
-	for key, want := range wantLabels {
-		if secret.Labels[key] != want {
-			t.Errorf("secret label %q = %q, want %q", key, secret.Labels[key], want)
-		}
-	}
-	if secret.Type != corev1.SecretTypeOpaque {
-		t.Errorf("secret type = %q, want Opaque", secret.Type)
-	}
-	if len(secret.StringData) != 1 || secret.StringData[configFileKey] != `{"token":"`+issuer.token+`"}` {
-		t.Errorf("secret keys = %v, want the one Job Token under %s", secret.StringData, configFileKey)
-	}
-	if tokenHash != tokenDigest(issuer.token) {
-		t.Errorf("token hash = %q, want the digest of the token the Secret carries", tokenHash)
-	}
-}
-
-// ---- CM present: the probe render over a deployment template ----
+// ---- the probe render over a deployment template ----
 
 func TestBuildCatalogProbeTemplateRender(t *testing.T) {
 	cfg, _ := probeTemplateConfig(t)
@@ -409,10 +218,10 @@ func TestBuildCatalogProbeTemplateRender(t *testing.T) {
 	if got := strings.Join(daemon.Args, " "); !strings.Contains(got, "--profile foreman-catalog") {
 		t.Errorf("daemon args = %q, want the probe profile", got)
 	}
-	if got := mountPathByName(t, daemon.VolumeMounts, volumeCred); got != "/home/agent/.multica/profiles/foreman-catalog/config.json" {
+	if got := mountPathByName(t, daemon.VolumeMounts, "cred"); got != "/home/agent/.multica/profiles/foreman-catalog/config.json" {
 		t.Errorf("cred mount = %q, want the probe profile path", got)
 	}
-	credSrc := volumeByName(t, job.Spec.Template.Spec.Volumes, volumeCredSrc)
+	credSrc := volumeByName(t, job.Spec.Template.Spec.Volumes, "cred-src")
 	if credSrc.Secret == nil || credSrc.Secret.SecretName != testProbeName+"-cred" {
 		t.Errorf("cred-src = %+v, want the probe's Secret", credSrc.VolumeSource)
 	}
@@ -436,10 +245,11 @@ func TestBuildCatalogProbeTemplateRender(t *testing.T) {
 		t.Errorf("affinity = %+v, want the item and its empty parents deleted", job.Spec.Template.Spec.Affinity)
 	}
 
-	// The probe consumes neither the template's deadline nor its TTL.
-	if *job.Spec.ActiveDeadlineSeconds != 86400 || *job.Spec.TTLSecondsAfterFinished != 600 {
-		t.Errorf("deadline/ttl = %d/%d, want the template's own values",
-			*job.Spec.ActiveDeadlineSeconds, *job.Spec.TTLSecondsAfterFinished)
+	// The TTL stays the template's; the deadline is the probe's own budget,
+	// the one field Foreman writes on a probe beyond the A1 faces (§5.1).
+	if *job.Spec.ActiveDeadlineSeconds != int64(budget/time.Second) || *job.Spec.TTLSecondsAfterFinished != 600 {
+		t.Errorf("deadline/ttl = %d/%d, want the budget %d and the template's 600",
+			*job.Spec.ActiveDeadlineSeconds, *job.Spec.TTLSecondsAfterFinished, int64(budget/time.Second))
 	}
 }
 
@@ -567,7 +377,7 @@ func TestBuildCatalogProbeTemplateCopy(t *testing.T) {
 	if strings.Contains(rendered, testEntry().TaskID) {
 		t.Errorf("probe Job carries the task's identity:\n%s", rendered)
 	}
-	if got := volumeByName(t, job.Spec.Template.Spec.Volumes, volumeCredSrc).Secret.SecretName; got != testProbeName+"-cred" {
+	if got := volumeByName(t, job.Spec.Template.Spec.Volumes, "cred-src").Secret.SecretName; got != testProbeName+"-cred" {
 		t.Errorf("probe cred-src = %q, want %q", got, testProbeName+"-cred")
 	}
 }

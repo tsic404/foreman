@@ -7,7 +7,6 @@ import (
 	"errors"
 	"io"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -100,6 +99,10 @@ func testConfig() Config {
 	if err != nil {
 		panic(err)
 	}
+	// The template is required, so every builder needs one: leaving the
+	// deployment path unset lets newTestBuilder supply the reference template,
+	// while templateConfig points at a test-owned manifest.
+	cfg.TemplatePath = ""
 	return cfg
 }
 
@@ -142,12 +145,13 @@ func mustBuild(t *testing.T, cfg Config, e TaskEntry) (*batchv1.Job, *corev1.Sec
 	return job, secret
 }
 
-// newTestBuilder runs the startup gate over cfg; the test config points at a
-// non-existent template path, so present=false (the AC-20 default path).
+// newTestBuilder runs the startup gate over cfg. The template is required
+// (ADR-030), so a config without one gets the reference template — the
+// baseline's Job document, byte for byte.
 func newTestBuilder(t *testing.T, cfg Config) *Builder {
 	t.Helper()
 	if cfg.TemplatePath == "" {
-		cfg.TemplatePath = filepath.Join(t.TempDir(), "job-overlay.yaml")
+		cfg.TemplatePath = referenceTemplatePath(t)
 	}
 	if cfg.Logger == nil {
 		cfg.Logger = discardLogger()
@@ -161,129 +165,6 @@ func newTestBuilder(t *testing.T, cfg Config) *Builder {
 
 func discardLogger() *slog.Logger {
 	return slog.New(slog.NewJSONHandler(io.Discard, nil))
-}
-
-func TestBuildJobMetadata(t *testing.T) {
-	job, _ := mustBuild(t, testConfig(), testEntry())
-
-	if job.Name != testJobName {
-		t.Errorf("job name = %q, want %q", job.Name, testJobName)
-	}
-	if job.Namespace != DefaultJobNamespace {
-		t.Errorf("namespace = %q, want %q", job.Namespace, DefaultJobNamespace)
-	}
-	wantLabels := map[string]string{
-		"app.kubernetes.io/name":        "foreman-job",
-		"app.kubernetes.io/managed-by":  "foreman",
-		"foreman.tsic.top/task-id":      testTaskID,
-		"foreman.tsic.top/agent-id":     "0a1b2c3d-4e5f-4a6b-9c8d-7e6f5a4b3c2d",
-		"foreman.tsic.top/workspace-id": "c20ff019-2980-4936-8cb0-22d79d694e71",
-	}
-	if len(job.Labels) != len(wantLabels) {
-		t.Fatalf("job labels = %v, want exactly %v", job.Labels, wantLabels)
-	}
-	for k, v := range wantLabels {
-		if job.Labels[k] != v {
-			t.Errorf("label %q = %q, want %q", k, job.Labels[k], v)
-		}
-	}
-	wantAnnotations := map[string]string{
-		"foreman.tsic.top/issue-id":         "aa10a105-59cf-4b6c-964e-4f857b580bcf",
-		"foreman.tsic.top/issue-identifier": "MULTI-9000",
-		"foreman.tsic.top/daemon-id":        testJobName,
-		"foreman.tsic.top/job-runtime-id":   "5d4c3b2a-1e0f-4a9b-8c7d-6e5f4a3b2c1d",
-		"foreman.tsic.top/claimed-at":       "2026-10-04T08:30:00Z",
-		"foreman.tsic.top/attempt":          "1",
-	}
-	for k, v := range wantAnnotations {
-		if job.Annotations[k] != v {
-			t.Errorf("annotation %q = %q, want %q", k, job.Annotations[k], v)
-		}
-	}
-}
-
-func TestBuildJobSpec(t *testing.T) {
-	job, _ := mustBuild(t, testConfig(), testEntry())
-	spec := job.Spec
-
-	if *spec.BackoffLimit != 0 || *spec.Completions != 1 || *spec.Parallelism != 1 {
-		t.Errorf("backoff/completions/parallelism = %d/%d/%d, want 0/1/1",
-			*spec.BackoffLimit, *spec.Completions, *spec.Parallelism)
-	}
-	if *spec.TTLSecondsAfterFinished != DefaultJobTTLSeconds {
-		t.Errorf("ttlSecondsAfterFinished = %d, want %d", *spec.TTLSecondsAfterFinished, DefaultJobTTLSeconds)
-	}
-	if *spec.ActiveDeadlineSeconds != int64(DefaultTaskMaxDuration/time.Second) {
-		t.Errorf("activeDeadlineSeconds = %d, want %d", *spec.ActiveDeadlineSeconds, int64(DefaultTaskMaxDuration/time.Second))
-	}
-}
-
-func TestBuildPodSpec(t *testing.T) {
-	job, _ := mustBuild(t, testConfig(), testEntry())
-	pod := job.Spec.Template
-
-	wantPodLabels := map[string]string{
-		"app.kubernetes.io/name":   "foreman-job",
-		"foreman.tsic.top/task-id": testTaskID,
-	}
-	if len(pod.Labels) != len(wantPodLabels) {
-		t.Fatalf("pod labels = %v, want exactly %v", pod.Labels, wantPodLabels)
-	}
-	for k, v := range wantPodLabels {
-		if pod.Labels[k] != v {
-			t.Errorf("pod label %q = %q, want %q", k, pod.Labels[k], v)
-		}
-	}
-
-	spec := pod.Spec
-	if spec.RestartPolicy != corev1.RestartPolicyNever {
-		t.Errorf("restartPolicy = %q, want Never", spec.RestartPolicy)
-	}
-	if *spec.TerminationGracePeriodSeconds != 30 {
-		t.Errorf("terminationGracePeriodSeconds = %d, want 30", *spec.TerminationGracePeriodSeconds)
-	}
-	if spec.ServiceAccountName != "multica-omp" {
-		t.Errorf("serviceAccountName = %q, want multica-omp", spec.ServiceAccountName)
-	}
-	if spec.AutomountServiceAccountToken == nil || *spec.AutomountServiceAccountToken {
-		t.Errorf("automountServiceAccountToken = %v, want false", spec.AutomountServiceAccountToken)
-	}
-	sc := spec.SecurityContext
-	if *sc.RunAsUser != 1000 || *sc.RunAsGroup != 1000 || *sc.FSGroup != 1000 || !*sc.RunAsNonRoot {
-		t.Errorf("pod securityContext = %+v, want uid/gid/fsGroup 1000 + runAsNonRoot", sc)
-	}
-	if sc.SeccompProfile == nil || sc.SeccompProfile.Type != corev1.SeccompProfileTypeRuntimeDefault {
-		t.Errorf("seccompProfile = %+v, want RuntimeDefault", sc.SeccompProfile)
-	}
-	if len(spec.ImagePullSecrets) != 1 || spec.ImagePullSecrets[0].Name != "registry-tsic" {
-		t.Errorf("imagePullSecrets = %v, want [registry-tsic]", spec.ImagePullSecrets)
-	}
-	if spec.NodeSelector["kubernetes.io/os"] != "linux" {
-		t.Errorf("nodeSelector = %v, want kubernetes.io/os=linux", spec.NodeSelector)
-	}
-	if len(spec.Tolerations) != 2 {
-		t.Fatalf("tolerations = %v, want 2 entries", spec.Tolerations)
-	}
-	for i, key := range []string{"unreachable", "maybe_unreachable"} {
-		tol := spec.Tolerations[i]
-		if tol.Key != key || tol.Operator != corev1.TolerationOpExists || tol.Effect != corev1.TaintEffectNoExecute {
-			t.Errorf("toleration[%d] = %+v, want key=%s Exists/NoExecute", i, tol, key)
-		}
-	}
-	if spec.HostNetwork || spec.HostPID {
-		t.Error("hostNetwork/hostPID must stay false (F4)")
-	}
-
-	if len(spec.TopologySpreadConstraints) != 1 {
-		t.Fatalf("topologySpreadConstraints = %v, want 1 entry", spec.TopologySpreadConstraints)
-	}
-	tsc := spec.TopologySpreadConstraints[0]
-	if tsc.MaxSkew != 3 || tsc.TopologyKey != "kubernetes.io/hostname" || tsc.WhenUnsatisfiable != corev1.ScheduleAnyway {
-		t.Errorf("topologySpreadConstraint = %+v, want maxSkew=3 hostname ScheduleAnyway", tsc)
-	}
-	if tsc.LabelSelector.MatchLabels["app.kubernetes.io/name"] != "foreman-job" {
-		t.Errorf("topologySpread labelSelector = %v", tsc.LabelSelector.MatchLabels)
-	}
 }
 
 // TestBuildKeepsJobImageReferenceVerbatim (AC-13): the configured reference
@@ -304,197 +185,6 @@ func TestBuildKeepsJobImageReferenceVerbatim(t *testing.T) {
 		}
 		if spec.InitContainers[0].Image != ref {
 			t.Errorf("prepare image = %q, want the verbatim %q", spec.InitContainers[0].Image, ref)
-		}
-	}
-}
-
-func TestBuildContainers(t *testing.T) {
-	job, _ := mustBuild(t, testConfig(), testEntry())
-	spec := job.Spec.Template.Spec
-
-	if len(spec.Containers) != 1 {
-		t.Fatalf("containers = %d, want exactly 1 (ADR-001)", len(spec.Containers))
-	}
-	if len(spec.InitContainers) != 1 {
-		t.Fatalf("initContainers = %d, want 1", len(spec.InitContainers))
-	}
-
-	agent := spec.Containers[0]
-	wantImage := DefaultJobImage
-	if agent.Image != wantImage {
-		t.Errorf("agent image = %q, want the FOREMAN_JOB_IMAGE default %q", agent.Image, wantImage)
-	}
-	if agent.ImagePullPolicy != corev1.PullAlways {
-		t.Errorf("agent imagePullPolicy = %q, want Always (ADR-012 movable tag)", agent.ImagePullPolicy)
-	}
-	if agent.WorkingDir != "/" {
-		t.Errorf("agent workingDir = %q, want / (guard 第三臂)", agent.WorkingDir)
-	}
-	if strings.Join(agent.Command, " ") != "/usr/bin/dumb-init -- /usr/local/bin/multica" || strings.Join(agent.Args, " ") != "daemon start --foreground --profile foreman-job" {
-		t.Errorf("agent command/args = %v %v", agent.Command, agent.Args)
-	}
-	if !agent.TTY {
-		t.Error("agent tty must be true so daemon logs go to stderr")
-	}
-	asc := agent.SecurityContext
-	if *asc.RunAsUser != 1000 || !*asc.RunAsNonRoot || *asc.AllowPrivilegeEscalation || *asc.ReadOnlyRootFilesystem {
-		t.Errorf("agent securityContext = %+v, want uid 1000 non-root no-escalation rw-rootfs", asc)
-	}
-	if len(asc.Capabilities.Drop) != 1 || asc.Capabilities.Drop[0] != "ALL" {
-		t.Errorf("agent capabilities = %+v, want drop ALL", asc.Capabilities)
-	}
-	if agent.Resources.Requests.Cpu().String() != "1" || agent.Resources.Requests.Memory().String() != "2Gi" {
-		t.Errorf("agent requests = %v", agent.Resources.Requests)
-	}
-	if agent.Resources.Limits.Cpu().String() != "4" || agent.Resources.Limits.Memory().String() != "8Gi" {
-		t.Errorf("agent limits = %v", agent.Resources.Limits)
-	}
-
-	wantMounts := []string{"home", "cred", "workspaces", "tmp"}
-	if len(agent.VolumeMounts) != len(wantMounts) {
-		t.Fatalf("agent volumeMounts = %v, want %v", agent.VolumeMounts, wantMounts)
-	}
-	for i, name := range wantMounts {
-		if agent.VolumeMounts[i].Name != name {
-			t.Errorf("agent volumeMount[%d] = %q, want %q", i, agent.VolumeMounts[i].Name, name)
-		}
-	}
-	// ADR-013 r2: the cred bucket reaches the agent as one read-only file on the
-	// node-local profile directory, never as a directory of its own.
-	if m := agent.VolumeMounts[1]; m.MountPath != mountCredFile || m.SubPath != configFileKey || !m.ReadOnly {
-		t.Errorf("agent cred mount = %+v, want single file %s (subPath %s, readOnly)", m, mountCredFile, configFileKey)
-	}
-	if m := spec.InitContainers[0].VolumeMounts[2]; m.Name != volumeCred || m.MountPath != mountCredOut || m.ReadOnly || m.SubPath != "" {
-		t.Errorf("prepare cred mount = %+v, want %s writable (no subPath)", m, mountCredOut)
-	}
-
-	init := spec.InitContainers[0]
-	if init.Name != "prepare" || init.Image != wantImage {
-		t.Errorf("init container = %q/%q, want prepare/%q", init.Name, init.Image, wantImage)
-	}
-	if init.Image != agent.Image {
-		t.Errorf("prepare image = %q, agent image = %q; both containers share FOREMAN_JOB_IMAGE (§5.2/ADR-012)", init.Image, agent.Image)
-	}
-	if init.ImagePullPolicy != corev1.PullAlways {
-		t.Errorf("prepare imagePullPolicy = %q, want Always (ADR-012 movable tag)", init.ImagePullPolicy)
-	}
-	if strings.Join(init.Command, " ") != "/bin/sh -ec" {
-		t.Errorf("init command = %v", init.Command)
-	}
-	wantScript := "for d in /home/agent/.multica /home/agent/.multica/profiles /home/agent/.multica/profiles/foreman-job; do\n" +
-		"  [ -d \"$d\" ] || { rm -f \"$d\"; mkdir -p \"$d\"; }\n" +
-		"done\n" +
-		"rm -rf /home/agent/.multica/daemon_task_context.json\n" +
-		"cp /cred/config.json /credout/config.json\n" +
-		"chmod 0400 /credout/config.json\n" +
-		"chown -R 1000:1000 /home/agent /credout\n"
-	if len(init.Args) != 1 || init.Args[0] != wantScript {
-		t.Errorf("init args = %q, want %q", init.Args, wantScript)
-	}
-	isc := init.SecurityContext
-	if *isc.RunAsUser != 0 || *isc.RunAsNonRoot || *isc.AllowPrivilegeEscalation || !*isc.ReadOnlyRootFilesystem {
-		t.Errorf("init securityContext = %+v, want uid 0 root-only ro-rootfs no-escalation", isc)
-	}
-	if got := capabilityStrings(isc.Capabilities.Drop); !equalStrings(got, []string{"ALL"}) {
-		t.Errorf("init capabilities.drop = %v, want [ALL]", got)
-	}
-	if got := capabilityStrings(isc.Capabilities.Add); !equalStrings(got, []string{"CHOWN", "DAC_OVERRIDE"}) {
-		t.Errorf("init capabilities.add = %v, want [CHOWN DAC_OVERRIDE] (prepare 属主/元数据最小集)", got)
-	}
-	if init.Resources.Requests.Cpu().String() != "20m" || init.Resources.Limits.Memory().String() != "128Mi" {
-		t.Errorf("init resources = %v", init.Resources)
-	}
-	if len(init.VolumeMounts) != 4 || init.VolumeMounts[3].Name != "cred-src" || !init.VolumeMounts[3].ReadOnly {
-		t.Errorf("init volumeMounts = %v, want cred-src readOnly", init.VolumeMounts)
-	}
-}
-
-func TestBuildAgentEnv(t *testing.T) {
-	job, _ := mustBuild(t, testConfig(), testEntry())
-	env := job.Spec.Template.Spec.Containers[0].Env
-
-	want := []struct {
-		name      string
-		value     string
-		fieldPath string
-	}{
-		{"MULTICA_SERVER_URL", "http://foreman.foreman.svc.cluster.local:8080", ""},
-		{"MULTICA_DAEMON_ID", "", "metadata.labels['job-name']"},
-		{"MULTICA_DAEMON_DEVICE_NAME", "", "spec.nodeName"},
-		{"MULTICA_AGENT_RUNTIME_NAME", "foreman-job", ""},
-		{"MULTICA_DAEMON_MAX_CONCURRENT_TASKS", "1", ""},
-		{"MULTICA_WORKSPACES_ROOT", "/state/workspaces", ""},
-		{"TMPDIR", "/tmp", ""},
-		{"TMP", "/tmp", ""},
-		{"TEMP", "/tmp", ""},
-		{"MULTICA_GC_ENABLED", "false", ""},
-		{"MULTICA_DAEMON_AUTO_UPDATE", "false", ""},
-		{"MULTICA_DAEMON_AUTO_RELOAD", "false", ""},
-		{"MULTICA_OMP_PATH", "/usr/local/bin/omp", ""},
-		{"HOME", "/home/agent", ""},
-		{"LOG_LEVEL", "info", ""},
-	}
-	if len(env) != len(want) {
-		t.Fatalf("env has %d entries, want exactly %d (contract §5.2)", len(env), len(want))
-	}
-	for i, w := range want {
-		got := env[i]
-		if got.Name != w.name {
-			t.Errorf("env[%d].Name = %q, want %q", i, got.Name, w.name)
-			continue
-		}
-		if w.fieldPath == "" {
-			if got.Value != w.value || got.ValueFrom != nil {
-				t.Errorf("env[%d] %s = %+v, want value %q", i, w.name, got, w.value)
-			}
-			continue
-		}
-		if got.ValueFrom == nil || got.ValueFrom.FieldRef == nil || got.ValueFrom.FieldRef.FieldPath != w.fieldPath {
-			t.Errorf("env[%d] %s = %+v, want fieldRef %q", i, w.name, got, w.fieldPath)
-		}
-	}
-}
-
-func TestBuildVolumes(t *testing.T) {
-	job, _ := mustBuild(t, testConfig(), testEntry())
-	volumes := job.Spec.Template.Spec.Volumes
-
-	if len(volumes) != 5 {
-		t.Fatalf("volumes = %d, want 5", len(volumes))
-	}
-	byName := make(map[string]corev1.Volume, len(volumes))
-	for _, v := range volumes {
-		byName[v.Name] = v
-	}
-	for name, wantPath := range map[string]string{"home": "/var/lib/foreman/home", "workspaces": "/var/lib/foreman/workspaces"} {
-		v := byName[name]
-		if v.HostPath == nil || v.HostPath.Path != wantPath || *v.HostPath.Type != corev1.HostPathDirectoryOrCreate {
-			t.Errorf("volume %q = %+v, want hostPath %s DirectoryOrCreate", name, v, wantPath)
-		}
-	}
-	if v := byName["tmp"]; v.EmptyDir == nil || v.EmptyDir.SizeLimit == nil || v.EmptyDir.SizeLimit.String() != "2Gi" {
-		t.Errorf("volume tmp = %+v, want emptyDir 2Gi", v)
-	}
-	if v := byName["cred"]; v.EmptyDir == nil || v.EmptyDir.SizeLimit == nil || v.EmptyDir.SizeLimit.String() != "16Mi" {
-		t.Errorf("volume cred = %+v, want emptyDir 16Mi", v)
-	}
-	credSrc := byName["cred-src"]
-	if credSrc.Secret == nil || credSrc.Secret.SecretName != testJobName+"-cred" || *credSrc.Secret.DefaultMode != 0o400 {
-		t.Errorf("volume cred-src = %+v, want secret %s-cred mode 0400", credSrc, testJobName)
-	}
-}
-
-func TestBuildIsolatedCacheMode(t *testing.T) {
-	cfg := testConfig()
-	cfg.RepoCacheMode = CacheModeIsolated
-	job, _ := mustBuild(t, cfg, testEntry())
-
-	for _, v := range job.Spec.Template.Spec.Volumes {
-		if v.HostPath != nil {
-			t.Errorf("isolated mode: volume %q still has hostPath %q", v.Name, v.HostPath.Path)
-		}
-		if (v.Name == "home" || v.Name == "workspaces") && v.EmptyDir == nil {
-			t.Errorf("isolated mode: volume %q must be emptyDir", v.Name)
 		}
 	}
 }
@@ -689,15 +379,6 @@ func TestBuildAffinityWithoutIssueContext(t *testing.T) {
 	}
 }
 
-func TestBuildActiveDeadlineDisabled(t *testing.T) {
-	cfg := testConfig()
-	cfg.TaskMaxDuration = 0
-	job, _ := mustBuild(t, cfg, testEntry())
-	if job.Spec.ActiveDeadlineSeconds != nil {
-		t.Errorf("activeDeadlineSeconds = %v, want nil when FOREMAN_TASK_MAX_DURATION=0", *job.Spec.ActiveDeadlineSeconds)
-	}
-}
-
 func TestBuildInvalidTaskID(t *testing.T) {
 	for _, taskID := range []string{
 		"",
@@ -786,24 +467,4 @@ func testConfigWithIssuer() Config {
 	cfg := testConfig()
 	cfg.Issuer = &fakeIssuer{token: "fmj_test.sig"}
 	return cfg
-}
-
-func capabilityStrings(caps []corev1.Capability) []string {
-	out := make([]string, 0, len(caps))
-	for _, capability := range caps {
-		out = append(out, string(capability))
-	}
-	return out
-}
-
-func equalStrings(got, want []string) bool {
-	if len(got) != len(want) {
-		return false
-	}
-	for i := range got {
-		if got[i] != want[i] {
-			return false
-		}
-	}
-	return true
 }

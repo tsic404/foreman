@@ -1,10 +1,12 @@
 // Package jobbuilder renders a TaskEntry into the Job and credential Secret
 // the scheduler creates, and the catalog-probe Job with its own credential
-// (ADR-019). A deployment may supply a complete Job template
-// (ConfigMap job-overlay.yaml); Foreman uses it verbatim apart from its own
-// writes — the A1.1 env keys, the per-task metadata and the §3.2 key set.
-// Design: docs/05-modules/job-template.md, contracts §3.2/§5.2,
-// proposals/P-006-template-passthrough-env-injection.md.
+// (ADR-019). The Job's shape comes from one place: the deployment's complete
+// Job template (ConfigMap foreman-job-template, key job-overlay.yaml), which
+// Foreman uses verbatim apart from its own writes — the A1.1 env keys, the
+// per-task metadata and the §3.2 key set. The template is a required
+// deployment artifact: a missing, unreadable or unparseable one refuses
+// startup (ADR-030), and there is no built-in fallback.
+// Design: docs/05-modules/job-template.md, contracts §3.2/§5.2/§5.4.
 package jobbuilder
 
 import (
@@ -72,23 +74,23 @@ var ErrInvalidTaskID = errors.New("invalid task id")
 // Builder renders Job/Secret objects; it never talks to the K8s API
 // (creation is the scheduler's job).
 type Builder struct {
-	cfg      Config
+	cfg Config
+	// template is the startup-parsed template; it is read-only and every
+	// Build renders a copy of it (A1.3).
 	template map[string]any
-	// templatePresent is true when the deployment supplied a template; the
-	// parsed map is then read-only and every Build renders a copy of it.
-	templatePresent bool
 }
 
 // NewBuilder runs the startup gate (job-template.md §关键流程 step 0): it
-// loads and parses the optional Job template, so an unreadable or unparseable
-// one makes main exit non-zero before the listener starts (CrashLoopBackOff
-// under the Deployment) instead of surfacing at the first claim.
+// loads and parses the required Job template, so a missing, unreadable or
+// unparseable one makes main exit non-zero before the listener starts
+// (CrashLoopBackOff under the Deployment) instead of surfacing at the first
+// claim.
 func NewBuilder(cfg Config) (*Builder, error) {
-	template, present, err := LoadJobTemplate(cfg)
+	template, err := LoadJobTemplate(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &Builder{cfg: cfg, template: template, templatePresent: present}, nil
+	return &Builder{cfg: cfg, template: template}, nil
 }
 
 // Build renders the Job, its credential Secret and the digest of the token
@@ -114,30 +116,20 @@ func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, string, erro
 	return job, b.credentialSecret(name, e.TaskID, token), b.cfg.Issuer.Hash(token), nil
 }
 
-// render is the build pipeline: pick the template — the deployment's copy or
-// the built-in default — then apply Foreman's writes to it.
+// render is the build pipeline: the template copy, then Foreman's writes
+// (A1.1 / A1.2). There is one shape source — the startup-parsed template.
 func (b *Builder) render(name string, e TaskEntry) (*batchv1.Job, error) {
-	var job *batchv1.Job
-	if b.templatePresent {
-		rendered, err := renderTemplate(b.template, b.placeholderValues(e))
-		if err != nil {
-			return nil, err
-		}
-		job = rendered
-	} else {
-		job = b.defaultJob(name, e)
-		// The built-in default template carries no placeholders: its
-		// node-reuse item is appended directly (AC-20 keeps this path
-		// byte-identical to the baseline).
-		b.applyPreferredNode(job, e)
+	job, err := renderTemplate(b.template, b.placeholderValues(e))
+	if err != nil {
+		return nil, err
 	}
 	b.applyWrites(job, name, e)
 	return job, nil
 }
 
 // placeholderValues resolves the template placeholders for one task; the
-// preferred node comes from the same soft-affinity decision the default
-// template uses.
+// preferred node comes from the soft-affinity decision §5.4 pins to the
+// session key.
 func (b *Builder) placeholderValues(e TaskEntry) placeholderValues {
 	v := placeholderValues{
 		taskID:          e.TaskID,
@@ -149,7 +141,7 @@ func (b *Builder) placeholderValues(e TaskEntry) placeholderValues {
 		chatSessionID:   e.ChatSessionID,
 		jobRuntimeID:    e.JobRuntimeID,
 		claimedAt:       e.ClaimedAt.UTC().Format(time.RFC3339),
-		jobImage:        b.cfg.imageRef(),
+		jobImage:        b.cfg.JobImage,
 	}
 	if node, ok := b.preferredNode(e); ok {
 		v.preferredNode = node
@@ -246,26 +238,6 @@ func setKeys(dst map[string]string, keys map[string]string) map[string]string {
 		dst[key] = value
 	}
 	return dst
-}
-
-// applyPreferredNode appends the node-reuse affinity item to the built-in
-// default template (03-contracts §5.4 「affinity 注入」). A deployment template
-// expresses the same decision with the <preferred node> placeholder instead —
-// Foreman never adds an affinity item to it (P-006 §A2).
-func (b *Builder) applyPreferredNode(job *batchv1.Job, e TaskEntry) {
-	node, ok := b.preferredNode(e)
-	if !ok {
-		return
-	}
-	pod := &job.Spec.Template.Spec
-	if pod.Affinity == nil {
-		pod.Affinity = &corev1.Affinity{}
-	}
-	if pod.Affinity.NodeAffinity == nil {
-		pod.Affinity.NodeAffinity = &corev1.NodeAffinity{}
-	}
-	pod.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = append(
-		pod.Affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution, preferredTerm(node))
 }
 
 // preferredNode resolves the single soft-affinity node for e's session: the

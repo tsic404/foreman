@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -16,17 +17,36 @@ import (
 
 // baselinePath is the AC-20 authority: a byte copy of the design repo's
 // test-cases/_infra/job-baseline.yaml (docs/05-modules/job-template.md
-// §Job Manifest). Editing the default template means syncing the design file
-// and this copy in the same change.
+// §Job Manifest). Its Job document is the reference template the deployment
+// publishes (deploy/25-job-template.yaml) — one copy each, same bytes — so
+// editing the reference template means syncing the design file, this copy and
+// the ConfigMap in the same change.
 const baselinePath = "testdata/job-baseline.yaml"
 
-// TestDefaultTemplateMatchesBaseline renders with no deployment template — the
-// AC-20 default window — and diffs the objects against the baseline after
-// placeholder substitution.
-func TestDefaultTemplateMatchesBaseline(t *testing.T) {
+// referenceTemplatePath writes the baseline's Job document — the reference
+// template the Deployment mounts — to a file and returns its path, so a test
+// builds through the same required-template gate the Deployment does.
+func referenceTemplatePath(t *testing.T) string {
+	t.Helper()
+	docs := rawBaselineDocuments(t)
+	if len(docs) != 2 {
+		t.Fatalf("baseline must hold a Job and a Secret, got %d documents", len(docs))
+	}
+	path := filepath.Join(t.TempDir(), "job-overlay.yaml")
+	if err := os.WriteFile(path, docs[0], 0o600); err != nil {
+		t.Fatalf("write reference template: %v", err)
+	}
+	return path
+}
+
+// TestReferenceTemplateMatchesBaseline renders through the reference template
+// and diffs the objects against the baseline: the AC-20 regression. Every
+// shape field now comes from the template, so this diff — not a per-field
+// assertion — is what holds the rendered Job to the reference shape.
+func TestReferenceTemplateMatchesBaseline(t *testing.T) {
 	entry := testEntry()
 	cfg := testConfig()
-	docs := baselineDocuments(t, entry, cfg.imageRef())
+	docs := baselineDocuments(t, entry, cfg.JobImage)
 	if len(docs) != 2 {
 		t.Fatalf("baseline must hold a Job and a Secret, got %d documents", len(docs))
 	}
@@ -42,7 +62,7 @@ func TestDefaultTemplateMatchesBaseline(t *testing.T) {
 		t.Fatalf("baseline must declare the batch/v1 Job, got %s/%s", wantJob.APIVersion, wantJob.Kind)
 	}
 	if got, want := canonicalJSON(jobProjection(job)), canonicalJSON(jobProjection(&wantJob)); got != want {
-		t.Errorf("default Job does not match the AC-20 baseline\n--- want ---\n%s\n--- got ---\n%s", want, got)
+		t.Errorf("reference-template Job does not match the AC-20 baseline\n--- want ---\n%s\n--- got ---\n%s", want, got)
 	}
 	if got, want := canonicalJSON(secret.ObjectMeta), canonicalJSON(wantSecret.ObjectMeta); got != want {
 		t.Errorf("credential Secret metadata does not match the baseline\n--- want ---\n%s\n--- got ---\n%s", want, got)
@@ -81,10 +101,7 @@ func jobProjection(job *batchv1.Job) map[string]any {
 // with the test entry's values, and splits the multi-document YAML.
 func baselineDocuments(t *testing.T, entry TaskEntry, jobImage string) [][]byte {
 	t.Helper()
-	raw, err := os.ReadFile(baselinePath)
-	if err != nil {
-		t.Fatalf("read baseline: %v", err)
-	}
+	docs := rawBaselineDocuments(t)
 	substitutions := map[string]string{
 		"<task_id>":             entry.TaskID,
 		"<agent_id>":            entry.AgentID,
@@ -94,12 +111,25 @@ func baselineDocuments(t *testing.T, entry TaskEntry, jobImage string) [][]byte 
 		"<job-image>":           jobImage,
 		`"fmj_<payload>.<sig>"`: `"fmj_test.sig"`,
 	}
-	text := string(raw)
-	for placeholder, value := range substitutions {
-		text = strings.ReplaceAll(text, placeholder, value)
+	out := make([][]byte, 0, len(docs))
+	for _, doc := range docs {
+		text := string(doc)
+		for placeholder, value := range substitutions {
+			text = strings.ReplaceAll(text, placeholder, value)
+		}
+		out = append(out, []byte(text))
 	}
+	return out
+}
 
-	reader := utilyaml.NewYAMLReader(bufio.NewReader(strings.NewReader(text)))
+// rawBaselineDocuments splits the baseline into its documents verbatim.
+func rawBaselineDocuments(t *testing.T) [][]byte {
+	t.Helper()
+	raw, err := os.ReadFile(baselinePath)
+	if err != nil {
+		t.Fatalf("read baseline: %v", err)
+	}
+	reader := utilyaml.NewYAMLReader(bufio.NewReader(bytes.NewReader(raw)))
 	var docs [][]byte
 	for {
 		doc, err := reader.Read()
