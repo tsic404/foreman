@@ -347,6 +347,21 @@ func newFixture(t *testing.T) *fixture {
 // delivery confirmation window a re-delivery scenario needs armed.
 func newFixtureWith(t *testing.T, opts ...registry.Option) *fixture {
 	t.Helper()
+	return newFixtureUnder(t, opts, nil)
+}
+
+// newFixtureWithEnv is the standard fixture under extra environment keys: a
+// scenario whose subject is a config switch (a switched-off boot bound, say)
+// then builds its scheduler through the same LoadConfig path production uses.
+func newFixtureWithEnv(t *testing.T, extra map[string]string) *fixture {
+	t.Helper()
+	return newFixtureUnder(t, nil, extra)
+}
+
+// newFixtureUnder is the shared construction: production's LoadConfig path,
+// with the registry options and environment keys a scenario needs.
+func newFixtureUnder(t *testing.T, opts []registry.Option, extra map[string]string) *fixture {
+	t.Helper()
 	f := &fixture{
 		jobs:    &fakeJobs{},
 		server:  &fakeServer{},
@@ -361,7 +376,7 @@ func newFixtureWith(t *testing.T, opts ...registry.Option) *fixture {
 	// would rot with wall time.
 	f.reg = registry.New(func() time.Time { return f.now },
 		append([]registry.Option{registry.WithDrainTimeout(testDrainTimeout)}, opts...)...)
-	cfg, err := LoadConfig(testEnv(nil))
+	cfg, err := LoadConfig(testEnv(extra))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
 	}
@@ -436,6 +451,21 @@ func (f *fixture) claim(t *testing.T, taskID string) registry.TaskEntry {
 }
 
 // ---- OnClaim ----
+
+// A switched-off boot bound (FOREMAN_JOB_BOOT_TIMEOUT=0, §5.1) writes no
+// boot_deadline at all: the zero value is "no upper bound", never a degenerate
+// claimed_at, and the boot judgement has no upper bound to hold against
+// (contract §3.1, ADR-026).
+func TestOnClaimWithoutBootBoundWritesNoDeadline(t *testing.T) {
+	f := newFixtureWithEnv(t, map[string]string{EnvJobBootTimeout: "0"})
+	e := f.claim(t, "task-1")
+	if !e.BootDeadline.IsZero() {
+		t.Fatalf("boot_deadline = %v, want no upper bound", e.BootDeadline)
+	}
+	if !e.ClaimedAt.Equal(testNow) {
+		t.Fatalf("claimed_at = %v, want the claim instant %v", e.ClaimedAt, testNow)
+	}
+}
 
 func TestOnClaimCreatesSecretJobAndEntry(t *testing.T) {
 	f := newFixture(t)

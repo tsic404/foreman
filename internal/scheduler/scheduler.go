@@ -464,7 +464,6 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		State:           registry.StatePending,
 		Attempt:         attempt,
 		ClaimedAt:       now,
-		BootDeadline:    now.Add(s.cfg.JobBootTimeout),
 		// The claim just stamped the server's 45s prepare lease (§1.1 C3),
 		// so the entry starts out with a live deadline and never projects
 		// the zero value (contract §3.1).
@@ -477,6 +476,12 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		// Memory-only: the runtime the server dispatched this claim under,
 		// which addresses C4/C19 and the S8 body translation (ADR-025).
 		RealRuntimeID: head.RuntimeID,
+	}
+	// A switched-off bound (0 = no upper bound, §5.1) writes no deadline at
+	// all: the zero value is "no bound", never an expired one, and must not
+	// degrade to claimed_at (contract §3.1, ADR-026).
+	if s.cfg.JobBootTimeout > 0 {
+		e.BootDeadline = now.Add(s.cfg.JobBootTimeout)
 	}
 	if err := s.reg.Put(e); err != nil {
 		return fmt.Errorf("register task %s: %w", e.TaskID, err)

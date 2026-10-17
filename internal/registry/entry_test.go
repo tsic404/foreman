@@ -38,6 +38,70 @@ func TestProjectedTimeMatchesTaskEntryProjection(t *testing.T) {
 	}
 }
 
+// TestTaskEntryProjectionRendersAbsentTimesAsEmpty pins the two fields whose
+// fact may not exist yet (contract §3.1, ADR-026): started_at and boot_deadline
+// keep their key and carry an empty string while absent — an RFC3339 zero would
+// satisfy AC-09's `!= ""` adoption poll before the fact exists — and render
+// RFC3339 once set. The remaining time fields keep the encoder's form, which
+// the embedded projection must not disturb.
+func TestTaskEntryProjectionRendersAbsentTimesAsEmpty(t *testing.T) {
+	observed := time.Date(2026, 10, 16, 14, 39, 9, 839000000, time.UTC)
+	deadline := observed.Add(5 * time.Minute)
+	for _, tc := range []struct {
+		name         string
+		startedAt    time.Time
+		bootDeadline time.Time
+	}{
+		{"neither fact", time.Time{}, time.Time{}},
+		{"both facts", observed, deadline},
+		{"start fact only", observed, time.Time{}},
+		{"boot bound only", time.Time{}, deadline},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(TaskEntry{
+				TaskID:       "t-1",
+				ClaimedAt:    observed,
+				StartedAt:    tc.startedAt,
+				BootDeadline: tc.bootDeadline,
+			})
+			if err != nil {
+				t.Fatalf("marshal entry: %v", err)
+			}
+			var projected map[string]any
+			if err := json.Unmarshal(raw, &projected); err != nil {
+				t.Fatalf("unmarshal entry: %v", err)
+			}
+			if got, want := projected["claimed_at"], ProjectedTime(observed); got != want {
+				t.Errorf("claimed_at = %v, want %q", got, want)
+			}
+			for _, field := range []struct {
+				key  string
+				fact time.Time
+			}{
+				{"started_at", tc.startedAt},
+				{"boot_deadline", tc.bootDeadline},
+			} {
+				got, ok := projected[field.key]
+				if !ok {
+					t.Fatalf("projection dropped %q: %v", field.key, projected)
+				}
+				want := ""
+				if !field.fact.IsZero() {
+					want = ProjectedTime(field.fact)
+				}
+				if got != want {
+					t.Errorf("%s = %v, want %q", field.key, got, want)
+				}
+				if want != "" {
+					if _, err := time.Parse(time.RFC3339, want); err != nil {
+						t.Errorf("%s = %q is not RFC3339: %v", field.key, want, err)
+					}
+				}
+			}
+		})
+	}
+}
+
 func jobWithMeta(labels, annos map[string]string) batchv1.Job {
 	return batchv1.Job{
 		ObjectMeta: metav1.ObjectMeta{

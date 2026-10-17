@@ -76,6 +76,23 @@ func TestLoadConfigRequiresWorkspaceID(t *testing.T) {
 	}
 }
 
+// FOREMAN_JOB_BOOT_TIMEOUT=0 switches the upper bound off (§5.1): the config
+// accepts it, and the startup probe window — which otherwise mirrors the boot
+// bound — falls back to the default magnitude rather than a zero window that
+// would fail the first probe before it could register.
+func TestLoadConfigAcceptsZeroBootTimeout(t *testing.T) {
+	cfg, err := LoadConfig(testEnv(map[string]string{EnvJobBootTimeout: "0"}))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.JobBootTimeout != 0 {
+		t.Fatalf("JobBootTimeout = %v, want the bound switched off", cfg.JobBootTimeout)
+	}
+	if cfg.StartupProbeTimeout != DefaultJobBootTimeout {
+		t.Fatalf("StartupProbeTimeout = %v, want the default %v", cfg.StartupProbeTimeout, DefaultJobBootTimeout)
+	}
+}
+
 func TestLoadConfigOverrides(t *testing.T) {
 	cfg, err := LoadConfig(testEnv(map[string]string{
 		EnvMaxInflightJobs:      "7",

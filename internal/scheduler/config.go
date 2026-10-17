@@ -162,8 +162,11 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		if err != nil {
 			return Config{}, fmt.Errorf("%s must be a duration: %v", EnvJobBootTimeout, err)
 		}
-		if d <= 0 {
-			return Config{}, fmt.Errorf("%s must be positive, got %s", EnvJobBootTimeout, d)
+		// 0 = no upper bound (排障用, §5.1): the claim writes no boot_deadline
+		// and the boot judgement never holds (contract §3.1, ADR-026). Only a
+		// negative bound is meaningless.
+		if d < 0 {
+			return Config{}, fmt.Errorf("%s must be >= 0, got %s", EnvJobBootTimeout, d)
 		}
 		cfg.JobBootTimeout = d
 	}
@@ -202,8 +205,14 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		return Config{}, fmt.Errorf("%s is required", EnvWorkspaceID)
 	}
 	// The startup window defaults to the task Job's boot bound: the same
-	// "schedule + pull + register" magnitude, with no second magic number.
+	// "schedule + pull + register" magnitude, with no second magic number
+	// (§5.1 启动探针窗口). A boot bound switched off (0 = no upper bound)
+	// leaves nothing to derive from, and a zero window would fail the probe
+	// before it could register — the default magnitude stands in.
 	cfg.StartupProbeTimeout = cfg.JobBootTimeout
+	if cfg.StartupProbeTimeout == 0 {
+		cfg.StartupProbeTimeout = DefaultJobBootTimeout
+	}
 	if raw := strings.TrimSpace(getenv(EnvStartupProbeTimeout)); raw != "" {
 		d, err := time.ParseDuration(raw)
 		if err != nil {
