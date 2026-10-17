@@ -101,9 +101,12 @@ type TaskEntry struct {
 	// means the daemon kept asking inside the confirmation window, i.e. the
 	// request arrived and the response was lost, rather than the request
 	// never arriving.
-	ClaimsAfterDelivery int       `json:"claims_after_delivery"`
-	StartedAt           time.Time `json:"started_at"`
-	BootDeadline        time.Time `json:"boot_deadline"`
+	ClaimsAfterDelivery int `json:"claims_after_delivery"`
+	// StartedAt and BootDeadline may have no fact yet (contract §3.1,
+	// ADR-026): the projection then carries an empty string, never the
+	// RFC3339 zero — see MarshalJSON.
+	StartedAt    time.Time `json:"started_at"`
+	BootDeadline time.Time `json:"boot_deadline"`
 	// LeaseKeepUntil is the local upper bound of the server's prepare lease
 	// (contract §3.1): the last successful renewal plus PrepareLeaseTTL,
 	// stamped after the response returned (Registry.SetLeaseKeepUntil).
@@ -150,6 +153,31 @@ type TaskEntry struct {
 	// Payload: raw claim payload until MarkDelivering replaces it with the
 	// delivered body — the form the ops preview must serve (S6 / AC-07).
 	Payload json.RawMessage `json:"-"`
+}
+
+// MarshalJSON renders the entry as /foreman/tasks projects it (contract §3.1,
+// observability.md §端点): the projection is TaskEntry's own JSON — no second
+// view type to keep in step — with started_at and boot_deadline rendered as an
+// empty string while their fact does not exist yet. Both keys stay present, and
+// the RFC3339 zero is banned: it would satisfy a consumer's `!= ""` test (the
+// adoption poll of AC-09) before the fact exists. A set value goes through the
+// same time.Time encoder every other projected time field uses.
+func (e TaskEntry) MarshalJSON() ([]byte, error) {
+	type entry TaskEntry
+	return json.Marshal(struct {
+		entry
+		StartedAt    string `json:"started_at"`
+		BootDeadline string `json:"boot_deadline"`
+	}{entry(e), projectedOptionalTime(e.StartedAt), projectedOptionalTime(e.BootDeadline)})
+}
+
+// projectedOptionalTime renders a time field whose fact may not exist yet: an
+// empty string while it does not, the encoder's RFC3339 form once it does.
+func projectedOptionalTime(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return ProjectedTime(t)
 }
 
 // ProjectedTime renders t exactly as the /foreman/tasks projection renders

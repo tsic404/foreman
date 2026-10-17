@@ -101,15 +101,15 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 				"task_id", e.TaskID, "job_name", e.JobName,
 				"lease_keep_until", registry.ProjectedTime(until))
 			// One terminal bound for the pre-start forms: the boot deadline,
-			// claim-relative. The delivery confirmation window no longer ends
-			// an entry — passing it with no start fact releases the delivery
-			// for another attempt on the daemon's next claim (ADR-032), so an
-			// entry whose daemon is preparing a payload it did receive is not
-			// killed by it. The attribution splits on whether a delivery was
-			// ever committed: an entry that was handed the payload and never
-			// started it did not fail to boot, its delivery never landed.
+			// claim-relative — a zero deadline is "no upper bound", not an
+			// expired one (contract §3.1, ADR-026), so the judgement holds only
+			// on a written bound. The delivery confirmation window no longer
+			// ends an entry: passing it with no start fact releases the
+			// delivery for another attempt on the daemon's next claim (ADR-032).
+			// The attribution splits on whether a delivery was ever committed:
+			// a delivered entry that never started did not fail to boot.
 			switch {
-			case !now.After(e.BootDeadline):
+			case e.BootDeadline.IsZero() || !now.After(e.BootDeadline):
 			case e.DeliveredAt.IsZero():
 				if herr := k.hooks.OnBootTimeout(ctx, e.TaskID); herr != nil {
 					k.log.Error("boot-timeout settlement failed", "task_id", e.TaskID, "err", herr)
@@ -137,16 +137,19 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 }
 
 // leaseable reports whether the entry still needs prepare-lease renewals:
-// claimed, not yet started, not terminal (proxy.md §prepare-lease 保活).
-// Entries rebuilt from K8s after a restart carry neither payload nor boot
-// deadline (§3.1/§3.2): leasing them would block the server's redispatch
-// and a zero deadline would fake a boot timeout — the startup convergence
-// owns them (failure-handling scenario #2).
+// claimed by this process, not yet started, not terminal (proxy.md
+// §prepare-lease 保活). The claim's payload is the criterion — a rebuilt
+// entry has none (F3) — never the boot bound: the bound is the boot face's
+// own criterion, and it is absent both on rebuilt entries and when
+// FOREMAN_JOB_BOOT_TIMEOUT=0, where the two would part ways (ADR-026: the two
+// criteria never derive from each other). Leasing a rebuilt entry would block
+// the server's redispatch; the startup convergence owns it (failure-handling
+// scenario #2).
 func leaseable(e registry.TaskEntry) bool {
 	if e.IsTerminal() || !e.StartedAt.IsZero() {
 		return false
 	}
-	if e.BootDeadline.IsZero() || len(e.Payload) == 0 {
+	if len(e.Payload) == 0 {
 		return false
 	}
 	switch e.State {
