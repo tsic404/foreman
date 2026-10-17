@@ -26,6 +26,8 @@ data:
     #     `MULTICA_OMP_PATH` 取值处（镜像不再内置 omp；init 耗时计入 FOREMAN_JOB_BOOT_TIMEOUT）；
     #   · `<preferred node>` **识别位属参考模板内容**（软亲和的取值/删除对象；缺该位则 AC-25 / AC-26 无判定对象）——
     #     由 TC-tech-job-01 步骤 3a 的「CM 内容自证」断言。
+    #   · `metadata.name` 是**名字格式**（模板表达，ADR-034）：参考模板取 `fm-<task_id>`，A1.2 在副本上写终值；
+    #     名字不承担身份——`foreman.tsic.top/daemon-id`（pod 标签）才是 `MULTICA_DAEMON_ID` 的 fieldRef 来源。
     # 占位符替换规则见 job-template.md「占位符与回归基线」。**条件块不在基线内**：触发上下文注解（issue-id /
     # issue-identifier / autopilot-run-id / chat-session-id）由 A1.2 先清 `foreman.tsic.top/*` 域再按字段增删 ⇒ CM 写不写都不影响产物，
     # 故基线（= CM 字面）不含；归一化时从实际对象删除，形状由 TC-tech-job-01（issue 触发分支）与 TC-tech-job-04（**首跑**分支）单独断言。
@@ -59,6 +61,7 @@ data:
           labels:
             app.kubernetes.io/name: foreman-job
             foreman.tsic.top/task-id: "<task_id>"
+            foreman.tsic.top/daemon-id: "fm-<task_id>"
         spec:
           restartPolicy: Never
           terminationGracePeriodSeconds: 30
@@ -167,7 +170,7 @@ data:
                 limits:   { cpu: "4", memory: 8Gi }
               env:
                 - { name: MULTICA_SERVER_URL,                  value: "http://foreman.foreman.svc.cluster.local:8080" }
-                - { name: MULTICA_DAEMON_ID,                   valueFrom: { fieldRef: { fieldPath: "metadata.labels['job-name']" } } }
+                - { name: MULTICA_DAEMON_ID,                   valueFrom: { fieldRef: { fieldPath: "metadata.labels['foreman.tsic.top/daemon-id']" } } }
                 - { name: MULTICA_DAEMON_DEVICE_NAME,          valueFrom: { fieldRef: { fieldPath: "spec.nodeName" } } }
                 - { name: MULTICA_AGENT_RUNTIME_NAME,          value: "foreman-job" }
                 - { name: MULTICA_DAEMON_MAX_CONCURRENT_TASKS, value: "1" }

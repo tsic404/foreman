@@ -137,6 +137,7 @@ func TestBuildCatalogProbeTemplateRender(t *testing.T) {
 		"app.kubernetes.io/name":       "foreman-job",
 		"app.kubernetes.io/managed-by": "foreman",
 		"foreman.tsic.top/role":        "catalog-probe",
+		"foreman.tsic.top/daemon-id":   testProbeName,
 		"cost-center":                  "platform",
 	}
 	if len(job.Labels) != len(wantLabels) {
@@ -183,8 +184,8 @@ func TestBuildCatalogProbeTemplateRender(t *testing.T) {
 	}
 	daemonID := envByName(t, daemon.Env, "MULTICA_DAEMON_ID")
 	if daemonID.ValueFrom == nil || daemonID.ValueFrom.FieldRef == nil ||
-		daemonID.ValueFrom.FieldRef.FieldPath != "metadata.labels['job-name']" {
-		t.Errorf("MULTICA_DAEMON_ID = %+v, want the job-name fieldRef", daemonID)
+		daemonID.ValueFrom.FieldRef.FieldPath != "metadata.labels['foreman.tsic.top/daemon-id']" {
+		t.Errorf("MULTICA_DAEMON_ID = %+v, want the daemon-id label fieldRef", daemonID)
 	}
 	if got := envByName(t, daemon.Env, "MULTICA_DAEMON_MAX_CONCURRENT_TASKS").Value; got != "1" {
 		t.Errorf("MULTICA_DAEMON_MAX_CONCURRENT_TASKS = %q, want 1", got)

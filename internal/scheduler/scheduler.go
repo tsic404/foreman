@@ -138,6 +138,12 @@ type claimHead struct {
 	AutopilotRunID  string `json:"autopilot_run_id"`
 	ChatSessionID   string `json:"chat_session_id"`
 	WorkspaceID     string `json:"workspace_id"`
+	// Agent is the payload's agent object: its name is the agent axis's
+	// keyspace and the <agent-segment> / <agent-name> source (ADR-035 keyspace
+	// = names). Absent or nameless means that axis has no identity.
+	Agent struct {
+		Name string `json:"name"`
+	} `json:"agent"`
 	// PriorSessionID locates the session this task resumes; it is the soft
 	// affinity key source and belongs to no trigger context (ADR-015).
 	PriorSessionID string `json:"prior_session_id"`
@@ -264,6 +270,11 @@ type Scheduler struct {
 	// would otherwise interleave the marker replacement and log the same
 	// transition twice.
 	nodeMu sync.Mutex
+
+	// project memoizes the read-only project reverse lookup per issue id, so a
+	// burst of tasks from one issue does not query the platform once per task
+	// (ADR-035 decision 3 — the cache is not a contract face).
+	project projectCache
 }
 
 // New builds a Scheduler. reg, jobs, builder and server are required.
@@ -448,7 +459,12 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	}
 
 	now := s.now()
-	jobName := jobNameFor(head.ID)
+	// Identity is derived here and never follows the display name: daemon_id =
+	// fm-<task_id> is the daemon-id label, the credential Secret's base, the
+	// Job Token's j claim and the uuid5 seed of job_runtime_id (ADR-034
+	// decision 8). The display name is the template's business, so it is
+	// resolved through the builder — the same function Build runs.
+	daemonID := daemonIDFor(head.ID)
 	e := registry.TaskEntry{
 		TaskID:          head.ID,
 		AgentID:         head.AgentID,
@@ -457,10 +473,9 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		AutopilotRunID:  head.AutopilotRunID,
 		ChatSessionID:   head.ChatSessionID,
 		WorkspaceID:     head.WorkspaceID,
-		JobName:         jobName,
 		JobNamespace:    s.cfg.JobNamespace,
-		DaemonID:        jobName, // per-Job daemon identity (ADR-003)
-		JobRuntimeID:    jobRuntimeID(jobName),
+		DaemonID:        daemonID, // per-Job daemon identity (ADR-003)
+		JobRuntimeID:    jobRuntimeID(daemonID),
 		State:           registry.StatePending,
 		Attempt:         attempt,
 		ClaimedAt:       now,
@@ -474,10 +489,25 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		// Memory-only: the session key of the Built Job's affinity item
 		// (ADR-015) — never annotated, never projected.
 		PriorSessionID: head.PriorSessionID,
+		// Memory-only: the two identity inputs of the three-axis policy
+		// (ADR-035) — the agent name from the payload and the project identity
+		// from the payload's structured key or the read-only lookup, both
+		// filled in below once the policy table has had its say.
+		AgentName: head.Agent.Name,
 		// Memory-only: the runtime the server dispatched this claim under,
 		// which addresses C4/C19 and the S8 body translation (ADR-025).
 		RealRuntimeID: head.RuntimeID,
 	}
+	// The name format was validated at startup, so this is the render-time
+	// final check; a failure refuses the claim before any object exists.
+	// The project identity is resolved only when a declared tier reads it
+	// (ADR-035 decision 3), and always before the name, which the policy
+	// cannot influence.
+	if s.builder.RequiresProjectIdentity(jobbuilderEntry(e)) {
+		e.ProjectName, e.ProjectSource = s.projectIdentity(ctx, task, head)
+	}
+	name, nameErr := s.builder.ResolveName(jobbuilderEntry(e))
+	e.JobName = name
 	if err := s.reg.Put(e); err != nil {
 		return fmt.Errorf("register task %s: %w", e.TaskID, err)
 	}
@@ -486,6 +516,10 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		"issue_identifier", e.IssueIdentifier,
 		"autopilot_run_id", e.AutopilotRunID, "chat_session_id", e.ChatSessionID,
 		"agent_id", e.AgentID)
+	if nameErr != nil {
+		s.failClaim(ctx, e, nameErr)
+		return nameErr
+	}
 
 	// The per-node soft cap is applied right before the Job is rendered
 	// ("下一次 claim 前把该节点从候选里排除", task-mapping §同节点并发): the
@@ -512,7 +546,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	// (NotFound counts as success inside the JobClient). The clear is
 	// best-effort and does not settle the claim — the CreateSecret below
 	// surfaces residue or a denied permission as a phase=secret failure.
-	_ = s.jobs.DeleteSecret(ctx, credName(jobName))
+	_ = s.jobs.DeleteSecret(ctx, credName(daemonID))
 	trace(createStepClearStaleSecret)
 	err = s.jobs.CreateSecret(ctx, secret)
 	trace(createStepCreateSecret)
@@ -530,7 +564,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		// not this task's failure — the entry goes and the server
 		// re-dispatches the task once the lease lapses, the same recovery
 		// as an undeliverable claim (failure-handling 场景 #1/#2).
-		_ = s.jobs.DeleteSecret(ctx, credName(jobName))
+		_ = s.jobs.DeleteSecret(ctx, credName(daemonID))
 		if errors.Is(err, errJobNameHeld) {
 			_ = s.reg.Delete(e.TaskID)
 			s.metrics.InflightJobs(s.reg.Inflight())
@@ -581,11 +615,12 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 // not terminating belongs to this attempt (restart replay, or a retry of the
 // same claim) and is kept — its creationTimestamp is the instance basis, so
 // the existing object is returned rather than the rendered one. A Job that is
-// terminating — or one whose state cannot be read — holds the name
-// (job_name = fm-<task_id>, task-mapping invariant 2) until its pods are
-// gone; swallowing that would bind the entry to a disappearing Job
-// (job_missing). Wait (bounded) and retry; a name that never frees returns
-// errJobNameHeld, a deferred claim rather than this task's failure.
+// terminating — or one whose state cannot be read — holds its name (the
+// display name the template expressed, shared by both meanings of "the same
+// Job") until its pods are gone; swallowing that would bind the entry to a
+// disappearing Job (job_missing). Wait (bounded) and retry; a name that never
+// frees returns errJobNameHeld, a deferred claim rather than this task's
+// failure.
 func (s *Scheduler) createJob(ctx context.Context, e registry.TaskEntry, job *batchv1.Job) (*batchv1.Job, error) {
 	deadline := s.now().Add(jobNameWait)
 	// maxPolls backs the clock bound so the loop cannot spin on a clock the
@@ -1278,7 +1313,7 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 	s.revokeCredential(ctx, e)
 	// ② The Secret is the credential's carrier; a failure here keeps the
 	// entry as the retry handle (顺序与幂等规则 7).
-	if err := s.jobs.DeleteSecret(ctx, credName(jobName)); err != nil {
+	if err := s.jobs.DeleteSecret(ctx, credName(e.DaemonID)); err != nil {
 		s.log.ErrorContext(ctx, "cred.reclaim_failed",
 			"task_id", e.TaskID, "job_name", jobName, "err", err)
 		return err
@@ -1419,15 +1454,33 @@ func podTerminated(pod *corev1.Pod) bool {
 
 // SweepOrphanSecrets deletes credential Secrets left behind by a reclaim a
 // restart interrupted (failure-handling 场景 #16). The criterion is
-// two-sided: the registry holds no entry for the task-id (any state) AND
-// GetJob explicitly answers NotFound. Either half alone would delete a
-// Secret that is still needed — the OnClaim CreateSecret → CreateJob window
-// has the entry but no Job yet, and a Job without its Secret boots into a
-// silent job_auth_failed.
+// two-sided: the registry holds no entry for the task-id (any state) AND no
+// task Job carries that task-id. Either half alone would delete a Secret that
+// is still needed — the OnClaim CreateSecret → CreateJob window has the entry
+// but no Job yet, and a Job without its Secret boots into a silent
+// job_auth_failed.
+//
+// The Job's presence is answered by listing task Jobs and reading their
+// foreman.tsic.top/task-id labels, never by deriving a name: the display name
+// is the template's business, so a name built from the task id would resolve
+// to nothing for every custom format and delete a live Job's credential
+// (ADR-034 decision 9 — the label is the only locator).
 func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 	secrets, err := s.jobs.ListSecrets(ctx)
 	if err != nil {
 		return fmt.Errorf("list credential secrets: %w", err)
+	}
+	jobs, err := s.jobs.ListJobs(ctx)
+	if err != nil {
+		// A list error is not a NotFound: the criterion demands an explicit
+		// absence, so no Secret is touched this round.
+		return fmt.Errorf("list task jobs: %w", err)
+	}
+	withJob := make(map[string]struct{}, len(jobs))
+	for i := range jobs {
+		if taskID := jobs[i].Labels[registry.LabelTaskID]; taskID != "" {
+			withJob[taskID] = struct{}{}
+		}
 	}
 	var firstErr error
 	for _, secret := range secrets {
@@ -1438,17 +1491,7 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		if _, ok := s.reg.Get(taskID); ok {
 			continue
 		}
-		jobName := jobNameFor(taskID)
-		job, err := s.jobs.GetJob(ctx, jobName)
-		if err != nil {
-			// An API error is not a NotFound: the criterion demands an
-			// explicit one, so the Secret stays this round.
-			if firstErr == nil {
-				firstErr = err
-			}
-			continue
-		}
-		if job != nil {
+		if _, ok := withJob[taskID]; ok {
 			continue
 		}
 		if err := s.jobs.DeleteSecret(ctx, secret.Name); err != nil {
@@ -1457,8 +1500,11 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 			}
 			continue
 		}
+		// job_name is derived for attribution only: the Job is gone, so there
+		// is no object to read a name from and the identity name is the one
+		// value the sweep can name (observability.md cred.orphan_secret_removed).
 		s.log.InfoContext(ctx, "cred.orphan_secret_removed",
-			"task_id", taskID, "job_name", jobName, "secret", secret.Name)
+			"task_id", taskID, "job_name", daemonIDFor(taskID), "secret", secret.Name)
 	}
 	return firstErr
 }
@@ -1646,10 +1692,10 @@ func (s *Scheduler) deleteObjects(ctx context.Context, e registry.TaskEntry) err
 			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
 		errs = append(errs, fmt.Errorf("delete job %s: %w", e.JobName, err))
 	}
-	if err := s.jobs.DeleteSecret(ctx, credName(e.JobName)); err != nil {
+	if err := s.jobs.DeleteSecret(ctx, credName(e.DaemonID)); err != nil {
 		s.log.ErrorContext(ctx, "job.delete_failed",
 			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
-		errs = append(errs, fmt.Errorf("delete secret %s: %w", credName(e.JobName), err))
+		errs = append(errs, fmt.Errorf("delete secret %s: %w", credName(e.DaemonID), err))
 	}
 	return errors.Join(errs...)
 }
@@ -1668,18 +1714,25 @@ func jobbuilderEntry(e registry.TaskEntry) jobbuilder.TaskEntry {
 		ClaimedAt:       e.ClaimedAt,
 		Attempt:         e.Attempt,
 		PriorSessionID:  e.PriorSessionID,
+		AgentName:       e.AgentName,
+		ProjectName:     e.ProjectName,
+		ProjectSource:   e.ProjectSource,
 	}
 }
 
-// jobNameFor is the single source of the Job name shape (task-mapping
-// invariant 2: job_name = daemon_id = fm-<task_id>).
-func jobNameFor(taskID string) string {
+// daemonIDFor is the identity name of a task's Job: fm-<task_id>, never the
+// template's display name (ADR-034 decision 8). The daemon-id label and
+// annotation, the credential Secret's base name and the Job Token's j claim
+// all derive from it; the display name is a locator-free label-only face.
+func daemonIDFor(taskID string) string {
 	return "fm-" + taskID
 }
 
-// credName is the credential Secret of a Job (contract §1.3: fm-<taskid>-cred).
-func credName(jobName string) string {
-	return jobName + "-cred"
+// credName is the credential Secret of a Job: the daemon identity plus the
+// -cred suffix (contract §1.3: fm-<taskid>-cred). It takes the daemon id, not
+// the display name — a template-expressed name never moves the credential.
+func credName(daemonID string) string {
+	return daemonID + "-cred"
 }
 
 // jobImage extracts the agent container's image reference for the job.created

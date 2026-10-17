@@ -10,6 +10,7 @@
 package jobbuilder
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"regexp"
@@ -37,6 +38,20 @@ type TaskEntry struct {
 	// PriorSessionID is the claim payload's session-resume path; its session
 	// key is the only soft-affinity key (ADR-015).
 	PriorSessionID string
+	// AgentName is the payload's raw agent.name — the agent axis's identity
+	// input and the <agent-name> placeholder's value (ADR-035 keyspace =
+	// names). Empty means the agent's identity is unavailable, never a
+	// failure.
+	AgentName string
+	// ProjectName is the task's project identity (contract §3.1): the payload's
+	// structured project key name, or the read-only reverse lookup's answer.
+	ProjectName string
+	// ProjectSource records where ProjectName came from (payload / api / none);
+	// it is projected into policy.applied only.
+	ProjectSource string
+	// NameSource is set by Build from the template's name format: "template"
+	// when the template expresses a format, "fallback" when it does not.
+	NameSource string
 }
 
 // TokenIssuer signs per-Job Tokens; satisfied by auth.Issuer. Hash is the
@@ -78,60 +93,137 @@ type Builder struct {
 	// template is the startup-parsed template; it is read-only and every
 	// Build renders a copy of it (A1.3).
 	template map[string]any
+	// policy is the startup-parsed policy table: read-only, shared by every
+	// Build, never reloaded (ADR-035 decision 7). A Builder constructed
+	// without it renders with all three axes at None.
+	policy Policy
 }
 
-// NewBuilder runs the startup gate (job-template.md §关键流程 step 0): it
-// loads and parses the required Job template, so a missing, unreadable or
-// unparseable one makes main exit non-zero before the listener starts
-// (CrashLoopBackOff under the Deployment) instead of surfacing at the first
-// claim.
+// NewBuilder runs the startup gate (job-template.md §关键流程 step 0): it loads
+// and parses the required Job template, so a missing, unreadable or
+// unparseable one — or one whose metadata.name is not a legal name format —
+// makes main exit non-zero before the listener starts (CrashLoopBackOff under
+// the Deployment) instead of surfacing at the first claim. Step 0b loads the
+// optional policy file at the same point, with its own failure classes.
 func NewBuilder(cfg Config) (*Builder, error) {
 	template, err := LoadJobTemplate(cfg)
 	if err != nil {
 		return nil, err
 	}
-	return &Builder{cfg: cfg, template: template}, nil
+	policy, err := LoadPolicy(cfg)
+	if err != nil {
+		return nil, err
+	}
+	return &Builder{cfg: cfg, template: template, policy: policy}, nil
 }
 
 // Build renders the Job, its credential Secret and the digest of the token
 // that Secret carries (contract §2: the token_hash OnClaim records is the
-// only handle the reclaim path has on the credential). An invalid task ID
-// fails before any object is produced.
+// only handle the reclaim path has on the credential). The display name comes
+// from the template's format; the identity name fm-<task_id> is what the Job
+// Token, the Secret and the daemon-id faces derive from (ADR-034 decision 8).
+// An invalid task id, or a name that leaves the name face, fails before any
+// object is produced.
 func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
-	name := jobName(e.TaskID)
-	if len(name) > 63 || !dns1123Label.MatchString(name) {
-		return nil, nil, "", fmt.Errorf("%w: %q does not yield a valid Job name %q", ErrInvalidTaskID, e.TaskID, name)
+	daemonID := daemonIDFor(e.TaskID)
+	if len(daemonID) > maxJobNameLength || !dns1123Label.MatchString(daemonID) {
+		return nil, nil, "", fmt.Errorf("%w: %q does not yield a valid daemon id %q", ErrInvalidTaskID, e.TaskID, daemonID)
 	}
 	if b.cfg.Issuer == nil {
 		return nil, nil, "", fmt.Errorf("Config.Issuer is required")
 	}
-	job, err := b.render(name, e)
+	e.NameSource = b.nameSource()
+	name, err := b.ResolveName(e)
 	if err != nil {
 		return nil, nil, "", err
 	}
-	token, err := b.cfg.Issuer.Issue(name, e.TaskID, e.WorkspaceID, b.cfg.JobTokenTTL)
+	job, ev, err := b.render(name, daemonID, e)
+	if err != nil {
+		return nil, nil, "", err
+	}
+	token, err := b.cfg.Issuer.Issue(daemonID, e.TaskID, e.WorkspaceID, b.cfg.JobTokenTTL)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("issue Job Token: %w", err)
 	}
-	return job, b.credentialSecret(name, e.TaskID, token), b.cfg.Issuer.Hash(token), nil
+	b.logPolicyApplied(e, name, ev)
+	return job, b.credentialSecret(daemonID, e.TaskID, token), b.cfg.Issuer.Hash(token), nil
 }
 
-// render is the build pipeline: the template copy, then Foreman's writes
-// (A1.1 / A1.2). There is one shape source — the startup-parsed template.
-func (b *Builder) render(name string, e TaskEntry) (*batchv1.Job, error) {
-	job, err := renderTemplate(b.template, b.placeholderValues(e))
-	if err != nil {
-		return nil, err
+// nameSource reports whether the template expresses a name format (ADR-034):
+// the sole input of policy.applied's name_source.
+func (b *Builder) nameSource() string {
+	if templateNameFormat(b.template) == "" {
+		return "fallback"
 	}
-	b.applyWrites(job, name, e)
-	return job, nil
+	return "template"
+}
+
+// render is the build pipeline (03-contracts.md §5.4「管线顺序」, one order for
+// every task): take a template copy, compose the name, substitute the
+// registered placeholders, inject the policy's three axes, settle the
+// <preferred node> item against the policy outcome, then perform Foreman's own
+// ownership writes. There is one shape source — the startup-parsed template.
+func (b *Builder) render(name, daemonID string, e TaskEntry) (*batchv1.Job, Evaluation, error) {
+	rendered := deepCopyTemplate(b.template)
+	// Step 2: the name composition writes metadata.name before the
+	// substitution, because <job-name> must already hold the final name.
+	setTemplateName(rendered, name)
+	// Step 3: the generic substitution — policy values are not in this copy
+	// yet, so a strategy's own <...> literal can never be re-substituted.
+	substituteValue(rendered, b.placeholderValues(name, daemonID, e))
+
+	job, err := decodeJobTemplate(rendered)
+	if err != nil {
+		return nil, Evaluation{}, err
+	}
+	// Step 4: the three-axis policy injection.
+	ev := b.policy.Evaluate(e)
+	applyPolicy(job, ev)
+	// Step 5: the <preferred node> conditional block, which depends on the
+	// nodeSelector axis outcome (ADR-036).
+	node, suppressed := b.preferredNode(e, len(ev.nodeSelector) > 0)
+	if ev.suppressed != SuppressionPolicy {
+		ev.suppressed = suppressed
+	}
+	resolvePreferredNode(job, node)
+	// Step 6: forced ownership — domain clear-then-write, the §3.2 key sets by
+	// side, the A1.1 env keys and the namespace.
+	b.applyWrites(job, name, daemonID, e)
+	return job, ev, nil
+}
+
+// setTemplateName writes the composed display name into the template copy
+// (A1.2's first item). The template's metadata object is created when it
+// declares none — the format may only be absent, never the carrier.
+func setTemplateName(template map[string]any, name string) {
+	metadata, ok := template["metadata"].(map[string]any)
+	if !ok {
+		metadata = map[string]any{}
+		template["metadata"] = metadata
+	}
+	metadata["name"] = name
+}
+
+// decodeJobTemplate turns the rendered map into the typed Job the writes act
+// on. Numbers were kept as json.Number by the parser, so an int64 field above
+// 2^53 survives the round trip.
+func decodeJobTemplate(rendered map[string]any) (*batchv1.Job, error) {
+	raw, err := json.Marshal(rendered)
+	if err != nil {
+		return nil, fmt.Errorf("render job template: %w", err)
+	}
+	var job batchv1.Job
+	if err := json.Unmarshal(raw, &job); err != nil {
+		return nil, fmt.Errorf("render job template: %w", err)
+	}
+	return &job, nil
 }
 
 // placeholderValues resolves the template placeholders for one task; the
 // preferred node comes from the soft-affinity decision §5.4 pins to the
 // session key.
-func (b *Builder) placeholderValues(e TaskEntry) placeholderValues {
-	v := placeholderValues{
+func (b *Builder) placeholderValues(name, daemonID string, e TaskEntry) placeholderValues {
+	return placeholderValues{
 		taskID:          e.TaskID,
 		agentID:         e.AgentID,
 		workspaceID:     e.WorkspaceID,
@@ -142,17 +234,16 @@ func (b *Builder) placeholderValues(e TaskEntry) placeholderValues {
 		jobRuntimeID:    e.JobRuntimeID,
 		claimedAt:       e.ClaimedAt.UTC().Format(time.RFC3339),
 		jobImage:        b.cfg.JobImage,
+		jobName:         name,
+		daemonID:        daemonID,
+		agentName:       e.AgentName,
 	}
-	if node, ok := b.preferredNode(e); ok {
-		v.preferredNode = node
-	}
-	return v
 }
 
 // applyWrites performs Foreman's own writes on the rendered Job — the only
-// three kinds a template passthrough allows (P-006 §A1.1/A1.2): the env keys on
+// kinds a template passthrough allows (P-006 §A1.1/A1.2): the env keys on
 // containers[0], the per-task metadata, and the §3.2 key set by side.
-func (b *Builder) applyWrites(job *batchv1.Job, name string, e TaskEntry) {
+func (b *Builder) applyWrites(job *batchv1.Job, name, daemonID string, e TaskEntry) {
 	injectContainerEnv(job)
 
 	job.Name = name
@@ -160,19 +251,29 @@ func (b *Builder) applyWrites(job *batchv1.Job, name string, e TaskEntry) {
 
 	// foreman.tsic.top/ is Foreman's own domain: clear it before writing, so a
 	// static template key (a hard-coded issue-id above all) cannot survive
-	// into a task it does not describe.
+	// into a task it does not describe. The two app.kubernetes.io keys are
+	// Foreman-owned too, and each side's key set decides whether they return:
+	// the Job side keeps both, the pod side keeps only the name (ADR-034
+	// decision 7, contract §3.2).
 	clearForemanDomain(job.Labels)
 	clearForemanDomain(job.Annotations)
 	clearForemanDomain(job.Spec.Template.Labels)
 	clearForemanDomain(job.Spec.Template.Annotations)
+	clearOwnedKeys(job.Labels)
+	clearOwnedKeys(job.Annotations)
+	clearOwnedKeys(job.Spec.Template.Labels)
+	clearOwnedKeys(job.Spec.Template.Annotations)
 
 	job.Labels = setKeys(job.Labels, b.identityLabels(e))
-	job.Annotations = setKeys(job.Annotations, b.identityAnnotations(name, e))
-	// Pod side: the two §3.2 labels only — no annotations, no managed-by
-	// (task-mapping lists Jobs, never pods).
+	job.Annotations = setKeys(job.Annotations, b.identityAnnotations(daemonID, e))
+	// Pod side: the three §3.2 labels (app name, task id, daemon id) — no
+	// annotations, no managed-by (task-mapping lists Jobs, never pods). The
+	// daemon-id label is what MULTICA_DAEMON_ID's fieldRef reads, so it is
+	// Foreman's own write and never the template's (ADR-034 decision 8).
 	job.Spec.Template.Labels = setKeys(job.Spec.Template.Labels, map[string]string{
-		labelAppName: jobAppName,
-		labelTaskID:  e.TaskID,
+		labelAppName:  jobAppName,
+		labelTaskID:   e.TaskID,
+		labelDaemonID: daemonID,
 	})
 }
 
@@ -229,6 +330,17 @@ func clearForemanDomain(keys map[string]string) {
 	}
 }
 
+// clearOwnedKeys drops the two app.kubernetes.io keys Foreman owns
+// (ADR-034 decision 7: their value is Foreman's fixed value wherever the key
+// set keeps them, so a template's same-name value is discarded). Only the
+// per-side key set decides whether they come back: the Job side carries both,
+// the pod side carries app.kubernetes.io/name alone, and the probe's Job side
+// carries both — never managed-by on a pod.
+func clearOwnedKeys(keys map[string]string) {
+	delete(keys, labelAppName)
+	delete(keys, labelManagedBy)
+}
+
 // setKeys merges keys into dst, allocating it when the template declared none.
 func setKeys(dst map[string]string, keys map[string]string) map[string]string {
 	if dst == nil {
@@ -240,29 +352,33 @@ func setKeys(dst map[string]string, keys map[string]string) map[string]string {
 	return dst
 }
 
-// preferredNode resolves the single soft-affinity node for e's session: the
+// preferredNode resolves the single soft-affinity node for e's session and
+// reports the cause when the item must go. A nodeSelector axis injection wins
+// outright — the hard constraint is not knowable against the session's node, so
+// the conservative suppression applies (ADR-036) and the cause is policy. The
 // session key must be non-empty and known to the index, and its node must not
 // sit at the per-node cap (task-mapping §同节点并发 — the cap lowers the
-// node's priority, it never blocks the Job). Reuse off, no resume session, an
-// unknown key and a saturated node all answer (_, false), which drops the
-// item. A task without a prior session has no key at all: `issue_id` is
-// deliberately not one (ADR-015).
-func (b *Builder) preferredNode(e TaskEntry) (string, bool) {
+// node's priority, it never blocks the Job); that failure is the saturation
+// cause. Reuse off, no resume session and an unknown key report none. A task
+// without a prior session has no key at all: `issue_id` is deliberately not one
+// (ADR-015).
+func (b *Builder) preferredNode(e TaskEntry, policyInjected bool) (string, string) {
+	if policyInjected {
+		return "", SuppressionPolicy
+	}
 	if !b.cfg.PreferNodeReuse || b.cfg.Nodes == nil {
-		return "", false
+		return "", SuppressionNone
 	}
 	key := registry.SessionKey(e.PriorSessionID)
 	if key == "" {
-		return "", false
+		return "", SuppressionNone
 	}
 	node := b.cfg.Nodes.LastNodeForSession(key)
-	if node == "" || b.cfg.Nodes.Saturated(node) {
-		return "", false
+	if node == "" {
+		return "", SuppressionNone
 	}
-	return node, true
-}
-
-// jobName is the single source of the Job/Secret/daemon naming convention.
-func jobName(taskID string) string {
-	return "fm-" + taskID
+	if b.cfg.Nodes.Saturated(node) {
+		return "", SuppressionSaturation
+	}
+	return node, SuppressionNone
 }

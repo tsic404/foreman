@@ -43,6 +43,16 @@ type ServerClient interface {
 // (ADR-017), the only handle the reclaim path has on the credential.
 type JobBuilder interface {
 	Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, string, error)
+	// ResolveName composes the display name the template expresses for one
+	// task (ADR-034): the same function Build runs internally, exposed so the
+	// claim can index the entry under the final name before any object exists.
+	// A failure refuses the claim (invalid_task_id).
+	ResolveName(e jobbuilder.TaskEntry) (string, error)
+	// RequiresProjectIdentity reports whether any of the task's declared axis
+	// tiers reads the project side (project / projectWithAgent). It is what
+	// keeps the read-only reverse lookup from happening when no axis needs it
+	// (ADR-035 decision 3).
+	RequiresProjectIdentity(e jobbuilder.TaskEntry) bool
 	// BuildCatalogProbe renders a catalog-probe Job and its credential Secret
 	// (ADR-019): shape = the template copy plus the probe write face, budget
 	// into the probe's activeDeadlineSeconds, token TTL = budget + drain

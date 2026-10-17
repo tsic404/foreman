@@ -19,11 +19,12 @@ import (
 // an arbitrary value — an illegal one included — is ignored, never a startup
 // refusal.
 const (
-	EnvJobNamespace    = "FOREMAN_JOB_NAMESPACE"
-	EnvJobImage        = "FOREMAN_JOB_IMAGE"
-	EnvJobTokenTTL     = "FOREMAN_JOB_TOKEN_TTL"
-	EnvPreferNodeReuse = "FOREMAN_PREFER_NODE_REUSE"
-	EnvJobDrainTimeout = "FOREMAN_JOB_DRAIN_TIMEOUT"
+	EnvJobNamespace        = "FOREMAN_JOB_NAMESPACE"
+	EnvJobImage            = "FOREMAN_JOB_IMAGE"
+	EnvJobTokenTTL         = "FOREMAN_JOB_TOKEN_TTL"
+	EnvPreferNodeReuse     = "FOREMAN_PREFER_NODE_REUSE"
+	EnvJobDrainTimeout     = "FOREMAN_JOB_DRAIN_TIMEOUT"
+	EnvPolicyNameResolveIn = "FOREMAN_POLICY_NAME_RESOLUTION_TIMEOUT"
 )
 
 // Contract defaults (§5.1).
@@ -53,6 +54,12 @@ const (
 	// the startup self-check keeps FOREMAN_MODEL_CATALOG_TIMEOUT at three
 	// times this value at least.
 	DefaultProbeHeartbeatInterval = 15 * time.Second
+
+	// DefaultPolicyNameResolutionTimeout bounds the startup name resolution
+	// of the policy table (§5.4「策略文件」第 2 条: the window belongs to the
+	// deployment interface, its key name to the implementation). Keys past the
+	// window conclude unavailable, which only warns.
+	DefaultPolicyNameResolutionTimeout = 5 * time.Second
 )
 
 // Config is the jobbuilder module's runtime configuration. Issuer and Nodes
@@ -80,6 +87,19 @@ type Config struct {
 	// tests point it elsewhere.
 	TemplatePath string
 
+	// PolicyPath is where policy.yaml is mounted (03-contracts.md §5.4
+	//「策略文件」): the optional ConfigMap foreman-job-policy. Like the
+	// template path it has no env switch — the mount is the deployment's
+	// contract — so only tests point it elsewhere.
+	PolicyPath string
+	// NameResolver is the platform-side name-resolution seam ADR-035 leaves to
+	// the platform. Nil means the platform offers no such query: every policy
+	// key concludes unavailable (warn, boot continues).
+	NameResolver PolicyNameResolver
+	// PolicyNameResolutionTimeout is FOREMAN_POLICY_NAME_RESOLUTION_TIMEOUT:
+	// the bounded window the startup resolution of all policy keys shares.
+	PolicyNameResolutionTimeout time.Duration
+
 	Issuer TokenIssuer
 	Nodes  NodeIndex
 	Logger *slog.Logger
@@ -105,6 +125,25 @@ func (c Config) probeHeartbeat() time.Duration {
 	return c.ProbeHeartbeatInterval
 }
 
+// policyPath is where policy.yaml is read from; the mount path is the fixed
+// deployment interface, and only tests point Config.PolicyPath elsewhere.
+func (c Config) policyPath() string {
+	if c.PolicyPath != "" {
+		return c.PolicyPath
+	}
+	return PolicyPath
+}
+
+// policyNameResolutionWindow is the bounded window the startup name resolution
+// shares: an unset or non-positive value falls back to the contract default, so
+// a hand-built Config cannot make the window unbounded.
+func (c Config) policyNameResolutionWindow() time.Duration {
+	if c.PolicyNameResolutionTimeout <= 0 {
+		return DefaultPolicyNameResolutionTimeout
+	}
+	return c.PolicyNameResolutionTimeout
+}
+
 // LoadConfig reads the jobbuilder configuration from env (os.Getenv when
 // getenv is nil) and applies the contract defaults.
 func LoadConfig(getenv func(string) string) (Config, error) {
@@ -117,9 +156,11 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		JobTokenTTL:     DefaultJobTokenTTL,
 		PreferNodeReuse: true,
 		TemplatePath:    TemplatePath,
+		PolicyPath:      PolicyPath,
 
-		JobDrainTimeout:        DefaultJobDrainTimeout,
-		ProbeHeartbeatInterval: DefaultProbeHeartbeatInterval,
+		JobDrainTimeout:             DefaultJobDrainTimeout,
+		ProbeHeartbeatInterval:      DefaultProbeHeartbeatInterval,
+		PolicyNameResolutionTimeout: DefaultPolicyNameResolutionTimeout,
 	}
 
 	if v := strings.TrimSpace(getenv(EnvJobNamespace)); v != "" {
@@ -159,6 +200,19 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("%s must be a boolean: %v", EnvPreferNodeReuse, err)
 		}
 		cfg.PreferNodeReuse = reuse
+	}
+	// The resolution window must stay bounded: a zero or negative value would
+	// make every key conclude unavailable instantly, which is a configuration
+	// mistake, not a mode.
+	if raw := strings.TrimSpace(getenv(EnvPolicyNameResolveIn)); raw != "" {
+		window, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be a duration: %v", EnvPolicyNameResolveIn, err)
+		}
+		if window <= 0 {
+			return Config{}, fmt.Errorf("%s must be positive, got %s", EnvPolicyNameResolveIn, window)
+		}
+		cfg.PolicyNameResolutionTimeout = window
 	}
 	return cfg, nil
 }

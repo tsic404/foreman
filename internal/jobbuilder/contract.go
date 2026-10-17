@@ -15,6 +15,11 @@ const (
 	labelTaskID      = "foreman.tsic.top/task-id"
 	labelAgentID     = "foreman.tsic.top/agent-id"
 	labelWorkspaceID = "foreman.tsic.top/workspace-id"
+	// labelDaemonID is the pod-template label carrying the identity name
+	// fm-<task_id> — the MULTICA_DAEMON_ID fieldRef source and the reason the
+	// display name can change without moving any identity (ADR-034 decision 8,
+	// contract §3.2).
+	labelDaemonID = "foreman.tsic.top/daemon-id"
 
 	annoIssueID         = "foreman.tsic.top/issue-id"
 	annoIssueIdentifier = "foreman.tsic.top/issue-identifier"
@@ -54,14 +59,16 @@ func (b *Builder) identityLabels(e TaskEntry) map[string]string {
 	}
 }
 
-// identityAnnotations is the §3.2 Job annotation set. The four trigger-context
-// keys are conditional blocks (ADR-014): a key appears only when its TaskEntry
-// field is non-empty — an empty placeholder is indistinguishable from a lost
-// annotation on the authoritative Job object. The task payload never appears
-// here: it stays in Foreman memory only (F3/ADR-007).
-func (b *Builder) identityAnnotations(name string, e TaskEntry) map[string]string {
+// identityAnnotations is the §3.2 Job annotation set. daemon-id carries the
+// identity name fm-<task_id>, never the display name the template expresses
+// (ADR-034 decision 8). The four trigger-context keys are conditional blocks
+// (ADR-014): a key appears only when its TaskEntry field is non-empty — an
+// empty placeholder is indistinguishable from a lost annotation on the
+// authoritative Job object. The task payload never appears here: it stays in
+// Foreman memory only (F3/ADR-007).
+func (b *Builder) identityAnnotations(daemonID string, e TaskEntry) map[string]string {
 	annotations := map[string]string{
-		annoDaemonID:     name,
+		annoDaemonID:     daemonID,
 		annoJobRuntimeID: e.JobRuntimeID,
 		annoClaimedAt:    e.ClaimedAt.UTC().Format(time.RFC3339),
 		annoAttempt:      strconv.Itoa(e.Attempt),
@@ -80,13 +87,15 @@ func (b *Builder) identityAnnotations(name string, e TaskEntry) map[string]strin
 }
 
 // injectedEnv is the A1.1 set Foreman writes into a template's first container
-// (03-contracts §5.4): the daemon's protocol surface, and the only env keys a
-// deployment template does not get to keep. On the reference template the same
-// three keys already carry these values, so the injection is idempotent there.
+// (03-contracts.md §5.4): the daemon's protocol surface, and the only env keys a
+// deployment template does not get to keep. MULTICA_DAEMON_ID reads the
+// pod-template label Foreman writes with the identity name — not the Job
+// controller's job-name label, which now carries the template's display name
+// (ADR-034 decision 8 / §5.2).
 func injectedEnv() []corev1.EnvVar {
 	return []corev1.EnvVar{
 		{Name: "MULTICA_SERVER_URL", Value: foremanServerURL},
-		{Name: "MULTICA_DAEMON_ID", ValueFrom: envFieldRef("metadata.labels['job-name']")},
+		{Name: "MULTICA_DAEMON_ID", ValueFrom: envFieldRef("metadata.labels['" + labelDaemonID + "']")},
 		{Name: "MULTICA_DAEMON_MAX_CONCURRENT_TASKS", Value: "1"},
 	}
 }
@@ -107,11 +116,14 @@ var (
 	triggerContextAnnotationKeys = []string{annoIssueID, annoIssueIdentifier, annoAutopilotRunID, annoChatSessionID}
 )
 
-func (b *Builder) credentialSecret(name, taskID, token string) *corev1.Secret {
+// credentialSecret is the per-task Secret. Its name derives from the identity
+// name (fm-<task_id>-cred), so it never follows the template's display name
+// (ADR-034 decision 8, contract §1.3).
+func (b *Builder) credentialSecret(daemonID, taskID, token string) *corev1.Secret {
 	configJSON := `{"token":` + strconv.Quote(token) + `}`
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name + secretCredSuffix,
+			Name:      daemonID + secretCredSuffix,
 			Namespace: b.cfg.JobNamespace,
 			Labels: map[string]string{
 				labelManagedBy: managedByForeman,

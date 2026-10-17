@@ -13,6 +13,7 @@ import (
 	"strings"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	jsonserializer "k8s.io/apimachinery/pkg/runtime/serializer/json"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 	"k8s.io/client-go/kubernetes/scheme"
@@ -60,12 +61,13 @@ var strictJobSerializer = jsonserializer.NewSerializerWithOptions(
 // LoadJobTemplate is the startup gate (called by NewBuilder): it reads the
 // required Job template and parses it. The template is a required deployment
 // artifact, so every failure refuses startup — there is no fallback and no
-// default template (ADR-030). Three failure classes, each logged on its own
+// default template (ADR-030). Four failure classes, each logged on its own
 // line: the file does not exist, the file cannot be read (the hash is out of
-// reach — the line says so), or the content is not a batch/v1 Job (a YAML
-// parse error, an unknown field under strict decoding, or an apiVersion/kind
-// that is not the Job's — the hash line is printed here, the bytes being
-// readable). Nothing else about the template is judged.
+// reach — the line says so), the content is not a batch/v1 Job (a YAML parse
+// error, an unknown field under strict decoding, or an apiVersion/kind that is
+// not the Job's — the hash line is printed here, the bytes being readable), or
+// metadata.name is not a legal name format (ADR-034 decision 3: the hash line
+// is printed here too). Nothing else about the template is judged.
 func LoadJobTemplate(cfg Config) (map[string]any, error) {
 	path := cfg.TemplatePath
 	if path == "" {
@@ -91,6 +93,17 @@ func LoadJobTemplate(cfg Config) (map[string]any, error) {
 	template, err := parseJobTemplate(path, data)
 	if err != nil {
 		log.Error("job template rejected: refusing to start",
+			"template", path, "err", err.Error(), "declaration", templateRiskDeclaration)
+		log.Error(hashLine, "template", path)
+		return nil, err
+	}
+	// Failure class 4 (ADR-034 decision 3): metadata.name is the name format
+	// string, and a non-empty one that leaves the character-level closure —
+	// an unregistered variable, a missing unique task segment, an over-long
+	// worst case, a minimum rendering that is not DNS-1123 — refuses startup.
+	// Falling back silently would hide the deployer's format.
+	if err := validateNameFormat(templateNameFormat(template)); err != nil {
+		log.Error("job template name format rejected: 名字格式非法，拒绝启动",
 			"template", path, "err", err.Error(), "declaration", templateRiskDeclaration)
 		log.Error(hashLine, "template", path)
 		return nil, err
@@ -140,26 +153,82 @@ func parseJobTemplate(path string, data []byte) (map[string]any, error) {
 	return template, nil
 }
 
-// renderTemplate renders one task from the startup-parsed template: a fresh
-// deep copy per Build (A1.3), the registered placeholders (step 6a — they never
-// consume the node literal), then the node-reuse recognition site (step 7, the
-// literal's only consumer), then the typed Job. Reusing the parsed object would
-// carry task A's per-task values — above all the fm-<task_id>-cred Secret
-// reference — into task B.
-func renderTemplate(template map[string]any, v placeholderValues) (*batchv1.Job, error) {
-	rendered := deepCopyTemplate(template)
-	substituteValue(rendered, v)
-	resolvePreferredNode(rendered, v.preferredNode)
+// resolvePreferredNode settles the node-reuse item on the rendered Job
+// (03-contracts §5.4「`<preferred node>` 条件块」): every values entry reading
+// exactly "<preferred node>" at
+// affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[*]
+// .preference.matchExpressions[*].values takes the resolved node's name, or —
+// when no node resolved — its whole item is dropped and the structures the
+// deletion empties are collapsed. The literal elsewhere is untouched: no
+// replacement, no deletion, no error. An item dropped here covers both the
+// reuse conditions (no session, unknown node, reuse off, saturated node) and
+// the nodeSelector axis's suppression (ADR-036).
+func resolvePreferredNode(job *batchv1.Job, node string) {
+	affinity := job.Spec.Template.Spec.Affinity
+	if affinity == nil || affinity.NodeAffinity == nil {
+		return
+	}
+	preferred := affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution
+	kept := make([]corev1.PreferredSchedulingTerm, 0, len(preferred))
+	dropped := false
+	for _, item := range preferred {
+		switch {
+		case node != "" && nameRecognitionValues(&item, node):
+			// The item carries the recognition element and now names the node.
+			kept = append(kept, item)
+		case node == "" && hasRecognitionValue(&item):
+			dropped = true
+		default:
+			kept = append(kept, item)
+		}
+	}
+	if !dropped {
+		return
+	}
+	if len(kept) > 0 {
+		affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = kept
+		return
+	}
+	// The empty-structure collapse is part of「删除该项」: the item, its list,
+	// nodeAffinity, affinity — until something non-empty is left.
+	affinity.NodeAffinity.PreferredDuringSchedulingIgnoredDuringExecution = nil
+	if affinity.NodeAffinity.RequiredDuringSchedulingIgnoredDuringExecution == nil {
+		affinity.NodeAffinity = nil
+	}
+	if affinity.NodeAffinity == nil && affinity.PodAffinity == nil && affinity.PodAntiAffinity == nil {
+		job.Spec.Template.Spec.Affinity = nil
+	}
+}
 
-	raw, err := json.Marshal(rendered)
-	if err != nil {
-		return nil, fmt.Errorf("render job template: %w", err)
+// nameRecognitionValues rewrites every recognition element of one preferred
+// item to the resolved node, reporting whether the item carried one.
+func nameRecognitionValues(item *corev1.PreferredSchedulingTerm, node string) bool {
+	found := false
+	for i := range item.Preference.MatchExpressions {
+		expression := &item.Preference.MatchExpressions[i]
+		for j, value := range expression.Values {
+			if value == placeholderPreferredNode {
+				expression.Values[j] = node
+				found = true
+			}
+		}
 	}
-	var job batchv1.Job
-	if err := json.Unmarshal(raw, &job); err != nil {
-		return nil, fmt.Errorf("render job template: %w", err)
+	return found
+}
+
+// hasRecognitionValue reports whether one preferred item carries a recognition
+// element. An entry whose value merely contains the literal is not a
+// recognition element — the design pins an exact value — so it is left to the
+// apiserver's own judgment.
+func hasRecognitionValue(item *corev1.PreferredSchedulingTerm) bool {
+	for i := range item.Preference.MatchExpressions {
+		for _, value := range item.Preference.MatchExpressions[i].Values {
+			if value == placeholderPreferredNode {
+				return true
+			}
+		}
 	}
-	return &job, nil
+	return false
 }
 
 // Registered template placeholders (05-modules/job-template.md 占位符与回归基线).
@@ -178,6 +247,9 @@ const (
 	placeholderJobRuntimeID    = "<job runtime uuid>"
 	placeholderClaimedAt       = "<RFC3339>"
 	placeholderJobImage        = "<job-image>"
+	placeholderJobName         = "<job-name>"
+	placeholderDaemonID        = "<daemon-id>"
+	placeholderAgentName       = "<agent-name>"
 	placeholderPreferredNode   = "<preferred node>"
 )
 
@@ -186,12 +258,14 @@ const (
 // design registers it as the substitution set's one exception (03-contracts
 // §5.4「占位符替换」第 1 条) — only its recognition site takes a value or drops
 // its item (resolvePreferredNode), and anywhere else the literal stays verbatim
-// like any other unregistered one.
+// like any other unregistered one. The name-face variables (<issue-segment>,
+// <agent-segment>, <task-key>) are absent for the same reason: they are valid
+// inside metadata.name only (ADR-034 decision 6).
 var placeholderRegistry = []string{
 	placeholderTaskID, placeholderAgentID, placeholderWorkspaceID,
 	placeholderIssueID, placeholderIssueIdentifier, placeholderAutopilotRunID,
 	placeholderChatSessionID, placeholderJobRuntimeID, placeholderClaimedAt,
-	placeholderJobImage,
+	placeholderJobImage, placeholderJobName, placeholderDaemonID, placeholderAgentName,
 }
 
 // placeholderValues resolves each registered placeholder for one task.
@@ -206,6 +280,16 @@ type placeholderValues struct {
 	jobRuntimeID    string
 	claimedAt       string
 	jobImage        string
+	// jobName is the final display name (ADR-034): the name composition step
+	// runs before the substitution, so a template can reference it outside
+	// metadata.name — where the name itself is already the final value.
+	jobName string
+	// daemonID is the identity name fm-<task_id>, independently of the display
+	// name (ADR-034 decision 8).
+	daemonID string
+	// agentName is the payload's raw agent.name (may carry uppercase, spaces
+	// or non-ASCII); only the name composition normalizes it.
+	agentName string
 	// preferredNode is empty when reuse is off, no history exists, or the node
 	// is saturated; the affinity item carrying the placeholder is then dropped
 	// instead of rendered empty.
@@ -234,6 +318,12 @@ func (v placeholderValues) replacement(placeholder string) string {
 		return v.claimedAt
 	case placeholderJobImage:
 		return v.jobImage
+	case placeholderJobName:
+		return v.jobName
+	case placeholderDaemonID:
+		return v.daemonID
+	case placeholderAgentName:
+		return v.agentName
 	default:
 		return ""
 	}
@@ -276,117 +366,6 @@ func substituteString(value string, v placeholderValues) string {
 		}
 	}
 	return value
-}
-
-// resolvePreferredNode writes the node-reuse decision into the template's
-// recognition site (03-contracts §5.4「识别位与执行顺序」): every values entry
-// reading exactly "<preferred node>" at
-// affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[*]
-// .preference.matchExpressions[*].values takes the resolved node's name, or —
-// when no node resolved — its whole item is dropped and the structures the
-// deletion empties are collapsed. The literal elsewhere is untouched: no
-// replacement, no deletion, no error.
-func resolvePreferredNode(template map[string]any, node string) {
-	spec := nestedMap(template, "spec", "template", "spec")
-	affinity, _ := spec["affinity"].(map[string]any)
-	nodeAffinity, _ := affinity["nodeAffinity"].(map[string]any)
-	items, _ := nodeAffinity["preferredDuringSchedulingIgnoredDuringExecution"].([]any)
-
-	kept := make([]any, 0, len(items))
-	dropped := false
-	for _, item := range items {
-		switch {
-		case node != "" && nameRecognitionElement(item, node):
-			// The item carries the recognition element and now names the node.
-			kept = append(kept, item)
-		case node == "" && hasRecognitionElement(item):
-			dropped = true
-		default:
-			kept = append(kept, item)
-		}
-	}
-	if !dropped {
-		return
-	}
-	if len(kept) > 0 {
-		nodeAffinity["preferredDuringSchedulingIgnoredDuringExecution"] = kept
-		return
-	}
-	// The empty-structure collapse is part of「删除该项」: the item, its list,
-	// nodeAffinity, affinity — until something non-empty is left.
-	delete(nodeAffinity, "preferredDuringSchedulingIgnoredDuringExecution")
-	if len(nodeAffinity) == 0 {
-		delete(affinity, "nodeAffinity")
-	}
-	if len(affinity) == 0 {
-		delete(spec, "affinity")
-	}
-}
-
-// nameRecognitionElement rewrites every recognition element of one preferred
-// item to the resolved node, reporting whether the item carried one.
-func nameRecognitionElement(item any, node string) bool {
-	found := false
-	for _, values := range recognitionValueLists(item) {
-		for i, raw := range values {
-			if literal, ok := raw.(string); ok && literal == placeholderPreferredNode {
-				values[i] = node
-				found = true
-			}
-		}
-	}
-	return found
-}
-
-// hasRecognitionElement reports whether one preferred item carries a
-// recognition element.
-func hasRecognitionElement(item any) bool {
-	for _, values := range recognitionValueLists(item) {
-		for _, raw := range values {
-			if literal, ok := raw.(string); ok && literal == placeholderPreferredNode {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// recognitionValueLists walks one preferred item down to the values lists the
-// recognition site names: preference.matchExpressions[*].values. An entry whose
-// value merely contains the literal is not a recognition element — the design
-// pins an exact value — so it is left to the apiserver's own judgment.
-func recognitionValueLists(item any) [][]any {
-	entry, ok := item.(map[string]any)
-	if !ok {
-		return nil
-	}
-	preference, _ := entry["preference"].(map[string]any)
-	expressions, _ := preference["matchExpressions"].([]any)
-	var lists [][]any
-	for _, raw := range expressions {
-		expression, ok := raw.(map[string]any)
-		if !ok {
-			continue
-		}
-		if values, ok := expression["values"].([]any); ok {
-			lists = append(lists, values)
-		}
-	}
-	return lists
-}
-
-// nestedMap walks a chain of map keys, returning nil when any step is absent
-// or is not a map.
-func nestedMap(root map[string]any, keys ...string) map[string]any {
-	current := root
-	for _, key := range keys {
-		next, ok := current[key].(map[string]any)
-		if !ok {
-			return nil
-		}
-		current = next
-	}
-	return current
 }
 
 // deepCopyTemplate clones the parsed template so Build never mutates the

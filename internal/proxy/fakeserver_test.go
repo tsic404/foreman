@@ -99,6 +99,12 @@ func (fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, 
 	return job, secret, "sha256:" + e.TaskID, nil
 }
 
+// ResolveName mirrors the fallback name the fake's Jobs carry.
+func (fakeBuilder) ResolveName(e jobbuilder.TaskEntry) (string, error) { return "fm-" + e.TaskID, nil }
+
+// RequiresProjectIdentity keeps the fake's claims out of the platform lookup.
+func (fakeBuilder) RequiresProjectIdentity(jobbuilder.TaskEntry) bool { return false }
+
 func (fakeBuilder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
 	name := "fm-catalog-" + requestID
 	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{

@@ -219,7 +219,7 @@ spec:
 	}
 	daemonID := envByName(t, first, "MULTICA_DAEMON_ID")
 	if daemonID.Value != "" || daemonID.ValueFrom == nil || daemonID.ValueFrom.FieldRef == nil ||
-		daemonID.ValueFrom.FieldRef.FieldPath != "metadata.labels['job-name']" {
+		daemonID.ValueFrom.FieldRef.FieldPath != "metadata.labels['foreman.tsic.top/daemon-id']" {
 		t.Errorf("MULTICA_DAEMON_ID = %+v, want the fieldRef only", daemonID)
 	}
 	if got := envValue(first, "MULTICA_DAEMON_MAX_CONCURRENT_TASKS"); got != "1" {
