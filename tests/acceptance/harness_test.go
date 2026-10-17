@@ -750,8 +750,17 @@ const (
 
 func newHarness(t *testing.T, catalogEnabled bool) *harness {
 	t.Helper()
+	return newHarnessWithWindow(t, catalogEnabled, deliveryConfirmWindow)
+}
+
+// newHarnessWithWindow is newHarness with the S6 confirmation window chosen by
+// the scenario. Zero turns the re-delivery exit off — the form whose scenario
+// is "delivered exactly once" (ADR-030 / AC-46) — and the registry and the
+// scheduler config must agree on it, as they do in a deployment.
+func newHarnessWithWindow(t *testing.T, catalogEnabled bool, window time.Duration) *harness {
+	t.Helper()
 	upstream := newUpstreamStub(t)
-	reg := registry.New(time.Now, registry.WithDeliveryConfirmTimeout(deliveryConfirmWindow))
+	reg := registry.New(time.Now, registry.WithDeliveryConfirmTimeout(window))
 	probes := registry.NewProbeRegistry()
 	startup := registry.NewStartupCatalog()
 	slots := proxy.NewCatalogSlots()
@@ -797,7 +806,7 @@ func newHarness(t *testing.T, catalogEnabled bool) *harness {
 		ClaimBatchMax:          32,
 		JobBootTimeout:         300 * time.Second,
 		JobDrainTimeout:        120 * time.Second,
-		DeliveryConfirmTimeout: deliveryConfirmWindow,
+		DeliveryConfirmTimeout: window,
 		StartupProbeTimeout:    3 * time.Second,
 		ModelCatalogEnabled:    catalogEnabled,
 		ModelCatalogTimeout:    45 * time.Second,

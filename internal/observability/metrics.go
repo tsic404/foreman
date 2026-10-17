@@ -64,11 +64,14 @@ var forwardEndpoints = []string{
 }
 
 // Delivery claim result label values (ADR-030; the proxy passes these
-// through its own Metrics seam): a committed delivery, a plain empty batch,
-// and an empty batch answering an entry whose delivery was committed but
-// never confirmed — the lost-response signature.
+// through its own Metrics seam): a committed delivery, a delivered payload
+// handed over again once the confirmation window released it — the
+// lost-response signature that recovered — a plain empty batch, and an empty
+// batch answering an entry whose delivery was committed but still unconfirmed
+// inside its window.
 const (
 	DeliveryClaimDelivered        = "delivered"
+	DeliveryClaimRedelivered      = "redelivered"
 	DeliveryClaimEmpty            = "empty"
 	DeliveryClaimEmptyUnconfirmed = "empty_unconfirmed"
 )
@@ -76,7 +79,8 @@ const (
 // deliveryClaimResults pre-initializes the foreman_delivery_claims_total
 // series so every designed label value is visible from boot.
 var deliveryClaimResults = []string{
-	DeliveryClaimDelivered, DeliveryClaimEmpty, DeliveryClaimEmptyUnconfirmed,
+	DeliveryClaimDelivered, DeliveryClaimRedelivered,
+	DeliveryClaimEmpty, DeliveryClaimEmptyUnconfirmed,
 }
 
 // authFailureReasons is the foreman_auth_failures_total label vocabulary.
@@ -155,7 +159,7 @@ func NewMetrics() *Metrics {
 	}, []string{"code"})
 	m.deliveryClaims = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: metricDeliveryClaimsTotal,
-		Help: "S6 task claims by result (delivered|empty|empty_unconfirmed).",
+		Help: "S6 task claims by result (delivered|redelivered|empty|empty_unconfirmed).",
 	}, []string{"result"})
 	m.deliveryLatency = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    metricDeliveryLatency,
@@ -164,7 +168,7 @@ func NewMetrics() *Metrics {
 	})
 	m.deliveryUnconfirm = prometheus.NewCounter(prometheus.CounterOpts{
 		Name: metricDeliveryUnconfirmedTotal,
-		Help: "Deliveries the confirmation window judged undelivered.",
+		Help: "Deliveries that reached the boot bound never confirmed by the daemon.",
 	})
 	m.jobBootSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
 		Name:    metricJobBootSeconds,
@@ -331,8 +335,9 @@ func (m *Metrics) DeliveryClaim(result string) {
 // (ADR-030).
 func (m *Metrics) DeliveryLatency(seconds float64) { m.deliveryLatency.Observe(seconds) }
 
-// DeliveryUnconfirmed counts one delivery the confirmation window judged
-// undelivered (ADR-030).
+// DeliveryUnconfirmed counts one entry that reached the boot bound on a
+// committed delivery the daemon never confirmed (ADR-030): the window
+// released the payload for another attempt, and no attempt was started.
 func (m *Metrics) DeliveryUnconfirmed() { m.deliveryUnconfirm.Inc() }
 
 // DuplicateDispatch counts a server re-dispatch of a known task.

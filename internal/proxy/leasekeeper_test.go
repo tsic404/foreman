@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -294,31 +295,37 @@ func TestLeaseKeeperSkipsRebuiltEntries(t *testing.T) {
 	}
 }
 
-// TestLeaseKeeperDeliveryWindowPrecedesBootBound guards ADR-030's gate: an
-// entry whose delivery was committed and whose confirmation window expired
-// settles as undelivered, and the boot bound keeps owning the entries that
-// never armed a window — judged in the same round, never the same entry.
-//
-// The third entry is the ordering the config relation cannot promise: the
-// window is delivery-relative and the boot bound claim-relative, so an entry
-// can reach its boot bound while its window is still open (a delivery late in
-// the claim window). It must keep its own attribution: neither bound fires,
-// and the boot branch never steals the verdict.
-func TestLeaseKeeperDeliveryWindowPrecedesBootBound(t *testing.T) {
+// TestLeaseKeeperBootBoundSplitsTheDeliveryAttribution guards ADR-030's bound
+// model: the boot deadline is the entry's only terminal bound, and the
+// confirmation window is not one — an expired window releases the delivery on
+// the claim path, it never settles an entry here. The attribution splits on
+// whether a delivery was ever committed: a delivered entry keeps the delivery
+// face, a never-delivered one the boot face, whether or not a window is armed.
+func TestLeaseKeeperBootBoundSplitsTheDeliveryAttribution(t *testing.T) {
 	now := time.Now()
 	reg := registry.New(time.Now)
-	client := &fakeLeaseClient{ready: map[string]bool{"t-armed": true, "t-unarmed": true, "t-inverted": true}}
+	client := &fakeLeaseClient{ready: map[string]bool{
+		"t-delivered": true, "t-delivered-early": true, "t-undelivered": true, "t-in-window": true,
+	}}
 	hooks := &fakeLeaseHooks{}
 
-	armed := leaseEntry("t-armed", registry.StateDelivering, false, now.Add(-time.Second))
-	armed.DeliveredAt = now.Add(-time.Minute)
-	armed.DeliveryDeadline = now.Add(-time.Second)
-	unarmed := leaseEntry("t-unarmed", registry.StateDelivering, false, now.Add(-time.Second))
-	unarmed.DeliveredAt = now.Add(-time.Minute)
-	inverted := leaseEntry("t-inverted", registry.StateDelivering, false, now.Add(-time.Second))
-	inverted.DeliveredAt = now.Add(-time.Second)
-	inverted.DeliveryDeadline = now.Add(time.Minute)
-	for _, e := range []registry.TaskEntry{armed, unarmed, inverted} {
+	// Delivered, window expired, boot bound passed: the delivery attribution.
+	delivered := leaseEntry("t-delivered", registry.StateDelivering, false, now.Add(-time.Second))
+	delivered.DeliveredAt = now.Add(-time.Minute)
+	delivered.DeliveryDeadline = now.Add(-30 * time.Second)
+	// Delivered with the window still open but the boot bound passed: the
+	// window cannot shield the entry from the boot bound any more.
+	early := leaseEntry("t-delivered-early", registry.StateDelivering, false, now.Add(-time.Second))
+	early.DeliveredAt = now.Add(-time.Second)
+	early.DeliveryDeadline = now.Add(time.Minute)
+	// Never delivered: the boot face keeps its own attribution.
+	undelivered := leaseEntry("t-undelivered", registry.StateDelivering, false, now.Add(-time.Second))
+	// Delivered, window expired, boot bound still ahead: the window is not a
+	// bound — nothing settles here, the claim path re-delivers.
+	inWindow := leaseEntry("t-in-window", registry.StateDelivering, false, now.Add(time.Minute))
+	inWindow.DeliveredAt = now.Add(-time.Minute)
+	inWindow.DeliveryDeadline = now.Add(-30 * time.Second)
+	for _, e := range []registry.TaskEntry{delivered, early, undelivered, inWindow} {
 		if err := reg.Put(e); err != nil {
 			t.Fatalf("Put %s: %v", e.TaskID, err)
 		}
@@ -327,10 +334,12 @@ func TestLeaseKeeperDeliveryWindowPrecedesBootBound(t *testing.T) {
 	k := NewLeaseKeeper(client, reg, hooks, time.Minute)
 	k.round(t.Context())
 
-	if len(hooks.unconfirmed) != 1 || hooks.unconfirmed[0] != "t-armed" {
-		t.Errorf("unconfirmed = %v, want only the entry whose window expired", hooks.unconfirmed)
+	wantUnconfirmed := []string{"t-delivered", "t-delivered-early"}
+	slices.Sort(hooks.unconfirmed)
+	if !slices.Equal(hooks.unconfirmed, wantUnconfirmed) {
+		t.Errorf("unconfirmed = %v, want %v", hooks.unconfirmed, wantUnconfirmed)
 	}
-	if len(hooks.bootTimeout) != 1 || hooks.bootTimeout[0] != "t-unarmed" {
-		t.Errorf("bootTimeout = %v, want only the entry without an armed window", hooks.bootTimeout)
+	if !slices.Equal(hooks.bootTimeout, []string{"t-undelivered"}) {
+		t.Errorf("bootTimeout = %v, want only the never-delivered entry", hooks.bootTimeout)
 	}
 }
