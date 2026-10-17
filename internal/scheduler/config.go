@@ -31,6 +31,10 @@ const (
 	EnvModelCatalogEnabled = "FOREMAN_MODEL_CATALOG_ENABLED"
 	EnvModelCatalogTimeout = "FOREMAN_MODEL_CATALOG_TIMEOUT"
 	EnvReconcileInterval   = "FOREMAN_RECONCILE_INTERVAL"
+	// EnvProjectLookupTimeout bounds one read-only project reverse lookup by
+	// issue id (ADR-035 decision 3: the timeout value belongs to the
+	// implementation, and the claim → Job 5s P95 must hold).
+	EnvProjectLookupTimeout = "FOREMAN_PROJECT_LOOKUP_TIMEOUT"
 )
 
 // Contract defaults (§5.1).
@@ -58,6 +62,11 @@ const (
 	// DefaultReconcileInterval is the convergence cadence (§5.1); the probe
 	// sweep grace is derived from it.
 	DefaultReconcileInterval = 30 * time.Second
+
+	// DefaultProjectLookupTimeout keeps one project reverse lookup well inside
+	// the claim → Job 5s P95 (ADR-035 decision 3): a lookup that outlives it
+	// converges on project.lookup_failed, never on a slow Job create.
+	DefaultProjectLookupTimeout = 2 * time.Second
 
 	// serverClaimBatchCap is the server-side claim batch ceiling
 	// (contract §1.1 C3: max_tasks > 32 is truncated to 32).
@@ -104,6 +113,14 @@ type Config struct {
 	// ReconcileInterval is the convergence cadence; the probe sweep grace
 	// covers one round on each side (FOREMAN_RECONCILE_INTERVAL).
 	ReconcileInterval time.Duration
+	// Project is the platform-side project-identity seam (ADR-035 decision 3):
+	// the payload's structured project key and the read-only lookup by issue
+	// id. Nil means the platform offers neither, so every task reads
+	// project_source=none and the project tiers stay no_identity.
+	Project ProjectIdentity
+	// ProjectLookupTimeout bounds one reverse lookup so the claim → Job budget
+	// holds (FOREMAN_PROJECT_LOOKUP_TIMEOUT). Zero falls back to the default.
+	ProjectLookupTimeout time.Duration
 }
 
 // LoadConfig reads the scheduler configuration from env (os.Getenv when
@@ -124,6 +141,8 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		ModelCatalogEnabled:    DefaultModelCatalogEnabled,
 		ModelCatalogTimeout:    DefaultModelCatalogTimeout,
 		ReconcileInterval:      DefaultReconcileInterval,
+
+		ProjectLookupTimeout: DefaultProjectLookupTimeout,
 	}
 
 	if v := strings.TrimSpace(getenv(jobbuilder.EnvJobNamespace)); v != "" {
@@ -239,6 +258,16 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("%s must be positive, got %s", EnvModelCatalogTimeout, d)
 		}
 		cfg.ModelCatalogTimeout = d
+	}
+	if raw := strings.TrimSpace(getenv(EnvProjectLookupTimeout)); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be a duration: %v", EnvProjectLookupTimeout, err)
+		}
+		if d <= 0 {
+			return Config{}, fmt.Errorf("%s must be positive, got %s", EnvProjectLookupTimeout, d)
+		}
+		cfg.ProjectLookupTimeout = d
 	}
 	if raw := strings.TrimSpace(getenv(EnvReconcileInterval)); raw != "" {
 		d, err := time.ParseDuration(raw)

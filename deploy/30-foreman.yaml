@@ -211,6 +211,13 @@ spec:
             - name: job-template
               mountPath: /etc/foreman/job-template
               readOnly: true
+            # §5.4「策略文件」: the three-axis policy carrier. Optional on
+            # purpose — an absent file is a legal default (all three axes read
+            # None), so this volume must not block startup. Content:
+            # 26-job-policy.yaml.
+            - name: job-policy
+              mountPath: /etc/foreman/policy
+              readOnly: true
       volumes:
         - name: state
           emptyDir: {}
@@ -218,6 +225,10 @@ spec:
           configMap:
             name: foreman-job-template
             optional: false
+        - name: job-policy
+          configMap:
+            name: foreman-job-policy
+            optional: true
 ---
 # Job-side entry point: the Job daemon's MULTICA_SERVER_URL resolves to
 # foreman.foreman.svc.cluster.local:8080 (contract §1.2/§5.2).

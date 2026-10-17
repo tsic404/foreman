@@ -570,6 +570,13 @@ func (b *builder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, s
 	return job, secret, "hash-" + name, nil
 }
 
+// ResolveName mirrors the fallback name the canned builder renders.
+func (b *builder) ResolveName(e jobbuilder.TaskEntry) (string, error) { return "fm-" + e.TaskID, nil }
+
+// RequiresProjectIdentity keeps the canned builder's claims out of the
+// platform lookup; the real builder answers from the policy table.
+func (b *builder) RequiresProjectIdentity(jobbuilder.TaskEntry) bool { return false }
+
 func (b *builder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
 	if b.probeErr != nil {
 		return nil, nil, "", b.probeErr
@@ -609,6 +616,17 @@ type realBuilder struct {
 
 func (b realBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
 	return b.inner.Build(e)
+}
+
+// ResolveName forwards the production name composition, so a scenario can see
+// the display name the template expresses without building the objects.
+func (b realBuilder) ResolveName(e jobbuilder.TaskEntry) (string, error) {
+	return b.inner.ResolveName(e)
+}
+
+// RequiresProjectIdentity forwards the policy table's answer.
+func (b realBuilder) RequiresProjectIdentity(e jobbuilder.TaskEntry) bool {
+	return b.inner.RequiresProjectIdentity(e)
 }
 
 func (b realBuilder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
@@ -679,22 +697,48 @@ func (h *harness) useRealBuilder(t *testing.T) {
 // over a test-owned template file (the custom-template window).
 func (h *harness) useRealBuilderWithTemplate(t *testing.T, templatePath string) {
 	t.Helper()
+	h.useRealBuilderWithPolicy(t, templatePath, "", nil)
+}
+
+// useRealBuilderWithPolicy is useRealBuilderWithTemplate plus the policy file
+// (03-contracts.md §5.4「策略文件」): an empty policyPath leaves the field at
+// the mounted path, which does not exist under test — the legal default of an
+// absent file (three axes None, warn). mutate receives the loaded config, so a
+// scenario can inject the platform name-resolution seam or any other knob.
+func (h *harness) useRealBuilderWithPolicy(t *testing.T, templatePath, policyPath string, mutate func(*jobbuilder.Config)) {
+	t.Helper()
 	jbCfg, err := jobbuilder.LoadConfig(func(string) string { return "" })
 	if err != nil {
 		t.Fatalf("jobbuilder.LoadConfig: %v", err)
 	}
 	jbCfg.TemplatePath = templatePath
+	if policyPath != "" {
+		jbCfg.PolicyPath = policyPath
+	}
 	jbCfg.JobNamespace = "multica-agents"
 	jbCfg.JobImage = harnessJobImage
 	jbCfg.Issuer = h.issuer
 	jbCfg.Nodes = h.reg
-	jbCfg.Logger = slog.New(slog.NewJSONHandler(io.Discard, nil))
+	jbCfg.Logger = slog.New(slog.NewJSONHandler(h.logs, nil))
+	if mutate != nil {
+		mutate(&jbCfg)
+	}
 	inner, err := jobbuilder.NewBuilder(jbCfg)
 	if err != nil {
 		t.Fatalf("jobbuilder.NewBuilder: %v", err)
 	}
 	h.builder = realBuilder{inner: inner, jobs: h.jobs}
 	h.rebuildScheduler(t, func(*scheduler.Config) {})
+}
+
+// writePolicyFile writes a policy.yaml where the builder reads it.
+func writePolicyFile(t *testing.T, policy string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "policy.yaml")
+	if err := os.WriteFile(path, []byte(policy), 0o600); err != nil {
+		t.Fatalf("write policy: %v", err)
+	}
+	return path
 }
 
 // schedulerServerClient is the scheduler's server seam.

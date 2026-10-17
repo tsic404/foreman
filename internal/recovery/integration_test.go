@@ -520,6 +520,14 @@ func (stubBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, 
 		"hash-of-" + e.TaskID, nil
 }
 
+// ResolveName mirrors the fallback name the stub's Jobs carry.
+func (stubBuilder) ResolveName(e jobbuilder.TaskEntry) (string, error) {
+	return fakeJobName(e.TaskID), nil
+}
+
+// RequiresProjectIdentity keeps the stub's claims out of the platform lookup.
+func (stubBuilder) RequiresProjectIdentity(jobbuilder.TaskEntry) bool { return false }
+
 func (stubBuilder) BuildCatalogProbe(requestID, _, _ string, _ time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
 	name := "fm-catalog-" + requestID
 	return &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name}},
