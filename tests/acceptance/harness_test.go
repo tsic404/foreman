@@ -17,6 +17,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -188,6 +189,12 @@ type upstreamStub struct {
 	modelSeq int
 	// queued is the server-side task queue C3 serves. Empty by default.
 	queued []*queuedTask
+	// skillStatus and skillBody are the C19 resolve answer (default 200 with
+	// an empty bundle list); skillGate, when set, holds every answer until it
+	// closes, so a scenario can make a resolve genuinely in flight.
+	skillStatus int
+	skillBody   []byte
+	skillGate   chan struct{}
 	// ackShape shapes the heartbeat ack's runtime_id field.
 	ackShape ackRuntimeIDShape
 	requests []upstreamRequest
@@ -201,6 +208,8 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		heartbeats:   map[string]int{},
 		modelsStatus: 200,
 		models:       map[string]*modelCommand{},
+		skillStatus:  200,
+		skillBody:    []byte(`{"bundles":[]}`),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/daemon/register", func(w http.ResponseWriter, r *http.Request) {
@@ -278,6 +287,19 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		body, _ := io.ReadAll(r.Body)
 		stub.record(r, r.URL.Path, body)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	})
+	// C19: the skill-bundle resolve Foreman forwards on a cache miss. The
+	// answer is programmable, and the call is recorded so a scenario can count
+	// upstream touches.
+	mux.HandleFunc("POST /api/daemon/runtimes/{rid}/tasks/{tid}/skill-bundles/resolve", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		stub.record(r, r.URL.Path, body)
+		status, resp, gate := stub.skillAnswer()
+		if gate != nil {
+			<-gate
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write(resp)
 	})
 	mux.HandleFunc("POST /api/daemon/deregister", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -422,6 +444,50 @@ func (s *upstreamStub) tasksInStatus(status string) int {
 	n := 0
 	for _, task := range s.queued {
 		if task.status == status {
+			n++
+		}
+	}
+	return n
+}
+
+// setSkillAnswer programs the C19 answer the stub serves for every resolve.
+func (s *upstreamStub) setSkillAnswer(status int, body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.skillStatus = status
+	s.skillBody = []byte(body)
+}
+
+// skillAnswer reads the programmed C19 answer and the gate currently holding
+// it (nil when the answers flow straight through).
+func (s *upstreamStub) skillAnswer() (int, []byte, chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	status := s.skillStatus
+	if status == 0 {
+		status = http.StatusOK
+	}
+	return status, append([]byte(nil), s.skillBody...), s.skillGate
+}
+
+// gateSkill holds every later C19 answer until the returned release is called:
+// a scenario that needs a resolve genuinely in flight releases it explicitly.
+func (s *upstreamStub) gateSkill() (release func()) {
+	gate := make(chan struct{})
+	s.mu.Lock()
+	s.skillGate = gate
+	s.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { close(gate) }) }
+}
+
+// skillCalls counts the C19 resolves the upstream observed.
+func (s *upstreamStub) skillCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, req := range s.requests {
+		if strings.HasSuffix(req.Path, "/skill-bundles/resolve") {
 			n++
 		}
 	}
@@ -1090,8 +1156,8 @@ func (c *schedulerServerClient) forwarded(ep scheduler.Endpoint) []upstreamReque
 }
 
 // recordingMetrics implements proxy.Metrics and the scheduler's metric seam,
-// recording the catalog outcomes, the daemon face's auth failures and the S6
-// delivery face.
+// recording the catalog outcomes, the daemon face's auth failures, the S6
+// delivery face and the skill-cache resolve faces.
 type recordingMetrics struct {
 	mu            sync.Mutex
 	catalogCodes  []string
@@ -1100,6 +1166,10 @@ type recordingMetrics struct {
 	unconfirmed   int
 	authReasons   []string
 	duplicates    int
+	skillResults  []string
+	skillEvicts   []string
+	skillEntries  int
+	skillBytes    int64
 }
 
 func (m *recordingMetrics) Forward(string, int, time.Duration) {}
@@ -1153,6 +1223,61 @@ func (m *recordingMetrics) DeliveryUnconfirmed() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.unconfirmed++
+}
+
+// SkillCache records one resolve face (§9.2).
+func (m *recordingMetrics) SkillCache(result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.skillResults = append(m.skillResults, result)
+}
+
+// SkillCacheSize records the store's current size (§9.2).
+func (m *recordingMetrics) SkillCacheSize(entries int, bytes int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.skillEntries = entries
+	m.skillBytes = bytes
+}
+
+// SkillCacheEviction records one reclaimed entry by reason (§9.2).
+func (m *recordingMetrics) SkillCacheEviction(reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.skillEvicts = append(m.skillEvicts, reason)
+}
+
+// skillResultCount counts the recorded resolve faces per result.
+func (m *recordingMetrics) skillResultCount(result string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, recorded := range m.skillResults {
+		if recorded == result {
+			n++
+		}
+	}
+	return n
+}
+
+// skillEvictionCount counts the recorded reclaims per reason.
+func (m *recordingMetrics) skillEvictionCount(reason string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, recorded := range m.skillEvicts {
+		if recorded == reason {
+			n++
+		}
+	}
+	return n
+}
+
+// skillSize is the last size the store published.
+func (m *recordingMetrics) skillSize() (entries int, bytes int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.skillEntries, m.skillBytes
 }
 
 func (m *recordingMetrics) codes() []string {
@@ -1266,6 +1391,10 @@ type harness struct {
 	// handlerLogs captures the fake server's own event lines (the job-facing
 	// face), separate from the scheduler's.
 	handlerLogs *syncBuffer
+	// bundles is the S26 resolve cache the fake server answers from; skillClock
+	// is its clock seam, which a scenario steps to age entries.
+	bundles    *proxy.SkillCache
+	skillClock *steppedClock
 
 	schedCfg scheduler.Config
 	// revoker is the scheduler's credential-revocation seam. Nil leaves it
@@ -1293,6 +1422,25 @@ func newHarness(t *testing.T, catalogEnabled bool) *harness {
 // scheduler config must agree on it, as they do in a deployment.
 func newHarnessWithWindow(t *testing.T, catalogEnabled bool, window time.Duration) *harness {
 	t.Helper()
+	return newHarnessWithSkill(t, catalogEnabled, window, nil)
+}
+
+// Skill-bundle cache windows and bounds the scenarios run with: short enough
+// that one clock step crosses them, and shaped like a deployment's knobs.
+const (
+	skillFreshTTL        = 10 * time.Minute
+	skillDowngradeWindow = time.Hour
+	skillRetention       = 2 * time.Hour
+	skillMaxEntries      = 4
+	skillMaxBytes        = 1 << 20
+)
+
+// newHarnessWithSkill is newHarnessWithWindow with the resolve cache's §1.8
+// configuration chosen by the scenario (nil keeps the defaults above): a
+// capacity or window scenario needs its own bounds, and the cache captures them
+// at construction.
+func newHarnessWithSkill(t *testing.T, catalogEnabled bool, window time.Duration, skill func(*proxy.Config)) *harness {
+	t.Helper()
 	upstream := newUpstreamStub(t)
 	reg := registry.New(time.Now, registry.WithDeliveryConfirmTimeout(window))
 	probes := registry.NewProbeRegistry()
@@ -1313,6 +1461,15 @@ func newHarnessWithWindow(t *testing.T, catalogEnabled bool, window time.Duratio
 		ModelCatalogEnabled:  catalogEnabled,
 		ModelCatalogTimeout:  45 * time.Second,
 		ModelCatalogCacheTTL: 6 * time.Hour,
+
+		SkillCacheFreshTTL:        skillFreshTTL,
+		SkillCacheDowngradeWindow: skillDowngradeWindow,
+		SkillCacheRetention:       skillRetention,
+		SkillCacheMaxEntries:      skillMaxEntries,
+		SkillCacheMaxBytes:        skillMaxBytes,
+	}
+	if skill != nil {
+		skill(&cfg)
 	}
 	client := proxy.NewClient(cfg, "mdt_test",
 		proxy.WithStartupCatalog(startup),
@@ -1356,7 +1513,14 @@ func newHarnessWithWindow(t *testing.T, catalogEnabled bool, window time.Duratio
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
 	}
+	// The resolve cache gets its own clock: a scenario ages entries by stepping
+	// it instead of waiting the windows out.
+	skillClock := &steppedClock{}
+	bundles := proxy.NewSkillCache(cfg, client, metrics,
+		proxy.WithSkillCacheClock(skillClock.now),
+		proxy.WithSkillCacheLogger(slog.New(slog.NewJSONHandler(handlerLogs, nil))))
 	handler := proxy.NewFakeServer(issuer, reg, sched, client, nil, metrics, proxy.WithProbeRegistry(probes),
+		proxy.WithSkillBundles(bundles),
 		proxy.WithServerLogger(slog.New(slog.NewJSONHandler(handlerLogs, nil)).With("component", "fake-server")))
 	httpServer := httptest.NewServer(handler)
 	t.Cleanup(httpServer.Close)
@@ -1365,7 +1529,8 @@ func newHarnessWithWindow(t *testing.T, catalogEnabled bool, window time.Duratio
 		t: t, cfg: cfg, reg: reg, probes: probes, startup: startup, slots: slots,
 		jobs: jobs, builder: bld, server: server, metrics: metrics, issuer: issuer,
 		client: client, sched: sched, upstream: upstream, handler: handler,
-		jobsHTTP: httpServer, logs: logs, handlerLogs: handlerLogs, schedCfg: schedCfg,
+		jobsHTTP: httpServer, logs: logs, handlerLogs: handlerLogs,
+		bundles: bundles, skillClock: skillClock, schedCfg: schedCfg,
 	}
 }
 

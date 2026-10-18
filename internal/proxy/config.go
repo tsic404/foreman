@@ -7,6 +7,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"k8s.io/apimachinery/pkg/api/resource"
 )
 
 // Environment variable names read by the proxy module.
@@ -21,6 +23,12 @@ const (
 	EnvModelCatalogEnabled  = "FOREMAN_MODEL_CATALOG_ENABLED"
 	EnvModelCatalogTimeout  = "FOREMAN_MODEL_CATALOG_TIMEOUT"
 	EnvModelCatalogCacheTTL = "FOREMAN_MODEL_CATALOG_CACHE_TTL"
+
+	EnvSkillCacheFreshTTL        = "FOREMAN_SKILL_CACHE_FRESH_TTL"
+	EnvSkillCacheDowngradeWindow = "FOREMAN_SKILL_CACHE_DOWNGRADE_WINDOW"
+	EnvSkillCacheRetention       = "FOREMAN_SKILL_CACHE_RETENTION"
+	EnvSkillCacheMaxEntries      = "FOREMAN_SKILL_CACHE_MAX_ENTRIES"
+	EnvSkillCacheMaxBytes        = "FOREMAN_SKILL_CACHE_MAX_BYTES"
 )
 
 // Default values applied when the environment variable is unset.
@@ -35,6 +43,18 @@ const (
 	DefaultModelCatalogEnabled  = true
 	DefaultModelCatalogTimeout  = 45 * time.Second
 	DefaultModelCatalogCacheTTL = 6 * time.Hour
+
+	// Skill-bundle resolve cache (§1.8). The fresh window is the period a
+	// resolved payload answers without touching upstream; the downgrade window
+	// is the outer age at which an entry may still answer an upstream failure
+	// (0 = off, the ADR-045 option B form); retention reclaims an entry left
+	// unused for that long, and the two capacity bounds are reclaimed
+	// least-recently-used first.
+	DefaultSkillCacheFreshTTL        = 30 * time.Minute
+	DefaultSkillCacheDowngradeWindow = 6 * time.Hour
+	DefaultSkillCacheRetention       = 6 * time.Hour
+	DefaultSkillCacheMaxEntries      = 1024
+	DefaultSkillCacheMaxBytes        = 256 << 20 // 256Mi
 
 	// MaxLeaseRefreshInterval is the upper bound on the renewal cadence: §10
 	// requires a claimed, not-yet-started task to be renewed every ≤20s.
@@ -78,6 +98,19 @@ type Config struct {
 	// ModelCatalogCacheTTL is the catalog cache staleness threshold: crossing
 	// it only logs a warning, it never stops answering (§10).
 	ModelCatalogCacheTTL time.Duration
+
+	// SkillCacheFreshTTL is the resolve cache's fresh window: an entry younger
+	// than it answers locally without touching upstream (§1.8).
+	SkillCacheFreshTTL time.Duration
+	// SkillCacheDowngradeWindow is the outer age bound at which an entry may
+	// still answer an upstream failure; 0 turns the downgrade off (§1.8).
+	SkillCacheDowngradeWindow time.Duration
+	// SkillCacheRetention reclaims an entry left unused for that long (§1.8).
+	SkillCacheRetention time.Duration
+	// SkillCacheMaxEntries and SkillCacheMaxBytes bound the cache; the excess
+	// is reclaimed least-recently-used first (§1.8).
+	SkillCacheMaxEntries int
+	SkillCacheMaxBytes   int64
 }
 
 // LoadConfig reads the proxy configuration from env (os.Getenv when getenv
@@ -97,6 +130,12 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		ModelCatalogEnabled:  DefaultModelCatalogEnabled,
 		ModelCatalogTimeout:  DefaultModelCatalogTimeout,
 		ModelCatalogCacheTTL: DefaultModelCatalogCacheTTL,
+
+		SkillCacheFreshTTL:        DefaultSkillCacheFreshTTL,
+		SkillCacheDowngradeWindow: DefaultSkillCacheDowngradeWindow,
+		SkillCacheRetention:       DefaultSkillCacheRetention,
+		SkillCacheMaxEntries:      DefaultSkillCacheMaxEntries,
+		SkillCacheMaxBytes:        DefaultSkillCacheMaxBytes,
 	}
 
 	cfg.ServerURL = strings.TrimRight(strings.TrimSpace(getenv(EnvServerURL)), "/")
@@ -162,6 +201,53 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if cfg.ModelCatalogCacheTTL <= 0 {
 		return Config{}, fmt.Errorf("%s must be positive", EnvModelCatalogCacheTTL)
 	}
+	if cfg.SkillCacheFreshTTL, err = envDuration(getenv, EnvSkillCacheFreshTTL, cfg.SkillCacheFreshTTL); err != nil {
+		return Config{}, err
+	}
+	// Zero is a value here, not a missing one: it turns the downgrade off
+	// (§1.8「降级窗口可配置，取零即关闭」), so it must survive a round trip.
+	if raw := strings.TrimSpace(getenv(EnvSkillCacheDowngradeWindow)); raw != "" {
+		d, perr := time.ParseDuration(raw)
+		if perr != nil || d < 0 {
+			return Config{}, fmt.Errorf("%s must be a non-negative duration: %q", EnvSkillCacheDowngradeWindow, raw)
+		}
+		cfg.SkillCacheDowngradeWindow = d
+	}
+	if cfg.SkillCacheRetention, err = envDuration(getenv, EnvSkillCacheRetention, cfg.SkillCacheRetention); err != nil {
+		return Config{}, err
+	}
+	if raw := strings.TrimSpace(getenv(EnvSkillCacheMaxEntries)); raw != "" {
+		n, perr := strconv.Atoi(raw)
+		if perr != nil || n < 1 {
+			return Config{}, fmt.Errorf("%s must be a positive integer: %q", EnvSkillCacheMaxEntries, raw)
+		}
+		cfg.SkillCacheMaxEntries = n
+	}
+	if raw := strings.TrimSpace(getenv(EnvSkillCacheMaxBytes)); raw != "" {
+		n, perr := byteSize(EnvSkillCacheMaxBytes, raw)
+		if perr != nil {
+			return Config{}, perr
+		}
+		if n < 1 {
+			return Config{}, fmt.Errorf("%s must be positive", EnvSkillCacheMaxBytes)
+		}
+		cfg.SkillCacheMaxBytes = n
+	}
+	// A retention shorter than the fresh window would reclaim an entry before
+	// its fresh window could ever be used: G10 requires the cache to be bounded
+	// and usable, so the pair is rejected instead of silently weakened.
+	if cfg.SkillCacheRetention < cfg.SkillCacheFreshTTL {
+		return Config{}, fmt.Errorf("%s (%s) must be >= %s (%s)",
+			EnvSkillCacheRetention, cfg.SkillCacheRetention, EnvSkillCacheFreshTTL, cfg.SkillCacheFreshTTL)
+	}
+	// A downgrade window shorter than the fresh window can never apply: the
+	// downgrade is only reached once an entry is past fresh (a fresher entry
+	// answers locally without consulting upstream), so such a pair would turn
+	// the knob off silently. Zero stays the documented off value (§1.8).
+	if cfg.SkillCacheDowngradeWindow != 0 && cfg.SkillCacheDowngradeWindow < cfg.SkillCacheFreshTTL {
+		return Config{}, fmt.Errorf("%s (%s) must be 0 or >= %s (%s): a shorter window could never apply",
+			EnvSkillCacheDowngradeWindow, cfg.SkillCacheDowngradeWindow, EnvSkillCacheFreshTTL, cfg.SkillCacheFreshTTL)
+	}
 	return cfg, nil
 }
 
@@ -175,4 +261,18 @@ func envDuration(getenv func(string) string, key string, def time.Duration) (tim
 		return 0, fmt.Errorf("%s must be a positive duration: %q", key, raw)
 	}
 	return d, nil
+}
+
+// byteSize parses the contract's quantity syntax (256Mi, 1Gi, plain bytes),
+// the same form the node-cache bound uses.
+func byteSize(key, raw string) (int64, error) {
+	q, err := resource.ParseQuantity(raw)
+	if err != nil {
+		return 0, fmt.Errorf("%s must be a byte quantity: %v", key, err)
+	}
+	n := q.Value()
+	if n < 0 {
+		return 0, fmt.Errorf("%s must not be negative, got %q", key, raw)
+	}
+	return n, nil
 }

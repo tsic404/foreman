@@ -31,6 +31,15 @@ type Metrics interface {
 	// task's claim to the delivery commit (§9.2
 	// foreman_delivery_latency_seconds).
 	DeliveryLatency(seconds float64)
+	// SkillCache records one skill-bundle resolve by result (§9.2
+	// foreman_skill_cache_resolves_total): one of the SkillResult values.
+	SkillCache(result string)
+	// SkillCacheSize sets the store's entry and byte gauges (§9.2 条目数与
+	// 字节量).
+	SkillCacheSize(entries int, bytes int64)
+	// SkillCacheEviction counts one reclaimed entry by reason: one of the
+	// SkillEvict values (§9.2 回收计数).
+	SkillCacheEviction(reason string)
 }
 
 // EndpointAgentAPI is the foreman_forward_total endpoint label for S29
@@ -67,6 +76,9 @@ func (noopMetrics) WSReconnect(string)                 {}
 func (noopMetrics) ModelCatalogRelay(string, float64)  {}
 func (noopMetrics) DeliveryClaim(string)               {}
 func (noopMetrics) DeliveryLatency(float64)            {}
+func (noopMetrics) SkillCache(string)                  {}
+func (noopMetrics) SkillCacheSize(int, int64)          {}
+func (noopMetrics) SkillCacheEviction(string)          {}
 
 func orNoopMetrics(m Metrics) Metrics {
 	if m == nil {
