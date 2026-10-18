@@ -119,8 +119,10 @@ platform. Whichever image ends up as `FOREMAN_JOB_IMAGE` must carry:
   base has all of them.
 
 `docs/03-contracts.md` §5.3 requires those contents, and §5.4 carries them as
-deployer constraints; the Job-image workflow's smoke step asserts them on the
-published image, both platforms.
+deployer constraints. The release workflows only build and push: checking what a
+published image contains is the design's acceptance face (`test-cases/job-template.md`
+TC-tech-job-08 for the contents, TC-tech-provenance-01 for the CLI provenance),
+run by QA against the image — not a post-push step in CI.
 
 The Job image is referenced by a **movable tag** in two places that carry the
 same literal (ADR-012):
@@ -140,9 +142,9 @@ set `imagePullPolicy: IfNotPresent` in the job template (§Job template below)
 and accepts that a moved tag then skips cached nodes. `foreman-gc` pulls
 `Always` for the same reason.
 
-CI publishes each run's references and digests (the `release-<image>-<version>`
-artifact and the workflow summary) as the run's own record — nothing in
-`deploy/` is backfilled from it.
+CI publishes each run's references (the `release-<image>-<version>` artifact and
+the workflow summary) as the run's own record — nothing in `deploy/` is
+backfilled from it.
 
 Local builds are for development and staging clusters, never the release path:
 `make build-job-image` builds one platform's image (`linux/$(ARCH)`, the host
@@ -156,36 +158,13 @@ make build-job-image \
   MULTICA_CLI_SHA256=<sha256 from that release's checksums.txt>
 ```
 
-What CI verifies about a published image is reproducible with the container CLI
-alone:
-
-```bash
-# both platforms in the manifest list, each with its own digest
-docker buildx imagetools inspect ghcr.io/tsic404/foreman-job:latest
-# the daemon version the image carries (the version tag it should be published
-# under)
-docker run --rm --platform linux/amd64 --entrypoint multica ghcr.io/tsic404/foreman-job:latest --version
-# the other platform's config, read without executing it (no emulation)
-cid=$(docker create --platform linux/arm64 ghcr.io/tsic404/foreman-job:latest /bin/true)
-docker cp "$cid:/usr/local/bin/multica" ./multica && sha256sum ./multica
-docker rm "$cid"
-```
-
-The Job-image workflow's smoke step asserts, **per platform** (inside one
-`for arch in amd64 arm64` loop): exactly two platform manifests, each with a
-digest; the tag still resolving to the digest that run published; `multica`
-matching the upstream release archive member, with the binary's self-reported
-version equal to the tag; `foreman-gc` present and executable; `/usr/bin/dumb-init`
-present and executable; `/usr/local/bin/omp` and `/usr/bin/nix` absent
-(ADR-031); the shell plus the download/checksum tools the reference template's
-init step uses (`sh`, `cp`, `chmod`, `chown`, `wget`, `uname`, `sha256sum`); and
-the C++ runtime that template-installed `omp` links. The scheduler workflow
-asserts the same manifest shape and that `foreman` is static and built for the
-platform whose config carries it.
-
-One assertion §5.3's contents list implies is **not** in either step: the
-image's `CMD` empty. It belongs to the build/publish surface (CI/ops), and the
-workflows never run on a pull request — so a PR cannot carry its result.
+Verification is not part of the release path: the workflows resolve the version,
+build the multi-platform image and push it, and that is all. What the published
+image contains is checked by the design's acceptance cases against the image
+(TC-tech-job-08 / TC-tech-provenance-01), which is where the contents and
+provenance assertions live. The release record reflects the push command's exit
+code only — a non-zero exit does not prove that nothing landed, so check the
+registry before re-running.
 
 ## Node-local state
 

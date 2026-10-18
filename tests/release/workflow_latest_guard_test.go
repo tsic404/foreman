@@ -287,16 +287,12 @@ func runPublish(t *testing.T, script, cwd string, env map[string]string) string 
 	t.Helper()
 	dir := t.TempDir()
 	log := filepath.Join(dir, "docker.log")
+	// The publish step only builds and pushes now: nothing reads the registry
+	// back, so the stub only records the buildx arguments.
 	stub(t, dir, "docker", `#!/bin/sh
 if [ "$1 $2" = "buildx build" ]; then
   shift 2
   echo "BUILD $*" >> "$STUB_DOCKER_LOG"
-  exit 0
-fi
-if [ "$1 $2" = "buildx imagetools" ]; then
-  # a digest, so the step's own "did the push land" check passes
-  printf 'sha256:'; printf '%064d' 0; printf '\n'
-  exit 0
 fi
 exit 0
 `)

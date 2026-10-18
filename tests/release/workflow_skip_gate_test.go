@@ -23,12 +23,10 @@ func TestJobImageSkipsPublishedVersions(t *testing.T) {
 	gate := requireStep(t, steps, "Skip an already-published version", foremanJobWorkflow)
 	publish := requireStep(t, steps, "Build and push the image", foremanJobWorkflow)
 
-	// Everything that would build, push or verify must hang off the gate.
+	// Everything that would build or push must hang off the gate.
 	downstream := []string{
 		"Build the per-platform binary",
 		"Build and push the image",
-		"Verify the published manifest",
-		"Smoke the published image",
 	}
 	for _, name := range downstream {
 		step := requireStep(t, steps, name, foremanJobWorkflow)
