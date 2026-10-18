@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tsic404/foreman/internal/auth"
@@ -43,6 +44,12 @@ type FakeServer struct {
 	metrics Metrics
 	log     *slog.Logger
 	mux     *http.ServeMux
+
+	// legacyClaimMu guards legacyClaimed: the per-entry dedup of the legacy
+	// claim fallback event. The set lives for the process lifetime — the
+	// contract scopes the dedup there (ADR-042), so it is never evicted.
+	legacyClaimMu sync.Mutex
+	legacyClaimed map[string]struct{}
 }
 
 // FakeServerOption customizes a FakeServer.
@@ -52,6 +59,11 @@ type FakeServerOption func(*FakeServer)
 // S4/S5/S19/S27 answer a probe token (§1.2 规则 1 的探针分支).
 func WithProbeRegistry(probes *registry.ProbeRegistry) FakeServerOption {
 	return func(s *FakeServer) { s.probes = probes }
+}
+
+// WithServerLogger overrides the fake server's logger (tests).
+func WithServerLogger(l *slog.Logger) FakeServerOption {
+	return func(s *FakeServer) { s.log = l }
 }
 
 // NewFakeServer builds the handler with the full §1.2 routing table.
@@ -67,6 +79,8 @@ func NewFakeServer(issuer *auth.Issuer, reg *registry.Registry, sched TaskSchedu
 		metrics: orNoopMetrics(metrics),
 		log:     slog.Default().With("component", "fake-server"),
 		mux:     http.NewServeMux(),
+
+		legacyClaimed: make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -87,6 +101,7 @@ func (s *FakeServer) routes() {
 	m.HandleFunc("POST /api/daemon/heartbeat", s.handleHeartbeat)                                                // S5
 	m.HandleFunc("POST /api/daemon/deregister", s.handleDeregister)                                              // S19
 	m.HandleFunc("POST /api/daemon/tasks/claim", s.handleClaim)                                                  // S6
+	m.HandleFunc("POST /api/daemon/runtimes/{rid}/tasks/claim", s.handleLegacyClaim)                             // S32 (no delivery face, ADR-042)
 	m.HandleFunc("GET /api/daemon/tasks/{tid}/status", s.handleTaskStatus)                                       // S9
 	m.HandleFunc("GET /api/daemon/tasks/{tid}/gc-check", s.handleTaskGCCheck)                                    // S20
 	m.HandleFunc("POST /api/daemon/tasks/{tid}/start", s.reportHandler(scheduler.EPStart))                       // S8
@@ -233,6 +248,40 @@ func (s *FakeServer) handleNotFound(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeError(w, http.StatusNotFound, "not found")
+}
+
+// handleLegacyClaim is the per-runtime claim fallback (S32). The path stays a
+// 404 — it carries no delivery face — but a task daemon asking here is the only
+// observable signal that it switched off the batch path, so its first request
+// per entry is recorded (ADR-042).
+func (s *FakeServer) handleLegacyClaim(w http.ResponseWriter, r *http.Request) {
+	claims, ok := s.authenticate(w, r, auth.RequestScope{RuntimeID: r.PathValue("rid")})
+	if !ok {
+		return
+	}
+	if claims.Role != catalogProbeRole {
+		if e, found := s.reg.ByDaemon(claims.JobName); found && s.noteLegacyClaim(e) {
+			s.log.Warn("task.legacy_claim_request",
+				"task_id", e.TaskID, "job_name", e.JobName,
+				"daemon_id", e.DaemonID, "job_runtime_id", e.JobRuntimeID)
+		}
+	}
+	writeError(w, http.StatusNotFound, "not found")
+}
+
+// noteLegacyClaim records the first legacy-claim request for an entry instance.
+// The key pairs the task id with the claim stamp: a re-dispatched task reuses
+// the daemon identity by design, so the entry's start is what marks a new
+// instance. The set lives for the process lifetime (ADR-042).
+func (s *FakeServer) noteLegacyClaim(e registry.TaskEntry) bool {
+	key := e.TaskID + "\x00" + e.ClaimedAt.UTC().Format(time.RFC3339Nano)
+	s.legacyClaimMu.Lock()
+	defer s.legacyClaimMu.Unlock()
+	if _, seen := s.legacyClaimed[key]; seen {
+		return false
+	}
+	s.legacyClaimed[key] = struct{}{}
+	return true
 }
 
 // jobLookup adapts the registry to auth.JobLookup.

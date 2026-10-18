@@ -274,6 +274,16 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 	// is the re-delivery the expired window released — while the window test
 	// itself stays in the registry's gate (one clock, one decision).
 	pending, pendingOK := s.reg.ByDaemon(req.DaemonID)
+	if pendingOK {
+		// Every listed runtime must be this Job's own (S6 归属判据): one
+		// foreign value refuses the batch even beside the Job's own id.
+		for _, rid := range req.RuntimeIDs {
+			if rid != pending.JobRuntimeID {
+				writeError(w, http.StatusForbidden, "runtime does not belong to this job")
+				return
+			}
+		}
+	}
 	unconfirmed := pendingOK && pending.DeliveryUnconfirmed(s.reg.Now())
 	tasks, err := s.sched.Deliver(req.DaemonID, runtimeID, req.MaxTasks)
 	if err != nil {
