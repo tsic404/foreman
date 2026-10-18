@@ -63,7 +63,7 @@ Two images come from this repo (`docs/04-architecture.md` §部署/运行方式)
 scheduler image for the Deployment, and the Job image (upstream multica CLI +
 `foreman-gc` + `dumb-init`) that both the Job pods and the `foreman-gc`
 DaemonSet run. Neither image carries an agent backend: the Job template's init
-step installs `omp` into every Job at start-up (ADR-031), which is why the
+step installs `omp` into every Job at start-up (ADR-033), which is why the
 shipped template mounts it at the `MULTICA_OMP_PATH` the daemon reads. Both are
 published as **multi-platform manifest lists** (`linux/amd64` + `linux/arm64`),
 so a cluster with nodes of both architectures pulls the platform each node runs;
@@ -258,7 +258,7 @@ the reference template has the placeholder in every container it declares
 (`agent`, `omp`, `prepare`).
 
 **The template also provides the agent backend.** The Job image carries no
-`omp` (ADR-031), so the shipped reference template's `omp` init container
+`omp` (ADR-033), so the shipped reference template's `omp` init container
 fetches the architecture's musl build from upstream's newest release, verifies
 it against that release's `SHA256SUMS.txt`, and leaves it where the agent
 container mounts it as the `MULTICA_OMP_PATH` file. A deployer's own template

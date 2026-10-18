@@ -22,7 +22,7 @@ BASE_IMAGE ?= alpine:3.20
 # the release archive and checked against the SHA-256 from that release's
 # checksum manifest. CI resolves both platforms itself; a local build passes the
 # pair for $(ARCH). The agent backend `omp` is not an image input — the Job
-# template installs it at start-up (ADR-031).
+# template installs it at start-up (ADR-033).
 MULTICA_CLI_URL ?=
 MULTICA_CLI_SHA256 ?=
 
@@ -55,7 +55,7 @@ build-foreman-image:
 		-t $(FOREMAN_IMAGE) $(BIN_DIR)
 
 # Job image: the upstream daemon CLI plus foreman-gc (the DaemonSet runs this
-# same image) — no omp and no nix (ADR-031; the Job template's init step
+# same image) — no omp and no nix (ADR-033; the Job template's init step
 # installs the agent binary). Tagged as $(JOB_IMAGE), referenced by movable tag;
 # in CI its version tag is the carried daemon version.
 build-job-image:
