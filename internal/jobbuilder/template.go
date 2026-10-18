@@ -290,6 +290,8 @@ type placeholderValues struct {
 	agentName string
 }
 
+// replacement resolves every registered placeholder for one task: the task
+// render consumes the whole registry (§8.3).
 func (v placeholderValues) replacement(placeholder string) string {
 	switch placeholder {
 	case placeholderTaskID:
@@ -323,10 +325,18 @@ func (v placeholderValues) replacement(placeholder string) string {
 	}
 }
 
+// substitution resolves the registered placeholders for one render. Both render
+// paths feed the one engine: a render that does not consume a placeholder
+// returns the literal itself, so the walk leaves it verbatim instead of
+// inventing a value it has none for.
+type substitution interface {
+	replacement(placeholder string) string
+}
+
 // substituteValue rewrites the registered placeholders in every string value
 // of the template — map values and list elements alike (§8.3: substring
 // matching over the whole object's string values).
-func substituteValue(node any, v placeholderValues) any {
+func substituteValue(node any, v substitution) any {
 	switch value := node.(type) {
 	case map[string]any:
 		for key, child := range value {
@@ -350,7 +360,7 @@ func substituteValue(node any, v placeholderValues) any {
 // recognition site only, so a template that writes it elsewhere keeps it
 // verbatim — the apiserver, not this walk, is what refuses such a position
 // (§8.3's failure face).
-func substituteString(value string, v placeholderValues) string {
+func substituteString(value string, v substitution) string {
 	if !strings.Contains(value, "<") {
 		return value
 	}

@@ -16,9 +16,10 @@ const (
 	// testProbeRuntime is the probe's own job runtime id: the value
 	// <job runtime uuid> takes in a probe render.
 	testProbeRuntime = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
-	// testProbeImage carries "foreman-job" inside the reference: a probe render
-	// renames that literal everywhere it appears *before* the image value lands,
-	// so the reference must come back intact (AC-13's shape rule).
+	// testProbeImage carries "foreman-job" inside the reference: the renames
+	// write only their declared faces (container command and arguments, mount
+	// paths, volume Secret references) and a container's image is none of them,
+	// so the reference must come back verbatim.
 	testProbeImage = "ghcr.io/tsic404/foreman-job:v0.1.0"
 	// testWorkspaceID is the workspace a probe token is scoped to.
 	testWorkspaceID = "c20ff019-2980-4936-8cb0-22d79d694e71"
@@ -215,7 +216,8 @@ func TestBuildCatalogProbeTemplateRender(t *testing.T) {
 		t.Errorf("heartbeat key appears %d times, want one", heartbeats)
 	}
 
-	// A1.4 ④: the two task-side literals are renamed across the whole object.
+	// A1.4 ④: the profile literal is renamed on its faces — the daemon's start
+	// arguments and the mount path the profile directory sits at.
 	if got := strings.Join(daemon.Args, " "); !strings.Contains(got, "--profile foreman-catalog") {
 		t.Errorf("daemon args = %q, want the probe profile", got)
 	}
@@ -251,6 +253,129 @@ func TestBuildCatalogProbeTemplateRender(t *testing.T) {
 	if *job.Spec.ActiveDeadlineSeconds != int64(budget/time.Second) || *job.Spec.TTLSecondsAfterFinished != 600 {
 		t.Errorf("deadline/ttl = %d/%d, want the budget %d and the template's 600",
 			*job.Spec.ActiveDeadlineSeconds, *job.Spec.TTLSecondsAfterFinished, int64(budget/time.Second))
+	}
+}
+
+// probeLiteralTemplate is the shape the whole-object literal rename corrupted: a
+// deployment template that carries its own image references (the published
+// repository name reads "foreman-job") and expresses the profile and the
+// credential as their task-side literals. A probe render may differ from it on
+// the faces A1.4 ④ declares and nowhere else.
+const probeLiteralTemplate = `
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fm-<task_id>
+  labels: { cost-center: foreman-job }
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels: { cost-center: foreman-job }
+    spec:
+      restartPolicy: Never
+      imagePullSecrets:
+        - { name: foreman-job-pull }
+      initContainers:
+        - name: prepare
+          image: ghcr.io/tsic404/foreman-job:v0.1.0
+          command: ["/bin/sh", "-ec"]
+          args: ["install -d /home/agent/.multica/profiles/foreman-job"]
+          volumeMounts:
+            - { name: home, mountPath: /home/agent }
+      containers:
+        - name: agent
+          image: ghcr.io/tsic404/foreman-job:v0.1.0
+          command: ["/usr/bin/dumb-init", "--", "/usr/local/bin/multica"]
+          args: ["daemon", "start", "--foreground", "--profile", "foreman-job"]
+          env:
+            - { name: MULTICA_AGENT_RUNTIME_NAME, value: "foreman-job" }
+            - { name: MULTICA_SERVER_URL, value: "http://somewhere-else:1234" }
+          volumeMounts:
+            - { name: cred, mountPath: /home/agent/.multica/profiles/foreman-job/config.json, subPath: config.json, readOnly: true }
+        - name: relay
+          image: ghcr.io/tsic404/foreman-job:v0.1.0
+          command: ["/bin/sh", "-ec", "exec multica daemon start --foreground --profile foreman-job"]
+          volumeMounts:
+            - { name: home, mountPath: /home/agent }
+      volumes:
+        - name: home
+          hostPath: { path: /var/lib/foreman/home, type: DirectoryOrCreate }
+        - name: cred
+          emptyDir: { sizeLimit: 16Mi }
+        - name: cred-src
+          secret: { secretName: fm-<task_id>-cred, defaultMode: 0400 }
+        - name: projected-creds
+          projected:
+            sources:
+              - secret: { name: fm-<task_id>-cred }
+`
+
+// TestBuildCatalogProbeKeepsTemplateLiterals (AC-13's shape rule, AC-32): the
+// two probe literals are renamed only on the faces A1.4 ④ declares, so a
+// template's own image references — and every other position off those faces —
+// reach the probe Job verbatim. A whole-object rename would turn the repository
+// name into the probe profile's and the probe would pull an image that does not
+// exist.
+func TestBuildCatalogProbeKeepsTemplateLiterals(t *testing.T) {
+	const literalImage = "ghcr.io/tsic404/foreman-job:v0.1.0"
+
+	cfg, _ := templateConfig(t, probeLiteralTemplate)
+	cfg.JobImage = testProbeImage
+	job, _, _, _ := mustBuildProbe(t, cfg, testRequestID, testProbeRuntime, testWorkspaceID, time.Minute)
+	podSpec := job.Spec.Template.Spec
+
+	for _, container := range podSpec.InitContainers {
+		if container.Image != literalImage {
+			t.Errorf("init container %q image = %q, want the template's verbatim %q",
+				container.Name, container.Image, literalImage)
+		}
+	}
+	for _, container := range podSpec.Containers {
+		if container.Image != literalImage {
+			t.Errorf("container %q image = %q, want the template's verbatim %q",
+				container.Name, container.Image, literalImage)
+		}
+	}
+	if len(podSpec.ImagePullSecrets) != 1 || podSpec.ImagePullSecrets[0].Name != "foreman-job-pull" {
+		t.Errorf("imagePullSecrets = %v, want the template's own pull credential", podSpec.ImagePullSecrets)
+	}
+
+	// The profile face: the daemon's start line and the mount path beside it.
+	daemon := podSpec.Containers[0]
+	if got := strings.Join(daemon.Args, " "); !strings.Contains(got, "--profile foreman-catalog") {
+		t.Errorf("daemon args = %q, want the probe profile", got)
+	}
+	if got := strings.Join(podSpec.Containers[1].Command, " "); !strings.Contains(got, "--profile foreman-catalog") {
+		t.Errorf("relay command = %q, want the probe profile", got)
+	}
+	if got := strings.Join(podSpec.InitContainers[0].Args, " "); !strings.Contains(got, "profiles/foreman-catalog") {
+		t.Errorf("prepare args = %q, want the probe profile directory", got)
+	}
+	if got := mountPathByName(t, daemon.VolumeMounts, "cred"); got != "/home/agent/.multica/profiles/foreman-catalog/config.json" {
+		t.Errorf("cred mount = %q, want the probe profile path", got)
+	}
+
+	// The credential face: every Secret reference a volume carries.
+	credSrc := volumeByName(t, podSpec.Volumes, "cred-src")
+	if credSrc.Secret == nil || credSrc.Secret.SecretName != testProbeName+"-cred" {
+		t.Errorf("cred-src = %+v, want the probe's Secret", credSrc.VolumeSource)
+	}
+	projected := volumeByName(t, podSpec.Volumes, "projected-creds")
+	if len(projected.Projected.Sources) != 1 || projected.Projected.Sources[0].Secret.Name != testProbeName+"-cred" {
+		t.Errorf("projected-creds = %+v, want the probe's Secret", projected.VolumeSource)
+	}
+
+	// Off the face the template's own text survives: the runtime name env value
+	// and the deployer's labels are the template's, not the probe's.
+	if got := envByName(t, daemon.Env, "MULTICA_AGENT_RUNTIME_NAME").Value; got != "foreman-job" {
+		t.Errorf("MULTICA_AGENT_RUNTIME_NAME = %q, want the template's own %q", got, "foreman-job")
+	}
+	if got := job.Labels["cost-center"]; got != "foreman-job" {
+		t.Errorf("job label cost-center = %q, want the template's own %q", got, "foreman-job")
+	}
+	if got := job.Spec.Template.Labels["cost-center"]; got != "foreman-job" {
+		t.Errorf("pod label cost-center = %q, want the template's own %q", got, "foreman-job")
 	}
 }
 

@@ -363,8 +363,14 @@ Foreman declares to the server; it also doubles as the template preflight.
 - **Template duty**: the probe needs its own credential and profile, so a
   template must express them with the two literals Foreman rewrites —
   profile `foreman-job` → `foreman-catalog`, Secret `fm-<task_id>-cred` →
-  `fm-catalog-<request_id>-cred`. A template that does not means the probe
-  cannot authenticate, so startup exits non-zero (visible, not silent).
+  `fm-catalog-<request_id>-cred`. The rewrite reaches the profile where the
+  template expresses it (each container's command line and the mount path the
+  profile directory sits at) and the Secret where the token reaches that
+  directory (the Secret references a pod volume carries). Every other position
+  keeps the template's own text — an image reference reading `foreman-job`, the
+  pull credential beside it, any env value or label. A template that does not
+  express the two faces means the probe cannot authenticate, so startup exits
+  non-zero (visible, not silent).
 - **Credential duty**: the probe's Job Token sits in the template-shaped pod and
   the template's own processes can read it — do not add a process to the probe
   that must not hold it (same rule as the task Jobs).
