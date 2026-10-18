@@ -1,12 +1,12 @@
 package scheduler
 
 // Endpoint identifies a task lifecycle callback forwarded to the server
-// (contract §2). The full routing table lives in the proxy module; the enum
+// (§2.2). The full routing table lives in the proxy module; the enum
 // is shared so scheduler and recovery can name endpoints without importing
 // protocol details.
 type Endpoint string
 
-// Task lifecycle endpoints (contract §2, exhaustive).
+// Task lifecycle endpoints (§2.2, exhaustive).
 const (
 	EPStart        Endpoint = "start"
 	EPProgress     Endpoint = "progress"

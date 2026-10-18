@@ -1,4 +1,4 @@
-# Publish the scheduler image (04-architecture.md §部署/运行方式):
+# Publish the scheduler image:
 # `foreman:<version>` (+ `latest`) for the Deployment, as a multi-platform
 # manifest list (linux/amd64 + linux/arm64), so a mixed-architecture cluster
 # pulls the platform its node runs.

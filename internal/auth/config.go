@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Environment variable names from the contract config table.
+// Environment variable names of the auth module.
 const (
 	EnvJobTokenKey     = "FOREMAN_JOB_TOKEN_KEY"
 	EnvJobTokenTTL     = "FOREMAN_JOB_TOKEN_TTL"
@@ -18,8 +18,8 @@ const (
 )
 
 const (
-	// DefaultJobTokenTTL matches the contract default (24h7m = 300s boot +
-	// 86400s task + 120s drain, §5.1): the token covers claim → Job boot →
+	// DefaultJobTokenTTL matches the design's TTL floor (24h7m = 300s boot +
+	// 86400s task + 120s drain, §6.1): the token covers claim → Job boot →
 	// task → the drain window that follows the task's verdict (ADR-017).
 	DefaultJobTokenTTL = 24*time.Hour + 7*time.Minute
 	// DefaultTaskMaxDuration matches the contract default (86400s).
@@ -95,7 +95,7 @@ func (c Config) Validate() error {
 }
 
 // ValidateTokenBudget runs the startup self-check of the credential budget
-// (contract §5.1): the Job Token must outlive the whole Job, i.e.
+// (§6.1): the Job Token must outlive the whole Job, i.e.
 //
 //	FOREMAN_JOB_TOKEN_TTL >= boot + task + drain
 //

@@ -1,14 +1,15 @@
 #!/bin/sh
-# Bind the test agent to the runtime Foreman registers, and create the §3
+# Bind the test agent to the runtime Foreman registers, and create the test
 # autopilot that hangs off it — the last step of the environment setup
-# (test-cases/_infra/test-multica-cluster.md §3).
+# (`README.md`).
 #
 #   ./bind-agent.sh [--wait SECONDS]     # default: wait up to 180s
 #
-# Why a separate step: the reset entry leaves the agent unbound, because §2's
-# self-check ② requires an empty runtime list *before* the instance starts,
-# while §3 requires the agent's runtime to be the one Foreman registers. The
-# two are only both true if the binding happens after registration.
+# Why a separate step: the reset entry leaves the agent unbound, because the
+# environment gate's ② requires an empty runtime list *before* the instance
+# starts, while the test objects require the agent's runtime to be the one
+# Foreman registers. The two are only both true if the binding happens after
+# registration.
 #
 # The autopilot is created here for the same reason: the server refuses an
 # autopilot whose assignee agent has no runtime, so it cannot be part of the
@@ -70,9 +71,9 @@ bound=$(wsapi GET "/api/agents/$agent" | jq -r '.runtime_id // ""')
 [ "$bound" = "$runtime" ] || die "binding did not take effect (agent runtime_id=$bound)"
 info "bound agent $AGENT_NAME ($agent) to runtime $name ($runtime)"
 
-# §3 可手动触发的 autopilot (`./multica-test autopilot trigger <id>`). Created
-# now that the assignee has a runtime; an autopilot left over from an earlier
-# round is re-pointed at the current agent and re-activated.
+# The 可手动触发的 autopilot (`./multica-test autopilot trigger <id>`).
+# Created now that the assignee has a runtime; an autopilot left over from an
+# earlier round is re-pointed at the current agent and re-activated.
 id=$(wsapi GET /api/autopilots |
 	jq -r --arg title "$AUTOPILOT_TITLE" '[.autopilots[] | select(.title == $title)][0].id // ""')
 if [ -z "$id" ]; then

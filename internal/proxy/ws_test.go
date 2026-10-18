@@ -78,7 +78,7 @@ func TestWSHandlerHandshakeAuth(t *testing.T) {
 	if err == nil || resp == nil || resp.StatusCode != 401 {
 		t.Errorf("no token: err=%v status=%v, want 401", err, resp.StatusCode)
 	}
-	// Non-fmj_ credential: the routing rules (§1.2 rule 2) are
+	// Non-fmj_ credential: the routing rules (§2.1 rule 2) are
 	// credential-based, so the request passes through to the real server
 	// verbatim rather than being handled by the local WS endpoint.
 	rig.stub.on("GET", "/api/daemon/ws", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
@@ -133,7 +133,7 @@ func TestWSHandlerHeartbeatAckPinned(t *testing.T) {
 	if ack.Type != FrameDaemonHeartbeatAck {
 		t.Fatalf("ack type = %s", ack.Type)
 	}
-	// The ack payload is pinned: exactly runtime_id + status=ok (§1.2 S30).
+	// The ack payload is pinned: exactly runtime_id + status=ok (S-30).
 	var payload map[string]string
 	if err := json.Unmarshal(ack.Payload, &payload); err != nil {
 		t.Fatalf("ack payload: %v", err)
@@ -313,7 +313,7 @@ func TestWSSubscriberLifecycle(t *testing.T) {
 	go func() { _ = sub.Run(ctx) }()
 
 	// C1 runs before the WS dial (ADR-010 startup order) and runtime_ids is
-	// the real runtime id (mandatory, §1.1 C20).
+	// the real runtime id (mandatory, C-20).
 	waitFor(t, "ws dial", func() bool { return stub.dialCount() == 1 })
 	waitFor(t, "ws.connected", func() bool { return metrics.wsCount(WSSideServer) == 1 })
 	stub.mu.Lock()
@@ -331,14 +331,14 @@ func TestWSSubscriberLifecycle(t *testing.T) {
 		t.Fatal("task_available did not wake the claim loop")
 	}
 
-	// A dropped connection reconnects with backoff (§4/ADR-010).
+	// A dropped connection reconnects with backoff (§1.5/ADR-010).
 	stub.closeConn()
 	waitFor(t, "ws reconnect", func() bool { return stub.dialCount() >= 2 })
 	waitFor(t, "ws.reconnect metric", func() bool { return metrics.reconnectCount(WSSideServer) >= 1 })
 }
 
 // TestWSSubscriberHandshake404BacksOff: a persistent handshake 404 must not
-// spin a re-registration storm — the subscriber waits out the §4 backoff.
+// spin a re-registration storm — the subscriber waits out the §1.5 backoff.
 func TestWSSubscriberHandshake404BacksOff(t *testing.T) {
 	var dials atomic.Int32
 	mux := http.NewServeMux()
@@ -372,7 +372,7 @@ func TestWSSubscriberHandshake404BacksOff(t *testing.T) {
 }
 
 // TestWSSubscriberDialTimeout: a peer that accepts TCP but never answers
-// the upgrade must not wedge the subscriber (§4 control-plane timeout).
+// the upgrade must not wedge the subscriber (§1.5 control-plane timeout).
 func TestWSSubscriberDialTimeout(t *testing.T) {
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -643,7 +643,7 @@ func TestWSSubscriberKeepsOneConnectionPerRuntimeOnIDMove(t *testing.T) {
 	})
 	time.Sleep(200 * time.Millisecond)
 	if live := stub.liveConnections(); live != 1 {
-		t.Fatalf("live connections = %d, want exactly one per provider (§1.1 C20)", live)
+		t.Fatalf("live connections = %d, want exactly one per provider (§1.2 C-20)", live)
 	}
 	if peak := stub.peakConnections(); peak != 1 {
 		t.Fatalf("peak connections = %d, want no overlap between the old and the new stream", peak)
@@ -655,7 +655,7 @@ func TestWSSubscriberKeepsOneConnectionPerRuntimeOnIDMove(t *testing.T) {
 }
 
 // TestWSSubscriberRateLimitsRepeatedIDMoves pins finding #2: when the id moves
-// on every register, the retire path takes the same §4 rate limit and budget as
+// on every register, the retire path takes the same §1.5 rate limit and budget as
 // the stale path instead of dialing + registering at RTT speed.
 func TestWSSubscriberRateLimitsRepeatedIDMoves(t *testing.T) {
 	srv, stub := newWSGoneStub(t, "rid-real")
@@ -759,7 +759,7 @@ func (m *gateMetrics) WSDisconnect(side string) {
 // an outcome names the stream *instance*, never its (provider, id). When an id
 // moves away and back (A→B→A) the replaced stream still names id A, and a
 // (provider, id) match would unregister the fresh stream for A, drop its cancel
-// and leave the provider with a second, unreclaimable connection (§1.1 C20).
+// and leave the provider with a second, unreclaimable connection (C-20).
 func TestWSSubscriberKeepsOneConnectionWhenTheIDComesBack(t *testing.T) {
 	srv, stub := newWSGoneStub(t, "rid-a")
 	stub.setAccept(true)
@@ -812,7 +812,7 @@ func TestWSSubscriberKeepsOneConnectionWhenTheIDComesBack(t *testing.T) {
 	close(gate.release)
 	time.Sleep(300 * time.Millisecond)
 	if live := stub.liveConnections(); live != 1 {
-		t.Fatalf("live connections = %d, want exactly one per provider (§1.1 C20)", live)
+		t.Fatalf("live connections = %d, want exactly one per provider (§1.2 C-20)", live)
 	}
 	if got := dials(); len(got) != 3 {
 		t.Fatalf("dials = %v, want one per id move and no stacked stream", got)
@@ -871,7 +871,7 @@ func TestWSSubscriberResetsTheStaleBudgetOnAHealthyConnection(t *testing.T) {
 }
 
 // TestCancelledStreamDoesNotSpendTheRuntimeProgression pins who owns the shared
-// §4 progression: a stream that was replaced (its ctx cancelled) is gone, so
+// §1.5 progression: a stream that was replaced (its ctx cancelled) is gone, so
 // the next dial's wait must still be the progression's first step — it belongs
 // to the replacement, not to the dead stream.
 func TestCancelledStreamDoesNotSpendTheRuntimeProgression(t *testing.T) {

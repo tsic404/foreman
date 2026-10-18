@@ -10,7 +10,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus/promhttp"
 )
 
-// Metric names and label vocabularies (observability.md §指标). Labels are
+// Metric names and label vocabularies (§9.2). Labels are
 // limited to the listed dimensions — task_id/issue_id/job_name/node_name
 // are forbidden as labels (cardinality discipline); use logs to locate a
 // task.
@@ -43,14 +43,14 @@ const (
 	metricModelCatalogSecond = "foreman_model_catalog_seconds"
 )
 
-// Terminal result label values (contract §3.1).
+// Terminal result label values (§4.1).
 const (
 	ResultCompleted = "completed"
 	ResultFailed    = "failed"
 	ResultCancelled = "cancelled"
 )
 
-// Forward endpoint label values (observability.md §指标); the proxy's
+// Forward endpoint label values (§9.2); the proxy's
 // Endpoint enum maps onto these, "agent-api" is the S29 passthrough.
 const (
 	ForwardAgentAPI = "agent-api"
@@ -98,11 +98,11 @@ var wsSides = []string{"server", "job"}
 
 // modelCatalogCodes is the foreman_model_catalog_relays_total label
 // vocabulary: the C21 status returned to the probe daemon, or "none" when the
-// relay was abandoned (observability.md 指标口径).
+// relay was abandoned (§9.2).
 var modelCatalogCodes = []string{"none", "200", "400", "401", "403", "404", "409", "500", "502", "503"}
 
-// Metrics is the Prometheus implementation of the contract §2 Metrics
-// interface plus the recorders for the remaining designed metrics. It owns
+// Metrics is the Prometheus implementation of the designed metric surface
+// (§9.2) plus the recorders for the remaining designed metrics. It owns
 // a private registry — no global state — so a collector panic is contained
 // by promhttp's recover and never corrupts other modules.
 type Metrics struct {
@@ -286,32 +286,32 @@ func NewMetrics() *Metrics {
 }
 
 // Handler serves the Prometheus text exposition. HTTPErrorOnError maps a
-// collector failure to 500 (observability.md §错误处理).
+// collector failure to 500.
 func (m *Metrics) Handler() http.Handler {
 	return promhttp.HandlerFor(m.reg, promhttp.HandlerOpts{ErrorHandling: promhttp.HTTPErrorOnError})
 }
 
-// TaskClaimed counts a successfully claimed task (contract §2).
+// TaskClaimed counts a successfully claimed task (§9.2).
 func (m *Metrics) TaskClaimed() { m.taskClaims.Inc() }
 
-// TaskTerminal counts a settled task by result (contract §2).
+// TaskTerminal counts a settled task by result (§9.2).
 func (m *Metrics) TaskTerminal(result string) { m.tasksTotal.WithLabelValues(result).Inc() }
 
-// JobBootSeconds observes claim -> daemon start latency (contract §2).
+// JobBootSeconds observes claim -> daemon start latency (§9.2).
 func (m *Metrics) JobBootSeconds(seconds float64) { m.jobBootSeconds.Observe(seconds) }
 
-// InflightJobs sets the current non-terminal entry count (contract §2).
+// InflightJobs sets the current non-terminal entry count (§9.2).
 func (m *Metrics) InflightJobs(n int) { m.inflightJobs.Set(float64(n)) }
 
-// TokenUsage accumulates a forwarded usage report (contract §2). The
-// contract signature carries input/output only; cache directions exist in
+// TokenUsage accumulates a forwarded usage report (§9.2). The
+// forwarded report carries input/output only; cache directions exist in
 // the label vocabulary for a future report shape.
 func (m *Metrics) TokenUsage(provider, model string, input, output int64) {
 	m.tokenUsage.WithLabelValues(provider, model, "input").Add(float64(input))
 	m.tokenUsage.WithLabelValues(provider, model, "output").Add(float64(output))
 }
 
-// Forward records one forwarded call's outcome and latency (contract §2).
+// Forward records one forwarded call's outcome and latency (§9.2).
 // endpoint takes the proxy's Endpoint string; "agent-api" for S29.
 func (m *Metrics) Forward(endpoint string, code int, d time.Duration) {
 	m.forwardTotal.WithLabelValues(endpoint, strconv.Itoa(code)).Inc()

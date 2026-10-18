@@ -38,7 +38,7 @@ func HTTPStatus(err error) int {
 }
 
 // Reason returns the metrics label for a Verify error. The vocabulary is
-// closed (observability.md §指标:
+// closed (§9.2:
 // malformed|signature|expired|scope|unknown_job|revoked) — a seventh value
 // would split the counter into an off-contract series. ErrRevoked is the
 // same-name reuse face (the entry came back with a predecessor's token);

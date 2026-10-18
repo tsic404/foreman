@@ -99,7 +99,7 @@ func TestOnBootTimeoutQueuesReportAndKeepsObjects(t *testing.T) {
 	if err := f.sched.OnBootTimeout(context.Background(), "t-boot-fail"); err != nil {
 		t.Fatalf("OnBootTimeout: %v", err)
 	}
-	// Contract §4: the terminal callback is not dropped — it lands in the
+	// §10: the terminal callback is not dropped — it lands in the
 	// durable queue and the objects stay until a drain delivers it.
 	e, ok := f.reg.Get("t-boot-fail")
 	if !ok || !e.IsTerminal() {
@@ -337,8 +337,8 @@ func TestOnReportNonTerminalTransientMaps502(t *testing.T) {
 	e := f.claim(t, "t-prog500")
 	f.server.forwardCode = 500
 
-	// proxy.md 转发 switch: upstream 5xx/408/429 on a non-terminal endpoint
-	// answers the daemon 502 {"error":"upstream unavailable"}.
+	// Transient upstream failure: upstream 5xx/408/429 on a non-terminal
+	// endpoint answers the daemon 502 {"error":"upstream unavailable"}.
 	code, resp, err := f.sched.OnReport(context.Background(), EPProgress, e, []byte(`{}`))
 	if err != nil {
 		t.Fatalf("OnReport: %v", err)

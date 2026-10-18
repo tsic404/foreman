@@ -20,14 +20,14 @@ import (
 	"github.com/tsic404/foreman/internal/scheduler"
 )
 
-// Client is the fake client: every F→S call of §1.1 (C1–C21). It injects
+// Client is the fake client: every F→S call of §1.2 (C-1–C-21). It injects
 // the daemon identity headers and Foreman's server credential, caches the
 // declared real runtime set, and owns the terminal-forward retry budget.
 type Client struct {
 	cfg     Config
 	token   string
-	ctrl    *http.Client // 30s control plane (§4)
-	lease   *http.Client // 10s prepare-lease (§4)
+	ctrl    *http.Client // 30s control plane (§1.5)
+	lease   *http.Client // 10s prepare-lease (§1.5)
 	pass    *http.Client // S29: same budget, compression negotiation off
 	metrics Metrics
 	log     *slog.Logger
@@ -37,7 +37,7 @@ type Client struct {
 	startup *registry.StartupCatalog
 	slots   *CatalogSlots
 	// taskRuntime resolves the real runtime id a task was dispatched under,
-	// which the S8 body needs (§1.2 S8).
+	// which the S-8 body needs (S-8).
 	taskRuntime func(taskID string) string
 
 	mu           sync.RWMutex
@@ -48,13 +48,13 @@ type Client struct {
 	workspace    string // workspace display name from C17
 
 	// lost records, per provider, that a 404 "runtime not found" proved that
-	// row deleted and its re-register failed (§1.1 failure table); it survives
+	// row deleted and its re-register failed (§1.5); it survives
 	// so the next successful C1 still treats that runtime as rebuilt (C15 +
 	// runtime-set signal) — and only that one.
 	lost map[string]bool
 
-	terminalWaits []time.Duration // §4 terminal retry budget
-	relayWaits    []time.Duration // §1.1 C21 relay budget progression (tests)
+	terminalWaits []time.Duration // §10 terminal retry budget
+	relayWaits    []time.Duration // C-21 relay budget progression (tests)
 
 	changes chan RuntimeChange // runtime set moved → per-runtime WS reconnect
 }
@@ -72,13 +72,13 @@ func WithLogger(l *slog.Logger) Option {
 	return func(c *Client) { c.log = l.With("component", "proxy-client") }
 }
 
-// WithTerminalRetryWaits overrides the §4 terminal retry budget (tests).
+// WithTerminalRetryWaits overrides the §10 terminal retry budget (tests).
 func WithTerminalRetryWaits(waits []time.Duration) Option {
 	return func(c *Client) { c.terminalWaits = waits }
 }
 
-// WithRelayBackoff overrides the §1.1 C21 relay backoff progression (tests);
-// the production progression is the §4 1s→30s one.
+// WithRelayBackoff overrides the C-21 relay backoff progression (tests);
+// the production progression is the §1.5 1s→30s one.
 func WithRelayBackoff(waits []time.Duration) Option {
 	return func(c *Client) { c.relayWaits = waits }
 }
@@ -95,7 +95,7 @@ func NewClient(cfg Config, token string, opts ...Option) *Client {
 			Timeout:   controlTimeout,
 			Transport: passthroughTransport(),
 			// A 3xx is the upstream's answer to hand back verbatim: the caller
-			// decides whether to follow it (proxy.md §S29 已知边界).
+			// decides whether to follow it (§2.4: S-29 已知边界).
 			CheckRedirect: func(*http.Request, []*http.Request) error {
 				return http.ErrUseLastResponse
 			},
@@ -120,7 +120,7 @@ func NewClient(cfg Config, token string, opts ...Option) *Client {
 
 // Registration returns the cached C1 response fields the fake server hands
 // to Job daemons (S2/S4): repos verbatim plus repos_version. Both are empty in
-// the pre-C1 window, which is what S2 must answer then (§1.2 S2).
+// the pre-C1 window, which is what S-2 must answer then (S-2).
 func (c *Client) Registration() (repos json.RawMessage, reposVersion string) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -140,7 +140,7 @@ func (c *Client) Workspace() (id, name string) {
 
 // ---- C1 register (runtime.go) ----
 
-// registerRequest is the C1 body (§1.1; field names strict, type not
+// registerRequest is the C1 body (§1.2; field names strict, type not
 // provider, legacy_daemon_ids empty). failed_profiles travels verbatim from
 // the startup probe's registration body — Foreman never interprets it.
 type registerRequest struct {
@@ -169,7 +169,7 @@ type registerResponse struct {
 	Settings     json.RawMessage `json:"settings"`
 }
 
-// recoverOrphans is C15, called only after a real-runtime rebuild (§1.1).
+// recoverOrphans is C15, called only after a real-runtime rebuild (§1.2).
 func (c *Client) recoverOrphans(ctx context.Context, runtimeID string) {
 	var resp struct {
 		Orphaned int `json:"orphaned"`
@@ -190,10 +190,10 @@ func (c *Client) recoverOrphans(ctx context.Context, runtimeID string) {
 }
 
 // Preflight runs the startup checks: C1 register (unless a live runtime set
-// already exists — the declaration has exactly one trigger per startup, §1.1
-// C1), C17 workspace validation (caches the workspace name for S1), C18
+// already exists — the declaration has exactly one trigger per startup,
+// C-1), C17 workspace validation (caches the workspace name for S1), C18
 // runtime-profiles (404 tolerated), C16 token renew (non-fatal). Callers retry
-// with the §4 backoff.
+// with the §1.5 backoff.
 func (c *Client) Preflight(ctx context.Context) error {
 	if len(c.RuntimeIDs()) == 0 {
 		if err := c.Register(ctx); err != nil {
@@ -214,7 +214,7 @@ func (c *Client) Preflight(ctx context.Context) error {
 
 // ---- C5–C12 lifecycle forward ----
 
-// endpointPath maps a lifecycle endpoint to its §1.1 path suffix.
+// endpointPath maps a lifecycle endpoint to its §1.2 path suffix.
 func endpointPath(ep scheduler.Endpoint, taskID string) string {
 	t := url.PathEscape(taskID)
 	switch ep {
@@ -243,9 +243,9 @@ func endpointPath(ep scheduler.Endpoint, taskID string) string {
 // Forward posts a lifecycle callback (C5–C12) with Foreman's server
 // credential and returns the upstream status and body. S8 is the one
 // callback whose body names a runtime — the daemon names the job runtime it
-// was handed (§1.2 S6), the server knows only the real runtime id its claim
+// was handed (S-6), the server knows only the real runtime id its claim
 // was dispatched under — so the identity is translated exactly as S7
-// translates {rid}. Terminal endpoints carry the §4 retry budget
+// translates {rid}. Terminal endpoints carry the §10 retry budget
 // (4s/8s/16s/32s/64s; 5xx/408/429/network only); exhaustion returns
 // ErrTerminalUndelivered for the PendingReports queue.
 func (c *Client) Forward(ctx context.Context, ep scheduler.Endpoint, taskID string, body []byte) (int, []byte, error) {
@@ -288,8 +288,8 @@ func (c *Client) Forward(ctx context.Context, ep scheduler.Endpoint, taskID stri
 // daemon names the job runtime it was handed at S6, while the server knows
 // only the real runtime id its claim was dispatched under. Forwarded
 // verbatim, the daemon's identity reads as a claim the server no longer
-// holds, and the start is refused (409 状态不允许, §1.2 S8 +
-// 05-modules/proxy.md §转发) — so the field is translated like S7's {rid}.
+// holds, and the start is refused (409 状态不允许, S-8 +
+// §2.2) — so the field is translated like S7's {rid}.
 // The id comes from the task's own dispatch record; a task without one (a
 // rebuilt entry) falls back to the only declared runtime, and a set that is
 // not registered yet leaves the body verbatim. Every other field stays
@@ -337,7 +337,7 @@ func (c *Client) forwardOnce(ctx context.Context, ep scheduler.Endpoint, path st
 
 // ---- S29 passthrough ----
 
-// exclusionFields is the §1.2 exclusion set: the RFC 7230 §6.1 hop-by-hop
+// exclusionFields is the §2.4 exclusion set: the RFC 7230 §6.1 hop-by-hop
 // fields, plus the two the proxy generates for its own connection and body
 // (the target authority as Host, the forwarded body's real length as
 // Content-Length). Every other field travels as the caller gave it.
@@ -354,7 +354,7 @@ var exclusionFields = map[string]bool{
 	"Content-Length":      true,
 }
 
-// forwardableHeader copies a header set minus the §1.2 exclusion set — the
+// forwardableHeader copies a header set minus the §2.4 exclusion set — the
 // fields above plus whatever a Connection value names. Values keep their
 // order and are never merged or dropped beyond that set; field names are
 // written in canonical form (their case is not a fidelity item). This is the
@@ -385,8 +385,8 @@ func forwardableHeader(h http.Header) http.Header {
 }
 
 // callerVisible is the status the caller of S29 ends up seeing: upstream
-// 5xx converges to 502 (§1.2 失败语义), which is also the code the
-// agent-api metric carries (observability.md).
+// 5xx converges to 502 (§2.4), which is also the code the
+// agent-api metric carries (§9.2).
 func callerVisible(upstream int) int {
 	if upstream >= http.StatusInternalServerError {
 		return http.StatusBadGateway
@@ -394,7 +394,7 @@ func callerVisible(upstream int) int {
 	return upstream
 }
 
-// passthroughTransport is the §1.2 transport for S29: compression
+// passthroughTransport is the §2.4 transport for S29: compression
 // negotiation is off, so no Accept-Encoding is invented for a caller that
 // sent none and no upstream-encoded body is transparently decoded. A
 // DefaultTransport that is not an *http.Transport falls back to the same
@@ -418,7 +418,7 @@ func passthroughTransport() http.RoundTripper {
 }
 
 // Passthrough forwards an agent-API call to the real server verbatim
-// (§1.2 rule 2 + ADR-020): method, raw path (EscapedPath, keeping %2F-style
+// (§2.1 rule 2 + ADR-020): method, raw path (EscapedPath, keeping %2F-style
 // segments), raw query (no decode/re-encode), the caller's whole header set
 // and body go out as given; the upstream status, whole header set and body
 // come back as given. The exclusion set is applied here, once;
@@ -449,7 +449,7 @@ func (c *Client) Passthrough(ctx context.Context, method, rawPath, rawQuery stri
 	data, err := io.ReadAll(resp.Body)
 	if err != nil {
 		// A truncated or dropped body is a transport failure: the caller gets
-		// 502, so the agent-api metric records 502 too (observability.md:
+		// 502, so the agent-api metric records 502 too (§9.2:
 		// code = the status returned to the caller).
 		c.metrics.Forward(EndpointAgentAPI, http.StatusBadGateway, time.Since(start))
 		return 0, nil, nil, err
@@ -482,7 +482,7 @@ func (c *Client) TaskStatus(ctx context.Context, taskID string) (string, error) 
 }
 
 // GCCheck forwards the S20 gc-check query to the server verbatim (GC is
-// disabled Job-side, but the endpoint stays truthful if enabled, §1.2 S20).
+// disabled Job-side, but the endpoint stays truthful if enabled, S-20).
 func (c *Client) GCCheck(ctx context.Context, taskID string) (int, []byte, error) {
 	return c.doOnce(ctx, c.ctrl, http.MethodGet, "/api/daemon/tasks/"+url.PathEscape(taskID)+"/gc-check", nil)
 }
@@ -564,7 +564,7 @@ func (c *Client) Workspaces(ctx context.Context) error {
 	return fmt.Errorf("workspace %s not visible to the server token", c.cfg.WorkspaceID)
 }
 
-// RuntimeProfiles is C18; a 404 is tolerated (no custom profiles, §1.1).
+// RuntimeProfiles is C18; a 404 is tolerated (no custom profiles, C-18).
 func (c *Client) RuntimeProfiles(ctx context.Context) error {
 	path := fmt.Sprintf("/api/daemon/workspaces/%s/runtime-profiles", url.PathEscape(c.cfg.WorkspaceID))
 	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodGet, path, nil)
@@ -609,7 +609,7 @@ func (c *Client) doOnce(ctx context.Context, hc *http.Client, method, path strin
 // setHeaders injects the daemon identity (§1.1): the capability string is
 // verbatim and must never gain or lose an entry. X-Client-Version carries the
 // startup discovery's cli_version once C1 has run, Foreman's own version
-// before that (§1.1 C1 的取值来源与声明域).
+// before that (C-1 的取值来源与声明域).
 func (c *Client) setHeaders(req *http.Request, hasBody bool) {
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("X-Client-Platform", "daemon")

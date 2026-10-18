@@ -16,7 +16,7 @@ import (
 	"github.com/tsic404/foreman/internal/registry"
 )
 
-// The two §3.2 keys the read side (registry) does not index: the Job-side app
+// The two A1.2 keys the read side (registry) does not index: the Job-side app
 // name and the pod-side daemon identity. They are asserted as literals, the
 // same way the other rendering TCs assert template keys.
 const (
@@ -88,7 +88,7 @@ func TestOwnership01DomainClearedAndRewritten(t *testing.T) {
 		t.Fatal("entry task-1 missing after the claim")
 	}
 
-	// Job side: the §3.2 set with Foreman's values, the template's same-name
+	// Job side: the A1.2 set with Foreman's values, the template's same-name
 	// values discarded, the deployer's own key kept.
 	wantLabels := map[string]string{
 		labelAppNameOwnership:     "foreman-job",
@@ -189,7 +189,7 @@ func TestOwnership01DomainClearedAndRewritten(t *testing.T) {
 	}
 
 	// The rendered objects carry no empty-string placeholder anywhere in the
-	// domain (§3.2: an empty string is indistinguishable from a lost key).
+	// domain (§8.2 A1.2: an empty string is indistinguishable from a lost key).
 	rendered := canonicalJob(second)
 	for _, key := range []string{
 		registry.AnnoIssueID, registry.AnnoIssueIdentifier,

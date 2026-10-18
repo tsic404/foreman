@@ -14,7 +14,7 @@ import (
 	"github.com/tsic404/foreman/internal/registry"
 )
 
-// ProbeHandle identifies one catalog-probe run (contract §2). Callers hand it
+// ProbeHandle identifies one catalog-probe run. Callers hand it
 // back to AwaitProbeRelayed/DeleteProbe verbatim; they never build or parse it.
 type ProbeHandle struct {
 	RequestID  string // the probe Job name's suffix (C2 ack id, or the minted startup id)
@@ -23,7 +23,7 @@ type ProbeHandle struct {
 }
 
 // Probe failure classes of the startup probe: the reason values are fixed by
-// observability.md and every one has its own observable landing point.
+// §10, and every one has its own observable landing point.
 const (
 	ProbeFailureJobCreateFailed     = "job_create_failed"
 	ProbeFailurePodNotStarted       = "pod_not_started"
@@ -32,11 +32,11 @@ const (
 )
 
 // ErrStartupProbeUnregistered is the fail-fast verdict: no runtime registered
-// inside the startup window, so Foreman must exit non-zero (§1.1 C1, AC-36).
+// inside the startup window, so Foreman must exit non-zero (C-1, AC-36).
 var ErrStartupProbeUnregistered = errors.New("startup probe registered no runtime within the window")
 
 // StartupProbeFailure carries the fixed reason class of a failed startup probe,
-// so the exit line reports the same reason the event does (observability.md
+// so the exit line reports the same reason the event does (§9.1
 // pins the field set and requires the same reason on the exit record).
 type StartupProbeFailure struct {
 	JobName string
@@ -55,26 +55,26 @@ func (e *StartupProbeFailure) Unwrap() error { return ErrStartupProbeUnregistere
 const probePollInterval = 500 * time.Millisecond
 
 // relayPollInterval is how often AwaitProbeRelayed re-reads the session's
-// result face; the wait is a shared-state poll, not a new channel (§2).
+// result face; the wait is a shared-state poll, not a new channel.
 const relayPollInterval = 100 * time.Millisecond
 
 // probePodPollInterval is how often a running probe's pod is inspected for its
-// landing node (the session's node_name producer, §2 ProbeSession).
+// landing node (the session's node_name producer).
 const probePodPollInterval = time.Second
 
 // WithProbeRegistry wires the catalog-probe session table: probe identity,
-// command delivery and result routing all read it (§2 ProbeRegistry).
+// command delivery and result routing all read it.
 func WithProbeRegistry(probes *registry.ProbeRegistry) Option {
 	return func(s *Scheduler) { s.probes = probes }
 }
 
-// probeJobName is the probe Job name of one request id (contract §1.3).
+// probeJobName is the probe Job name of one request id (§3).
 func probeJobName(requestID string) string { return "fm-catalog-" + requestID }
 
 // StartProbe builds one catalog-probe Job: it mints the job runtime id, issues
 // the probe Job Token, writes the session, then creates the Secret and the Job
 // in that fixed order — the session must exist before the pod can register, and
-// the Secret before the Job that mounts it (§2 CatalogProbe).
+// the Secret before the Job that mounts it.
 //
 // realRuntimeID is empty in startup-discovery mode, where the probe's own
 // minted command id (== requestID) is what S5 delivers.
@@ -124,7 +124,7 @@ func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID str
 
 // rollbackProbe removes what StartProbe built so far, in the teardown order
 // (session first, then Secret, then Job); a failed rollback leaves objects for
-// the sweep to find (§2 CatalogProbe).
+// the sweep to find.
 func (s *Scheduler) rollbackProbe(ctx context.Context, h ProbeHandle) {
 	if err := s.DeleteProbe(ctx, h); err != nil {
 		s.log.WarnContext(ctx, "probe rollback incomplete", "job_name", h.JobName, "err", err)
@@ -133,7 +133,7 @@ func (s *Scheduler) rollbackProbe(ctx context.Context, h ProbeHandle) {
 
 // trackProbeNode backfills the session's node_name from the probe pod: the
 // fake server cannot know it (it never touches K8s), and the value is what the
-// relay event and AwaitProbeRelayed report (§2 ProbeSession).
+// relay event and AwaitProbeRelayed report.
 func (s *Scheduler) trackProbeNode(ctx context.Context, h ProbeHandle, deadline time.Time) {
 	for {
 		pods, err := s.jobs.ListPods(ctx, jobNameSelector(h.JobName))
@@ -161,7 +161,7 @@ func (s *Scheduler) trackProbeNode(ctx context.Context, h ProbeHandle, deadline 
 // AwaitProbeRelayed waits until the probe's result has landed (startup
 // discovery) or been forwarded (command driven), or the deadline passes. The
 // completion signal is the session's RelayedAt — the result path writes it, not
-// the container log (§2 CatalogProbe).
+// the container log.
 func (s *Scheduler) AwaitProbeRelayed(ctx context.Context, h ProbeHandle, deadline time.Time) (nodeName string, relayed bool, relayedCode int, err error) {
 	for {
 		session, ok := s.probes.ProbeByJob(h.JobName)
@@ -187,7 +187,7 @@ func (s *Scheduler) AwaitProbeRelayed(ctx context.Context, h ProbeHandle, deadli
 // DeleteProbe tears one probe down: the session goes first and unconditionally
 // (it is the credential's validity face), then the Secret, then the Job, all
 // with the Background propagation policy. Every step is attempted; the first
-// failure is returned (§2 CatalogProbe).
+// failure is returned.
 func (s *Scheduler) DeleteProbe(ctx context.Context, h ProbeHandle) error {
 	var errs []error
 	if err := s.probes.DeleteProbe(h.JobName); err != nil {
@@ -210,7 +210,7 @@ func (s *Scheduler) DeleteProbe(ctx context.Context, h ProbeHandle) error {
 // session table (which is not rebuilt after a restart). Two discovery faces
 // share one grace period and one ownership exclusion: anything carrying a
 // task-id belongs to the task face and is never touched here
-// (failure-handling scenario #17).
+// (§6.5: the probe residual sweep).
 func (s *Scheduler) SweepStaleProbes(ctx context.Context) error {
 	cutoff := s.now().Add(-s.staleProbeGrace())
 	var firstErr error
@@ -294,7 +294,7 @@ func isProbeObject(labels map[string]string) bool {
 // discovery back for C1.
 //
 // Only "no runtime registered inside the window" is fatal — the discovery not
-// landing is a visible failure event that does not stop startup (§1.1 C1, §7).
+// landing is a visible failure event that does not stop startup (C-1, §10).
 func (s *Scheduler) RunStartupProbe(ctx context.Context) (registry.Discovery, error) {
 	window := s.cfg.StartupProbeTimeout
 	minted, err := mintedProbeID()
@@ -339,7 +339,7 @@ func (s *Scheduler) RunStartupProbe(ctx context.Context) (registry.Discovery, er
 	}
 	if !registered {
 		// The window's last poll interval still counts: a registration landing
-		// in it is "a runtime registered within the window" (§7).
+		// in it is "a runtime registered within the window" (§10).
 		if found, ok := readRegistration(); ok {
 			registered, discovery = true, found
 		}
@@ -392,7 +392,7 @@ func (s *Scheduler) teardownStartupProbe(ctx context.Context, h ProbeHandle) {
 }
 
 // reportProbeFailure emits the startup probe failure event; the exit path
-// carries the same reason in its error line (§7, observability.md).
+// carries the same reason in its error line (§10, §9.1).
 func (s *Scheduler) reportProbeFailure(ctx context.Context, jobName, reason, podStatus, jobEvent string, sessionExists bool) {
 	s.log.ErrorContext(ctx, "startup.probe_failed",
 		"job_name", jobName, "reason", reason, "pod_status", podStatus,
@@ -463,8 +463,7 @@ func podStarted(pod corev1.Pod) bool {
 }
 
 // mintedProbeID is the startup discovery's self-minted command id: it must not
-// share the server's request-id shape, so it carries an explicit prefix
-// (§2 ProbeSession).
+// share the server's request-id shape, so it carries an explicit prefix.
 func mintedProbeID() (string, error) {
 	var raw [16]byte
 	if _, err := rand.Read(raw[:]); err != nil {

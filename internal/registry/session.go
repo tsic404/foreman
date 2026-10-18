@@ -7,7 +7,7 @@ import (
 )
 
 // SessionKey normalizes a session identifier into the soft-affinity index key
-// (03-contracts §3.1 「节点软亲和键」): an empty value stays empty (first run),
+// (§4.5 归一化): an empty value stays empty (first run),
 // a value without "/" is a bare id and stays as is, and a path keeps only its
 // base name without extension. The learning side (the terminal report body's
 // session_id) and the payload side (prior_session_id) MUST call this one

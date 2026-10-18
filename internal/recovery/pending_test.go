@@ -141,7 +141,7 @@ func TestDrainDropsExpiredReports(t *testing.T) {
 	_ = p.Enqueue("task-old", "fm-task-old", "fm-task-old", scheduler.EPFail, []byte(`{}`))
 
 	// 25h later the report exceeds the TTL and is dropped with an error log
-	// (failure-handling 场景 #10).
+	// (§10).
 	later := now.Add(25 * time.Hour)
 	p2, _ := NewPendingReports(p.dir, WithPendingReportsClock(func() time.Time { return later }))
 	sender := &fakeSender{code: 200}
@@ -361,7 +361,7 @@ func TestDrainDeliversUnstorableTaskIDFromStaging(t *testing.T) {
 	}
 }
 
-// TestReportEventsCarryTaskIdentity (02-contracts §9.1, AC-10): every pending
+// TestReportEventsCarryTaskIdentity (02-contracts.md §9.1, AC-10): every pending
 // queue event row carries task_id, job_name and daemon_id. The identity is on
 // the durable file, so a restarted queue still logs it; a report whose
 // identity is unknown keeps the keys with empty values.

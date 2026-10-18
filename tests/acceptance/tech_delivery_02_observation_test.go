@@ -155,7 +155,7 @@ func TestDelivery02LostResponseLeavesMetricsEventsAndRetainedRecord(t *testing.T
 		t.Errorf("projected deliveries = %v, want 2", projected["deliveries"])
 	}
 	if _, ok := projected["started_at"]; !ok {
-		t.Errorf("the projection keeps every key (contract §3.1): %v", projected)
+		t.Errorf("the projection keeps every key (02-contracts.md §4.1): %v", projected)
 	}
 
 	// The list endpoint is the live index: a reclaimed task is not in it.
@@ -177,7 +177,7 @@ func TestDelivery02LostResponseLeavesMetricsEventsAndRetainedRecord(t *testing.T
 // commits with an empty-batch window between them. A per-window reading would
 // report the second rearm with the claims of its own window alone, so after a
 // later commit the entry would read as a daemon that stopped asking — the
-// other branch of the diagnostic (contract §3.1, AC-47 ②).
+// other branch of the diagnostic (02-contracts.md §4.1, AC-47 ②).
 func TestDelivery02ClaimsAfterDeliveryAccumulateAcrossRearms(t *testing.T) {
 	// Two full windows have to fit under the boot bound, the form's only
 	// terminal bound; the window keeps its scenario cadence.

@@ -8,7 +8,7 @@ import (
 // CatalogSlot is one real runtime's catalog cache entry: the probe daemon's
 // reported bytes verbatim plus the moment it landed. The landing time is local
 // only — it drives the staleness warning and never enters the replayed body,
-// which stays byte-identical (§1.1 C21 第 12 条).
+// which stays byte-identical (§1.3).
 type CatalogSlot struct {
 	Body     []byte
 	LandedAt time.Time
@@ -25,7 +25,7 @@ type SlotState struct {
 
 // CatalogSlots holds one catalog slot per real runtime. It is written by the
 // fake server (probe results) and read by the reporter (cache replay); the
-// key is always the real runtime id (§1.1 C21 第 13 条).
+// key is always the real runtime id (§1.3).
 type CatalogSlots struct {
 	mu        sync.RWMutex
 	byRuntime map[string]CatalogSlot

@@ -2,7 +2,7 @@
 // Foreman: the durable pending terminal-report queue, the restart/failure
 // reconciler over the Job/Pod facts and the server's C13 truth, the K8s
 // object watcher, the heartbeat-suspect signal and the cancel-ack timeout.
-// Design: docs/05-modules/failure-handling.md, contracts §3.4/§4.
+// Design: 02-contracts.md §4.2, §10.
 package recovery
 
 import (
@@ -23,7 +23,7 @@ import (
 )
 
 // PendingReportTTL caps how long a queued terminal report is retried before
-// it is dropped with an error log (failure-handling 场景 #10: 上限 24h).
+// it is dropped with an error log (§10: 上限 24h).
 const PendingReportTTL = 24 * time.Hour
 
 // ReportSender re-delivers a queued report; satisfied by proxy.Client.
@@ -31,7 +31,7 @@ type ReportSender interface {
 	Forward(ctx context.Context, ep scheduler.Endpoint, taskID string, body []byte) (int, []byte, error)
 }
 
-// pendingReport is one queued terminal report (contract §4). The file is
+// pendingReport is one queued terminal report (contract §10). The file is
 // the queue: a report is durable iff its file exists (staged until it lands).
 type pendingReport struct {
 	TaskID     string          `json:"task_id"`
@@ -50,7 +50,7 @@ var taskIDFileChars = regexp.MustCompile(`^[a-zA-Z0-9-]+$`)
 func validTaskID(taskID string) bool { return taskIDFileChars.MatchString(taskID) }
 
 // PendingReports is the durable terminal-report queue
-// (FOREMAN_STATE_ROOT/pending-reports/<taskid>.json, contract §4).
+// (FOREMAN_STATE_ROOT/pending-reports/<taskid>.json, contract §10).
 type PendingReports struct {
 	dir string
 	now func() time.Time
@@ -60,7 +60,7 @@ type PendingReports struct {
 	onChange func(int) // foreman_pending_reports gauge hook
 
 	// staged holds the reports that are not durable yet: a write that failed
-	// (failure-handling 错误处理表「待发队列目录不可写：记 error + gauge 不
+	// (待发队列目录不可写：记 error + gauge 不
 	// 增长；退避后重试」) or a task id that can never name a queue file. It is
 	// the retry handle of that error row: every Drain retries the write,
 	// Queued counts the report as undelivered, and the gauge stays at the
@@ -108,7 +108,7 @@ func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReport
 }
 
 // Enqueue lands a terminal report on disk (atomic tmp+rename; a report is
-// queued only once the file is durable — failure-handling 顺序规则 5).
+// queued only once the file is durable — §10).
 // Re-enqueueing the same task replaces the body but keeps the original
 // enqueue time, so the TTL clocks the first failure.
 //
@@ -172,12 +172,12 @@ func (p *PendingReports) inheritClockLocked(rep *pendingReport) {
 // sender. A report leaves the queue when the server accepts it (2xx) or
 // settles it as moot (404/409: server-side already terminal or deleted).
 // Reports older than PendingReportTTL are dropped with an error log
-// (failure-handling 场景 #10). It returns the number of reports still
+// (§10). It returns the number of reports still
 // undelivered: the durable entries plus the ones a failed write left staged.
 //
 // A report whose task id cannot name a queue file is delivered straight from
 // staging: it can never become durable, and dropping it would lose a
-// terminal callback (contract §4).
+// terminal callback (contract §10).
 //
 // The lock is never held across the network: the queue is snapshotted,
 // forwarded, and settled entry-by-entry, so a slow upstream cannot block
@@ -230,7 +230,7 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 // flushStagedLocked retries the disk write of every staged report
 // (错误处理表「退避后重试」). A report whose write lands leaves the staging
 // area — listLocked then carries it, so it counts as queued only once the
-// file exists (顺序规则 5) — while a write that keeps failing stays staged
+// file exists (§10) — while a write that keeps failing stays staged
 // for the next round. A report past the TTL is dropped, and one whose id can
 // never name a file stays staged for the direct delivery.
 func (p *PendingReports) flushStagedLocked() {
@@ -312,7 +312,7 @@ func (p *PendingReports) Len() int {
 // Queued reports whether taskID still has an undelivered report: one whose
 // file exists, or one a failed write left staged. The scheduler gates the
 // verdict-time Job deletion of a terminal entry on it, so the Job goes only
-// once the report landed (contract §4) — the credential and the entry follow
+// once the report landed (contract §10) — the credential and the entry follow
 // their own drain window (ADR-017).
 //
 // A task id that cannot name a queue file is answered without touching the

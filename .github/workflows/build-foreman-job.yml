@@ -1,4 +1,4 @@
-# Publish the Job image (04-architecture.md §部署/运行方式): the image the Job
+# Publish the Job image: the image the Job
 # pods and the foreman-gc DaemonSet run, as a multi-platform manifest list
 # (linux/amd64 + linux/arm64).
 #

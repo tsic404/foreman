@@ -1,6 +1,6 @@
 // Package gc implements foreman-gc, the node-local cache collector that
 // runs as a DaemonSet (one pod per node) over the hostPath state root.
-// Design: docs/05-modules/job-template.md §节点清理, contracts §5.1,
+// Design: 02-contracts.md §8.8 (节点状态清理), §10 (缓存与节点状态限额),
 // ADR-005 (node-local hostPath), ADR-006 (shared .repos).
 package gc
 
@@ -16,7 +16,7 @@ import (
 	"github.com/tsic404/foreman/internal/observability"
 )
 
-// Environment variable names from the contract config table (§5.1).
+// Environment variable names of the node-cleanup component.
 const (
 	EnvStateRoot     = "FOREMAN_STATE_ROOT"
 	EnvCacheTTL      = "FOREMAN_CACHE_TTL"
@@ -37,12 +37,12 @@ const (
 	EnvNodeName = "NODE_NAME"
 )
 
-// Contract defaults (§5.1).
+// Deployment defaults.
 const (
 	DefaultStateRoot = "/var/lib/foreman"
 	DefaultCacheTTL  = 720 * time.Hour
 	// DefaultTaskDirTTL covers both task directories and orphan task roots
-	// (05-modules/job-template.md §节点清理: 7 days).
+	// (§8.8: 7 days).
 	DefaultTaskDirTTL    = 168 * time.Hour
 	DefaultCacheMaxBytes = 50 << 30 // 50Gi
 	DefaultGCInterval    = 6 * time.Hour

@@ -19,7 +19,7 @@ import (
 	"github.com/tsic404/foreman/internal/observability"
 )
 
-// statefulSetShapedTemplate is the deployment shape P-006 was filed for: a
+// statefulSetShapedTemplate is the deployment shape ADR-016 was filed for: a
 // privileged dind native sidecar holding the node's docker socket, an init
 // installing into a shared nix store, a deployment-chosen command/args, a
 // second container, and the omp config mounted where the deployment wants it.
@@ -193,12 +193,12 @@ func mustBuildTemplate(t *testing.T, manifest string, e TaskEntry, mutate func(*
 	return job, logs
 }
 
-// ---- startup gate: the template is required, three failure classes (03-contracts §5.4) ----
+// ---- startup gate: the template is required, three failure classes (§8.1) ----
 
 // The startup log's fixed literals, pinned as text and not read from the
 // production constants: the acceptance test greps them verbatim
-// (test-cases/job-template.md TC-tech-job-07, AC-29), so a typo inside a
-// constant is exactly the defect these assertions have to catch.
+// (TC-tech-job-07, AC-29), so a typo inside a constant is exactly the defect
+// these assertions have to catch.
 const (
 	wantDeclaration = "Foreman 不对 Job 模板做任何校验，模板内容不构成安全边界"
 	wantEffect      = "运行中 CM 变更不生效"
@@ -304,7 +304,7 @@ func TestLoadJobTemplateUnreadable(t *testing.T) {
 
 // TestLoadJobTemplateRejects is failure class 3: the content is not a
 // batch/v1 Job. A bare manifest fragment lands here too — it has no
-// apiVersion/kind, so it cannot be the complete template §5.4 requires.
+// apiVersion/kind, so it cannot be the complete template §8.1 requires.
 func TestLoadJobTemplateRejects(t *testing.T) {
 	cases := []struct {
 		name     string
@@ -391,7 +391,7 @@ func TestTemplatePassthroughShape(t *testing.T) {
 	}
 }
 
-// TestTemplateInjectsA1Env (P-006 §A1.1): the three keys land on containers[0]
+// TestTemplateInjectsA1Env (§8.2 A1.1): the three keys land on containers[0]
 // — the first entry by writing order, never a container matched by name — a
 // same-name entry is replaced whole, and every other container is untouched.
 func TestTemplateInjectsA1Env(t *testing.T) {
@@ -433,7 +433,7 @@ func TestTemplateWithoutContainers(t *testing.T) {
 	}
 }
 
-// TestTemplatePerTaskWrites (P-006 §A1.2): metadata, the §3.2 key set by side,
+// TestTemplatePerTaskWrites (§8.2 A1.2): metadata, the per-side key set,
 // and the domain clear that lets an empty TaskEntry field delete a template's
 // static key.
 func TestTemplatePerTaskWrites(t *testing.T) {
@@ -479,11 +479,11 @@ func TestTemplatePerTaskWrites(t *testing.T) {
 
 	podLabels := job.Spec.Template.Labels
 	if len(podLabels) != 4 {
-		t.Fatalf("pod labels = %v, want the three §3.2 labels plus the template's own", podLabels)
+		t.Fatalf("pod labels = %v, want the three §8.2 A1.2 labels plus the template's own", podLabels)
 	}
 	if podLabels["app.kubernetes.io/name"] != "foreman-job" || podLabels["foreman.tsic.top/task-id"] != testTaskID ||
 		podLabels[labelDaemonID] != testJobName {
-		t.Errorf("pod labels = %v, want the three §3.2 labels", podLabels)
+		t.Errorf("pod labels = %v, want the three §8.2 A1.2 labels", podLabels)
 	}
 	if podLabels["cost-center"] != "platform" {
 		t.Errorf("pod labels = %v, the template's free label must survive", podLabels)
@@ -497,7 +497,7 @@ func TestTemplatePerTaskWrites(t *testing.T) {
 }
 
 // TestTemplateConditionalTriggerContext: a template's static trigger-context
-// keys are deleted when the entry has no such context (P-006 §A1.2 增删).
+// keys are deleted when the entry has no such context (§8.2 A1.2 增删).
 func TestTemplateConditionalTriggerContext(t *testing.T) {
 	entry := testEntry()
 	entry.IssueID, entry.IssueIdentifier = "", ""
@@ -515,7 +515,7 @@ func TestTemplateConditionalTriggerContext(t *testing.T) {
 	}
 }
 
-// TestTemplatePlaceholders (P-006 §A1.2): every registered placeholder resolves
+// TestTemplatePlaceholders (§8.2 A1.2): every registered placeholder resolves
 // to its per-task value — inside larger strings too — and an unregistered
 // <...> literal is left verbatim.
 func TestTemplatePlaceholders(t *testing.T) {
@@ -540,7 +540,7 @@ func TestTemplatePlaceholders(t *testing.T) {
 	}
 }
 
-// TestTemplatePreferredNodePlaceholder (P-006 §A1.2): <preferred node> is a
+// TestTemplatePreferredNodePlaceholder (§8.2 A1.2): <preferred node> is a
 // conditional block — resolved into the affinity item when a node exists, and
 // dropped together with that item when none does. Affinity items the
 // deployment owns are never touched.
@@ -655,10 +655,11 @@ spec:
 `
 
 // conflictingMetadataTemplate writes its own per-task metadata and its own
-// §3.2 keys: every one of them is Foreman's to overwrite or delete, so the
-// assertions below fail if the A1.2 write is removed. The name is a format
-// string now (ADR-034), so the template expresses one instead of a static
-// name — a static name is itself a startup refusal.
+// label/annotation keys (§8.2 A1.2): every one of them is Foreman's to
+// overwrite or delete, so the assertions below fail if the A1.2 write is
+// removed. The name is a format string now (ADR-034), so the template
+// expresses one instead of a static name — a static name is itself a startup
+// refusal.
 const conflictingMetadataTemplate = `
 apiVersion: batch/v1
 kind: Job
@@ -692,7 +693,7 @@ spec:
           image: <job-image>
 `
 
-// TestTemplateInjectsA1EnvOnce (P-006 §A1.1): a template may declare an
+// TestTemplateInjectsA1EnvOnce (§8.2 A1.1): a template may declare an
 // injected key twice; the daemon reads the last entry, so every copy must be
 // replaced and exactly one authoritative entry must remain.
 func TestTemplateInjectsA1EnvOnce(t *testing.T) {
@@ -724,12 +725,12 @@ func TestTemplateInjectsA1EnvOnce(t *testing.T) {
 	}
 }
 
-// TestTemplateNodeLiteralOutsideRecognitionSite: §5.4 registers <preferred node>
+// TestTemplateNodeLiteralOutsideRecognitionSite: §8.3 registers <preferred node>
 // as the substitution set's one exception — only its recognition site consumes
-// it (「识别位与执行顺序」: the values entry reading *exactly* the literal). Every
-// other position keeps the literal verbatim: no replacement, no deletion, no
+// it (the values entry reading *exactly* the literal, §8.6). Every other
+// position keeps the literal verbatim: no replacement, no deletion, no
 // Build error; whether such a position can take the literal is the apiserver's
-// judgment at Job creation (§5.4「占位符替换」第 4 条).
+// judgment at Job creation (§8.3's failure face).
 func TestTemplateNodeLiteralOutsideRecognitionSite(t *testing.T) {
 	entry := testEntry()
 	containerArgs := strings.Replace(statefulSetShapedTemplate,
@@ -829,7 +830,7 @@ func TestTemplateIntegerPrecision(t *testing.T) {
 	}
 }
 
-// TestTemplateAuthoritativeMetadataWins (P-006 §A1.2): the template's own
+// TestTemplateAuthoritativeMetadataWins (§8.2 A1.2): the template's own
 // per-task values are overwritten or deleted, never trusted.
 func TestTemplateAuthoritativeMetadataWins(t *testing.T) {
 	entry := testEntry()
@@ -874,10 +875,10 @@ func TestTemplateAuthoritativeMetadataWins(t *testing.T) {
 	podLabels := job.Spec.Template.Labels
 	if len(podLabels) != 3 || podLabels["app.kubernetes.io/name"] != jobAppName ||
 		podLabels[labelTaskID] != entry.TaskID || podLabels[labelDaemonID] != daemonIDFor(entry.TaskID) {
-		t.Errorf("pod labels = %v, want exactly the three §3.2 labels", podLabels)
+		t.Errorf("pod labels = %v, want exactly the three §8.2 A1.2 labels", podLabels)
 	}
-	// app.kubernetes.io/managed-by is a Job-side §3.2 key: Foreman owns both
-	// app.kubernetes.io keys, and the pod side's key set does not carry
+	// app.kubernetes.io/managed-by is a Job-side key (§8.2 A1.2): Foreman owns
+	// both app.kubernetes.io keys, and the pod side's key set does not carry
 	// managed-by, so the template's same-name value is discarded rather than
 	// left standing (ADR-034 decision 7).
 	if _, ok := podLabels[labelManagedBy]; ok {
@@ -942,7 +943,7 @@ func volumeByName(t *testing.T, volumes []corev1.Volume, name string) corev1.Vol
 	return corev1.Volume{}
 }
 
-// TestTemplateCopyPerBuild (P-006 §A1.3): the startup-parsed template is
+// TestTemplateCopyPerBuild (§8.2 A1.3): the startup-parsed template is
 // read-only, so a second task's Job carries only its own per-task values — the
 // credential Secret reference above all.
 func TestTemplateCopyPerBuild(t *testing.T) {

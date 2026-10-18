@@ -19,19 +19,19 @@ import (
 // surface; the contract pins no limit).
 const maxRequestBody = 32 << 20
 
-// TaskScheduler is the fake server's scheduling surface (proxy.md
-// §请求路由): S6 delivery, S8–S17 report handling, task-vanish settlement.
+// TaskScheduler is the fake server's scheduling surface (§2.1):
+// S6 delivery, S8–S17 report handling, task-vanish settlement.
 type TaskScheduler interface {
 	Deliver(daemonID, runtimeID string, maxTasks int) ([]json.RawMessage, error)
 	OnReport(ctx context.Context, ep scheduler.Endpoint, e registry.TaskEntry, body []byte) (int, []byte, error)
 	OnTaskVanished(ctx context.Context, taskID string) error
 	// FailJob settles a Job whose daemon was refused at S4: the entry reaches
-	// terminal/failed without waiting out the boot deadline (§1.2 S4).
+	// terminal/failed without waiting out the boot deadline (S-4).
 	FailJob(ctx context.Context, jobName, reason string) error
 }
 
 // FakeServer is the J→F face: it speaks the official server protocol to the
-// Job daemons (§1.2). ServeHTTP applies the three routing rules — fmj_
+// Job daemons (§2.2). ServeHTTP applies the three routing rules — fmj_
 // Job Tokens to the local daemon face, any other credential verbatim to
 // the real server (S29), none to 401.
 type FakeServer struct {
@@ -62,7 +62,7 @@ type FakeServer struct {
 type FakeServerOption func(*FakeServer)
 
 // WithProbeRegistry wires the catalog-probe session table: it is what makes
-// S4/S5/S19/S27 answer a probe token (§1.2 规则 1 的探针分支).
+// S4/S5/S19/S27 answer a probe token (§2.1 规则 1 的探针分支).
 func WithProbeRegistry(probes *registry.ProbeRegistry) FakeServerOption {
 	return func(s *FakeServer) { s.probes = probes }
 }
@@ -72,9 +72,9 @@ func WithServerLogger(l *slog.Logger) FakeServerOption {
 	return func(s *FakeServer) { s.log = l }
 }
 
-// NewFakeServer builds the handler with the full §1.2 routing table.
+// NewFakeServer builds the handler with the full §2.2 endpoint table.
 // ws may be nil; the S30 route is then not registered and WS dials get a
-// 404 (the FOREMAN_WS_ENABLED=false degradation, §5.1).
+// 404 (the FOREMAN_WS_ENABLED=false degradation).
 func NewFakeServer(issuer *auth.Issuer, reg *registry.Registry, sched TaskScheduler, client *Client, ws *WSHandler, metrics Metrics, opts ...FakeServerOption) *FakeServer {
 	s := &FakeServer{
 		issuer:  issuer,
@@ -95,7 +95,7 @@ func NewFakeServer(issuer *auth.Issuer, reg *registry.Registry, sched TaskSchedu
 	return s
 }
 
-// routes registers the local daemon face (§1.2 table; proxy.md §请求路由).
+// routes registers the local daemon face (§2.2 table; §2.1).
 // Every registration goes through register/handleFn so the pattern set stays
 // readable (registered) — the daemon-face census in protocol_test.go is what
 // requires it.
@@ -128,7 +128,7 @@ func (s *FakeServer) routes() {
 	handleFn("POST /api/daemon/tasks/{tid}/session", s.reportHandler(scheduler.EPSession))                   // S16
 	handleFn("POST /api/daemon/tasks/{tid}/wait-local-directory", s.reportHandler(scheduler.EPWaitLocalDir)) // S17
 	// S23 is defensive-only this version: these calls carry the caller's
-	// own credential and are forwarded verbatim (§1.2 rule 2 semantics).
+	// own credential and are forwarded verbatim (§2.1 rule 2 semantics).
 	// The Job Token is still verified first — an invalid fmj_ must 401
 	// locally, never reach the upstream.
 	handleFn("GET /api/daemon/tasks/{tid}/plugin-hooks", s.handleS23)
@@ -161,7 +161,7 @@ func (s *FakeServer) registeredPatterns() []string {
 	return append([]string(nil), s.registered...)
 }
 
-// ServeHTTP applies the §1.2 routing rules before the endpoint table.
+// ServeHTTP applies the §2.1 routing rules before the endpoint table.
 func (s *FakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !strings.HasPrefix(r.URL.Path, "/api/") {
 		writeError(w, http.StatusNotFound, "not found")
@@ -182,7 +182,7 @@ func (s *FakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.handlePassthrough(w, r)
 }
 
-// authenticate verifies the Job Token against the request scope (§1.2 rule
+// authenticate verifies the Job Token against the request scope (§2.1 rule
 // 1 + resource check). On failure it writes the mapped status (401/403).
 func (s *FakeServer) authenticate(w http.ResponseWriter, r *http.Request, scope auth.RequestScope) (auth.Claims, bool) {
 	token, _ := bearerToken(r)
@@ -230,14 +230,14 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 	writeRaw(w, code, raw)
 }
 
-// writeRaw replies with an upstream response verbatim (§1.2 forwarding).
+// writeRaw replies with an upstream response verbatim (§2.4 forwarding).
 func writeRaw(w http.ResponseWriter, code int, body []byte) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(code)
 	_, _ = w.Write(body)
 }
 
-// writeError is the §1.2 unified error shape.
+// writeError is the unified error shape of the daemon face.
 func writeError(w http.ResponseWriter, code int, msg string) {
 	raw, _ := json.Marshal(map[string]string{"error": msg})
 	writeRaw(w, code, raw)

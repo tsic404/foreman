@@ -1,4 +1,4 @@
-# Job image (contracts §5.3 "Job 镜像", 05-modules/job-template.md §Job Manifest).
+# Job image (ADR-033; acceptance 03-acceptance.md AC-34).
 #
 # Contents, by contract:
 #   * the upstream `multica` CLI, used verbatim — never patched (F1/ADR-004),
@@ -57,7 +57,8 @@ COPY foreman-gc-linux-${TARGETARCH} /usr/local/bin/foreman-gc
 
 # No ENTRYPOINT and an explicitly empty CMD: the Job pod and the DaemonSet both
 # state the command explicitly, so a pod that forgets it fails at start instead
-# of running the base image's inherited `Cmd=["/bin/sh"]` (contracts §5.3).
+# of running the base image's inherited `Cmd=["/bin/sh"]` (03-acceptance.md
+# TC-tech-job-08: the image declares no entry point).
 CMD []
 
 WORKDIR /home/agent

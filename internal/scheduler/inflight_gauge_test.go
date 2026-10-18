@@ -44,7 +44,7 @@ func (f *fixture) assertSettled(t *testing.T, taskID string) {
 
 // FailJob compensates a Job that ended without a daemon report: the task
 // turns terminal, so the gauge must fall with Registry.Inflight()
-// (observability.md §指标, AC-10).
+// (§9.2, AC-10).
 func TestFailJobResetsInflightGauge(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
@@ -57,7 +57,7 @@ func TestFailJobResetsInflightGauge(t *testing.T) {
 }
 
 // A terminal entry whose fail report cannot be forwarded stays in the index
-// as the retry handle (contract §4), but it is no longer inflight: the gauge
+// as the retry handle (§10), but it is no longer inflight: the gauge
 // must read 0 although the Job is still there.
 func TestFailJobResetsInflightGaugeWhenTheReportIsRetained(t *testing.T) {
 	f := newFixture(t)

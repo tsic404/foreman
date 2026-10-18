@@ -20,26 +20,26 @@ type LeaseClient interface {
 }
 
 // LeaseHooks are the scheduler's settlement entries the LeaseKeeper drives
-// (proxy.md §prepare-lease 保活).
+// (S-7 + §10 租约不超时).
 type LeaseHooks interface {
 	// OnDeliveryUnconfirmed settles the S6 lost-response form: the entry
 	// reached the boot bound on a committed delivery without a start fact, so
-	// no delivery attempt was ever confirmed (failure-handling scenario #18,
+	// no delivery attempt was ever confirmed (§5,
 	// ADR-032).
 	OnDeliveryUnconfirmed(ctx context.Context, taskID string) error
-	// OnBootTimeout fails the task (failure-handling scenario #4).
+	// OnBootTimeout fails the task (§4.4).
 	OnBootTimeout(ctx context.Context, taskID string) error
 	// ConvergeLeaseRefused settles a C4-400 entry against the server (C13).
 	ConvergeLeaseRefused(ctx context.Context, taskID string) error
-	// OnTaskVanished drops an entry whose task the server deleted (#9).
+	// OnTaskVanished drops an entry whose task the server deleted (§4.6).
 	OnTaskVanished(ctx context.Context, taskID string) error
 }
 
 // LeaseKeeper renews prepare leases (C4) for tasks that are claimed but not
 // yet started, every FOREMAN_LEASE_REFRESH_INTERVAL (capped at 20s by the
 // config guard, §10). It also enforces the pre-start terminal bound, the
-// boot deadline (scenario #4), with the S6 delivery attribution split
-// (scenario #18, ADR-032); the delivery confirmation window itself is not a
+// boot deadline (§4.4), with the S6 delivery attribution split
+// (§5, ADR-032); the delivery confirmation window itself is not a
 // bound here — it releases the delivery for another attempt on the claim
 // path.
 type LeaseKeeper struct {
@@ -73,7 +73,7 @@ func (k *LeaseKeeper) Run(ctx context.Context) error {
 	}
 }
 
-// round renews every leaseable entry once (proxy.md §prepare-lease 保活).
+// round renews every leaseable entry once (S-7 + §10 租约不超时).
 func (k *LeaseKeeper) round(ctx context.Context) {
 	for _, e := range k.reg.List() {
 		if !leaseable(e) {
@@ -89,8 +89,8 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 		switch {
 		case err == nil && ready:
 			// The renewal restamped the server's lease: project the new
-			// deadline (contract §3.1) and emit the observation line
-			// protocol-lease.md 场景 A judges. Info, not debug: that line
+			// deadline (§4.1) and emit the observation line
+			// the lease acceptance case judges. Info, not debug: that line
 			// carries no level prefix there, i.e. it is read at the design's
 			// default level — unlike daemon.heartbeat, whose debug level the
 			// same file states explicitly.
@@ -102,7 +102,7 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 				"lease_keep_until", registry.ProjectedTime(until))
 			// One terminal bound for the pre-start forms: the boot deadline,
 			// claim-relative — a zero deadline is "no upper bound", not an
-			// expired one (contract §3.1, ADR-026), so the judgement holds only
+			// expired one (§4.1, ADR-026), so the judgement holds only
 			// on a written bound. The delivery confirmation window no longer
 			// ends an entry: passing it with no start fact releases the
 			// delivery for another attempt on the daemon's next claim (ADR-032).
@@ -137,14 +137,13 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 }
 
 // leaseable reports whether the entry still needs prepare-lease renewals:
-// claimed by this process, not yet started, not terminal (proxy.md
-// §prepare-lease 保活). The claim's payload is the criterion — a rebuilt
+// claimed by this process, not yet started, not terminal (S-7 +
+// §10 租约不超时). The claim's payload is the criterion — a rebuilt
 // entry has none (F3) — never the boot bound: the bound is the boot face's
 // own criterion, and it is absent both on rebuilt entries and when
 // FOREMAN_JOB_BOOT_TIMEOUT=0, where the two would part ways (ADR-026: the two
 // criteria never derive from each other). Leasing a rebuilt entry would block
-// the server's redispatch; the startup convergence owns it (failure-handling
-// scenario #2).
+// the server's redispatch; the startup convergence owns it (§4.3).
 func leaseable(e registry.TaskEntry) bool {
 	if e.IsTerminal() || !e.StartedAt.IsZero() {
 		return false

@@ -76,7 +76,7 @@ func TestLoadConfigRequiresWorkspaceID(t *testing.T) {
 	}
 }
 
-// FOREMAN_JOB_BOOT_TIMEOUT=0 switches the upper bound off (§5.1): the config
+// FOREMAN_JOB_BOOT_TIMEOUT=0 switches the upper bound off: the config
 // accepts it, and the startup probe window — which otherwise mirrors the boot
 // bound — falls back to the default magnitude rather than a zero window that
 // would fail the first probe before it could register.
@@ -131,7 +131,7 @@ func TestLoadConfigClampsClaimBatchToServerCeiling(t *testing.T) {
 	}
 }
 
-// TestLoadConfigDeliveryConfirmWindow guards §5.1's window semantics
+// TestLoadConfigDeliveryConfirmWindow guards §5's window semantics
 // (ADR-032): 30s by default, an explicit lower value accepted, and 0 legal —
 // it disarms the convergence exit.
 func TestLoadConfigDeliveryConfirmWindow(t *testing.T) {

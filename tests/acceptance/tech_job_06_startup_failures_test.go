@@ -167,8 +167,8 @@ func TestJob06AdversarialTemplateStarts(t *testing.T) {
 
 // TestJob06InjectsThreeEnvKeysOnly (AC-28): containers[0]'s three keys are
 // Foreman's — a same-name entry is replaced whole, never duplicated — the
-// remaining twelve §5.2 keys are not injected, and a second container is
-// outside the injection face.
+// remaining twelve template-side env keys are not injected, and a second
+// container is outside the injection face.
 func TestJob06InjectsThreeEnvKeysOnly(t *testing.T) {
 	const manifest = `
 apiVersion: batch/v1
@@ -234,7 +234,7 @@ spec:
 			t.Errorf("env %q appears %d times, want one entry", name, count)
 		}
 	}
-	// §5.2 minus the three injected keys: none of the rest may appear.
+	// The reference template's other env keys: none of the rest may appear.
 	for _, name := range []string{
 		"MULTICA_DAEMON_DEVICE_NAME", "MULTICA_AGENT_RUNTIME_NAME", "MULTICA_WORKSPACES_ROOT",
 		"TMPDIR", "TMP", "TEMP", "MULTICA_GC_ENABLED", "MULTICA_DAEMON_AUTO_UPDATE",

@@ -24,18 +24,18 @@ PROFILE=${TEST_MULTICA_PROFILE:-test-multica}
 HOST=${TEST_MULTICA_HOST:-127.0.0.1}
 SERVER_URL=${TEST_MULTICA_SERVER_URL:-http://$HOST:30080}
 ENTRY_URL=${TEST_MULTICA_ENTRY_URL:-http://$HOST:30300}
-# The stable access point (§2): the test server itself, nothing in front of it.
+# The stable access point: the test server itself, nothing in front of it.
 # It has one face per consumer — in-cluster consumers (the instance under test)
 # resolve the Service name, host-side ones (the CLI profile, self-check ③) use
 # SERVER_URL above. Both are that one server, and neither is the production one.
 ACCESS_URL=${TEST_MULTICA_ACCESS_URL:-http://test-multica-server.$NS.svc:8080}
 # The instance under test: the Deployment the wiring and self-check entries
-# read and re-point (§2 接线). It comes from deploy/ (deploy/README.md); the
+# read and re-point. It comes from deploy/ (deploy/README.md); the
 # test cluster only decides where it points.
 INSTANCE_NS=${TEST_MULTICA_INSTANCE_NS:-foreman}
 INSTANCE=${TEST_MULTICA_INSTANCE:-foreman}
 INSTANCE_SECRET=${TEST_MULTICA_INSTANCE_SECRET:-foreman-secret}
-# Names of the test workspace's objects (§3). The reset entry rebuilds these.
+# Names of the test workspace's objects. The reset entry rebuilds these.
 WORKSPACE_NAME=${TEST_MULTICA_WORKSPACE_NAME:-Foreman Test}
 WORKSPACE_SLUG=${TEST_MULTICA_WORKSPACE_SLUG:-foreman-test}
 ACCOUNT_EMAIL=${TEST_MULTICA_EMAIL:-acceptance@test.local}
@@ -108,7 +108,7 @@ k() {
 }
 
 # The profile's personal access token: the acceptance side's credential
-# (§2 查询面凭据). Read from the profile config the CLI itself uses.
+# (查询面凭据). Read from the profile config the CLI itself uses.
 pat() {
 	[ -r "$PROFILE_CONFIG" ] || die "no CLI profile at $PROFILE_CONFIG — run ./reset.sh first"
 	jq -er .token "$PROFILE_CONFIG" || die "profile $PROFILE_CONFIG carries no token"
@@ -150,19 +150,19 @@ wsapi() {
 }
 
 # The test workspace id from the profile (the acceptance side's
-# MULTICA_WORKSPACE_ID, §2 接线).
+# MULTICA_WORKSPACE_ID).
 workspace_id() {
 	jq -er .workspace_id "$PROFILE_CONFIG" || die "profile $PROFILE_CONFIG carries no workspace_id"
 }
 
-# psql against the test server's own database, for the reset entry's row wipe
-# (§6 重置). Runs inside the persistence pod; no credential leaves the cluster.
+# psql against the test server's own database, for the reset entry's row wipe.
+# Runs inside the persistence pod; no credential leaves the cluster.
 psql_ro() {
 	k exec deploy/postgres -n "$NS" -- \
 		psql -v ON_ERROR_STOP=1 -U multica -d multica -qtAX -c "$1"
 }
 
-# --- The instance under test (§2 接线) ---------------------------------------
+# --- The instance under test -------------------------------------------------
 
 # Is one object of the instance under test there? 0 = present, 1 = definitively
 # absent, dies when the API cannot answer at all. The first read is unretried
@@ -184,16 +184,15 @@ instance_object_present() {
 	return 0
 }
 
-# One env key of the instance under test's first container. The contract reads
-# `containers[0]`, so this does too (03-contracts.md §5.3).
+# One env key of the instance under test's first container (`containers[0]`).
 instance_env() {
 	instance_object_present deploy "$INSTANCE" || return 1
 	k -n "$INSTANCE_NS" get deploy "$INSTANCE" \
 		-o jsonpath="{.spec.template.spec.containers[0].env[?(@.name==\"$1\")].value}"
 }
 
-# Scale the instance under test to 0 and wait for its pod to go away. §2 ② is a
-# pre-start assertion — the runtime list must be empty before the instance
+# Scale the instance under test to 0 and wait for its pod to go away. Gate ②
+# is a pre-start assertion — the runtime list must be empty before the instance
 # starts — so both the reset entry (the wipe has to be observable) and the
 # wiring entry (the assertion must not race its own rollout) bring it down
 # first. An instance that is not deployed at all is left to the self-check,
@@ -211,7 +210,7 @@ stop_instance() {
 	k -n "$INSTANCE_NS" scale deploy "$INSTANCE" --replicas=0 >/dev/null
 	# The wait runs only while pods are listed: `--for=delete` errors when the
 	# selector matches nothing, which is the state wanted here. A pod that
-	# outlives the wait is reported instead of swallowed — the §2 ② gate that
+	# outlives the wait is reported instead of swallowed — the gate's ② that
 	# follows is what decides, and it needs the pod actually gone.
 	selector=$(k -n "$INSTANCE_NS" get deploy "$INSTANCE" -o jsonpath='{.spec.selector.matchLabels}' |
 		jq -r 'to_entries | map("\(.key)=\(.value)") | join(",")') ||

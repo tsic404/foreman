@@ -2,7 +2,7 @@ package proxy
 
 import "time"
 
-// backoff implements the §4 exponential retry policy for the client-side
+// backoff implements the §1.5 exponential retry policy for the client-side
 // control loops: 1s doubling up to a 30s ceiling, reset on success.
 type backoff struct {
 	min, max time.Duration

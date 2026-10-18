@@ -283,7 +283,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-// ---- scenario #1/#2: restart rebuild ------------------------------------
+// ---- §4.3: restart rebuild ----------------------------------------------
 
 func TestReconcileTerminalEntryRetriesCleanup(t *testing.T) {
 	e := testEntry("t1")
@@ -470,7 +470,7 @@ func TestReconcileTerminalStatusSettles(t *testing.T) {
 	}
 }
 
-// ---- scenario #9: task deleted server-side ------------------------------
+// ---- §4.6: task deleted server-side -------------------------------------
 
 // A task the server deleted settles terminal with an empty result and
 // enters drain: no report is sent, but the Job is deleted and the credential
@@ -492,7 +492,7 @@ func TestReconcileDeletedTaskVanishes(t *testing.T) {
 	}
 }
 
-// ---- scenario #3/#5/#11: the Job ended without a report -----------------
+// ---- §4.6: the Job ended without a report -------------------------------
 
 func TestReconcileJobEndedWaitsThenFails(t *testing.T) {
 	reg := newRegistry(t, testEntry("t1"))
@@ -617,7 +617,7 @@ func TestReconcileUnknownPodIsEvicted(t *testing.T) {
 	}
 }
 
-// ---- scenario #8: server-side cancel ------------------------------------
+// ---- §4.6: server-side cancel -------------------------------------------
 
 func TestReconcileCancelledWaitsForAckThenReleases(t *testing.T) {
 	reg := newRegistry(t, testEntry("t1"))
@@ -687,7 +687,7 @@ func TestReconcileCancelledPrunedWhenDaemonAcks(t *testing.T) {
 	}
 }
 
-// ---- scenario #6: heartbeat suspect -------------------------------------
+// ---- §4.6: heartbeat suspect --------------------------------------------
 
 func TestSuspectSignalTracksStaleHeartbeats(t *testing.T) {
 	e := testEntry("t1")
@@ -745,7 +745,7 @@ func TestSuspectIgnoresUnregisteredDaemons(t *testing.T) {
 	}
 }
 
-// ---- scenario #7/#10: durable report queue ------------------------------
+// ---- §4.6/§10: durable report queue -------------------------------------
 
 func TestReconcileDrainsPendingReports(t *testing.T) {
 	reg := newRegistry(t)

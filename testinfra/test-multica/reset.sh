@@ -1,28 +1,30 @@
 #!/bin/sh
 # Reset the test multica cluster to its clean state — the reset entry of
-# test-cases/_infra/test-multica-cluster.md §6 运维接口, run before every
+# the test environment's 运维接口 (`README.md`), run before every
 # acceptance round.
 #
-#   ./reset.sh                 # stop the instance, wipe rows, rebuild §3
+#   ./reset.sh                 # stop the instance, wipe rows, rebuild objects
 #   ./reset.sh --print-token   # …and print the profile's token (wiring input)
 #
 # What it does, in order:
 #
-#   1. stop — scale the instance under test to 0: §2 ② is a pre-start assertion
-#      (the runtime list must be empty before the instance starts), and a
-#      running instance would re-register the runtime this entry is about to
-#      wipe;
+#   1. stop — scale the instance under test to 0: gate ② is a pre-start
+#      assertion (the runtime list must be empty before the instance starts),
+#      and a running instance would re-register the runtime this entry is
+#      about to wipe;
 #   2. credentials — ensure the CLI profile holds a working personal access
 #      token for the test server (creating the account on first use);
 #   3. workspace — ensure the test workspace exists and is selected;
 #   4. wipe — delete every runtime row and task row of the test workspace
-#      (§1 可重置). The agent rows survive, unbound;
-#   5. rebuild §3 — writable repository, test agent (unbound), chat entry. The
-#      autopilot is not here: the server refuses an autopilot whose assignee
-#      agent has no runtime, and this entry leaves the runtime list empty on
-#      purpose — ./bind-agent.sh creates it once the agent is bound;
-#   6. gate — ./selfcheck.sh: §2 ①②③ (the instance points at the access point,
-#      the runtime list is empty, the server reports the artifact anchor).
+#      (可重置). The agent rows survive, unbound;
+#   5. rebuild the test objects — writable repository, test agent (unbound),
+#      chat entry. The autopilot is not here: the server refuses an autopilot
+#      whose assignee agent has no runtime, and this entry leaves the runtime
+#      list empty on purpose — ./bind-agent.sh creates it once the agent is
+#      bound;
+#   6. gate — ./selfcheck.sh: the environment gate ①②③ (the instance points at
+#      the access point, the runtime list is empty, the server reports the
+#      artifact anchor).
 #
 # It is idempotent: everything is looked up by name and only created when
 # missing. The agent stays unbound on purpose — ./bind-agent.sh binds it to the
@@ -51,7 +53,7 @@ done
 # --- 1. stop the instance under test -----------------------------------------
 
 # The wipe below only sticks while nothing is registered: a running instance
-# re-registers the runtime row it just lost, and §2 ② asserts that list is
+# re-registers the runtime row it just lost, and gate ② asserts that list is
 # empty *before* the instance starts.
 stop_instance
 
@@ -118,7 +120,7 @@ ensure_credentials() {
 ensure_workspace() {
 	# A profile that already names a workspace is the fast path — the workspace
 	# list is the slowest endpoint on a loaded server — but the id is only
-	# trusted after it reads back: a rebuilt environment (§6 升级 = 整环境重建)
+	# trusted after it reads back: a rebuilt environment (升级 = 整环境重建)
 	# leaves the profile file behind while the workspace it names is gone.
 	if [ -r "$PROFILE_CONFIG" ]; then
 		ws=$(jq -r '.workspace_id // ""' "$PROFILE_CONFIG")
@@ -163,7 +165,7 @@ wipe_rows() {
 	info "wiped runtime rows and task rows"
 }
 
-# --- 5. §3 objects -----------------------------------------------------------
+# --- 5. the test objects ------------------------------------------------------
 
 ensure_repo() {
 	if ! ws=$(api GET "/api/workspaces/$(workspace_id)"); then
@@ -233,9 +235,9 @@ ensure_repo
 ensure_agent
 ensure_chat
 
-# §2 ①②③, the gate every round opens with. Run here, with the instance under
-# test stopped, ② is the reset-time state the design asserts; a blocked
-# environment exits 2 through this call.
+# The environment gate ①②③, the gate every round opens with. Run here, with
+# the instance under test stopped, ② is the reset-time state this entry sets
+# up; a blocked environment exits 2 through this call.
 "$TEST_MULTICA_DIR/selfcheck.sh"
 
 printf '\n'
@@ -246,7 +248,7 @@ printf 'entry:        %s\n' "$ENTRY_URL"
 printf 'agent:        %s\n' "$AGENT_NAME"
 printf 'chat session: %s\n' "$CHAT_TITLE"
 printf 'next:         ./wire.sh         # points the instance at the access point and starts it\n'
-printf '              ./bind-agent.sh   # after the instance registered its runtime (creates the §3 autopilot %s)\n' "$AUTOPILOT_TITLE"
+printf '              ./bind-agent.sh   # after the instance registered its runtime (creates the test autopilot %s)\n' "$AUTOPILOT_TITLE"
 if [ "$print_token" -eq 1 ]; then
 	printf 'token:        %s\n' "$(pat)"
 fi

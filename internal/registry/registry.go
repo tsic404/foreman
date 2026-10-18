@@ -9,12 +9,12 @@ import (
 	"time"
 )
 
-// DoneIndexTTL is the retention of terminal task IDs (contract §3.1); within
+// DoneIndexTTL is the retention of terminal task IDs (§4.3); within
 // the window the index deduplicates late reports and repeated claims.
 const DoneIndexTTL = 24 * time.Hour
 
 // ErrTerminalImmutable rejects a write that would move a terminal entry back
-// to a non-terminal state (task-mapping invariant 4: terminal is irreversible).
+// to a non-terminal state (§4.2 invariant: terminal is irreversible).
 var ErrTerminalImmutable = errors.New("terminal entry cannot become non-terminal")
 
 // Registry is the in-memory mapping index. The K8s Job objects are the
@@ -41,7 +41,7 @@ type Registry struct {
 	byDaemon map[string]string // daemon_id → task_id
 
 	// done is the settled index: terminal task_id → the entry's terminal
-	// projection (contract §3.1). It backs the late-replay dedup, the drain
+	// projection (§4.3). It backs the late-replay dedup, the drain
 	// duration and — after the credential reclaim deletes the live row — the
 	// retained terminal record the ops endpoint still answers with.
 	done *ttlMap[TaskEntry]
@@ -51,7 +51,7 @@ type Registry struct {
 	// — an issue key would pin every agent of an issue to one node while only
 	// the resuming agent gains anything from it.
 	sessionNode map[string]sessionNodeEntry
-	// Saturation markers of the per-node soft cap (task-mapping §同节点并发,
+	// Saturation markers of the per-node soft cap (§8.6 饱和抑制,
 	// ADR-006 节流): replaced wholesale by the scheduler's reconcile round,
 	// so the set never outgrows the live node count.
 	saturated map[string]bool
@@ -191,7 +191,7 @@ func (r *Registry) SetLastStatusSeen(taskID, status string) {
 }
 
 // SetLeaseKeepUntil records the task's current prepare-lease deadline
-// (contract §3.1 lease_keep_until): the last successful C4 renewal plus the
+// (§10 lease_keep_until): the last successful C4 renewal plus the
 // server's 45s lease TTL. The value is a local upper bound of the server's
 // own prepare_lease_expires_at — it is projected with Foreman's clock and
 // taken after the renewal response returns (local round trip/2 + clock
@@ -219,7 +219,7 @@ func (r *Registry) List() []TaskEntry {
 	return out
 }
 
-// Inflight counts non-terminal entries (contract §3.1).
+// Inflight counts non-terminal entries (§4.2).
 func (r *Registry) Inflight() int {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
@@ -240,13 +240,13 @@ func (r *Registry) IsDone(taskID string) bool {
 
 // DoneAt returns the moment the task reached its verdict, as recorded by the
 // single alive → draining transition. The credential reclaim measures the
-// drain duration from it (observability.md §指标 foreman_job_drain_seconds).
+// drain duration from it (§9.2 foreman_job_drain_seconds).
 func (r *Registry) DoneAt(taskID string) (time.Time, bool) {
 	_, at, ok := r.done.get(taskID)
 	return at, ok
 }
 
-// Settled returns the retained terminal record of taskID (contract §3.1):
+// Settled returns the retained terminal record of taskID (§4.3):
 // the entry's terminal projection, still answerable after the credential
 // reclaim deleted the live row, until the retention window expires. It backs
 // the ops endpoint's post-hoc query face (ADR-032); the record never carries
@@ -266,11 +266,11 @@ func (r *Registry) Settled(taskID string) (TaskEntry, bool) {
 func (r *Registry) Now() time.Time { return r.now() }
 
 // MarkTerminal is the single write path into the terminal state
-// (task-mapping pseudocode markTerminal): it sets state+result atomically
-// with the settled record. completedAt defaults to now. reason is the
+// (§4.2 markTerminal): it sets state+result atomically with the settled
+// record. completedAt defaults to now. reason is the
 // externally observable attribution of a failure Foreman judged itself; an
 // empty one leaves any recorded attribution in place, and the server's own
-// verdicts carry none (contract §3.1).
+// verdicts carry none (§4.1).
 //
 // It is also the drain entry point (ADR-017): the alive → draining transition
 // writes drain_deadline, the completion time and the settled record exactly
@@ -334,7 +334,7 @@ func (r *Registry) SetTokenHash(taskID, tokenHash string) {
 }
 
 // MarkJobCreated advances pending → job_created and records the apiserver's
-// creationTimestamp as job_created_at (contract §3.1: the pod instance
+// creationTimestamp as job_created_at (§4.1: the pod instance
 // filter's basis, never a local clock reading). It writes in place — the
 // claim's snapshot predates the Job create, which can wait up to jobNameWait
 // on a name still held by a terminating predecessor, so re-Putting that
@@ -376,7 +376,7 @@ func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntr
 
 // MarkDelivering atomically performs the S6 delivery check and records the
 // delivered body as the entry's payload, so the ops preview serves exactly
-// what the daemon received (observability.md §端点). Only a claim gate the
+// what the daemon received (§9.3). Only a claim gate the
 // entry passes transitions (deliverable); without the single-lock check, two
 // concurrent claims could both pass the test before either writes. It also
 // (re-)arms the delivery confirmation window (ADR-032): the entry's delivery
@@ -412,8 +412,8 @@ func deliverable(e TaskEntry, at time.Time) bool {
 }
 
 // NoteClaimAfterDelivery records one S6 claim answered with an empty batch
-// while the entry's delivery was committed and still unconfirmed (contract
-// §3.1). The count is the per-task discriminator between "the request never
+// while the entry's delivery was committed and still unconfirmed
+// (§4.1). The count is the per-task discriminator between "the request never
 // arrived" and "the response was lost": the daemon keeps asking only when it
 // never got the payload.
 func (r *Registry) NoteClaimAfterDelivery(taskID string) {
@@ -460,7 +460,7 @@ func (r *Registry) SetNode(taskID, nodeName string) {
 }
 
 // ActiveJobsByNode counts the non-terminal entries placed on each node
-// (contract §3.1: Inflight semantics). Entries whose pod has not landed yet
+// (§4.2: Inflight semantics). Entries whose pod has not landed yet
 // carry no node_name and are not counted, so the load appears one reconcile
 // round after placement. It is the load input of the per-node soft cap
 // (ADR-006 §决策结果 3).
@@ -477,7 +477,7 @@ func (r *Registry) ActiveJobsByNode() map[string]int {
 	return byNode
 }
 
-// SetSaturatedNodes replaces the saturation markers (task-mapping §同节点并发:
+// SetSaturatedNodes replaces the saturation markers (§8.6 饱和抑制:
 // Reconcile marks the nodes at or over FOREMAN_MAX_JOBS_PER_NODE). The whole
 // set is replaced because a node that dropped below the cap must lose its
 // marker again; replacement also prunes nodes that left the index.
@@ -520,7 +520,7 @@ func (r *Registry) dropIndexesLocked(e TaskEntry) {
 }
 
 // PutRuntime upserts the fake runtime of a Job's daemon (S4 registration,
-// contract §3.3).
+// §2.3).
 func (r *Registry) PutRuntime(rt JobRuntime) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

@@ -11,7 +11,7 @@ import (
 	"github.com/tsic404/foreman/internal/scheduler"
 )
 
-// tokenRenewResponseTTL is the S24 synthetic expiry (§1.2: now+24h; the Job
+// tokenRenewResponseTTL is the S24 synthetic expiry (§2.2: now+24h; the Job
 // Token is not actually renewed through this endpoint).
 const tokenRenewResponseTTL = 24 * time.Hour
 
@@ -45,7 +45,7 @@ func (s *FakeServer) handleRepos(w http.ResponseWriter, r *http.Request) {
 	if repos == nil {
 		// The register-before window (the startup probe's S1/S2 calls): C1 has
 		// not run yet, so there is nothing cached to hand back — an empty repos
-		// list, which never blocks the registration (§1.2 S2).
+		// list, which never blocks the registration (S-2).
 		repos = noRepos
 	}
 	writeRaw(w, http.StatusOK, mustMarshal(map[string]any{
@@ -61,7 +61,7 @@ func (s *FakeServer) handleRepos(w http.ResponseWriter, r *http.Request) {
 type daemonRegisterRequest struct {
 	DaemonID string `json:"daemon_id"`
 	// CLIVersion is the template CLI's version: the startup probe's value
-	// becomes C1's cli_version (§1.1 C1 的取值来源与声明域).
+	// becomes C1's cli_version (C-1 的取值来源与声明域).
 	CLIVersion string            `json:"cli_version"`
 	Runtimes   []registerRuntime `json:"runtimes"`
 	// FailedProfiles travels verbatim into C1; Foreman never interprets it.
@@ -107,7 +107,7 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	// The Job's provider is the provider of the real runtime its claim was
 	// dispatched under; the declared entry of that type is the one echoed
-	// back (§1.2 S4 的选条与拒绝注册面).
+	// back (§2.3).
 	jobProvider, known := s.client.ProviderForRuntime(e.RealRuntimeID)
 	if !known {
 		// A rebuilt entry has no dispatch record: fall back to the oldest
@@ -173,8 +173,8 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 // ---- S5 heartbeat ----
 
 // handleHeartbeat answers S5 with the fixed ok body — never any pending_*
-// field (§1.2 S5) — and refreshes the shared heartbeat clock. An unknown
-// runtime gets a 404 so the daemon re-registers (scenario #12).
+// field (S-5) — and refreshes the shared heartbeat clock. An unknown
+// runtime gets a 404 so the daemon re-registers (§1.4).
 func (s *FakeServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	claims, ok := s.authenticate(w, r, auth.RequestScope{})
 	if !ok {
@@ -236,7 +236,7 @@ type daemonClaimRequest struct {
 	MaxTasks   int      `json:"max_tasks"`
 }
 
-// handleClaim delivers the Job's task at most once (S6; proxy.md §任务交付).
+// handleClaim delivers the Job's task at most once (S6; §2.5).
 func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 	claims, ok := s.authenticate(w, r, auth.RequestScope{})
 	if !ok {
@@ -257,7 +257,7 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	if claims.Role == catalogProbeRole {
 		// A probe carries no task face: always an empty batch, never a 403
-		// and never a registry lookup (§1.2 S6).
+		// and never a registry lookup (S-6).
 		writeRaw(w, http.StatusOK, mustMarshal(map[string]any{"tasks": []json.RawMessage{}}))
 		return
 	}
@@ -346,10 +346,10 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 	case err != nil:
 		s.log.Debug("prepare-lease forward failed", "task_id", tid, "job_name", claims.JobName, "err", err)
 	case ready:
-		// Local renewal bookkeeping (proxy.md §请求路由 S7): the daemon's
+		// Local renewal bookkeeping (§2.2 S-7): the daemon's
 		// renewal restamped the same server lease the keeper renews, so the
-		// entry's lease_keep_until advances here too (contract §3.1) and the
-		// same Info observation line is emitted (protocol-lease.md 场景 A).
+		// entry's lease_keep_until advances here too (§4.1) and the
+		// same Info observation line is emitted.
 		until := time.Now().Add(scheduler.PrepareLeaseTTL)
 		s.reg.SetLeaseKeepUntil(tid, until)
 		s.log.Info("lease.renewed", "task_id", tid, "job_name", claims.JobName,
@@ -361,8 +361,8 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 // ---- S9 status ----
 
 // handleTaskStatus forwards C13 so the daemon can discover cancellation. A
-// server-side 404 settles the mapping locally (proxy.md 转发 switch:
-// non-terminal 404 → OnTaskVanished; failure-handling scenario #9).
+// server-side 404 settles the mapping locally (the forward switch:
+// non-terminal 404 → OnTaskVanished; §4.6).
 func (s *FakeServer) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 	tid := r.PathValue("tid")
 	if _, ok := s.authenticate(w, r, auth.RequestScope{TaskID: tid}); !ok {
@@ -413,7 +413,7 @@ func (s *FakeServer) reportHandler(ep scheduler.Endpoint) http.HandlerFunc {
 		}
 		if claims.IsLateReplay {
 			// The task settled and the report already landed: idempotent
-			// 200, no side effects (proxy.md 迟到重放).
+			// 200, no side effects (§1.3 迟到重放).
 			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 			return
 		}
@@ -542,7 +542,7 @@ func (s *FakeServer) handleS23(w http.ResponseWriter, r *http.Request) {
 // ---- S29 passthrough ----
 
 // handlePassthrough forwards any non-fmj_ /api/* call to the real server
-// verbatim (§1.2 rule 2 + ADR-020): the caller's whole header set and body
+// verbatim (§2.1 rule 2 + ADR-020): the caller's whole header set and body
 // go out as given, the upstream status, header set and body come back as
 // given. This call site neither picks nor adds fields — the exclusion set
 // lives in Passthrough alone. Upstream 5xx and transport failures map to 502.
@@ -559,7 +559,7 @@ func (s *FakeServer) handlePassthrough(w http.ResponseWriter, r *http.Request) {
 	writeUpstream(w, code, header, resp)
 }
 
-// writeUpstream replays a passthrough response verbatim (§1.2 S29): the
+// writeUpstream replays a passthrough response verbatim (S-29): the
 // upstream's fields, then its status, then its body bytes. It is not the
 // local-response outlet — writeRaw stamps Content-Type: application/json on
 // the responses Foreman synthesizes, which would rewrite this one. Nil

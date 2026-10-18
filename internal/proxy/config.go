@@ -9,7 +9,7 @@ import (
 	"time"
 )
 
-// Environment variable names from the contract config table (§5.1).
+// Environment variable names read by the proxy module.
 const (
 	EnvServerURL            = "MULTICA_SERVER_URL"
 	EnvWorkspaceID          = "MULTICA_WORKSPACE_ID"
@@ -23,7 +23,7 @@ const (
 	EnvModelCatalogCacheTTL = "FOREMAN_MODEL_CATALOG_CACHE_TTL"
 )
 
-// Contract defaults (§5.1).
+// Default values applied when the environment variable is unset.
 const (
 	// DefaultDaemonID is the contract's foreman-<cluster> pattern collapsed
 	// to the single-cluster deployment v1 supports.
@@ -48,9 +48,9 @@ const (
 	// adding or dropping an entry changes server response shapes (§1.1).
 	ClientCapabilities = "skill-bundles-v1,coalesced-comments-v1,rpc-v1"
 
-	// controlTimeout is the control-plane HTTP timeout (§4).
+	// controlTimeout is the control-plane HTTP timeout (§1.5).
 	controlTimeout = 30 * time.Second
-	// leaseTimeout is the C4 prepare-lease timeout (§4).
+	// leaseTimeout is the C4 prepare-lease timeout (§1.5).
 	leaseTimeout = 10 * time.Second
 )
 
@@ -73,10 +73,10 @@ type Config struct {
 	// (ack → probe → C21); false disables consumption but not the startup probe.
 	ModelCatalogEnabled bool
 	// ModelCatalogTimeout is one catalog probe's own budget, anchored at the
-	// moment the ack is consumed (§1.1 C21 第 6 条).
+	// moment the ack is consumed (§1.3).
 	ModelCatalogTimeout time.Duration
 	// ModelCatalogCacheTTL is the catalog cache staleness threshold: crossing
-	// it only logs a warning, it never stops answering (§5.1).
+	// it only logs a warning, it never stops answering (§10).
 	ModelCatalogCacheTTL time.Duration
 }
 
@@ -152,7 +152,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if cfg.ModelCatalogCacheTTL, err = envDuration(getenv, EnvModelCatalogCacheTTL, cfg.ModelCatalogCacheTTL); err != nil {
 		return Config{}, err
 	}
-	// §5.1 startup self-check: probeMinBudget (= timeout/3) must cover one
+	// §1.3 startup self-check: probeMinBudget (= timeout/3) must cover one
 	// heartbeat period, otherwise a probe started on the minimum budget can
 	// never receive its command before the budget runs out.
 	if cfg.ModelCatalogTimeout < 3*ProbeHeartbeatInterval {

@@ -1,6 +1,6 @@
 // Package auth implements Foreman's two-way authentication: it signs and
 // statelessly verifies per-Job Tokens (fmj_), and loads Foreman's own server
-// credential. Design: docs/05-modules/auth.md, ADR-007.
+// credential. Design: 02-contracts.md §2.1/§6, ADR-007.
 package auth
 
 import (
@@ -238,10 +238,10 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 		}
 		claims.Role = RoleCatalogProbe
 		// The probe has no task face at all: any {tid} on the path is out of
-		// scope, never a resource to adjudicate (auth.md「目录探针的身份
-		// 面」作用域行). Without this, a probe token could drive the
-		// task-addressed endpoints (S9/S20/S26 forward with Foreman's own
-		// server credential) and even settle an in-flight task via S9's 404.
+		// scope, never a resource to adjudicate (§6.3 作用域行). Without
+		// this, a probe token could drive the task-addressed endpoints
+		// (S9/S20/S26 forward with Foreman's own server credential) and
+		// even settle an in-flight task via S9's 404.
 		if req.TaskID != "" {
 			return Claims{}, fmt.Errorf("%w: probe carries no task scope, got %s", ErrScopeMismatch, req.TaskID)
 		}
@@ -292,7 +292,7 @@ func (i *Issuer) Hash(token string) string {
 // the Secret and the entry (ADR-017); see RevocationSet for the face it
 // protects.
 //
-// The window is the *upper bound approximation* of auth.md's "TTL = the
+// The window is the *upper bound approximation* of §6.1's "TTL = the
 // token's remaining validity": the reclaim runs after the issue, so the
 // remaining time is ≤ the issued TTL, and `now + TTL + ClockSkew` therefore
 // never expires an entry early (conservative direction — the digest may

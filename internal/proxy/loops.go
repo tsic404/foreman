@@ -10,13 +10,13 @@ import (
 	"time"
 )
 
-// heartbeatInterval is the C2 cadence (§1.1: every 15s per real runtime).
+// heartbeatInterval is the C2 cadence (§1.2: every 15s per real runtime).
 const heartbeatInterval = 15 * time.Second
 
-// tokenRenewInterval is the C16 cadence (§1.1: every 72h, non-fatal).
+// tokenRenewInterval is the C16 cadence (§1.2: every 72h, non-fatal).
 const tokenRenewInterval = 72 * time.Hour
 
-// isConfigError reports whether err is a 403 (§1.1 failure table: token ↔
+// isConfigError reports whether err is a 403 (§1.5: token ↔
 // daemon_id/workspace_id mismatch). 403 is a configuration error: log it
 // and stop instead of blindly retrying — a CrashLoopBackOff is the alarm.
 func isConfigError(err error) bool {
@@ -24,20 +24,20 @@ func isConfigError(err error) bool {
 	return errors.As(err, &se) && se.Code == http.StatusForbidden
 }
 
-// ClaimScheduler is the scheduler's claim surface (task-mapping 内部结构).
+// ClaimScheduler is the scheduler's claim surface.
 type ClaimScheduler interface {
 	// ClaimBudget is how many tasks may be claimed right now.
 	ClaimBudget() int
 	// OnClaim registers a claimed task and creates its Job; duplicate
-	// claims (server redispatch) are settled inside (task-mapping §重复
-	// claim), so the loop hands every claimed task over.
+	// claims (server redispatch) are settled inside (§4.3), so the loop hands
+	// every claimed task over.
 	OnClaim(ctx context.Context, task json.RawMessage) error
 }
 
-// ClaimLoop is the polling claim loop (proxy.md §claim 循环): it claims up
+// ClaimLoop is the polling claim loop (S-6 + §10): it claims up
 // to the scheduler's budget every FOREMAN_CLAIM_INTERVAL, idles at
 // FOREMAN_CLAIM_INTERVAL_IDLE when no slot is free, and runs one immediate
-// iteration on a WS wakeup (ADR-010). Errors back off per §4 (1s→30s,
+// iteration on a WS wakeup (ADR-010). Errors back off per §1.5 (1s→30s,
 // never exit) — except 403, which is a config error and stops the loop.
 type ClaimLoop struct {
 	cfg     Config
@@ -70,9 +70,9 @@ func (l *ClaimLoop) Wake() {
 	}
 }
 
-// Run preflights (C1/C17/C18/C16) with §4 backoff, then serves the claim
+// Run preflights (C1/C17/C18/C16) with §1.5 backoff, then serves the claim
 // loop until ctx ends. A 403 ends the loop with an error: the credential
-// is misbound (§1.1 failure table) and retrying cannot fix it.
+// is misbound (§1.5) and retrying cannot fix it.
 func (l *ClaimLoop) Run(ctx context.Context) error {
 	for {
 		err := l.client.Preflight(ctx)
@@ -132,7 +132,7 @@ func (l *ClaimLoop) iterate(ctx context.Context) error {
 }
 
 // interval picks the poll cadence: the idle interval when no claim slot is
-// free, the active interval otherwise (§5.1).
+// free, the active interval otherwise.
 func (l *ClaimLoop) interval() time.Duration {
 	if l.sched.ClaimBudget() == 0 {
 		return l.cfg.ClaimIntervalIdle
@@ -142,10 +142,9 @@ func (l *ClaimLoop) interval() time.Duration {
 
 // HeartbeatLoop keeps every declared real runtime alive: one independent C2
 // stream per runtime, each with its own backoff — a failing runtime never
-// touches the others (§7 多 runtime 的失败面按 runtime 粒度). C16 renews the
+// touches the others (§1.4 多 runtime 的失败面按 runtime 粒度). C16 renews the
 // server token every 72h and is non-fatal. A 403 stops the loop (config error).
-// The heartbeat ack is consumed in the same round it arrives (§1.1「C2 ack
-// 消费」第 3 条).
+// The heartbeat ack is consumed in the same round it arrives (§1.3).
 type HeartbeatLoop struct {
 	client   *Client
 	reporter *ModelCatalogReporter
@@ -174,7 +173,7 @@ func NewHeartbeatLoop(client *Client, reporter *ModelCatalogReporter) *Heartbeat
 
 // Run supervises one heartbeat goroutine per declared real runtime until ctx
 // ends or a 403 marks the credential misbound. A runtime whose id moved is
-// restarted on its own; the other streams keep running (§7).
+// restarted on its own; the other streams keep running (§1.4).
 func (l *HeartbeatLoop) Run(ctx context.Context) error {
 	changes := l.client.Changes()
 	streams := map[string]heartbeatStream{}
@@ -250,7 +249,7 @@ func (l *HeartbeatLoop) stream(ctx context.Context, runtimeID string) error {
 	backoff := newBackoff()
 	// The ack body's runtime_id is advisory: the real server's ack does not
 	// reliably echo it, so a mismatch is worth one event per stream — never a
-	// re-key (§1.1「C2 ack 消费」).
+	// re-key (§1.3).
 	ackMismatchWarned := false
 	for {
 		ack, err := l.client.Heartbeat(ctx, runtimeID)

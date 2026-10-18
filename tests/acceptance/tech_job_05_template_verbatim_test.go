@@ -126,7 +126,7 @@ func TestJob05TemplateVerbatimCustomWindow(t *testing.T) {
 		t.Errorf("docker-sock = %+v, want the template's node socket", socket.VolumeSource)
 	}
 	if pod.NodeSelector["disktype"] != "ssd" {
-		t.Errorf("nodeSelector = %v, want the template's (no §5.1 env is applied)", pod.NodeSelector)
+		t.Errorf("nodeSelector = %v, want the template's (no §8.2 A1.1 env is applied)", pod.NodeSelector)
 	}
 	if got := envValue(agent.Env, "HTTP_PROXY"); got != "http://proxy.corp:3128" {
 		t.Errorf("agent HTTP_PROXY = %q, want the template's", got)
@@ -165,7 +165,7 @@ func TestJob05TemplateVerbatimCustomWindow(t *testing.T) {
 		t.Errorf("per-task keys = %v/%v", job.Labels, job.Annotations)
 	}
 	if job.Spec.Template.Labels[registry.LabelTaskID] != "task-1" || job.Spec.Template.Labels["app.kubernetes.io/name"] != "foreman-job" {
-		t.Errorf("pod labels = %v, want the two §3.2 labels", job.Spec.Template.Labels)
+		t.Errorf("pod labels = %v, want the two A1.2 labels", job.Spec.Template.Labels)
 	}
 	if _, present := job.Spec.Template.Labels["app.kubernetes.io/managed-by"]; present {
 		t.Error("pod labels carry managed-by: that key is Job-side only")
@@ -209,7 +209,7 @@ func TestJob05TemplateVerbatimCustomWindow(t *testing.T) {
 // substitution set's one exception — a template that writes it outside the
 // recognition site keeps it verbatim. The Job still builds; whether that
 // position can take the literal is the apiserver's call at creation
-// (03-contracts §5.4「占位符替换」第 4 条), never a Build failure and never a
+// (02-contracts.md §8.3 非法形态的失败面), never a Build failure and never a
 // silent rewrite.
 func TestJob05NodeLiteralOutsideRecognitionSite(t *testing.T) {
 	const manifest = `
@@ -264,8 +264,7 @@ spec:
 	}
 }
 
-// registeredPlaceholders is the substitution set of 05-modules/job-template.md
-// 「占位符与回归基线」.
+// registeredPlaceholders is the substitution set of 02-contracts.md §8.3.
 var registeredPlaceholders = []string{
 	"<task_id>", "<agent_id>", "<workspace_id>", "<issue_id>", "<issue-identifier>",
 	"<autopilot_run_id>", "<chat_session_id>", "<job runtime uuid>", "<RFC3339>",

@@ -20,18 +20,17 @@ import (
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 )
 
-// PolicyPath is the fixed policy carrier location (03-contracts.md §5.3/§5.4):
+// PolicyPath is the fixed policy carrier location (02-contracts.md §8.5):
 // the Deployment mounts the optional ConfigMap foreman-job-policy here with key
 // policy.yaml, as an optional read-only volume. The file's absence is a legal
 // default — all three axes stay None — so the path is a constant and not an env
 // switch, exactly like the template carrier's.
 const PolicyPath = "/etc/foreman/policy/policy.yaml"
 
-// Policy-side startup literals (03-contracts.md §5.4「风险告知」and「运维口径」).
-// The declaration is always printed — a missing policy file is a legal default,
-// not a silent one — and the hash line only when the file was readable. They are
-// independent of the template's own two lines and never replace them (AC-29 /
-// AC-44).
+// Policy-side startup literals (§8.7). The declaration is always printed — a
+// missing policy file is a legal default, not a silent one — and the hash
+// line only when the file was readable. They are independent of the template's
+// own two lines and never replace them (AC-29 / AC-44).
 const (
 	policyEffectStatement = "策略文件在启动期一次性加载，运行中变更不生效"
 	policyHashLinePrefix  = "策略文件内容哈希 sha256="
@@ -49,7 +48,7 @@ const (
 )
 
 // appliedValue renders the tier the way policy.applied carries it
-// (05-modules/observability.md: none / project / agent / project_with_agent).
+// (§9.1: none / project / agent / project_with_agent).
 func (a AxisPolicy) appliedValue() string {
 	switch a {
 	case AxisProject:
@@ -75,7 +74,7 @@ const (
 )
 
 // PolicyNameResolver is the platform-side seam ADR-035 leaves to the platform
-// (03-contracts.md §5.4 第 2 条: the query's shape is a platform contract).
+// (02-contracts.md §8.5: the query's shape is a platform contract).
 // Foreman calls it once per key at startup, never again: a nil resolver means
 // the platform offers no such query, so every key concludes unavailable and
 // startup continues (the documented degradation).
@@ -87,14 +86,14 @@ type PolicyNameResolver interface {
 }
 
 // Axis sources: the evaluation outcome of one axis
-// (05-modules/observability.md policy.applied *_source).
+// (§9.1: the policy.applied event's *_source field).
 const (
 	SourceDirect       = "direct"
 	SourceNoDefinition = "no_definition"
 	SourceNoIdentity   = "no_identity"
 )
 
-// Project identity sources (contract §3.1 项目身份).
+// Project identity sources (02-contracts.md §4.1 项目身份).
 const (
 	ProjectSourcePayload = "payload"
 	ProjectSourceAPI     = "api"
@@ -158,7 +157,7 @@ func emptyNodeSelector(d map[string]string) bool { return len(d) == 0 }
 
 // Evaluation is one task's three-axis outcome, before and after the merge:
 // the fields map one-to-one onto the policy.applied event
-// (05-modules/observability.md), so the event is a rendering of this struct.
+// (§9.1), so the event is a rendering of this struct.
 type Evaluation struct {
 	resourcePolicy     AxisPolicy
 	capPolicy          AxisPolicy
@@ -230,15 +229,15 @@ type fileCapabilities struct {
 	Add []string `json:"add"`
 	// Drop is present only so an explicit drop key is decodable and can be
 	// refused with a precise reason: silently ignoring it would swallow a
-	// security intent (03-contracts.md §5.4「加载与失败」第 3 类).
+	// security intent (§8.5, loading-and-failure class 3).
 	Drop []string `json:"drop"`
 }
 
-// LoadPolicy is the policy startup gate (03-contracts.md §5.4「策略文件」段,
-// job-template.md §关键流程 step 0b). A missing file is a legal default: all
-// three axes read None, a warn records it, and the fixed declaration sentence is
-// still printed. A file that is unreadable, unparseable, carries an explicit
-// drop, or whose keys the platform's authority reports absent or ambiguous
+// LoadPolicy is the policy startup gate (§8.5, alongside the template gate of
+// §8.1). A missing file is a legal default: all three axes read None, a warn
+// records it, and the fixed declaration sentence is still printed. A file
+// that is unreadable, unparseable, carries an explicit drop, or whose keys the
+// platform's authority reports absent or ambiguous
 // refuses startup; an unreachable platform only downgrades the conclusions to
 // unavailable.
 func LoadPolicy(cfg Config) (Policy, error) {
@@ -632,8 +631,8 @@ func (p Policy) Evaluate(e TaskEntry) Evaluation {
 
 	// An empty agent name leaves the agent's row unreachable, so no axis
 	// declares a tier; the reason nothing was read is the missing identity,
-	// not a missing definition (05-modules/job-template.md 静默面: agent 名缺席
-	// ⇒ no_identity). An agent that is simply unlisted keeps no_definition.
+	// not a missing definition (§8.5: an absent agent name reads no_identity).
+	// An agent that is simply unlisted keeps no_definition.
 	if e.AgentName == "" {
 		ev.resourceSource, ev.capSource, ev.nodeSelectorSource = SourceNoIdentity, SourceNoIdentity, SourceNoIdentity
 		return ev
@@ -938,10 +937,10 @@ func copyNodeSelector(def map[string]string) map[string]string {
 }
 
 // applyPolicy writes the evaluated axes onto the rendered Job
-// (03-contracts.md §5.4 A1.5): the first container's resources as one
-// replacement block, its capability add list appended, and the pod template's
-// nodeSelector merged key by key. drop and every other securityContext field
-// stay the template's, and initContainers are never touched.
+// (§8.2 A1.5): the first container's resources as one replacement block, its
+// capability add list appended, and the pod template's nodeSelector merged key
+// by key. drop and every other securityContext field stay the template's, and
+// initContainers are never touched.
 func applyPolicy(job *batchv1.Job, ev Evaluation) {
 	containers := job.Spec.Template.Spec.Containers
 	if len(containers) == 0 {
@@ -1016,10 +1015,10 @@ type logger interface {
 }
 
 // logPolicyApplied emits the per-task policy.applied event
-// (05-modules/observability.md): the declared tiers, the per-axis source, the
-// project and name sources, the definition-side overrides, the faces actually
-// written, and the soft-affinity decision's cause. It is the only observable
-// face of a policy that silently does not apply; there is no policy metric
+// (§9.1): the declared tiers, the per-axis source, the project and name
+// sources, the definition-side overrides, the faces actually written, and the
+// soft-affinity decision's cause. It is the only observable face of a policy
+// that silently does not apply; there is no policy metric
 // (cardinality discipline).
 func (b *Builder) logPolicyApplied(e TaskEntry, jobName string, ev Evaluation) {
 	b.cfg.logger().Info("policy.applied",

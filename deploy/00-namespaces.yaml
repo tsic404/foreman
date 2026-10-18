@@ -1,4 +1,4 @@
-# Foreman namespaces (contracts §5.3).
+# Foreman namespaces (object names are implementation-side).
 #
 # `foreman` hosts the single-replica Foreman Deployment, its Service and the
 # server credential; `multica-agents` hosts every Job/Secret Foreman creates,

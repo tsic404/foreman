@@ -1,4 +1,4 @@
-# Foreman local build entry points (docs/04-architecture.md §部署/运行方式).
+# Foreman local build entry points.
 #
 # Local development only: the release path is the two workflows in
 # `.github/workflows/` (build-foreman.yml, build-foreman-job.yml), which build

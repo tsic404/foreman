@@ -14,26 +14,26 @@ import (
 	"github.com/tsic404/foreman/internal/scheduler"
 )
 
-// Timing defaults of the failure-handling 场景矩阵. They are design
-// constants (§5.1 makes only the interval configurable); the reconciler
+// Timing defaults of the failure-recovery paths. They are design
+// constants (only the interval is configurable); the reconciler
 // carries them as fields so its own tests can shrink them, and every timer
 // reads the real clock so a shrunk window is honoured by the loop.
 const (
 	// defaultRecheckWindow gives a daemon that just lost its container the
 	// chance to land its terminal report before Foreman synthesizes one
-	// (场景 #3).
+	// (§4.6).
 	defaultRecheckWindow = 10 * time.Second
 	// defaultCancelAckTimeout is how long a server-side cancelled task waits
-	// for its daemon's cancel-ack before its objects are removed (场景 #8).
+	// for its daemon's cancel-ack before its objects are removed (§4.6).
 	defaultCancelAckTimeout = 60 * time.Second
 	// defaultSuspectThreshold is the two-channel heartbeat silence after
-	// which a task is flagged suspect — signalled, never acted on (场景 #6).
+	// which a task is flagged suspect — signalled, never acted on (§4.6).
 	defaultSuspectThreshold = 60 * time.Second
 	// defaultJobGoneWindow is how long a Job must be observed missing before
 	// the missing-Job compensation engages. Measured from the first missing
 	// observation, never from the claim: a long-lived Job that briefly
 	// disappears from the API or the informer view must not be failed on the
-	// spot (reconcileOne step 1).
+	// spot.
 	defaultJobGoneWindow = 60 * time.Second
 	// cleanupRetryLimit bounds the object-deletion retries of a terminal
 	// entry (顺序与幂等规则 2: 每轮重试删除，最多 10 轮). When the budget is
@@ -42,7 +42,7 @@ const (
 	cleanupRetryLimit = 10
 )
 
-// C13 statuses the convergence switches on (contract §1.1).
+// C13 statuses the convergence switches on (§1.2).
 const (
 	statusRunning    = "running"
 	statusQueued     = "queued"
@@ -58,14 +58,14 @@ type StatusClient interface {
 }
 
 // Watcher triggers a convergence round on Job/Pod changes so the loop does
-// not wait for the next tick (failure-handling 内部结构 JobWatcher). The
+// not wait for the next tick (the Job watcher). The
 // reconciler re-reads the object state itself, so a missed or stale event
 // costs latency, never correctness.
 type Watcher interface {
 	Watch(ctx context.Context, notify func()) error
 }
 
-// Metrics is the recovery module's observability seam (observability.md).
+// Metrics is the recovery module's observability seam (§9.2).
 // The observability module provides the Prometheus implementation; nil
 // degrades to a no-op.
 type Metrics interface {
@@ -78,7 +78,7 @@ type noopMetrics struct{}
 
 func (noopMetrics) HeartbeatSuspect(int) {}
 
-// Reconciler is the convergence driver (failure-handling 内部结构):
+// Reconciler is the convergence driver:
 // every round settles each live entry against the Job/Pod facts, the
 // server's C13 truth and the daemon's own reports, drains the durable
 // terminal-report queue and refreshes the heartbeat-suspect signal.
@@ -92,7 +92,7 @@ type Reconciler struct {
 	metrics Metrics
 	log     *slog.Logger
 
-	// Timing of the deferred settlements (design constants, §5.1). Kept as
+	// Timing of the deferred settlements (design constants). Kept as
 	// fields so the package tests can shrink them; every timer below runs on
 	// the real clock, so the shrunk value is what the loop actually waits.
 	recheckWindow    time.Duration
@@ -112,11 +112,11 @@ type Reconciler struct {
 
 	// ended records when a Job was first observed ended, so the daemon's
 	// report gets recheckWindow to arrive before the synthesized fail
-	// (场景 #3). missing records the first observation of a Job object that
+	// (§4.6). missing records the first observation of a Job object that
 	// is gone (jobGoneWindow, cleared as soon as it is visible again).
-	// cancels records the same for a server-side cancellation (场景 #8).
+	// cancels records the same for a server-side cancellation (§4.6).
 	// cleanups counts the failed deletion rounds of a terminal entry
-	// (顺序规则 2). releasing remembers a release this process started but
+	// releasing remembers a release this process started but
 	// could not finish, so a later round completes it instead of reading the
 	// missing Job as an unexpected death. suspects tracks the tasks
 	// currently flagged (transition events and gauge only).
@@ -137,7 +137,7 @@ func WithWatcher(w Watcher) Option {
 }
 
 // WithPendingReports wires the durable terminal-report queue and the sender
-// that re-delivers its entries (contract §4).
+// that re-delivers its entries (contract §10).
 func WithPendingReports(p *PendingReports, sender ReportSender) Option {
 	return func(r *Reconciler) {
 		r.pending = p
@@ -224,8 +224,8 @@ func (r *Reconciler) Run(ctx context.Context) error {
 // terminal report's 4s→64s retry budget, object deletes), and a value that
 // waits for the round to finish would freeze for exactly that long. This
 // ticker is independent of the round, so the gauge cannot lag the live index
-// by more than one interval whatever the round is doing (observability.md
-// §指标, AC-10; failure-handling 内部结构 Reconciler.Run).
+// by more than one interval whatever the round is doing (§9.2,
+// AC-10).
 func (r *Reconciler) refreshInflight(ctx context.Context) {
 	ticker := time.NewTicker(r.cfg.ReconcileInterval)
 	defer ticker.Stop()
@@ -315,7 +315,7 @@ func (r *Reconciler) nextDeadline() (time.Time, bool) {
 func (r *Reconciler) Reconcile(ctx context.Context) error {
 	// The inflight gauge is derived state of the live index: re-derive it on
 	// entry so the settlements below start from a fresh value, and let the
-	// independent ticker bound any straggler (observability.md §指标).
+	// independent ticker bound any straggler (§9.2).
 	r.settler.SyncInflight()
 	r.mu.Lock()
 	defer r.mu.Unlock()
@@ -328,7 +328,7 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 
 // round settles every live entry, collecting the first error so one broken
 // task does not hide the rest of the round. The orphan-Secret sweep runs once
-// per round, before the entries (failure-handling 场景 #16): it covers the
+// per round, before the entries (§6.5): it covers the
 // credentials a reclaim left behind when this process restarted.
 func (r *Reconciler) round(ctx context.Context) error {
 	// The session index expires on this loop alone (ADR-015): its entries are
@@ -346,7 +346,7 @@ func (r *Reconciler) round(ctx context.Context) error {
 		return nil
 	}
 	// One pod read per round, grouped by owning Job, instead of one call
-	// per entry (failure-handling 判据模型 reads both objects).
+	// per entry (the judgement reads both objects).
 	pods, err := r.objects.ListPods(ctx)
 	if err != nil {
 		return fmt.Errorf("list foreman pods: %w", err)
@@ -359,7 +359,7 @@ func (r *Reconciler) round(ctx context.Context) error {
 			break
 		}
 		// Node placement is the fact the per-node soft cap counts
-		// (FOREMAN_MAX_JOBS_PER_NODE, contract §1.3: Pod 读 spec.nodeName),
+		// (FOREMAN_MAX_JOBS_PER_NODE, contract §3: Pod 读 spec.nodeName),
 		// and the node_name the terminal report's learning face reads
 		// (ADR-015). The pods are already listed for this round; record the
 		// node once it is known.
@@ -379,7 +379,7 @@ func (r *Reconciler) round(ctx context.Context) error {
 	return firstErr
 }
 
-// reconcileOne converges a single task (failure-handling 收敛算法):
+// reconcileOne converges a single task:
 //
 //  0. locally terminal → retry the queued report, delete the Job, then close
 //     the drain window once the Job terminated or its upper bound expired
@@ -393,7 +393,7 @@ func (r *Reconciler) round(ctx context.Context) error {
 func (r *Reconciler) reconcileOne(ctx context.Context, e registry.TaskEntry, pods []corev1.Pod) error {
 	if e.IsTerminal() {
 		// Locally terminal: only a queued report and the Job deletion may
-		// still linger (顺序规则 1: the state was already written), and the
+		// still linger (§4.2: the state was already written), and the
 		// credential waits for the Job to terminate or the drain upper bound
 		// (ADR-017). Both are attempted: the drain must not stall behind a
 		// deletion that keeps failing.
@@ -418,7 +418,7 @@ func (r *Reconciler) reconcileOne(ctx context.Context, e registry.TaskEntry, pod
 		return fmt.Errorf("get job %s: %w", e.JobName, err)
 	}
 	if job == nil {
-		// 场景 #1/#9: the Job vanished (deleted, TTL-collected, or never
+		// §4.3/§4.6: the Job vanished (deleted, TTL-collected, or never
 		// created). The compensation waits out jobGoneWindow measured from
 		// this first missing observation — a briefly invisible long-lived
 		// Job must not be failed on the spot — and C13 then decides what to
@@ -444,8 +444,8 @@ func (r *Reconciler) reconcileOne(ctx context.Context, e registry.TaskEntry, pod
 }
 
 // release discards the objects and mapping of a task that will be re-run,
-// without any terminal report and without entering drain (failure-handling
-// 场景 #2). A failed attempt is remembered: the entry is the retry handle,
+// without any terminal report and without entering drain (§4.3). A failed
+// attempt is remembered: the entry is the retry handle,
 // and the next round must finish the release instead of treating the
 // already-deleted Job as an unexpected loss.
 func (r *Reconciler) release(ctx context.Context, taskID string) error {
@@ -531,7 +531,7 @@ func (r *Reconciler) reclaimIfDue(ctx context.Context, e registry.TaskEntry) err
 	return r.settler.OnJobTerminated(ctx, e.JobName, reason, podTerminatedAt, orphans)
 }
 
-// settleEnded compensates a Job whose container ended (场景 #3/#5/#11).
+// settleEnded compensates a Job whose container ended (§4.6).
 // A deadline kill is immediate; every other end first gives the daemon
 // recheckWindow to land its own terminal report — the daemon's report wins
 // whenever it arrives (判据模型), which the C13 recheck inside the
@@ -551,14 +551,14 @@ func (r *Reconciler) settleEnded(ctx context.Context, e registry.TaskEntry, reas
 	return r.comp.Fail(ctx, e, reason)
 }
 
-// settleFromServer applies the C13 facts (收敛算法 step 3). A healthy
+// settleFromServer applies the C13 facts. A healthy
 // in-flight task is left alone: the lease keeper and the daemon's own
 // reports own it.
 func (r *Reconciler) settleFromServer(ctx context.Context, e registry.TaskEntry) error {
 	st, err := r.server.TaskStatus(ctx, e.TaskID)
 	switch {
 	case errors.Is(err, scheduler.ErrTaskNotFound):
-		// 场景 #9: the server deleted the task — settle it terminal with an
+		// §4.6: the server deleted the task — settle it terminal with an
 		// empty result (the only source of result="") and delete the Job, but
 		// send no report for a task it never knew. The credential stays until
 		// the Job is gone (ADR-017).
@@ -578,13 +578,13 @@ func (r *Reconciler) settleFromServer(ctx context.Context, e registry.TaskEntry)
 		delete(r.cancels, e.TaskID)
 		return r.settler.SettleTerminal(ctx, e.TaskID, st)
 	case st == statusRunning:
-		// 场景 #1: the task is executing — keep the Job, stop lease
+		// §4.3: the task is executing — keep the Job, stop lease
 		// renewals and accept the daemon's reports (a rebuilt entry has no
 		// delivery to replay).
 		delete(r.cancels, e.TaskID)
 		return r.settler.AdoptRunning(ctx, e.TaskID)
 	case st == statusQueued || st == statusDispatched:
-		// 场景 #2: only a rebuilt entry (payload lost with the restart,
+		// §4.3: only a rebuilt entry (payload lost with the restart,
 		// F3) has nothing to deliver — release the Job so the server
 		// re-dispatches after its reclaim window. An in-flight entry still
 		// holds its payload and is simply pre-start: leave it alone.
@@ -599,7 +599,7 @@ func (r *Reconciler) settleFromServer(ctx context.Context, e registry.TaskEntry)
 	}
 }
 
-// settleCancelled implements 场景 #8: the server cancelled the task while
+// settleCancelled implements §4.6: the server cancelled the task while
 // its daemon may still be polling C13 (S9, every 5s) to notice. Foreman
 // waits cancelAckTimeout for the daemon's cancel-ack (forwarded as C11 and
 // settled by the normal report path), then settles the entry as cancelled
@@ -627,9 +627,9 @@ func (r *Reconciler) settleCancelled(ctx context.Context, e registry.TaskEntry) 
 
 // reportSuspects flags every live task whose daemon has been silent on both
 // heartbeat channels (S5 and the S30 WS frame share last_heartbeat_at) for
-// suspectThreshold, and refreshes the gauge (场景 #6). It never acts: the
+// suspectThreshold, and refreshes the gauge (§4.6). It never acts: the
 // daemon may still be working behind a partition, so the Job is kept and
-// only the pod's end (#3) may settle the task.
+// only the pod's end (§4.6) may settle the task.
 func (r *Reconciler) reportSuspects(ctx context.Context) {
 	suspects := 0
 	for _, e := range r.reg.List() {
@@ -659,8 +659,8 @@ func (r *Reconciler) reportSuspects(ctx context.Context) {
 }
 
 // drainPending re-delivers the durable terminal-report queue every round
-// (场景 #7/#10): the contract bounds a restored Foreman's catch-up to
-// 2×FOREMAN_RECONCILE_INTERVAL (§7 可靠性).
+// (§4.6/§10): the contract bounds a restored Foreman's catch-up to
+// 2×FOREMAN_RECONCILE_INTERVAL (§10 可靠性).
 func (r *Reconciler) drainPending(ctx context.Context) {
 	if r.pending == nil || r.sender == nil {
 		return

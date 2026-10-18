@@ -24,8 +24,8 @@ func scrape(t *testing.T, m *Metrics) string {
 }
 
 // TestMetricsExposeAllDesignedNames is TC-tech-observability-01 step 3 at
-// process start: every metric name from observability.md §指标 must appear
-// even before any recording.
+// process start: every metric name from §9.2 must appear even before any
+// recording.
 func TestMetricsExposeAllDesignedNames(t *testing.T) {
 	out := scrape(t, NewMetrics())
 	for _, name := range []string{
@@ -113,7 +113,7 @@ func TestWSJobGaugeNeverNegative(t *testing.T) {
 }
 
 // TestWSDegradationContract: with WS disabled no recorder is ever called,
-// yet the WS series stay registered at 0 (observability.md §降级契约).
+// yet the WS series stay registered at 0.
 func TestWSDegradationContract(t *testing.T) {
 	out := scrape(t, NewMetrics())
 	for _, want := range []string{

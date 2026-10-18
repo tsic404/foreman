@@ -132,9 +132,9 @@ func TestLeaseKeeperRound(t *testing.T) {
 	}
 }
 
-// TestLeaseKeeperProjectsLeaseKeepUntil guards contract §3.1: every
+// TestLeaseKeeperProjectsLeaseKeepUntil guards §4.1: every
 // successful C4 renewal advances the entry's lease_keep_until by the server's
-// 45s lease TTL — the field surface protocol-lease.md 场景 A reads as
+// 45s lease TTL — the field surface the acceptance case reads as
 // "lease_keep_until 持续推进". A refused or failed renewal moves nothing.
 func TestLeaseKeeperProjectsLeaseKeepUntil(t *testing.T) {
 	reg := registry.New(time.Now)
@@ -166,7 +166,7 @@ func TestLeaseKeeperProjectsLeaseKeepUntil(t *testing.T) {
 	if want := first.Add(scheduler.PrepareLeaseTTL); !renewed.LeaseKeepUntil.Equal(want) {
 		t.Fatalf("lease_keep_until = %v, want %v", renewed.LeaseKeepUntil, want)
 	}
-	// The renewal leaves the Info line protocol-lease.md 场景 A reads: the
+	// The renewal leaves the Info line the acceptance case reads: the
 	// handler's default level (info) admits it, a debug record would not.
 	records := logRecords(t, buf.Bytes(), "lease.renewed")
 	if len(records) != 1 {
@@ -175,7 +175,7 @@ func TestLeaseKeeperProjectsLeaseKeepUntil(t *testing.T) {
 	if got := records[0]["level"]; got != "INFO" {
 		t.Errorf("lease.renewed level = %v, want INFO (default-level observation surface)", got)
 	}
-	// observability.md §结构化日志: the field carries the same value
+	// §9.1: the field carries the same value
 	// /foreman/tasks projects, so it is compared against the projection, not
 	// against a re-derived format (a truncated/TZ-forced rendering would pass
 	// such a self-consistent check but fail the design's wording).
@@ -230,7 +230,7 @@ func TestLeaseKeeperSkipsTerminalAndStarted(t *testing.T) {
 
 // projectedLeaseKeepUntil returns the entry's lease_keep_until exactly as
 // /foreman/tasks renders it: TaskEntry's own JSON encoding, the same value
-// the lease.renewed line must carry (observability.md §结构化日志).
+// the lease.renewed line must carry (§9.1).
 func projectedLeaseKeepUntil(t *testing.T, e registry.TaskEntry) string {
 	t.Helper()
 	raw, err := json.Marshal(e)
@@ -264,7 +264,7 @@ func logRecords(t *testing.T, raw []byte, event string) []map[string]any {
 	return out
 }
 
-// TestLeaseKeeperSkipsRebuiltEntries guards failure-handling scenario #2:
+// TestLeaseKeeperSkipsRebuiltEntries guards §4.3:
 // an entry rebuilt from a K8s Job after a restart has no payload and a zero
 // boot deadline — leasing it would block server redispatch, and the zero
 // deadline would fake a boot timeout on a healthy pre-start task.
@@ -344,10 +344,10 @@ func TestLeaseKeeperBootBoundSplitsTheDeliveryAttribution(t *testing.T) {
 	}
 }
 
-// A switched-off boot bound (FOREMAN_JOB_BOOT_TIMEOUT=0, §5.1) leaves the
+// A switched-off boot bound (FOREMAN_JOB_BOOT_TIMEOUT=0) leaves the
 // entry's deadline unset while the entry is still this process's claim: the
 // renewals must continue — otherwise the server's prepare lease lapses and it
-// redispatches the task (contract §3.1) — and no settlement may fire on the
+// redispatches the task (§4.1) — and no settlement may fire on the
 // renewal path: `now.After(zero)` is true for every clock, so an unguarded
 // check would fail a healthy pre-start task, and the attribution split needs a
 // bound to hold against (ADR-026: the bound's presence and the payload's

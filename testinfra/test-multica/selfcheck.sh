@@ -1,10 +1,9 @@
 #!/bin/sh
-# The environment self-check of test-cases/_infra/test-multica-cluster.md §2 —
-# the three checks every acceptance round opens with.
+# The environment gate — the three checks every acceptance round opens with.
 #
 #   ./selfcheck.sh
 #
-#   ① the instance under test points at the test access point (§2 接线; never
+#   ① the instance under test points at the test access point (never
 #      the production address);
 #   ② the runtime list is empty — the reset-time state, asserted *before* the
 #      instance starts (the AC-01 premise; once it runs the assertion becomes

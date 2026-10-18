@@ -25,7 +25,7 @@ type wsFrame struct {
 	Payload json.RawMessage `json:"payload"`
 }
 
-// heartbeatAckOK is the pinned S30 heartbeat ack payload (§1.2 S30):
+// heartbeatAckOK is the pinned S-30 heartbeat ack payload (§2.2 S-30):
 // exactly runtime_id + status; server_capabilities and runtime_gone are
 // forbidden on the normal path.
 func heartbeatAckOK(runtimeID string) wsFrame {
@@ -37,8 +37,8 @@ func heartbeatAckOK(runtimeID string) wsFrame {
 }
 
 // heartbeatAckRuntimeGone is the single permitted runtime_gone signal:
-// the answer to a heartbeat naming an unknown runtime (failure-handling
-// scenario #12), which triggers the daemon's re-registration.
+// the answer to a heartbeat naming an unknown runtime (§1.4), which triggers
+// the daemon's re-registration.
 func heartbeatAckRuntimeGone(runtimeID string) wsFrame {
 	payload, _ := json.Marshal(map[string]any{
 		"runtime_id":   runtimeID,

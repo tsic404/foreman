@@ -45,7 +45,7 @@ func newTestHandler(reg *registry.Registry, logs PodLogReader) http.Handler {
 func do(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	// Ops endpoints take no Job Token (contract §1.2 S25); requests go out
+	// Ops endpoints take no Job Token (S-25); requests go out
 	// without Authorization on purpose.
 	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
 	return rec
@@ -110,13 +110,13 @@ func TestTasksListOmitsPayload(t *testing.T) {
 		t.Fatalf("payload leaked into tasks list: %v", e)
 	}
 	// The soft-affinity key is payload-derived, not a trigger context: it
-	// stays in memory too (§3.1).
+	// stays in memory too (§4.1).
 	if _, ok := e["prior_session_id"]; ok {
 		t.Fatalf("prior_session_id leaked into tasks list: %v", e)
 	}
 }
 
-// TestTasksListKeepsTriggerContextKeys (contract §3.1 / AC-04): the four
+// TestTasksListKeepsTriggerContextKeys (§4.1 / AC-04): the four
 // trigger-context keys are always in the projection — an absent context is an
 // empty string, never a missing key, so consumers can assert `== ""`.
 func TestTasksListKeepsTriggerContextKeys(t *testing.T) {
@@ -188,9 +188,8 @@ func TestTaskGetUnknown(t *testing.T) {
 	}
 }
 
-// TestPayloadPreview (observability.md §端点 / AC-07 ②): the preview serves
-// the delivered body, including the rewritten runtime_id — and only while the
-// entry is alive.
+// TestPayloadPreview (§9.3 / AC-07 ②): the preview serves the delivered body,
+// including the rewritten runtime_id — and only while the entry is alive.
 func TestPayloadPreview(t *testing.T) {
 	reg := registry.New(time.Now)
 	_ = reg.Put(registry.TaskEntry{
@@ -237,7 +236,7 @@ func TestPayloadPreview(t *testing.T) {
 	}
 }
 
-// TestPayloadPreviewNotDelivered (observability.md §端点): the window opens at
+// TestPayloadPreviewNotDelivered (§9.3): the window opens at
 // delivered_at, so an existing entry that was never delivered answers 404 with
 // the contract literal — its claim-time payload is not a delivery body.
 func TestPayloadPreviewNotDelivered(t *testing.T) {
@@ -250,7 +249,7 @@ func TestPayloadPreviewNotDelivered(t *testing.T) {
 		State:        registry.StateDaemonRegistered,
 		Payload:      json.RawMessage(`{"id":"t-1","runtime_id":"real-runtime"}`),
 	})
-	// Rebuilt-after-restart entry: no payload in memory (contract §3.2), also
+	// Rebuilt-after-restart entry: no payload in memory (§4.3), also
 	// never delivered.
 	_ = reg.Put(registry.TaskEntry{TaskID: "t-2", State: registry.StateJobCreated})
 	h := newTestHandler(reg, nil)
@@ -341,8 +340,8 @@ func TestJobLogsUnavailable(t *testing.T) {
 	}
 }
 
-// TestJobLogsForbidden covers observability.md §错误处理: pods/log RBAC
-// denied maps to 403 and an error log, not the generic 500.
+// TestJobLogsForbidden covers the pods/log RBAC denial path: it maps to 403
+// and an error log, not the generic 500.
 func TestJobLogsForbidden(t *testing.T) {
 	reg := registry.New(time.Now)
 	_ = reg.Put(registry.TaskEntry{TaskID: "t-1", JobName: "fm-t-1", JobNamespace: "ns", State: registry.StateRunning})

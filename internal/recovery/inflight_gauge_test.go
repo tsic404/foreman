@@ -43,7 +43,7 @@ func TestIntegrationJobFailedCompensationResetsInflightGauge(t *testing.T) {
 		t.Fatalf("foreman_inflight_jobs = %v while the task is live, want 1", got)
 	}
 
-	// The Job's container ended without a daemon report (场景 #3): the
+	// The Job's container ended without a daemon report (§4.6): the
 	// reconciler compensates with failure_reason=job_failed.
 	rec := newReconciler(&fakeObjects{
 		job: failedJob(fakeJobName("t1"), "BackoffLimitExceeded"),
@@ -115,10 +115,10 @@ func TestIntegrationReconcileRoundHealsStaleInflightGauge(t *testing.T) {
 }
 
 // AC-10 on a terminal report whose upstream is unreachable: the terminal
-// write lands, the report goes to the durable queue (contract §4) and the
+// write lands, the report goes to the durable queue (contract §10) and the
 // gauge must follow the index right there — no round runs on this path, so a
 // refresh registered after the forward would leave the pre-terminal count
-// standing (observability.md §指标: 四源一致).
+// standing (§9.2: 四源一致).
 func TestIntegrationTerminalReportTransportErrorKeepsInflightGaugeInSync(t *testing.T) {
 	server := newFakeServerClient(map[string]string{"t1": "running"})
 	metrics := observability.NewMetrics()

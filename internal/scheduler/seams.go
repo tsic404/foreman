@@ -12,7 +12,7 @@ import (
 )
 
 // ErrTaskNotFound is the C13 signal that the server no longer knows the
-// task (deleted server-side; failure-handling scenario #9).
+// task (deleted server-side; §4.6).
 var ErrTaskNotFound = errors.New("task not found on server")
 
 // ErrUnknownDaemon rejects a claim from a daemon with no mapping entry
@@ -80,11 +80,10 @@ type Metrics interface {
 	DuplicateDispatch()
 	// CredReclaimed counts one credential reclaim by reason
 	// (job_terminated|drain_timeout) and observes the drain duration
-	// (observability.md §指标, ADR-017).
+	// (§9.2, ADR-017).
 	CredReclaimed(reason string, drainSeconds float64)
 	// DeliveryUnconfirmed counts one S6 delivery the confirmation window
-	// judged undelivered (observability.md §指标
-	// foreman_delivery_unconfirmed_total, ADR-032).
+	// judged undelivered (§9.2, foreman_delivery_unconfirmed_total, ADR-032).
 	DeliveryUnconfirmed()
 }
 
@@ -96,7 +95,7 @@ type Reconciler interface {
 }
 
 // PendingReports is the recovery module's durable terminal-report queue
-// (contract §4: terminal callbacks are never dropped). The scheduler hands
+// (§10: terminal callbacks are never dropped). The scheduler hands
 // it every terminal report whose forward exhausted the proxy's retry budget
 // or failed outright; recovery drains the queue until the server accepts
 // them. A queued report also holds back the object cleanup of its task:

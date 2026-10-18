@@ -23,7 +23,7 @@ func TestCatalog01EmptySlotRelaysProbeResultVerbatim(t *testing.T) {
 	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
 	h.declare(declaredRuntimes())
 	// The scenario's precondition: the runtime has no cached catalog, so the
-	// command falls back to a fresh probe (§1.1 C21 第 12 条).
+	// command falls back to a fresh probe (C-21, §1.3).
 	if _, cached := h.slots.Get("rid-omp"); cached {
 		t.Fatal("the runtime's catalog slot must start empty")
 	}

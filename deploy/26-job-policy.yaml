@@ -1,4 +1,4 @@
-# ConfigMap foreman-job-policy (contracts §5.3/§5.4「策略文件」): the optional
+# ConfigMap foreman-job-policy (02-contracts.md §8.5): the optional
 # carrier of the three-axis job policy (resourcePolicy / capPolicy /
 # nodeSelectorPolicy). The Deployment mounts it as an *optional* read-only
 # volume at /etc/foreman/policy/, so deleting this object (or applying the

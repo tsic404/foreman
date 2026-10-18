@@ -4,8 +4,8 @@
 // roots by TTL and by the .repos size cap, plus the node-local agent state
 // (sessions, transcripts and memory) under /state/home.
 //
-// Design: docs/05-modules/job-template.md §节点清理, contracts §5.1,
-// ADR-005 (node-local hostPath), ADR-006 (shared .repos).
+// Design: 02-contracts.md §8.8 (node state cleanup), §10 (cache and node
+// state caps), ADR-005 (node-local hostPath), ADR-006 (shared .repos).
 package main
 
 import (

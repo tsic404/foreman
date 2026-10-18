@@ -10,7 +10,7 @@ import (
 	"github.com/tsic404/foreman/internal/jobbuilder"
 )
 
-// ProjectIdentity is the task's project identity input (contract §3.1
+// ProjectIdentity is the task's project identity input (§4.1
 // 项目身份, ADR-035 decision 3). Its two sources are both platform-side
 // capabilities the design leaves to the platform — the claim payload's
 // structured project key and the read-only reverse lookup by issue id — so a

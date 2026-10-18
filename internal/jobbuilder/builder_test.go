@@ -27,7 +27,7 @@ const (
 )
 
 // testSessionKey is the index key of testPriorSession — the key the learning
-// side and the payload side must derive identically (03-contracts §3.1).
+// side and the payload side must derive identically (§4.5).
 const testSessionKey = "sess-1"
 
 var testClaimedAt = time.Date(2026, 10, 4, 8, 30, 0, 0, time.UTC)
@@ -242,7 +242,7 @@ func TestBuildPreferredNodeAffinity(t *testing.T) {
 	}
 }
 
-// The two sides of the index derive the key with one function (§3.1): the
+// The two sides of the index derive the key with one function (§4.5): the
 // learning face stored a path under its session key, and a payload naming the
 // same file — a different root directory, as a changed HOME gives it — still
 // resolves it. The real registry is the witness that both sides match.
@@ -288,8 +288,8 @@ func TestBuildDropsAffinityForSaturatedNode(t *testing.T) {
 // TestBuildTriggerContextAnnotations (AC-24): the four trigger-context keys are
 // independent conditional blocks — a non-empty field writes its key with that
 // value, an empty field writes no key at all. The issue group carries its two
-// mixed forms as well: §3.1 declares `issue_id` without `issue_identifier` (and
-// the reverse) legal, so neither key may be written from the other's value. The
+// mixed forms as well: an issue id without an issue identifier (and the
+// reverse) is legal, so neither key may be written from the other's value. The
 // last two cases (autopilot and chat entry, no issue context) are the payload
 // shapes the build path used to refuse (ADR-014).
 func TestBuildTriggerContextAnnotations(t *testing.T) {

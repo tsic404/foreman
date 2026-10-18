@@ -6,7 +6,7 @@ import (
 	"strings"
 )
 
-// The name face (ADR-034, 03-contracts.md §5.4「名字合成」): the template's
+// The name face (ADR-034, 02-contracts.md §8.3): the template's
 // metadata.name is the only source of the Job's display name. It is a format
 // string over a character-level closure — four variables plus lowercase
 // letters, digits and '-' — and Foreman only falls back to the identity name
@@ -14,7 +14,7 @@ import (
 // credential Secret, the token's j claim) never follows the display name.
 //
 // The name is not a locator: rebuild, deletion, Secret sweeps and pod
-// ownership all key on the foreman.tsic.top/task-id label (contract §1.3).
+// ownership all key on the foreman.tsic.top/task-id label (§3).
 const (
 	// Name variables, only valid inside metadata.name. Anywhere else they stay
 	// verbatim like any other unregistered <...> literal.

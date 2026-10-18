@@ -1,4 +1,4 @@
-# Prometheus Operator scrape object (contracts §5.3).
+# Prometheus Operator scrape object (02-contracts.md §9.2).
 #
 # OPTIONAL: it needs the monitoring.coreos.com CRDs from the Prometheus
 # Operator, which the base deploy/ set does not assume. The Service and the

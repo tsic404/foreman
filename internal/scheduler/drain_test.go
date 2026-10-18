@@ -40,7 +40,7 @@ func newLoggingScheduler(t *testing.T, f *fixture, logw io.Writer) *Scheduler {
 
 // job_created_at is the apiserver's creationTimestamp of the accepted Job
 // object, not a local clock reading: it is the instance-filter basis that
-// separates this Job's pods from a previous instance's (contract §3.1).
+// separates this Job's pods from a previous instance's (§4.1).
 func TestOnClaimTakesJobCreatedAtFromTheApiserver(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "task-1")
@@ -106,7 +106,7 @@ func TestJobTerminationEvidenceSurfacesListErrors(t *testing.T) {
 
 // The termination fact comes from the kubelet's finishedAt; with no such fact
 // (the pod objects are gone) it is zero, and the reclaim records the
-// observation moment in the observed clock domain instead (contract §7).
+// observation moment in the observed clock domain instead (§10).
 func TestLastPodTerminatedAtReadsKubeletFact(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "task-1")
@@ -141,7 +141,7 @@ func TestLastPodTerminatedAtReadsKubeletFact(t *testing.T) {
 
 // The cred.reclaimed evidence carries the clock domain with the value: a
 // kubelet fact is the node clock, a degraded fact the observation moment, and
-// the drain upper bound claims no fact at all (contract §7, ADR-017).
+// the drain upper bound claims no fact at all (§10, ADR-017).
 func TestCredReclaimedEvidenceCarriesClockDomain(t *testing.T) {
 	f := newFixture(t)
 	var logs bytes.Buffer
@@ -228,11 +228,11 @@ func decodeLogEvent(t *testing.T, logs *bytes.Buffer, msg string) map[string]any
 	return nil
 }
 
-// The reclaim's Job-deletion catch-up carries the contract §4 gate: while a
+// The reclaim's Job-deletion catch-up carries the §10 gate: while a
 // terminal report is still queued the Job must not be deleted — a deleted Job
 // must never stand in for a delivered report — so it is left to its
-// ttlSecondsAfterFinished (failure-handling 顺序与幂等规则 2). The credential
-// is reclaimed either way: its bound does not wait for the report.
+// ttlSecondsAfterFinished (§8.1). The credential is reclaimed either way: its
+// bound does not wait for the report.
 func TestReclaimGatesTheJobDeletionOnTheQueuedReport(t *testing.T) {
 	f := newFixture(t)
 	p := f.withPendingReports()

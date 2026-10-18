@@ -1,6 +1,6 @@
 #!/bin/sh
 # Recycle the whole test environment — the recycle entry of
-# test-cases/_infra/test-multica-cluster.md §6 运维接口.
+# the test environment's 运维接口 (`README.md`).
 #
 #   ./recycle.sh
 #

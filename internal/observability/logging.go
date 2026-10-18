@@ -9,8 +9,8 @@ import (
 
 // tokenPattern matches the wire form of every credential Foreman handles
 // (Job Token fmj_, server mdt_/mul_, task mat_). Log lines must never carry
-// a token in clear (observability.md §禁止); the redacting handler below
-// makes that structural instead of relying on call-site discipline.
+// a token in clear (§9.1); the redacting handler below makes that
+// structural instead of relying on call-site discipline.
 var tokenPattern = regexp.MustCompile(`(fmj|mdt|mul|mat)_[A-Za-z0-9_-]{8,}`)
 
 const redactedValue = "[redacted]"
@@ -26,7 +26,7 @@ const redactedValue = "[redacted]"
 func NewLogger(w io.Writer, level slog.Level, component string) *slog.Logger {
 	json := slog.NewJSONHandler(w, &slog.HandlerOptions{
 		Level: level,
-		// The fixed field is called ts (observability.md §结构化日志), not
+		// The fixed field is called ts (§9.1), not
 		// slog's default "time".
 		ReplaceAttr: func(_ []string, a slog.Attr) slog.Attr {
 			if a.Key == slog.TimeKey {
