@@ -27,7 +27,8 @@ const (
 
 // probeTemplate is a deployment template written the way the probe render
 // expects: the profile and the credential Secret as their task-side literals,
-// the two consumed placeholders, and one <task_id> the probe must leave alone.
+// the four consumed placeholders, and the task-identity and agent placeholders
+// the probe must leave alone.
 const probeTemplate = `
 apiVersion: batch/v1
 kind: Job
@@ -43,6 +44,7 @@ metadata:
     foreman.tsic.top/daemon-id: "fm-<task_id>"
     example.com/note: keep-me
     example.com/runtime: "<job runtime uuid>"
+    example.com/probe-identity: "<job-name>|<daemon-id>"
 spec:
   backoffLimit: 0
   completions: 1
@@ -78,6 +80,7 @@ spec:
             - { name: MULTICA_SERVER_URL, value: "http://somewhere-else:1234" }
             - { name: MULTICA_DAEMON_HEARTBEAT_INTERVAL, value: "60s" }
             - { name: TASK_ANCHOR, value: "<task_id>" }
+            - { name: AGENT_ANCHOR, value: "<agent-name>" }
           volumeMounts:
             - { name: cred, mountPath: /home/agent/.multica/profiles/foreman-job/config.json, subPath: config.json, readOnly: true }
       volumes:
@@ -157,9 +160,15 @@ func TestBuildCatalogProbeTemplateRender(t *testing.T) {
 	if job.Annotations["example.com/note"] != "keep-me" {
 		t.Errorf("out-of-domain annotation = %v, want the template's own kept", job.Annotations)
 	}
-	// <job runtime uuid> is one of the two placeholders a probe consumes.
+	// <job runtime uuid> is one of the four placeholders a probe consumes.
 	if got := job.Annotations["example.com/runtime"]; got != testProbeRuntime {
 		t.Errorf("<job runtime uuid> = %q, want %q", got, testProbeRuntime)
+	}
+	// <job-name> and <daemon-id> are two more: the probe's own final Job name
+	// and its identity name — the same string on this path, since a probe is
+	// identified by its Job name.
+	if got := job.Annotations["example.com/probe-identity"]; got != testProbeName+"|"+testProbeName {
+		t.Errorf("<job-name>|<daemon-id> = %q, want %q", got, testProbeName+"|"+testProbeName)
 	}
 
 	podLabels := job.Spec.Template.Labels
@@ -238,9 +247,12 @@ func TestBuildCatalogProbeTemplateRender(t *testing.T) {
 		t.Errorf("daemon image = %q, want the verbatim %q", daemon.Image, testProbeImage)
 	}
 
-	// Task-identity placeholders are not the probe's to resolve.
+	// Task-identity and agent placeholders are not the probe's to resolve.
 	if got := envByName(t, daemon.Env, "TASK_ANCHOR").Value; got != "<task_id>" {
 		t.Errorf("TASK_ANCHOR = %q, want the <task_id> literal left verbatim", got)
+	}
+	if got := envByName(t, daemon.Env, "AGENT_ANCHOR").Value; got != "<agent-name>" {
+		t.Errorf("AGENT_ANCHOR = %q, want the <agent-name> literal left verbatim", got)
 	}
 
 	// No soft affinity: the item is deleted with the structures it empties.
