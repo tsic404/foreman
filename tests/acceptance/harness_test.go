@@ -1081,6 +1081,9 @@ func (h *harness) useRealBuilderWithPolicy(t *testing.T, templatePath, policyPat
 	}
 	jbCfg.JobNamespace = "multica-agents"
 	jbCfg.JobImage = harnessJobImage
+	if h.jobImage != "" {
+		jbCfg.JobImage = h.jobImage
+	}
 	jbCfg.Issuer = h.issuer
 	jbCfg.Nodes = h.reg
 	jbCfg.Logger = slog.New(slog.NewJSONHandler(h.logs, nil))
@@ -1395,6 +1398,11 @@ type harness struct {
 	// is its clock seam, which a scenario steps to age entries.
 	bundles    *proxy.SkillCache
 	skillClock *steppedClock
+
+	// jobImage overrides the reference template's <job-image> value: a
+	// scenario that asserts the deployment's own reference sets it before
+	// swapping in the real builder.
+	jobImage string
 
 	schedCfg scheduler.Config
 	// revoker is the scheduler's credential-revocation seam. Nil leaves it

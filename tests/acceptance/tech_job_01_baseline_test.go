@@ -24,7 +24,8 @@ import (
 
 // authorityFixture is the AC-20 authority: the in-repo reference-template
 // baseline the jobbuilder package tests against, whose Job document the
-// deployment publishes byte for byte.
+// deployment publishes byte for byte. It also carries ADR-011's
+// `/state/workspaces` ownership target for prepare.
 const authorityFixture = "../../internal/jobbuilder/testdata/job-baseline.yaml"
 
 func TestJob01ReferenceTemplateMatchesBaseline(t *testing.T) {

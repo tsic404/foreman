@@ -151,6 +151,7 @@ type tcClaimPayloadBody struct {
 	RuntimeID       string          `json:"runtime_id"`
 	IssueID         string          `json:"issue_id,omitempty"`
 	IssueIdentifier string          `json:"issue_identifier,omitempty"`
+	ChatSessionID   string          `json:"chat_session_id,omitempty"`
 	PriorSessionID  string          `json:"prior_session_id,omitempty"`
 	Agent           tcAgentObject   `json:"agent"`
 	Project         *tcProjectValue `json:"project,omitempty"`
