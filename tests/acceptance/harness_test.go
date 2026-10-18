@@ -139,6 +139,21 @@ type modelCommand struct {
 	completed bool
 }
 
+// queuedTask is one task the stub server holds on its side of the claim
+// contract: queued until a C3 claim hands it out, dispatched afterwards. The
+// server keeps the excess queued — Foreman only ever sees what it claimed.
+type queuedTask struct {
+	id      string
+	payload json.RawMessage
+	status  string
+}
+
+// The server-side task statuses the claim contract moves through.
+const (
+	taskStatusQueued     = "queued"
+	taskStatusDispatched = "dispatched"
+)
+
 // upstreamStub is the server side of C1–C21 as the scenarios need it.
 type upstreamStub struct {
 	mu sync.Mutex
@@ -154,6 +169,8 @@ type upstreamStub struct {
 	models map[string]*modelCommand
 	// modelSeq numbers the minted request ids (the real ones are 32 hex digits).
 	modelSeq int
+	// queued is the server-side task queue C3 serves. Empty by default.
+	queued []*queuedTask
 	// ackShape shapes the heartbeat ack's runtime_id field.
 	ackShape ackRuntimeIDShape
 	requests []upstreamRequest
@@ -231,7 +248,11 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 	mux.HandleFunc("POST /api/daemon/tasks/claim", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		stub.record(r, "/api/daemon/tasks/claim", body)
-		writeJSON(w, http.StatusOK, map[string]any{"tasks": []any{}})
+		var req struct {
+			MaxTasks int `json:"max_tasks"`
+		}
+		_ = json.Unmarshal(body, &req)
+		writeJSON(w, http.StatusOK, map[string]any{"tasks": stub.claim(req.MaxTasks)})
 	})
 	// C4: the lease keeper's renewal. Without this route the stub's 404 would
 	// read as "the server deleted the task" and settle every pre-start entry
@@ -251,6 +272,21 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		stub.record(r, r.URL.Path, body)
 		stub.completeModelCommand(r.PathValue("req"))
 		writeJSON(w, stub.modelsStatus, map[string]string{"status": "ok"})
+	})
+	// The claim loop's preflight (C17/C18/C16). A scenario driving the
+	// production loop needs these to answer as the server does before C3 runs.
+	mux.HandleFunc("GET /api/daemon/workspaces", func(w http.ResponseWriter, r *http.Request) {
+		stub.record(r, "/api/daemon/workspaces", nil)
+		writeJSON(w, http.StatusOK, []map[string]string{{"id": "ws-1", "name": "foreman"}})
+	})
+	mux.HandleFunc("GET /api/daemon/workspaces/{wid}/runtime-profiles", func(w http.ResponseWriter, r *http.Request) {
+		stub.record(r, r.URL.Path, nil)
+		writeJSON(w, http.StatusOK, []any{})
+	})
+	mux.HandleFunc("POST /api/tokens/current/renew", func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		stub.record(r, "/api/tokens/current/renew", body)
+		writeJSON(w, http.StatusOK, map[string]string{"token": "mdt_test"})
 	})
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
@@ -281,6 +317,66 @@ func (s *upstreamStub) statusFor(runtimeID string) int {
 		return http.StatusOK
 	}
 	return status
+}
+
+// enqueueTask puts one task on the stub server's queue in the queued state.
+// The payload carries the fields the scheduler indexes (proxy.md 数据结构).
+func (s *upstreamStub) enqueueTask(taskID string) {
+	payload, _ := json.Marshal(map[string]any{
+		"id": taskID, "agent_id": "agent-1", "workspace_id": "ws-1",
+		"runtime_id": "rid-zz", "agent": map[string]any{"model": "k3"},
+	})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.queued = append(s.queued, &queuedTask{
+		id: taskID, payload: payload, status: taskStatusQueued,
+	})
+}
+
+// claim serves up to maxTasks queued tasks and flips each to dispatched: the
+// server's own queued → dispatched transition on C3 (§1.1). Tasks beyond the
+// batch stay queued — they are the server's queue, not Foreman's.
+func (s *upstreamStub) claim(maxTasks int) []json.RawMessage {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	served := make([]json.RawMessage, 0, maxTasks)
+	for _, task := range s.queued {
+		if len(served) >= maxTasks {
+			break
+		}
+		if task.status != taskStatusQueued {
+			continue
+		}
+		task.status = taskStatusDispatched
+		served = append(served, task.payload)
+	}
+	return served
+}
+
+// taskStatus is the stub server's status for one enqueued task ("" when the
+// task was never enqueued).
+func (s *upstreamStub) taskStatus(taskID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, task := range s.queued {
+		if task.id == taskID {
+			return task.status
+		}
+	}
+	return ""
+}
+
+// tasksInStatus counts the stub server's tasks in one status.
+func (s *upstreamStub) tasksInStatus(status string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, task := range s.queued {
+		if task.status == status {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *upstreamStub) calls(method, path string) []upstreamRequest {
