@@ -1241,6 +1241,10 @@ type fakeMetrics struct {
 	catalogSpans   []float64
 	deliveryClaims []string
 	deliverSpans   []float64
+	skillResults   []string
+	skillEvicts    []string
+	skillEntries   int
+	skillBytes     int64
 }
 
 func (m *fakeMetrics) Forward(endpoint string, code int, _ time.Duration) {
@@ -1303,6 +1307,25 @@ func (m *fakeMetrics) DeliveryLatency(seconds float64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.deliverSpans = append(m.deliverSpans, seconds)
+}
+
+func (m *fakeMetrics) SkillCache(result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.skillResults = append(m.skillResults, result)
+}
+
+func (m *fakeMetrics) SkillCacheSize(entries int, bytes int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.skillEntries = entries
+	m.skillBytes = bytes
+}
+
+func (m *fakeMetrics) SkillCacheEviction(reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.skillEvicts = append(m.skillEvicts, reason)
 }
 
 // deliveryClaimCount counts the recorded S6 claim outcomes per result.

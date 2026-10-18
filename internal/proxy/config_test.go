@@ -59,3 +59,103 @@ func TestLoadConfigLeaseRefreshBound(t *testing.T) {
 		}
 	}
 }
+
+// TestLoadConfigSkillCache pins the resolve cache's configuration surface
+// (§1.8): the downgrade window's zero is a value (its off switch), a retention
+// shorter than the fresh window is refused instead of silently weakening the
+// cache the design requires, and so is a downgrade window below the fresh
+// window, which could never apply. The equality boundary stays legal.
+func TestLoadConfigSkillCache(t *testing.T) {
+	env := func(overrides map[string]string) func(string) string {
+		base := map[string]string{
+			EnvServerURL:   "http://multica.example",
+			EnvWorkspaceID: "ws-test",
+		}
+		for k, v := range overrides {
+			base[k] = v
+		}
+		return func(key string) string { return base[key] }
+	}
+
+	cfg, err := LoadConfig(env(nil))
+	if err != nil {
+		t.Fatalf("LoadConfig defaults: %v", err)
+	}
+	if cfg.SkillCacheFreshTTL != DefaultSkillCacheFreshTTL ||
+		cfg.SkillCacheDowngradeWindow != DefaultSkillCacheDowngradeWindow ||
+		cfg.SkillCacheRetention != DefaultSkillCacheRetention ||
+		cfg.SkillCacheMaxEntries != DefaultSkillCacheMaxEntries ||
+		cfg.SkillCacheMaxBytes != DefaultSkillCacheMaxBytes {
+		t.Errorf("skill cache defaults = %+v, want the contract defaults", cfg)
+	}
+
+	// Zero is the documented off switch, so it must survive parsing.
+	cfg, err = LoadConfig(env(map[string]string{EnvSkillCacheDowngradeWindow: "0"}))
+	if err != nil {
+		t.Fatalf("LoadConfig(zero downgrade): %v", err)
+	}
+	if cfg.SkillCacheDowngradeWindow != 0 {
+		t.Errorf("SkillCacheDowngradeWindow = %s, want 0", cfg.SkillCacheDowngradeWindow)
+	}
+
+	_, err = LoadConfig(env(map[string]string{
+		EnvSkillCacheFreshTTL:   "2h",
+		EnvSkillCacheRetention:  "1h",
+		EnvSkillCacheMaxEntries: "8",
+		EnvSkillCacheMaxBytes:   "512Mi",
+	}))
+	if err == nil {
+		t.Fatal("a retention below the fresh window was accepted")
+	}
+	for _, want := range []string{EnvSkillCacheRetention, EnvSkillCacheFreshTTL} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+
+	// The downgrade is only reachable past the fresh window, so a shorter one
+	// would be a knob that never fires: it is refused too.
+	_, err = LoadConfig(env(map[string]string{
+		EnvSkillCacheFreshTTL:        "1h",
+		EnvSkillCacheDowngradeWindow: "5m",
+	}))
+	if err == nil {
+		t.Fatal("a downgrade window below the fresh window was accepted")
+	}
+	for _, want := range []string{EnvSkillCacheDowngradeWindow, EnvSkillCacheFreshTTL} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not name %q", err, want)
+		}
+	}
+	// Equal windows are the boundary the design allows: at that age the entry
+	// is stale, which is exactly where the downgrade may answer.
+	if _, err := LoadConfig(env(map[string]string{
+		EnvSkillCacheFreshTTL:        "1h",
+		EnvSkillCacheDowngradeWindow: "1h",
+		EnvSkillCacheRetention:       "1h",
+	})); err != nil {
+		t.Errorf("LoadConfig(window == fresh): %v", err)
+	}
+
+	for _, bad := range []map[string]string{
+		{EnvSkillCacheMaxEntries: "0"},
+		{EnvSkillCacheMaxBytes: "not-a-size"},
+		{EnvSkillCacheDowngradeWindow: "-1s"},
+		{EnvSkillCacheFreshTTL: "0s"},
+	} {
+		if _, err := LoadConfig(env(bad)); err == nil {
+			t.Errorf("LoadConfig(%v) was accepted, want a refusal", bad)
+		}
+	}
+
+	cfg, err = LoadConfig(env(map[string]string{
+		EnvSkillCacheMaxBytes:   "512Mi",
+		EnvSkillCacheMaxEntries: "8",
+	}))
+	if err != nil {
+		t.Fatalf("LoadConfig(valid overrides): %v", err)
+	}
+	if cfg.SkillCacheMaxBytes != 512<<20 || cfg.SkillCacheMaxEntries != 8 {
+		t.Errorf("overrides = %d entries / %d bytes, want 8 / 512Mi", cfg.SkillCacheMaxEntries, cfg.SkillCacheMaxBytes)
+	}
+}

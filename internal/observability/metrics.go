@@ -41,6 +41,12 @@ const (
 	// status code ("none" = abandoned) and the consumption-to-answer span.
 	metricModelCatalogRelays = "foreman_model_catalog_relays_total"
 	metricModelCatalogSecond = "foreman_model_catalog_seconds"
+	// Skill-bundle resolve cache (§9.2): the resolve outcome by result, the
+	// store's two size gauges, and the reclaim counter by reason.
+	metricSkillCacheResolves  = "foreman_skill_cache_resolves_total"
+	metricSkillCacheEntries   = "foreman_skill_cache_entries"
+	metricSkillCacheBytes     = "foreman_skill_cache_bytes"
+	metricSkillCacheEvictions = "foreman_skill_cache_evictions_total"
 )
 
 // Terminal result label values (§4.1).
@@ -101,6 +107,17 @@ var wsSides = []string{"server", "job"}
 // relay was abandoned (§9.2).
 var modelCatalogCodes = []string{"none", "200", "400", "401", "403", "404", "409", "500", "502", "503"}
 
+// skillCacheResults is the foreman_skill_cache_resolves_total label vocabulary
+// (§9.2): a fresh hit, a miss, a refresh of an expired entry, a downgraded
+// answer, and a failure that had nothing to answer with. The proxy passes these
+// through its own Metrics seam.
+var skillCacheResults = []string{"hit", "miss", "stale_hit", "degraded", "upstream_failure"}
+
+// skillCacheEvictReasons is the foreman_skill_cache_evictions_total label
+// vocabulary: the entry-count bound, the byte bound, the retention, and the
+// integrity check's own verdict.
+var skillCacheEvictReasons = []string{"capacity", "retention", "damaged"}
+
 // Metrics is the Prometheus implementation of the designed metric surface
 // (§9.2) plus the recorders for the remaining designed metrics. It owns
 // a private registry — no global state — so a collector panic is contained
@@ -130,6 +147,10 @@ type Metrics struct {
 	jobDrainSeconds   prometheus.Histogram
 	catalogRelays     *prometheus.CounterVec
 	catalogSeconds    prometheus.Histogram
+	skillResolves     *prometheus.CounterVec
+	skillEntries      prometheus.Gauge
+	skillBytes        prometheus.Gauge
+	skillEvictions    *prometheus.CounterVec
 
 	// wsMu guards wsJobs, the authoritative side=job connection count; the
 	// gauge is Set from it so a disconnect without a matching connect (e.g.
@@ -241,6 +262,23 @@ func NewMetrics() *Metrics {
 		Buckets: []float64{0.05, 0.5, 1, 5, 15, 30, 45, 60, 90},
 	})
 
+	m.skillResolves = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricSkillCacheResolves,
+		Help: "Skill-bundle resolves by result (hit|miss|stale_hit|degraded|upstream_failure).",
+	}, []string{"result"})
+	m.skillEntries = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: metricSkillCacheEntries,
+		Help: "Skill-bundle cache entries currently held.",
+	})
+	m.skillBytes = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: metricSkillCacheBytes,
+		Help: "Skill-bundle cache response bytes currently held.",
+	})
+	m.skillEvictions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricSkillCacheEvictions,
+		Help: "Skill-bundle cache entries reclaimed by reason.",
+	}, []string{"reason"})
+
 	collectors := []prometheus.Collector{
 		m.tasksTotal, m.taskClaims, m.claimErrors, m.jobBootSeconds,
 		m.deliveryClaims, m.deliveryLatency, m.deliveryUnconfirm,
@@ -248,6 +286,7 @@ func NewMetrics() *Metrics {
 		m.authFailures, m.tokenUsage, m.duplicateDispatch, m.pendingReports,
 		m.wsConnected, m.wsReconnects, m.heartbeatSuspect,
 		m.credReclaims, m.jobDrainSeconds, m.catalogRelays, m.catalogSeconds,
+		m.skillResolves, m.skillEntries, m.skillBytes, m.skillEvictions,
 	}
 	for _, c := range collectors {
 		m.reg.MustRegister(c)
@@ -281,6 +320,12 @@ func NewMetrics() *Metrics {
 	}
 	for _, result := range deliveryClaimResults {
 		m.deliveryClaims.WithLabelValues(result)
+	}
+	for _, result := range skillCacheResults {
+		m.skillResolves.WithLabelValues(result)
+	}
+	for _, reason := range skillCacheEvictReasons {
+		m.skillEvictions.WithLabelValues(reason)
 	}
 	return m
 }
@@ -401,4 +446,19 @@ func (m *Metrics) ModelCatalogRelay(code string, seconds float64) {
 func (m *Metrics) CredReclaimed(reason string, drainSeconds float64) {
 	m.credReclaims.WithLabelValues(reason).Inc()
 	m.jobDrainSeconds.Observe(drainSeconds)
+}
+
+// SkillCache records one skill-bundle resolve by result (§9.2): the proxy's
+// SkillResult label value passes through unchanged.
+func (m *Metrics) SkillCache(result string) { m.skillResolves.WithLabelValues(result).Inc() }
+
+// SkillCacheSize sets the store's entry and byte gauges (§9.2 条目数与字节量).
+func (m *Metrics) SkillCacheSize(entries int, bytes int64) {
+	m.skillEntries.Set(float64(entries))
+	m.skillBytes.Set(float64(bytes))
+}
+
+// SkillCacheEviction counts one reclaimed entry by reason (§9.2 回收计数).
+func (m *Metrics) SkillCacheEviction(reason string) {
+	m.skillEvictions.WithLabelValues(reason).Inc()
 }

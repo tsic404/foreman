@@ -51,6 +51,10 @@ type FakeServer struct {
 	// added to or dropped from the local face without the census moving too.
 	registered []string
 
+	// bundles answers S26: the §1.8 resolve cache (fresh hit, upstream refresh,
+	// bounded downgrade). Never nil once the server is built.
+	bundles *SkillCache
+
 	// legacyClaimMu guards legacyClaimed: the per-entry dedup of the legacy
 	// claim fallback event. The set lives for the process lifetime — the
 	// contract scopes the dedup there (ADR-042), so it is never evicted.
@@ -72,6 +76,13 @@ func WithServerLogger(l *slog.Logger) FakeServerOption {
 	return func(s *FakeServer) { s.log = l }
 }
 
+// WithSkillBundles replaces the resolve cache S26 answers from (§1.8). The
+// default one is built from the client's configuration, which is what a
+// deployment wants; a scenario injects its own to drive the clock.
+func WithSkillBundles(cache *SkillCache) FakeServerOption {
+	return func(s *FakeServer) { s.bundles = cache }
+}
+
 // NewFakeServer builds the handler with the full §2.2 endpoint table.
 // ws may be nil; the S30 route is then not registered and WS dials get a
 // 404 (the FOREMAN_WS_ENABLED=false degradation).
@@ -90,6 +101,9 @@ func NewFakeServer(issuer *auth.Issuer, reg *registry.Registry, sched TaskSchedu
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	if s.bundles == nil && client != nil {
+		s.bundles = NewSkillCache(client.cfg, client, s.metrics)
 	}
 	s.routes()
 	return s

@@ -123,6 +123,27 @@ spec:
             # never stops answering.
             - name: FOREMAN_MODEL_CATALOG_CACHE_TTL
               value: "6h"
+            # --- skill-bundle resolve cache (ADR-045 / §1.8) ---
+            # Fresh window: a resolved payload inside it answers locally and
+            # never reaches the server. Must not exceed the retention below.
+            - name: FOREMAN_SKILL_CACHE_FRESH_TTL
+              value: "30m"
+            # Outer age at which an entry may still answer an upstream failure
+            # (with an error-level event and a degraded count). "0" turns the
+            # downgrade off; any other value must be >= the fresh window above
+            # (a shorter one could never apply).
+            - name: FOREMAN_SKILL_CACHE_DOWNGRADE_WINDOW
+              value: "6h"
+            # An entry left unused for this long is reclaimed; the cache is
+            # process-local, so a restart starts empty.
+            - name: FOREMAN_SKILL_CACHE_RETENTION
+              value: "6h"
+            # Capacity bounds; the excess is reclaimed least-recently-used
+            # first, and a response larger than the byte bound is not stored.
+            - name: FOREMAN_SKILL_CACHE_MAX_ENTRIES
+              value: "1024"
+            - name: FOREMAN_SKILL_CACHE_MAX_BYTES
+              value: "256Mi"
             # Startup probe window: the first probe must register within it or
             # Foreman exits non-zero (default = FOREMAN_JOB_BOOT_TIMEOUT).
             - name: FOREMAN_STARTUP_PROBE_TIMEOUT

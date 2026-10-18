@@ -510,8 +510,11 @@ func (s *FakeServer) handleTokenRenew(w http.ResponseWriter, r *http.Request) {
 
 // ---- S26 skill bundles ----
 
-// handleSkillBundles forwards the resolve call as C19: the {rid} is
-// rewritten to the real runtime id and Foreman's credential is used (S26).
+// handleSkillBundles answers the resolve call from the §1.8 cache (S26): a
+// fresh entry replays locally, a miss forwards as C19 with the {rid} rewritten
+// to the real runtime id, and a failed upstream may still be answered from an
+// entry inside the downgrade window. The payload bytes are the only cache key
+// input; the task and runtime ids never reach it.
 func (s *FakeServer) handleSkillBundles(w http.ResponseWriter, r *http.Request) {
 	tid, rid := r.PathValue("tid"), r.PathValue("rid")
 	if _, ok := s.authenticate(w, r, auth.RequestScope{TaskID: tid, RuntimeID: rid}); !ok {
@@ -521,7 +524,7 @@ func (s *FakeServer) handleSkillBundles(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	code, resp, err := s.client.ResolveSkillBundles(r.Context(), tid, body)
+	code, resp, err := s.bundles.Resolve(r.Context(), tid, rid, body)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream unavailable")
 		return

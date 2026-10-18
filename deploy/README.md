@@ -379,6 +379,39 @@ Foreman declares to the server; it also doubles as the template preflight.
   discovered list, the declared runtimes and each runtime's catalog slot state
   (read-only — it never triggers a discovery).
 
+### Skill-bundle resolve cache (ADR-045)
+
+The Job daemon resolves skill references against
+`POST /api/daemon/runtimes/{rid}/tasks/{tid}/skill-bundles/resolve`. Foreman now
+answers that call from a **process-local** cache before it ever reaches the
+server: the key is the request payload bytes alone (the task and runtime ids
+never enter it), so the same reference set resolved by another task is a hit.
+
+- `FOREMAN_SKILL_CACHE_FRESH_TTL` (default `30m`) — a hit inside this window
+  answers locally and issues no upstream request. Past it the entry is refreshed.
+- `FOREMAN_SKILL_CACHE_DOWNGRADE_WINDOW` (default `6h`, `0` = off) — when the
+  server is unreachable, a timeout, or answers 5xx, an entry still inside this
+  age may answer instead. A non-zero value must be ≥ the fresh window (a
+  shorter one could never apply, since a fresher entry answers locally). That
+  answer is **error-level logged**, carries the `degraded` count, and is the
+  only case where a cached body replaces a failed upstream; outside the window
+  (or with no entry) the failure returns unchanged.
+- `FOREMAN_SKILL_CACHE_RETENTION` (default `6h`, must be ≥ the fresh window) —
+  an entry unused for this long is reclaimed.
+- `FOREMAN_SKILL_CACHE_MAX_ENTRIES` / `FOREMAN_SKILL_CACHE_MAX_BYTES`
+  (defaults `1024` / `256Mi`) — the excess is reclaimed least-recently-used
+  first; a single response larger than the byte bound is not stored.
+- The cache is **per process**: a restart starts empty and every resolve is a
+  plain forward, which is also what a missing or damaged entry degrades to. It
+  is never shared across replicas or nodes (single replica, NG7/NG11).
+- Metrics: `foreman_skill_cache_resolves_total{result}` (`hit` / `miss` /
+  `stale_hit` / `degraded` / `upstream_failure`), `foreman_skill_cache_entries`,
+  `foreman_skill_cache_bytes`, `foreman_skill_cache_evictions_total{reason}`
+  (`capacity` / `retention` / `damaged`). Events: `skill.cache_hit`,
+  `skill.cache_stale`, `skill.cache_degraded` (error level),
+  `skill.cache_upstream_failure`, `skill.cache_evicted`, `skill.cache_entry_damaged`.
+  None of them carries the payload, a payload field name or a skill name.
+
 ## Job policy (optional)
 
 `26-job-policy.yaml` ships a comment-only `policy.yaml`; the Deployment mounts
