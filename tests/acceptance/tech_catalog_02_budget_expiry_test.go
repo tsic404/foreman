@@ -47,16 +47,26 @@ func TestCatalog02ProbeSilentWithinBudgetRelaysNothing(t *testing.T) {
 	logs := &writeBuffer{}
 	reporter := proxy.NewModelCatalogReporter(cfg, h.client, h.sched, h.slots, h.metrics,
 		proxy.WithReporterLogger(slog.New(slog.NewJSONHandler(logs, nil))))
+	// The command must be on the server before the stream's first heartbeat:
+	// the ack is its only delivery channel and the next one is a full C2
+	// cadence away, so a request that lands after that beat would reach the
+	// probe far outside this scenario's budget (§1.2 C2; §1.3 交付).
+	id := h.requestModelList(t, "rid-omp")
 	h.runHeartbeatStream(t, reporter)
 
-	id := h.requestModelList(t, "rid-omp")
-	select {
-	case handed := <-commands:
-		if handed != id {
-			t.Fatalf("probe was handed command %q, want %q verbatim", handed, id)
+	// The handover is polled, not waited out on a bare timer: the ack lands one
+	// round after the stream starts, which is a scheduling step, not a deadline.
+	var handed string
+	waitFor(t, "the probe's S5 handover", 3*time.Second, func() bool {
+		select {
+		case handed = <-commands:
+			return true
+		default:
+			return false
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("the probe daemon never received a command (S5 delivery)")
+	})
+	if handed != id {
+		t.Fatalf("probe was handed command %q, want %q verbatim", handed, id)
 	}
 
 	// Foreman gives up at its own budget and reports the abandoned relay.

@@ -52,9 +52,12 @@ func TestCatalog06ZeroParseNegative(t *testing.T) {
 	reporterLogs := &writeBuffer{}
 	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.slots, metrics,
 		proxy.WithReporterLogger(slog.New(slog.NewJSONHandler(reporterLogs, nil))))
+	// The command must be on the server before the stream's first heartbeat:
+	// the ack is its only delivery channel and the next one is a full C2
+	// cadence away (§1.2 C2; §1.3 交付).
+	id := h.requestModelList(t, "rid-omp")
 	h.runHeartbeatStream(t, reporter)
 
-	id := h.requestModelList(t, "rid-omp")
 	h.waitModelCompleted(t, id)
 	waitFor(t, "the relay metric", 3*time.Second, func() bool {
 		return strings.Contains(scrapeMetrics(t, metrics), `foreman_model_catalog_relays_total{code="200"} 1`)
