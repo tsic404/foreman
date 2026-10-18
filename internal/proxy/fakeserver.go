@@ -45,6 +45,12 @@ type FakeServer struct {
 	log     *slog.Logger
 	mux     *http.ServeMux
 
+	// registered lists every pattern routes() registered, in registration
+	// order. The daemon-face census (protocol_test.go) compares this set
+	// against the pinned upstream daemon API both ways: a route cannot be
+	// added to or dropped from the local face without the census moving too.
+	registered []string
+
 	// legacyClaimMu guards legacyClaimed: the per-entry dedup of the legacy
 	// claim fallback event. The set lives for the process lifetime — the
 	// contract scopes the dedup there (ADR-042), so it is never evicted.
@@ -90,53 +96,69 @@ func NewFakeServer(issuer *auth.Issuer, reg *registry.Registry, sched TaskSchedu
 }
 
 // routes registers the local daemon face (§1.2 table; proxy.md §请求路由).
+// Every registration goes through register/handleFn so the pattern set stays
+// readable (registered) — the daemon-face census in protocol_test.go is what
+// requires it.
 func (s *FakeServer) routes() {
 	m := s.mux
-	m.HandleFunc("GET /api/daemon/workspaces", s.handleWorkspaces)                                               // S1
-	m.HandleFunc("GET /api/workspaces", s.handleWorkspaces)                                                      // S28
-	m.HandleFunc("GET /api/daemon/workspaces/{ws}/repos", s.handleRepos)                                         // S2
-	m.HandleFunc("GET /api/daemon/workspaces/{ws}/runtime-profiles", s.handle404)                                // S3
-	m.HandleFunc("POST /api/daemon/workspaces/{ws}/issues/gc-check", s.handleIssueGCCheck)                       // S21
-	m.HandleFunc("POST /api/daemon/register", s.handleRegister)                                                  // S4
-	m.HandleFunc("POST /api/daemon/heartbeat", s.handleHeartbeat)                                                // S5
-	m.HandleFunc("POST /api/daemon/deregister", s.handleDeregister)                                              // S19
-	m.HandleFunc("POST /api/daemon/tasks/claim", s.handleClaim)                                                  // S6
-	m.HandleFunc("POST /api/daemon/runtimes/{rid}/tasks/claim", s.handleLegacyClaim)                             // S32 (no delivery face, ADR-042)
-	m.HandleFunc("GET /api/daemon/tasks/{tid}/status", s.handleTaskStatus)                                       // S9
-	m.HandleFunc("GET /api/daemon/tasks/{tid}/gc-check", s.handleTaskGCCheck)                                    // S20
-	m.HandleFunc("POST /api/daemon/tasks/{tid}/start", s.reportHandler(scheduler.EPStart))                       // S8
-	m.HandleFunc("POST /api/daemon/tasks/{tid}/progress", s.reportHandler(scheduler.EPProgress))                 // S10
-	m.HandleFunc("POST /api/daemon/tasks/{tid}/messages", s.reportHandler(scheduler.EPMessages))                 // S11
-	m.HandleFunc("POST /api/daemon/tasks/{tid}/usage", s.reportHandler(scheduler.EPUsage))                       // S12
-	m.HandleFunc("POST /api/daemon/tasks/{tid}/complete", s.reportHandler(scheduler.EPComplete))                 // S13
-	m.HandleFunc("POST /api/daemon/tasks/{tid}/fail", s.reportHandler(scheduler.EPFail))                         // S14
-	m.HandleFunc("POST /api/daemon/tasks/{tid}/cancel-ack", s.reportHandler(scheduler.EPCancelAck))              // S15
-	m.HandleFunc("POST /api/daemon/tasks/{tid}/session", s.reportHandler(scheduler.EPSession))                   // S16
-	m.HandleFunc("POST /api/daemon/tasks/{tid}/wait-local-directory", s.reportHandler(scheduler.EPWaitLocalDir)) // S17
+	register := func(pattern string, h http.Handler) {
+		s.registered = append(s.registered, pattern)
+		m.Handle(pattern, h)
+	}
+	handleFn := func(pattern string, h http.HandlerFunc) { register(pattern, h) }
+	handleFn("GET /api/daemon/workspaces", s.handleWorkspaces)                                               // S1
+	handleFn("GET /api/workspaces", s.handleWorkspaces)                                                      // S28
+	handleFn("GET /api/daemon/workspaces/{ws}/repos", s.handleRepos)                                         // S2
+	handleFn("GET /api/daemon/workspaces/{ws}/runtime-profiles", s.handle404)                                // S3
+	handleFn("POST /api/daemon/workspaces/{ws}/issues/gc-check", s.handleIssueGCCheck)                       // S21
+	handleFn("POST /api/daemon/register", s.handleRegister)                                                  // S4
+	handleFn("POST /api/daemon/heartbeat", s.handleHeartbeat)                                                // S5
+	handleFn("POST /api/daemon/deregister", s.handleDeregister)                                              // S19
+	handleFn("POST /api/daemon/tasks/claim", s.handleClaim)                                                  // S6
+	handleFn("POST /api/daemon/runtimes/{rid}/tasks/claim", s.handleLegacyClaim)                             // S32 (no delivery face, ADR-042)
+	handleFn("GET /api/daemon/tasks/{tid}/status", s.handleTaskStatus)                                       // S9
+	handleFn("GET /api/daemon/tasks/{tid}/gc-check", s.handleTaskGCCheck)                                    // S20
+	handleFn("POST /api/daemon/tasks/{tid}/start", s.reportHandler(scheduler.EPStart))                       // S8
+	handleFn("POST /api/daemon/tasks/{tid}/progress", s.reportHandler(scheduler.EPProgress))                 // S10
+	handleFn("POST /api/daemon/tasks/{tid}/messages", s.reportHandler(scheduler.EPMessages))                 // S11
+	handleFn("POST /api/daemon/tasks/{tid}/usage", s.reportHandler(scheduler.EPUsage))                       // S12
+	handleFn("POST /api/daemon/tasks/{tid}/complete", s.reportHandler(scheduler.EPComplete))                 // S13
+	handleFn("POST /api/daemon/tasks/{tid}/fail", s.reportHandler(scheduler.EPFail))                         // S14
+	handleFn("POST /api/daemon/tasks/{tid}/cancel-ack", s.reportHandler(scheduler.EPCancelAck))              // S15
+	handleFn("POST /api/daemon/tasks/{tid}/session", s.reportHandler(scheduler.EPSession))                   // S16
+	handleFn("POST /api/daemon/tasks/{tid}/wait-local-directory", s.reportHandler(scheduler.EPWaitLocalDir)) // S17
 	// S23 is defensive-only this version: these calls carry the caller's
 	// own credential and are forwarded verbatim (§1.2 rule 2 semantics).
 	// The Job Token is still verified first — an invalid fmj_ must 401
 	// locally, never reach the upstream.
-	m.HandleFunc("GET /api/daemon/tasks/{tid}/plugin-hooks", s.handleS23)
-	m.HandleFunc("POST /api/daemon/tasks/{tid}/plugin-hooks", s.handleS23)
-	m.HandleFunc("GET /api/daemon/tasks/{tid}/remote-mcp/{cid}/credential", s.handleS23)
-	m.HandleFunc("GET /api/daemon/tasks/{tid}/plugin-mcp/{cid}/credential", s.handleS23)
-	m.HandleFunc("POST /api/daemon/runtimes/{rid}/tasks/{tid}/prepare-lease", s.handlePrepareLease)         // S7
-	m.HandleFunc("POST /api/daemon/runtimes/{rid}/tasks/{tid}/skill-bundles/resolve", s.handleSkillBundles) // S26
-	m.HandleFunc("POST /api/daemon/runtimes/{rid}/recover-orphans", s.handleRecoverOrphans)                 // S18
-	m.HandleFunc("POST /api/daemon/runtimes/{rid}/models/{req}/result", s.handleModelResult)                // S27
-	m.HandleFunc("POST /api/daemon/runtimes/{rid}/local-skills/{req}/result", s.handle404)                  // S27
-	m.HandleFunc("POST /api/daemon/runtimes/{rid}/local-skills/import/{req}/result", s.handle404)           // S27
-	m.HandleFunc("POST /api/daemon/runtimes/{rid}/update/{req}/result", s.handle404)                        // S27
-	m.HandleFunc("GET /api/daemon/issues/{id}/gc-check", s.handle404)                                       // S22
-	m.HandleFunc("GET /api/daemon/chat-sessions/{id}/gc-check", s.handle404)                                // S22
-	m.HandleFunc("GET /api/daemon/autopilot-runs/{id}/gc-check", s.handle404)                               // S22
-	m.HandleFunc("POST /api/tokens/current/renew", s.handleTokenRenew)                                      // S24
+	handleFn("GET /api/daemon/tasks/{tid}/plugin-hooks", s.handleS23)
+	handleFn("POST /api/daemon/tasks/{tid}/plugin-hooks", s.handleS23)
+	handleFn("GET /api/daemon/tasks/{tid}/remote-mcp/{cid}/credential", s.handleS23)
+	handleFn("GET /api/daemon/tasks/{tid}/plugin-mcp/{cid}/credential", s.handleS23)
+	handleFn("POST /api/daemon/runtimes/{rid}/tasks/{tid}/prepare-lease", s.handlePrepareLease)         // S7
+	handleFn("POST /api/daemon/runtimes/{rid}/tasks/{tid}/skill-bundles/resolve", s.handleSkillBundles) // S26
+	handleFn("POST /api/daemon/runtimes/{rid}/recover-orphans", s.handleRecoverOrphans)                 // S18
+	handleFn("POST /api/daemon/runtimes/{rid}/models/{req}/result", s.handleModelResult)                // S27
+	handleFn("POST /api/daemon/runtimes/{rid}/local-skills/{req}/result", s.handle404)                  // S27
+	handleFn("POST /api/daemon/runtimes/{rid}/local-skills/import/{req}/result", s.handle404)           // S27
+	handleFn("POST /api/daemon/runtimes/{rid}/update/{req}/result", s.handle404)                        // S27
+	handleFn("GET /api/daemon/issues/{id}/gc-check", s.handle404)                                       // S22
+	handleFn("GET /api/daemon/chat-sessions/{id}/gc-check", s.handle404)                                // S22
+	handleFn("GET /api/daemon/autopilot-runs/{id}/gc-check", s.handle404)                               // S22
+	handleFn("POST /api/tokens/current/renew", s.handleTokenRenew)                                      // S24
 	if s.ws != nil {
-		m.Handle("GET /api/daemon/ws", s.ws) // S30
+		register("GET /api/daemon/ws", s.ws) // S30
 	}
 	// Everything else under /api/ with a Job Token is not a local endpoint.
-	m.HandleFunc("/api/", s.handleNotFound)
+	handleFn("/api/", s.handleNotFound)
+}
+
+// registeredPatterns returns the patterns routes() registered, in order. It
+// is the read side of the daemon-face census (protocol_test.go): the census
+// asserts this set against the pinned upstream daemon API, so an undeclared
+// local route is a test failure rather than a silent addition to the face.
+func (s *FakeServer) registeredPatterns() []string {
+	return append([]string(nil), s.registered...)
 }
 
 // ServeHTTP applies the §1.2 routing rules before the endpoint table.

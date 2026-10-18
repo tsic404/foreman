@@ -150,8 +150,17 @@ type testRig struct {
 
 func newTestRig(t *testing.T) *testRig {
 	t.Helper()
+	return newTestRigWithRegister(t, func(stub *stubUpstream) { stubRegister(stub, "rid-real") })
+}
+
+// newTestRigWithRegister is newTestRig with the C1 register answer under the
+// caller's control: the daemon-face census needs a register response carrying
+// every field the real server can send (settings, profile_id, unknown keys),
+// which the shared stub does not.
+func newTestRigWithRegister(t *testing.T, register func(*stubUpstream)) *testRig {
+	t.Helper()
 	upstream, stub := newStubUpstream(t)
-	stubRegister(stub, "rid-real")
+	register(stub)
 
 	rig := &testRig{stub: stub}
 	stub.on("GET", "/api/daemon/workspaces", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
