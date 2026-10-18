@@ -2262,6 +2262,25 @@ func collectLogRecords(t *testing.T, raw []byte, event string) []map[string]any 
 	return out
 }
 
+// assertTaskIdentity checks the three keys every task event row must carry.
+// daemon_id is asserted by presence as well as value: an unknown identity is
+// an empty value, never a missing key.
+func assertTaskIdentity(t *testing.T, record map[string]any, taskID, jobName, daemonID string) {
+	t.Helper()
+	if got := record["task_id"]; got != taskID {
+		t.Errorf("task_id = %v, want %q", got, taskID)
+	}
+	if got := record["job_name"]; got != jobName {
+		t.Errorf("job_name = %v, want %q", got, jobName)
+	}
+	got, ok := record["daemon_id"]
+	if !ok {
+		t.Errorf("daemon_id key missing: %v", record)
+	} else if got != daemonID {
+		t.Errorf("daemon_id = %v, want %q", got, daemonID)
+	}
+}
+
 // findLogRecord returns the first JSON log record whose msg equals event.
 func findLogRecord(t *testing.T, raw []byte, event string) map[string]any {
 	t.Helper()
@@ -2382,6 +2401,163 @@ func TestOnClaimDropsAffinityForSaturatedNode(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestTaskEventsCarryIdentity (AC-10, TC-tech-observability-02): every task
+// event row carries task_id, job_name and daemon_id, so one task's chain can
+// be followed by its identifier alone. The daemon identity is a key even when
+// unknown (empty value), never an absent one.
+func TestTaskEventsCarryIdentity(t *testing.T) {
+	t.Run("claimed", func(t *testing.T) {
+		f := newFixture(t)
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		f.claim(t, "task-1")
+		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.claimed"), "task-1", "fm-task-1", "fm-task-1")
+	})
+
+	t.Run("started", func(t *testing.T) {
+		f := newFixture(t)
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		e := f.claim(t, "task-1")
+		if code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`)); err != nil || code != 200 {
+			t.Fatalf("OnReport = %d, %v", code, err)
+		}
+		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.started"), "task-1", "fm-task-1", "fm-task-1")
+	})
+
+	t.Run("failed_compensated_on_boot_timeout", func(t *testing.T) {
+		f := newFixture(t)
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		f.claim(t, "task-1")
+		if err := f.sched.OnBootTimeout(context.Background(), "task-1"); err != nil {
+			t.Fatalf("OnBootTimeout: %v", err)
+		}
+		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.failed_compensated"), "task-1", "fm-task-1", "fm-task-1")
+	})
+
+	t.Run("failed_compensated_on_claim_failure", func(t *testing.T) {
+		f := newFixture(t)
+		f.jobs.createSecretErr = errors.New("rbac denied")
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err == nil {
+			t.Fatal("OnClaim error swallowed")
+		}
+		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.failed_compensated"), "task-1", "fm-task-1", "fm-task-1")
+	})
+
+	t.Run("vanished", func(t *testing.T) {
+		f := newFixture(t)
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		f.claim(t, "task-1")
+		if err := f.sched.OnTaskVanished(context.Background(), "task-1"); err != nil {
+			t.Fatalf("OnTaskVanished: %v", err)
+		}
+		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.vanished"), "task-1", "fm-task-1", "fm-task-1")
+	})
+
+	t.Run("forward_failed_permanent", func(t *testing.T) {
+		f := newFixture(t)
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		e := f.claim(t, "task-1")
+		f.server.forwardCode = 400
+		if _, _, err := f.sched.OnReport(context.Background(), EPFail, e, []byte(`{}`)); err != nil {
+			t.Fatalf("OnReport: %v", err)
+		}
+		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.forward_failed"), "task-1", "fm-task-1", "fm-task-1")
+	})
+
+	t.Run("forward_failed_compensation_report", func(t *testing.T) {
+		f := newFixture(t)
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		f.claim(t, "task-1")
+		f.server.forwardCode = 400
+		if err := f.sched.OnBootTimeout(context.Background(), "task-1"); err != nil {
+			t.Fatalf("OnBootTimeout: %v", err)
+		}
+		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.forward_failed"), "task-1", "fm-task-1", "fm-task-1")
+	})
+
+	t.Run("claim_deferred", func(t *testing.T) {
+		f := newFixture(t)
+		f.claim(t, "task-1")
+		f.server.status = "dispatched"
+		f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
+		f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
+		f.jobs.onGetJob = func() { f.now = f.now.Add(jobNameWait + time.Second) }
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); !errors.Is(err, errJobNameHeld) {
+			t.Fatalf("OnClaim err = %v, want errJobNameHeld", err)
+		}
+		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.claim_deferred"), "task-1", "fm-task-1", "fm-task-1")
+	})
+
+	t.Run("payload_missing", func(t *testing.T) {
+		f := newFixture(t)
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		if err := f.reg.Put(registry.TaskEntry{
+			TaskID: "task-1", JobName: "fm-task-1", DaemonID: "fm-task-1",
+			JobRuntimeID: "rt-1", State: registry.StateDaemonRegistered,
+		}); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+		if got, err := f.sched.Deliver("fm-task-1", "rt-1", 1); err != nil || len(got) != 0 {
+			t.Fatalf("Deliver = %v, %v", got, err)
+		}
+		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.payload_missing"), "task-1", "fm-task-1", "fm-task-1")
+	})
+
+	t.Run("delivered", func(t *testing.T) {
+		f := newFixture(t)
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		e := f.claim(t, "task-1")
+		if _, ok := f.reg.MarkDaemonRegistered(e.DaemonID, f.now); !ok {
+			t.Fatal("MarkDaemonRegistered failed")
+		}
+		if got, err := f.sched.Deliver(e.DaemonID, e.JobRuntimeID, 1); err != nil || len(got) != 1 {
+			t.Fatalf("Deliver = %v, %v", got, err)
+		}
+		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.delivered"), "task-1", "fm-task-1", "fm-task-1")
+	})
+
+	t.Run("settle_failed", func(t *testing.T) {
+		f := newFixture(t)
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		e := f.claim(t, "task-1")
+		f.server.forwardCode = 409
+		f.server.statusErr = errors.New("status lookup unavailable")
+		if code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`)); err != nil || code != 409 {
+			t.Fatalf("OnReport = %d, %v", code, err)
+		}
+		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.settle_failed"), "task-1", "fm-task-1", "fm-task-1")
+	})
+
+	t.Run("adopted_running", func(t *testing.T) {
+		f := newFixture(t)
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		f.claim(t, "task-1")
+		if err := f.sched.AdoptRunning(context.Background(), "task-1"); err != nil {
+			t.Fatalf("AdoptRunning: %v", err)
+		}
+		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.adopted_running"), "task-1", "fm-task-1", "fm-task-1")
+	})
+
+	t.Run("discard_failed", func(t *testing.T) {
+		f := newFixture(t)
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		e := f.claim(t, "task-1")
+		f.jobs.deleteJobErr = errors.New("apiserver unavailable")
+		f.sched.discardQuietly(context.Background(), e)
+		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.discard_failed"), "task-1", "fm-task-1", "fm-task-1")
+	})
+
+	t.Run("forward_undelivered", func(t *testing.T) {
+		f := newFixture(t)
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		e := f.claim(t, "task-1")
+		f.pending.err = errors.New("queue unwritable")
+		f.sched.enqueuePending(context.Background(), e, EPFail, []byte(`{}`))
+		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.forward_undelivered"), "task-1", "fm-task-1", "fm-task-1")
+	})
 }
 
 // TestOnClaimWithoutIssueContext (AC-23): an autopilot-triggered payload has no

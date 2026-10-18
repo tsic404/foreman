@@ -14,16 +14,22 @@ import (
 type fakePendingReports struct {
 	reports []pendingCall
 	queued  map[string]bool
+	err     error // Enqueue's durable-write failure
 }
 
 type pendingCall struct {
-	taskID string
-	ep     Endpoint
-	body   string
+	taskID   string
+	jobName  string
+	daemonID string
+	ep       Endpoint
+	body     string
 }
 
-func (f *fakePendingReports) Enqueue(taskID string, ep Endpoint, body []byte) error {
-	f.reports = append(f.reports, pendingCall{taskID, ep, string(body)})
+func (f *fakePendingReports) Enqueue(taskID, jobName, daemonID string, ep Endpoint, body []byte) error {
+	f.reports = append(f.reports, pendingCall{taskID, jobName, daemonID, ep, string(body)})
+	if f.err != nil {
+		return f.err
+	}
 	if f.queued == nil {
 		f.queued = map[string]bool{}
 	}

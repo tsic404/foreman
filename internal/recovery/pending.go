@@ -35,6 +35,8 @@ type ReportSender interface {
 // the queue: a report is durable iff its file exists (staged until it lands).
 type pendingReport struct {
 	TaskID     string          `json:"task_id"`
+	JobName    string          `json:"job_name"`
+	DaemonID   string          `json:"daemon_id"`
 	Endpoint   string          `json:"endpoint"`
 	Body       json.RawMessage `json:"body"`
 	EnqueuedAt time.Time       `json:"enqueued_at"`
@@ -115,11 +117,13 @@ func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReport
 // reports it as undelivered, so the task's objects stay until it landed. The
 // returned error is that error row's "记 error" half — never a reason to
 // discard the report.
-func (p *PendingReports) Enqueue(taskID string, ep scheduler.Endpoint, body []byte) error {
+func (p *PendingReports) Enqueue(taskID, jobName, daemonID string, ep scheduler.Endpoint, body []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	rep := pendingReport{
 		TaskID:     taskID,
+		JobName:    jobName,
+		DaemonID:   daemonID,
 		Endpoint:   string(ep),
 		Body:       body,
 		EnqueuedAt: p.now(),
@@ -137,7 +141,8 @@ func (p *PendingReports) Enqueue(taskID string, ep scheduler.Endpoint, body []by
 	}
 	delete(p.staged, taskID)
 	p.log.Error("task.forward_queued",
-		"task_id", taskID, "endpoint", rep.Endpoint)
+		"task_id", taskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
+		"endpoint", rep.Endpoint)
 	p.notifyLocked()
 	return nil
 }
@@ -187,7 +192,8 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 	for _, rep := range queue {
 		if p.now().Sub(rep.EnqueuedAt) > PendingReportTTL {
 			p.log.Error("task.forward_dropped",
-				"task_id", rep.TaskID, "endpoint", rep.Endpoint,
+				"task_id", rep.TaskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
+				"endpoint", rep.Endpoint,
 				"attempts", rep.Attempts, "reason", "pending report TTL exceeded")
 			p.mu.Lock()
 			p.dropLocked(rep.TaskID)
@@ -199,7 +205,8 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 		p.mu.Lock()
 		if delivered {
 			p.log.Info("task.forward_delivered",
-				"task_id", rep.TaskID, "endpoint", rep.Endpoint, "attempts", rep.Attempts+1)
+				"task_id", rep.TaskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
+				"endpoint", rep.Endpoint, "attempts", rep.Attempts+1)
 			p.dropLocked(rep.TaskID)
 		} else {
 			p.bumpAttemptsLocked(rep.TaskID)
@@ -230,7 +237,8 @@ func (p *PendingReports) flushStagedLocked() {
 	for taskID, rep := range p.staged {
 		if p.now().Sub(rep.EnqueuedAt) > PendingReportTTL {
 			p.log.Error("task.forward_dropped",
-				"task_id", taskID, "endpoint", rep.Endpoint,
+				"task_id", taskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
+				"endpoint", rep.Endpoint,
 				"attempts", rep.Attempts, "reason", "pending report TTL exceeded")
 			delete(p.staged, taskID)
 			continue
@@ -244,7 +252,8 @@ func (p *PendingReports) flushStagedLocked() {
 			continue
 		}
 		p.log.Info("task.forward_queued",
-			"task_id", taskID, "endpoint", rep.Endpoint, "retried_write", true)
+			"task_id", taskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
+			"endpoint", rep.Endpoint, "retried_write", true)
 		delete(p.staged, taskID)
 	}
 }

@@ -241,7 +241,7 @@ func TestReclaimGatesTheJobDeletionOnTheQueuedReport(t *testing.T) {
 	if _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, "", f.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
-	if err := p.Enqueue("task-1", EPFail, []byte(`{"failure_reason":"job_missing"}`)); err != nil {
+	if err := p.Enqueue("task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"failure_reason":"job_missing"}`)); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 

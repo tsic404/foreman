@@ -754,7 +754,7 @@ func TestReconcileDrainsPendingReports(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	if err := queue.Enqueue("t1", scheduler.EPComplete, []byte(`{"status":"completed"}`)); err != nil {
+	if err := queue.Enqueue("t1", "fm-t1", "fm-t1", scheduler.EPComplete, []byte(`{"status":"completed"}`)); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	sender := &recordingSender{}
