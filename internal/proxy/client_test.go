@@ -1331,6 +1331,13 @@ func (m *fakeMetrics) catalogCodeCount(code string) int {
 	return n
 }
 
+// catalogSpansSnapshot copies the recorded catalog durations (locked).
+func (m *fakeMetrics) catalogSpansSnapshot() []float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]float64(nil), m.catalogSpans...)
+}
+
 // wsCount reads the current connection gauge for a side (locked).
 func (m *fakeMetrics) wsCount(side string) int {
 	m.mu.Lock()

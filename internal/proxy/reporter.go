@@ -104,6 +104,9 @@ func (r *ModelCatalogReporter) OnAck(ctx context.Context, runtimeID, requestID s
 	if requestID == "" {
 		return
 	}
+	// The server window is anchored at consumption, never at goroutine dispatch
+	// (§1.1「C2 ack 消费」第 6 条).
+	consumedAt := r.now()
 	if !r.cfg.ModelCatalogEnabled {
 		// The disabled path is a visible degradation, never a silent drop.
 		r.log.Warn("model.catalog_relay_failed", "request_id", requestID,
@@ -127,17 +130,19 @@ func (r *ModelCatalogReporter) OnAck(ctx context.Context, runtimeID, requestID s
 		// in-round (§1.1 C2 ack 消费 第 3 条), while the replay — which may
 		// retry inside its own budget — must not stretch the 15s cadence of
 		// this runtime's C2 stream (a replay is meant to be the near-zero path).
-		go r.replay(context.WithoutCancel(ctx), runtimeID, requestID, slot)
+		go r.replay(context.WithoutCancel(ctx), runtimeID, requestID, slot, consumedAt)
 		return
 	}
-	r.Submit(ctx, runtimeID, requestID, r.now())
+	r.Submit(ctx, runtimeID, requestID, consumedAt)
 }
 
 // replay answers a command from the runtime's catalog cache: the body and the
 // request id go out byte for byte, and the slot is not single-flight state
-// (§1.1 C21 第 13 条).
-func (r *ModelCatalogReporter) replay(ctx context.Context, runtimeID, requestID string, slot CatalogSlot) {
-	start := r.now()
+// (§1.1 C21 第 13 条). consumedAt is when the ack was read: the local budget
+// and the recorded span both start there, so a replay dispatched late can never
+// outlive the server's window.
+func (r *ModelCatalogReporter) replay(ctx context.Context, runtimeID, requestID string, slot CatalogSlot, consumedAt time.Time) {
+	start := consumedAt
 	age := start.Sub(slot.LandedAt)
 	if r.cfg.ModelCatalogCacheTTL > 0 && age > r.cfg.ModelCatalogCacheTTL {
 		// Staleness is only ever a warning: crossing the TTL must never stop
@@ -183,7 +188,7 @@ func (r *ModelCatalogReporter) Submit(ctx context.Context, runtimeID, requestID 
 		if slot.queued != nil {
 			r.log.Warn("model.catalog_relay_failed", "request_id", slot.queued.reqID,
 				"runtime_id", runtimeID, "reason", "superseded by a newer request")
-			r.metrics.ModelCatalogRelay("none", 0)
+			r.metrics.ModelCatalogRelay("none", r.now().Sub(slot.queued.consumedAt).Seconds())
 		}
 		slot.queued = req
 	}
