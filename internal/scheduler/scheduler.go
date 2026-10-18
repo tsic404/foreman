@@ -846,7 +846,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			e.Result = result
 			s.metrics.TaskTerminal(string(result))
 			s.log.InfoContext(ctx, "task.terminal",
-				"task_id", e.TaskID, "job_name", e.JobName,
+				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 				"result", string(result),
 				"duration_seconds", now.Sub(e.ClaimedAt).Seconds())
 		}
@@ -1197,7 +1197,8 @@ func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) e
 		}
 		s.metrics.TaskTerminal(result)
 		s.log.InfoContext(ctx, "task.terminal",
-			"task_id", e.TaskID, "job_name", e.JobName, "result", result)
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+			"result", result)
 	}
 	return s.deleteJob(ctx, e)
 }
