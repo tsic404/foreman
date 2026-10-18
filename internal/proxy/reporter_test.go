@@ -295,6 +295,59 @@ func TestReporterReplayIgnoresInFlightProbe(t *testing.T) {
 	close(h.probes.gate)
 }
 
+// TestReporterReplaySpanStartsAtAckConsumption pins the observable duration:
+// the recorded span is consumption -> answer, not dispatch -> answer. The
+// replay goroutine starts after the ack, so anchoring at its own clock would
+// silently drop the dispatch gap (and the same anchor bounds the retry budget).
+func TestReporterReplaySpanStartsAtAckConsumption(t *testing.T) {
+	cfg := testConfig("http://unused")
+	h := newReporterHarness(t, cfg)
+	h.slots.Put("rid-a", []byte(`{"models":[]}`), h.now.Add(-time.Minute))
+	h.recordC21(t, 200)
+	slot, ok := h.slots.Get("rid-a")
+	if !ok {
+		t.Fatal("slot missing")
+	}
+
+	h.reporter.replay(t.Context(), "rid-a", "req-1", slot, h.now.Add(-7*time.Second))
+
+	spans := h.metrics.catalogSpansSnapshot()
+	if len(spans) != 1 {
+		t.Fatalf("catalog spans = %v, want one recorded relay", spans)
+	}
+	if spans[0] != 7 {
+		t.Errorf("catalog span = %vs, want the 7s since the ack was consumed", spans[0])
+	}
+}
+
+// TestReporterReplayBudgetStartsAtAckConsumption is the window face of the same
+// anchor: an ack consumed before the budget began leaves no time for a C21, so
+// the replay must abandon it visibly rather than start a relay the server has
+// already timed out.
+func TestReporterReplayBudgetStartsAtAckConsumption(t *testing.T) {
+	cfg := testConfig("http://unused")
+	cfg.ModelCatalogTimeout = 45 * time.Second
+	h := newReporterHarness(t, cfg)
+	h.slots.Put("rid-a", []byte(`{"models":[]}`), h.now.Add(-time.Minute))
+	calls := h.recordC21(t, 200)
+	slot, ok := h.slots.Get("rid-a")
+	if !ok {
+		t.Fatal("slot missing")
+	}
+
+	h.reporter.replay(t.Context(), "rid-a", "req-1", slot, h.now.Add(-46*time.Second))
+
+	if got := calls.len(); got != 0 {
+		t.Errorf("C21 calls = %d, want none past the consumption-anchored budget", got)
+	}
+	if got := h.metrics.catalogCodeCount("none"); got != 1 {
+		t.Errorf("abandoned relay metric = %d, want 1", got)
+	}
+	if logs := h.logs.String(); !strings.Contains(logs, "model.catalog_relay_failed") {
+		t.Errorf("the abandoned replay must be visible: %s", logs)
+	}
+}
+
 func TestReporterStaleCacheStillAnswers(t *testing.T) {
 	cfg := testConfig("http://unused")
 	cfg.ModelCatalogCacheTTL = time.Minute
@@ -470,6 +523,38 @@ func TestReporterSupersedesQueuedRequest(t *testing.T) {
 			t.Errorf("req %s: relayed event missing: %s", id, logs)
 		}
 	}
+}
+
+// TestReporterSupersededSpanCountsItsQueueWait pins the abandoned queued
+// request's duration: it waited from its own ack consumption until the newer
+// command displaced it, and that wait is part of the consumption -> abandon
+// span the metric claims to report.
+func TestReporterSupersededSpanCountsItsQueueWait(t *testing.T) {
+	cfg := testConfig("http://unused")
+	h := newReporterHarness(t, cfg)
+	h.probes.gate = make(chan struct{})
+	h.probes.result = probeResult{relayed: true, code: 200}
+
+	h.reporter.Submit(t.Context(), "rid-a", "req-1", h.now)
+	h.reporter.Submit(t.Context(), "rid-a", "req-2", h.now.Add(-12*time.Second))
+	h.reporter.Submit(t.Context(), "rid-a", "req-3", h.now)
+
+	if got := h.metrics.catalogCodeCount("none"); got != 1 {
+		t.Fatalf("abandoned relay metric = %d, want 1 (the superseded request)", got)
+	}
+	spans := h.metrics.catalogSpansSnapshot()
+	if len(spans) != 1 || spans[0] != 12 {
+		t.Fatalf("catalog spans = %v, want the superseded request's 12s queue wait", spans)
+	}
+	if !strings.Contains(h.logs.String(), "superseded by a newer request") {
+		t.Errorf("the superseded request must stay visible: %s", h.logs.String())
+	}
+	close(h.probes.gate)
+	waitForCondition(t, "the promoted request to finish", func() bool {
+		h.probes.mu.Lock()
+		defer h.probes.mu.Unlock()
+		return len(h.probes.started) == 2
+	})
 }
 
 func TestReporterInsufficientBudgetDoesNotStartProbe(t *testing.T) {
