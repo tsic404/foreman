@@ -112,6 +112,9 @@ type upstreamRequest struct {
 	Path   string
 	Body   []byte
 	Header http.Header
+	// At is when the request arrived: the wire observation a renewal-cadence
+	// scenario reads its intervals off.
+	At time.Time
 }
 
 // ackRuntimeIDShape is how the stub shapes the heartbeat ack's runtime_id: the
@@ -323,7 +326,7 @@ func (s *upstreamStub) record(r *http.Request, path string, body []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.requests = append(s.requests, upstreamRequest{
-		Method: r.Method, Path: path, Body: body, Header: r.Header.Clone(),
+		Method: r.Method, Path: path, Body: body, Header: r.Header.Clone(), At: time.Now(),
 	})
 }
 
@@ -376,6 +379,27 @@ func (s *upstreamStub) claim(maxTasks int) []json.RawMessage {
 		served = append(served, task.payload)
 	}
 	return served
+}
+
+// requeueTask puts a dispatched task back on the stub server's queue: the
+// redispatch the server performs once its lease on the task has lapsed. The
+// lease magnitude is the server's own clock, so the fixture plays its decision
+// rather than waiting it out. Reports false when the task is not the stub's or
+// is not dispatched.
+func (s *upstreamStub) requeueTask(taskID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, task := range s.queued {
+		if task.id != taskID {
+			continue
+		}
+		if task.status != taskStatusDispatched {
+			return false
+		}
+		task.status = taskStatusQueued
+		return true
+	}
+	return false
 }
 
 // taskStatus is the stub server's status for one enqueued task ("" when the
@@ -812,22 +836,36 @@ func (c *jobClient) probeJobsCreated() []string {
 }
 
 // builder is the jobbuilder seam: it renders canned objects and issues the
-// probe Job Token with the real issuer, so probe requests authenticate against
-// the real auth module.
+// Job Tokens with the real issuer — the task Job's credential and the probe's
+// alike — so probe requests authenticate against the real auth module and a
+// task entry records the digest the daemon face adjudicates (ADR-017).
 type builder struct {
 	issuer   *auth.Issuer
 	probes   *registry.ProbeRegistry
 	probeErr error
 
 	mu     sync.Mutex
-	tokens map[string]string // probe Job name -> issued Job Token
+	tokens map[string]string // Job name -> issued Job Token
 }
 
+// Build renders the task's objects and issues its Job Token, returning the
+// digest the entry carries. It mirrors the production builder's credential
+// behaviour (ADR-017's token_hash write is OnClaim's, from this return).
 func (b *builder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
 	name := "fm-" + e.TaskID
+	token, err := b.issuer.Issue(name, e.TaskID, e.WorkspaceID, auth.DefaultJobTokenTTL)
+	if err != nil {
+		return nil, nil, "", err
+	}
 	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name}}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name + "-cred"}}
-	return job, secret, "hash-" + name, nil
+	b.mu.Lock()
+	if b.tokens == nil {
+		b.tokens = map[string]string{}
+	}
+	b.tokens[name] = token
+	b.mu.Unlock()
+	return job, secret, b.issuer.Hash(token), nil
 }
 
 // ResolveName mirrors the fallback name the canned builder renders.
@@ -860,7 +898,7 @@ func (b *builder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string,
 	return job, secret, b.issuer.Hash(token), nil
 }
 
-// probeToken returns the Job Token issued for a probe Job.
+// probeToken returns the Job Token issued for a Job (task or probe).
 func (b *builder) probeToken(jobName string) string {
 	b.mu.Lock()
 	defer b.mu.Unlock()
@@ -1052,21 +1090,31 @@ func (c *schedulerServerClient) forwarded(ep scheduler.Endpoint) []upstreamReque
 }
 
 // recordingMetrics implements proxy.Metrics and the scheduler's metric seam,
-// recording the catalog outcomes and the S6 delivery face.
+// recording the catalog outcomes, the daemon face's auth failures and the S6
+// delivery face.
 type recordingMetrics struct {
 	mu            sync.Mutex
 	catalogCodes  []string
 	catalogSecs   []float64
 	deliveryKinds []string
 	unconfirmed   int
+	authReasons   []string
+	duplicates    int
 }
 
 func (m *recordingMetrics) Forward(string, int, time.Duration) {}
 func (m *recordingMetrics) ClaimError(string)                  {}
-func (m *recordingMetrics) AuthFailure(string)                 {}
 func (m *recordingMetrics) WSConnect(string)                   {}
 func (m *recordingMetrics) WSDisconnect(string)                {}
 func (m *recordingMetrics) WSReconnect(string)                 {}
+
+// AuthFailure records the reason the daemon face rejected a request
+// (foreman_auth_failures_total{reason}).
+func (m *recordingMetrics) AuthFailure(reason string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.authReasons = append(m.authReasons, reason)
+}
 
 // The scheduler's own seam: recorded only where a scenario reads it, no-ops
 // otherwise (the scheduler must never change behaviour because a metric
@@ -1076,8 +1124,15 @@ func (m *recordingMetrics) TaskTerminal(string)           {}
 func (m *recordingMetrics) JobBootSeconds(float64)        {}
 func (m *recordingMetrics) JobCreateSeconds(float64)      {}
 func (m *recordingMetrics) InflightJobs(int)              {}
-func (m *recordingMetrics) DuplicateDispatch()            {}
 func (m *recordingMetrics) CredReclaimed(string, float64) {}
+
+// DuplicateDispatch counts a server redispatch of a known task
+// (foreman_duplicate_dispatch_total).
+func (m *recordingMetrics) DuplicateDispatch() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.duplicates++
+}
 
 func (m *recordingMetrics) ModelCatalogRelay(code string, seconds float64) {
 	m.mu.Lock()
@@ -1134,10 +1189,59 @@ func (m *recordingMetrics) deliveryUnconfirmedCount() int {
 	return m.unconfirmed
 }
 
+// duplicateDispatchCount reports how many redispatches of a known task the
+// scheduler counted.
+func (m *recordingMetrics) duplicateDispatchCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.duplicates
+}
+
+// authFailureCount counts the daemon-face rejections recorded under one reason.
+func (m *recordingMetrics) authFailureCount(reason string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, recorded := range m.authReasons {
+		if recorded == reason {
+			n++
+		}
+	}
+	return n
+}
+
 // probeBuilder is the jobbuilder seam plus the test-only credential reader.
 type probeBuilder interface {
 	scheduler.JobBuilder
 	probeToken(jobName string) string
+}
+
+// syncBuffer is the log sink a scenario reads while the production loops log
+// into it from their own goroutines (claim loop, lease keeper, probe server):
+// a plain bytes.Buffer would be read while it is written.
+type syncBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *syncBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+// Bytes snapshots the lines written so far.
+func (b *syncBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.buf.Bytes()...)
+}
+
+// String snapshots the lines written so far.
+func (b *syncBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
 }
 
 // harness wires the real components against the stubs.
@@ -1158,12 +1262,16 @@ type harness struct {
 	upstream *upstreamStub
 	handler  http.Handler
 	jobsHTTP *httptest.Server
-	logs     *bytes.Buffer
+	logs     *syncBuffer
 	// handlerLogs captures the fake server's own event lines (the job-facing
 	// face), separate from the scheduler's.
-	handlerLogs *bytes.Buffer
+	handlerLogs *syncBuffer
 
 	schedCfg scheduler.Config
+	// revoker is the scheduler's credential-revocation seam. Nil leaves it
+	// inert (noRevoker): a scenario that judges the revocation set wires the
+	// shared issuer here and rebuilds the scheduler, as a deployment wires it.
+	revoker scheduler.Revoker
 }
 
 // Delivery confirmation window and lease cadence the scenarios run with: the
@@ -1190,8 +1298,8 @@ func newHarnessWithWindow(t *testing.T, catalogEnabled bool, window time.Duratio
 	probes := registry.NewProbeRegistry()
 	startup := registry.NewStartupCatalog()
 	slots := proxy.NewCatalogSlots()
-	logs := &bytes.Buffer{}
-	handlerLogs := &bytes.Buffer{}
+	logs := &syncBuffer{}
+	handlerLogs := &syncBuffer{}
 
 	cfg := proxy.Config{
 		ServerURL:            upstream.server.URL,
@@ -1269,7 +1377,7 @@ func (h *harness) rebuildScheduler(t *testing.T, mutate func(*scheduler.Config))
 	mutate(&cfg)
 	sched, err := scheduler.New(cfg, h.reg, h.jobs, h.builder, h.server, h.metrics,
 		scheduler.WithPendingReports(noReports{}),
-		scheduler.WithRevoker(noRevoker{}),
+		scheduler.WithRevoker(credentialRevoker(h.revoker)),
 		scheduler.WithProbeRegistry(h.probes),
 		scheduler.WithLogger(slog.New(slog.NewJSONHandler(h.logs, nil))),
 	)
@@ -1509,6 +1617,15 @@ func (noReports) Queued(string) bool                                            
 type noRevoker struct{}
 
 func (noRevoker) Revoke(string) {}
+
+// credentialRevoker is the scheduler's revoker: the scenario's when it wired
+// one, the inert one otherwise.
+func credentialRevoker(r scheduler.Revoker) scheduler.Revoker {
+	if r != nil {
+		return r
+	}
+	return noRevoker{}
+}
 
 // steppedClock is the reporter's clock seam with a scenario-controlled offset:
 // a catalog scenario ages one request's budget without waiting it out, and the
