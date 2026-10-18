@@ -295,7 +295,13 @@ func (f *fakeBuilder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID str
 	return job, secret, hash, nil
 }
 
+// fakeMetrics records the scheduler's metric calls. Every setter locks: the
+// metrics seam is reached from OnClaim's deferred SyncInflight, which runs
+// after the per-task lock is released, so concurrent claims record here in
+// parallel.
 type fakeMetrics struct {
+	mu sync.Mutex
+
 	claimed     int
 	terminal    []string
 	inflight    []int
@@ -305,14 +311,42 @@ type fakeMetrics struct {
 	drainSecond []float64
 }
 
-func (f *fakeMetrics) TaskClaimed()               { f.claimed++ }
-func (f *fakeMetrics) TaskTerminal(result string) { f.terminal = append(f.terminal, result) }
-func (f *fakeMetrics) JobBootSeconds(float64)     {}
-func (f *fakeMetrics) JobCreateSeconds(float64)   {}
-func (f *fakeMetrics) InflightJobs(n int)         { f.inflight = append(f.inflight, n) }
-func (f *fakeMetrics) DuplicateDispatch()         { f.duplicates++ }
-func (f *fakeMetrics) DeliveryUnconfirmed()       { f.unconfirmed++ }
+func (f *fakeMetrics) TaskClaimed() {
+	f.mu.Lock()
+	f.claimed++
+	f.mu.Unlock()
+}
+
+func (f *fakeMetrics) TaskTerminal(result string) {
+	f.mu.Lock()
+	f.terminal = append(f.terminal, result)
+	f.mu.Unlock()
+}
+
+func (f *fakeMetrics) JobBootSeconds(float64)   {}
+func (f *fakeMetrics) JobCreateSeconds(float64) {}
+
+func (f *fakeMetrics) InflightJobs(n int) {
+	f.mu.Lock()
+	f.inflight = append(f.inflight, n)
+	f.mu.Unlock()
+}
+
+func (f *fakeMetrics) DuplicateDispatch() {
+	f.mu.Lock()
+	f.duplicates++
+	f.mu.Unlock()
+}
+
+func (f *fakeMetrics) DeliveryUnconfirmed() {
+	f.mu.Lock()
+	f.unconfirmed++
+	f.mu.Unlock()
+}
+
 func (f *fakeMetrics) CredReclaimed(reason string, drainSeconds float64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.reclaim = append(f.reclaim, reason)
 	f.drainSecond = append(f.drainSecond, drainSeconds)
 }
