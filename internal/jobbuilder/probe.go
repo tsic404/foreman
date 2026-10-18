@@ -1,7 +1,6 @@
 package jobbuilder
 
 import (
-	"encoding/json"
 	"errors"
 	"fmt"
 	"strconv"
@@ -27,8 +26,10 @@ const (
 
 // taskCredSecretLiteral is a template's per-task credential Secret name: the
 // literal A1.4 ④ substitutes for the probe's own Secret, beside the task
-// profile literal (jobProfile) it renames to the probe profile.
-var taskCredSecretLiteral = jobName(placeholderTaskID) + secretCredSuffix
+// profile literal (jobProfile) it renames to the probe profile. The task
+// Secret's own name derives from the identity name, never from the display
+// name (ADR-034 decision 8).
+var taskCredSecretLiteral = daemonIDFor(placeholderTaskID) + secretCredSuffix
 
 // ErrInvalidRequestID marks a request id that cannot name a probe Job: no
 // object is created, and the caller reports the relay as failed.
@@ -68,15 +69,17 @@ func probeJobName(requestID string) string {
 	return probeJobPrefix + requestID
 }
 
-// probeLabels is the §3.2 label block every probe Job and probe Secret carry.
-// managed-by is the stale-sweep selector, so Foreman writes it even when a
-// template omits it; task-id is never written — it is what makes a Job a task
-// Job (03-contracts.md §1.3).
-func probeLabels() map[string]string {
+// probeLabels is the §3.2 label block every probe Job and probe Secret carry:
+// the probe's daemon identity, which is also what its MULTICA_DAEMON_ID
+// fieldRef reads (ADR-019 / ADR-034). managed-by is the stale-sweep selector,
+// so Foreman writes it even when a template omits it; task-id is never written
+// — it is what makes a Job a task Job (03-contracts.md §1.3).
+func probeLabels(name string) map[string]string {
 	return map[string]string{
 		labelAppName:   jobAppName,
 		labelManagedBy: managedByForeman,
 		labelRole:      probeRole,
+		labelDaemonID:  name,
 	}
 }
 
@@ -122,13 +125,19 @@ func (b *Builder) applyProbeWrites(job *batchv1.Job, name string) {
 	clearForemanDomain(job.Annotations)
 	clearForemanDomain(job.Spec.Template.Labels)
 	clearForemanDomain(job.Spec.Template.Annotations)
+	clearOwnedKeys(job.Labels)
+	clearOwnedKeys(job.Annotations)
+	clearOwnedKeys(job.Spec.Template.Labels)
+	clearOwnedKeys(job.Spec.Template.Annotations)
 
-	job.Labels = setKeys(job.Labels, probeLabels())
-	// Pod side: the probe block's name and role only. managed-by is the Job
-	// side's selector — nothing lists pods by it.
+	job.Labels = setKeys(job.Labels, probeLabels(name))
+	// Pod side: the probe block's name, role and daemon id — the last is the
+	// fieldRef source, and the same writing rule as a task Job's. managed-by is
+	// the Job side's selector — nothing lists pods by it.
 	job.Spec.Template.Labels = setKeys(job.Spec.Template.Labels, map[string]string{
-		labelAppName: jobAppName,
-		labelRole:    probeRole,
+		labelAppName:  jobAppName,
+		labelRole:     probeRole,
+		labelDaemonID: name,
 	})
 
 	writeProbeHeartbeat(job, b.cfg.probeHeartbeat())
@@ -162,7 +171,7 @@ func (b *Builder) probeCredentialSecret(name, token string) *corev1.Secret {
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name + secretCredSuffix,
 			Namespace: b.cfg.JobNamespace,
-			Labels:    probeLabels(),
+			Labels:    probeLabels(name),
 		},
 		Type:       corev1.SecretTypeOpaque,
 		StringData: map[string]string{configFileKey: configJSON},
@@ -206,17 +215,13 @@ func renderProbeTemplate(template map[string]any, v probeValues) (*batchv1.Job, 
 	rendered := deepCopyTemplate(template)
 	rewriteStrings(rendered, v.literals)
 	rewriteStrings(rendered, v.placeholders)
-	resolvePreferredNode(rendered, "")
 
-	raw, err := json.Marshal(rendered)
+	job, err := decodeJobTemplate(rendered)
 	if err != nil {
 		return nil, fmt.Errorf("render probe Job: %w", err)
 	}
-	var job batchv1.Job
-	if err := json.Unmarshal(raw, &job); err != nil {
-		return nil, fmt.Errorf("render probe Job: %w", err)
-	}
-	return &job, nil
+	resolvePreferredNode(job, "")
+	return job, nil
 }
 
 // rewriteStrings applies rewrite to every string value of the object — map

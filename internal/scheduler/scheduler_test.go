@@ -49,6 +49,7 @@ type fakeJobs struct {
 	deleteJobErr    error
 	deleteSecretErr error
 	getJobErr       error
+	listJobsErr     error
 	listPodsErr     error
 
 	// existingJobs models Jobs already in the cluster: CreateJob answers
@@ -165,7 +166,12 @@ func (f *fakeJobs) secretDeleted(name string) bool {
 	return false
 }
 
-func (f *fakeJobs) ListJobs(context.Context) ([]batchv1.Job, error) { return f.jobs, nil }
+func (f *fakeJobs) ListJobs(context.Context) ([]batchv1.Job, error) {
+	if f.listJobsErr != nil {
+		return nil, f.listJobsErr
+	}
+	return f.jobs, nil
+}
 
 func (f *fakeJobs) ListSecrets(context.Context) ([]corev1.Secret, error) { return f.secrets, nil }
 
@@ -234,8 +240,11 @@ type fakeBuilder struct {
 	secret    *corev1.Secret
 	tokenHash string
 	err       error
-	got       jobbuilder.TaskEntry
-	delay     time.Duration
+	// resolveNameErr makes the name composition fail, the claim path's
+	// invalid_task_id face before any object exists.
+	resolveNameErr error
+	got            jobbuilder.TaskEntry
+	delay          time.Duration
 
 	// Catalog-probe face: the recorded call and the injected failure.
 	probeRequestID string
@@ -270,6 +279,19 @@ func (f *fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secre
 	}
 	return job, secret, hash, nil
 }
+
+// ResolveName mirrors the production shape for the fallback template the fake
+// stands in for: no format expressed, so the identity name. resolveNameErr
+// injects the name-composition failure the claim path must survive.
+func (f *fakeBuilder) ResolveName(e jobbuilder.TaskEntry) (string, error) {
+	if f.resolveNameErr != nil {
+		return "", f.resolveNameErr
+	}
+	return "fm-" + e.TaskID, nil
+}
+
+// RequiresProjectIdentity keeps the fake's claims out of the platform lookup.
+func (f *fakeBuilder) RequiresProjectIdentity(jobbuilder.TaskEntry) bool { return false }
 
 // BuildCatalogProbe records the probe call and renders the probe objects a
 // real builder would: Job fm-catalog-<requestID> with its credential Secret.
@@ -625,6 +647,55 @@ func TestOnClaimInvalidTaskIDFailsWithInvalidTaskID(t *testing.T) {
 	}
 	if body["failure_reason"] != FailureReasonInvalidTaskID {
 		t.Fatalf("failure_reason = %q, want %q (failure-handling #0)", body["failure_reason"], FailureReasonInvalidTaskID)
+	}
+}
+
+func TestOnClaimNameResolutionFailureLeavesReclaimableEntry(t *testing.T) {
+	f := newFixture(t)
+	f.builder.resolveNameErr = fmt.Errorf("%w: %q does not yield a valid Job name", jobbuilder.ErrInvalidTaskID, "TASK-1")
+
+	err := f.sched.OnClaim(context.Background(), claimPayload("TASK-1"))
+	if err == nil {
+		t.Fatal("OnClaim error swallowed")
+	}
+	if !errors.Is(err, jobbuilder.ErrInvalidTaskID) {
+		t.Fatalf("error = %v, want ErrInvalidTaskID", err)
+	}
+	if len(f.jobs.createdJobs) != 0 || len(f.jobs.createdSecrets) != 0 {
+		t.Fatalf("objects created for an unresolvable name: jobs=%d secrets=%d",
+			len(f.jobs.createdJobs), len(f.jobs.createdSecrets))
+	}
+
+	e, ok := f.reg.Get("TASK-1")
+	if !ok {
+		t.Fatal("entry missing: the failure must stay queryable until it is reclaimed")
+	}
+	if e.State != registry.StateTerminal || e.Result != registry.ResultFailed || e.FailureReason != FailureReasonInvalidTaskID {
+		t.Fatalf("entry = %+v, want terminal/failed/%s", e, FailureReasonInvalidTaskID)
+	}
+	// The regression: an empty JobName has no byJob index, and the reclaim path
+	// only ever finds a draining entry through that index — it would leak.
+	if e.JobName == "" {
+		t.Fatal("empty JobName: the entry can never be found by its Job name")
+	}
+	if e.JobName != daemonIDFor("TASK-1") {
+		t.Errorf("JobName = %q, want the identity name %q", e.JobName, daemonIDFor("TASK-1"))
+	}
+	indexed, ok := f.reg.ByJob(e.JobName)
+	if !ok || indexed.TaskID != "TASK-1" {
+		t.Fatalf("ByJob(%q) = %+v/%v, want the entry", e.JobName, indexed, ok)
+	}
+
+	// The drain path finds it by that name and reclaims it; the terminal record
+	// survives in the done index.
+	if err := f.sched.OnJobTerminated(context.Background(), e.JobName, JobTerminationReasonJobTerminated, time.Time{}, 0); err != nil {
+		t.Fatalf("OnJobTerminated: %v", err)
+	}
+	if _, ok := f.reg.Get("TASK-1"); ok {
+		t.Fatal("entry survived the reclaim")
+	}
+	if !f.reg.IsDone("TASK-1") {
+		t.Fatal("terminal record lost by the reclaim")
 	}
 }
 

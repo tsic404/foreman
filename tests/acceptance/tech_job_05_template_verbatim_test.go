@@ -143,8 +143,8 @@ func TestJob05TemplateVerbatimCustomWindow(t *testing.T) {
 		t.Errorf("containers[0] MULTICA_SERVER_URL = %q, want Foreman's address", got)
 	}
 	if daemonID := envByName(t, pod.Containers[0].Env, "MULTICA_DAEMON_ID"); daemonID.ValueFrom == nil ||
-		daemonID.ValueFrom.FieldRef == nil || daemonID.ValueFrom.FieldRef.FieldPath != "metadata.labels['job-name']" {
-		t.Errorf("containers[0] MULTICA_DAEMON_ID = %+v, want the job-name fieldRef", daemonID)
+		daemonID.ValueFrom.FieldRef == nil || daemonID.ValueFrom.FieldRef.FieldPath != "metadata.labels['foreman.tsic.top/daemon-id']" {
+		t.Errorf("containers[0] MULTICA_DAEMON_ID = %+v, want the daemon-id label fieldRef", daemonID)
 	}
 	if got := envValue(pod.Containers[0].Env, "MULTICA_DAEMON_MAX_CONCURRENT_TASKS"); got != "1" {
 		t.Errorf("containers[0] MULTICA_DAEMON_MAX_CONCURRENT_TASKS = %q, want 1", got)
@@ -269,7 +269,7 @@ spec:
 var registeredPlaceholders = []string{
 	"<task_id>", "<agent_id>", "<workspace_id>", "<issue_id>", "<issue-identifier>",
 	"<autopilot_run_id>", "<chat_session_id>", "<job runtime uuid>", "<RFC3339>",
-	"<job-image>", "<preferred node>",
+	"<job-image>", "<job-name>", "<daemon-id>", "<agent-name>", "<preferred node>",
 }
 
 // writeTemplateFile writes a template manifest where the builder reads it.
