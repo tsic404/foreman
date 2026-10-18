@@ -35,7 +35,9 @@ resolved from upstream's newest release at build time, `latest` from the newest
 release) and skips a version that is already published. `.github/workflows/` is
 the whole release path and needs nothing from this repo beyond the two
 Containerfiles. The `make build-*-image` targets are the single-platform local
-equivalents (`ARCH=` picks the platform).
+equivalents (`ARCH=` picks the platform). Outside the release path, a pull
+request into `main` is checked by `pr-check.yml` — `go build ./...`,
+`go test ./...`, and a two-platform image build that publishes nothing.
 
 The acceptance cases run against their own test multica cluster, deployed from
 `testinfra/test-multica/` (deploy, reset, recycle, CLI profile — see its

@@ -1,0 +1,114 @@
+# The check line for pull requests into `main`: what a PR can show before it is
+# merged. It is separate from the release path (build-foreman.yml,
+# build-foreman-job.yml), which stays the only thing that publishes anything —
+# a release run never waits on this workflow, and editing this file can never
+# change what a release does.
+#
+# Two jobs, parallel and independent. `check` is the gate the owner asked for
+# (build + tests); `image` proves the Containerfile and the two-platform build
+# still work before merge. Kept apart so that a slow emulated arm64 leg, or a
+# registry hiccup while pulling the base image, cannot hide a failing unit
+# test — and so a failing test cannot hide a broken image build.
+#
+# The workflow is read-only: `contents: read` is the whole permission surface,
+# no step logs in anywhere, and the image step has no delivery output, so a PR
+# check cannot publish even by accident (a PR check holds no credential to
+# publish with). That is also why both jobs run on hosted runners: unreviewed
+# PR code does not execute inside the tailnet. If an image build ever has to
+# run there, switch `runs-on` to the release line's runner variable
+# (vars.FOREMAN_RELEASE_RUNNER).
+name: PR Check
+
+on:
+  # `main` push is already covered by the two release lines, tag pushes are
+  # releases too, and a PR check has nothing to say about either.
+  pull_request:
+    branches: [main]
+  # Manual entry point: re-run a check whose runner died, without pushing an
+  # empty commit.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  # One check per PR: pushing a fix cancels its predecessor's run. The release
+  # line keeps `cancel-in-progress: false` for the opposite reason — a
+  # cancelled release is not repeatable, a cancelled check is.
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check:
+    name: Build and test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v7
+        with:
+          # Same source of truth as the release workflows: the toolchain comes
+          # from go.mod, never from a version literal here.
+          go-version-file: go.mod
+
+      - name: Build
+        run: go build ./...
+
+      - name: Test
+        # `internal/*` unit tests plus `tests/acceptance` (in-memory k8s fake
+        # and httptest stubs) and `tests/release` (stubbed docker/git running
+        # the release steps): no cluster and no credentials, minutes not hours.
+        # The exit code is the only failure signal — no `continue-on-error`,
+        # no `if: always()`, and no `make check` either: that target's fmt only
+        # lists unformatted files, so it would gate on something else than the
+        # build + tests asked for here.
+        run: go test ./...
+
+  image:
+    name: Image build (no push)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Build the per-platform binary
+        # Same shape as the release step, with the version frozen to the one a
+        # local build stamps in (`main.version` defaults to `dev`): a check has
+        # no tag to resolve, and inventing one would judge a false version.
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.version=dev" \
+              -o "dist/foreman-linux-${arch}" ./cmd/foreman
+          done
+          ls -l dist
+
+      - name: Set up QEMU
+        # The arm64 leg of the manifest list is built on an amd64 host: binfmt
+        # registration is what lets the Containerfile's RUN step execute there.
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Build the image (no push)
+        # The release step's command with the delivery part removed: the build
+        # is what is being checked. `--output type=cacheonly` is the explicit
+        # "build, dispatch nowhere" exporter (Docker exporters: it is mutually
+        # exclusive with the loading/publishing exporters), so the artifacts
+        # stay in the build cache and no later edit can make this step deliver
+        # by adding a flag.
+        run: |
+          set -euo pipefail
+          docker buildx build \
+            --file images/foreman.Containerfile \
+            --platform linux/amd64,linux/arm64 \
+            --build-arg "BASE_IMAGE=${{ vars.FOREMAN_BASE_IMAGE || 'alpine:3.20' }}" \
+            --provenance=false \
+            --output type=cacheonly \
+            dist
