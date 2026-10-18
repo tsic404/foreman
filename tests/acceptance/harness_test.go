@@ -995,6 +995,9 @@ type harness struct {
 	handler  http.Handler
 	jobsHTTP *httptest.Server
 	logs     *bytes.Buffer
+	// handlerLogs captures the fake server's own event lines (the job-facing
+	// face), separate from the scheduler's.
+	handlerLogs *bytes.Buffer
 
 	schedCfg scheduler.Config
 }
@@ -1024,6 +1027,7 @@ func newHarnessWithWindow(t *testing.T, catalogEnabled bool, window time.Duratio
 	startup := registry.NewStartupCatalog()
 	slots := proxy.NewCatalogSlots()
 	logs := &bytes.Buffer{}
+	handlerLogs := &bytes.Buffer{}
 
 	cfg := proxy.Config{
 		ServerURL:            upstream.server.URL,
@@ -1080,7 +1084,8 @@ func newHarnessWithWindow(t *testing.T, catalogEnabled bool, window time.Duratio
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
 	}
-	handler := proxy.NewFakeServer(issuer, reg, sched, client, nil, metrics, proxy.WithProbeRegistry(probes))
+	handler := proxy.NewFakeServer(issuer, reg, sched, client, nil, metrics, proxy.WithProbeRegistry(probes),
+		proxy.WithServerLogger(slog.New(slog.NewJSONHandler(handlerLogs, nil)).With("component", "fake-server")))
 	httpServer := httptest.NewServer(handler)
 	t.Cleanup(httpServer.Close)
 
@@ -1088,7 +1093,7 @@ func newHarnessWithWindow(t *testing.T, catalogEnabled bool, window time.Duratio
 		t: t, cfg: cfg, reg: reg, probes: probes, startup: startup, slots: slots,
 		jobs: jobs, builder: bld, server: server, metrics: metrics, issuer: issuer,
 		client: client, sched: sched, upstream: upstream, handler: handler,
-		jobsHTTP: httpServer, logs: logs, schedCfg: schedCfg,
+		jobsHTTP: httpServer, logs: logs, handlerLogs: handlerLogs, schedCfg: schedCfg,
 	}
 }
 
@@ -1276,6 +1281,25 @@ func (h *harness) probeCall(method, path, token string, body []byte) (int, []byt
 func (h *harness) events(msg string) []map[string]any {
 	var found []map[string]any
 	for _, line := range bytes.Split(h.logs.Bytes(), []byte("\n")) {
+		if len(bytes.TrimSpace(line)) == 0 {
+			continue
+		}
+		var fields map[string]any
+		if err := json.Unmarshal(line, &fields); err != nil {
+			continue
+		}
+		if fields["msg"] == msg {
+			found = append(found, fields)
+		}
+	}
+	return found
+}
+
+// handlerEvents is events for the fake server's own logger, whose lines land in
+// a separate buffer from the scheduler's.
+func (h *harness) handlerEvents(msg string) []map[string]any {
+	var found []map[string]any
+	for _, line := range bytes.Split(h.handlerLogs.Bytes(), []byte("\n")) {
 		if len(bytes.TrimSpace(line)) == 0 {
 			continue
 		}
