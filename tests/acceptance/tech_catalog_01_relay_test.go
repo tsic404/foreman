@@ -35,15 +35,21 @@ func TestCatalog01EmptySlotRelaysProbeResultVerbatim(t *testing.T) {
 	logs := &writeBuffer{}
 	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.slots, h.metrics,
 		proxy.WithReporterLogger(slog.New(slog.NewJSONHandler(logs, nil))))
+	// The command must be on the server before the stream's first heartbeat:
+	// the ack is its only delivery channel and the next one is a full C2
+	// cadence away (§1.2 C2; §1.3 交付).
+	id := h.requestModelList(t, "rid-omp")
 	h.runHeartbeatStream(t, reporter)
 
-	id := h.requestModelList(t, "rid-omp")
 	var handed string
-	select {
-	case handed = <-commands:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the probe daemon never received a command (S5 delivery)")
-	}
+	waitFor(t, "the probe's S5 handover", 3*time.Second, func() bool {
+		select {
+		case handed = <-commands:
+			return true
+		default:
+			return false
+		}
+	})
 	if handed != id {
 		t.Fatalf("probe was handed command %q, want the ack's id %q verbatim", handed, id)
 	}
