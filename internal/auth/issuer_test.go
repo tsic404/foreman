@@ -385,7 +385,7 @@ func TestReason(t *testing.T) {
 }
 
 // TestReasonVocabularyIsClosed pins the foreman_auth_failures_total reason
-// label to the closed enum of observability.md §指标
+// label to the closed enum of §9.2
 // (malformed|signature|expired|scope|unknown_job|revoked): a seventh value
 // lands on a label the design does not define and splits the counter
 // off-contract.

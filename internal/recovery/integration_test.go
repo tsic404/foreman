@@ -47,7 +47,7 @@ func fakeJobName(taskID string) string { return "fm-" + taskID }
 
 // drainPod is a pod of the current Job instance: it carries a
 // creationTimestamp at or after the Job's, so the instance filter of the
-// termination evidence keeps it (contract §3.1 — a pod from a reused name's
+// termination evidence keeps it (a pod from a reused name's
 // predecessor is filtered out instead).
 func drainPod(jobName string, phase corev1.PodPhase) corev1.Pod {
 	pod := podFor(jobName, func(p *corev1.Pod) { p.Status.Phase = phase })

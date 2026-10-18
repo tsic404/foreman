@@ -1,7 +1,7 @@
 // Package scheduler orchestrates the task→Job mapping: it decides how many
 // tasks may run concurrently, creates and deletes Jobs/Secrets, advances the
 // state machine, settles terminal tasks, and rebuilds the mapping from K8s
-// after a restart. Design: docs/05-modules/task-mapping.md, contracts §3.4.
+// after a restart. Design: 02-contracts.md §4 (mapping table, state machine).
 package scheduler
 
 import (
@@ -25,8 +25,7 @@ import (
 )
 
 // jobGoneGracePeriod tolerates the first-visibility delay of a freshly
-// created Job before the missing-Job compensation engages
-// (failure-handling reconcileOne step 1).
+// created Job before the missing-Job compensation engages (§4.6).
 const jobGoneGracePeriod = 60 * time.Second
 
 // jobNamePollInterval is the cadence at which a claim retries a Job create
@@ -35,7 +34,7 @@ const jobNamePollInterval = 500 * time.Millisecond
 
 // jobNameWait bounds that retry. The Job controller deletes the pods first
 // and the Job object follows once they are gone, normally within the 30s
-// terminationGracePeriodSeconds of the template (05-modules/job-template.md).
+// terminationGracePeriodSeconds of the template (§8.7).
 const jobNameWait = 45 * time.Second
 
 // errJobNameHeld reports that a Job name was still held by a terminating
@@ -43,16 +42,16 @@ const jobNameWait = 45 * time.Second
 // re-dispatch, never reported as this task's failure.
 var errJobNameHeld = errors.New("job name still held by a terminating job")
 
-// PrepareLeaseTTL is the server-side prepare lease (§1.1 C3): the claim
-// stamps a 45s lease and every C4 renewal restamps it. An entry's
-// lease_keep_until (§3.1) is its last successful renewal plus this TTL — a
+// PrepareLeaseTTL is the server-side prepare lease (C-3): the claim
+// stamps a 45s lease and every C-4 renewal restamps it. An entry's
+// lease_keep_until (§10) is its last successful renewal plus this TTL — a
 // local upper bound of the server's own prepare_lease_expires_at, since the
 // renewal response carries no expiry and Foreman projects the deadline with
 // its own clock after the response returns.
 const PrepareLeaseTTL = 45 * time.Second
 
 // Failure reasons carried in the synthesized fail report (C10 body
-// failure_reason) for every compensation path (failure-handling 场景矩阵).
+// failure_reason) for every compensation path (§4.4).
 const (
 	FailureReasonJobCreateFailed = "job_create_failed"
 	FailureReasonJobMissing      = "job_missing"
@@ -60,30 +59,31 @@ const (
 	FailureReasonJobFailed       = "job_failed"
 	FailureReasonJobDeadline     = "job_deadline_exceeded"
 	FailureReasonJobEvicted      = "job_evicted"
-	// FailureReasonInvalidTaskID is failure-handling scenario #0: the task ID
-	// cannot become a legal Job name (05-modules/job-template.md §错误处理).
+	// FailureReasonInvalidTaskID is the invalid-name form: the task ID
+	// cannot become a legal Job name (§8.1, §4.4).
 	FailureReasonInvalidTaskID = "invalid_task_id"
-	// FailureReasonStaleClaim is the S8 rejection: the server answered the
+	// FailureReasonStaleClaim is the S-8 rejection: the server answered the
 	// forwarded start with 409 状态不允许 — the claim is stale or the task
-	// is no longer startable (03-contracts.md §1.2 S8, 05-modules/proxy.md
-	// §转发). Permanent by that switch, so the task cannot run under this
-	// claim and is settled failed instead of being re-dispatched.
+	// is no longer startable (S-8, §1.5). Permanent by that switch, so the
+	// task cannot run under this claim and is settled failed instead of
+	// being re-dispatched.
 	FailureReasonStaleClaim = "stale_claim"
-	// FailureReasonDaemonNotRegistered is the S4 refusal: the Job's daemon
+	// FailureReasonDaemonNotRegistered is the S-4 refusal: the Job's daemon
 	// declared no runtime for the provider its claim was dispatched under, so
-	// the task is settled instead of waiting out the boot deadline (§1.2 S4).
+	// the task is settled instead of waiting out the boot deadline (S-4,
+	// §2.3).
 	FailureReasonDaemonNotRegistered = "daemon_not_registered"
-	// FailureReasonDeliveryUnconfirmed is the S6 lost-response form: the
+	// FailureReasonDeliveryUnconfirmed is the S-6 lost-response form: the
 	// delivery was committed but no start fact arrived within the delivery
 	// confirmation window, so the payload never reached the daemon
-	// (03-contracts.md §1.2, ADR-032). It is a transport verdict, not a Job
+	// (S-6, §5, ADR-032). It is a transport verdict, not a Job
 	// one — the Job was created, its pod ran and its daemon registered.
 	FailureReasonDeliveryUnconfirmed = "delivery_unconfirmed"
 )
 
 // job.create_step step values: the claim chain's five steps, in order
-// (05-modules/observability.md §必须记录的事件). A step's trace line is
-// emitted once the step finished, a failed step included.
+// (§9.1). A step's trace line is emitted once the step finished, a failed
+// step included.
 const (
 	createStepBuild            = "build"
 	createStepClearStaleSecret = "clear_stale_secret"
@@ -107,7 +107,7 @@ const (
 	JobTerminationReasonDrainTimeout  = "drain_timeout"
 )
 
-// Pod termination clock domains (contract §7): k8s = the kubelet's
+// Pod termination clock domains (§10): k8s = the kubelet's
 // state.terminated.finishedAt (node clock), observed = the pod objects are
 // gone and the fact degrades to Foreman's observation moment (Foreman clock).
 // The reclaim log carries the domain so the "reclaim is never earlier than
@@ -127,7 +127,7 @@ func jobNameSelector(jobName string) string {
 }
 
 // claimHead is the subset of the claim payload the scheduler reads to index
-// the task (proxy.md 数据结构). Everything else passes through opaque. The
+// the task. Everything else passes through opaque. The
 // trigger-context fields are optional: a missing or empty value means that
 // context does not exist and never rejects the claim (ADR-014).
 type claimHead struct {
@@ -156,8 +156,8 @@ type claimHead struct {
 // claims of the same task must not interleave their
 // DeleteSecret→CreateSecret→CreateJob sequence (the loser's AlreadyExists
 // would otherwise fail a healthy task), and no settlement path may settle an
-// entry while the S8 round that decides its `running` write is still in
-// flight (failure-handling §判据模型: one decisive fact per transition).
+// entry while the S-8 round that decides its `running` write is still in
+// flight (§4.2: one decisive fact per transition).
 type keyedMutex struct {
 	mu sync.Mutex
 	m  map[string]*refMutex
@@ -195,7 +195,7 @@ func (k *keyedMutex) Lock(key string) func() {
 
 // failReport is a synthetic fail report (C10) for a task the daemon could
 // not settle itself. A forward that does not land hands the very same bytes
-// to the durable pending-report queue (contract §4), so the report is
+// to the durable pending-report queue (§10), so the report is
 // delivered even if this process dies right after.
 type failReport struct {
 	reason  string
@@ -225,7 +225,7 @@ func WithReconciler(r Reconciler) Option {
 
 // WithPendingReports wires the recovery module's durable terminal-report
 // queue; a terminal report whose forward failed outright or exhausted the
-// proxy's retry budget is enqueued instead of dropped (contract §4).
+// proxy's retry budget is enqueued instead of dropped (§10).
 func WithPendingReports(p PendingReports) Option {
 	return func(s *Scheduler) { s.pendingReports = p }
 }
@@ -262,8 +262,8 @@ type Scheduler struct {
 
 	// taskMu serializes the per-task transitions (OnClaim and every
 	// settlement path): a settlement that ran concurrently with an in-flight
-	// S8 round would decide on a registry snapshot the start is about to
-	// change (failure-handling §判据模型).
+	// S-8 round would decide on a registry snapshot the start is about to
+	// change (§4.2).
 	taskMu *keyedMutex
 
 	// nodeMu serializes the per-node soft cap refresh: concurrent claims
@@ -297,7 +297,7 @@ func New(cfg Config, reg *registry.Registry, jobs JobClient, builder JobBuilder,
 	for _, opt := range opts {
 		opt(s)
 	}
-	// Contract §4: a terminal report the server did not take must have a
+	// Contract §10: a terminal report the server did not take must have a
 	// durable home. Without the queue the scheduler could only log it and
 	// drop it, so a missing queue is a wiring error, not a mode.
 	if s.pendingReports == nil {
@@ -333,7 +333,7 @@ func (s *Scheduler) Run(ctx context.Context) error {
 
 // ClaimBudget is how many tasks the proxy may claim right now:
 // min(max-inflight − inflight, claim-batch-max). Queueing stays on the
-// server; Foreman never pre-fetches (task-mapping §并发与排队策略).
+// server; Foreman never pre-fetches (AC-02).
 func (s *Scheduler) ClaimBudget() int {
 	free := s.cfg.MaxInflightJobs - s.reg.Inflight()
 	if free < 0 {
@@ -343,7 +343,7 @@ func (s *Scheduler) ClaimBudget() int {
 }
 
 // SyncInflight re-derives foreman_inflight_jobs from the live index. The
-// gauge is defined as Registry.Inflight() (observability.md §指标), so it is
+// gauge is defined as Registry.Inflight() (§9.2), so it is
 // a derived value, never an independently updated one: every settlement path
 // re-derives it on exit, and recovery's ticker repeats it every interval.
 // That bound is the ticker's, not the round's — a round can sit in its own
@@ -356,7 +356,7 @@ func (s *Scheduler) SyncInflight() { s.metrics.InflightJobs(s.reg.Inflight()) }
 // MaxJobsPerNode non-terminal Jobs is marked, so the next claim drops its
 // reuse affinity (jobbuilder) and adds no further load to it. Jobs are never
 // deleted and nothing is queued or refused — the cap is a placement
-// preference, not admission control (task-mapping §同节点并发).
+// preference, not admission control (§8.6, AC-02).
 //
 // Node names appear one reconcile round after placement (the round reads
 // spec.nodeName), so a node's load is the Jobs it held as of that round.
@@ -378,7 +378,7 @@ func (s *Scheduler) RefreshNodeSaturation(ctx context.Context) map[string]int {
 
 	// Log only the transitions: the load of every node would flood the log
 	// once per round, while a transition carries the count and the cap the
-	// operator needs (observability.md §结构化日志).
+	// operator needs (§9.1).
 	was := make(map[string]bool, len(previous))
 	for _, node := range previous {
 		was[node] = true
@@ -479,9 +479,9 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		State:           registry.StatePending,
 		Attempt:         attempt,
 		ClaimedAt:       now,
-		// The claim just stamped the server's 45s prepare lease (§1.1 C3),
+		// The claim just stamped the server's 45s prepare lease (C-3),
 		// so the entry starts out with a live deadline and never projects
-		// the zero value (contract §3.1).
+		// the zero value (§10).
 		LeaseKeepUntil: now.Add(PrepareLeaseTTL),
 		Payload:        append(json.RawMessage(nil), task...),
 		PayloadVersion: 1,
@@ -497,9 +497,9 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		// which addresses C4/C19 and the S8 body translation (ADR-025).
 		RealRuntimeID: head.RuntimeID,
 	}
-	// A switched-off bound (0 = no upper bound, §5.1) writes no deadline at
+	// A switched-off bound (0 = no upper bound) writes no deadline at
 	// all: the zero value is "no bound", never an expired one, and must not
-	// degrade to claimed_at (contract §3.1, ADR-026).
+	// degrade to claimed_at (§4.2, ADR-026).
 	if s.cfg.JobBootTimeout > 0 {
 		e.BootDeadline = now.Add(s.cfg.JobBootTimeout)
 	}
@@ -535,7 +535,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	}
 
 	// The per-node soft cap is applied right before the Job is rendered
-	// ("下一次 claim 前把该节点从候选里排除", task-mapping §同节点并发): the
+	// ("下一次 claim 前把该节点从候选里排除", §8.6, AC-02): the
 	// refresh marks the nodes at their cap so the affinity below skips them.
 	s.RefreshNodeSaturation(ctx)
 
@@ -576,7 +576,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		// Secret again. A name still held by a terminating predecessor is
 		// not this task's failure — the entry goes and the server
 		// re-dispatches the task once the lease lapses, the same recovery
-		// as an undeliverable claim (failure-handling 场景 #1/#2).
+		// as an undeliverable claim (§4.3).
 		_ = s.jobs.DeleteSecret(ctx, credName(daemonID))
 		if errors.Is(err, errJobNameHeld) {
 			_ = s.reg.Delete(e.TaskID)
@@ -596,7 +596,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	// job_created_at is the apiserver's creationTimestamp, never a local
 	// clock reading: it is the instance-filter basis that separates this
 	// Job's pods from a previous instance's when the name is reused
-	// (contract §3.1). Recorded in place: this claim's snapshot predates the
+	// (§4.1). Recorded in place: this claim's snapshot predates the
 	// Job create, and writing it back wholesale would revert a renewal the
 	// LeaseKeeper landed while the name was held.
 	marked, ok := s.reg.MarkJobCreated(e.TaskID, created.CreationTimestamp.Time)
@@ -605,7 +605,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		// The entry left the registry inside the create window — settled
 		// (e.g. cancelled while the Job name was held) or reclaimed. The
 		// Secret and Job built above then have no owner left, and nothing
-		// else reclaims an entry-less Job: failure-handling #16 skips a Job
+		// else reclaims an entry-less Job: §6.5 skips a Job
 		// that still exists and ListJobs is read only by the startup rebuild
 		// (TaskEntryFromJob), so the objects are rolled back here. The
 		// snapshot still carries the identity those rollbacks need.
@@ -677,9 +677,9 @@ func (s *Scheduler) createJob(ctx context.Context, e registry.TaskEntry, job *ba
 	}
 }
 
-// resolveDuplicateClaim applies the duplicate-claim rule (task-mapping
-// §重复 claim): C13 decides the truth. It reports whether the claim proceeds
-// as a replacement (old pre-start entry discarded) and the prior attempt.
+// resolveDuplicateClaim applies the duplicate-claim rule (§10): C13 decides
+// the truth. It reports whether the claim proceeds as a replacement (old
+// pre-start entry discarded) and the prior attempt.
 func (s *Scheduler) resolveDuplicateClaim(ctx context.Context, existing registry.TaskEntry) (bool, int, error) {
 	defer s.SyncInflight()
 	s.metrics.DuplicateDispatch()
@@ -764,7 +764,7 @@ func (s *Scheduler) Deliver(daemonID string, runtimeID string, maxTasks int) ([]
 		return nil, nil
 	}
 
-	// The only rewritten field (contract §1.2 S6); every other field keeps
+	// The only rewritten field (S-6); every other field keeps
 	// its value (the map round-trip may reorder keys). Rewritten before the
 	// state transition so a marshal failure does not burn the single delivery.
 	var fields map[string]json.RawMessage
@@ -818,8 +818,8 @@ func (s *Scheduler) Deliver(daemonID string, runtimeID string, maxTasks int) ([]
 // OnReport applies the state transition for a forwarded lifecycle callback
 // (S8–S15) and returns the upstream status and body for the daemon. The Job
 // is deleted only after the terminal report succeeded — never the other way
-// around (task-mapping invariant 3) — and the credential then waits for the
-// Job's own termination (ADR-017). S8 is the one endpoint
+// around (§10) — and the credential then waits for the Job's own
+// termination (ADR-017). S8 is the one endpoint
 // whose transition follows the answer: 2xx marks the entry running, 409
 // settles it through OnStartRejected — and its whole round (forward, answer,
 // transition) runs under the task's lock, so no settlement path can settle
@@ -836,7 +836,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		// including the transport-error exit below, which only queues the
 		// report: the terminal write above already left the index, so a
 		// refresh registered after the forward would leave the pre-terminal
-		// value standing (observability.md §指标, AC-10).
+		// value standing (§9.2, AC-10).
 		defer s.SyncInflight()
 		if !e.IsTerminal() {
 			result := registry.Result(ep.TerminalResult())
@@ -857,8 +857,8 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 	if err != nil {
 		if ep.IsTerminal() {
 			// The proxy's retry budget is exhausted (or the transport is
-			// down): contract §4 forbids dropping the report — queue it and
-			// tell the daemon the upstream is unavailable (proxy.md 转发).
+			// down): §10 forbids dropping the report — queue it and
+			// tell the daemon the upstream is unavailable.
 			s.enqueuePending(ctx, e, ep, body)
 			return http.StatusBadGateway, upstreamUnavailableBody, nil
 		}
@@ -870,18 +870,19 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			s.deleteJob(ctx, e)
 		case code == 404:
 			// The server already forgot the task: the report is moot and the
-			// cleanup idempotent (proxy.md 转发 switch).
+			// cleanup idempotent (§4.4: nothing left to write).
 			s.deleteJob(ctx, e)
 			return 200, resp, nil
 		case code == 400 || code == 403 || code == 409:
-			// Permanent failure (§1.1 failure table): no retry, no queue;
-			// the entry stays terminal and the objects stay for inspection.
+			// Permanent failure (§1.5: 4xx is a permanent failure): no retry,
+			// no queue; the entry stays terminal and the objects stay for
+			// inspection.
 			s.log.ErrorContext(ctx, "task.forward_failed",
 				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 				"endpoint", string(ep), "status", code)
 		default:
 			// Transient failure with the retry budget exhausted: queue the
-			// report; recovery drains it until the server accepts (§4).
+			// report; recovery drains it until the server accepts (§10).
 			s.log.ErrorContext(ctx, "task.forward_failed",
 				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 				"endpoint", string(ep), "status", code)
@@ -893,7 +894,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 	if ep == EPStart {
 		// The running write waits for the server's answer: marking the entry
 		// running before the forward would leave it running for a task the
-		// server never started (409 状态不允许, §1.2 S8 + proxy.md §转发), and
+		// server never started (409 状态不允许, S-8 + §1.5), and
 		// the re-dispatched task would be re-claimed into another Job that is
 		// refused the same way — an unbounded dispatch loop. A late start on
 		// an already settled entry is still forwarded: the 409 tells the
@@ -918,7 +919,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 	}
 	if code == 404 {
 		// A non-terminal forward answered 404: the server deleted the task
-		// (proxy.md 转发 switch → failure-handling scenario #9).
+		// (§4.6).
 		if err := s.OnTaskVanished(ctx, e.TaskID); err != nil {
 			s.log.ErrorContext(ctx, "task vanish cleanup failed",
 				"task_id", e.TaskID, "job_name", e.JobName, "err", err)
@@ -926,23 +927,23 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		return 404, resp, nil
 	}
 	if code >= 500 || code == http.StatusRequestTimeout || code == http.StatusTooManyRequests {
-		// Transient upstream failure: the §1.2/proxy.md 转发 switch maps it
+		// Transient upstream failure: the forward switch maps it
 		// to 502 for the daemon (the daemon owns the retry).
 		return http.StatusBadGateway, upstreamUnavailableBody, nil
 	}
 	return code, resp, nil
 }
 
-// upstreamUnavailableBody is the §1.2 error body for a transiently
-// undeliverable forward (proxy.md 转发 switch).
+// upstreamUnavailableBody is the fixed error body for a transiently
+// undeliverable forward.
 var upstreamUnavailableBody = []byte(`{"error":"upstream unavailable"}`)
 
 // enqueuePending lands a terminal report in the recovery module's durable
-// queue (contract §4: terminal callbacks are never dropped). A write that
+// queue (§10: terminal callbacks are never dropped). A write that
 // fails is the queue's own error row: it keeps the report staged and retries
-// it every drain (错误处理表「退避后重试」), and Queued reports it as
+// it every drain (§1.5 退避后重试), and Queued reports it as
 // undelivered so the entry's objects stay put. The error is logged, never
-// acted on — dropping the report here is exactly what §4 forbids.
+// acted on — dropping the report here is exactly what §10 forbids.
 func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep Endpoint, body []byte) {
 	if err := s.pendingReports.Enqueue(e.TaskID, e.JobName, e.DaemonID, ep, body); err != nil {
 		s.log.ErrorContext(ctx, "task.forward_undelivered",
@@ -952,9 +953,9 @@ func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep
 	}
 }
 
-// OnStartRejected settles an entry whose S8 start the server refused with
-// 409 (03-contracts.md §1.2 S8 + 05-modules/proxy.md §转发: 状态不允许).
-// 顺序规则 3 puts C13 before the compensation: a 409 says "not startable",
+// OnStartRejected settles an entry whose S-8 start the server refused with
+// 409 (S-8 + §1.5: 状态不允许).
+// The ordering puts C13 before the compensation: a 409 says "not startable",
 // not "not running", so running adopts, terminal settles, 404 releases, and
 // only queued/dispatched proves the claim itself stale — that one is settled
 // failed (stale_claim) and its Job/Secret go, ending the re-dispatch loop.
@@ -978,7 +979,7 @@ func (s *Scheduler) OnStartRejected(ctx context.Context, taskID string) error {
 	switch {
 	case st == "running":
 		// The start landed after all: keep the Job, wait for the daemon's
-		// reports (failure-handling 场景 #1).
+		// reports (§4.3).
 		return s.AdoptRunning(ctx, taskID)
 	case registry.IsTerminalResult(st):
 		return s.SettleTerminal(ctx, taskID, st)
@@ -988,13 +989,13 @@ func (s *Scheduler) OnStartRejected(ctx context.Context, taskID string) error {
 			message: "server rejected the task start: task claim is stale or task is no longer startable",
 		})
 	default:
-		// waiting_*: no decisive fact (proxy.md §prepare-lease 保活) — the
+		// waiting_*: no decisive fact (S-7 + §10: 租约不超时) — the
 		// daemon's own reports converge this entry.
 		return nil
 	}
 }
 
-// OnBootTimeout handles failure-handling scenario #4: the Job's daemon never
+// OnBootTimeout handles the boot-deadline form (§4.2): the Job's daemon never
 // started within the boot deadline. The task is failed on the daemon's
 // behalf (C10, failure_reason=job_boot_timeout) and the objects removed.
 // The task's lock keeps it from settling an entry whose S8 answer is still
@@ -1014,10 +1015,10 @@ func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
 	})
 }
 
-// OnDeliveryUnconfirmed handles the S6 lost-response form (failure-handling
-// scenario #18, ADR-032) at its terminal bound: the entry reached the boot
-// deadline on a committed delivery with no start fact, so the payload never
-// took — every attempt the confirmation window released went unconfirmed too.
+// OnDeliveryUnconfirmed handles the S-6 lost-response form (§5, ADR-032) at
+// its terminal bound: the entry reached the boot deadline on a committed
+// delivery with no start fact, so the payload never took — every attempt the
+// confirmation window released went unconfirmed too.
 // The task is failed on the daemon's behalf (C10,
 // failure_reason=delivery_unconfirmed) and the objects removed, with the
 // attribution the form actually deserves rather than the boot face's. The
@@ -1052,7 +1053,7 @@ func (s *Scheduler) OnDeliveryUnconfirmed(ctx context.Context, taskID string) er
 // (C4 400: the task left the renewable pre-start state). C13 decides:
 // running marks the entry started (leasing stops), terminal settles and
 // cleans up, a deleted task vanishes; anything else waits for the next
-// lease round (proxy.md §prepare-lease 保活).
+// lease round (S-7 + §10: 租约不超时).
 func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) error {
 	defer s.SyncInflight()
 	unlock := s.taskMu.Lock(taskID)
@@ -1087,7 +1088,7 @@ func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) err
 }
 
 // OnJobGone is the compensation entry for a Job object that disappeared
-// without a daemon report (failure-handling 场景 #1 step 1 / #2 / #9 / #11).
+// without a daemon report (§4.6: Job gone, task deleted server-side).
 // The grace period tolerates the first-visibility delay of a freshly created
 // Job; C13 then decides what to settle.
 func (s *Scheduler) OnJobGone(ctx context.Context, jobName string) error {
@@ -1107,14 +1108,14 @@ func (s *Scheduler) OnJobGone(ctx context.Context, jobName string) error {
 }
 
 // FailJob compensates a Job whose container ended without the daemon
-// reporting a terminal state (failure-handling 场景 #3/#5/#11, and #1's
-// missing-Job path via OnJobGone). reason is the failure_reason reported to
-// the server; C13 decides first what to report (判据模型): a terminal server
-// status is settled as-is, a task the server deleted settles terminal with an
-// empty result (the drain starts either way), and only a still-active task
-// gets the synthesized fail.
+// reporting a terminal state (§4.6 Job failure/eviction, §4.4 platform
+// termination, and the missing-Job path via OnJobGone). reason is the
+// failure_reason reported to the server; C13 decides first what to report
+// (§4.2): a terminal server status is settled as-is, a task the server
+// deleted settles terminal with an empty result (the drain starts either
+// way), and only a still-active task gets the synthesized fail.
 // Idempotent: an already-terminal entry only retries its Job deletion
-// (顺序规则 2).
+// (§4.2).
 func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 	defer s.SyncInflight()
 	e, ok := s.reg.ByJob(jobName)
@@ -1153,11 +1154,11 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 }
 
 // failEntry settles a task as failed on the daemon's behalf: the terminal
-// write first (markTerminal is the single write path, 顺序规则 1), then the
+// write first (markTerminal is the single write path, §4.2), then the
 // C10 report, then the Job deletion. The verdict also starts the drain, so
 // the credential and the entry stay until the Job terminates or the upper
 // bound expires (ADR-017). A report that does not land is in the durable
-// queue now, so the Job stays until a drain lands it (contract §4) —
+// queue now, so the Job stays until a drain lands it (§10) —
 // deleting it would let a Job deletion stand in for a delivered report.
 func (s *Scheduler) failEntry(ctx context.Context, e registry.TaskEntry, report failReport) error {
 	s.log.ErrorContext(ctx, "task.failed_compensated",
@@ -1180,10 +1181,10 @@ func (s *Scheduler) failEntry(ctx context.Context, e registry.TaskEntry, report 
 // SettleTerminal converges an entry the server already holds as terminal
 // (C13 completed/failed/cancelled, or a rebuilt entry whose deletion is
 // still pending): the entry is marked terminal and the Job is deleted
-// (顺序规则 1) — the credential and the entry then wait for the Job's pods
+// (§4.2) — the credential and the entry then wait for the Job's pods
 // to terminate or for the drain upper bound (ADR-017). A terminal report
 // still waiting in the durable queue holds the Job back until it lands
-// (contract §4): the recovery loop drains the queue every round and the
+// (§10): the recovery loop drains the queue every round and the
 // round that saw it delivered deletes the Job.
 func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) error {
 	defer s.SyncInflight()
@@ -1192,8 +1193,8 @@ func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) e
 		return nil
 	}
 	if s.pendingReports.Queued(taskID) {
-		// 场景 #7/#10: the objects wait for the report — a deleted Job must
-		// never stand in for a delivered one (contract §4).
+		// The partition-and-queue form (§4.6, §10): the objects wait for the
+		// report — a deleted Job must never stand in for a delivered one.
 		return nil
 	}
 	if !e.IsTerminal() {
@@ -1211,7 +1212,7 @@ func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) e
 // AdoptRunning records that the server considers the task running (C13),
 // e.g. after a restart rebuilt the entry: the Job is kept, lease renewals
 // stop (started_at is set) and the daemon's reports are accepted
-// (failure-handling 场景 #1).
+// (§4.3: the adopt branch).
 func (s *Scheduler) AdoptRunning(ctx context.Context, taskID string) error {
 	e, ok := s.reg.MarkStarted(taskID, s.now())
 	if !ok {
@@ -1224,7 +1225,7 @@ func (s *Scheduler) AdoptRunning(ctx context.Context, taskID string) error {
 
 // DiscardTask removes the objects and the mapping of a task that will be
 // re-run, without any terminal report and without entering drain
-// (failure-handling 场景 #2 redispatch, and the pre-start half of the
+// (§4.3: discard and redispatch; §10: the pre-start half of the
 // duplicate-claim rule). A successor Job may be rendered under the same
 // display name (the template's format is deterministic per task), so the
 // predecessor's credential is revoked first: its pod must never be able to
@@ -1232,7 +1233,7 @@ func (s *Scheduler) AdoptRunning(ctx context.Context, taskID string) error {
 // has no digest to revoke; that degradation is logged as
 // cred.revoke_unavailable. A failed deletion keeps the entry: it is the only
 // retry handle, and dropping it would leave a zombie Job or leak the
-// credential Secret (顺序规则 2).
+// credential Secret (§6.4: the entry is the only retry handle).
 func (s *Scheduler) DiscardTask(ctx context.Context, taskID string) error {
 	defer s.SyncInflight()
 	e, ok := s.reg.Get(taskID)
@@ -1246,10 +1247,10 @@ func (s *Scheduler) DiscardTask(ctx context.Context, taskID string) error {
 	return s.reg.Delete(taskID)
 }
 
-// OnTaskVanished settles a task the server deleted (failure-handling 场景
-// #9, C13/C4 404). No terminal report is sent for a task the server no
-// longer knows, but the verdict still starts the drain: the entry is marked
-// terminal with an empty result — the only source of result="" — and the Job
+// OnTaskVanished settles a task the server deleted (§4.6, C13/C4 404). No
+// terminal report is sent for a task the server no longer knows, but the
+// verdict still starts the drain: the entry is marked terminal with an empty
+// result — the only source of result="" — and the Job
 // goes, while the credential and the entry stay until the Job terminates or
 // the drain upper bound expires (ADR-017).
 func (s *Scheduler) OnTaskVanished(ctx context.Context, taskID string) error {
@@ -1300,12 +1301,12 @@ func (s *Scheduler) discardQuietly(ctx context.Context, e registry.TaskEntry) {
 // the entry is the only retry handle, and dropping it first would leave an
 // orphan Secret with no sweep face. Idempotent; a no-op for an entry that is
 // not draining. The verdict-time Job deletion is caught up outside that
-// sequence, under the contract §4 report gate — see the body.
+// sequence, under the §10 report gate — see the body.
 //
 // podTerminatedAt is the termination fact the caller measured (zero when the
 // evidence carries none), orphanPods the pods still alive at reclaim time
 // (instance-filtered); both are evidence fields of the cred.reclaimed event
-// (observability.md §结构化日志). The clock domain the value belongs to is
+// (§9.1). The clock domain the value belongs to is
 // derived here and declared alongside it: the drain upper bound closes the
 // window without any termination fact (empty value, observed domain), a
 // kubelet-reported finish is the node clock (k8s domain), and a fact that
@@ -1357,13 +1358,13 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 		"orphan_pods", orphanPods)
 
 	// The verdict-time Job deletion may still be outstanding: it is held back
-	// while a terminal report is queued (contract §4 — a deleted Job must
+	// while a terminal report is queued (§10 — a deleted Job must
 	// never stand in for a delivered report), so a drain that closed inside
 	// that window would otherwise leave the Job with no deleter at all. The
 	// catch-up runs after the reclaim sequence, under the same gate, and is
 	// deliberately not part of it: a failure neither stalls the credential's
-	// bound nor keeps the entry — 顺序与幂等规则 2 owns the leftover Job via
-	// its ttlSecondsAfterFinished.
+	// bound nor keeps the entry — the template's ttlSecondsAfterFinished owns
+	// the leftover Job (§8.1).
 	if !s.pendingReports.Queued(e.TaskID) {
 		_ = s.deleteJob(ctx, e)
 	}
@@ -1383,12 +1384,12 @@ func (s *Scheduler) drainSeconds(taskID string) float64 {
 }
 
 // jobPods is the single ownership + instance filter behind every termination
-// fact (task-mapping §内部结构): the pods the Job controller labelled with
-// this Job's name, restricted to the current instance — a pod created before
+// fact: the pods the Job controller labelled with this Job's name,
+// restricted to the current instance — a pod created before
 // this Job instance belongs to a reused name's predecessor, whose disposal is
 // the revoke-and-discard path, never this Job's credential verdict. since is
 // the Job's apiserver creationTimestamp, so both sides of the comparison are
-// apiserver timestamps (contract §3.1).
+// apiserver timestamps (§4.1).
 func (s *Scheduler) jobPods(ctx context.Context, jobName string, since time.Time) ([]corev1.Pod, error) {
 	pods, err := s.jobs.ListPods(ctx, jobNameSelector(jobName))
 	if err != nil {
@@ -1425,7 +1426,7 @@ func (s *Scheduler) JobTerminated(ctx context.Context, jobName string, since tim
 // from the kubelet-reported state.terminated.finishedAt (node clock). Zero
 // when no pod carries such a fact — the pod objects are gone, or none ever
 // reported a finish — which the reclaim reads as "no k8s-domain fact" and
-// records as the observation moment in the observed domain (contract §7: the
+// records as the observation moment in the observed domain (§10: the
 // clock domain must be declared with the value, because only the observed
 // domain compares directly against Foreman's clock).
 func (s *Scheduler) LastPodTerminatedAt(ctx context.Context, jobName string, since time.Time) (time.Time, error) {
@@ -1474,7 +1475,7 @@ func podTerminated(pod *corev1.Pod) bool {
 }
 
 // SweepOrphanSecrets deletes credential Secrets left behind by a reclaim a
-// restart interrupted (failure-handling 场景 #16). The criterion is
+// restart interrupted (§6.5). The criterion is
 // two-sided: the registry holds no entry for the task-id (any state) AND no
 // task Job carries that task-id. Either half alone would delete a Secret that
 // is still needed — the OnClaim CreateSecret → CreateJob window has the entry
@@ -1523,7 +1524,7 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		}
 		// job_name is derived for attribution only: the Job is gone, so there
 		// is no object to read a name from and the identity name is the one
-		// value the sweep can name (observability.md cred.orphan_secret_removed).
+		// value the sweep can name (§9.1: cred.orphan_secret_removed).
 		s.log.InfoContext(ctx, "cred.orphan_secret_removed",
 			"task_id", taskID, "job_name", daemonIDFor(taskID), "secret", secret.Name)
 	}
@@ -1532,14 +1533,14 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 
 // Reconcile converges the live index with the server. With a recovery
 // reconciler wired it delegates; otherwise it runs the built-in startup
-// convergence (task-mapping §持久化与重建 step 3) over every live entry.
+// convergence (§4.3: the rebuild disposition table) over every live entry.
 // The per-node soft cap and the inflight gauge are refreshed first: both are
 // derived state of the live index and must not outlive the load they describe.
 func (s *Scheduler) Reconcile(ctx context.Context) error {
 	s.RefreshNodeSaturation(ctx)
 	s.SyncInflight()
-	// Round-level action, independent of the entry list (failure-handling
-	// scenario #17): probe remnants are found by their labels, not by the
+	// Round-level action, independent of the entry list (§6.5: the probe
+	// residual sweep): probe remnants are found by their labels, not by the
 	// session table, which is empty after a restart.
 	if err := s.SweepStaleProbes(ctx); err != nil {
 		s.log.WarnContext(ctx, "probe sweep failed", "err", err)
@@ -1570,7 +1571,7 @@ func (s *Scheduler) Rebuild(ctx context.Context) error {
 	}
 	rebuilt := 0
 	for _, job := range jobs {
-		// The task-Job predicate is managed-by ∧ task-id (contract §1.3): a
+		// The task-Job predicate is managed-by ∧ task-id (§3): a
 		// catalog-probe Job carries no task-id and must never become a
 		// payload-less pseudo entry.
 		if _, ok := job.GetLabels()[registry.LabelTaskID]; !ok {
@@ -1641,7 +1642,7 @@ func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) err
 		return s.SettleTerminal(ctx, e.TaskID, st)
 	default:
 		// e.g. waiting_local_directory: no decisive fact yet — keep waiting
-		// (failure-handling 判据模型).
+		// (§4.2).
 		return nil
 	}
 }
@@ -1649,11 +1650,11 @@ func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) err
 // failClaim settles a task whose Job could not be created
 // (pending → terminal, result=failed) and tells the server. A report whose
 // forward does not land goes to the durable queue, and the terminal entry
-// stays until a round drains it (contract §4).
+// stays until a round drains it (§10).
 func (s *Scheduler) failClaim(ctx context.Context, e registry.TaskEntry, cause error) {
 	defer s.SyncInflight()
 	// An invalid task ID is not a create failure: the Job must not be
-	// retried, the operator has to fix the task (failure-handling #0).
+	// retried, the operator has to fix the task (§4.4).
 	reason := FailureReasonJobCreateFailed
 	if errors.Is(cause, jobbuilder.ErrInvalidTaskID) {
 		reason = FailureReasonInvalidTaskID
@@ -1752,7 +1753,7 @@ func daemonIDFor(taskID string) string {
 }
 
 // credName is the credential Secret of a Job: the daemon identity plus the
-// -cred suffix (contract §1.3: fm-<taskid>-cred). It takes the daemon id, not
+// -cred suffix (§3: fm-<taskid>-cred). It takes the daemon id, not
 // the display name — a template-expressed name never moves the credential.
 func credName(daemonID string) string {
 	return daemonID + "-cred"

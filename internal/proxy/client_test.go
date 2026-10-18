@@ -191,7 +191,7 @@ func TestRegisterSendsContractBody(t *testing.T) {
 	}
 	// The request is already past the probe's registration, so the header
 	// carries the template CLI's version — the same value as cli_version
-	// (§1.1 C1 的取值来源与声明域, AC-37).
+	// (C-1 的取值来源与声明域, AC-37).
 	if got := req.Header.Get("X-Client-Version"); got != "18.0.0" {
 		t.Errorf("version = %q, want the discovery's cli_version", got)
 	}
@@ -411,7 +411,7 @@ func TestForwardTerminalExhaustion(t *testing.T) {
 		t.Fatalf("err = %v, want ErrTerminalUndelivered", err)
 	}
 	if got := len(stub.calls("POST", "/api/daemon/tasks/t1/fail")); got != 6 {
-		t.Fatalf("attempts = %d, want 6 (full §4 budget)", got)
+		t.Fatalf("attempts = %d, want 6 (full §10 budget)", got)
 	}
 }
 
@@ -541,7 +541,7 @@ func singleCall(t *testing.T, stub *stubUpstream, method, path string) recordedR
 
 // upstreamFields is a received header set with the field the transport
 // generates for the forwarded body set aside: Content-Length belongs to the
-// proxy's own connection (§1.2 exclusion set), so the caller's set is
+// proxy's own connection (§2.4 exclusion set), so the caller's set is
 // compared without it.
 func upstreamFields(h http.Header) http.Header {
 	out := make(http.Header, len(h))
@@ -555,7 +555,7 @@ func upstreamFields(h http.Header) http.Header {
 }
 
 // upstreamAuthority is the Host the stub upstream must see: the proxy's own
-// address is never forwarded (§1.2 exclusion set).
+// address is never forwarded (§2.4 exclusion set).
 func upstreamAuthority(srv *httptest.Server) string {
 	return srv.URL[len("http://"):]
 }
@@ -647,7 +647,7 @@ func TestForwardableHeaderAppliesExclusionSet(t *testing.T) {
 }
 
 func TestForwardableHeaderCanonicalizesNames(t *testing.T) {
-	// Field-name case is not a fidelity item (§1.2 逐字段裁定): the copy
+	// Field-name case is not a fidelity item (§2.4 逐字段裁定): the copy
 	// writes canonical names, so net/http's own lookups (User-Agent, framing
 	// fields) see the same field the caller spelled differently.
 	for _, tt := range []struct{ name, caller string }{
@@ -756,7 +756,7 @@ func TestPassthroughKeepsUpstreamContentEncoding(t *testing.T) {
 		t.Fatalf("Passthrough = %d, %v", code, err)
 	}
 	// The body is never decoded: the encoding field and the bytes it
-	// describes travel together (§1.2 逐字段裁定).
+	// describes travel together (§2.4 逐字段裁定).
 	if v := header.Values("Content-Encoding"); !slices.Equal(v, []string{"gzip"}) {
 		t.Errorf("Content-Encoding = %v, want gzip verbatim", v)
 	}
@@ -902,7 +902,7 @@ func TestPassthroughNoContentTypeFallback(t *testing.T) {
 
 	// A caller that declares no Content-Type gets none upstream: a fallback
 	// would put the proxied request on a different upstream branch than the
-	// same direct request (§1.2 逐字段裁定).
+	// same direct request (§2.4 逐字段裁定).
 	if _, _, _, err := c.Passthrough(t.Context(), "POST", "/api/issues/42/comments", "", http.Header{"Authorization": {"Bearer mat_x"}}, []byte(`{"body":"hi"}`)); err != nil {
 		t.Fatalf("Passthrough: %v", err)
 	}
@@ -942,7 +942,7 @@ func TestPassthroughMetricCarriesCallerVisibleCode(t *testing.T) {
 	got := append([]int(nil), metrics.codes...)
 	metrics.mu.Unlock()
 	// Upstream 5xx converges to the 502 the caller sees; the upstream's own
-	// code is not the label (observability.md).
+	// code is not the label (§9.2).
 	if !slices.Equal(got, []int{502, 400, 502}) {
 		t.Errorf("metric codes = %v, want [502 400 502]", got)
 	}
@@ -1093,7 +1093,7 @@ func TestRebuildSignalSurvivesFailedReregister(t *testing.T) {
 func TestTerminalRetryBudgetMatchesContract(t *testing.T) {
 	want := []time.Duration{0, 4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second, 64 * time.Second}
 	if !slices.Equal(terminalRetryWaits, want) {
-		t.Fatalf("terminalRetryWaits = %v, want the §4 budget %v", terminalRetryWaits, want)
+		t.Fatalf("terminalRetryWaits = %v, want the §10 budget %v", terminalRetryWaits, want)
 	}
 }
 
@@ -1364,7 +1364,7 @@ type roundTripperFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripperFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
 
-// TestFirstDeclarationDoesNotRecoverOrphans pins §1.1 C15: C15 belongs to a
+// TestFirstDeclarationDoesNotRecoverOrphans pins C-15: C15 belongs to a
 // rebuilt runtime, never to the rows a first declaration creates.
 func TestFirstDeclarationDoesNotRecoverOrphans(t *testing.T) {
 	srv, stub := newStubUpstream(t)
@@ -1381,7 +1381,7 @@ func TestFirstDeclarationDoesNotRecoverOrphans(t *testing.T) {
 	}
 }
 
-// TestPreflightSendsSingleC1 pins §1.1 C1's single startup trigger: once the
+// TestPreflightSendsSingleC1 pins C-1's single startup trigger: once the
 // startup declaration has been answered, the claim loop's preflight must not
 // declare again (a second C1 could move ids and orphan the startup discovery).
 func TestPreflightSendsSingleC1(t *testing.T) {
@@ -1454,7 +1454,7 @@ func TestRebuildSkipsReRegisterForAStaleID(t *testing.T) {
 	}
 }
 
-// TestFailedRebuildIsRememberedPerRuntime pins §1.1 C15's granularity: one
+// TestFailedRebuildIsRememberedPerRuntime pins C-15's granularity: one
 // runtime's failed rebuild must not make every other row look rebuilt on the
 // next successful C1 (each of those would emit a C15 call and a
 // `runtime.rebuilt` line).
@@ -1512,7 +1512,7 @@ func TestFailedRebuildIsRememberedPerRuntime(t *testing.T) {
 	}
 }
 
-// TestSuccessfulRegisterKeepsAConcurrentLostMark pins §1.1 C15 under a race: a
+// TestSuccessfulRegisterKeepsAConcurrentLostMark pins C-15 under a race: a
 // rebuild that fails while another C1 is in flight marks its own provider lost,
 // and the successful C1 consumes only the marks it started with. A global clear
 // would silently drop that row's C15 (`recover-orphans` + `runtime.rebuilt`)

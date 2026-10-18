@@ -255,7 +255,7 @@ func TestReporterReplayExhaustionIsVisible(t *testing.T) {
 
 // TestReporterReplayDoesNotBlockTheHeartbeatRound pins the C2 cadence: the ack
 // is consumed in-round, but a replay that has to retry must not hold the
-// heartbeat goroutine for its whole budget (§1.1 C2「每 15s」).
+// heartbeat goroutine for its whole budget (C-2「每 15s」).
 func TestReporterReplayDoesNotBlockTheHeartbeatRound(t *testing.T) {
 	cfg := testConfig("http://unused")
 	cfg.ModelCatalogTimeout = 30 * time.Second

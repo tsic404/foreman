@@ -218,7 +218,7 @@ func TestProbeModelResultRelayRetriesTransient5xx(t *testing.T) {
 		t.Fatalf("relay = %d: %s, want the retried 200", code, body)
 	}
 	if attempts != 3 {
-		t.Errorf("upstream attempts = %d, want the §1.1 C21 backoff to retry 5xx", attempts)
+		t.Errorf("upstream attempts = %d, want the §1.2 C-21 backoff to retry 5xx", attempts)
 	}
 	updated, _ := r.probes.ProbeByJob(session.JobName)
 	if updated.RelayedCode != 200 {
@@ -278,7 +278,7 @@ func TestProbeModelResultUnknownRequestIs403(t *testing.T) {
 	token, session := startProbeToken(t, r, "cmd-2", "rid-real")
 	code, _ := r.call(t, "POST",
 		"/api/daemon/runtimes/"+session.JobRuntime+"/models/not-mine/result", token, []byte(`{}`))
-	// §7「探针凭据不越界」: a {req} outside the session's two ids is a scope
+	// §10「探针凭据不越界」: a {req} outside the session's two ids is a scope
 	// violation (403), never a routing-level 404.
 	if code != 403 {
 		t.Fatalf("unknown {req} = %d, want 403", code)

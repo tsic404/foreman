@@ -8,7 +8,7 @@ import (
 	"time"
 )
 
-// Environment variable names from the contract config table (§5.1).
+// Environment variable names read by the recovery module.
 const (
 	EnvStateRoot         = "FOREMAN_STATE_ROOT"
 	EnvReconcileInterval = "FOREMAN_RECONCILE_INTERVAL"
@@ -18,7 +18,7 @@ const (
 	EnvAgentStateTTL = "FOREMAN_AGENT_STATE_TTL"
 )
 
-// Contract defaults (§5.1).
+// Default values applied when the environment variable is unset.
 const (
 	DefaultStateRoot = "/var/lib/foreman"
 
@@ -26,12 +26,12 @@ const (
 	DefaultReconcileInterval = 30 * time.Second
 
 	// DefaultAgentStateTTL is 14 days, the upstream GC default the GC module
-	// uses for the same env (§5.1).
+	// uses for the same env.
 	DefaultAgentStateTTL = 336 * time.Hour
 )
 
 // PendingReportsDir resolves the durable queue directory:
-// FOREMAN_STATE_ROOT/pending-reports (contract §4).
+// FOREMAN_STATE_ROOT/pending-reports (contract §10).
 func PendingReportsDir(getenv func(string) string) string {
 	if getenv == nil {
 		getenv = os.Getenv

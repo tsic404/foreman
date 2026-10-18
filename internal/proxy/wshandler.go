@@ -19,7 +19,7 @@ import (
 const wsWriteTimeout = 10 * time.Second
 
 // WSHandler is the Job-side WS endpoint (S30, ADR-010). It authenticates the
-// handshake with the Job Token (§1.2 rule 1 plus the query runtime_ids
+// handshake with the Job Token (§2.1 rule 1 plus the query runtime_ids
 // ownership check), acks every daemon:heartbeat frame with the pinned
 // payload, pushes daemon:task_available when the Job's task is deliverable,
 // and closes on terminal/teardown.
@@ -41,7 +41,7 @@ type jobConn struct {
 }
 
 // NewWSHandler builds the handler. It is only mounted when
-// FOREMAN_WS_ENABLED=true (the route is absent otherwise, §5.1).
+// FOREMAN_WS_ENABLED=true (the route is absent otherwise).
 func NewWSHandler(issuer *auth.Issuer, reg *registry.Registry, metrics Metrics) *WSHandler {
 	return &WSHandler{
 		issuer:  issuer,
@@ -57,7 +57,7 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	token, ok := bearerToken(r)
 	if !ok || !auth.HasJobTokenPrefix(token) {
 		// The WS endpoint exists only on the local daemon face; other
-		// credentials are not proxied (§1.2 rule 1).
+		// credentials are not proxied (§2.1 rule 1).
 		writeError(w, http.StatusUnauthorized, "job token required")
 		return
 	}
@@ -70,7 +70,7 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	if claims.Role == catalogProbeRole {
 		// S30 is not open to probes: a probe heartbeats over HTTP only, and a
-		// 404 is the daemon's expected answer (§5.1 探针不消费).
+		// 404 is the daemon's expected answer (§6.3).
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
@@ -107,7 +107,7 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		"side", WSSideJob, "task_id", entry.TaskID, "job_name", entry.JobName,
 		"daemon_id", claims.JobName)
 
-	// Catch-up push (proxy.md 请求路由 S30): the daemon registered before
+	// Catch-up push (§2.2 S-30): the daemon registered before
 	// connecting may have missed the task_available push; pushes are
 	// idempotent because claim dedups by task_id.
 	if entry.State == registry.StateDaemonRegistered && entry.DeliveredAt.IsZero() && len(entry.Payload) > 0 {
@@ -126,7 +126,7 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // readLoop answers daemon:heartbeat frames until the connection drops
-// (§1.2 S30: every heartbeat frame gets an ack; the ack refreshes the
+// (S-30: every heartbeat frame gets an ack; the ack refreshes the
 // heartbeat clock shared with S5).
 func (h *WSHandler) readLoop(ctx context.Context, jc *jobConn, jobRuntimeID string) {
 	for {
@@ -150,7 +150,7 @@ func (h *WSHandler) readLoop(ctx context.Context, jc *jobConn, jobRuntimeID stri
 		}
 		_ = json.Unmarshal(frame.Payload, &payload)
 		if payload.RuntimeID != "" && payload.RuntimeID != jobRuntimeID {
-			// Unknown runtime (failure-handling scenario #12): the single
+			// Unknown runtime (§1.4): the single
 			// permitted runtime_gone ack, prompting re-registration.
 			jc.write(heartbeatAckRuntimeGone(payload.RuntimeID))
 			continue

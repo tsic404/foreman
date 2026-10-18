@@ -53,7 +53,7 @@ func TestLoadConfigDefaults(t *testing.T) {
 // source (ADR-030), so the keys that used to tune the deleted built-in
 // template must not be read at all. An arbitrary value — an illegal one
 // included — is ignored and never refuses startup; the five resource/placement
-// keys are the idle entries whose deletion follows P-012 / P-013.
+// keys are the idle entries whose deletion follows ADR-028 / ADR-035.
 func TestLoadConfigIgnoresTemplateShapeKeys(t *testing.T) {
 	cfg, err := LoadConfig(envFrom(map[string]string{
 		"FOREMAN_JOB_IMAGE_PULL_SECRETS": `["a"]`,

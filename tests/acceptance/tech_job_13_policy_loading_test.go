@@ -24,7 +24,7 @@ import (
 )
 
 // tcJob13Declaration is the fixed declaration sentence every policy-side
-// startup path prints (03-contracts.md §5.4「风险告知」).
+// startup path prints (02-contracts.md §8.7 风险告知).
 const tcJob13Declaration = "策略文件在启动期一次性加载，运行中变更不生效"
 
 // tcJob13HashPattern is the hash line's shape: the prefix and 64 lowercase hex

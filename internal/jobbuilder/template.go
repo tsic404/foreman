@@ -19,23 +19,22 @@ import (
 	"k8s.io/client-go/kubernetes/scheme"
 )
 
-// TemplatePath is the fixed template carrier location (03-contracts.md §5.4):
+// TemplatePath is the fixed template carrier location (02-contracts.md §8.1):
 // the Deployment mounts the required ConfigMap foreman-job-template here with
 // key job-overlay.yaml, as a non-optional read-only volume. There is no env
 // switch — the file's presence is the deployment's contract, so a setting
 // cannot point at a file the Deployment never mounted.
 const TemplatePath = "/etc/foreman/job-template/job-overlay.yaml"
 
-// The startup log carries fixed literals from two places in 03-contracts.md
-// §5.4: the risk declaration (§5.4 风险告知) and the hash line plus effect
-// statement (§5.4 运维口径①). The declaration and the hash line are greped
-// verbatim by AC-29 / TC-tech-job-07; the effect statement rests on design text
-// only — no AC or TC protects it. They stay constants so call sites cannot
-// drift from the contract text.
+// The startup log carries fixed literals from two places: the risk
+// declaration (§8.7) and the hash line plus effect statement (§8.1). The
+// declaration and the hash line are greped verbatim by AC-29 / TC-tech-job-07;
+// the effect statement rests on design text only — no AC or TC protects it.
+// They stay constants so call sites cannot drift from the contract text.
 
 // templateRiskDeclaration is the statement the startup log always carries
-// (03-contracts.md §5.4 风险告知): the template is not a security boundary,
-// and Foreman does not check it.
+// (§8.7): the template is not a security boundary, and Foreman does not
+// check it.
 const templateRiskDeclaration = "Foreman 不对 Job 模板做任何校验，模板内容不构成安全边界"
 
 // templateHashLinePrefix starts the hash line, whose fixed literal is
@@ -46,13 +45,13 @@ const templateRiskDeclaration = "Foreman 不对 Job 模板做任何校验，模�
 // paths say the hash is out of reach instead.
 const templateHashLinePrefix = "模板内容哈希 sha256="
 
-// templateEffectStatement is the 生效状态声明 (§5.4 运维口径①): the file is
+// templateEffectStatement is the effect statement (§8.1): the file is
 // read once at startup, so a ConfigMap edit takes effect only after a restart.
 const templateEffectStatement = "运行中 CM 变更不生效"
 
 // strictJobSerializer rejects unknown fields instead of dropping them: a
 // misspelled "contianers" must fail loudly rather than render a Job without
-// containers (03-contracts §5.4 启动期判定).
+// containers (§8.1 启动期判定).
 var strictJobSerializer = jsonserializer.NewSerializerWithOptions(
 	jsonserializer.DefaultMetaFactory, scheme.Scheme, scheme.Scheme,
 	jsonserializer.SerializerOptions{Yaml: false, Strict: true},
@@ -154,8 +153,7 @@ func parseJobTemplate(path string, data []byte) (map[string]any, error) {
 }
 
 // resolvePreferredNode settles the node-reuse item on the rendered Job
-// (03-contracts §5.4「`<preferred node>` 条件块」): every values entry reading
-// exactly "<preferred node>" at
+// (§8.6): every values entry reading exactly "<preferred node>" at
 // affinity.nodeAffinity.preferredDuringSchedulingIgnoredDuringExecution[*]
 // .preference.matchExpressions[*].values takes the resolved node's name, or —
 // when no node resolved — its whole item is dropped and the structures the
@@ -231,7 +229,7 @@ func hasRecognitionValue(item *corev1.PreferredSchedulingTerm) bool {
 	return false
 }
 
-// Registered template placeholders (05-modules/job-template.md 占位符与回归基线).
+// Registered template placeholders (§8.3).
 // Anything else written as <...> stays verbatim — an unregistered literal is
 // never guessed at, so a typo cannot silently become a value.
 // placeholderPreferredNode is registered too, but as the substitution set's one
@@ -255,12 +253,12 @@ const (
 
 // placeholderRegistry is the substitution set in one place, so the walk and the
 // documented table cannot drift. <preferred node> is deliberately absent: the
-// design registers it as the substitution set's one exception (03-contracts
-// §5.4「占位符替换」第 1 条) — only its recognition site takes a value or drops
-// its item (resolvePreferredNode), and anywhere else the literal stays verbatim
-// like any other unregistered one. The name-face variables (<issue-segment>,
-// <agent-segment>, <task-key>) are absent for the same reason: they are valid
-// inside metadata.name only (ADR-034 decision 6).
+// design registers it as the substitution set's one exception (§8.3) — only
+// its recognition site takes a value or drops its item (resolvePreferredNode),
+// and anywhere else the literal stays verbatim like any other unregistered one.
+// The name-face variables (<issue-segment>, <agent-segment>, <task-key>) are
+// absent for the same reason: they are valid inside metadata.name only
+// (ADR-034 decision 6).
 var placeholderRegistry = []string{
 	placeholderTaskID, placeholderAgentID, placeholderWorkspaceID,
 	placeholderIssueID, placeholderIssueIdentifier, placeholderAutopilotRunID,
@@ -326,8 +324,8 @@ func (v placeholderValues) replacement(placeholder string) string {
 }
 
 // substituteValue rewrites the registered placeholders in every string value
-// of the template — map values and list elements alike (§5.4「占位符替换」
-// 第 2/3 条: substring matching over the whole object's string values).
+// of the template — map values and list elements alike (§8.3: substring
+// matching over the whole object's string values).
 func substituteValue(node any, v placeholderValues) any {
 	switch value := node.(type) {
 	case map[string]any:
@@ -351,7 +349,7 @@ func substituteValue(node any, v placeholderValues) any {
 // value. The node-reuse literal is not among them: it is handled at its
 // recognition site only, so a template that writes it elsewhere keeps it
 // verbatim — the apiserver, not this walk, is what refuses such a position
-// (§5.4「占位符替换」第 4 条).
+// (§8.3's failure face).
 func substituteString(value string, v placeholderValues) string {
 	if !strings.Contains(value, "<") {
 		return value
@@ -365,7 +363,7 @@ func substituteString(value string, v placeholderValues) string {
 }
 
 // deepCopyTemplate clones the parsed template so Build never mutates the
-// startup-parsed object (P-006 §A1.3).
+// startup-parsed object (§8.2 A1.3).
 func deepCopyTemplate(template map[string]any) map[string]any {
 	out := make(map[string]any, len(template))
 	for key, value := range template {

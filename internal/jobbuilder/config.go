@@ -9,15 +9,15 @@ import (
 	"time"
 )
 
-// Environment variable names from the contract config table (§5.1) that this
-// module reads. Five keys the table still lists are deliberately absent here:
+// Environment variable names from the deployment manifest that this module
+// reads. Five keys the manifest still lists are deliberately absent here:
 // FOREMAN_JOB_IMAGE_PULL_SECRETS / FOREMAN_JOB_TOLERATIONS /
 // FOREMAN_JOB_TTL_SECONDS / FOREMAN_REPO_CACHE_MODE are deleted by ADR-030,
 // and FOREMAN_JOB_CPU_REQUEST / _MEMORY_REQUEST / _CPU_LIMIT / _MEMORY_LIMIT /
-// FOREMAN_JOB_NODE_SELECTOR are idle entries whose deletion follows P-012 /
-// P-013. Foreman reads none of them: the template is the only shape source, so
-// an arbitrary value — an illegal one included — is ignored, never a startup
-// refusal.
+// FOREMAN_JOB_NODE_SELECTOR are idle entries whose deletion follows ADR-028 /
+// ADR-035. Foreman reads none of them: the template is the only shape source,
+// so an arbitrary value — an illegal one included — is ignored, never a
+// startup refusal.
 const (
 	EnvJobNamespace        = "FOREMAN_JOB_NAMESPACE"
 	EnvJobImage            = "FOREMAN_JOB_IMAGE"
@@ -27,37 +27,36 @@ const (
 	EnvPolicyNameResolveIn = "FOREMAN_POLICY_NAME_RESOLUTION_TIMEOUT"
 )
 
-// Contract defaults (§5.1).
+// Contract defaults.
 const (
 	DefaultJobNamespace = "multica-agents"
 	DefaultJobImage     = "ghcr.io/tsic404/foreman-job:latest"
 
-	// DefaultJobTokenTTL is the §5.1 value 24h7m = boot 300s + task 86400s +
+	// DefaultJobTokenTTL is the §6.1 value 24h7m = boot 300s + task 86400s +
 	// drain 120s. This module signs the token, while auth runs the startup
 	// budget check on the same env: the two must stay equal, and
 	// TestLoadConfigDefaults pins them against auth's constant — a second
 	// default that drifted lower would pass the self-check and still expire
 	// inside the drain window (the 401 this change removes). The value is
-	// duplicated as a literal on purpose: 04-architecture.md's module
-	// dependency table lists jobbuilder → registry only, so the pin is a test
-	// concern, not a new production dependency.
+	// duplicated as a literal on purpose: jobbuilder depends on registry only,
+	// so the pin is a test concern, not a new production dependency.
 	DefaultJobTokenTTL = 24*time.Hour + 7*time.Minute
 
 	// DefaultJobDrainTimeout is the credential-reclaim upper bound that
-	// follows a task's verdict (§5.1, ADR-017). It is also the scheduler
+	// follows a task's verdict (§6.4, ADR-017). It is also the scheduler
 	// module's default, read from the same env: a probe's Job Token must
 	// outlive the probe's Job by this bound.
 	DefaultJobDrainTimeout = 120 * time.Second
 
 	// DefaultProbeHeartbeatInterval is the probe daemon's S5 heartbeat
-	// interval (§5.1 固定值): Foreman writes the key, never the template, and
+	// interval (§8.4 固定值): Foreman writes the key, never the template, and
 	// the startup self-check keeps FOREMAN_MODEL_CATALOG_TIMEOUT at three
 	// times this value at least.
 	DefaultProbeHeartbeatInterval = 15 * time.Second
 
 	// DefaultPolicyNameResolutionTimeout bounds the startup name resolution
-	// of the policy table (§5.4「策略文件」第 2 条: the window belongs to the
-	// deployment interface, its key name to the implementation). Keys past the
+	// of the policy table (§8.5: the window belongs to the deployment
+	// interface, its key name to the implementation). Keys past the
 	// window conclude unavailable, which only warns.
 	DefaultPolicyNameResolutionTimeout = 5 * time.Second
 )
@@ -78,19 +77,19 @@ type Config struct {
 	// to cover (ADR-017).
 	JobDrainTimeout time.Duration
 	// ProbeHeartbeatInterval is the value Foreman writes into the probe's
-	// MULTICA_DAEMON_HEARTBEAT_INTERVAL (§5.1 固定值): it fixes how late a
+	// MULTICA_DAEMON_HEARTBEAT_INTERVAL (§8.4 固定值): it fixes how late a
 	// server command can reach a probe, so it is not deployer-tunable.
 	ProbeHeartbeatInterval time.Duration
 
-	// TemplatePath is where job-overlay.yaml is mounted (03-contracts.md §5.4).
-	// The Deployment fixes it; §5.4 has no env switch on purpose, so only
+	// TemplatePath is where job-overlay.yaml is mounted (02-contracts.md §8.1).
+	// The Deployment fixes it; §8.1 has no env switch on purpose, so only
 	// tests point it elsewhere.
 	TemplatePath string
 
-	// PolicyPath is where policy.yaml is mounted (03-contracts.md §5.4
-	//「策略文件」): the optional ConfigMap foreman-job-policy. Like the
-	// template path it has no env switch — the mount is the deployment's
-	// contract — so only tests point it elsewhere.
+	// PolicyPath is where policy.yaml is mounted (02-contracts.md §8.5): the
+	// optional ConfigMap foreman-job-policy. Like the template path it has no
+	// env switch — the mount is the deployment's contract — so only tests
+	// point it elsewhere.
 	PolicyPath string
 	// NameResolver is the platform-side name-resolution seam ADR-035 leaves to
 	// the platform. Nil means the platform offers no such query: every policy
@@ -106,7 +105,7 @@ type Config struct {
 }
 
 // logger falls back to the process default so the module logs through the
-// same handler main installed (observability §结构化日志).
+// same handler main installed (§9.1).
 func (c Config) logger() *slog.Logger {
 	if c.Logger != nil {
 		return c.Logger

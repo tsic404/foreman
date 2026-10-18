@@ -161,7 +161,7 @@ func TestVerifyProbeScopeMismatch(t *testing.T) {
 		// scope even when the runtime and request ids are its own. This is the
 		// guard that keeps a probe token away from S9/S20/S26, which forward
 		// with Foreman's own server credential and can settle an in-flight
-		// task through S9's 404 (auth.md「目录探针的身份面」作用域行).
+		// task through S9's 404 (§6.3 作用域行).
 		"task id on the path": {TaskID: "task-elsewhere", RuntimeID: probeRuntime, RequestID: probeRequest},
 		"task id only":        {TaskID: "task-elsewhere"},
 	} {

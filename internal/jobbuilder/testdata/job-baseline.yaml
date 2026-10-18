@@ -1,18 +1,18 @@
 # TC-tech-job-01 / AC-20 的权威回归基线；**其 Job 文档 = 随仓发布的参考模板内容的唯一权威源**
 # （部署清单把本文件的 Job 文档发布为 ConfigMap `foreman-job-template` 的 `job-overlay.yaml`；模板为必选部署物，ADR-030）。
-# 本文件与 `docs/05-modules/job-template.md` §Job Manifest 是**同一份模板**的两种呈现（字面一致）：
-#   · `<job-image>` **逐字保留**在三处容器 `image`（agent / omp / prepare；消费面见 03-contracts §5.1 / §5.4）；
+# 参考模板内容的逐条约定：
+#   · `<job-image>` **逐字保留**在三处容器 `image`（agent / omp / prepare；消费面见 02-contracts.md §8.3）；
 #   · `omp` 由 `omp` init 容器在启动期按架构下载并校验后落到 `agent-bin` 卷，agent 容器以单文件挂载取到
 #     `MULTICA_OMP_PATH` 取值处（镜像不再内置 omp；init 耗时计入 FOREMAN_JOB_BOOT_TIMEOUT）；
 #   · `<preferred node>` **识别位属参考模板内容**（软亲和的取值/删除对象；缺该位则 AC-25 / AC-26 无判定对象）——
 #     由 TC-tech-job-01 步骤 3a 的「CM 内容自证」断言。
 #   · `metadata.name` 是**名字格式**（模板表达，ADR-034）：参考模板取 `fm-<task_id>`，A1.2 在副本上写终值；
 #     名字不承担身份——`foreman.tsic.top/daemon-id`（pod 标签）才是 `MULTICA_DAEMON_ID` 的 fieldRef 来源。
-# 占位符替换规则见 job-template.md「占位符与回归基线」。**条件块不在基线内**：触发上下文注解（issue-id /
+# 占位符替换规则见 02-contracts.md §8.3。**条件块不在基线内**：触发上下文注解（issue-id /
 # issue-identifier / autopilot-run-id / chat-session-id）由 A1.2 先清 `foreman.tsic.top/*` 域再按字段增删 ⇒ CM 写不写都不影响产物，
 # 故基线（= CM 字面）不含；归一化时从实际对象删除，形状由 TC-tech-job-01（issue 触发分支）与 TC-tech-job-04（**首跑**分支）单独断言。
 # **软亲和项在渲染面上的取舍（取值 → 恰一项 / 不满足条件 → 删项并上收空结构）由 TC-tech-job-01 步骤 3b 与 TC-tech-cache-05/06 断言（ADR-015）。**
-# 修订 job-template.md 的参考模板必须同 PR 同步本文件（两份 = 同一份模板，不得漂移）。
+# 修订参考模板时：基线夹具与部署清单两处必须同 PR 同步（同一份字面，AC-20 断言逐字一致）。
 # 末段 Secret 文档是该夹具的**凭据回归面**，不是模板内容（模板 = 单份 `batch/v1 Job`）。
 apiVersion: batch/v1
 kind: Job

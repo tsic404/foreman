@@ -21,7 +21,7 @@ import (
 const podJobNameLabel = "job-name"
 
 // ObjectClient is the recovery module's K8s read surface for the object
-// facts of the 判据模型 (failure-handling.md): whether the container ended
+// facts of the recovery judgement: whether the container ended
 // and why (依赖: client-go Job/Pod 读).
 type ObjectClient interface {
 	// GetJob returns the foreman Job, or nil when it is gone.
@@ -60,11 +60,11 @@ func podNodeName(pods []corev1.Pod) string {
 // whether the container ended, the pod refines why. A failed or succeeded
 // Job both mean the container is gone — the daemon (its main process) cannot
 // report anything after that, so the task must converge. Deadline kills
-// (#5) and node losses (#11) are named from the pod; anything else is
-// job_failed (#3).
+// (§4.4) and node losses (§4.6) are named from the pod; anything else is
+// job_failed (§4.6).
 //
 // The pod evidence is read first: a lost node shows up there before the Job
-// controller marks the Job failed (场景 #11).
+// controller marks the Job failed (§4.6).
 func jobEndReason(job *batchv1.Job, pods []corev1.Pod) (string, bool) {
 	if job == nil {
 		return "", false
@@ -113,7 +113,7 @@ func podTerminatedByDeadline(pod *corev1.Pod) bool {
 }
 
 // podLost reports a pod whose node went away — evicted, or its status no
-// longer observable (failure-handling 场景 #11).
+// longer observable (§4.6).
 func podLost(pod *corev1.Pod) bool {
 	if pod.Status.Phase == corev1.PodUnknown {
 		return true
@@ -126,7 +126,7 @@ func podLost(pod *corev1.Pod) bool {
 }
 
 // K8sObjects is the client-go implementation of ObjectClient and Watcher in
-// the Job namespace (RBAC: contract §1.3 — Job/Pod reads only).
+// the Job namespace (RBAC: contract §3 — Job/Pod reads only).
 type K8sObjects struct {
 	client    kubernetes.Interface
 	namespace string
@@ -156,7 +156,7 @@ func (o *K8sObjects) GetJob(ctx context.Context, name string) (*batchv1.Job, err
 }
 
 // ListPods returns the pods of the foreman Jobs (label
-// foreman.tsic.top/task-id, contract §3.2).
+// foreman.tsic.top/task-id).
 func (o *K8sObjects) ListPods(ctx context.Context) ([]corev1.Pod, error) {
 	list, err := o.client.CoreV1().Pods(o.namespace).List(ctx, metav1.ListOptions{
 		LabelSelector: registry.LabelTaskID,

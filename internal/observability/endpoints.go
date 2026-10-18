@@ -13,7 +13,7 @@ import (
 	"github.com/tsic404/foreman/internal/registry"
 )
 
-// Log tail bounds for /foreman/tasks/{id}/logs (observability.md §端点).
+// Log tail bounds for /foreman/tasks/{id}/logs (§9.3).
 const (
 	defaultLogTail = 200
 	maxLogTail     = 2000
@@ -24,7 +24,7 @@ const (
 type TaskIndex interface {
 	Get(taskID string) (registry.TaskEntry, bool)
 	// Settled returns the retained terminal record of an already-reclaimed
-	// task (contract §3.1, ADR-032): the single-task endpoint answers with it
+	// task (§4.3, ADR-032): the single-task endpoint answers with it
 	// inside the retention window.
 	Settled(taskID string) (registry.TaskEntry, bool)
 	List() []registry.TaskEntry
@@ -45,8 +45,8 @@ type OpsConfig struct {
 	Logger         *slog.Logger
 }
 
-// NewOpsHandler mounts the cluster-internal ops surface (contract §1.2
-// S25): /metrics plus /foreman/*. No Job Token check — these endpoints are
+// NewOpsHandler mounts the cluster-internal ops surface (§2.2 S-25): /metrics
+// plus /foreman/*. No Job Token check — these endpoints are
 // reachable only inside the cluster and never exposed via Ingress. A nil
 // logs reader keeps the route but answers 404 (optional endpoint).
 func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg OpsConfig) http.Handler {
@@ -87,7 +87,7 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 		e, ok := index.Get(taskID)
 		if !ok {
 			// A reclaimed task keeps answering with its terminal record until
-			// the retention window expires (observability.md §端点, ADR-032):
+			// the retention window expires (§9.3, ADR-032):
 			// the convergence instant is no longer the end of the evidence
 			// window. Beyond it, a reclaimed task and one that never existed
 			// are again indistinguishable.
@@ -108,14 +108,14 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 			// A reclaimed entry's terminal record is still answerable, but the
 			// payload is not part of it: the record drops the body at the
 			// verdict (registry.settledRecord), and this window has always
-			// been the live entry alone (observability.md §端点).
+			// been the live entry alone (§9.3).
 			writeError(w, http.StatusNotFound, "task not found")
 			return
 		}
 		// The served body is the entry's delivered payload — written by the S6
 		// delivery — and the window is delivered_at until reclaim. An entry
 		// that is not delivered yet holds the claim-time payload, which must
-		// never be exposed as the delivery body (observability.md §端点).
+		// never be exposed as the delivery body (§9.3).
 		if e.DeliveredAt.IsZero() || len(e.Payload) == 0 {
 			writeError(w, http.StatusNotFound, "payload unavailable")
 			return
@@ -165,8 +165,8 @@ func serveJobLogs(w http.ResponseWriter, r *http.Request, index TaskIndex, logs 
 		writeError(w, http.StatusNotFound, ErrJobLogsUnavailable.Error())
 		return
 	case apierrors.IsForbidden(err):
-		// observability.md §错误处理: pods/log RBAC denied is 403 + an error
-		// log; the task chain itself is unaffected.
+		// pods/log RBAC denied is 403 + an error log; the task chain itself
+		// is unaffected.
 		log.ErrorContext(r.Context(), "read job logs forbidden",
 			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
 		writeError(w, http.StatusForbidden, "job logs forbidden")
@@ -201,7 +201,7 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_ = json.NewEncoder(w).Encode(v)
 }
 
-// writeError uses the contract §1.2 error shape {"error":"<message>"}.
+// writeError writes the ops surface's error shape {"error":"<message>"}.
 func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }

@@ -48,7 +48,7 @@ func (h *harness) delayedProbeDaemon(t *testing.T, resultBody string, delay time
 // TestCatalog03DuplicateForwardIsIdempotent drives the C21 retry rule: the
 // server took the result but its answer was lost, so Foreman forwards the same
 // bytes again. The repeat is accepted like the first, and the record holds the
-// same result — nothing is rejected as a duplicate (§1.1 C21 重试规则).
+// same result — nothing is rejected as a duplicate (C-21; §1.3 幂等).
 func TestCatalog03DuplicateForwardIsIdempotent(t *testing.T) {
 	h := newHarness(t, true)
 	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}

@@ -39,7 +39,7 @@ func (f *fakeClaimScheduler) claimedCount() int {
 
 func TestBackoffProgression(t *testing.T) {
 	b := newBackoff()
-	// §4: exponential 1s→30s ceiling for the control-plane loops.
+	// §1.5: exponential 1s→30s ceiling for the control-plane loops.
 	want := []time.Duration{time.Second, 2 * time.Second, 4 * time.Second, 8 * time.Second, 16 * time.Second, 30 * time.Second, 30 * time.Second}
 	for i, w := range want {
 		if got := b.next(); got != w {
@@ -181,7 +181,7 @@ func TestClaimLoopStopsOn403(t *testing.T) {
 	client.refs = declaredRefs(testDiscovery())
 	loop := NewClaimLoop(testConfig(srv.URL), client, sched)
 
-	// §1.1 failure table: 403 is a config error — no blind retry; the loop
+	// §1.5: 403 is a config error — no blind retry; the loop
 	// exits (CrashLoopBackOff is the alarm surface).
 	done := make(chan error, 1)
 	go func() { done <- loop.Run(t.Context()) }()
@@ -246,7 +246,7 @@ func TestHeartbeatLoopHeartbeatsImmediately(t *testing.T) {
 	}
 }
 
-// TestClaimLoopRetriesTransientPreflight pins the startup C1's §4 behavior: a
+// TestClaimLoopRetriesTransientPreflight pins the startup C1's §1.5 behavior: a
 // transient failure backs off and retries instead of exiting the process.
 func TestClaimLoopRetriesTransientPreflight(t *testing.T) {
 	srv, stub := newStubUpstream(t)
@@ -318,8 +318,8 @@ func TestHeartbeatAckConsumesUnderTheStreamsRuntime(t *testing.T) {
 			probes := &fakeProbe{}
 			reporter := NewModelCatalogReporter(cfg, client, probes, slots, &fakeMetrics{})
 
-			// The mismatch line is a registered event (§1.1「C2 ack 消费」/
-			// observability.md model.catalog_ack_mismatch): exactly one when
+			// The mismatch line is a registered event (§1.3/
+			// §9.2 model.catalog_ack_mismatch): exactly one when
 			// the ack echoes a foreign runtime id, none otherwise.
 			logs := &lockedBuffer{}
 			prev := slog.Default()

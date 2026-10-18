@@ -128,7 +128,7 @@ func TestCatalog06ZeroParseNegative(t *testing.T) {
 }
 
 // catalogConfigKeys is the catalog configuration surface of the deployment
-// (02-contracts.md §5.1): the switch, the window and the cache TTL.
+// (02-contracts.md §1.3): the switch, the window and the cache TTL.
 var catalogConfigKeys = []string{
 	"FOREMAN_MODEL_CATALOG_ENABLED",
 	"FOREMAN_MODEL_CATALOG_TIMEOUT",

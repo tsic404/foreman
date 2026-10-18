@@ -13,8 +13,7 @@ import (
 )
 
 // ErrJobLogsUnavailable means the Job's pod is gone (finished Jobs are
-// deleted) or never scheduled; the endpoint maps it to 404
-// (observability.md §错误处理).
+// deleted) or never scheduled; the endpoint maps it to 404.
 var ErrJobLogsUnavailable = errors.New("job logs unavailable")
 
 // PodLogReader is the Job log proxy's read seam (ADR-009 point 3).
@@ -23,7 +22,7 @@ type PodLogReader interface {
 }
 
 // K8sPodLogReader reads Job logs through the pods/log subresource; it needs
-// pods: list and pods/log: get (contract §1.3 RBAC).
+// pods: list and pods/log: get (§3 RBAC).
 type K8sPodLogReader struct {
 	client kubernetes.Interface
 }

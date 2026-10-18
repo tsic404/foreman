@@ -6,7 +6,7 @@ import (
 )
 
 // jobRuntimeNamespace is the fixed UUIDv5 namespace for job runtime IDs
-// (contract §3.1: job_runtime_id = uuid5(ns_job_runtime, job_name)). It must
+// (§8.3: job runtime identity is derived from the daemon identity). It must
 // never change: rebuilt entries carry the ID in Job annotations and a running
 // daemon keeps presenting it.
 var jobRuntimeNamespace = [16]byte{

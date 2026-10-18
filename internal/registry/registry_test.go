@@ -369,7 +369,7 @@ func TestMarkDeliveringRearmsAfterTheWindow(t *testing.T) {
 }
 
 // TestClaimsAfterDeliveryAccumulatesAcrossDeliveries guards the counter's
-// cumulative reading (contract §3.1): it answers how many empty S6 claims
+// cumulative reading (§4.1): it answers how many empty S6 claims
 // followed a delivery commit in total, not how many followed the last one. A
 // per-window reading would report zero right after a re-delivery commit, i.e.
 // the diagnostic's other branch ("the daemon stopped asking" instead of "the

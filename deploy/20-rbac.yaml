@@ -1,4 +1,4 @@
-# ServiceAccounts and the Foreman least-privilege Role (contracts §1.3/§5.3, F8).
+# ServiceAccounts and the Foreman least-privilege Role (02-contracts.md §3, F8).
 #
 # The Role is namespaced to multica-agents and carries exactly the verbs the
 # design lists: secrets create/delete/get/list, jobs.batch

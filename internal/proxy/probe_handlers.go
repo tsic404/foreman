@@ -25,7 +25,7 @@ func (s *FakeServer) probeSession(claims auth.Claims) (registry.ProbeSession, bo
 // probeCommand returns the command id this probe must report on, and whether
 // one is still outstanding: command-driven probes carry the C2 ack's id
 // verbatim, a startup-discovery probe carries Foreman's own minted id
-// (§1.2 S5/S27).
+// (S-5/S-27).
 func probeCommand(session registry.ProbeSession) (string, bool) {
 	if !session.RelayedAt.IsZero() {
 		return "", false
@@ -51,7 +51,7 @@ func (s *FakeServer) registerProbe(w http.ResponseWriter, r *http.Request, claim
 	if len(req.Runtimes) == 0 {
 		// Zero declared runtimes: refusing the registration is the probe's
 		// third failure class (pod up, daemon not registered), which the
-		// startup window turns into the exit decision (§1.2 S4).
+		// startup window turns into the exit decision (S-4).
 		s.log.Error("probe declared no runtime; refusing registration", "job_name", claims.JobName)
 		writeError(w, http.StatusConflict, "no runtime declared")
 		return
@@ -96,7 +96,7 @@ func (s *FakeServer) registerProbe(w http.ResponseWriter, r *http.Request, claim
 
 // selectDeclaredRuntime picks the declared entry answering one Job: the type
 // must equal the Job's provider, an empty profile_id wins, and ties resolve by
-// name (§1.2 S4 的选条与拒绝注册面).
+// name (§2.3).
 func selectDeclaredRuntime(runtimes []registerRuntime, provider string) (registerRuntime, bool) {
 	if len(runtimes) == 0 {
 		return registerRuntime{}, false
@@ -127,7 +127,7 @@ func selectDeclaredRuntime(runtimes []registerRuntime, provider string) (registe
 }
 
 // probeServedRuntime picks the runtime a probe serves: the first entry by name,
-// the same stable ordering C1 declares (§1.1 C1 的取值来源与声明域).
+// the same stable ordering C1 declares (C-1 的取值来源与声明域).
 func probeServedRuntime(runtimes []registerRuntime) registerRuntime {
 	ordered := append([]registerRuntime(nil), runtimes...)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Name < ordered[j].Name })
@@ -143,7 +143,7 @@ func discoveredRuntimes(runtimes []registerRuntime) []registry.DiscoveredRuntime
 }
 
 // heartbeatProbe answers S5 for a probe: the ack carries pending_model_list
-// while a command is outstanding, and nothing otherwise (§1.2 S5 按角色分叉).
+// while a command is outstanding, and nothing otherwise (S-5 按角色分叉).
 func (s *FakeServer) heartbeatProbe(w http.ResponseWriter, claims auth.Claims, runtimeID string) {
 	session, ok := s.probeSession(claims)
 	if !ok {
@@ -161,13 +161,13 @@ func (s *FakeServer) heartbeatProbe(w http.ResponseWriter, claims auth.Claims, r
 	writeRaw(w, http.StatusOK, mustMarshal(ack))
 }
 
-// noRepos is the empty repos block the pre-C1 window answers (§1.2 S2).
+// noRepos is the empty repos block the pre-C1 window answers (S-2).
 var noRepos = json.RawMessage("[]")
 
 // handleModelResult is S27's models path. A task Job always gets 404 (F9); a
 // probe Job's result is routed by its source: the startup-discovery id is
 // absorbed into the slot store without any C21, the command id is relayed
-// byte for byte (§1.2 S27).
+// byte for byte (S-27).
 func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 	tid, rid, req := r.PathValue("tid"), r.PathValue("rid"), r.PathValue("req")
 	claims, ok := s.authenticate(w, r, auth.RequestScope{
@@ -213,7 +213,7 @@ func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 		s.log.Info("model.catalog_absorbed", "job_name", claims.JobName, "provider", provider)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case session.RequestID != "" && req == session.RequestID:
-		// The relay retries transport errors and 5xx with §1.1 C21's backoff,
+		// The relay retries transport errors and 5xx with C-21's backoff,
 		// bounded by the probe's own budget (the consumption-to-answer window);
 		// a 4xx is the upstream's verdict and goes back as it is.
 		status, resp, err := relayCatalog(r.Context(), s.client, session.RealRuntimeID, req, body, session.Deadline, s.log)

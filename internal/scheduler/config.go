@@ -10,7 +10,7 @@ import (
 	"github.com/tsic404/foreman/internal/jobbuilder"
 )
 
-// Environment variable names from the contract config table (§5.1).
+// Environment variable names read by LoadConfig.
 const (
 	EnvMaxInflightJobs = "FOREMAN_MAX_INFLIGHT_JOBS"
 	EnvMaxJobsPerNode  = "FOREMAN_MAX_JOBS_PER_NODE"
@@ -25,8 +25,8 @@ const (
 	EnvDeliveryConfirmTimeout = "FOREMAN_DELIVERY_CONFIRM_TIMEOUT"
 	EnvWorkspaceID            = "MULTICA_WORKSPACE_ID"
 	// EnvStartupProbeTimeout names the startup probe window; the design fixes
-	// its semantics (one Job-boot magnitude) but leaves the key to the
-	// implementation (§5.1).
+	// its semantics (one Job-boot magnitude, §10) but leaves the key to the
+	// implementation.
 	EnvStartupProbeTimeout = "FOREMAN_STARTUP_PROBE_TIMEOUT"
 	EnvModelCatalogEnabled = "FOREMAN_MODEL_CATALOG_ENABLED"
 	EnvModelCatalogTimeout = "FOREMAN_MODEL_CATALOG_TIMEOUT"
@@ -37,14 +37,14 @@ const (
 	EnvProjectLookupTimeout = "FOREMAN_PROJECT_LOOKUP_TIMEOUT"
 )
 
-// Contract defaults (§5.1).
+// Defaults applied when the environment leaves a scheduler key unset.
 const (
 	DefaultMaxInflightJobs = 100
 	DefaultMaxJobsPerNode  = 4
 	DefaultClaimBatchMax   = 32
 	DefaultJobBootTimeout  = 300 * time.Second
 	// DefaultDeliveryConfirmTimeout is the S6 delivery confirmation window
-	// (§5.1, ADR-032): comfortably above the upstream daemon's own claim
+	// (§5, ADR-032): comfortably above the upstream daemon's own claim
 	// budget (seconds, plus its retry margin), so a released delivery can
 	// never race a response still in flight, and well under the boot bound,
 	// which stays the entry's terminal bound.
@@ -54,12 +54,12 @@ const (
 	// deployment that raises its template's terminationGracePeriodSeconds
 	// must raise this too.
 	DefaultJobDrainTimeout = 120 * time.Second
-	// DefaultModelCatalogTimeout is one catalog probe's own budget (§5.1).
+	// DefaultModelCatalogTimeout is one catalog probe's own budget (§1.3).
 	DefaultModelCatalogTimeout = 45 * time.Second
 	// DefaultModelCatalogEnabled keeps the catalog route on unless a
-	// deployment turns it off explicitly (§5.1).
+	// deployment turns it off explicitly (§1.3).
 	DefaultModelCatalogEnabled = true
-	// DefaultReconcileInterval is the convergence cadence (§5.1); the probe
+	// DefaultReconcileInterval is the convergence cadence; the probe
 	// sweep grace is derived from it.
 	DefaultReconcileInterval = 30 * time.Second
 
@@ -69,7 +69,7 @@ const (
 	DefaultProjectLookupTimeout = 2 * time.Second
 
 	// serverClaimBatchCap is the server-side claim batch ceiling
-	// (contract §1.1 C3: max_tasks > 32 is truncated to 32).
+	// (C-3: max_tasks > 32 is truncated to 32).
 	serverClaimBatchCap = 32
 )
 
@@ -101,14 +101,14 @@ type Config struct {
 	// (MULTICA_WORKSPACE_ID); the catalog probe has no task to carry it.
 	WorkspaceID string
 	// StartupProbeTimeout is the startup probe's wait window: the first probe
-	// must register within it or Foreman exits non-zero (§5.1 启动探针窗口,
+	// must register within it or Foreman exits non-zero (§10 启动探针窗口,
 	// default = JobBootTimeout — one "schedule + pull + register" magnitude).
 	StartupProbeTimeout time.Duration
 	// ModelCatalogEnabled is the catalog route's path-level switch; with it
 	// off the startup orchestration completes as soon as S4 registered.
 	ModelCatalogEnabled bool
 	// ModelCatalogTimeout is one catalog probe's own budget: the probe sweep
-	// grace is derived from it (§5.1 FOREMAN_MODEL_CATALOG_TIMEOUT).
+	// grace is derived from it (§1.3).
 	ModelCatalogTimeout time.Duration
 	// ReconcileInterval is the convergence cadence; the probe sweep grace
 	// covers one round on each side (FOREMAN_RECONCILE_INTERVAL).
@@ -181,8 +181,8 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		if err != nil {
 			return Config{}, fmt.Errorf("%s must be a duration: %v", EnvJobBootTimeout, err)
 		}
-		// 0 = no upper bound (排障用, §5.1): the claim writes no boot_deadline
-		// and the boot judgement never holds (contract §3.1, ADR-026). Only a
+		// 0 = no upper bound (排障用): the claim writes no boot_deadline
+		// and the boot judgement never holds (§4.2, ADR-026). Only a
 		// negative bound is meaningless.
 		if d < 0 {
 			return Config{}, fmt.Errorf("%s must be >= 0, got %s", EnvJobBootTimeout, d)
@@ -192,7 +192,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	// The delivery confirmation window is the second pre-start bound, and its
 	// whole point is to fire before the boot one: a window at or above
 	// JobBootTimeout would leave the lost-response form settling as
-	// job_boot_timeout again (ADR-032). Zero is legal by §5.1: it disarms the
+	// job_boot_timeout again (ADR-032). Zero is legal here: it disarms the
 	// convergence exit.
 	if raw := strings.TrimSpace(getenv(EnvDeliveryConfirmTimeout)); raw != "" {
 		d, err := time.ParseDuration(raw)
@@ -225,7 +225,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	}
 	// The startup window defaults to the task Job's boot bound: the same
 	// "schedule + pull + register" magnitude, with no second magic number
-	// (§5.1 启动探针窗口). A boot bound switched off (0 = no upper bound)
+	// (§10 启动探针窗口). A boot bound switched off (0 = no upper bound)
 	// leaves nothing to derive from, and a zero window would fail the probe
 	// before it could register — the default magnitude stands in.
 	cfg.StartupProbeTimeout = cfg.JobBootTimeout

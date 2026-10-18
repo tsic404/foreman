@@ -35,7 +35,7 @@ type fakeJobs struct {
 	deletedJobs   []string
 	deletedSecret []string
 	// created is the apiserver timestamp stamped on every created Job; the
-	// scheduler reads it as job_created_at (contract §3.1).
+	// scheduler reads it as job_created_at (§4.1).
 	created time.Time
 }
 
@@ -461,7 +461,7 @@ func TestFullLifecycle(t *testing.T) {
 
 	// A retry of the same terminal report inside the drain window is a live
 	// Job's report: it is forwarded again and the server's terminal callback
-	// is idempotent (proxy.md 迟到重放 ①).
+	// is idempotent (§1.3 ①).
 	code, _ = rig.call(t, "POST", "/api/daemon/tasks/t-life/complete", tok, completeBody)
 	if code != 200 {
 		t.Fatalf("drain-window retry = %d, want 200", code)
@@ -489,7 +489,7 @@ func TestFullLifecycle(t *testing.T) {
 
 	// Late replay after the reclaim: the entry adjudication falls to the done
 	// index, so the terminal endpoint is a 200 idempotent with no second C9
-	// (proxy.md 迟到重放 ②).
+	// (§1.3 ②).
 	code, _ = rig.call(t, "POST", "/api/daemon/tasks/t-life/complete", tok, completeBody)
 	if code != 200 {
 		t.Fatalf("late replay = %d, want 200", code)
@@ -519,7 +519,7 @@ func TestTerminalForwardFailureLandsInPendingReports(t *testing.T) {
 	if code != 502 {
 		t.Fatalf("S13 with down upstream = %d, want 502: %s", code, body)
 	}
-	// The report landed in the durable queue (contract §4: never dropped).
+	// The report landed in the durable queue (contract §10: never dropped).
 	if got := rig.pending.Len(); got != 1 {
 		t.Fatalf("pending reports = %d, want 1", got)
 	}
@@ -593,7 +593,7 @@ func TestS5HeartbeatSemantics(t *testing.T) {
 		t.Error("heartbeat clock not refreshed")
 	}
 
-	// Unknown runtime → 404 (scenario #12: daemon re-registers).
+	// Unknown runtime → 404 (§1.4: daemon re-registers).
 	code, _ = rig.call(t, "POST", "/api/daemon/heartbeat", tok, []byte(`{"runtime_id":"nope"}`))
 	if code != 404 {
 		t.Errorf("unknown runtime = %d, want 404", code)
@@ -791,8 +791,8 @@ func TestS7PrepareLeaseForwardsC4(t *testing.T) {
 	if got := len(rig.stub.calls("POST", "/api/daemon/runtimes/rid-real/tasks/t-lease/prepare-lease")); got != 1 {
 		t.Fatalf("C4 calls = %d, want 1 (real runtime id)", got)
 	}
-	// S7's local renewal bookkeeping (proxy.md §请求路由): the daemon's
-	// renewal restamped the server lease, so lease_keep_until (§3.1) moves to
+	// S7's local renewal bookkeeping (§2.2 S-7): the daemon's
+	// renewal restamped the server lease, so lease_keep_until (§4.1) moves to
 	// the renewal moment plus the 45s TTL.
 	after, ok := rig.reg.Get("t-lease")
 	if !ok {
@@ -806,9 +806,8 @@ func TestS7PrepareLeaseForwardsC4(t *testing.T) {
 		t.Errorf("S7 left lease_keep_until unadvanced: before %v, after %v",
 			before.LeaseKeepUntil, after.LeaseKeepUntil)
 	}
-	// S7 leaves the same Info observation line the keeper does
-	// (protocol-lease.md 场景 A): one record per renewal, at a level the
-	// default handler admits.
+	// S7 leaves the same Info observation line the keeper does: one record
+	// per renewal, at a level the default handler admits.
 	records := logRecords(t, buf.Bytes(), "lease.renewed")
 	if len(records) != 1 {
 		t.Fatalf("lease.renewed records = %d, want 1", len(records))
@@ -884,7 +883,7 @@ func TestS9Status404SettlesTaskVanished(t *testing.T) {
 	if code != 404 {
 		t.Fatalf("S9 = %d, want 404", code)
 	}
-	// proxy.md 转发 switch: non-terminal 404 → OnTaskVanished (the Job object
+	// Forward switch: non-terminal 404 → OnTaskVanished (§4.6; the Job object
 	// is taken down and the entry settles terminal, still draining until the
 	// reclaim) instead of lingering until a restart.
 	e, ok := rig.reg.Get("t-s9")
@@ -1052,7 +1051,7 @@ func TestS29UpstreamFailureMaps502(t *testing.T) {
 }
 
 // stubAuthority is the authority the upstream must see as Host: the target
-// server's address, never the Foreman address the caller dialed (§1.2
+// server's address, never the Foreman address the caller dialed (§2.4
 // exclusion set).
 func (r *testRig) stubAuthority() string {
 	return strings.TrimPrefix(r.client.cfg.ServerURL, "http://")

@@ -8,7 +8,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// Label and annotation keys (contract §3.2, verbatim).
+// Label and annotation keys (verbatim).
 const (
 	labelAppName     = "app.kubernetes.io/name"
 	labelManagedBy   = "app.kubernetes.io/managed-by"
@@ -18,7 +18,7 @@ const (
 	// labelDaemonID is the pod-template label carrying the identity name
 	// fm-<task_id> — the MULTICA_DAEMON_ID fieldRef source and the reason the
 	// display name can change without moving any identity (ADR-034 decision 8,
-	// contract §3.2).
+	// §4.3).
 	labelDaemonID = "foreman.tsic.top/daemon-id"
 
 	annoIssueID         = "foreman.tsic.top/issue-id"
@@ -31,8 +31,8 @@ const (
 	annoAttempt         = "foreman.tsic.top/attempt"
 )
 
-// Names the writers of both render paths share: the §3.2 domain, the probe
-// render's literals (A1.4 ④) and the credential Secret carrier.
+// Names the writers of both render paths share: the Foreman-owned domain, the
+// probe render's literals (A1.4 ④) and the credential Secret carrier.
 const (
 	jobAppName       = "foreman-job"
 	managedByForeman = "foreman"
@@ -40,15 +40,15 @@ const (
 	secretCredSuffix = "-cred"
 	foremanDomain    = "foreman.tsic.top/"
 
-	// jobProfile is the design constant JOB_PROFILE (ADR-013, 03-contracts
-	// §3.1/§5.2): the daemon runs under this named profile and its config.json,
+	// jobProfile is the design's fixed profile name (ADR-013, §6.2): the daemon
+	// runs under this named profile and its config.json,
 	// daemon.pid and daemon.log resolve to the profile directory. The probe
 	// render renames this literal to its own profile (A1.4 ④), so it is also
 	// the task-side anchor of the probe's profile directory.
 	jobProfile = "foreman-job"
 )
 
-// identityLabels is the §3.2 Job label set.
+// identityLabels is the Job label set (§4.3).
 func (b *Builder) identityLabels(e TaskEntry) map[string]string {
 	return map[string]string{
 		labelAppName:     jobAppName,
@@ -59,7 +59,7 @@ func (b *Builder) identityLabels(e TaskEntry) map[string]string {
 	}
 }
 
-// identityAnnotations is the §3.2 Job annotation set. daemon-id carries the
+// identityAnnotations is the Job annotation set (§4.3). daemon-id carries the
 // identity name fm-<task_id>, never the display name the template expresses
 // (ADR-034 decision 8). The four trigger-context keys are conditional blocks
 // (ADR-014): a key appears only when its TaskEntry field is non-empty — an
@@ -87,11 +87,11 @@ func (b *Builder) identityAnnotations(daemonID string, e TaskEntry) map[string]s
 }
 
 // injectedEnv is the A1.1 set Foreman writes into a template's first container
-// (03-contracts.md §5.4): the daemon's protocol surface, and the only env keys a
+// (§8.2 A1.1): the daemon's protocol surface, and the only env keys a
 // deployment template does not get to keep. MULTICA_DAEMON_ID reads the
 // pod-template label Foreman writes with the identity name — not the Job
 // controller's job-name label, which now carries the template's display name
-// (ADR-034 decision 8 / §5.2).
+// (ADR-034 decision 8 / §8.2 A1.1).
 func injectedEnv() []corev1.EnvVar {
 	return []corev1.EnvVar{
 		{Name: "MULTICA_SERVER_URL", Value: foremanServerURL},
@@ -100,15 +100,15 @@ func injectedEnv() []corev1.EnvVar {
 	}
 }
 
-// foremanServerURL is the one server a Job daemon may dial (F5 收窄, §5.2).
+// foremanServerURL is the one server a Job daemon may dial (F5 收窄, A1.1).
 const foremanServerURL = "http://foreman.foreman.svc.cluster.local:8080"
 
-// envFieldRef is the fieldRef form §5.2 uses for the daemon identity keys.
+// envFieldRef is the fieldRef form A1.1 uses for the daemon identity keys.
 func envFieldRef(fieldPath string) *corev1.EnvVarSource {
 	return &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: fieldPath}}
 }
 
-// requiredAnnotationKeys are the §3.2 keys every Job carries; the four
+// requiredAnnotationKeys are the keys every Job carries (§4.3); the four
 // trigger-context keys are conditional blocks (ADR-014), present only when
 // their TaskEntry field is non-empty.
 var (
@@ -118,7 +118,7 @@ var (
 
 // credentialSecret is the per-task Secret. Its name derives from the identity
 // name (fm-<task_id>-cred), so it never follows the template's display name
-// (ADR-034 decision 8, contract §1.3).
+// (ADR-034 decision 8, §3).
 func (b *Builder) credentialSecret(daemonID, taskID, token string) *corev1.Secret {
 	configJSON := `{"token":` + strconv.Quote(token) + `}`
 	return &corev1.Secret{

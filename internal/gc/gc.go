@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// State-root layout (ADR-005 / 05-modules/job-template.md §节点清理).
+// State-root layout (ADR-005 / §8.8).
 const (
 	workspacesDir = "workspaces"
 	reposDir      = ".repos"
@@ -20,7 +20,7 @@ const (
 	skillCacheDir = ".skill-cache"
 )
 
-// Node-local agent state layout (05-modules/job-template.md §节点清理).
+// Node-local agent state layout (§8.8).
 // It lives on the `home` hostPath beside the workspaces tree, so every rule
 // below is covered by the same quiesce probe and the same state-root guard.
 const (
@@ -170,7 +170,7 @@ func (c *Collector) RunOnce(ctx context.Context) (Stats, error) {
 
 // quiesced reports whether the state root was written within the quiesce
 // window; such a round is skipped so a running Job's directories are never
-// raced (05-modules/job-template.md §节点清理).
+// raced (§8.8).
 func (c *Collector) quiesced(ctx context.Context, root string) (bool, error) {
 	if c.cfg.Quiesce <= 0 {
 		return false, nil

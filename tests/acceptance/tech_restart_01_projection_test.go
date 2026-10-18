@@ -33,7 +33,7 @@ func TestRestart01AbsentStartFactsProjectEmptyThenAdopt(t *testing.T) {
 		t.Fatalf("OnClaim: %v", err)
 	}
 	// This process claimed the task, so the boot upper bound exists and
-	// projects RFC3339; no start fact exists yet (contract §3.1).
+	// projects RFC3339; no start fact exists yet (02-contracts.md §4.1).
 	assertProjectedTime(t, ops.URL, "task-1", "boot_deadline", true)
 	assertProjectedTime(t, ops.URL, "task-1", "started_at", false)
 
@@ -66,7 +66,7 @@ func TestRestart01AbsentStartFactsProjectEmptyThenAdopt(t *testing.T) {
 	}
 }
 
-// TestRestart01UnboundedBootProjectsEmpty (contract §3.1 / §5.1): with
+// TestRestart01UnboundedBootProjectsEmpty (02-contracts.md §4.1 / §4.2): with
 // FOREMAN_JOB_BOOT_TIMEOUT=0 the claim writes no upper bound at all, so the
 // projection keeps the key and carries the empty string — the same form a
 // rebuilt entry has, and never a degenerate claimed_at that a consumer's
@@ -116,7 +116,7 @@ func TestRestart01DeletedJobLeavesNoGhostEntry(t *testing.T) {
 	}
 }
 
-// claimPayload is a claim as the server hands it over (contract §1.2 S6).
+// claimPayload is a claim as the server hands it over (S-6).
 func claimPayload(taskID string) json.RawMessage {
 	return json.RawMessage(fmt.Sprintf(
 		`{"id":%q,"agent_id":"agent-1","workspace_id":"ws-1","runtime_id":"rt-1"}`, taskID))

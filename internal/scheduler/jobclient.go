@@ -36,12 +36,12 @@ type JobEvent struct {
 // deleted kind.
 type JobEventHandler func(JobEvent)
 
-// JobClient is the scheduler's K8s object access (task-mapping 内部结构).
+// JobClient is the scheduler's K8s object access.
 // Deletes are idempotent: a missing object counts as success.
 type JobClient interface {
 	// CreateJob creates the Job and returns the object the apiserver
 	// accepted. Its metadata.creationTimestamp is the instance-filter basis
-	// of the pod evidence (contract §3.1) — never substitute a local clock
+	// of the pod evidence (§4.1) — never substitute a local clock
 	// reading, or an apiserver clock that lags would filter out this Job's
 	// own pod and read the empty set as "terminated".
 	CreateJob(ctx context.Context, job *batchv1.Job) (*batchv1.Job, error)
@@ -54,12 +54,10 @@ type JobClient interface {
 	// ListJobs returns the foreman-managed Jobs in the configured namespace.
 	ListJobs(ctx context.Context) ([]batchv1.Job, error)
 	// ListSecrets returns the foreman-managed credential Secrets in the
-	// configured namespace — the list face of the orphan sweep
-	// (failure-handling 场景 #16).
+	// configured namespace — the list face of the orphan sweep (§6.5).
 	ListSecrets(ctx context.Context) ([]corev1.Secret, error)
 	// ListPods returns the pods matching labelSelector in the configured
-	// namespace — the value surface of jobTerminated (task-mapping
-	// §内部结构).
+	// namespace — the value surface of jobTerminated.
 	ListPods(ctx context.Context, labelSelector string) ([]corev1.Pod, error)
 	// WatchJobs streams Job changes via a client-go informer until ctx ends.
 	WatchJobs(ctx context.Context, handler JobEventHandler) error
@@ -71,7 +69,7 @@ type k8sJobClient struct {
 	namespace string
 }
 
-// NewJobClient wraps a clientset for the Job namespace (RBAC: contract §1.3).
+// NewJobClient wraps a clientset for the Job namespace (RBAC: §3).
 func NewJobClient(client kubernetes.Interface, namespace string) JobClient {
 	return &k8sJobClient{client: client, namespace: namespace}
 }
@@ -86,8 +84,8 @@ func (c *k8sJobClient) CreateJob(ctx context.Context, job *batchv1.Job) (*batchv
 // DefaultGarbageCollectionPolicy, kept for compatibility), so a bare Delete
 // would keep the pods alive without a SIGTERM — the termination evidence
 // would stay false forever, every reclaim would fall to the drain upper
-// bound, and the pods would be left with no reclaim path (ADR-017,
-// contract §1.3). Background removes the Job object at once and lets the GC
+// bound, and the pods would be left with no reclaim path (ADR-017, §3).
+// Background removes the Job object at once and lets the GC
 // delete the pods asynchronously (SIGTERM → terminationGracePeriodSeconds),
 // which is why "Job object gone" is not "Job terminated".
 func jobDeleteOptions() metav1.DeleteOptions {
@@ -203,7 +201,7 @@ func (c *k8sJobClient) WatchJobs(ctx context.Context, handler JobEventHandler) e
 	return nil
 }
 
-// managedJobSelector selects exactly the Jobs Foreman owns (contract §3.2).
+// managedJobSelector selects exactly the Jobs Foreman owns (§4.3).
 func managedJobSelector() string {
 	return labels.Set{registry.LabelManagedBy: registry.ManagedByForeman}.String()
 }

@@ -117,7 +117,7 @@ var upstreamDaemonFace = []daemonFaceEntry{
 		name: "S-30 ws", upstream: "GET /api/daemon/ws",
 		caller: "internal/daemon/wakeup.go:521",
 		local:  "GET /api/daemon/ws", design: "S-30", handling: faceServed,
-		note: "registered only when the WS handler is wired; otherwise the dial gets the catch-all 404 (FOREMAN_WS_ENABLED=false, §5.1)",
+		note: "registered only when the WS handler is wired; otherwise the dial gets the catch-all 404 (FOREMAN_WS_ENABLED=false)",
 	},
 	{
 		name: "S-1 workspaces", upstream: "GET /api/daemon/workspaces",

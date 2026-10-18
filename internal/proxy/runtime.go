@@ -25,7 +25,7 @@ type RuntimeRef struct {
 
 // RuntimeChange reports a change of the declared runtime set. NewID empty means
 // the runtime disappeared; OldID empty means it appeared. The WS subscriber
-// reconnects only the connections whose id moved (§7 按 runtime 粒度).
+// reconnects only the connections whose id moved (§1.4 按 runtime 粒度).
 type RuntimeChange struct {
 	Provider string
 	OldID    string
@@ -33,11 +33,11 @@ type RuntimeChange struct {
 }
 
 // errAckUnparsable marks a C2 ack body Foreman could not read; the caller logs
-// an error and continues as if there were no pending work (§1.1 C21 第 8 条).
+// an error and continues as if there were no pending work (§1.3).
 var errAckUnparsable = errors.New("heartbeat ack unparsable")
 
 // HeartbeatAck is C2's ack body. pending_model_list is the only consumed field;
-// every other pending_* field is ignored on purpose (§1.1「C2 ack 消费」).
+// every other pending_* field is ignored on purpose (§1.3).
 type HeartbeatAck struct {
 	Status           string            `json:"status"`
 	RuntimeID        string            `json:"runtime_id"`
@@ -45,7 +45,7 @@ type HeartbeatAck struct {
 }
 
 // PendingModelList is the server-issued catalog request. The id is opaque: its
-// shape is never parsed (§1.1 C2 ack 消费 第 2 条).
+// shape is never parsed (§1.3).
 type PendingModelList struct {
 	ID string `json:"id"`
 }
@@ -64,7 +64,7 @@ func WithCatalogSlots(s *CatalogSlots) Option {
 
 // WithTaskRuntime wires the lookup translating a task's real runtime id: the S8
 // body names the job runtime the daemon was handed, the server knows only the
-// real runtime id its claim was dispatched under (§1.2 S8).
+// real runtime id its claim was dispatched under (S-8).
 func WithTaskRuntime(fn func(taskID string) string) Option {
 	return func(cl *Client) { cl.taskRuntime = fn }
 }
@@ -103,7 +103,7 @@ func (c *Client) Declaration() registry.Discovery {
 // cli_version once the probe has reported it (the template CLI's truth),
 // Foreman's own version before that — the discriminator is the request moment
 // against the probe's registration, so C1 itself already carries the template
-// version (§1.1 C1 的取值来源与声明域).
+// version (C-1 的取值来源与声明域).
 func (c *Client) CLIVersion() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
@@ -114,7 +114,7 @@ func (c *Client) CLIVersion() string {
 }
 
 // Declare caches the startup discovery as the C1 declaration without sending
-// it. The first Register (the claim loop's preflight, with the §4 backoff)
+// it. The first Register (the claim loop's preflight, with the §1.5 backoff)
 // carries it, so the startup path has exactly one C1 trigger.
 func (c *Client) Declare(d registry.Discovery) {
 	c.mu.Lock()
@@ -124,7 +124,7 @@ func (c *Client) Declare(d registry.Discovery) {
 }
 
 // RegisterWithDiscovery declares exactly the runtime set the startup probe
-// discovered and caches the ids the server answered with (§1.1 C1).
+// discovered and caches the ids the server answered with (C-1).
 func (c *Client) RegisterWithDiscovery(ctx context.Context, d registry.Discovery) error {
 	c.mu.Lock()
 	c.disc = d
@@ -134,11 +134,11 @@ func (c *Client) RegisterWithDiscovery(ctx context.Context, d registry.Discovery
 }
 
 // Register re-declares the cached startup discovery. It is the 404 rebuild path
-// and never starts a new probe (§1.1 failure table).
+// and never starts a new probe (§1.5).
 func (c *Client) Register(ctx context.Context) error { return c.register(ctx) }
 
 // declaredRefs turns a discovery into the declared runtime set, deduplicating
-// repeated provider types (a repeat merges into the first entry, §1.1 C1).
+// repeated provider types (a repeat merges into the first entry, C-1).
 func declaredRefs(d registry.Discovery) []RuntimeRef {
 	refs := make([]RuntimeRef, 0, len(d.Runtimes))
 	seen := make(map[string]bool, len(d.Runtimes))
@@ -153,7 +153,7 @@ func declaredRefs(d registry.Discovery) []RuntimeRef {
 }
 
 // runtimePayloads is the C1 `runtimes[]` array: the startup discovery handed
-// over entry by entry (status = online, profile_id always empty, §1.1 C1).
+// over entry by entry (status = online, profile_id always empty, C-1).
 func runtimePayloads(d registry.Discovery) []runtimePayload {
 	payloads := make([]runtimePayload, 0, len(d.Runtimes))
 	seen := make(map[string]bool, len(d.Runtimes))
@@ -215,7 +215,7 @@ func (c *Client) register(ctx context.Context) error {
 	c.refs = next
 	// Consume only the marks this attempt started with: a rebuild that failed
 	// while this C1 was in flight recorded its own provider, and that row still
-	// owes its C15 (§1.1 C15, §7 按 runtime 粒度).
+	// owes its C15 (C-15, §1.4 按 runtime 粒度).
 	for p := range lost {
 		delete(c.lost, p)
 	}
@@ -238,7 +238,7 @@ type runtimeAnswer struct {
 
 // selectRuntimes binds every declared runtime to exactly one answered runtime
 // row: provider ↔ type by value, name matching first, then the lexicographically
-// smallest id with a warn naming the candidates (§1.2 S4 tie-break).
+// smallest id with a warn naming the candidates (S-4 + §2.3 tie-break).
 func (c *Client) selectRuntimes(declared []runtimePayload, answers []runtimeAnswer) ([]RuntimeRef, error) {
 	byProvider := make(map[string][]runtimeAnswer, len(answers))
 	for _, a := range answers {
@@ -300,7 +300,7 @@ func (c *Client) applyRuntimeChanges(prev, next []RuntimeRef, lost map[string]bo
 		before, had := prevByProvider[ref.Provider]
 		// A rebuild is an id that moved, or any successful C1 that follows a
 		// 404 (the row came back, possibly under the same id). A first
-		// declaration is neither: C15 belongs to rebuilt rows only (§1.1 C15).
+		// declaration is neither: C15 belongs to rebuilt rows only (C-15).
 		rebuilt := had && before.ID != "" && (before.ID != ref.ID || lost[ref.Provider])
 		if had && before.ID != "" && !rebuilt {
 			continue
@@ -336,7 +336,7 @@ func (c *Client) notifyChange(change RuntimeChange) {
 }
 
 // bindStartupCatalog moves the startup discovery result staged by its provider
-// into the real runtime's catalog slot (§1.1 C21 第 13 条).
+// into the real runtime's catalog slot (§1.3).
 func (c *Client) bindStartupCatalog(refs []RuntimeRef, at time.Time) {
 	if c.startup == nil || c.slots == nil {
 		return
@@ -376,7 +376,7 @@ func (c *Client) stageStartupCatalog(provider string, body []byte) {
 
 // rebuildRuntime re-registers (C1) after a 404 "runtime not found" and returns
 // the fresh id of the runtime that was lost. Only that runtime's id moves: the
-// other rows answer with the ids they already had (§1.1 failure table).
+// other rows answer with the ids they already had (§1.5).
 func (c *Client) rebuildRuntime(ctx context.Context, runtimeID string) (string, error) {
 	c.mu.RLock()
 	provider := ""
@@ -399,7 +399,7 @@ func (c *Client) rebuildRuntime(ctx context.Context, runtimeID string) (string, 
 			c.lost = map[string]bool{}
 		}
 		// Only this runtime's row is known lost; the other rows of the
-		// declaration did not fail (C15 is per runtime, §1.1).
+		// declaration did not fail (C15 is per runtime, §1.2).
 		c.lost[provider] = true
 		c.mu.Unlock()
 		return "", err
@@ -415,7 +415,7 @@ func (c *Client) rebuildRuntime(ctx context.Context, runtimeID string) (string, 
 }
 
 // Heartbeat is C2 for one real runtime. A 404 "runtime not found" rebuilds that
-// runtime's row only and retries once (§7 多 runtime 的失败面按 runtime 粒度).
+// runtime's row only and retries once (§1.4 多 runtime 的失败面按 runtime 粒度).
 func (c *Client) Heartbeat(ctx context.Context, runtimeID string) (HeartbeatAck, error) {
 	code, raw, err := c.heartbeatOnce(ctx, runtimeID)
 	if err != nil {
@@ -518,7 +518,7 @@ func (c *Client) claimOnce(ctx context.Context, runtimeIDs []string, maxTasks in
 	return c.doOnce(ctx, c.ctrl, http.MethodPost, "/api/daemon/tasks/claim", body)
 }
 
-// PrepareLease is C4 on the runtime that claimed the task. The §1.1 C4
+// PrepareLease is C4 on the runtime that claimed the task. The C-4
 // semantics are normalized to ready: 200 → true; 400 → false (the task left the
 // renewable pre-start state); 404 → scheduler.ErrTaskNotFound.
 func (c *Client) PrepareLease(ctx context.Context, runtimeID, taskID string) (ready bool, err error) {
@@ -559,7 +559,7 @@ func (c *Client) prepareLeaseOnce(ctx context.Context, runtimeID, taskID string)
 
 // RelayModelCatalog is C21: it forwards, byte for byte, the body a probe daemon
 // reported (or the body cached from an earlier discovery). No field is parsed,
-// assembled or validated — the path is the only thing rewritten (§1.1 C21).
+// assembled or validated — the path is the only thing rewritten (C-21).
 func (c *Client) RelayModelCatalog(ctx context.Context, runtimeID, requestID string, body []byte) (int, []byte, error) {
 	path := fmt.Sprintf("/api/daemon/runtimes/%s/models/%s/result",
 		url.PathEscape(runtimeID), url.PathEscape(requestID))

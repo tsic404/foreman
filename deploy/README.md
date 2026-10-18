@@ -1,6 +1,6 @@
 # Deploying Foreman
 
-`deploy/` is the whole deployment surface from `docs/03-contracts.md` §5.3.
+`deploy/` is the whole deployment surface from `02-contracts.md` §3 and §8.
 Everything is plain YAML — `kubectl apply -f deploy/` installs it in one pass.
 
 | File | Objects |
@@ -59,15 +59,15 @@ characters); `MULTICA_TOKEN` must start with `mdt_` or `mul_`.
 
 ## Images
 
-Two images come from this repo (`docs/04-architecture.md` §部署/运行方式): the
-scheduler image for the Deployment, and the Job image (upstream multica CLI +
-`foreman-gc` + `dumb-init`) that both the Job pods and the `foreman-gc`
-DaemonSet run. Neither image carries an agent backend: the Job template's init
-step installs `omp` into every Job at start-up (ADR-033), which is why the
-shipped template mounts it at the `MULTICA_OMP_PATH` the daemon reads. Both are
-published as **multi-platform manifest lists** (`linux/amd64` + `linux/arm64`),
-so a cluster with nodes of both architectures pulls the platform each node runs;
-nothing in `deploy/` names an architecture.
+Two images come from this repo: the scheduler image for the Deployment, and the
+Job image (upstream multica CLI + `foreman-gc` + `dumb-init`) that both the Job
+pods and the `foreman-gc` DaemonSet run. Neither image carries an agent
+backend: the Job template's init step installs `omp` into every Job at start-up
+(ADR-033), which is why the shipped template mounts it at the
+`MULTICA_OMP_PATH` the daemon reads. Both are published as **multi-platform
+manifest lists** (`linux/amd64` + `linux/arm64`), so a cluster with nodes of
+both architectures pulls the platform each node runs; nothing in `deploy/`
+names an architecture.
 
 Each image has its own release line and its own version semantics:
 
@@ -118,9 +118,9 @@ platform. Whichever image ends up as `FOREMAN_JOB_IMAGE` must carry:
   `sha256sum`) plus `sh`/`cp`/`chmod`/`chown` for `prepare` — the stock Alpine
   base has all of them.
 
-`docs/03-contracts.md` §5.3 requires those contents, and §5.4 carries them as
-deployer constraints. The release workflows only build and push: checking what a
-published image contains is the design's acceptance face (`test-cases/job-template.md`
+`ADR-033` requires those contents, and §8.7 carries them as deployer
+constraints. The release workflows only build and push: checking what a
+published image contains is the design's acceptance face (`03-acceptance.md`
 TC-tech-job-08 for the contents, TC-tech-provenance-01 for the CLI provenance),
 run by QA against the image — not a post-push step in CI.
 
@@ -198,9 +198,9 @@ The Job's shape comes from one place: the ConfigMap `foreman-job-template`,
 which `25-job-template.yaml` ships and the Deployment mounts at
 `/etc/foreman/job-template/` as a **non-optional** read-only volume (key
 `job-overlay.yaml`). The shipped content is the **reference template** — a byte
-copy of the design repo's `test-cases/_infra/job-baseline.yaml` Job document,
-the AC-20 authority — and a deployer replaces it with their own complete
-`batch/v1 Job` (contract §5.4):
+copy of the in-repo baseline `internal/jobbuilder/testdata/job-baseline.yaml`
+Job document, the AC-20 authority — and a deployer replaces it with their own
+complete `batch/v1 Job` (contract §8.1):
 
 ```bash
 # The shipped reference template (this repo's deploy/25-job-template.yaml) is
@@ -224,7 +224,7 @@ Foreman writes exactly four things into that template:
    `foreman.tsic.top/daemon-id`;
 2. the name and the per-task metadata: `metadata.name` is the template's name
    **format** rendered per task (empty ⇒ `fm-<task_id>`), `metadata.namespace`
-   is `FOREMAN_JOB_NAMESPACE`, and the §3.2 label/annotation set is written
+   is `FOREMAN_JOB_NAMESPACE`, and the A1.2 label/annotation set is written
    after clearing the `foreman.tsic.top/` domain (the four trigger-context keys
    are added or deleted to match the task). The **identity** name
    `fm-<task_id>` — the `daemon-id` label and annotation, the credential Secret
@@ -266,10 +266,10 @@ does the same job its own way — that is the template's choice, and nothing
 checks it. Consequences to size for:
 
 - every Job boot pays the download (the reference template takes the newest
-  release each time), so `FOREMAN_JOB_BOOT_TIMEOUT` (default `300s`, §5.4) must
+  release each time), so `FOREMAN_JOB_BOOT_TIMEOUT` (default `300s`, §4.2) must
   cover a multi-minute fetch on a cold or slow link;
 - the Job image must keep the runtime that binary links (`libstdc++` /
-  `libgcc_s`); `docs/03-contracts.md` §5.3 lists it as an image content;
+  `libgcc_s`); `ADR-033` lists it as an image content;
 - a `MULTICA_OMP_PATH` that exists in neither the image nor a mounted volume
   leaves the daemon with no runtime to discover, which the startup probe reports
   as a failed profile.

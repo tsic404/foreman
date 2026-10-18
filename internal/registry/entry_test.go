@@ -11,8 +11,8 @@ import (
 )
 
 // TestProjectedTimeMatchesTaskEntryProjection pins the log-side renderer to
-// the projection encoding: observability.md §结构化日志 registers the
-// lease.renewed field as carrying the same value /foreman/tasks projects, so
+// the projection encoding: §9.1 / ADR-041 registers the lease.renewed field
+// as carrying the same value /foreman/tasks projects, so
 // ProjectedTime must go through the encoder the projection uses (not a copy
 // of its layout: RFC3339 truncates the nanoseconds, .UTC() would drop the
 // value's own zone).
@@ -39,7 +39,7 @@ func TestProjectedTimeMatchesTaskEntryProjection(t *testing.T) {
 }
 
 // TestTaskEntryProjectionRendersAbsentTimesAsEmpty pins the two fields whose
-// fact may not exist yet (contract §3.1, ADR-026): started_at and boot_deadline
+// fact may not exist yet (§4.1, ADR-026): started_at and boot_deadline
 // keep their key and carry an empty string while absent — an RFC3339 zero would
 // satisfy AC-09's `!= ""` adoption poll before the fact exists — and render
 // RFC3339 once set. The remaining time fields keep the encoder's form, which

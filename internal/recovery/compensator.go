@@ -8,17 +8,17 @@ import (
 	"github.com/tsic404/foreman/internal/registry"
 )
 
-// Settler is the scheduler's settlement surface (task-mapping 内部结构).
+// Settler is the scheduler's settlement surface.
 // Every method owns the invariants the recovery loop must not re-implement:
-// the state is written before the K8s objects go (顺序规则 1), a terminal
-// callback is never dropped (contract §4), and C13 is consulted before any
-// compensation (顺序规则 3).
+// the state is written before the K8s objects go (§4.2), a terminal
+// callback is never dropped (contract §10), and C13 is consulted before any
+// compensation (§4.6).
 type Settler interface {
-	// OnJobGone compensates a Job object that disappeared (#1/#9/#11); the
+	// OnJobGone compensates a Job object that disappeared (§4.6); the
 	// freshly-created grace period is included.
 	OnJobGone(ctx context.Context, jobName string) error
 	// FailJob reports a synthesized failure for a Job whose container ended
-	// without a daemon terminal report (#3/#5/#11). reason is the reported
+	// without a daemon terminal report (§4.6). reason is the reported
 	// failure_reason.
 	FailJob(ctx context.Context, jobName, reason string) error
 	// SettleTerminal converges an entry the server holds as terminal: any
@@ -26,13 +26,13 @@ type Settler interface {
 	// the entry stay for the drain (ADR-017).
 	SettleTerminal(ctx context.Context, taskID, result string) error
 	// AdoptRunning keeps the Job of a task the server reports as running
-	// and stops lease renewals (#1).
+	// and stops lease renewals (§4.3).
 	AdoptRunning(ctx context.Context, taskID string) error
 	// DiscardTask removes the objects and the mapping of a task that will be
-	// re-run (#2 redispatch), without a terminal report and without entering
+	// re-run (§4.3 redispatch), without a terminal report and without entering
 	// drain; the credential is revoked when its digest is known.
 	DiscardTask(ctx context.Context, taskID string) error
-	// OnTaskVanished settles a task the server deleted (#9): terminal with an
+	// OnTaskVanished settles a task the server deleted (§4.6): terminal with an
 	// empty result, Job deleted, entry into drain.
 	OnTaskVanished(ctx context.Context, taskID string) error
 	// JobTerminated reports whether every pod of the Job instance has
@@ -49,7 +49,7 @@ type Settler interface {
 	// revoke → delete Secret → drop the entry.
 	OnJobTerminated(ctx context.Context, jobName, reason string, podTerminatedAt time.Time, orphanPods int) error
 	// SweepOrphanSecrets deletes credential Secrets whose task has no
-	// registry entry (any state) and no Job object (#16).
+	// registry entry (any state) and no Job object (§6.5).
 	SweepOrphanSecrets(ctx context.Context) error
 	// SyncInflight re-derives the inflight gauge from the live index. The
 	// round calls it on entry and a ticker repeats it every interval, so a
@@ -58,7 +58,7 @@ type Settler interface {
 }
 
 // Compensator reports a terminal state on the daemon's behalf
-// (failure-handling 内部结构: Fail(e, reason)).
+// (Fail(e, reason)).
 type Compensator struct {
 	settler Settler
 	log     *slog.Logger

@@ -2,7 +2,7 @@
 // JSON), the Prometheus metric set and its /metrics handler, and the
 // cluster-internal ops endpoints (/foreman/*). Every other module depends
 // on this one for instrumentation; it depends only on registry's read view.
-// Design: docs/05-modules/observability.md, contracts §1.2 S25/§2/§5.1.
+// Design: 02-contracts.md §9, S-25 (观测面与运维端点).
 package observability
 
 import (
@@ -13,7 +13,7 @@ import (
 	"strings"
 )
 
-// Environment variable names from the contract config table (§5.1).
+// Environment variable names of the observability module.
 const (
 	EnvLogLevel       = "FOREMAN_LOG_LEVEL"
 	EnvMetricsEnabled = "FOREMAN_METRICS_ENABLED"

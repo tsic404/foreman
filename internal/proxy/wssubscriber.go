@@ -16,7 +16,7 @@ import (
 
 // WSSubscriber is the C20 subscription to the server's daemon WS (ADR-010): N
 // declared real runtimes take N connections, one per runtime id, each with its
-// own dial loop and backoff (§1.1 C20). It turns daemon:task_available pushes
+// own dial loop and backoff (C-20). It turns daemon:task_available pushes
 // into immediate claim iterations. It is an accelerator only — the polling
 // claim loop keeps running while a connection is down.
 type WSSubscriber struct {
@@ -25,25 +25,25 @@ type WSSubscriber struct {
 	metrics Metrics
 	log     *slog.Logger
 
-	// dialTimeout bounds the WS handshake (§4 control-plane 30s); without it
+	// dialTimeout bounds the WS handshake (§1.5 control-plane 30s); without it
 	// a peer that accepts TCP but stalls the upgrade would wedge the
 	// subscriber forever.
 	dialTimeout time.Duration
 	// waitSteps overrides the reconnect progression (tests use near-zero
-	// waits); production leaves it nil and takes the §4 1s→30s backoff.
+	// waits); production leaves it nil and takes the §1.5 1s→30s backoff.
 	waitSteps []time.Duration
 	// parkRetry bounds how long one parked runtime waits before the supervisor
-	// arms its retry again — §4 is "back off and reconnect", not "stop" — so a
+	// arms its retry again — §1.5 is "back off and reconnect", not "stop" — so a
 	// row that becomes dialable again under the same id returns on its own.
 	parkRetry time.Duration
 	// now is the clock (overridable in tests).
 	now func() time.Time
 }
 
-// parkRetryInterval is the production park window (one §4 backoff ceiling).
+// parkRetryInterval is the production park window (one §1.5 backoff ceiling).
 const parkRetryInterval = 30 * time.Second
 
-// reconnectBackoff is one stream's progression: the §4 exponential backoff, or
+// reconnectBackoff is one stream's progression: the §1.5 exponential backoff, or
 // a scripted list in tests.
 type reconnectBackoff struct {
 	next  func() time.Duration
@@ -96,7 +96,7 @@ const (
 	// streamParked means dialing this id cannot succeed any more (the row is
 	// gone and re-registering did not move it). The stream stops instead of
 	// hammering the handshake; the supervisor un-parks on the next runtime-set
-	// change, which is exactly when dialing can work again (§4 退避面).
+	// change, which is exactly when dialing can work again (§1.5 退避面).
 	streamParked
 	// streamDone means the context ended.
 	streamDone
@@ -127,7 +127,7 @@ type providerStreamState struct {
 	staleRebuilds int
 }
 
-// nextBackoff advances this runtime's §4 progression and returns the wait.
+// nextBackoff advances this runtime's §1.5 progression and returns the wait.
 func (st *providerStreamState) nextBackoff() time.Duration {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -142,10 +142,10 @@ func (st *providerStreamState) noteStaleRebuild() int {
 	return st.staleRebuilds
 }
 
-// rearm clears the failure streak: the §4 progression and the stale-rebuild
+// rearm clears the failure streak: the §1.5 progression and the stale-rebuild
 // budget both start over. It runs whenever the streak ends — a dial succeeded,
 // or a parked runtime's retry window expired — so staleRebuildLimit bounds
-// *consecutive* failures, never a runtime's lifetime (§1.1 C20, §4).
+// *consecutive* failures, never a runtime's lifetime (C-20, §1.5).
 func (st *providerStreamState) rearm() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
@@ -165,14 +165,14 @@ type streamResult struct {
 
 // Run keeps one connection per declared real runtime until ctx ends. A runtime
 // whose id moved is reconnected on its own; the other connections stay up
-// (§7 多 runtime 的失败面按 runtime 粒度). It is never started when
+// (§1.4 多 runtime 的失败面按 runtime 粒度). It is never started when
 // FORMANET_WS_ENABLED=false (ADR-010 degradation switch).
 func (s *WSSubscriber) Run(ctx context.Context) error {
 	changes := s.client.Changes()
 	connections := map[string]wsSubscription{}
 	// parked holds the moment each provider's dialing is armed again. It is
 	// keyed by provider, not by id: an id that moves on every register is the
-	// same pathology as one that never moves, and only a bounded window (§4's
+	// same pathology as one that never moves, and only a bounded window (§1.5's
 	// 30s ceiling) keeps either from dialing at RTT speed. The retry comes back
 	// on its own when the window expires.
 	parked := map[string]time.Time{}
@@ -265,7 +265,7 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 			// Unregister by identity: the outcome names the stream instance,
 			// not (provider, id). An id that moved away and back names a
 			// different stream, and matching it here would delete that live
-			// connection and orphan its cancel (§1.1 C20).
+			// connection and orphan its cancel (C-20).
 			sub, ok := connections[result.provider]
 			if !ok || sub.epoch != result.epoch {
 				continue
@@ -280,7 +280,7 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 }
 
 // listen drives one runtime's connection: dial → read → reconnect, with its own
-// backoff (1s→30s, §4). The progression and the stale-rebuild budget live in
+// backoff (1s→30s, §1.5). The progression and the stale-rebuild budget live in
 // state, which outlives a stream replacement — an id that keeps moving must not
 // reset the rate limit by starting a fresh stream. epoch is this instance's own
 // identity and travels back with the outcome.
@@ -317,7 +317,7 @@ func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *provi
 		}
 		switch {
 		case code == http.StatusBadRequest:
-			// §1.1 failure table: a handshake 400 means this implementation
+			// §1.5: a handshake 400 means this implementation
 			// sent a bad URL — log and stop dialing this id; polling carries
 			// on, and the next runtime-set change gives it another chance.
 			s.log.Error("ws handshake rejected (bad request); staying on polling", "status", code, "runtime_id", runtimeID)
@@ -339,7 +339,7 @@ func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *provi
 				return streamParked
 			}
 			// Retire and stale take the same rate limit: the id moved, so the
-			// next dial targets the fresh one — after the §4 wait, so a server
+			// next dial targets the fresh one — after the §1.5 wait, so a server
 			// that hands out a new id on every register cannot be dialed at RTT
 			// speed (and cannot be re-registered at that speed either).
 			s.waitReconnect(ctx, err, state)
@@ -352,7 +352,7 @@ func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *provi
 		return streamRetry
 	}
 	// A connection is the streak's end: both the stale-rebuild budget and the
-	// §4 progression start over (the limit bounds consecutive failures only).
+	// §1.5 progression start over (the limit bounds consecutive failures only).
 	state.rearm()
 	s.metrics.WSConnect(WSSideServer)
 	s.log.Info("ws.connected", "side", WSSideServer, "runtime_id", runtimeID)
@@ -363,7 +363,7 @@ func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *provi
 	s.log.Info("ws.reconnect", "side", WSSideServer, "runtime_id", runtimeID)
 	// A replaced stream must not spend the runtime's progression: the select
 	// below evaluates its operands even once the cancel arrived, and that step
-	// belongs to the replacement's first dial (§4).
+	// belongs to the replacement's first dial (§1.5).
 	if ctx.Err() != nil {
 		return streamDone
 	}
@@ -377,7 +377,7 @@ func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *provi
 }
 
 // readLoop consumes frames until the connection drops; task_available
-// coalesces into a single claim wakeup (proxy.md §claim 循环).
+// coalesces into a single claim wakeup (S-6 + §10).
 func (s *WSSubscriber) readLoop(ctx context.Context, conn *websocket.Conn) {
 	for {
 		_, data, err := conn.Read(ctx)
@@ -396,7 +396,7 @@ func (s *WSSubscriber) readLoop(ctx context.Context, conn *websocket.Conn) {
 }
 
 // handshakeSaysRuntimeGone checks the failed handshake body for the
-// server's "runtime not found" marker (§1.1 failure table).
+// server's "runtime not found" marker (§1.5).
 func handshakeSaysRuntimeGone(resp *http.Response) bool {
 	if resp == nil || resp.Body == nil {
 		return false
@@ -408,7 +408,7 @@ func handshakeSaysRuntimeGone(resp *http.Response) bool {
 
 func (s *WSSubscriber) waitReconnect(ctx context.Context, err error, state *providerStreamState) {
 	// A stream that is already gone waits for nobody: both the sleep and the
-	// §4 step it would spend belong to the replacement.
+	// §1.5 step it would spend belong to the replacement.
 	if errors.Is(err, context.Canceled) || ctx.Err() != nil {
 		return
 	}

@@ -3,7 +3,7 @@
 // ConfigMap is missing must never start. That refusal is the volume's
 // `optional: false`, so this case reads deploy/30-foreman.yaml and holds the
 // manifest to it: `optional: true`, or a dropped key, turns the pod gate off
-// with no other symptom (03-contracts §5.4「启动期判定」/ ADR-030 决策 1；the
+// with no other symptom (02-contracts.md §8.1 / ADR-030 决策 1；the
 // design's cluster check compares the same field's value).
 package acceptance
 
@@ -22,12 +22,11 @@ import (
 )
 
 // templateVolume is the volume name deploy/30-foreman.yaml gives the template
-// carrier; the name itself is the deployment's, the ConfigMap's is the
-// contract's.
+// carrier; the ConfigMap's name is the deployment's as well.
 const templateVolume = "job-template"
 
-// templateMountPath is §5.4's fixed mount point, minus the trailing slash the
-// design writes for prose.
+// templateMountPath is the mount point deploy/30-foreman.yaml gives the
+// template carrier, minus the trailing slash the manifest omits.
 const templateMountPath = "/etc/foreman/job-template"
 
 func TestJob06DeployTemplateVolumeIsRequired(t *testing.T) {
@@ -52,7 +51,7 @@ func TestJob06DeployTemplateVolumeIsRequired(t *testing.T) {
 	// dropped key says nothing about the deployment's intent — the next edit
 	// could as well write true.
 	if volume.ConfigMap.Optional == nil {
-		t.Fatal("the template volume must state optional: false explicitly: a dropped key no longer expresses the required mount (03-contracts §5.4 / ADR-030 决策 1)")
+		t.Fatal("the template volume must state optional: false explicitly: a dropped key no longer expresses the required mount (02-contracts §8.1 / ADR-030 决策 1)")
 	}
 	if *volume.ConfigMap.Optional {
 		t.Fatal("the template volume is optional: a missing ConfigMap would let the pod start with no template at all — the container-layer half of the fail-fast pair is gone (ADR-030 决策 1)")

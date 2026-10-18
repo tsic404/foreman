@@ -148,7 +148,7 @@ type modelCommand struct {
 	body       []byte
 	bodyWrites int
 	// dropNextResponse makes the next C21 answer vanish on the wire — the
-	// result landed but its response never reached Foreman (§1.1 C21 重试规则).
+	// result landed but its response never reached Foreman (C-21 / §1.3).
 	dropNextResponse bool
 }
 
@@ -348,7 +348,7 @@ func (s *upstreamStub) statusFor(runtimeID string) int {
 }
 
 // enqueueTask puts one task on the stub server's queue in the queued state.
-// The payload carries the fields the scheduler indexes (proxy.md 数据结构).
+// The payload carries the fields the scheduler indexes.
 func (s *upstreamStub) enqueueTask(taskID string) {
 	payload, _ := json.Marshal(map[string]any{
 		"id": taskID, "agent_id": "agent-1", "workspace_id": "ws-1",
@@ -362,7 +362,7 @@ func (s *upstreamStub) enqueueTask(taskID string) {
 }
 
 // claim serves up to maxTasks queued tasks and flips each to dispatched: the
-// server's own queued → dispatched transition on C3 (§1.1). Tasks beyond the
+// server's own queued → dispatched transition on C-3 (§1.2). Tasks beyond the
 // batch stay queued — they are the server's queue, not Foreman's.
 func (s *upstreamStub) claim(maxTasks int) []json.RawMessage {
 	s.mu.Lock()
@@ -999,7 +999,7 @@ func (h *harness) useRealBuilderWithTemplate(t *testing.T, templatePath string) 
 }
 
 // useRealBuilderWithPolicy is useRealBuilderWithTemplate plus the policy file
-// (03-contracts.md §5.4「策略文件」): an empty policyPath leaves the field at
+// (02-contracts.md §8.5): an empty policyPath leaves the field at
 // the mounted path, which does not exist under test — the legal default of an
 // absent file (three axes None, warn). mutate receives the loaded config, so a
 // scenario can inject the platform name-resolution seam or any other knob.

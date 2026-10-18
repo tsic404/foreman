@@ -1,5 +1,5 @@
-# foreman-gc: node-local cache collector, one pod per node (contracts §5.3,
-# 05-modules/job-template.md §节点清理, ADR-005).
+# foreman-gc: node-local cache collector, one pod per node (02-contracts.md
+# §8.8, §10, ADR-005).
 #
 # Cleanup runs in the node's state root mounted at /state — never inside a Job
 # pod, because concurrent pods cannot safely judge each other's directories.
@@ -48,7 +48,7 @@ spec:
           command: ["/usr/local/bin/foreman-gc"]
           env:
             # The hostPath below is mounted here; on the node the same tree is
-            # ${FOREMAN_STATE_ROOT} (contract §5.1).
+            # ${FOREMAN_STATE_ROOT}.
             - name: FOREMAN_STATE_ROOT
               value: "/state"
             - name: NODE_NAME
@@ -62,7 +62,7 @@ spec:
             # Node-local agent state under ${FOREMAN_STATE_ROOT}/home: the
             # session/transcript stores, pi-sessions and codex stores follow
             # the state TTL, hermes memory the (deliberately long) memory TTL.
-            # "0" turns the corresponding rule off (contract §5.1).
+            # "0" turns the corresponding rule off (contract §8.8).
             - name: FOREMAN_AGENT_STATE_TTL
               value: "336h"
             - name: FOREMAN_AGENT_MEMORY_TTL

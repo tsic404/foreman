@@ -45,7 +45,7 @@ type DiscoveredRuntime struct {
 }
 
 // Discovery is the S4 registration body of the startup probe = the truth
-// source of C1 (03-contracts §1.1「C1 的取值来源与声明域」).
+// source of C-1 (§1.2「注册体的取值来源与声明域」).
 type Discovery struct {
 	CLIVersion     string
 	Runtimes       []DiscoveredRuntime
@@ -211,7 +211,7 @@ func (r *ProbeRegistry) dropRuntimeIndexLocked(jobRuntimeID, jobName string) {
 }
 
 // StartupCatalog stages the startup discovery result by provider until the C1
-// response binds providers to real runtime ids (03-contracts §1.1 C21 第 13 条).
+// response binds providers to real runtime ids (§1.2 C-21).
 // The startup probe registers before its runtime exists — C1 creates it — so
 // the body is parked under the provider type and taken once the real runtime id
 // is known; taking removes the entry, which is where 「已落槽」 is recorded.

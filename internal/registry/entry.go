@@ -2,7 +2,7 @@
 // (taskID ↔ jobName ↔ nodeName ↔ daemonID ↔ jobRuntimeID) and its state
 // machine. The K8s Job object is the only durable truth (ADR-002); this
 // package rebuilds the index from Job labels/annotations after a restart.
-// Design: docs/05-modules/task-mapping.md, contracts §3.1/§3.3/§3.4.
+// Design: 02-contracts.md §4.1/§4.2, §2.3 (mapping index and state machine).
 package registry
 
 import (
@@ -14,11 +14,11 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 )
 
-// State is the task lifecycle stage (contract §3.4). It has exactly six
+// State is the task lifecycle stage (§4.2). It has exactly six
 // values; "failed" is not a state but a Result of StateTerminal.
 type State string
 
-// Lifecycle states (contract §3.4, exhaustive).
+// Lifecycle states (§4.2, exhaustive).
 const (
 	StatePending          State = "pending"
 	StateJobCreated       State = "job_created"
@@ -31,7 +31,7 @@ const (
 // Result classifies a terminal entry; set only when State == StateTerminal.
 type Result string
 
-// Terminal results (contract §3.1).
+// Terminal results (§4.1).
 const (
 	ResultCompleted Result = "completed"
 	ResultFailed    Result = "failed"
@@ -44,22 +44,22 @@ func IsTerminalResult(s string) bool {
 }
 
 // JobPhase is the Job lifecycle phase, orthogonal to the task state
-// (contract §3.4). "gone" is expressed by the entry's absence, so only the
+// (§4.2). "gone" is expressed by the entry's absence, so only the
 // two live phases are named; the zero value means alive, which is what a
 // rebuilt entry starts from.
 type JobPhase string
 
-// Job lifecycle phases (contract §3.4, exhaustive).
+// Job lifecycle phases (§4.2, exhaustive).
 const (
 	JobPhaseAlive    JobPhase = "alive"
 	JobPhaseDraining JobPhase = "draining"
 )
 
-// TaskEntry is the mapping table row (contract §3.1). The four trigger-context
+// TaskEntry is the mapping table row (§4.1). The four trigger-context
 // fields (issue/autopilot/chat) are optional: an empty value means that context
 // does not exist and is never an error (ADR-014). The JSON projection keeps all
 // four keys with an empty string instead of omitting them, so consumers can
-// test `== ""` (§3.1). Payload is the task body kept in process memory only —
+// test `== ""` (§4.1). Payload is the task body kept in process memory only —
 // the raw claim payload until delivery, the S6 delivery body (runtime_id
 // rewritten to job_runtime_id) afterwards: it carries auth_token and must never
 // be serialized into annotations, Secrets, or logs (F3).
@@ -79,7 +79,7 @@ type TaskEntry struct {
 	State           State  `json:"state"`
 	Result          Result `json:"result"`
 	// FailureReason is the externally observable attribution of a terminal
-	// failure Foreman judged itself (contract §3.1): empty for a verdict the
+	// failure Foreman judged itself (§4.1): empty for a verdict the
 	// server made (S13/S14/S15 or C13) and for non-failed results.
 	FailureReason      string    `json:"failure_reason"`
 	Attempt            int       `json:"attempt"`
@@ -90,31 +90,31 @@ type TaskEntry struct {
 	// entry: the first one, or the latest re-delivery once an expired
 	// confirmation window released the payload again. Once non-zero it never
 	// goes back to zero, so it also answers "was this entry ever delivered"
-	// (contract §3.1).
+	// (§4.1).
 	DeliveredAt time.Time `json:"delivered_at"`
 	// Deliveries counts the delivery commits this entry accepted: 1 for the
 	// single-delivery form, more when expired confirmation windows released
-	// the payload for another attempt (contract §3.1, ADR-032).
+	// the payload for another attempt (§4.1, ADR-032).
 	Deliveries int `json:"deliveries"`
 	// ClaimsAfterDelivery counts the S6 claim calls answered with an empty
-	// batch after this entry's delivery was committed (contract §3.1): > 0
+	// batch after this entry's delivery was committed (§4.1): > 0
 	// means the daemon kept asking inside the confirmation window, i.e. the
 	// request arrived and the response was lost, rather than the request
 	// never arriving.
 	ClaimsAfterDelivery int `json:"claims_after_delivery"`
-	// StartedAt and BootDeadline may have no fact yet (contract §3.1,
+	// StartedAt and BootDeadline may have no fact yet (§4.1,
 	// ADR-026): the projection then carries an empty string, never the
 	// RFC3339 zero — see MarshalJSON.
 	StartedAt    time.Time `json:"started_at"`
 	BootDeadline time.Time `json:"boot_deadline"`
 	// LeaseKeepUntil is the local upper bound of the server's prepare lease
-	// (contract §3.1): the last successful renewal plus PrepareLeaseTTL,
+	// (§10): the last successful renewal plus PrepareLeaseTTL,
 	// stamped after the response returned (Registry.SetLeaseKeepUntil).
 	LeaseKeepUntil time.Time `json:"lease_keep_until"`
 	LastStatusSeen string    `json:"last_status_seen"`
 	PayloadVersion int       `json:"payload_version"`
 
-	// Job lifecycle fields (contract §3.1): memory-only — never projected
+	// Job lifecycle fields (§4.3): memory-only — never projected
 	// into /foreman/tasks, never written to annotations, never persisted.
 	// The credential stays valid while the entry exists, so an entry in
 	// draining is still the authorization row for its Job (ADR-017).
@@ -123,7 +123,7 @@ type TaskEntry struct {
 	TokenHash     string    `json:"-"`
 
 	// DeliveryDeadline is the S6 delivery confirmation window's expiry
-	// (contract §1.2, ADR-032): stamped at each accepted delivery commit from
+	// (§5, ADR-032): stamped at each accepted delivery commit from
 	// FOREMAN_DELIVERY_CONFIRM_TIMEOUT. Passing it with no start fact
 	// releases the delivery for another attempt (the re-arm), so the window
 	// bounds the re-delivery rather than the entry. Zero means no window is
@@ -149,7 +149,7 @@ type TaskEntry struct {
 	// unavailable, which degrades the axes rather than failing the task.
 	AgentName string `json:"-"`
 
-	// ProjectName is the task's project identity (contract §3.1 项目身份):
+	// ProjectName is the task's project identity (§4.1 项目身份):
 	// read at claim time from the payload's structured project key, or from
 	// the read-only reverse lookup by issue id. Memory-only: never annotated,
 	// never projected, never rebuilt.
@@ -170,8 +170,8 @@ type TaskEntry struct {
 	Payload json.RawMessage `json:"-"`
 }
 
-// MarshalJSON renders the entry as /foreman/tasks projects it (contract §3.1,
-// observability.md §端点): the projection is TaskEntry's own JSON — no second
+// MarshalJSON renders the entry as /foreman/tasks projects it (§4.1,
+// §9.3): the projection is TaskEntry's own JSON — no second
 // view type to keep in step — with started_at and boot_deadline rendered as an
 // empty string while their fact does not exist yet. Both keys stay present, and
 // the RFC3339 zero is banned: it would satisfy a consumer's `!= ""` test (the
@@ -199,8 +199,8 @@ func projectedOptionalTime(t time.Time) string {
 // TaskEntry's time fields: through the time.Time JSON encoder that
 // encoding/json uses for them (RFC3339Nano, the value's own location), not
 // through a copy of its layout string. A log field that mirrors a projected
-// field must go through here — observability.md §结构化日志 requires the
-// lease.renewed lease_keep_until to carry the same value the projection does,
+// field must go through here — §9.1 / ADR-041 requires the lease.renewed
+// lease_keep_until to carry the same value the projection does,
 // and a duplicated layout would drift from it silently. An unencodable value
 // (year outside [0,9999]) yields "" — the projection itself cannot encode it
 // either.
@@ -237,13 +237,13 @@ func (e TaskEntry) DeliveryRearmable(at time.Time) bool {
 // that this claim may not re-deliver: the window is open (the response may be
 // in flight and the daemon may still be preparing the payload it received) or
 // no window is configured at all. An empty batch answering it is the
-// lost-response signature (observability.md §指标 result=empty_unconfirmed).
+// lost-response signature (§9.2 result=empty_unconfirmed).
 func (e TaskEntry) DeliveryUnconfirmed(at time.Time) bool {
 	return e.State == StateDelivering && e.StartedAt.IsZero() &&
 		!e.DeliveredAt.IsZero() && !e.DeliveryRearmable(at)
 }
 
-// JobRuntime is the fake runtime registered to a Job's daemon (contract §3.3).
+// JobRuntime is the fake runtime registered to a Job's daemon (§2.3).
 type JobRuntime struct {
 	JobRuntimeID    string    `json:"job_runtime_id"`
 	DaemonID        string    `json:"daemon_id"`
@@ -255,7 +255,7 @@ type JobRuntime struct {
 	DeliveredTaskID string    `json:"delivered_task_id"`
 }
 
-// Label and annotation keys carried by every foreman Job (contract §3.2).
+// Label and annotation keys carried by every foreman Job.
 // jobbuilder owns the write side; these copies are the read side for rebuild.
 const (
 	LabelManagedBy   = "app.kubernetes.io/managed-by"
@@ -263,7 +263,7 @@ const (
 
 	// LabelRole and RoleCatalogProbe mark a catalog-probe Job/Secret; they are
 	// the probe domain's discriminator, mutually exclusive with LabelTaskID
-	// (contract §3.2).
+	// (§6.5).
 	LabelRole        = "foreman.tsic.top/role"
 	RoleCatalogProbe = "catalog-probe"
 	LabelTaskID      = "foreman.tsic.top/task-id"
@@ -281,7 +281,7 @@ const (
 )
 
 // TaskEntryFromJob rebuilds an entry from a Job's labels and annotations
-// (contract §3.2). The state starts at the conservative StateJobCreated and
+// (§4.3). The state starts at the conservative StateJobCreated and
 // is advanced by the startup C13 convergence; the payload is not restored
 // (it never leaves process memory, so a restarted Foreman cannot re-deliver).
 // The four trigger-context annotations are conditional blocks: a missing key
@@ -298,7 +298,7 @@ func TaskEntryFromJob(job batchv1.Job) (TaskEntry, error) {
 		JobNamespace: job.GetNamespace(),
 		State:        StateJobCreated,
 		// The apiserver timestamp is the instance-filter basis of the pod
-		// evidence (contract §3.1): a rebuilt entry must carry the object's
+		// evidence (§4.1): a rebuilt entry must carry the object's
 		// value, never a local clock reading.
 		JobCreatedAt: job.CreationTimestamp.Time,
 

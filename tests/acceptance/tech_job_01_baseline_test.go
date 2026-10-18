@@ -22,9 +22,9 @@ import (
 	"github.com/tsic404/foreman/internal/registry"
 )
 
-// authorityFixture is the AC-20 authority, the same byte copy of the design
-// repo's test-cases/_infra/job-baseline.yaml the jobbuilder package tests
-// against.
+// authorityFixture is the AC-20 authority: the in-repo reference-template
+// baseline the jobbuilder package tests against, whose Job document the
+// deployment publishes byte for byte.
 const authorityFixture = "../../internal/jobbuilder/testdata/job-baseline.yaml"
 
 func TestJob01ReferenceTemplateMatchesBaseline(t *testing.T) {

@@ -13,7 +13,7 @@ import (
 
 // A failed discard must keep the entry live: it is the only retry handle for
 // the Job and its credential Secret, and dropping it would leave a zombie Job
-// or leak the Secret (failure-handling 顺序与幂等规则 2).
+// or leak the Secret (§6.4: the entry is the only retry handle).
 func TestDiscardTaskKeepsEntryUntilObjectsAreGone(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
@@ -81,7 +81,7 @@ func TestDiscardTaskRevokesTheCredential(t *testing.T) {
 }
 
 // A terminal entry whose report is still queued keeps its Job: the deletion
-// waits for the drain that lands the report (contract §4) — a deleted Job
+// waits for the drain that lands the report (§10) — a deleted Job
 // must never stand in for a delivered report.
 func TestSettleTerminalKeepsJobWhileReportIsQueued(t *testing.T) {
 	f := newFixture(t)

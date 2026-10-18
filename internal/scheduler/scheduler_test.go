@@ -508,10 +508,10 @@ func (f *fixture) claim(t *testing.T, taskID string) registry.TaskEntry {
 
 // ---- OnClaim ----
 
-// A switched-off boot bound (FOREMAN_JOB_BOOT_TIMEOUT=0, §5.1) writes no
+// A switched-off boot bound (FOREMAN_JOB_BOOT_TIMEOUT=0) writes no
 // boot_deadline at all: the zero value is "no upper bound", never a degenerate
 // claimed_at, and the boot judgement has no upper bound to hold against
-// (contract §3.1, ADR-026).
+// (§4.2, ADR-026).
 func TestOnClaimWithoutBootBoundWritesNoDeadline(t *testing.T) {
 	f := newFixtureWithEnv(t, map[string]string{EnvJobBootTimeout: "0"})
 	e := f.claim(t, "task-1")
@@ -540,8 +540,8 @@ func TestOnClaimCreatesSecretJobAndEntry(t *testing.T) {
 	if e.BootDeadline != testNow.Add(DefaultJobBootTimeout) {
 		t.Fatalf("boot_deadline = %v", e.BootDeadline)
 	}
-	// The claim stamped the server's 45s prepare lease (§1.1 C3), so the
-	// projected lease_keep_until (§3.1) starts out live — never the zero
+	// The claim stamped the server's 45s prepare lease (C-3), so the
+	// projected lease_keep_until (§10) starts out live — never the zero
 	// value the field would otherwise carry into /foreman/tasks.
 	if want := testNow.Add(PrepareLeaseTTL); !e.LeaseKeepUntil.Equal(want) {
 		t.Fatalf("lease_keep_until = %v, want %v", e.LeaseKeepUntil, want)
@@ -569,7 +569,7 @@ func TestOnClaimCreatesSecretJobAndEntry(t *testing.T) {
 // create — up to jobNameWait long when a terminating predecessor still holds
 // the name — so re-Putting that snapshot wholesale would revert
 // lease_keep_until behind the LeaseKeeper's last renewal, i.e. behind exactly
-// the advance test-cases/protocol-lease.md 场景 A asserts.
+// the advance TC-tech-lease-01 asserts.
 func TestClaimKeepsLeaseRenewedDuringJobCreate(t *testing.T) {
 	f := newFixture(t)
 	renewed := testNow.Add(2 * time.Minute)
@@ -591,7 +591,7 @@ func TestClaimKeepsLeaseRenewedDuringJobCreate(t *testing.T) {
 // TestClaimRollsBackObjectsWhenEntryLeftDuringJobCreate covers the create
 // window's failure branch: once the entry is settled or reclaimed while the
 // Job is being created, the fresh Secret and Job have no owner left, and
-// nothing else reclaims an entry-less Job (failure-handling #16 skips Jobs
+// nothing else reclaims an entry-less Job (§6.5 skips Jobs
 // that exist, ListJobs is read only by the startup rebuild) — so the claim
 // must delete both before returning its error.
 func TestClaimRollsBackObjectsWhenEntryLeftDuringJobCreate(t *testing.T) {
@@ -829,7 +829,7 @@ func TestDuplicateClaimWaitsForTerminatingJobName(t *testing.T) {
 
 // A name that never frees (stuck pod, unresponsive node) must not become a
 // false failure: the claim is dropped and the server re-dispatches the task
-// once the lease lapses (failure-handling #1/#2).
+// once the lease lapses (§4.3).
 func TestClaimDefersWhileJobNameStillHeld(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
@@ -1180,7 +1180,7 @@ func TestOnReportStartMarksRunning(t *testing.T) {
 	}
 }
 
-// A refused start (409 状态不允许, §1.2 S8 + 05-modules/proxy.md §转发)
+// A refused start (409 状态不允许, S-8 + §1.5)
 // settles the task instead of leaving it running: failed/stale_claim,
 // reported on the daemon's behalf, objects deleted — and the done index
 // stops the re-dispatched task from building another Job whose start would
@@ -1290,7 +1290,7 @@ func TestOnReportStart409TerminalSettlesToServer(t *testing.T) {
 }
 
 // C13 = 404: the server deleted the task — the objects go and no terminal is
-// synthesized for a task nobody holds (failure-handling 场景 #9).
+// synthesized for a task nobody holds (§4.6).
 func TestOnReportStart409VanishedReleases(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "t-gone")
@@ -1319,7 +1319,7 @@ func TestOnReportStart409VanishedReleases(t *testing.T) {
 
 // The start round owns the entry: a boot deadline that fires while the S8
 // answer is still outstanding must not settle the task and delete its Job
-// (failure-handling §判据模型 — the in-flight 2xx is the decisive fact).
+// (§4.2 — the in-flight 2xx is the decisive fact).
 func TestBootTimeoutWaitsForInFlightStart(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "t-race")
@@ -1405,7 +1405,7 @@ func TestOnReportStart409OnSettledEntryKeepsResult(t *testing.T) {
 
 // A transient start failure (5xx → 502) leaves the entry pre-start: the
 // running write waits for a 2xx, so the daemon's retry can still start the
-// task (05-modules/proxy.md §转发 transient branch).
+// task (§1.5: transient errors are retried).
 func TestOnReportStartTransientKeepsEntryPreStart(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "t-5xx")
@@ -1487,9 +1487,9 @@ func TestOnReportTerminalFailureKeepsObjects(t *testing.T) {
 	f.reg.Put(e)
 	f.server.forwardCode = 500
 
-	// The daemon still gets 502 (proxy.md 转发 switch) and the terminal
-	// entry keeps its objects: the report is in the durable queue now, not
-	// dropped.
+	// The daemon still gets 502 (§1.5: the caller owns the retry) and the
+	// terminal entry keeps its objects: the report is in the durable queue
+	// now, not dropped.
 	code, _, err := f.sched.OnReport(context.Background(), EPComplete, e, []byte(`{}`))
 	if err != nil || code != 502 {
 		t.Fatalf("OnReport = %d, %v", code, err)
@@ -1747,7 +1747,7 @@ func TestReconcileDelegatesToRecoveryWhenWired(t *testing.T) {
 	}
 }
 
-// Contract §4: without a durable queue a terminal report could only be
+// §10: without a durable queue a terminal report could only be
 // logged and dropped, so a scheduler cannot be built without one.
 func TestNewRequiresPendingReports(t *testing.T) {
 	f := newFixture(t)
@@ -2133,7 +2133,7 @@ func TestJobCreateFailedLogsPhaseForJobStep(t *testing.T) {
 	}
 }
 
-// TestOnClaimStaleClearFailureKeepsClaim (task-mapping §OnClaim): the stale
+// TestOnClaimStaleClearFailureKeepsClaim: the stale
 // Secret sweep is the best-effort half of an idempotent retry — its failure
 // does not settle the claim, and only the CreateSecret that follows can turn
 // it into a phase=secret failure.
@@ -2599,7 +2599,7 @@ func TestOnClaimWithoutIssueContext(t *testing.T) {
 		t.Fatalf("entry trigger context = %+v", e)
 	}
 	// The claim log carries the entry anchors, so an operator can find a task
-	// that has no issue (observability.md task.claimed).
+	// that has no issue (§9.1: task.claimed).
 	record := findLogRecord(t, buf.Bytes(), "task.claimed")
 	if record["autopilot_run_id"] != "run-1" || record["chat_session_id"] != "" || record["issue_identifier"] != "" {
 		t.Errorf("task.claimed trigger context = %v", record)

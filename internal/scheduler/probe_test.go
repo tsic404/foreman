@@ -479,7 +479,7 @@ func TestRunStartupProbePodRanThenExitedClass(t *testing.T) {
 	}
 }
 
-// TestRunStartupProbeExitCarriesReason pins observability.md's requirement that
+// TestRunStartupProbeExitCarriesReason pins §9.1's requirement that
 // the exit record reports the same reason class the event does.
 func TestRunStartupProbeExitCarriesReason(t *testing.T) {
 	cfg := probeConfig(t)

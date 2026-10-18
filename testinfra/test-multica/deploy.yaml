@@ -1,12 +1,12 @@
 # Test multica cluster — the execution environment of the TC-tech cases
-# (test-cases/_infra/test-multica-cluster.md §1/§2/§3/§6).
+# (see `README.md`).
 #
 # One complete multica deployment: server (backend) + its persistence
 # (postgres) + the frontend entry (web + proxy). It is isolated from
 # production by namespace, database and workspace — no production workspace,
-# token or runtime is ever reused (§1).
+# token or runtime is ever reused.
 #
-# The version anchor is absolute (§1/§6): every image is pinned to the
+# The version anchor is absolute: every image is pinned to the
 # `v0.6.1` release (multica@2ea01ae4). Upgrade = rebuild this whole
 # environment from a new anchor, never an in-place upgrade.
 #
@@ -55,7 +55,7 @@ data:
 ---
 # Frontend entry: one origin for the web UI and the /ws upgrade. The Next.js
 # rewrites cannot carry a WebSocket upgrade, so /ws goes straight to the
-# backend and everything else goes to the frontend (§2 前端入口).
+# backend and everything else goes to the frontend entry.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -122,7 +122,7 @@ spec:
     requests:
       storage: 2Gi
 ---
-# The stable access point (§2 接入点与接线): the test multica server itself,
+# The stable access point: the test multica server itself,
 # for the environment self-check, the instance under test and troubleshooting —
 # nothing sits in front of it. In-cluster consumers use
 # `http://test-multica-server:8080`; the test network reaches the same Service
@@ -146,7 +146,7 @@ spec:
       targetPort: http
       nodePort: 30080
 ---
-# Frontend entry (§2): the stable origin for the web UI (board, chat entry,
+# Frontend entry: the stable origin for the web UI (board, chat entry,
 # task cancellation).
 apiVersion: v1
 kind: Service
@@ -188,7 +188,7 @@ spec:
       targetPort: http
 ---
 # Database endpoint. Only the backend uses it; the reset entry reaches it
-# through `kubectl exec` (§6 重置).
+# through `kubectl exec`.
 apiVersion: v1
 kind: Service
 metadata:
@@ -274,7 +274,7 @@ spec:
             claimName: postgres-data
 ---
 # The test multica server itself. Its Service name is also the in-cluster face
-# of the access point (`http://test-multica-server:8080`, §2 接入点与接线) that
+# of the access point (`http://test-multica-server:8080`) that
 # the instance under test is wired to.
 apiVersion: apps/v1
 kind: Deployment

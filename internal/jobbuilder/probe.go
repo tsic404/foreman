@@ -12,10 +12,10 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
-// The catalog probe's fixed names and values (ADR-019 / ADR-025, 03-contracts.md
-// §3.2「目录探针 Job 的标签」). A probe runs the same official daemon as a task
-// Job, but under its own profile and its own credential — so a probe and a
-// task Job can sit on one node without touching each other's profile directory.
+// The catalog probe's fixed names and values (ADR-019 / ADR-025, §8.4). A
+// probe runs the same official daemon as a task Job, but under its own profile
+// and its own credential — so a probe and a task Job can sit on one node
+// without touching each other's profile directory.
 const (
 	probeJobPrefix    = "fm-catalog-"
 	probeRole         = "catalog-probe"
@@ -36,13 +36,13 @@ var taskCredSecretLiteral = daemonIDFor(placeholderTaskID) + secretCredSuffix
 var ErrInvalidRequestID = errors.New("invalid request id")
 
 // BuildCatalogProbe renders the catalog-probe Job (fm-catalog-<requestID>) and
-// its credential Secret, returning the digest of the token that Secret carries
-// (03-contracts.md §2 CatalogProbe.Start). Its shape is the deployment
-// template's copy plus the probe write face (ADR-025): A1.1's env keys, the
-// namespace, A1.4's four items and the two placeholders a probe consumes. The
-// budget becomes activeDeadlineSeconds — the probe's own deadline, written by
-// Foreman and not by the template (§5.1) — and the token always outlives the
-// Job by the drain bound (ADR-017).
+// its credential Secret, returning the digest of the token that Secret carries.
+// Its shape is the deployment template's copy plus the probe write face
+// (ADR-025): A1.1's env keys, the namespace, A1.4's four items and the two
+// placeholders a probe consumes. The budget becomes activeDeadlineSeconds —
+// the probe's own deadline, written by Foreman and not by the template
+// (§8.4) — and the token always outlives the Job by the drain bound
+// (ADR-017).
 func (b *Builder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
 	name := probeJobName(requestID)
 	if len(name) > 63 || !dns1123Label.MatchString(name) {
@@ -69,11 +69,11 @@ func probeJobName(requestID string) string {
 	return probeJobPrefix + requestID
 }
 
-// probeLabels is the §3.2 label block every probe Job and probe Secret carry:
-// the probe's daemon identity, which is also what its MULTICA_DAEMON_ID
+// probeLabels is the probe label block (§8.4) every probe Job and probe Secret
+// carry: the probe's daemon identity, which is also what its MULTICA_DAEMON_ID
 // fieldRef reads (ADR-019 / ADR-034). managed-by is the stale-sweep selector,
 // so Foreman writes it even when a template omits it; task-id is never written
-// — it is what makes a Job a task Job (03-contracts.md §1.3).
+// — it is what makes a Job a task Job (§3).
 func probeLabels(name string) map[string]string {
 	return map[string]string{
 		labelAppName:   jobAppName,
@@ -83,8 +83,8 @@ func probeLabels(name string) map[string]string {
 	}
 }
 
-// renderProbe is the probe pipeline (03-contracts.md §5.4「探针渲染的完整写入面」):
-// the template copy through the probe write face, then the budget deadline.
+// renderProbe is the probe pipeline (§8.4): the template copy through the
+// probe write face, then the budget deadline.
 func (b *Builder) renderProbe(name, jobRuntimeID string, budget time.Duration) (*batchv1.Job, error) {
 	job, err := renderProbeTemplate(b.template, probeValues{
 		jobImage:     b.cfg.JobImage,
@@ -101,8 +101,8 @@ func (b *Builder) renderProbe(name, jobRuntimeID string, budget time.Duration) (
 
 // writeProbeDeadline writes the probe's own budget into activeDeadlineSeconds:
 // it is the time the probe was bought for, and the one field Foreman overwrites
-// on a probe beyond the A1 faces (§5.1 探针的行为面). A non-positive budget
-// renders none rather than an already-expired deadline.
+// on a probe beyond the A1 faces (§8.4). A non-positive budget renders none
+// rather than an already-expired deadline.
 func writeProbeDeadline(job *batchv1.Job, budget time.Duration) {
 	if budget <= 0 {
 		return
@@ -114,7 +114,7 @@ func writeProbeDeadline(job *batchv1.Job, budget time.Duration) {
 // namespace overwrite, and A1.4 ①②③ — the probe name, the label block with
 // the foreman.tsic.top/ domain cleared first, and the heartbeat key. Annotations
 // stay as the template wrote them, minus that domain: a probe maps no task, so
-// it carries none of the §3.2 task annotations.
+// it carries none of the task annotations (§4.3).
 func (b *Builder) applyProbeWrites(job *batchv1.Job, name string) {
 	injectContainerEnv(job)
 
@@ -164,7 +164,7 @@ func writeProbeHeartbeat(job *batchv1.Job, interval time.Duration) {
 // probeCredentialSecret is the probe's credential Secret: the same carrier as
 // a task's (one config.json, mounted 0400 through cred-src), labelled with the
 // probe role and without a task id, so the task-side orphan sweep leaves it to
-// the probe sweep (03-contracts.md §1.3).
+// the probe sweep (§6.5).
 func (b *Builder) probeCredentialSecret(name, token string) *corev1.Secret {
 	configJSON := `{"token":` + strconv.Quote(token) + `}`
 	return &corev1.Secret{
@@ -198,7 +198,7 @@ func (v probeValues) literals(value string) string {
 }
 
 // placeholders is the probe's generic substitution: exactly the two
-// placeholders §5.4 lets a probe consume. Task-identity placeholders stay
+// placeholders §8.4 lets a probe consume. Task-identity placeholders stay
 // verbatim — they name a task the probe does not have, so there is no value to
 // invent (and silence beats failure here: the probe must still register).
 func (v probeValues) placeholders(value string) string {
@@ -226,7 +226,7 @@ func renderProbeTemplate(template map[string]any, v probeValues) (*batchv1.Job, 
 
 // rewriteStrings applies rewrite to every string value of the object — map
 // values and list elements alike, substring matching with every occurrence
-// replaced (§5.4「占位符替换」的匹配与作用域). Keys are not values and are left
+// replaced (§8.3). Keys are not values and are left
 // alone, as on the task path.
 func rewriteStrings(node any, rewrite func(string) string) any {
 	switch value := node.(type) {

@@ -11,12 +11,12 @@ import (
 )
 
 // codeLabel renders a C21 status code as the metrics label value; an abandoned
-// relay is reported as "none" (observability.md 指标口径).
+// relay is reported as "none" (§9.2 指标口径).
 func codeLabel(code int) string { return strconv.Itoa(code) }
 
 // CatalogProbe is the control channel to the catalog-probe Jobs: build/wait/
 // delete. The scheduler owns it (K8s objects); proxy only ever calls it and
-// shares state with it through the probe session table (§2 CatalogProbe).
+// shares state with it through the probe session table.
 type CatalogProbe interface {
 	// StartProbe builds the probe Job and its credential Secret;
 	// realRuntimeID is empty in startup-discovery mode.
@@ -29,7 +29,7 @@ type CatalogProbe interface {
 }
 
 // ModelCatalogReporter consumes the C2 ack's pending_model_list and answers it
-// (§1.1「C2 ack 消费」, C21): a slot with a cache replays it verbatim, an empty
+// (§1.3): a slot with a cache replays it verbatim, an empty
 // slot falls back to a fresh probe whose result is forwarded verbatim. Both
 // paths are single-flight per real runtime; a replay never occupies the probe
 // slot.
@@ -98,14 +98,14 @@ func probeMinBudget(timeout time.Duration) time.Duration {
 }
 
 // OnAck consumes one heartbeat ack. It runs inside the heartbeat round of the
-// runtime the ack belongs to (§1.1「C2 ack 消费」第 3 条): an empty slot is
+// runtime the ack belongs to (§1.3): an empty slot is
 // filled by a fresh probe, a cached slot is replayed right here.
 func (r *ModelCatalogReporter) OnAck(ctx context.Context, runtimeID, requestID string) {
 	if requestID == "" {
 		return
 	}
 	// The server window is anchored at consumption, never at goroutine dispatch
-	// (§1.1「C2 ack 消费」第 6 条).
+	// (§1.3).
 	consumedAt := r.now()
 	if !r.cfg.ModelCatalogEnabled {
 		// The disabled path is a visible degradation, never a silent drop.
@@ -115,11 +115,11 @@ func (r *ModelCatalogReporter) OnAck(ctx context.Context, runtimeID, requestID s
 		return
 	}
 	if runtimeID == "" {
-		// A command always belongs to a real runtime (§1.1「C2 ack 消费」第 1
-		// 条). Without one the probe would be built in startup-discovery mode,
-		// whose result is absorbed locally and never relayed: the command would
-		// die as an upstream window timeout while the relay metric reported a
-		// success that never reached the server. Fail visibly instead.
+		// A command always belongs to a real runtime (§1.3). Without one the
+		// probe would be built in startup-discovery mode, whose result is
+		// absorbed locally and never relayed: the command would die as an
+		// upstream window timeout while the relay metric reported a success
+		// that never reached the server. Fail visibly instead.
 		r.log.Warn("model.catalog_relay_failed", "request_id", requestID,
 			"runtime_id", runtimeID, "reason", "no real runtime for the command")
 		r.metrics.ModelCatalogRelay("none", 0)
@@ -127,7 +127,7 @@ func (r *ModelCatalogReporter) OnAck(ctx context.Context, runtimeID, requestID s
 	}
 	if slot, ok := r.slots.Get(runtimeID); ok {
 		// The answer leaves the heartbeat round: consuming the ack stays
-		// in-round (§1.1 C2 ack 消费 第 3 条), while the replay — which may
+		// in-round (§1.3), while the replay — which may
 		// retry inside its own budget — must not stretch the 15s cadence of
 		// this runtime's C2 stream (a replay is meant to be the near-zero path).
 		go r.replay(context.WithoutCancel(ctx), runtimeID, requestID, slot, consumedAt)
@@ -138,7 +138,7 @@ func (r *ModelCatalogReporter) OnAck(ctx context.Context, runtimeID, requestID s
 
 // replay answers a command from the runtime's catalog cache: the body and the
 // request id go out byte for byte, and the slot is not single-flight state
-// (§1.1 C21 第 13 条). consumedAt is when the ack was read: the local budget
+// (§1.3). consumedAt is when the ack was read: the local budget
 // and the recorded span both start there, so a replay dispatched late can never
 // outlive the server's window.
 func (r *ModelCatalogReporter) replay(ctx context.Context, runtimeID, requestID string, slot CatalogSlot, consumedAt time.Time) {
@@ -146,12 +146,12 @@ func (r *ModelCatalogReporter) replay(ctx context.Context, runtimeID, requestID 
 	age := start.Sub(slot.LandedAt)
 	if r.cfg.ModelCatalogCacheTTL > 0 && age > r.cfg.ModelCatalogCacheTTL {
 		// Staleness is only ever a warning: crossing the TTL must never stop
-		// the answer (§5.1 目录缓存 TTL).
+		// the answer (§10 目录缓存 TTL).
 		r.log.Warn("model.catalog_stale", "request_id", requestID, "runtime_id", runtimeID,
 			"age_seconds", age.Seconds(), "ttl_seconds", r.cfg.ModelCatalogCacheTTL.Seconds())
 	}
 	// The replay is a C21 like any other: transport errors and 5xx retry with
-	// the §1.1 C21 backoff inside the same local budget the probe path uses.
+	// the C-21 backoff inside the same local budget the probe path uses.
 	budget := start.Add(r.cfg.ModelCatalogTimeout)
 	relayCtx, cancel := context.WithDeadline(ctx, budget)
 	defer cancel()
@@ -168,7 +168,7 @@ func (r *ModelCatalogReporter) replay(ctx context.Context, runtimeID, requestID 
 
 // Submit enqueues one command for its runtime. The occupied/queued transition
 // and the superseded warning are a single atomic step against release, so a
-// request logged as superseded is never also started (§1.1 C21 第 13 条).
+// request logged as superseded is never also started (§1.3).
 func (r *ModelCatalogReporter) Submit(ctx context.Context, runtimeID, requestID string, consumedAt time.Time) {
 	req := &pendingCatalogRequest{reqID: requestID, consumedAt: consumedAt}
 	start := (*pendingCatalogRequest)(nil)
@@ -217,7 +217,7 @@ func (r *ModelCatalogReporter) release(runtimeID string) {
 // run drives one command through a fresh probe. The budget is anchored at the
 // moment the ack was consumed — never at dequeue time: the server window starts
 // at delivery, and a queued request may already have waited out one full probe
-// (§1.1 C21 第 6 条).
+// (§1.3).
 func (r *ModelCatalogReporter) run(ctx context.Context, runtimeID string, req *pendingCatalogRequest) {
 	start := r.now()
 	// LIFO: Delete must finish before release promotes the next request, or two

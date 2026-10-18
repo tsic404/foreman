@@ -115,7 +115,7 @@ func TestStartupDeclarationComesFromProbeRegistration(t *testing.T) {
 	if body.CLIVersion != cliVersion {
 		t.Errorf("C1 cli_version = %q, want the probe's %q (the template CLI's truth)", body.CLIVersion, cliVersion)
 	}
-	// Declared count = discovered count, entry by entry (§1.1 C1).
+	// Declared count = discovered count, entry by entry (C-1).
 	if len(body.Runtimes) != len(discovery.Runtimes) {
 		t.Fatalf("C1 runtimes = %d, want the discovery's %d", len(body.Runtimes), len(discovery.Runtimes))
 	}

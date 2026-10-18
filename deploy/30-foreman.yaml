@@ -1,8 +1,9 @@
-# Foreman Deployment + Service (contracts §5.3).
+# Foreman Deployment + Service (02-contracts.md §9.3, §8.1).
 #
-# Single replica (NG7): two Foreman instances would claim the same runtime and
-# double-dispatch tasks, so the strategy is Recreate and replicas is pinned.
-# Environment: every §5.1 key with its contract default spelled out, except
+# Single replica (01-scope.md NG7): two Foreman instances would claim the same
+# runtime and double-dispatch tasks, so the strategy is Recreate and replicas
+# is pinned.
+# Environment: every key with its deployment default spelled out, except
 # MULTICA_SERVER_URL / MULTICA_WORKSPACE_ID (deployment values) and the two
 # secret keys. FOREMAN_JOB_IMAGE is a full movable image reference (ADR-012);
 # the foreman-gc DaemonSet carries the same literal — see deploy/README.md
@@ -56,7 +57,7 @@ spec:
               containerPort: 8080
               protocol: TCP
           env:
-            # --- server identity / credentials (§5.1) ---
+            # --- server identity / credentials ---
             - name: MULTICA_SERVER_URL
               value: "http://multica.tsic.top"
             - name: MULTICA_WORKSPACE_ID
@@ -98,7 +99,7 @@ spec:
               value: "300s"
             # Boot window: claim → daemon start, including every init step the
             # template runs — the reference template fetches the agent backend
-            # there, so a slow or cold link needs a larger value (§5.4).
+            # there, so a slow or cold link needs a larger value (§4.2).
             # Credential-reclaim upper bound after a task's verdict; a
             # deployment that raises the template's
             # terminationGracePeriodSeconds must raise this too (ADR-017).
@@ -143,7 +144,7 @@ spec:
               value: "6h"
             - name: FOREMAN_GC_QUIESCE
               value: "30m"
-            # Same env as the foreman-gc DaemonSet (contract §5.1): here it
+            # Same env as the foreman-gc DaemonSet: here it
             # bounds the learned session-index entries of the soft-affinity
             # key, so one value keeps placement and node GC in step (ADR-015).
             # "0" disables expiry.
@@ -153,7 +154,7 @@ spec:
             # The five keys below are idle contract entries: the Job's
             # resources and nodeSelector come from the template, and Foreman
             # reads none of them (an arbitrary value, an illegal one included,
-            # is ignored). Their deletion follows P-012 / P-013.
+            # is ignored). Their deletion follows ADR-028 / ADR-035 (§8.5).
             - name: FOREMAN_JOB_CPU_REQUEST
               value: "1"
             - name: FOREMAN_JOB_MEMORY_REQUEST
@@ -203,17 +204,17 @@ spec:
               drop: ["ALL"]
           volumeMounts:
             # ADR-002: no PVC. This emptyDir holds nothing but the durable
-            # terminal-report queue (contract §4) between container restarts.
+            # terminal-report queue (contract §10) between container restarts.
             - name: state
               mountPath: /var/lib/foreman
-            # §5.4 template carrier: required, so a missing ConfigMap blocks
+            # §8.1 template carrier: required, so a missing ConfigMap blocks
             # pod creation with CreateContainerConfigError (the container-layer
             # half of the fail-fast pair) instead of starting a Foreman with
             # nothing to render from. Content: 25-job-template.yaml.
             - name: job-template
               mountPath: /etc/foreman/job-template
               readOnly: true
-            # §5.4「策略文件」: the three-axis policy carrier. Optional on
+            # §8.5 policy file: the three-axis policy carrier. Optional on
             # purpose — an absent file is a legal default (all three axes read
             # None), so this volume must not block startup. Content:
             # 26-job-policy.yaml.
@@ -233,7 +234,7 @@ spec:
             optional: true
 ---
 # Job-side entry point: the Job daemon's MULTICA_SERVER_URL resolves to
-# foreman.foreman.svc.cluster.local:8080 (contract §1.2/§5.2).
+# foreman.foreman.svc.cluster.local:8080 (contract §8.2 A1.1).
 apiVersion: v1
 kind: Service
 metadata:

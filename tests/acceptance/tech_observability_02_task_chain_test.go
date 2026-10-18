@@ -1,7 +1,7 @@
 // TC-tech-observability-02 implements AC-10's log-chain face: one task's
 // events are traceable by its task id from claim to deletion, so every
 // task-face event line carries the task id, the Job name and the daemon
-// identity (02-contracts §9.1). Both paths that write the terminal line are
+// identity (02-contracts.md §9.1). Both paths that write the terminal line are
 // covered — the forwarded terminal report and the settlement of an entry the
 // server already holds as terminal — and the daemon key is present with an
 // empty value where the identity is unknown, never omitted.

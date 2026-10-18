@@ -104,7 +104,7 @@ func TestDeleteJobRequestsBackgroundCascade(t *testing.T) {
 }
 
 // CreateJob returns the object the apiserver holds: its creationTimestamp is
-// the instance basis the pod evidence filters on (contract §3.1), so it must
+// the instance basis the pod evidence filters on (§4.1), so it must
 // come back from the API and not from the caller's local copy.
 func TestCreateJobReturnsTheAcceptedObject(t *testing.T) {
 	clientset := fake.NewSimpleClientset()

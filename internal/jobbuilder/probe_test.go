@@ -247,7 +247,7 @@ func TestBuildCatalogProbeTemplateRender(t *testing.T) {
 	}
 
 	// The TTL stays the template's; the deadline is the probe's own budget,
-	// the one field Foreman writes on a probe beyond the A1 faces (§5.1).
+	// the one field Foreman writes on a probe beyond the A1 faces (§8.4).
 	if *job.Spec.ActiveDeadlineSeconds != int64(budget/time.Second) || *job.Spec.TTLSecondsAfterFinished != 600 {
 		t.Errorf("deadline/ttl = %d/%d, want the budget %d and the template's 600",
 			*job.Spec.ActiveDeadlineSeconds, *job.Spec.TTLSecondsAfterFinished, int64(budget/time.Second))

@@ -3,8 +3,7 @@
 // the server towards the official daemon inside every Job pod (fake
 // server), and turns each claimed task into a Kubernetes Job.
 //
-// Design: docs/04-architecture.md §系统形态/§部署运行方式,
-// docs/03-contracts.md §5.1 (configuration), ADR-002 (no PVC).
+// Design: 01-scope.md 定位/能力面, ADR-002 (no PVC).
 package main
 
 import (
@@ -41,7 +40,7 @@ var version = "dev"
 const (
 	// shutdownTimeout bounds the graceful deregister + HTTP drain window.
 	shutdownTimeout = 20 * time.Second
-	// readHeaderTimeout bounds request header reads (§4 control-plane).
+	// readHeaderTimeout bounds request header reads.
 	readHeaderTimeout = 10 * time.Second
 )
 
@@ -59,7 +58,7 @@ func run() error {
 	getenv := os.Getenv
 	started := time.Now()
 
-	// Configuration (§5.1). Every loader is fail-fast: a bad value must be
+	// Configuration. Every loader is fail-fast: a bad value must be
 	// refused at startup, never half-applied at runtime.
 	obsCfg, err := observability.LoadConfig(getenv)
 	if err != nil {
@@ -95,8 +94,8 @@ func run() error {
 		return err
 	}
 	// Startup self-check of the credential budget: the Job Token must cover
-	// claim → boot → task → drain (contract §5.1, ADR-017). Only here are all
-	// three timeouts known, so the check lives on this seam.
+	// claim → boot → task → drain (02-contracts.md §6.1, ADR-017). Only here
+	// are all three timeouts known, so the check lives on this seam.
 	if err := authCfg.ValidateTokenBudget(schedCfg.JobBootTimeout, schedCfg.JobDrainTimeout); err != nil {
 		return err
 	}
@@ -150,7 +149,7 @@ func run() error {
 	)
 
 	// Terminal reports that exhausted the retry budget are queued on the
-	// node-local state root and re-sent by the reconciler (contract §4).
+	// node-local state root and re-sent by the reconciler (contract §10).
 	pending, err := recovery.NewPendingReports(
 		recovery.PendingReportsDir(getenv),
 		recovery.WithPendingReportsGauge(metrics.PendingReports),
@@ -172,8 +171,8 @@ func run() error {
 	jbCfg.JobDrainTimeout = schedCfg.JobDrainTimeout
 
 	// Startup gate: an unreadable or unparseable job-overlay.yaml must refuse
-	// to serve (CrashLoopBackOff), never fail at the first claim (03-contracts
-	// §5.4).
+	// to serve (CrashLoopBackOff), never fail at the first claim
+	// (02-contracts.md §8.1).
 	builder, err := jobbuilder.NewBuilder(jbCfg)
 	if err != nil {
 		return fmt.Errorf("job template: %w", err)
@@ -273,7 +272,7 @@ func run() error {
 		// Fail-fast, visible: no registration inside the window means the
 		// template (or the probe) is not runnable, and Foreman must not
 		// declare a runtime set it never observed (AC-36). The exit record
-		// repeats the event's reason class (observability.md 钉死字段集).
+		// repeats the event's reason class (02-contracts.md §9.1).
 		fields := []any{"err", err.Error()}
 		var failure *scheduler.StartupProbeFailure
 		if errors.As(err, &failure) {
@@ -283,7 +282,7 @@ func run() error {
 		return err
 	}
 	// The declaration is cached here; the claim loop's preflight sends the one
-	// C1 of this startup (with the §4 backoff, §1.1 C1), so a transient failure
+	// C1 of this startup (with the §1.5 backoff, C-1), so a transient failure
 	// retries instead of exiting.
 	client.Declare(discovery)
 	log.Info("runtime.declared",
