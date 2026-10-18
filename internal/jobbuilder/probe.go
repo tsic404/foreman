@@ -112,9 +112,11 @@ func writeProbeDeadline(job *batchv1.Job, budget time.Duration) {
 
 // applyProbeWrites performs the probe's typed writes: the A1.1 env keys, the
 // namespace overwrite, and A1.4 ①②③ — the probe name, the label block with
-// the foreman.tsic.top/ domain cleared first, and the heartbeat key. Annotations
-// stay as the template wrote them, minus that domain: a probe maps no task, so
-// it carries none of the task annotations (§4.3).
+// the foreman.tsic.top/ domain cleared first, and the heartbeat key (④'s
+// literal renames run on the template copy in renderProbeTemplate, ahead of the
+// generic substitution). Annotations stay as the template wrote them, minus
+// that domain: a probe maps no task, so it carries none of the task
+// annotations (§4.3).
 func (b *Builder) applyProbeWrites(job *batchv1.Job, name string) {
 	injectContainerEnv(job)
 
@@ -179,42 +181,42 @@ func (b *Builder) probeCredentialSecret(name, token string) *corev1.Secret {
 }
 
 // probeValues are the probe render's substitution inputs: the two placeholders
-// a probe consumes, plus the credential Secret name A1.4 ④ renames the task's
-// to. The generic substitution runs last, after the two literals — a template's
-// image reference may itself read "foreman-job", and renaming it after the
-// image value landed would corrupt the reference.
+// a probe consumes, plus the credential Secret name A1.4 ④ writes on the volume
+// references.
 type probeValues struct {
 	jobImage     string
 	jobRuntimeID string
 	credSecret   string
 }
 
-// literals is A1.4 ④: the task profile and the task credential Secret name are
-// renamed over the whole object, substring and every occurrence, because the
-// probe and the task Job share one template copy.
-func (v probeValues) literals(value string) string {
-	value = strings.ReplaceAll(value, jobProfile, probeProfile)
-	return strings.ReplaceAll(value, taskCredSecretLiteral, v.credSecret)
-}
-
-// placeholders is the probe's generic substitution: exactly the two
-// placeholders §8.4 lets a probe consume. Task-identity placeholders stay
-// verbatim — they name a task the probe does not have, so there is no value to
-// invent (and silence beats failure here: the probe must still register).
-func (v probeValues) placeholders(value string) string {
-	value = strings.ReplaceAll(value, placeholderJobImage, v.jobImage)
-	return strings.ReplaceAll(value, placeholderJobRuntimeID, v.jobRuntimeID)
+// replacement is the probe's consumption face: exactly the two placeholders
+// §8.4 lets a probe consume. Every other registered placeholder is returned
+// unchanged and so stays verbatim — it names a task the probe does not have, so
+// there is no value to invent (and silence beats failure here: the probe must
+// still register).
+func (v probeValues) replacement(placeholder string) string {
+	switch placeholder {
+	case placeholderJobImage:
+		return v.jobImage
+	case placeholderJobRuntimeID:
+		return v.jobRuntimeID
+	default:
+		return placeholder
+	}
 }
 
 // renderProbeTemplate renders one probe from the startup-parsed template: a
 // fresh copy (A1.3), then the object-level steps of the write face in order —
-// the A1.4 literals, the generic substitution, then the node-reuse recognition
-// site with no node (the probe has no soft affinity, so the item carrying the
-// recognition element goes with the structures the deletion empties).
+// the A1.4 ④ literal renames, the generic substitution, then the node-reuse
+// recognition site with no node (the probe has no soft affinity, so the item
+// carrying the recognition element goes with the structures the deletion
+// empties). The renames run first, as §8.4 pins: a value the substitution lands
+// afterwards — an image reference, say — can never be drawn into a written
+// face.
 func renderProbeTemplate(template map[string]any, v probeValues) (*batchv1.Job, error) {
 	rendered := deepCopyTemplate(template)
-	rewriteStrings(rendered, v.literals)
-	rewriteStrings(rendered, v.placeholders)
+	writeProbeLiterals(rendered, v.credSecret)
+	substituteValue(rendered, v)
 
 	job, err := decodeJobTemplate(rendered)
 	if err != nil {
@@ -224,22 +226,72 @@ func renderProbeTemplate(template map[string]any, v probeValues) (*batchv1.Job, 
 	return job, nil
 }
 
-// rewriteStrings applies rewrite to every string value of the object — map
-// values and list elements alike, substring matching with every occurrence
-// replaced (§8.3). Keys are not values and are left
-// alone, as on the task path.
-func rewriteStrings(node any, rewrite func(string) string) any {
-	switch value := node.(type) {
-	case map[string]any:
-		for key, child := range value {
-			value[key] = rewriteStrings(child, rewrite)
+// writeProbeLiterals performs A1.4 ④ on the template copy: the task profile
+// name and the task credential Secret name, each renamed along the face the
+// probe write face declares. The profile name is written where the profile is
+// expressed — every container's command, arguments and mount path, the daemon's
+// own start line and the profile directory beside it (§6.2: profile name and
+// mount point come from one constant). The credential Secret name is written
+// where the token reaches that directory — every Secret reference a pod volume
+// carries. Images, pull credentials, env values, labels and volume names are
+// not among those positions, so the write cannot reach them: the template's own
+// text there survives (A2) by construction, not by an exclusion list.
+func writeProbeLiterals(rendered map[string]any, credSecret string) {
+	podSpec := nestedObject(nestedObject(nestedObject(rendered, "spec"), "template"), "spec")
+	for _, side := range []string{"containers", "initContainers"} {
+		for _, container := range objectList(podSpec, side) {
+			renameLiteral(container, jobProfile, probeProfile, "command", "args")
+			for _, mount := range objectList(container, "volumeMounts") {
+				renameLiteral(mount, jobProfile, probeProfile, "mountPath")
+			}
 		}
-	case []any:
-		for i, child := range value {
-			value[i] = rewriteStrings(child, rewrite)
-		}
-	case string:
-		return rewrite(value)
 	}
-	return node
+	for _, volume := range objectList(podSpec, "volumes") {
+		renameLiteral(nestedObject(volume, "secret"), taskCredSecretLiteral, credSecret, "secretName")
+		for _, source := range objectList(nestedObject(volume, "projected"), "sources") {
+			renameLiteral(nestedObject(source, "secret"), taskCredSecretLiteral, credSecret, "name")
+		}
+	}
+}
+
+// nestedObject returns one named child object of a raw template node, or nil
+// when the template carries none — every position this render writes is
+// optional.
+func nestedObject(node map[string]any, field string) map[string]any {
+	child, _ := node[field].(map[string]any)
+	return child
+}
+
+// objectList returns the object elements of one named list of a raw template
+// node. A missing list, and entries of another shape, contribute none.
+func objectList(node map[string]any, field string) []map[string]any {
+	children, _ := node[field].([]any)
+	objects := make([]map[string]any, 0, len(children))
+	for _, child := range children {
+		if object, ok := child.(map[string]any); ok {
+			objects = append(objects, object)
+		}
+	}
+	return objects
+}
+
+// renameLiteral replaces one literal inside the named fields of one raw node:
+// a string field's value, or every string element of a list field. A nil node
+// is an absent position and is skipped.
+func renameLiteral(node map[string]any, from, to string, fields ...string) {
+	if node == nil {
+		return
+	}
+	for _, field := range fields {
+		switch value := node[field].(type) {
+		case string:
+			node[field] = strings.ReplaceAll(value, from, to)
+		case []any:
+			for i, element := range value {
+				if text, ok := element.(string); ok {
+					value[i] = strings.ReplaceAll(text, from, to)
+				}
+			}
+		}
+	}
 }
