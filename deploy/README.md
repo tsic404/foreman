@@ -73,23 +73,26 @@ Each image has its own release line and its own version semantics:
 
 | Workflow | Image | Tags | Triggers |
 |---|---|---|---|
-| `.github/workflows/build-foreman.yml` | `ghcr.io/tsic404/foreman` | `<repo version>`, `latest` | `main` push, `v*.*.*` tag |
+| `.github/workflows/build-foreman.yml` | `ghcr.io/tsic404/foreman` | `v<X.Y.Z>` (tag push), `latest` (everything else) | `main` push, `v*.*.*` tag, manual dispatch |
 | `.github/workflows/build-foreman-job.yml` | `ghcr.io/tsic404/foreman-job` | `<multica daemon version>`, `latest` | `main` push, hourly schedule, manual dispatch |
 
-`foreman`'s `<version>` is the newest `v*.*.*` tag reachable from the commit
-(falling back to `v0.1.0`); `foreman-job`'s `<version>` is the upstream daemon
+`foreman`'s `<version>` is the trigger's: a `v*.*.*` tag push publishes exactly
+`foreman:v<X.Y.Z>`, any other run (a `main` push, a manual dispatch as its re-run
+entry point) exactly `foreman:latest` — so a published version tag always names
+the image built from that tag and stays a valid rollback target (ADR-012), and
+no main push mints a version. `foreman-job`'s `<version>` is the upstream daemon
 version the image carries, resolved at build time from upstream's newest release
 (never from a repository variable) and verified against that release's checksums.
 
 **`latest` never moves backwards**, in either line: it is pushed only by a run
-that publishes a version at least as new as the line's newest release — for
-`foreman` the newest `v*.*.*` tag (and never from a tag push), for `foreman-job`
-exactly upstream's newest release. Both images are referenced by movable tag
-with `imagePullPolicy: Always` (`FOREMAN_JOB_IMAGE` defaults to
-`foreman-job:latest`), so a build of an older version would otherwise roll the
-whole cluster back. The two lines are independent: a `foreman` tag push never
-changes the Job image's version, and a Job-image run never builds the scheduler
-image.
+that publishes newer content — for `foreman` a `main` push (a `v*.*.*` tag push
+publishes its version tag and leaves `latest` alone, however old that tag is),
+for `foreman-job` a run publishing exactly upstream's newest release. Both images
+are referenced by movable tag with `imagePullPolicy: Always` (`FOREMAN_JOB_IMAGE`
+defaults to `foreman-job:latest`), so a build of an older version would otherwise
+roll the whole cluster back. The two lines are independent: a `foreman` tag push
+never changes the Job image's version, and a Job-image run never builds the
+scheduler image.
 
 A Job-image run whose version is already published **skips** the build and the
 push, so the schedule and `main` pushes normally cost one registry query. That

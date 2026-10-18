@@ -1,10 +1,12 @@
-// Package release pins the release workflows' `latest` guards: the two images
-// are referenced by movable tag with imagePullPolicy Always, so a run that
-// publishes an older version must leave `latest` where it is (a backwards move
-// downgrades every Job's daemon / the Deployment). The scripts under test are
-// the workflows' own `run:` blocks — with their `env:` expressions resolved
-// against the preceding step's outputs, so the wiring is under test too —
-// executed with stubbed docker/curl.
+// Package release pins the two release workflows' version semantics: both images
+// ride movable tags with `imagePullPolicy: Always`, so a run must publish exactly
+// the tag its trigger names. For build-foreman.yml that is the version tag on a
+// `v*.*.*` tag push — never `latest`, so the tag keeps naming the image built
+// from it (ADR-012's rollback path) — and `latest` on a main push — never a
+// version tag, so the untagged line cannot mint or overwrite one. The scripts
+// under test are the workflows' own `run:` blocks — with their `env:` expressions
+// resolved against the preceding step's outputs, so the wiring is under test too
+// — executed with stubbed docker/curl.
 package release
 
 import (
@@ -12,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -79,51 +82,93 @@ func TestJobImageLatestOnlyFollowsUpstreamsNewestRelease(t *testing.T) {
 	})
 }
 
-// TestForemanImageLatestNeverMovesToAnOlderVersion covers build-foreman.yml:
-// the ordering source is this repository's v*.*.* tags, a tag push never moves
-// `latest`, and a dispatch naming an older version leaves it alone.
-func TestForemanImageLatestNeverMovesToAnOlderVersion(t *testing.T) {
+// TestForemanImageTagPushPublishesOnlyThatVersion covers build-foreman.yml: a
+// `v*.*.*` tag push publishes exactly `foreman:v<X.Y.Z>` — never `latest`,
+// which would point the version tag's rollback path at main content — and a ref
+// that is not a v<major>.<minor>.<patch> tag fails before any build.
+func TestForemanImageTagPushPublishesOnlyThatVersion(t *testing.T) {
 	requireTools(t, "bash", "git")
-	repo := taggedRepo(t)
-	top := workflowEnv(t, foremanWorkflow)
-	steps := workflowSteps(t, foremanWorkflow)
-	resolve := requireStep(t, steps, "Resolve the version", foremanWorkflow)
-	publish := requireStep(t, steps, "Build and push the image", foremanWorkflow)
+	top, resolve, publish := foremanReleaseSteps(t)
+	repo := t.TempDir()
+
+	resolved := runStep(t, resolve.run, repo, t.TempDir(), mergeEnv(top, map[string]string{
+		"GITHUB_REF_TYPE": "tag",
+		"GITHUB_REF_NAME": "v0.2.0",
+	}))
+	assertOutput(t, resolved, "version", "v0.2.0")
+
+	args, env := runForemanPublish(t, top, publish, resolved, repo)
+	assertPublishTags(t, args, env["REGISTRY"]+"/foreman:v0.2.0")
+
+	t.Run("a malformed tag fails before the build", func(t *testing.T) {
+		out := runStepAllowFailure(t, resolve.run, repo, t.TempDir(), mergeEnv(top, map[string]string{
+			"GITHUB_REF_TYPE": "tag",
+			"GITHUB_REF_NAME": "v1.2",
+		}))
+		if out.err == nil {
+			t.Fatalf("version resolution accepted v1.2:\n%s", out.stdout)
+		}
+	})
+}
+
+// TestForemanImageMainPushPublishesOnlyLatest covers build-foreman.yml: a `main`
+// push (and a manual dispatch, its re-run entry point) publishes exactly
+// `foreman:latest` whether or not the repository carries version tags — the
+// repository's own tags never become the version.
+func TestForemanImageMainPushPublishesOnlyLatest(t *testing.T) {
+	requireTools(t, "bash", "git")
+	top, resolve, publish := foremanReleaseSteps(t)
 
 	for _, tc := range []struct {
-		label      string
-		env        map[string]string
-		version    string
-		pushLatest string
+		label string
+		repo  func(*testing.T) string
 	}{
-		{label: "main push resolves the newest tag", env: nil, version: "v0.9.0", pushLatest: "1"},
-		{label: "dispatch of the newest tag", env: map[string]string{"inputs.version": "v0.9.0"}, version: "v0.9.0", pushLatest: "1"},
-		{label: "dispatch of an older version", env: map[string]string{"inputs.version": "v0.1.0"}, version: "v0.1.0", pushLatest: "0"},
-		{label: "tag push", env: map[string]string{"github.ref_type": "tag", "github.ref_name": "v0.9.0"}, version: "v0.9.0", pushLatest: "0"},
+		{label: "repository carries published tags", repo: taggedRepo},
+		{label: "repository carries no tag", repo: scratchRepo},
 	} {
 		t.Run(tc.label, func(t *testing.T) {
-			provided := map[string]string{"inputs.version": ""}
-			for k, v := range tc.env {
-				provided[k] = v
-			}
-			stepEnv := resolveEnv(t, resolve.env, provided, nil)
-			// `github.ref_type` / `github.ref_name` are Actions' built-ins, not
-			// the step's own env: they reach the script as env vars.
-			for contextKey, envKey := range map[string]string{"github.ref_type": "GITHUB_REF_TYPE", "github.ref_name": "GITHUB_REF_NAME"} {
-				if v, ok := tc.env[contextKey]; ok {
-					stepEnv[envKey] = v
-				}
-			}
-			resolved := runStep(t, resolve.run, repo, t.TempDir(), mergeEnv(top, stepEnv))
-			assertOutput(t, resolved, "version", tc.version)
-			assertOutput(t, resolved, "push_latest", tc.pushLatest)
+			repo := tc.repo(t)
+			resolved := runStep(t, resolve.run, repo, t.TempDir(), mergeEnv(top, map[string]string{
+				"GITHUB_REF_TYPE": "branch",
+				"GITHUB_REF_NAME": "main",
+			}))
+			assertOutput(t, resolved, "version", "latest")
 
-			buildArgs := runPublish(t, publish.run, repo, mergeEnv(top, resolveEnv(t, publish.env, nil, nil, resolved.outputs)))
-			want := tc.pushLatest == "1"
-			if got := strings.Contains(buildArgs, "foreman:latest"); got != want {
-				t.Errorf("buildx args contain foreman:latest = %v, want %v\n%s", got, want, buildArgs)
-			}
+			args, env := runForemanPublish(t, top, publish, resolved, repo)
+			assertPublishTags(t, args, env["REGISTRY"]+"/foreman:latest")
 		})
+	}
+}
+
+// foremanReleaseSteps extracts the two build-foreman.yml steps whose scripts
+// decide what a run publishes, plus the workflow-level env they inherit.
+func foremanReleaseSteps(t *testing.T) (top map[string]string, resolve, publish step) {
+	t.Helper()
+	top = workflowEnv(t, foremanWorkflow)
+	steps := workflowSteps(t, foremanWorkflow)
+	return top, requireStep(t, steps, "Resolve the version", foremanWorkflow),
+		requireStep(t, steps, "Build and push the image", foremanWorkflow)
+}
+
+// runForemanPublish resolves the publish step against the resolve step's outputs
+// and runs it, returning the recorded buildx arguments and the resolved env the
+// reference is built from.
+func runForemanPublish(t *testing.T, top map[string]string, publish step, resolved stepRun, cwd string) (string, map[string]string) {
+	t.Helper()
+	env := mergeEnv(top, resolveEnv(t, publish.env, nil, nil, resolved.outputs))
+	return runPublish(t, publish.run, cwd, env), env
+}
+
+// assertPublishTags requires the recorded buildx invocation to carry exactly the
+// tags the trigger names: one tag per run, none beside it.
+func assertPublishTags(t *testing.T, args string, want ...string) {
+	t.Helper()
+	var got []string
+	for _, match := range buildxTag.FindAllStringSubmatch(args, -1) {
+		got = append(got, match[1])
+	}
+	if !slices.Equal(got, want) {
+		t.Errorf("buildx published %v, want %v\n%s", got, want, args)
 	}
 }
 
@@ -177,6 +222,7 @@ var (
 	ternaryExpr = regexp.MustCompile(`^inputs\.[A-Za-z0-9_-]+ && '(.*)' \|\| '(.*)'$`)
 	varsExpr    = regexp.MustCompile(`^vars\.[A-Za-z0-9_-]+ \|\| '(.*)'$`)
 	contextExpr = regexp.MustCompile(`^(github|env|secrets|needs|matrix|runner)\.`)
+	buildxTag   = regexp.MustCompile(`--tag (\S+)`)
 )
 
 func resolveValue(t *testing.T, key, raw string, provided, outputs map[string]string) string {
@@ -308,32 +354,40 @@ exit 0
 	return string(body)
 }
 
-// taggedRepo is a scratch repository with two commits and the tags v0.1.0
-// (older) + v0.9.0 (newest) — the ordering source the foreman workflow's guard
-// reads.
-func taggedRepo(t *testing.T) string {
+// scratchRepo is a scratch repository with two commits and no tag — the state
+// the scheduler line is in before its first release.
+func scratchRepo(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	git := func(args ...string) {
-		t.Helper()
-		argv := append([]string{"-c", "user.name=release-test", "-c", "user.email=release-test@example.invalid"}, args...)
-		cmd := exec.Command("git", argv...)
-		cmd.Dir = dir
-		if out, err := cmd.CombinedOutput(); err != nil {
-			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
-		}
-	}
-	git("init", "-q")
+	gitIn(t, dir, "init", "-q")
 	for _, name := range []string{"first", "second"} {
 		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o644); err != nil {
 			t.Fatalf("write %s: %v", name, err)
 		}
-		git("add", name)
-		git("commit", "-q", "-m", name)
+		gitIn(t, dir, "add", name)
+		gitIn(t, dir, "commit", "-q", "-m", name)
 	}
-	git("tag", "v0.1.0", "HEAD~1")
-	git("tag", "v0.9.0", "HEAD")
 	return dir
+}
+
+// taggedRepo is scratchRepo carrying two published version tags (v0.1.0 older,
+// v0.9.0 newest): a main push must publish `latest` from it, never one of them.
+func taggedRepo(t *testing.T) string {
+	t.Helper()
+	dir := scratchRepo(t)
+	gitIn(t, dir, "tag", "v0.1.0", "HEAD~1")
+	gitIn(t, dir, "tag", "v0.9.0", "HEAD")
+	return dir
+}
+
+func gitIn(t *testing.T, dir string, args ...string) {
+	t.Helper()
+	argv := append([]string{"-c", "user.name=release-test", "-c", "user.email=release-test@example.invalid"}, args...)
+	cmd := exec.Command("git", argv...)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
 }
 
 func stub(t *testing.T, dir, name, body string) {

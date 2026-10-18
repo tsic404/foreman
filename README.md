@@ -28,9 +28,10 @@ make check                # gofmt + vet + tests + build
 
 Both images are built and published to GHCR as multi-platform manifest lists
 (`linux/amd64` + `linux/arm64`) by the workflows in `.github/workflows/`, each
-on its own release line: `build-foreman.yml` publishes `foreman` (tagged with
-this repo's `v*.*.*` version, `latest` from `main`), `build-foreman-job.yml`
-publishes `foreman-job` (tagged with the upstream daemon version it carries,
+on its own release line: `build-foreman.yml` publishes `foreman` (a `v*.*.*`
+tag push publishes exactly `foreman:v<X.Y.Z>` and never touches `latest`, a
+`main` push exactly `foreman:latest`), `build-foreman-job.yml` publishes
+`foreman-job` (tagged with the upstream daemon version it carries,
 resolved from upstream's newest release at build time, `latest` from the newest
 release) and skips a version that is already published. `.github/workflows/` is
 the whole release path and needs nothing from this repo beyond the two
