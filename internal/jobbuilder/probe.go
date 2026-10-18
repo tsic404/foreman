@@ -38,7 +38,7 @@ var ErrInvalidRequestID = errors.New("invalid request id")
 // BuildCatalogProbe renders the catalog-probe Job (fm-catalog-<requestID>) and
 // its credential Secret, returning the digest of the token that Secret carries.
 // Its shape is the deployment template's copy plus the probe write face
-// (ADR-025): A1.1's env keys, the namespace, A1.4's four items and the two
+// (ADR-025): A1.1's env keys, the namespace, A1.4's four items and the four
 // placeholders a probe consumes. The budget becomes activeDeadlineSeconds —
 // the probe's own deadline, written by Foreman and not by the template
 // (§8.4) — and the token always outlives the Job by the drain bound
@@ -89,6 +89,8 @@ func (b *Builder) renderProbe(name, jobRuntimeID string, budget time.Duration) (
 	job, err := renderProbeTemplate(b.template, probeValues{
 		jobImage:     b.cfg.JobImage,
 		jobRuntimeID: jobRuntimeID,
+		jobName:      name,
+		daemonID:     name,
 		credSecret:   name + secretCredSuffix,
 	})
 	if err != nil {
@@ -180,26 +182,39 @@ func (b *Builder) probeCredentialSecret(name, token string) *corev1.Secret {
 	}
 }
 
-// probeValues are the probe render's substitution inputs: the two placeholders
-// a probe consumes, plus the credential Secret name A1.4 ④ writes on the volume
-// references.
+// probeValues are the probe render's substitution inputs: the four
+// placeholders §8.4 lets a probe consume, plus the credential Secret name
+// A1.4 ④ writes on the volume references.
 type probeValues struct {
 	jobImage     string
 	jobRuntimeID string
-	credSecret   string
+	// jobName is the probe's own final Job name (A1.4 ①): the template's
+	// metadata.name is overwritten with it, and every other reading of
+	// <job-name> takes the same value.
+	jobName string
+	// daemonID is the probe's identity name — a probe's identity is its Job
+	// name, which is what its daemon-id label and Job Token carry (§8.4 ②),
+	// so the two placeholders agree on this path.
+	daemonID   string
+	credSecret string
 }
 
-// replacement is the probe's consumption face: exactly the two placeholders
-// §8.4 lets a probe consume. Every other registered placeholder is returned
-// unchanged and so stays verbatim — it names a task the probe does not have, so
-// there is no value to invent (and silence beats failure here: the probe must
-// still register).
+// replacement is the probe's consumption face: exactly the four placeholders
+// §8.4 lets a probe consume — image, job runtime identity, final Job name and
+// daemon identity. Every other registered placeholder is returned unchanged and
+// so stays verbatim — it names a task the probe does not have, so there is no
+// value to invent (and silence beats failure here: the probe must still
+// register).
 func (v probeValues) replacement(placeholder string) string {
 	switch placeholder {
 	case placeholderJobImage:
 		return v.jobImage
 	case placeholderJobRuntimeID:
 		return v.jobRuntimeID
+	case placeholderJobName:
+		return v.jobName
+	case placeholderDaemonID:
+		return v.daemonID
 	default:
 		return placeholder
 	}
