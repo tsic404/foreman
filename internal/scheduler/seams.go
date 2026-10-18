@@ -102,7 +102,7 @@ type Reconciler interface {
 // them. A queued report also holds back the object cleanup of its task:
 // a deleted Job must never stand in for a delivered report.
 type PendingReports interface {
-	Enqueue(taskID string, ep Endpoint, body []byte) error
+	Enqueue(taskID, jobName, daemonID string, ep Endpoint, body []byte) error
 	// Queued reports whether taskID's terminal report is still undelivered.
 	Queued(taskID string) bool
 }

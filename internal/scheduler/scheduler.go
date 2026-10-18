@@ -525,7 +525,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		return fmt.Errorf("register task %s: %w", e.TaskID, err)
 	}
 	s.log.InfoContext(ctx, "task.claimed",
-		"task_id", e.TaskID, "job_name", e.JobName,
+		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 		"issue_identifier", e.IssueIdentifier,
 		"autopilot_run_id", e.AutopilotRunID, "chat_session_id", e.ChatSessionID,
 		"agent_id", e.AgentID)
@@ -582,7 +582,8 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 			_ = s.reg.Delete(e.TaskID)
 			s.metrics.InflightJobs(s.reg.Inflight())
 			s.log.WarnContext(ctx, "task.claim_deferred",
-				"task_id", e.TaskID, "job_name", e.JobName, "err", err.Error())
+				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+				"err", err.Error())
 			return err
 		}
 		cause := fmt.Errorf("create job: %w", err)
@@ -759,7 +760,7 @@ func (s *Scheduler) Deliver(daemonID string, runtimeID string, maxTasks int) ([]
 		// The full payload never leaves process memory (F3); a rebuilt entry
 		// has nothing to deliver and is converged away instead.
 		s.log.Warn("task.payload_missing",
-			"task_id", e.TaskID, "job_name", e.JobName)
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID)
 		return nil, nil
 	}
 
@@ -796,7 +797,7 @@ func (s *Scheduler) Deliver(daemonID string, runtimeID string, maxTasks int) ([]
 		s.reg.PutRuntime(rt)
 	}
 	s.log.Info("task.delivered",
-		"task_id", e.TaskID, "job_name", e.JobName,
+		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 		"deliver_latency_ms", now.Sub(e.ClaimedAt).Milliseconds())
 	if e.Deliveries > 1 {
 		// The window's exit (ADR-032): the delivery committed at
@@ -876,12 +877,14 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			// Permanent failure (§1.1 failure table): no retry, no queue;
 			// the entry stays terminal and the objects stay for inspection.
 			s.log.ErrorContext(ctx, "task.forward_failed",
-				"task_id", e.TaskID, "endpoint", string(ep), "status", code)
+				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+				"endpoint", string(ep), "status", code)
 		default:
 			// Transient failure with the retry budget exhausted: queue the
 			// report; recovery drains it until the server accepts (§4).
 			s.log.ErrorContext(ctx, "task.forward_failed",
-				"task_id", e.TaskID, "endpoint", string(ep), "status", code)
+				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+				"endpoint", string(ep), "status", code)
 			s.enqueuePending(ctx, e, ep, body)
 			return http.StatusBadGateway, upstreamUnavailableBody, nil
 		}
@@ -900,14 +903,14 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			if started, ok := s.reg.MarkStarted(e.TaskID, now); ok {
 				s.metrics.JobBootSeconds(now.Sub(started.ClaimedAt).Seconds())
 				s.log.InfoContext(ctx, "task.started",
-					"task_id", e.TaskID, "job_name", e.JobName,
+					"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", started.DaemonID,
 					"boot_seconds", now.Sub(started.ClaimedAt).Seconds())
 			}
 			return code, resp, nil
 		case code == http.StatusConflict:
 			if err := s.OnStartRejected(ctx, e.TaskID); err != nil {
 				s.log.ErrorContext(ctx, "task.settle_failed",
-					"task_id", e.TaskID, "job_name", e.JobName,
+					"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 					"endpoint", string(ep), "err", err)
 			}
 			return code, resp, nil
@@ -941,9 +944,10 @@ var upstreamUnavailableBody = []byte(`{"error":"upstream unavailable"}`)
 // undelivered so the entry's objects stay put. The error is logged, never
 // acted on — dropping the report here is exactly what §4 forbids.
 func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep Endpoint, body []byte) {
-	if err := s.pendingReports.Enqueue(e.TaskID, ep, body); err != nil {
+	if err := s.pendingReports.Enqueue(e.TaskID, e.JobName, e.DaemonID, ep, body); err != nil {
 		s.log.ErrorContext(ctx, "task.forward_undelivered",
-			"task_id", e.TaskID, "endpoint", string(ep),
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+			"endpoint", string(ep),
 			"reason", "pending-report enqueue failed", "err", err)
 	}
 }
@@ -1157,7 +1161,8 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 // deleting it would let a Job deletion stand in for a delivered report.
 func (s *Scheduler) failEntry(ctx context.Context, e registry.TaskEntry, report failReport) error {
 	s.log.ErrorContext(ctx, "task.failed_compensated",
-		"task_id", e.TaskID, "job_name", e.JobName, "failure_reason", report.reason)
+		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+		"failure_reason", report.reason)
 	if _, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, report.reason, s.now()); err != nil {
 		return err
 	}
@@ -1212,7 +1217,7 @@ func (s *Scheduler) AdoptRunning(ctx context.Context, taskID string) error {
 		return nil
 	}
 	s.log.InfoContext(ctx, "task.adopted_running",
-		"task_id", e.TaskID, "job_name", e.JobName)
+		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID)
 	return nil
 }
 
@@ -1254,7 +1259,7 @@ func (s *Scheduler) OnTaskVanished(ctx context.Context, taskID string) error {
 	}
 	if !e.IsTerminal() {
 		s.log.InfoContext(ctx, "task.vanished",
-			"task_id", e.TaskID, "job_name", e.JobName)
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID)
 		if _, err := s.reg.MarkTerminal(taskID, "", "", s.now()); err != nil {
 			return err
 		}
@@ -1282,7 +1287,8 @@ func (s *Scheduler) revokeCredential(ctx context.Context, e registry.TaskEntry) 
 func (s *Scheduler) discardQuietly(ctx context.Context, e registry.TaskEntry) {
 	if err := s.DiscardTask(ctx, e.TaskID); err != nil {
 		s.log.WarnContext(ctx, "task.discard_failed",
-			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+			"err", err)
 	}
 }
 
@@ -1656,7 +1662,8 @@ func (s *Scheduler) failClaim(ctx context.Context, e registry.TaskEntry, cause e
 	}
 	s.metrics.TaskTerminal(string(registry.ResultFailed))
 	s.log.ErrorContext(ctx, "task.failed_compensated",
-		"task_id", e.TaskID, "job_name", e.JobName, "failure_reason", reason, "err", cause.Error())
+		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+		"failure_reason", reason, "err", cause.Error())
 	report := failReport{reason: reason, message: cause.Error()}
 	// A report whose forward does not land goes to the durable queue
 	// (场景 #10); the entry stays terminal until a round drains it.
@@ -1677,7 +1684,8 @@ func (s *Scheduler) reportFail(ctx context.Context, e registry.TaskEntry, report
 		err = fmt.Errorf("server returned %d", code)
 	}
 	s.log.ErrorContext(ctx, "task.forward_failed",
-		"task_id", e.TaskID, "endpoint", string(EPFail), "status", code, "err", err)
+		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+		"endpoint", string(EPFail), "status", code, "err", err)
 	s.enqueuePending(ctx, e, EPFail, body)
 	return err
 }
