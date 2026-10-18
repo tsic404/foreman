@@ -55,6 +55,13 @@ func TestTechConcurrency01InflightCapLeavesExcessQueued(t *testing.T) {
 	awaitCondition(t, "three tasks queued server-side", func() bool {
 		return h.upstream.tasksInStatus(taskStatusQueued) == 3
 	})
+	// The Job face lags the registry count above: OnClaim registers the entry
+	// and places the Job a step later, so waiting on Inflight() alone samples
+	// a fact the assertion below then re-reads. Wait on the asserted count
+	// itself; an overshoot stays the assertion's to report.
+	awaitCondition(t, "both claimed tasks' Jobs placed", func() bool {
+		return h.liveTaskJobs() >= concurrency01MaxInflight
+	})
 	if got := h.sched.ClaimBudget(); got != 0 {
 		t.Fatalf("ClaimBudget() = %d with %d in flight, want 0", got, h.reg.Inflight())
 	}
@@ -115,6 +122,14 @@ func TestTechConcurrency01InflightCapLeavesExcessQueued(t *testing.T) {
 				inflightBefore, refill, freeAfterSettle)
 		}
 	}
+
+	// Every hand-out must have landed as a Job before the last tasks settle:
+	// the server marks a task dispatched when it hands it out, a step before
+	// the claim's Job exists, so the queue reads empty while one claim is
+	// still mid-flight. An overshoot stays the assertion's to report.
+	awaitCondition(t, "every dispatched task's Job placed", func() bool {
+		return len(h.createdTaskJobNames()) >= len(concurrency01Tasks)
+	})
 
 	// The last two in-flight tasks settle without a refill: the queue is
 	// empty, so every task has run and nothing is left waiting.
@@ -222,6 +237,11 @@ func TestTechConcurrency01ClaimBatchClampBinds(t *testing.T) {
 	startConcurrency01ClaimLoop(t, h)
 	awaitCondition(t, "the two freed slots are refilled", func() bool {
 		return h.reg.Inflight() == clampMaxInflight
+	})
+	// The refill's Jobs land a step after the registry rows the wait above
+	// covers, and the per-task create counts asserted below are that Job face.
+	awaitCondition(t, "every refilled claim's Job placed", func() bool {
+		return len(h.createdTaskJobNames()) >= clampTasks
 	})
 	refill := concurrency01ClaimBatches(t, h)[len(want):]
 	if !slices.Equal(refill, []int{2}) {
