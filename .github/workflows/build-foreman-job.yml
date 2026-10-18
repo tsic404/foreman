@@ -9,7 +9,7 @@
 # referenced by movable tag (ADR-012); the published version tags are the
 # rollback path, so a run never publishes `latest` alone.
 #
-# What the image carries is ADR-031: the upstream daemon CLI and `foreman-gc`,
+# What the image carries is ADR-033: the upstream daemon CLI and `foreman-gc`,
 # with no agent backend of its own — the template's init step installs `omp`
 # into the Job at start-up, and the image keeps the C++ runtime that binary
 # links against. `nix` is not part of the image either.

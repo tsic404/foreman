@@ -1,4 +1,4 @@
-// TC-tech-job-08 covers the agent-backend provision ADR-031 splits in two: the
+// TC-tech-job-08 covers the agent-backend provision ADR-033 splits in two: the
 // Job image carries `dumb-init` and no longer carries `omp` / `nix`, and the
 // reference template installs the agent backend where the agent container's
 // MULTICA_OMP_PATH reads it. The image half runs against the published

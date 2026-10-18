@@ -10,11 +10,11 @@
 #     `libgcc`): the agent binary is installed by the template at start-up, not
 #     built into this image, but it is dynamically linked against musl +
 #     libstdc++ and executes inside this image — removing the package makes
-#     every Job fail at agent start (ADR-031),
+#     every Job fail at agent start (ADR-033),
 #   * `dumb-init`, the container PID 1 the Job and probe Job `command`s start
 #     with, so orphans are reaped and SIGTERM is not swallowed (ADR-022).
 #
-# `omp` and `nix` are deliberately absent (ADR-031): the agent binary comes
+# `omp` and `nix` are deliberately absent (ADR-033): the agent binary comes
 # from the consuming Job template's init step, and the task-side toolchain is
 # the template's business — the image carries no agent backend of its own.
 #
