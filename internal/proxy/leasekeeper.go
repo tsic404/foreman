@@ -36,8 +36,8 @@ type LeaseHooks interface {
 }
 
 // LeaseKeeper renews prepare leases (C4) for tasks that are claimed but not
-// yet started, every FOREMAN_LEASE_REFRESH_INTERVAL (must stay < the 45s
-// server lease, §1.1 C3). It also enforces the pre-start terminal bound, the
+// yet started, every FOREMAN_LEASE_REFRESH_INTERVAL (capped at 20s by the
+// config guard, §10). It also enforces the pre-start terminal bound, the
 // boot deadline (scenario #4), with the S6 delivery attribution split
 // (scenario #18, ADR-032); the delivery confirmation window itself is not a
 // bound here — it releases the delivery for another attempt on the claim
@@ -130,7 +130,7 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 				k.log.Error("task-vanish settlement failed", "task_id", e.TaskID, "err", verr)
 			}
 		default:
-			// Transient failure: next tick retries (§4 backoff envelope).
+			// Transient failure: the next tick retries within the §10 bound.
 			k.log.Debug("prepare-lease failed", "task_id", e.TaskID, "err", err)
 		}
 	}

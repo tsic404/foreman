@@ -7,8 +7,6 @@ import (
 	"strconv"
 	"strings"
 	"time"
-
-	"github.com/tsic404/foreman/internal/scheduler"
 )
 
 // Environment variable names from the contract config table (§5.1).
@@ -37,6 +35,10 @@ const (
 	DefaultModelCatalogEnabled  = true
 	DefaultModelCatalogTimeout  = 45 * time.Second
 	DefaultModelCatalogCacheTTL = 6 * time.Hour
+
+	// MaxLeaseRefreshInterval is the upper bound on the renewal cadence: §10
+	// requires a claimed, not-yet-started task to be renewed every ≤20s.
+	MaxLeaseRefreshInterval = 20 * time.Second
 
 	// ProbeHeartbeatInterval is the fixed heartbeat interval written into the
 	// catalog probe env; the startup self-check ties ModelCatalogTimeout to it.
@@ -122,11 +124,13 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if cfg.LeaseRefreshInterval, err = envDuration(getenv, EnvLeaseRefreshInterval, cfg.LeaseRefreshInterval); err != nil {
 		return Config{}, err
 	}
-	// The server-side prepare lease is 45s (§1.1 C3); refreshing slower
-	// guarantees duplicate dispatch.
-	if cfg.LeaseRefreshInterval >= scheduler.PrepareLeaseTTL {
-		return Config{}, fmt.Errorf("%s must be < %s (server prepare lease), got %s",
-			EnvLeaseRefreshInterval, scheduler.PrepareLeaseTTL, cfg.LeaseRefreshInterval)
+	// The interval is the renewal cadence itself, so a value above §10's 20s
+	// bound leaves a claimed task unrenewed for longer than the contract
+	// allows — one delayed tick plus the C4 request timeout then approaches
+	// the 45s server lease and the task can be redispatched before it starts.
+	if cfg.LeaseRefreshInterval > MaxLeaseRefreshInterval {
+		return Config{}, fmt.Errorf("%s (%s) must be <= %s (§10 lease renewal bound)",
+			EnvLeaseRefreshInterval, cfg.LeaseRefreshInterval, MaxLeaseRefreshInterval)
 	}
 	if raw := strings.TrimSpace(getenv(EnvWSEnabled)); raw != "" {
 		b, perr := strconv.ParseBool(raw)

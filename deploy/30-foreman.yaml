@@ -90,6 +90,8 @@ spec:
               value: "5s"
             - name: FOREMAN_CLAIM_INTERVAL_IDLE
               value: "30s"
+            # Renewal cadence for a claimed, not-yet-started task; values above
+            # 20s are refused at startup (§10: renewed every ≤20s).
             - name: FOREMAN_LEASE_REFRESH_INTERVAL
               value: "15s"
             - name: FOREMAN_JOB_BOOT_TIMEOUT
