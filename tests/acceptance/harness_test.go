@@ -137,6 +137,16 @@ type modelCommand struct {
 	runtimeID string
 	delivered bool
 	completed bool
+	// deliveredAt anchors the server's window at delivery (§1.3「窗口自交付起算」).
+	deliveredAt time.Time
+	// body is the result the record holds, bodyWrites how many C21 forwards it
+	// adopted: a repeat that adopts the same bytes again is idempotent, a forward
+	// past the window adopts nothing (§1.3).
+	body       []byte
+	bodyWrites int
+	// dropNextResponse makes the next C21 answer vanish on the wire — the
+	// result landed but its response never reached Foreman (§1.1 C21 重试规则).
+	dropNextResponse bool
 }
 
 // queuedTask is one task the stub server holds on its side of the claim
@@ -167,6 +177,10 @@ type upstreamStub struct {
 	modelsStatus int
 	// models tracks the caller-facing model-list commands by request id.
 	models map[string]*modelCommand
+	// modelWindow is the server's request window, anchored at delivery: a C21
+	// forward past it is answered like any other and adopts nothing. Zero means
+	// the window is not modelled (every forward adopts).
+	modelWindow time.Duration
 	// modelSeq numbers the minted request ids (the real ones are 32 hex digits).
 	modelSeq int
 	// queued is the server-side task queue C3 serves. Empty by default.
@@ -270,7 +284,18 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 	mux.HandleFunc("POST /api/daemon/runtimes/{rid}/models/{req}/result", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		stub.record(r, r.URL.Path, body)
-		stub.completeModelCommand(r.PathValue("req"))
+		requestID := r.PathValue("req")
+		stub.acceptModelResult(requestID, body)
+		if stub.takeDroppedModelResponse(requestID) {
+			// The result landed but its answer never reaches Foreman: closing
+			// the connection is how a lost response looks to the caller.
+			if conn, _, err := http.NewResponseController(w).Hijack(); err == nil {
+				_ = conn.Close()
+				return
+			}
+			writeJSON(w, http.StatusBadGateway, map[string]string{"status": "error"})
+			return
+		}
 		writeJSON(w, stub.modelsStatus, map[string]string{"status": "ok"})
 	})
 	// The claim loop's preflight (C17/C18/C16). A scenario driving the
@@ -427,28 +452,40 @@ func (s *upstreamStub) newModelCommand(runtimeID string) *modelCommand {
 }
 
 // deliverModelCommand hands the runtime's pending command to one ack — the
-// server delivers a request exactly once.
+// server delivers a request exactly once, and the delivery anchors its window.
 func (s *upstreamStub) deliverModelCommand(runtimeID string) *modelCommand {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	for _, cmd := range s.models {
 		if cmd.runtimeID == runtimeID && !cmd.delivered {
 			cmd.delivered = true
+			cmd.deliveredAt = time.Now()
 			return cmd
 		}
 	}
 	return nil
 }
 
-// completeModelCommand records the C21 result the server accepted.
-func (s *upstreamStub) completeModelCommand(requestID string) {
+// acceptModelResult plays the server taking one C21 forward: inside the window
+// the record adopts the body (counting the write, so a repeat stays visible),
+// past it the forward is answered like any other and changes nothing (§1.3
+// 「越过窗口后的转发不改写终态与缓存」).
+func (s *upstreamStub) acceptModelResult(requestID string, body []byte) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	if cmd, ok := s.models[requestID]; ok {
-		cmd.completed = true
+	cmd, ok := s.models[requestID]
+	if !ok {
+		return
 	}
+	if s.modelWindow > 0 && !cmd.deliveredAt.IsZero() && time.Since(cmd.deliveredAt) > s.modelWindow {
+		return
+	}
+	cmd.body = append([]byte(nil), body...)
+	cmd.bodyWrites++
+	cmd.completed = true
 }
 
+// modelCommandState reports the delivery and completion faces of one request.
 func (s *upstreamStub) modelCommandState(requestID string) (delivered, completed bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -457,6 +494,80 @@ func (s *upstreamStub) modelCommandState(requestID string) (delivered, completed
 		return false, false
 	}
 	return cmd.delivered, cmd.completed
+}
+
+// modelCommandVerdict reads the server's request record back: "completed" once
+// a result landed, "timeout" once the window closed without one, "pending"
+// while it is still open ("" for an unknown request).
+func (s *upstreamStub) modelCommandVerdict(requestID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cmd, ok := s.models[requestID]
+	if !ok {
+		return ""
+	}
+	switch {
+	case cmd.completed:
+		return "completed"
+	case cmd.delivered && s.modelWindow > 0 && time.Since(cmd.deliveredAt) > s.modelWindow:
+		return "timeout"
+	default:
+		return "pending"
+	}
+}
+
+// modelCommandRecord reads back what the server's record holds and how many C21
+// forwards it adopted.
+func (s *upstreamStub) modelCommandRecord(requestID string) ([]byte, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cmd, ok := s.models[requestID]
+	if !ok {
+		return nil, 0
+	}
+	return append([]byte(nil), cmd.body...), cmd.bodyWrites
+}
+
+// setModelWindow programs the server's request window (zero leaves it
+// unmodelled).
+func (s *upstreamStub) setModelWindow(window time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.modelWindow = window
+}
+
+// markModelDelivered plays the server handing one request out through the
+// runtime's ack — the step a heartbeat-stream scenario gets for free, and one a
+// scenario driving OnAck directly has to state.
+func (s *upstreamStub) markModelDelivered(requestID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cmd, ok := s.models[requestID]; ok {
+		cmd.delivered = true
+		cmd.deliveredAt = time.Now()
+	}
+}
+
+// programDroppedModelResponse programs the next C21 answer for one request to
+// vanish on the wire.
+func (s *upstreamStub) programDroppedModelResponse(requestID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if cmd, ok := s.models[requestID]; ok {
+		cmd.dropNextResponse = true
+	}
+}
+
+// takeDroppedModelResponse consumes the programmed lost answer.
+func (s *upstreamStub) takeDroppedModelResponse(requestID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	cmd, ok := s.models[requestID]
+	if !ok || !cmd.dropNextResponse {
+		return false
+	}
+	cmd.dropNextResponse = false
+	return true
 }
 
 // requestModelList is the caller-facing entry point: one model-list command for
@@ -589,6 +700,15 @@ func (c *jobClient) DeleteSecret(_ context.Context, name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.deletedSecrets = append(c.deletedSecrets, name)
+	// As on the Job side: a deleted object leaves the list face, or a sweep that
+	// reads the list again would find what it just removed.
+	kept := c.secrets[:0]
+	for _, secret := range c.secrets {
+		if secret.Name != name {
+			kept = append(kept, secret)
+		}
+	}
+	c.secrets = kept
 	return nil
 }
 
@@ -633,6 +753,50 @@ func (c *jobClient) jobDeleted(name string) bool {
 		}
 	}
 	return false
+}
+
+// secretDeleted reports whether the Secret object was deleted.
+func (c *jobClient) secretDeleted(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, deleted := range c.deletedSecrets {
+		if deleted == name {
+			return true
+		}
+	}
+	return false
+}
+
+// deletedSecretNames snapshots the Secret deletions in order.
+func (c *jobClient) deletedSecretNames() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.deletedSecrets...)
+}
+
+// deletedJobNames snapshots the Job deletions in order.
+func (c *jobClient) deletedJobNames() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.deletedJobs...)
+}
+
+// programListed stages the list faces (ListJobs/ListSecrets): the remnant forms
+// a sweep scenario needs, which the fake client cannot reach by creating
+// objects alone.
+func (c *jobClient) programListed(jobs []batchv1.Job, secrets []corev1.Secret) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.jobs = jobs
+	c.secrets = secrets
+}
+
+// programGetJob stages the GetJob face: the sweep's "does this Job still
+// exist" question answers from here.
+func (c *jobClient) programGetJob(job *batchv1.Job) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.existingJobs[job.Name] = job
 }
 
 func (c *jobClient) probeJobsCreated() []string {
@@ -1202,56 +1366,79 @@ func (h *harness) newReporter(t *testing.T) *proxy.ModelCatalogReporter {
 // serveProbeDaemon plays the probe pod's daemon: register (S4), take the command
 // from the S5 ack, then report it (S27). It runs off the CreateJob call so the
 // scheduler's start path is not held up by the HTTP round trips; the returned
-// channel yields the command id the daemon was handed.
+// channel yields the command id of the first probe the daemon serves (later
+// probes report without waiting for a reader — a scenario that watches one
+// probe is not made to drain every one).
 func (h *harness) serveProbeDaemon(t *testing.T, resultBody string) <-chan string {
 	t.Helper()
 	seen := make(chan string, 1)
 	h.jobs.onCreateJob = func(job *batchv1Job) {
 		name := job.Name
 		go func() {
-			token := h.builder.probeToken(name)
-			if token == "" {
+			command := h.probeTakeCommand(t, name)
+			if command == "" {
 				return
 			}
-			code, body, err := h.probeCall("POST", "/api/daemon/register", token, []byte(`{
-				"daemon_id": "`+name+`",
-				"cli_version": "0.6.1",
-				"runtimes": [{"name": "foreman-omp", "type": "omp", "version": "0.6.1"}]
-			}`))
-			if err != nil || code != 200 {
-				t.Errorf("probe S4 = %d: %s (%v)", code, body, err)
-				return
+			select {
+			case seen <- command:
+			default:
 			}
 			session, ok := h.probes.ProbeByJob(name)
 			if !ok {
-				t.Errorf("probe session %s missing at S4", name)
+				t.Errorf("probe session %s is gone before its result", name)
 				return
 			}
-			code, body, err = h.probeCall("POST", "/api/daemon/heartbeat", token,
-				[]byte(`{"runtime_id": "`+session.JobRuntime+`"}`))
-			if err != nil || code != 200 {
-				t.Errorf("probe S5 = %d: %s (%v)", code, body, err)
-				return
-			}
-			var ack struct {
-				PendingModelList *struct {
-					ID string `json:"id"`
-				} `json:"pending_model_list"`
-			}
-			if err := json.Unmarshal(body, &ack); err != nil || ack.PendingModelList == nil {
-				t.Errorf("probe S5 ack carries no command: %s (%v)", body, err)
-				return
-			}
-			seen <- ack.PendingModelList.ID
-			code, body, err = h.probeCall("POST",
-				"/api/daemon/runtimes/"+session.JobRuntime+"/models/"+ack.PendingModelList.ID+"/result",
-				token, []byte(resultBody))
+			code, body, err := h.probeCall("POST",
+				"/api/daemon/runtimes/"+session.JobRuntime+"/models/"+command+"/result",
+				h.builder.probeToken(name), []byte(resultBody))
 			if err != nil || code != 200 {
 				t.Errorf("probe S27 = %d: %s (%v)", code, body, err)
 			}
 		}()
 	}
 	return seen
+}
+
+// probeTakeCommand plays the probe daemon's start-up: S4 registration, then the
+// command id the S5 ack hands it. It returns "" when a round trip failed — the
+// daemon runs off the test goroutine, so failures are reported with t.Errorf.
+func (h *harness) probeTakeCommand(t *testing.T, name string) string {
+	t.Helper()
+	token := h.builder.probeToken(name)
+	if token == "" {
+		t.Errorf("probe Job %s has no Job Token", name)
+		return ""
+	}
+	code, body, err := h.probeCall("POST", "/api/daemon/register", token, []byte(`{
+		"daemon_id": "`+name+`",
+		"cli_version": "0.6.1",
+		"runtimes": [{"name": "foreman-omp", "type": "omp", "version": "0.6.1"}]
+	}`))
+	if err != nil || code != 200 {
+		t.Errorf("probe S4 = %d: %s (%v)", code, body, err)
+		return ""
+	}
+	session, ok := h.probes.ProbeByJob(name)
+	if !ok {
+		t.Errorf("probe session %s missing at S4", name)
+		return ""
+	}
+	code, body, err = h.probeCall("POST", "/api/daemon/heartbeat", token,
+		[]byte(`{"runtime_id": "`+session.JobRuntime+`"}`))
+	if err != nil || code != 200 {
+		t.Errorf("probe S5 = %d: %s (%v)", code, body, err)
+		return ""
+	}
+	var ack struct {
+		PendingModelList *struct {
+			ID string `json:"id"`
+		} `json:"pending_model_list"`
+	}
+	if err := json.Unmarshal(body, &ack); err != nil || ack.PendingModelList == nil {
+		t.Errorf("probe S5 ack carries no command: %s (%v)", body, err)
+		return ""
+	}
+	return ack.PendingModelList.ID
 }
 
 // probeCall performs one Job-side request from the probe daemon's own
@@ -1322,3 +1509,98 @@ func (noReports) Queued(string) bool                                            
 type noRevoker struct{}
 
 func (noRevoker) Revoke(string) {}
+
+// steppedClock is the reporter's clock seam with a scenario-controlled offset:
+// a catalog scenario ages one request's budget without waiting it out, and the
+// span the reporter records stays exactly reproducible.
+type steppedClock struct {
+	mu     sync.Mutex
+	offset time.Duration
+}
+
+func (c *steppedClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return time.Now().Add(c.offset)
+}
+
+// advance moves the clock forward; the reporter reads the offset on its next
+// now() call.
+func (c *steppedClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.offset += d
+}
+
+// gatingBuilder holds probe builds until the scenario releases them, so the
+// state a queued-request scenario needs — a probe genuinely in flight — is
+// deterministic instead of a race against the probe's build and relay.
+type gatingBuilder struct {
+	probeBuilder
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newGatingBuilder(inner probeBuilder) *gatingBuilder {
+	return &gatingBuilder{probeBuilder: inner, started: make(chan struct{}, 1), release: make(chan struct{})}
+}
+
+// BuildCatalogProbe signals the first build and waits for the release; once
+// released, every later build passes straight through.
+func (b *gatingBuilder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
+	select {
+	case b.started <- struct{}{}:
+	default:
+	}
+	<-b.release
+	return b.probeBuilder.BuildCatalogProbe(requestID, jobRuntimeID, workspaceID, budget)
+}
+
+// releaseAll lets every held build through; safe to call more than once (a
+// scenario registers it as cleanup so a failed assertion cannot strand one).
+func (b *gatingBuilder) releaseAll() {
+	b.once.Do(func() { close(b.release) })
+}
+
+// gateProbes installs the gating builder on the scheduler, so a scenario can
+// hold one probe open. The scheduler is rebuilt because it captured the builder
+// at construction.
+func (h *harness) gateProbes(t *testing.T) *gatingBuilder {
+	t.Helper()
+	gated := newGatingBuilder(h.builder)
+	h.builder = gated
+	h.rebuildScheduler(t, func(*scheduler.Config) {})
+	return gated
+}
+
+// runHeartbeatStream runs the production C2 stream against the stub upstream
+// for the rest of the test: the ack it receives is what hands a model-list
+// command to the reporter.
+func (h *harness) runHeartbeatStream(t *testing.T, reporter *proxy.ModelCatalogReporter) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = proxy.NewHeartbeatLoop(h.client, reporter).Run(ctx)
+	}()
+	t.Cleanup(func() {
+		cancel()
+		<-done
+	})
+}
+
+// waitFor polls cond until it holds or the timeout passes: the catalog
+// outcomes land one poll interval after the relay, not on the call's return.
+func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
