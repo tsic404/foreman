@@ -1653,6 +1653,36 @@ func TestOnReportStart409RunningAdoptsEntry(t *testing.T) {
 	}
 }
 
+// C13 = waiting_local_directory is post-delivery too (ADR-026 决策结果 1
+// 证据面②): the refused start adopts the entry, keeps its Job and leaves the
+// state at the delivery phase.
+func TestOnReportStart409WaitingLocalDirectoryAdoptsEntry(t *testing.T) {
+	f := newFixture(t)
+	e := f.claim(t, "t-wait")
+	e.State = registry.StateDelivering
+	f.reg.Put(e)
+	f.server.forwardCode = 409
+	f.server.status = "waiting_local_directory"
+
+	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`), "")
+	if err != nil || code != 409 {
+		t.Fatalf("OnReport = %d, %v (the daemon keeps the server's 409)", code, err)
+	}
+	got, ok := f.reg.Get("t-wait")
+	if !ok || got.State != registry.StateDelivering || got.StartedAt.IsZero() {
+		t.Fatalf("entry = %+v, want delivering with the start fact", got)
+	}
+	if !f.hasJob("fm-t-wait") {
+		t.Fatal("the Job of an adopted post-delivery task must be kept")
+	}
+	if len(f.server.forwards) != 1 || f.server.forwards[0].ep != EPStart {
+		t.Fatalf("forwards = %+v, want the start only (no synthesized fail)", f.server.forwards)
+	}
+	if got := f.metrics.terminal; len(got) != 0 {
+		t.Fatalf("terminal metric = %v, want none", got)
+	}
+}
+
 // A C13 value outside the domain gets no disposition: the entry is kept and
 // the value is reported, never guessed (ADR-026 决策结果 3).
 func TestOnReportStart409UnclassifiedStatusIsReported(t *testing.T) {

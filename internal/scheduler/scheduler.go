@@ -1224,9 +1224,10 @@ func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep
 // OnStartRejected settles an entry whose S-8 start the server refused with
 // 409 (S-8 + §1.5: 状态不允许).
 // The ordering puts C13 before the compensation: a 409 says "not startable",
-// not "not running", so running adopts, terminal settles, 404 releases, and
-// only queued/dispatched proves the claim itself stale — that one is settled
-// failed (stale_claim) and its Job/Secret go, ending the re-dispatch loop.
+// not "not running", so a post-delivery status adopts, terminal settles, 404
+// releases, and only queued/dispatched proves the claim itself stale — that
+// one is settled failed (stale_claim) and its Job/Secret go, ending the
+// re-dispatch loop.
 //
 // The caller holds the task's lock (OnReport's S8 round), so the C13 answer
 // and the transition cannot be overtaken by another settlement path.
@@ -1245,9 +1246,9 @@ func (s *Scheduler) OnStartRejected(ctx context.Context, taskID string) error {
 	}
 	s.reg.SetLastStatusSeen(taskID, st)
 	switch {
-	case st == "running":
-		// The start landed after all: keep the Job, wait for the daemon's
-		// reports (§4.3).
+	case st == "running" || st == "waiting_local_directory":
+		// Post-delivery (ADR-026 决策结果 1 证据面②): the daemon holds the
+		// task, so record the start fact, stop renewals and keep the Job.
 		return s.AdoptRunning(ctx, taskID, st)
 	case registry.IsTerminalResult(st):
 		return s.settleTerminalLocked(ctx, taskID, st)
@@ -1256,11 +1257,6 @@ func (s *Scheduler) OnStartRejected(ctx context.Context, taskID string) error {
 			reason:  FailureReasonStaleClaim,
 			message: "server rejected the task start: task claim is stale or task is no longer startable",
 		})
-	case st == "waiting_local_directory":
-		// The daemon holds the task but has not started it: no decisive fact
-		// for the refused start (S-7 + §10: 租约不超时) — the daemon's own
-		// reports converge this entry.
-		return nil
 	default:
 		s.logUnclassifiedStatus(ctx, e, st)
 		return nil
