@@ -475,6 +475,39 @@ func TestReconcileLivePreStartEntryIsLeftAlone(t *testing.T) {
 	}
 }
 
+// ADR-026 决策 5: the discard row's 成立面 is started_at == 0. An entry
+// adopted through C13 has lost its payload with the restart, so it still
+// answers the payload test; a later queued/dispatched answer (the server
+// re-queues or the status jitters) must not send it back to that row — the
+// Job survives and the entry converges on the Job/Pod facts.
+func TestReconcileAdoptedEntryOnStatusFallbackIsKept(t *testing.T) {
+	for _, status := range []string{"queued", "dispatched"} {
+		t.Run(status, func(t *testing.T) {
+			e := testEntry("t1")
+			e.Payload = nil // rebuilt entry: nothing to deliver
+			e.StartedAt = time.Now().Add(-time.Minute)
+			reg := newRegistry(t, e)
+			set := &fakeSettler{}
+
+			r := newTestReconciler(t, reg, &fakeObjects{job: runningJob("fm-t1")}, &fakeStatus{status: status}, set)
+			if err := r.Reconcile(context.Background()); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if gone, fails, settles, adopts, discards := set.calls(); gone+fails+settles+adopts+discards != 0 {
+				t.Fatalf("settlements = gone:%d fail:%d terminal:%d adopt:%d discard:%d, want none for an adopted entry",
+					gone, fails, settles, adopts, discards)
+			}
+			got, ok := reg.Get("t1")
+			if !ok {
+				t.Fatal("the adopted entry disappeared from the index")
+			}
+			if got.StartedAt.IsZero() {
+				t.Fatal("started_at was cleared")
+			}
+		})
+	}
+}
+
 func TestReconcileRunningTaskIsAdopted(t *testing.T) {
 	reg := newRegistry(t, testEntry("t1"))
 	set := &fakeSettler{}
@@ -786,6 +819,65 @@ func TestReconcileCancelledPrunedWhenDaemonAcks(t *testing.T) {
 	}
 	if _, _, _, _, discards := set.calls(); discards != 0 {
 		t.Fatalf("discards = %d, want 0 (the ack path owns the cleanup)", discards)
+	}
+}
+
+// A cancelled observation that falls back to a pre-delivery status must drop
+// the cancel deadline (02-contracts §4.6): a stale timestamp makes
+// nextDeadline() return a past instant — the loop's wait goes to zero and
+// spins — and lets the next cancelled observation settle on the old window
+// instead of the daemon's fresh cancel-ack window.
+func TestReconcileStatusFallbackClearsCancelDeadline(t *testing.T) {
+	for _, status := range []string{"queued", "dispatched"} {
+		t.Run(status, func(t *testing.T) {
+			reg := newRegistry(t, testEntry("t1"))
+			set := &fakeSettler{}
+			st := &fakeStatus{status: "cancelled"}
+			r := newTestReconciler(t, reg, &fakeObjects{job: runningJob("fm-t1")}, st, set)
+			r.cancelAckTimeout = 50 * time.Millisecond
+
+			if err := r.Reconcile(context.Background()); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			first, ok := r.cancels["t1"]
+			if !ok {
+				t.Fatal("the cancelled sighting was not recorded")
+			}
+			if next, ok := r.nextDeadline(); !ok || !next.Equal(first.Add(r.cancelAckTimeout)) {
+				t.Fatalf("nextDeadline = %v, %v; want the cancel deadline", next, ok)
+			}
+
+			// The server falls back to a pre-delivery status: the entry is
+			// kept and the confirmation window is dropped with the
+			// observation.
+			time.Sleep(r.cancelAckTimeout + 10*time.Millisecond)
+			st.status = status
+			if err := r.Reconcile(context.Background()); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if _, ok := r.cancels["t1"]; ok {
+				t.Fatal("the stale cancel deadline survived the status fallback")
+			}
+			if _, ok := r.nextDeadline(); ok {
+				t.Fatal("nextDeadline() still reports the stale cancel deadline")
+			}
+			if _, _, settles, _, discards := set.calls(); settles+discards != 0 {
+				t.Fatalf("settles=%d discards=%d, want the entry kept", settles, discards)
+			}
+
+			// A later cancellation opens a fresh window: the expired stale
+			// timestamp would have settled it immediately.
+			st.status = "cancelled"
+			if err := r.Reconcile(context.Background()); err != nil {
+				t.Fatalf("Reconcile: %v", err)
+			}
+			if len(set.settles) != 0 || len(set.discards) != 0 {
+				t.Fatalf("settles=%+v discards=%v, want a fresh cancel-ack window", set.settles, set.discards)
+			}
+			if _, ok := r.cancels["t1"]; !ok {
+				t.Fatal("the fresh cancelled sighting was not recorded")
+			}
+		})
 	}
 }
 

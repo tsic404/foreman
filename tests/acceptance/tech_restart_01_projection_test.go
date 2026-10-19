@@ -7,6 +7,7 @@
 package acceptance
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -16,7 +17,11 @@ import (
 	"testing"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/tsic404/foreman/internal/observability"
+	"github.com/tsic404/foreman/internal/recovery"
 	"github.com/tsic404/foreman/internal/scheduler"
 )
 
@@ -68,6 +73,142 @@ func TestRestart01AbsentStartFactsProjectEmptyThenAdopt(t *testing.T) {
 	if h.jobs.jobDeleted("fm-task-1") {
 		t.Error("the adopted task's Job was deleted")
 	}
+}
+
+// TestRestart01AdoptedEntryIgnoresStatusFallback guards ADR-026 决策 5 on the
+// production convergence driver: once C13 adopted a rebuilt entry
+// (started_at non-empty), a later queued/dispatched answer — a server
+// re-queue or status jitter — must not send it back to the discard row. The
+// Job survives and the entry stays in the projection with its start fact.
+func TestRestart01AdoptedEntryIgnoresStatusFallback(t *testing.T) {
+	h := newHarness(t, false)
+	h.useRealBuilder(t)
+	ops := httptest.NewServer(observability.NewOpsHandler(
+		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
+	t.Cleanup(ops.Close)
+
+	if err := h.sched.OnClaim(t.Context(), claimPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	// Restart: the index is gone, the Job is not — the rebuilt entry has no
+	// payload and no start fact.
+	if err := h.reg.Delete("task-1"); err != nil {
+		t.Fatalf("drop entry: %v", err)
+	}
+	if err := h.sched.Rebuild(t.Context()); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	rec, err := recovery.New(recovery.Config{ReconcileInterval: time.Minute},
+		h.reg, recoveryObjects{jobs: h.jobs}, h.server, h.sched)
+	if err != nil {
+		t.Fatalf("recovery.New: %v", err)
+	}
+
+	// C13 = running → adopt (start fact set), Job kept.
+	h.server.setStatus("task-1", "running")
+	if err := rec.Reconcile(t.Context()); err != nil {
+		t.Fatalf("Reconcile adopt: %v", err)
+	}
+	assertProjectedTime(t, ops.URL, "task-1", "started_at", true)
+
+	for _, status := range []string{"queued", "dispatched"} {
+		h.server.setStatus("task-1", status)
+		if err := rec.Reconcile(t.Context()); err != nil {
+			t.Fatalf("Reconcile on C13=%s: %v", status, err)
+		}
+		if h.jobs.jobDeleted("fm-task-1") {
+			t.Fatalf("C13=%s deleted the Job of an adopted entry", status)
+		}
+		projected := projectedEntry(t, ops.URL, "task-1")
+		if state := projected["state"]; state == "terminal" {
+			t.Errorf("C13=%s settled the adopted entry terminal", status)
+		}
+		assertProjectedTime(t, ops.URL, "task-1", "started_at", true)
+	}
+}
+
+// TestRestart01StartFactWinsOverRoundSnapshot guards ADR-026 决策 5 at the
+// deletion surface: the round snapshot is taken before C13 is queried, so an
+// S8 start that lands inside the C13 round trip leaves started_at zero in
+// that snapshot. The release must re-read the live entry under the task lock
+// and keep the Job — a snapshot-based reading deletes an adopted task.
+func TestRestart01StartFactWinsOverRoundSnapshot(t *testing.T) {
+	h := newHarness(t, false)
+	h.useRealBuilder(t)
+	ops := httptest.NewServer(observability.NewOpsHandler(
+		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
+	t.Cleanup(ops.Close)
+
+	if err := h.sched.OnClaim(t.Context(), claimPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	// Restart: the rebuilt entry has neither a payload nor a start fact.
+	if err := h.reg.Delete("task-1"); err != nil {
+		t.Fatalf("drop entry: %v", err)
+	}
+	if err := h.sched.Rebuild(t.Context()); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+
+	rec, err := recovery.New(recovery.Config{ReconcileInterval: time.Minute},
+		h.reg, recoveryObjects{jobs: h.jobs}, h.server, h.sched)
+	if err != nil {
+		t.Fatalf("recovery.New: %v", err)
+	}
+
+	// C13 answers dispatched (the discard row), and S8's start lands before
+	// the release runs: MarkStarted is ordered behind the same task lock the
+	// deletion surface re-reads under.
+	h.server.setStatus("task-1", "dispatched")
+	var startErr error
+	h.server.setStatusHook(func() {
+		h.server.setStatusHook(nil)
+		e, ok := h.reg.Get("task-1")
+		if !ok {
+			startErr = fmt.Errorf("entry gone before the S8 round")
+			return
+		}
+		if _, _, startErr = h.sched.OnReport(t.Context(), scheduler.EPStart, e,
+			[]byte(`{"status":"running"}`), ""); startErr != nil {
+			startErr = fmt.Errorf("S8 start: %w", startErr)
+		}
+	})
+
+	if err := rec.Reconcile(t.Context()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if startErr != nil {
+		t.Fatalf("interleaved start: %v", startErr)
+	}
+	if h.jobs.jobDeleted("fm-task-1") {
+		t.Fatal("the release deleted the Job after S8 established the start fact")
+	}
+	if _, ok := h.reg.Get("task-1"); !ok {
+		t.Fatal("the adopted entry disappeared from the index")
+	}
+	assertProjectedTime(t, ops.URL, "task-1", "started_at", true)
+}
+
+// recoveryObjects adapts the scenario's K8s surface to the recovery
+// reconciler's object read face: GetJob answers from the Jobs the scheduler
+// created, ListPods from the programmed pod list.
+type recoveryObjects struct{ jobs *jobClient }
+
+func (o recoveryObjects) GetJob(ctx context.Context, name string) (*batchv1.Job, error) {
+	jobs, err := o.jobs.ListJobs(ctx)
+	if err != nil {
+		return nil, err
+	}
+	for i := range jobs {
+		if jobs[i].Name == name {
+			return &jobs[i], nil
+		}
+	}
+	return nil, nil
+}
+
+func (o recoveryObjects) ListPods(ctx context.Context) ([]corev1.Pod, error) {
+	return o.jobs.ListPods(ctx, "")
 }
 
 // TestRestart01UnboundedBootProjectsEmpty (02-contracts.md §4.1 / §4.2): with

@@ -152,9 +152,10 @@ func TestConvergeLeaseRefusedResetsInflightGaugeWhenCleanupIsRetried(t *testing.
 	}
 }
 
-// Dropping the entry of a task the server already deleted must take the
-// gauge down with it: no survivor of the discarded claim refreshes it.
-func TestDuplicateClaimDiscardResetsInflightGauge(t *testing.T) {
+// A task the server already deleted settles through §4.6's vanished face:
+// the entry turns terminal + draining (its credential waits for the Job's own
+// termination), so it leaves Inflight() and the gauge must follow it.
+func TestDuplicateClaimVanishedResetsInflightGauge(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
 	f.server.statusErr = ErrTaskNotFound
@@ -162,8 +163,9 @@ func TestDuplicateClaimDiscardResetsInflightGauge(t *testing.T) {
 	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
 		t.Fatalf("OnClaim: %v", err)
 	}
-	if _, ok := f.reg.Get("task-1"); ok {
-		t.Fatal("the entry of a task deleted server-side must be dropped")
+	e, ok := f.reg.Get("task-1")
+	if !ok || !e.IsTerminal() || !e.IsDraining() {
+		t.Fatalf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
 	if got := f.inflightGauge(t); got != 0 {
 		t.Fatalf("foreman_inflight_jobs = %d, want 0 with Registry.Inflight() = %d", got, f.reg.Inflight())

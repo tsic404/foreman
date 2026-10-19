@@ -444,7 +444,17 @@ func (r *Reconciler) reconcileOne(ctx context.Context, e registry.TaskEntry, pod
 // attempt is remembered: the entry is the retry handle,
 // and the next round must finish the release instead of treating the
 // already-deleted Job as an unexpected loss.
+//
+// An adopted entry left the disposal table permanently (ADR-026 决策 5), so
+// the start fact is re-read from the live entry before the call. That read is
+// an optimization only: the authoritative check sits at the deletion surface
+// (DiscardTask re-reads the entry under the task lock), so an S8 transition
+// landing right after this read still wins.
 func (r *Reconciler) release(ctx context.Context, taskID string) error {
+	if e, ok := r.reg.Get(taskID); ok && !e.StartedAt.IsZero() {
+		delete(r.releasing, taskID)
+		return nil
+	}
 	if err := r.settler.DiscardTask(ctx, taskID); err != nil {
 		r.releasing[taskID] = true
 		return err
@@ -567,11 +577,19 @@ func (r *Reconciler) settleFromServer(ctx context.Context, e registry.TaskEntry)
 	}
 	r.reg.SetLastStatusSeen(e.TaskID, st)
 
+	// The cancel confirmation window is measured over a continuous cancelled
+	// observation (§4.6). Any other answer ends that stretch: keeping its
+	// timestamp would let nextDeadline() return a past instant (the loop's
+	// wait goes to zero and spins) and would make the next cancelled
+	// observation settle on the old window instead of starting a fresh one.
+	if st != statusCancelled {
+		delete(r.cancels, e.TaskID)
+	}
+
 	switch {
 	case st == statusCancelled:
 		return r.settleCancelled(ctx, e)
 	case registry.IsTerminalResult(st):
-		delete(r.cancels, e.TaskID)
 		return r.settler.SettleTerminal(ctx, e.TaskID, st)
 	case st == statusRunning:
 		// §4.3: the task is executing — keep the Job, stop lease
@@ -580,15 +598,19 @@ func (r *Reconciler) settleFromServer(ctx context.Context, e registry.TaskEntry)
 		delete(r.cancels, e.TaskID)
 		return r.settler.AdoptRunning(ctx, e.TaskID, st)
 	case st == statusQueued || st == statusDispatched:
-		// §4.3: only a rebuilt entry (payload lost with the restart,
-		// F3) has nothing to deliver — release the Job so the server
-		// re-dispatches after its reclaim window. An in-flight entry still
-		// holds its payload and is simply pre-start: leave it alone.
-		if len(e.Payload) == 0 {
-			delete(r.cancels, e.TaskID)
-			return r.release(ctx, e.TaskID)
+		// §4.3 / ADR-026 决策 3/5: the discard row needs the payload to be
+		// unavailable and the start fact to be absent. Payload availability
+		// is stable for a live entry; the start fact is re-read from the live
+		// entry at the deletion surface (DiscardTask holds the task lock), so
+		// an S8 start that landed during this C13 round trip keeps the Job
+		// even though the round snapshot still reads started_at == 0.
+		if len(e.Payload) != 0 {
+			// In-flight pre-start task: it still holds its payload; the
+			// delivery and boot faces own it.
+			return nil
 		}
-		return nil
+		delete(r.cancels, e.TaskID)
+		return r.release(ctx, e.TaskID)
 	case st == statusWaitingLocalDirectory:
 		// §4.3: the daemon holds the task, so a rebuilt entry adopts (start
 		// fact recorded, no renewals). An in-flight entry still holds its
