@@ -42,10 +42,10 @@ const jobNamePollInterval = 500 * time.Millisecond
 // terminationGracePeriodSeconds of the template (§8.7).
 const jobNameWait = 45 * time.Second
 
-// errJobNameHeld reports that a Job name was still held by a terminating
-// predecessor after jobNameWait: the claim is deferred to the server's
-// re-dispatch, never reported as this task's failure.
-var errJobNameHeld = errors.New("job name still held by a terminating job")
+// errJobNameHeld reports that a Job name was still held after jobNameWait (by
+// a terminating predecessor or an object this task does not own): the claim is
+// deferred to the server's re-dispatch, never reported as this task's failure.
+var errJobNameHeld = errors.New("job name still held")
 
 // PrepareLeaseTTL is the server-side prepare lease (C-3): the claim
 // stamps a 45s lease and every C-4 renewal restamps it. An entry's
@@ -165,7 +165,7 @@ type claimHead struct {
 // keyedMutex serializes the per-task state transitions: two concurrent
 // claims of the same task must not interleave their
 // DeleteSecret→CreateSecret→CreateJob sequence (the loser's AlreadyExists
-// would otherwise fail a healthy task), and no settlement path may settle an
+// would otherwise reclaim the winner's live Job), and no settlement path may settle an
 // entry while the S-8 round that decides its `running` write is still in
 // flight (§4.2: one decisive fact per transition).
 type keyedMutex struct {
@@ -697,22 +697,22 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 }
 
 // createJob places the entry's Job and returns the object the apiserver
-// holds, resolving the two meanings of AlreadyExists. A Job that is there and
-// not terminating belongs to this attempt (restart replay, or a retry of the
-// same claim) and is kept — its creationTimestamp is the instance basis, so
-// the existing object is returned rather than the rendered one. A Job that is
-// terminating — or one whose state cannot be read — holds its name (the
-// display name the template expressed, shared by both meanings of "the same
-// Job") until its pods are gone; swallowing that would bind the entry to a
-// disappearing Job (job_missing). Wait (bounded) and retry; a name that never
-// frees returns errJobNameHeld, a deferred claim rather than this task's
-// failure.
+// holds. AlreadyExists is never an adoption: adoption is the rebuild row of
+// the disposal table and needs the payload (§4.3), while this claim carries no
+// facts of any existing Job — the object is a predecessor corpse. It is
+// deleted and the create retried within jobNameWait; adopting it would burn
+// the whole boot bound and mix the pod instance domains (AC-08). A terminating
+// object holds its name until its pods are gone (bounded wait, then
+// errJobNameHeld — a deferred claim, never this task's failure).
 func (s *Scheduler) createJob(ctx context.Context, e registry.TaskEntry, job *batchv1.Job) (*batchv1.Job, error) {
 	deadline := s.now().Add(jobNameWait)
 	// maxPolls backs the clock bound so the loop cannot spin on a clock the
 	// caller froze (tests) or on a view that keeps reporting the name as
 	// free while Create disagrees.
 	maxPolls := int(jobNameWait / jobNamePollInterval)
+	// staleDeleteErr keeps the last failed attempt to free the name, so a
+	// deferred claim carries its cause.
+	var staleDeleteErr error
 	for poll := 0; ; poll++ {
 		created, err := s.jobs.CreateJob(ctx, job)
 		if err == nil {
@@ -722,9 +722,6 @@ func (s *Scheduler) createJob(ctx context.Context, e registry.TaskEntry, job *ba
 			return nil, err
 		}
 		existing, probeErr := s.jobs.GetJob(ctx, e.JobName)
-		if probeErr == nil && existing != nil && existing.DeletionTimestamp == nil {
-			return existing, nil
-		}
 		if probeErr != nil {
 			// Truth unknown: the name may still be held, so keep polling.
 			// Transient read failures stay in Debug (cf. prepare-lease);
@@ -732,8 +729,28 @@ func (s *Scheduler) createJob(ctx context.Context, e registry.TaskEntry, job *ba
 			// here is a deferred claim, never a task failure (AC-09).
 			s.log.DebugContext(ctx, "job.probe_failed",
 				"task_id", e.TaskID, "job_name", e.JobName, "err", probeErr)
+		} else if existing != nil && existing.DeletionTimestamp == nil {
+			if !jobOwnedBy(existing, e) {
+				// The name is not a locating face for deletion (§3): an
+				// object this task does not own is never removed. Defer the
+				// claim instead; the occupied name stays visible through
+				// task.claim_deferred.
+				return nil, fmt.Errorf("%w: %s (held by an object this task does not own)", errJobNameHeld, e.JobName)
+			}
+			if derr := s.jobs.DeleteJob(ctx, e.JobName); derr != nil {
+				staleDeleteErr = derr
+				s.log.DebugContext(ctx, "job.stale_delete_failed",
+					"task_id", e.TaskID, "job_name", e.JobName, "err", derr)
+			} else {
+				staleDeleteErr = nil
+				s.log.InfoContext(ctx, "job.stale_deleted",
+					"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID)
+			}
 		}
 		if poll >= maxPolls || s.now().After(deadline) {
+			if staleDeleteErr != nil {
+				return nil, fmt.Errorf("%w: %s (delete stale job: %v)", errJobNameHeld, e.JobName, staleDeleteErr)
+			}
 			return nil, fmt.Errorf("%w: %s", errJobNameHeld, e.JobName)
 		}
 		if probeErr == nil && existing == nil {
@@ -747,6 +764,15 @@ func (s *Scheduler) createJob(ctx context.Context, e registry.TaskEntry, job *ba
 		case <-time.After(jobNamePollInterval):
 		}
 	}
+}
+
+// jobOwnedBy reports whether the existing object is a Foreman task Job of this
+// entry's task. Ownership is read from labels, never from the name (§3): the
+// name only says which object the create collided with.
+func jobOwnedBy(existing *batchv1.Job, e registry.TaskEntry) bool {
+	labels := existing.GetLabels()
+	return labels[registry.LabelManagedBy] == registry.ManagedByForeman &&
+		labels[registry.LabelTaskID] == e.TaskID
 }
 
 // resolveDuplicateClaim applies the duplicate-claim rule (§10): C13 decides
@@ -1760,7 +1786,7 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		if taskID == "" {
 			continue
 		}
-		if secret.Name != credName(daemonIDFor(taskID)) {
+		if secret.Name != jobbuilder.CredentialSecretName(jobbuilder.DaemonIDFor(taskID)) {
 			continue
 		}
 		if _, ok := s.reg.Get(taskID); ok {
