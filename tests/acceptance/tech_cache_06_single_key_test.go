@@ -5,6 +5,8 @@
 // reuse off suppresses it with the key still resolvable, and an expired index
 // entry suppresses it after the TTL prune. Each negative shape carries its own
 // positive control so a missing key and a suppressed item are distinguishable.
+// The live-Job face of the four shapes is
+// tests/acceptance/tech-cache-06-cluster.sh.
 package acceptance
 
 import (
