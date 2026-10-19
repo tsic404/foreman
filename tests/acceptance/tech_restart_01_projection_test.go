@@ -58,8 +58,11 @@ func TestRestart01AbsentStartFactsProjectEmptyThenAdopt(t *testing.T) {
 	}
 	assertProjectedTime(t, ops.URL, "task-1", "started_at", true)
 	projected := projectedEntry(t, ops.URL, "task-1")
-	if state := projected["state"]; state == "terminal" {
-		t.Errorf("state = %v, want the adopted task kept", state)
+	// Adoption does not advance the lifecycle state: the projection keeps the
+	// rebuild's initial phase (ADR-026 后果) — the running face is started_at,
+	// never state.
+	if state := projected["state"]; state != "job_created" {
+		t.Errorf("state = %v, want the rebuild phase job_created after adoption", state)
 	}
 	if h.jobs.jobDeleted("fm-task-1") {
 		t.Error("the adopted task's Job was deleted")

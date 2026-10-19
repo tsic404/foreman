@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -180,7 +181,7 @@ func TestOnTaskVanished(t *testing.T) {
 }
 
 func TestConvergeLeaseRefused(t *testing.T) {
-	t.Run("running marks started", func(t *testing.T) {
+	t.Run("running records the start fact only", func(t *testing.T) {
 		f := newFixture(t)
 		f.claim(t, "t-lr")
 		f.server.status = "running"
@@ -189,11 +190,53 @@ func TestConvergeLeaseRefused(t *testing.T) {
 			t.Fatalf("ConvergeLeaseRefused: %v", err)
 		}
 		e, _ := f.reg.Get("t-lr")
-		if e.State != registry.StateRunning || e.StartedAt.IsZero() {
-			t.Errorf("entry = %+v, want running with started_at", e)
+		// Adoption leaves the state alone; only the report path advances it
+		// (ADR-026 后果).
+		if e.State != registry.StateJobCreated || e.StartedAt.IsZero() {
+			t.Errorf("entry = %+v, want job_created with started_at", e)
 		}
 		if !f.hasJob("fm-t-lr") {
 			t.Error("running task's Job must survive")
+		}
+	})
+
+	t.Run("waiting_local_directory records the start fact", func(t *testing.T) {
+		f := newFixture(t)
+		f.claim(t, "t-lw")
+		f.server.status = "waiting_local_directory"
+
+		if err := f.sched.ConvergeLeaseRefused(context.Background(), "t-lw"); err != nil {
+			t.Fatalf("ConvergeLeaseRefused: %v", err)
+		}
+		e, _ := f.reg.Get("t-lw")
+		if e.State != registry.StateJobCreated || e.StartedAt.IsZero() {
+			t.Errorf("entry = %+v, want job_created with started_at", e)
+		}
+		if !f.hasJob("fm-t-lw") {
+			t.Error("a daemon-held task's Job must survive")
+		}
+	})
+
+	t.Run("unclassified status is reported and kept", func(t *testing.T) {
+		f := newFixture(t)
+		buf := newLogScheduler(t, f, slog.LevelInfo)
+		f.claim(t, "t-lu")
+		f.server.status = "paused"
+
+		if err := f.sched.ConvergeLeaseRefused(context.Background(), "t-lu"); err != nil {
+			t.Fatalf("ConvergeLeaseRefused: %v", err)
+		}
+		record := findLogRecord(t, buf.Bytes(), "task.status_unclassified")
+		assertErrorLevel(t, record)
+		assertTaskIdentity(t, record, "t-lu", "fm-t-lu", "fm-t-lu")
+		if got := record["status"]; got != "paused" {
+			t.Errorf("status = %v, want paused", got)
+		}
+		if e, ok := f.reg.Get("t-lu"); !ok || e.IsTerminal() {
+			t.Errorf("entry = %+v, %v; want retained non-terminal", e, ok)
+		}
+		if !f.hasJob("fm-t-lu") {
+			t.Error("an unclassified status must keep the Job")
 		}
 	})
 

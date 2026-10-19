@@ -255,6 +255,33 @@ func TestMarkStarted(t *testing.T) {
 	}
 }
 
+func TestMarkStartFact(t *testing.T) {
+	r := New(fixedClock())
+	e := entryFor("t1")
+	e.State = StateJobCreated
+	_ = r.Put(e)
+
+	// The adoption write records the fact and leaves the lifecycle state at
+	// the rebuild's initial phase (ADR-026 后果).
+	got, ok := r.MarkStartFact("t1", testNow)
+	if !ok || got.State != StateJobCreated || got.StartedAt != testNow {
+		t.Fatalf("MarkStartFact = %v, %v", got, ok)
+	}
+	// started_at is written once; a later observation does not overwrite it.
+	got, ok = r.MarkStartFact("t1", testNow.Add(time.Minute))
+	if !ok || got.StartedAt != testNow {
+		t.Fatalf("started_at overwritten: %v", got.StartedAt)
+	}
+	// Terminal wins over a late fact.
+	_, _ = r.MarkTerminal("t1", ResultCompleted, "", testNow)
+	if _, ok := r.MarkStartFact("t1", testNow); ok {
+		t.Fatal("late start fact regressed a terminal entry")
+	}
+	if _, ok := r.MarkStartFact("ghost", testNow); ok {
+		t.Fatal("unknown task marked started")
+	}
+}
+
 func TestMarkDelivering(t *testing.T) {
 	r := New(fixedClock())
 	e := entryFor("t1")

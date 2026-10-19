@@ -25,9 +25,10 @@ type Settler interface {
 	// queued report lands first, then the Job is deleted. The credential and
 	// the entry stay for the drain (ADR-017).
 	SettleTerminal(ctx context.Context, taskID, result string) error
-	// AdoptRunning keeps the Job of a task the server reports as running
-	// and stops lease renewals (§4.3).
-	AdoptRunning(ctx context.Context, taskID string) error
+	// AdoptRunning keeps the Job of a task the server reports as post-delivery
+	// (running or waiting_local_directory) and stops lease renewals (§4.3);
+	// status is the observed value, carried into the adopt event.
+	AdoptRunning(ctx context.Context, taskID, status string) error
 	// DiscardTask removes the objects and the mapping of a task that will be
 	// re-run (§4.3 redispatch), without a terminal report and without entering
 	// drain; the credential is revoked when its digest is known.
