@@ -159,7 +159,10 @@ func (p *PendingReports) Enqueue(taskID, jobName, daemonID string, ep Endpoint, 
 		return err
 	}
 	delete(p.staged, taskID)
-	p.log.Error("task.forward_queued",
+	// Every terminal report lands here before its forward (write-ahead), so
+	// this is the queue's trace line, not an error signal: the failed
+	// forward is what the error face reports (§9.1).
+	p.log.Debug("task.forward_queued",
 		"task_id", taskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
 		"endpoint", rep.Endpoint)
 	p.notifyLocked()
@@ -348,6 +351,17 @@ func (p *PendingReports) Queued(taskID string) bool {
 	}
 	_, ok := p.staged[taskID]
 	return ok
+}
+
+// Drop forgets the report queued for taskID: the direct forward it was
+// written ahead of settled it (accepted, moot, or permanently refused), so no
+// replay is owed. A no-op when nothing is queued. The gauge follows the
+// durable depth.
+func (p *PendingReports) Drop(taskID string) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.dropLocked(taskID)
+	p.notifyLocked()
 }
 
 func (p *PendingReports) path(taskID string) string {
