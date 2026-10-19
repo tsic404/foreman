@@ -256,6 +256,14 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 	entry, ok := i.jobs.ByDaemon(payload.JobName)
 	if !ok {
 		if i.done.IsDone(payload.TaskID) && req.IsTerminalEndpoint {
+			// The replay is idempotent only for the token's own task: the
+			// done index proves that task settled, never that the request
+			// addresses it (§2.1 rule 1). Without this check any settled
+			// task's token would be answered 200 on every task's terminal
+			// endpoint.
+			if req.TaskID != "" && req.TaskID != payload.TaskID {
+				return Claims{}, fmt.Errorf("%w: task %s", ErrScopeMismatch, req.TaskID)
+			}
 			claims.IsLateReplay = true
 			return claims, nil
 		}

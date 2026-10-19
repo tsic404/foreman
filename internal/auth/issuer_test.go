@@ -291,6 +291,35 @@ func TestVerifyLateReplay(t *testing.T) {
 	}
 }
 
+// TestVerifyLateReplayScopeMismatch pins §2.1 rule 1 on the late-replay
+// branch: the done index proves the token's own task settled, so the token is
+// idempotent only on that task's terminal endpoints — never on another task's.
+func TestVerifyLateReplayScopeMismatch(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	iss := newTestIssuer(now, fakeRegistry{}, fakeDone{"task-1": true})
+	token, err := iss.Issue("fm-task-1", "task-1", "ws-1", time.Hour)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+
+	_, err = iss.Verify(token, RequestScope{TaskID: "task-2", IsTerminalEndpoint: true})
+	if !errors.Is(err, ErrScopeMismatch) {
+		t.Fatalf("err = %v, want ErrScopeMismatch", err)
+	}
+	if got := HTTPStatus(err); got != http.StatusForbidden {
+		t.Errorf("status = %d, want 403", got)
+	}
+
+	// The token's own terminal endpoint keeps the idempotent replay.
+	claims, err := iss.Verify(token, RequestScope{TaskID: "task-1", IsTerminalEndpoint: true})
+	if err != nil {
+		t.Fatalf("own terminal replay: %v", err)
+	}
+	if !claims.IsLateReplay || claims.TaskID != "task-1" {
+		t.Fatalf("claims = %+v, want IsLateReplay for task-1", claims)
+	}
+}
+
 // TestVerifyDrainWindowEntryStillValid pins ADR-017: an entry that exists
 // while its task is already terminal (the drain window) still authorizes the
 // token, including on non-terminal endpoints.
