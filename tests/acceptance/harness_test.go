@@ -1035,6 +1035,10 @@ type jobClient struct {
 	jobs         []batchv1.Job
 	secrets      []corev1.Secret
 	pods         []corev1.Pod
+
+	// listSecretsErr makes the Secret list face fail — the carrier list
+	// window a restart scenario has to survive (§4.3).
+	listSecretsErr error
 }
 
 func newJobClient() *jobClient {
@@ -1090,6 +1094,9 @@ func (c *jobClient) CreateSecret(_ context.Context, secret *corev1.Secret) error
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.createdSecrets = append(c.createdSecrets, secret)
+	// The list face sees the object too, exactly as the apiserver's does: a
+	// carrier written before a restart is what the rebuilt queue lists.
+	c.secrets = append(c.secrets, *secret.DeepCopy())
 	return nil
 }
 
@@ -1118,7 +1125,30 @@ func (c *jobClient) ListJobs(context.Context) ([]batchv1.Job, error) {
 func (c *jobClient) ListSecrets(context.Context) ([]corev1.Secret, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.listSecretsErr != nil {
+		return nil, c.listSecretsErr
+	}
 	return append([]corev1.Secret(nil), c.secrets...), nil
+}
+
+// setListSecretsErr programs the Secret list face (nil restores it).
+func (c *jobClient) setListSecretsErr(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.listSecretsErr = err
+}
+
+// carrierSecrets lists the pending-report carriers on the cluster face.
+func (c *jobClient) carrierSecrets() []corev1.Secret {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []corev1.Secret
+	for _, secret := range c.secrets {
+		if secret.Labels[registry.LabelRole] == registry.RolePendingReport {
+			out = append(out, secret)
+		}
+	}
+	return out
 }
 
 func (c *jobClient) ListPods(context.Context, string) ([]corev1.Pod, error) {
@@ -1968,9 +1998,16 @@ func newHarnessWithSkill(t *testing.T, catalogEnabled bool, window time.Duration
 	// The terminal-report queue is the production one: the write-ahead
 	// discipline and the gauge are part of the face the scenarios judge.
 	pending, err := scheduler.NewPendingReports(t.TempDir(),
-		scheduler.WithPendingReportsGauge(metrics.PendingReports))
+		scheduler.WithPendingReportsGauge(metrics.PendingReports),
+		scheduler.WithPendingReportsCarrier(scheduler.NewSecretCarrierStore(jobs)))
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
+	}
+	// Production's startup rebuild restores the queue before any settlement
+	// (§4.3); the harness mirrors that so the settlement gates see a completed
+	// carrier list.
+	if err := pending.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
 	}
 	schedCfg := scheduler.Config{
 		JobNamespace:           "multica-agents",

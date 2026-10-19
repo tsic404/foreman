@@ -45,7 +45,7 @@ func PendingReportsDir(getenv func(string) string) string {
 // not an inbound report: it never enters the attribution gate, and it sends
 // the instance's decided body when one is registered (ADR-031).
 type ReportSender interface {
-	DeliverQueued(ctx context.Context, ep Endpoint, taskID string, body []byte) (int, []byte, error)
+	DeliverQueued(ctx context.Context, ep Endpoint, taskID string, body []byte, failureReason string) (int, []byte, error)
 }
 
 // pendingReport is one queued terminal report (contract §10). The file is
@@ -58,6 +58,11 @@ type pendingReport struct {
 	Body       json.RawMessage `json:"body"`
 	EnqueuedAt time.Time       `json:"enqueued_at"`
 	Attempts   int             `json:"attempts"`
+	// FailureReason is the verdict's attribution when the queued report is a
+	// failure Foreman judged itself (§4.1). It rides the queue entry because
+	// the projection is rebuilt from it after a restart; the body is never
+	// the source (an inbound failure body carries the same key).
+	FailureReason string `json:"failure_reason,omitempty"`
 }
 
 var taskIDFileChars = regexp.MustCompile(`^[a-zA-Z0-9-]+$`)
@@ -72,9 +77,10 @@ func validTaskID(taskID string) bool { return taskIDFileChars.MatchString(taskID
 // forwarded, and the recovery loop drains the queue through the Settler seam,
 // so there is one queue behind every terminal-report path.
 type PendingReports struct {
-	dir string
-	now func() time.Time
-	log *slog.Logger
+	dir      string
+	now      func() time.Time
+	log      *slog.Logger
+	carriers CarrierStore
 
 	mu       sync.Mutex
 	onChange func(int) // foreman_pending_reports gauge hook
@@ -92,6 +98,18 @@ type PendingReports struct {
 	// already attempted: a rename that keeps failing (permissions, a taken
 	// .bad name) is not retried and re-logged every Drain.
 	quarantineTried map[string]bool
+
+	// carrierBacked holds the task ids whose report has landed on its
+	// cluster carrier (ADR-046). The carrier, not the node-local disk, is the
+	// cross-process persistence face: a restored report is carried here even
+	// when the disk write fails, so it stays queued and is replayed.
+	carrierBacked map[string]bool
+
+	// restored is set once the carrier list completed (successfully or not
+	// configured). A failed list leaves it false: the queue is not rebuilt,
+	// and no settlement may read it as empty (§4.3). Without a carrier store
+	// the disk is the whole persistence face, so there is nothing to rebuild.
+	restored bool
 }
 
 // PendingReportsOption customizes a PendingReports queue.
@@ -112,6 +130,12 @@ func WithPendingReportsLogger(l *slog.Logger) PendingReportsOption {
 	return func(p *PendingReports) { p.log = l.With("component", "pending-reports") }
 }
 
+// WithPendingReportsCarrier wires the cluster carrier store (ADR-046). Nil
+// keeps the node-local queue only — the shape tests and degraded builds use.
+func WithPendingReportsCarrier(c CarrierStore) PendingReportsOption {
+	return func(p *PendingReports) { p.carriers = c }
+}
+
 // NewPendingReports opens (creating if needed) the queue directory.
 func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReports, error) {
 	if dir == "" {
@@ -126,15 +150,21 @@ func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReport
 		log:             slog.Default().With("component", "pending-reports"),
 		staged:          make(map[string]pendingReport),
 		quarantineTried: make(map[string]bool),
+		carrierBacked:   make(map[string]bool),
 	}
 	for _, opt := range opts {
 		opt(p)
 	}
+	// Without a carrier store the node-local queue is complete at open: no
+	// cross-process list can still add entries.
+	p.restored = p.carriers == nil
 	return p, nil
 }
 
-// Enqueue lands a terminal report on disk (atomic tmp+rename; a report is
-// queued only once the file is durable — §10).
+// Enqueue lands a terminal report on disk (atomic tmp+rename) and on its
+// cluster carrier (ADR-046). The disk copy is the in-process queue; the
+// carrier is what survives a process exit, so a report is only durable once
+// its carrier write landed.
 // Re-enqueueing the same task replaces the body but keeps the original
 // enqueue time, so the TTL clocks the first failure.
 //
@@ -143,36 +173,99 @@ func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReport
 // reports it as undelivered, so the task's objects stay until it landed. The
 // returned error is that error row's "记 error" half — never a reason to
 // discard the report.
-func (p *PendingReports) Enqueue(taskID, jobName, daemonID string, ep Endpoint, body []byte) error {
+func (p *PendingReports) Enqueue(ctx context.Context, taskID, jobName, daemonID string, ep Endpoint, body []byte, failureReason string) error {
 	p.mu.Lock()
-	defer p.mu.Unlock()
 	rep := pendingReport{
-		TaskID:     taskID,
-		JobName:    jobName,
-		DaemonID:   daemonID,
-		Endpoint:   string(ep),
-		Body:       body,
-		EnqueuedAt: p.now(),
+		TaskID:        taskID,
+		JobName:       jobName,
+		DaemonID:      daemonID,
+		Endpoint:      string(ep),
+		Body:          body,
+		EnqueuedAt:    p.now(),
+		FailureReason: failureReason,
 	}
 	p.inheritClockLocked(&rep)
+	var diskErr error
 	if !validTaskID(taskID) {
 		// The id can never name a queue file: keep the report staged so the
 		// drain delivers it straight from memory instead of losing it.
 		p.staged[taskID] = rep
-		return fmt.Errorf("task id %q is not a safe file name", taskID)
-	}
-	if err := p.writeLocked(rep); err != nil {
+		diskErr = fmt.Errorf("task id %q is not a safe file name", taskID)
+	} else if err := p.writeLocked(rep); err != nil {
+		diskErr = err
 		p.staged[taskID] = rep
+	} else {
+		delete(p.staged, taskID)
+		// Every terminal report lands here before its forward (write-ahead),
+		// so this is the queue's trace line, not an error signal: the failed
+		// forward is what the error face reports (§9.1).
+		p.log.Debug("task.forward_queued",
+			"task_id", taskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
+			"endpoint", rep.Endpoint)
+	}
+	p.notifyLocked()
+	p.mu.Unlock()
+
+	// The carrier is the durability face (ADR-046): a report whose carrier
+	// write fails stays in process memory and is retried on the next drain.
+	carrierErr := p.persistCarrier(ctx, rep)
+	if diskErr != nil {
+		return diskErr
+	}
+	return carrierErr
+}
+
+// persistCarrier lands one report on its cluster carrier. A report that
+// settles while the write is in flight leaves an orphan carrier behind — the
+// post-write check deletes it instead of resurrecting a settled entry.
+func (p *PendingReports) persistCarrier(ctx context.Context, rep pendingReport) error {
+	if p.carriers == nil || !validTaskID(rep.TaskID) {
+		return nil
+	}
+	carrier := Carrier{
+		TaskID:        rep.TaskID,
+		JobName:       rep.JobName,
+		DaemonID:      rep.DaemonID,
+		Endpoint:      rep.Endpoint,
+		Body:          rep.Body,
+		EnqueuedAt:    rep.EnqueuedAt,
+		Attempts:      rep.Attempts,
+		FailureReason: rep.FailureReason,
+	}
+	var err error
+	if carrier.sizeBytes() > MaxCarrierBytes {
+		err = fmt.Errorf("%w: %d bytes > %d", ErrCarrierPayloadTooLarge, carrier.sizeBytes(), MaxCarrierBytes)
+	} else {
+		err = p.carriers.PutCarrier(ctx, carrier)
+	}
+	if errors.Is(err, ErrCarrierPayloadTooLarge) {
+		// Registered boundary: the report is kept in process memory and the
+		// error face reports the loss on process exit (ADR-046 decision 6).
+		p.log.Error("task.forward_undelivered",
+			"task_id", rep.TaskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
+			"endpoint", rep.Endpoint,
+			"reason", "pending report exceeds the carrier object bound", "err", err)
 		return err
 	}
-	delete(p.staged, taskID)
-	// Every terminal report lands here before its forward (write-ahead), so
-	// this is the queue's trace line, not an error signal: the failed
-	// forward is what the error face reports (§9.1).
-	p.log.Debug("task.forward_queued",
-		"task_id", taskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
-		"endpoint", rep.Endpoint)
+	if err != nil {
+		p.log.Error("task.forward_undelivered",
+			"task_id", rep.TaskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
+			"endpoint", rep.Endpoint,
+			"reason", "pending-report carrier write failed", "err", err)
+		return err
+	}
+
+	p.mu.Lock()
+	if !p.queuedKnownLocked(rep.TaskID) {
+		// The direct forward settled the report while the carrier write was
+		// in flight: the carrier must not outlive the queue entry.
+		p.mu.Unlock()
+		p.deleteCarrier(ctx, rep.TaskID)
+		return nil
+	}
+	p.carrierBacked[rep.TaskID] = true
 	p.notifyLocked()
+	p.mu.Unlock()
 	return nil
 }
 
@@ -197,12 +290,13 @@ func (p *PendingReports) inheritClockLocked(rep *pendingReport) {
 	}
 }
 
-// Drain retries the staged writes and then every queued report once through
-// sender. A report leaves the queue when the server accepts it (2xx) or
-// settles it as moot (404/409: server-side already terminal or deleted).
-// Reports older than PendingReportTTL are dropped with an error log
-// (§10). It returns the number of reports still
-// undelivered: the durable entries plus the ones a failed write left staged.
+// Drain retries the staged disk writes and the missing carrier writes, then
+// sends every queued report once through sender. A report leaves the queue
+// when the server accepts it (2xx) or settles it as moot (404/409: server-side
+// already terminal or deleted). Reports older than PendingReportTTL are
+// dropped with an error log (§10). It returns the number of reports still
+// undelivered: the disk entries, the carrier-backed ones, and the ones a
+// failed write left staged.
 //
 // A report whose task id cannot name a queue file is delivered straight from
 // staging: it can never become durable, and dropping it would lose a
@@ -213,8 +307,20 @@ func (p *PendingReports) inheritClockLocked(rep *pendingReport) {
 // Enqueue (the daemon's terminal-report path) or Len (metrics).
 func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, error) {
 	p.mu.Lock()
-	p.flushStagedLocked()
-	queue := append(p.listLocked(), p.unstorableStagedLocked()...)
+	expired := p.flushStagedLocked()
+	retryCarriers := p.unbackedLocked()
+	p.mu.Unlock()
+	// A report whose carrier write failed is retried every drain
+	// (ADR-046 decision 2): until it lands, a process exit loses it.
+	for _, rep := range retryCarriers {
+		_ = p.persistCarrier(ctx, rep)
+	}
+	for _, taskID := range expired {
+		p.deleteCarrier(ctx, taskID)
+	}
+
+	p.mu.Lock()
+	queue := p.drainQueueLocked()
 	p.mu.Unlock()
 
 	var firstErr error
@@ -225,13 +331,17 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 				"endpoint", rep.Endpoint,
 				"attempts", rep.Attempts, "reason", "pending report TTL exceeded")
 			p.mu.Lock()
-			p.dropIfUnchangedLocked(rep)
+			deleteCarrier := p.dropSettledLocked(rep)
 			p.mu.Unlock()
+			if deleteCarrier {
+				p.deleteCarrier(ctx, rep.TaskID)
+			}
 			continue
 		}
-		code, _, err := sender.DeliverQueued(ctx, Endpoint(rep.Endpoint), rep.TaskID, rep.Body)
+		code, _, err := sender.DeliverQueued(ctx, Endpoint(rep.Endpoint), rep.TaskID, rep.Body, rep.FailureReason)
 		delivered := err == nil && terminalReportDelivered(code)
 		p.mu.Lock()
+		var deleteCarrier bool
 		if delivered {
 			p.log.Info("task.forward_delivered",
 				"task_id", rep.TaskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
@@ -239,12 +349,16 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 			// Drop only the snapshot that was just delivered: a concurrent
 			// Enqueue may have replaced the body (the decided body, a late
 			// replay) while the forward was in flight, and deleting it by task
-			// id would lose a report §10 forbids dropping.
-			p.dropIfUnchangedLocked(rep)
+			// id would lose a report §10 forbids dropping. The carrier goes
+			// only when no queue entry remains.
+			deleteCarrier = p.dropSettledLocked(rep)
 		} else {
 			p.bumpAttemptsLocked(rep.TaskID)
 		}
 		p.mu.Unlock()
+		if deleteCarrier {
+			p.deleteCarrier(ctx, rep.TaskID)
+		}
 		if err != nil && firstErr == nil {
 			firstErr = err
 		}
@@ -253,27 +367,81 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 		}
 	}
 	p.mu.Lock()
-	durable := len(p.listLocked())
-	remaining := durable + len(p.staged)
+	remaining := p.undeliveredLocked()
+	gauge := p.lenLocked()
 	p.mu.Unlock()
-	p.notify(durable)
+	p.notify(gauge)
 	return remaining, firstErr
+}
+
+// drainQueueLocked snapshots the reports this round delivers: the disk
+// entries plus the staged ones that can never reach the disk or that are
+// already durable on their carrier. A storable, carrier-less staged report
+// waits for its write — the disk is its only durability face.
+func (p *PendingReports) drainQueueLocked() []pendingReport {
+	seen := make(map[string]struct{})
+	queue := make([]pendingReport, 0)
+	for _, rep := range p.listLocked() {
+		seen[rep.TaskID] = struct{}{}
+		queue = append(queue, rep)
+	}
+	for taskID, rep := range p.staged {
+		if _, ok := seen[taskID]; ok {
+			continue
+		}
+		if !validTaskID(taskID) || p.carrierBacked[taskID] {
+			queue = append(queue, rep)
+		}
+	}
+	return queue
+}
+
+// unbackedLocked lists the queued reports whose carrier write has not
+// landed yet, so Drain can retry it.
+func (p *PendingReports) unbackedLocked() []pendingReport {
+	if p.carriers == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	var out []pendingReport
+	for _, rep := range p.listLocked() {
+		seen[rep.TaskID] = struct{}{}
+		if !p.carrierBacked[rep.TaskID] {
+			out = append(out, rep)
+		}
+	}
+	for taskID, rep := range p.staged {
+		if _, ok := seen[taskID]; ok {
+			continue
+		}
+		if validTaskID(taskID) && !p.carrierBacked[taskID] {
+			out = append(out, rep)
+		}
+	}
+	return out
 }
 
 // flushStagedLocked retries the disk write of every staged report
 // (错误处理表「退避后重试」). A report whose write lands leaves the staging
-// area — listLocked then carries it, so it counts as queued only once the
-// file exists (§10) — while a write that keeps failing stays staged
-// for the next round. A report past the TTL is dropped, and one whose id can
-// never name a file stays staged for the direct delivery.
-func (p *PendingReports) flushStagedLocked() {
+// area — listLocked then carries it — while a write that keeps failing stays
+// staged for the next round. A report past the TTL is dropped, and one whose
+// id can never name a file stays staged for the direct delivery.
+//
+// It returns the TTL-dropped task ids whose carrier must be deleted: the
+// caller holds no lock then, because the delete is a network call.
+func (p *PendingReports) flushStagedLocked() []string {
+	var expired []string
 	for taskID, rep := range p.staged {
 		if p.now().Sub(rep.EnqueuedAt) > PendingReportTTL {
 			p.log.Error("task.forward_dropped",
 				"task_id", taskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
 				"endpoint", rep.Endpoint,
 				"attempts", rep.Attempts, "reason", "pending report TTL exceeded")
+			if p.carrierBacked[taskID] {
+				expired = append(expired, taskID)
+			}
 			delete(p.staged, taskID)
+			delete(p.carrierBacked, taskID)
 			continue
 		}
 		if !validTaskID(taskID) {
@@ -289,18 +457,7 @@ func (p *PendingReports) flushStagedLocked() {
 			"endpoint", rep.Endpoint, "retried_write", true)
 		delete(p.staged, taskID)
 	}
-}
-
-// unstorableStagedLocked lists the staged reports whose task id can never
-// name a queue file; the delivery loop sends them straight from memory.
-func (p *PendingReports) unstorableStagedLocked() []pendingReport {
-	var out []pendingReport
-	for _, rep := range p.staged {
-		if !validTaskID(rep.TaskID) {
-			out = append(out, rep)
-		}
-	}
-	return out
+	return expired
 }
 
 // bumpAttemptsLocked records one more delivery attempt: a durable report is
@@ -343,39 +500,53 @@ func (p *PendingReports) dropIfUnchangedLocked(sent pendingReport) {
 	}
 }
 
+// dropSettledLocked removes the snapshot a drain just settled and reports
+// whether its carrier must be deleted. The carrier goes only when no queue
+// entry remains: a concurrent re-enqueue keeps its own body on the carrier
+// and settles later.
+func (p *PendingReports) dropSettledLocked(sent pendingReport) (deleteCarrier bool) {
+	p.dropIfUnchangedLocked(sent)
+	if p.entryPresentLocked(sent.TaskID) {
+		return false
+	}
+	wasBacked := p.carrierBacked[sent.TaskID]
+	delete(p.carrierBacked, sent.TaskID)
+	return wasBacked
+}
+
+// entryPresentLocked reports whether a queue entry (disk or staged) still
+// holds taskID. The carrier alone is not an entry — it is one entry's
+// durability face.
+func (p *PendingReports) entryPresentLocked(taskID string) bool {
+	if validTaskID(taskID) {
+		if _, ok := p.readLocked(taskID); ok {
+			return true
+		}
+	}
+	_, ok := p.staged[taskID]
+	return ok
+}
+
 // dropLocked removes a report from the queue, wherever it sits: the durable
-// file, the staging area, or both.
+// file, the staging area, or both. The carrier is the caller's (it needs the
+// network), see Drop.
 func (p *PendingReports) dropLocked(taskID string) {
 	if validTaskID(taskID) {
 		p.removeLocked(taskID)
 	}
 	delete(p.staged, taskID)
+	delete(p.carrierBacked, taskID)
 }
 
-// Len reports the durable queue depth — the foreman_pending_reports gauge.
-// A report counts once its write succeeded; one a failed write left staged
-// does not grow the gauge (错误处理表).
-func (p *PendingReports) Len() int {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-	return len(p.listLocked())
-}
-
-// Queued reports whether taskID still has an undelivered report: one whose
-// file exists, or one a failed write left staged. The scheduler gates the
-// verdict-time Job deletion of a terminal entry on it, so the Job goes only
-// once the report landed (contract §10) — the credential and the entry follow
-// their own drain window (ADR-017).
-//
-// A task id that cannot name a queue file is answered without touching the
-// filesystem: such a report is never a durable queue entry (Drain delivers
-// it straight from staging), so it gates no objects either.
-func (p *PendingReports) Queued(taskID string) bool {
+// queuedKnownLocked answers Queued from the entries the process actually
+// holds: the carrier-backed ids, the disk files and the staging area.
+func (p *PendingReports) queuedKnownLocked(taskID string) bool {
+	if p.carrierBacked[taskID] {
+		return true
+	}
 	if !validTaskID(taskID) {
 		return false
 	}
-	p.mu.Lock()
-	defer p.mu.Unlock()
 	if _, ok := p.readLocked(taskID); ok {
 		return true
 	}
@@ -383,15 +554,184 @@ func (p *PendingReports) Queued(taskID string) bool {
 	return ok
 }
 
+// queuedLocked is the settlement gate: while the carrier list has not
+// completed, the queue's state is unknown, and "unknown" must never read as
+// "empty" (§4.3). A task may hold a queued report the rebuild has not seen
+// yet, so every task reads as queued until the list lands.
+func (p *PendingReports) queuedLocked(taskID string) bool {
+	if !p.restored {
+		return true
+	}
+	return p.queuedKnownLocked(taskID)
+}
+
+// lenLocked is the queue depth across both durability faces: the disk entries
+// and the carrier-backed ones (deduplicated by task id). A staged report with
+// neither face does not count — it is not durable (错误处理表).
+func (p *PendingReports) lenLocked() int {
+	seen := make(map[string]struct{})
+	for _, rep := range p.listLocked() {
+		seen[rep.TaskID] = struct{}{}
+	}
+	for taskID := range p.carrierBacked {
+		seen[taskID] = struct{}{}
+	}
+	return len(seen)
+}
+
+// undeliveredLocked is the drain's report count: the durable entries plus
+// the staged ones a failed write left in memory. It is the same union as the
+// gauge, plus the not-yet-durable staged reports the gauge deliberately does
+// not count.
+func (p *PendingReports) undeliveredLocked() int {
+	seen := make(map[string]struct{})
+	for _, rep := range p.listLocked() {
+		seen[rep.TaskID] = struct{}{}
+	}
+	for taskID := range p.carrierBacked {
+		seen[taskID] = struct{}{}
+	}
+	for taskID := range p.staged {
+		seen[taskID] = struct{}{}
+	}
+	return len(seen)
+}
+
+// Len reports the durable queue depth — the foreman_pending_reports gauge.
+// A report counts once a durability face holds it (the disk write or the
+// carrier write); one both faces failed does not grow the gauge.
+func (p *PendingReports) Len() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.lenLocked()
+}
+
+// Queued reports whether taskID still has an undelivered report: one whose
+// file exists, one a failed write left staged, or one carried on the cluster
+// carrier. The scheduler gates the verdict-time Job deletion of a terminal
+// entry on it, so the Job goes only once the report landed (contract §10) —
+// the credential and the entry follow their own drain window (ADR-017).
+//
+// While the carrier list has not completed, the queue's state is unknown and
+// every task answers true: a failed or unfinished rebuild must not let a
+// settlement read the queue as empty (§4.3). Rebuilt reports whether the
+// list completed; HasQueuedEntry is the known-membership face for callers
+// deciding whether to write, not whether to settle.
+//
+// A task id that cannot name a queue file is answered without touching the
+// filesystem: such a report is never a durable queue entry (Drain delivers
+// it straight from staging), so it gates no objects either.
+func (p *PendingReports) Queued(taskID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.queuedLocked(taskID)
+}
+
+// Rebuilt reports whether the carrier list completed, so the queue's state is
+// authoritative. A queue without a carrier store is complete at open (the
+// disk is its whole persistence face). Settlement paths check it before
+// acting: an uncompleted rebuild is not an empty queue (§4.3).
+func (p *PendingReports) Rebuilt() bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.restored
+}
+
+// HasQueuedEntry reports whether a queue entry the process actually holds
+// exists for taskID. Unlike Queued it does not treat an uncompleted carrier
+// list as "queued": it answers a write decision (does this report still need
+// a write-ahead entry?), where an unknown list must not suppress the write.
+func (p *PendingReports) HasQueuedEntry(taskID string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.queuedKnownLocked(taskID)
+}
+
 // Drop forgets the report queued for taskID: the direct forward it was
 // written ahead of settled it (accepted, moot, or permanently refused), so no
 // replay is owed. A no-op when nothing is queued. The gauge follows the
-// durable depth.
-func (p *PendingReports) Drop(taskID string) {
+// durable depth; a carrier is deleted with the entry (ADR-046 decision 3).
+func (p *PendingReports) Drop(ctx context.Context, taskID string) {
 	p.mu.Lock()
-	defer p.mu.Unlock()
+	wasBacked := p.carrierBacked[taskID]
 	p.dropLocked(taskID)
 	p.notifyLocked()
+	p.mu.Unlock()
+	if wasBacked {
+		// The sweep is the retry handle: a settled carrier whose delete
+		// failed is removed on the next round (§6.5).
+		p.deleteCarrier(ctx, taskID)
+	}
+}
+
+// deleteCarrier removes one carrier; a failure is the sweep's retry handle
+// (§6.5), never a reason to resurrect the queue entry.
+func (p *PendingReports) deleteCarrier(ctx context.Context, taskID string) {
+	if p.carriers == nil {
+		return
+	}
+	if err := p.carriers.DeleteCarrier(ctx, taskID); err != nil {
+		p.log.Error("pending carrier delete failed", "task_id", taskID, "err", err)
+	}
+}
+
+// Restore rebuilds the queue from its carriers (§4.3). It is the same
+// recovery as the index rebuild: a restored report keeps its enqueue time and
+// body, so a replay sends exactly the body that was enqueued. A list failure
+// leaves the queue unrestored — the caller must not read it as empty — and a
+// later call retries.
+func (p *PendingReports) Restore(ctx context.Context) error {
+	p.mu.Lock()
+	if p.restored || p.carriers == nil {
+		p.restored = true
+		p.mu.Unlock()
+		return nil
+	}
+	p.mu.Unlock()
+
+	carriers, err := p.carriers.ListCarriers(ctx)
+	if err != nil {
+		return fmt.Errorf("restore pending reports: %w", err)
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	queued := 0
+	for _, c := range carriers {
+		rep := pendingReport{
+			TaskID:        c.TaskID,
+			JobName:       c.JobName,
+			DaemonID:      c.DaemonID,
+			Endpoint:      c.Endpoint,
+			Body:          c.Body,
+			EnqueuedAt:    c.EnqueuedAt,
+			Attempts:      c.Attempts,
+			FailureReason: c.FailureReason,
+		}
+		if rep.TaskID == "" || rep.Endpoint == "" {
+			p.log.Error("pending carrier malformed",
+				"secret", c.Name, "task_id", rep.TaskID, "endpoint", rep.Endpoint)
+			continue
+		}
+		if rep.EnqueuedAt.IsZero() {
+			// A carrier without a clock reading is still a real report; the
+			// TTL starts now rather than dropping it unread.
+			rep.EnqueuedAt = p.now()
+		}
+		already := p.queuedKnownLocked(rep.TaskID)
+		p.carrierBacked[rep.TaskID] = true
+		if !already {
+			// The disk (a container restart keeps the emptyDir) is the
+			// in-process copy; it wins when both exist, because it was
+			// written first and a re-enqueue keeps the original clock.
+			p.staged[rep.TaskID] = rep
+			queued++
+		}
+	}
+	p.restored = true
+	p.notifyLocked()
+	p.log.Info("pending.rebuilt", "carriers", len(carriers), "queued", queued)
+	return nil
 }
 
 func (p *PendingReports) path(taskID string) string {
@@ -478,7 +818,7 @@ func (p *PendingReports) removeLocked(taskID string) {
 }
 
 func (p *PendingReports) notifyLocked() {
-	p.notify(len(p.listLocked()))
+	p.notify(p.lenLocked())
 }
 
 // notify reports the queue depth to the gauge hook.

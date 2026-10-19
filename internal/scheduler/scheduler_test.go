@@ -2930,7 +2930,7 @@ func TestTaskEventsCarryIdentity(t *testing.T) {
 		buf := newLogScheduler(t, f, slog.LevelInfo)
 		e := f.claim(t, "task-1")
 		f.pending.err = errors.New("queue unwritable")
-		f.sched.enqueuePending(context.Background(), e, EPFail, []byte(`{}`))
+		f.sched.enqueuePending(context.Background(), e, EPFail, "", []byte(`{}`))
 		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.forward_undelivered"), "task-1", "fm-task-1", "fm-task-1")
 	})
 }

@@ -973,7 +973,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			// exists only in memory. Marking first and enqueueing on failure
 			// left a window where a crash lost both the verdict and the
 			// report; the rebuilt Job then read a completed task as failed.
-			s.enqueuePending(ctx, e, ep, body)
+			s.enqueuePending(ctx, e, ep, "", body)
 			result := registry.Result(ep.TerminalResult())
 			if _, err := s.reg.MarkTerminal(e.TaskID, result, "", now); err != nil {
 				unlockTerminal()
@@ -994,12 +994,14 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		if decided, ok := s.reg.DecidedReport(e.TaskID); ok {
 			body = decided
 		}
-		if !undecided && !s.pendingReports.Queued(e.TaskID) {
+		if !undecided && !s.pendingReports.HasQueuedEntry(e.TaskID) {
 			// Every terminal forward has a queue landing before it (§10
 			// 补偿与重放同源). A verdict decided on another path already
 			// wrote one; a duplicate late report has no such decision to
-			// rely on.
-			s.enqueuePending(ctx, e, ep, body)
+			// rely on. The known-membership face is deliberate: an
+			// uncompleted carrier list must not suppress this write, and it
+			// is the write itself that is being decided, not a settlement.
+			s.enqueuePending(ctx, e, ep, "", body)
 		}
 	}
 
@@ -1021,7 +1023,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			// 409 = it already holds a verdict. All three leave nothing to
 			// retry: the write-ahead entry goes, and the Job goes now (the
 			// convergence round would delete it anyway).
-			s.pendingReports.Drop(e.TaskID)
+			s.pendingReports.Drop(ctx, e.TaskID)
 			if code == 404 && undecided {
 				// §4.4's in-place decision: the server no longer holds the
 				// task, so nothing is writable. A report that was still
@@ -1042,7 +1044,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			// no queue — the write-ahead entry goes too. The verdict is
 			// written, so the Job is torn down like every other terminal
 			// path; only the log records the loss.
-			s.pendingReports.Drop(e.TaskID)
+			s.pendingReports.Drop(ctx, e.TaskID)
 			s.log.ErrorContext(ctx, "task.forward_failed",
 				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 				"endpoint", string(ep), "status", code)
@@ -1113,8 +1115,8 @@ var upstreamUnavailableBody = []byte(`{"error":"upstream unavailable"}`)
 // reports it as undelivered so the entry's objects stay put. The error is
 // logged, never acted on — dropping the report here is exactly what §10
 // forbids.
-func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep Endpoint, body []byte) {
-	if err := s.pendingReports.Enqueue(e.TaskID, e.JobName, e.DaemonID, ep, body); err != nil {
+func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep Endpoint, failureReason string, body []byte) {
+	if err := s.pendingReports.Enqueue(ctx, e.TaskID, e.JobName, e.DaemonID, ep, body, failureReason); err != nil {
 		s.log.ErrorContext(ctx, "task.forward_undelivered",
 			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 			"endpoint", string(ep),
@@ -1286,6 +1288,11 @@ func (s *Scheduler) OnJobGone(ctx context.Context, jobName string) error {
 		return nil
 	}
 	if e.IsTerminal() {
+		if s.pendingReports.Queued(e.TaskID) {
+			// A queued report owns the terminal: the Job goes only once the
+			// replay landed (§10).
+			return nil
+		}
 		return s.deleteJob(ctx, e)
 	}
 	if s.now().Sub(e.ClaimedAt) < jobGoneGracePeriod {
@@ -1306,6 +1313,15 @@ func (s *Scheduler) OnJobGone(ctx context.Context, jobName string) error {
 // (§4.2).
 func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 	defer s.SyncInflight()
+	// §4.3: the carrier list is the premise of "this task has no pending
+	// report". Until it completes, a rebuilt entry may hold a queued terminal
+	// report the process has not seen — settling it here would synthesize a
+	// terminal that rewrites the report's verdict. This entry point is
+	// reachable outside the recovery round (the proxy's refused-registration
+	// path), so the gate lives here, not only in the round.
+	if !s.pendingReports.Rebuilt() {
+		return nil
+	}
 	e, ok := s.reg.ByJob(jobName)
 	if !ok {
 		return nil
@@ -1320,7 +1336,17 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 		return nil
 	}
 	if e.IsTerminal() {
+		if s.pendingReports.Queued(e.TaskID) {
+			return nil
+		}
 		return s.deleteJob(ctx, e)
+	}
+	if s.pendingReports.Queued(e.TaskID) {
+		// §4.3: a task with a pending entry converges only through the
+		// entry's replay and the two settlement classes — never through a
+		// synthesized terminal. This covers the rebuilt entry whose Job
+		// ended after the crash that queued its report.
+		return nil
 	}
 	st, err := s.server.TaskStatus(ctx, e.TaskID)
 	switch {
@@ -1350,6 +1376,13 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 // Job stays until a drain lands it (§10) — deleting it would let a Job
 // deletion stand in for a delivered report.
 func (s *Scheduler) failEntry(ctx context.Context, e registry.TaskEntry, report failReport) error {
+	// Every synthetic terminal goes through here (compensation, boot bound,
+	// unconfirmed delivery, refused start). None of them may be emitted while
+	// the queue's carrier list is outstanding: a pending report the rebuild
+	// has not seen owns the verdict (§4.3).
+	if !s.pendingReports.Rebuilt() {
+		return nil
+	}
 	_, body, err := s.settleFailure(ctx, e, report)
 	if err != nil {
 		return err
@@ -1377,8 +1410,10 @@ func (s *Scheduler) settleFailure(ctx context.Context, e registry.TaskEntry, rep
 		"failure_reason", report.reason)
 	// §10 write-ahead: durable before the verdict write, exactly like an
 	// inbound terminal report — a crash cannot leave a failure verdict whose
-	// report only lived in the process.
-	s.enqueuePending(ctx, e, EPFail, body)
+	// report only lived in the process. The attribution rides the queue entry:
+	// the rebuilt entry has no in-memory verdict, and the replay must restore
+	// failure_reason from the entry, never from the body (§4.1).
+	s.enqueuePending(ctx, e, EPFail, report.reason, body)
 	settled, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, report.reason, s.now())
 	if err != nil {
 		return e, body, err
@@ -1403,6 +1438,12 @@ func (s *Scheduler) settleFailure(ctx context.Context, e registry.TaskEntry, rep
 // round that saw it delivered deletes the Job.
 func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) error {
 	defer s.SyncInflight()
+	// §4.3: an uncompleted carrier list is not an empty queue. Converging an
+	// entry now could delete the Job of a task whose queued report the
+	// rebuild has not seen yet.
+	if !s.pendingReports.Rebuilt() {
+		return nil
+	}
 	e, ok := s.reg.Get(taskID)
 	if !ok {
 		return nil
@@ -1756,14 +1797,26 @@ func podTerminated(pod *corev1.Pod) bool {
 	return pod.Status.Phase == corev1.PodSucceeded || pod.Status.Phase == corev1.PodFailed
 }
 
-// SweepOrphanSecrets deletes credential Secrets left behind by a reclaim a
-// restart interrupted (§6.5). The criterion is two-sided: no registry entry
-// for the task-id (any state) AND no task Job carrying it; either half alone
-// deletes a Secret still needed (CreateSecret → CreateJob window, or a Job
-// that boots job_auth_failed). A Secret whose name is not fm-<task-id>-cred
-// is not a design product and is skipped — deleting by label would hit a
-// same-named in-flight credential. Job presence is read from the task-id
-// label, never a derived name (ADR-034 decision 9).
+// SweepOrphanSecrets runs the two Secret-domain sweeps of §6.5.
+//
+// The credential domain is selected by the absence of a role label ∧ the
+// task-id label ∧ the name fm-<task-id>-cred; its criterion is two-sided: no
+// registry entry for the task-id (any state) AND no task Job carrying it;
+// either half alone deletes a Secret still needed (CreateSecret → CreateJob
+// window, or a Job that boots job_auth_failed). A Secret whose name is not
+// fm-<task-id>-cred is not a design product and is skipped — deleting by
+// label would hit a same-named in-flight credential.
+//
+// The carrier domain is selected by the carrier role label ∧ managed-by; its
+// criterion is "the entry settled" — the queue no longer holds the task. The
+// task-id label and the Job's existence do not participate: a carrier must
+// outlive its Job until the report is settled (§6.5).
+//
+// The Job's presence is answered by listing task Jobs and reading their
+// foreman.tsic.top/task-id labels, never by deriving a name: the display name
+// is the template's business, so a name built from the task id would resolve
+// to nothing for every custom format and delete a live Job's credential
+// (ADR-034 decision 9 — the label is the only locator).
 func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 	secrets, err := s.jobs.ListSecrets(ctx)
 	if err != nil {
@@ -1783,6 +1836,12 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 	}
 	var firstErr error
 	for _, secret := range secrets {
+		// Ownership exclusion precedes the criterion: a role-labelled Secret
+		// belongs to another domain, and the carrier carries a task-id label
+		// (§6.5).
+		if secret.Labels[registry.LabelRole] != "" {
+			continue
+		}
 		taskID := secret.Labels[registry.LabelTaskID]
 		if taskID == "" {
 			continue
@@ -1808,6 +1867,34 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		s.log.InfoContext(ctx, "cred.orphan_secret_removed",
 			"task_id", taskID, "job_name", jobbuilder.DaemonIDFor(taskID), "secret", secret.Name)
 	}
+	for _, secret := range secrets {
+		// Carrier domain: selected by the carrier role label ∧ managed-by.
+		// The name form and the task-id label are not selectors (§6.5).
+		if secret.Labels[registry.LabelRole] != registry.RolePendingReport {
+			continue
+		}
+		if secret.Labels[registry.LabelManagedBy] != registry.ManagedByForeman {
+			continue
+		}
+		taskID := secret.Labels[registry.LabelTaskID]
+		if taskID == "" {
+			// No task identity: no settlement judgement, so no deletion.
+			continue
+		}
+		if s.pendingReports.Queued(taskID) {
+			// Unsettled carriers are never swept — the retention bound does
+			// not apply to entries already queued (§6.5, §4.6).
+			continue
+		}
+		if err := s.jobs.DeleteSecret(ctx, secret.Name); err != nil {
+			if firstErr == nil {
+				firstErr = err
+			}
+			continue
+		}
+		s.log.InfoContext(ctx, "pending.carrier_removed",
+			"task_id", taskID, "secret", secret.Name)
+	}
 	return firstErr
 }
 
@@ -1827,6 +1914,12 @@ func (s *Scheduler) Reconcile(ctx context.Context) error {
 	}
 	if s.reconciler != nil {
 		return s.reconciler.Reconcile(ctx)
+	}
+	// Without the recovery loop this path is the only convergence driver:
+	// the queue must be rebuilt before any entry is settled, or a failed
+	// carrier list would read as an empty queue (§4.3).
+	if err := s.pendingReports.Restore(ctx); err != nil {
+		return err
 	}
 	var firstErr error
 	for _, e := range s.reg.List() {
@@ -1895,6 +1988,12 @@ func (s *Scheduler) Rebuild(ctx context.Context) error {
 	// Payloads never leave process memory (F3), so every rebuilt entry lacks
 	// one; the C13 convergence releases pre-start entries for redispatch.
 	s.log.InfoContext(ctx, "registry.rebuilt", "jobs", rebuilt)
+	// The same recovery rebuilds the pending queue from its carriers
+	// (§4.3). A list failure is not fatal here: the queue stays unrestored
+	// and the recovery round retries it, settling nothing until it succeeds.
+	if err := s.pendingReports.Restore(ctx); err != nil {
+		s.log.ErrorContext(ctx, "pending.restore_failed", "err", err)
+	}
 	return nil
 }
 
@@ -2094,11 +2193,11 @@ func (s *Scheduler) reportFail(ctx context.Context, e registry.TaskEntry, body [
 	if err == nil {
 		switch {
 		case terminalReportDelivered(code):
-			s.pendingReports.Drop(e.TaskID)
+			s.pendingReports.Drop(ctx, e.TaskID)
 			return nil
 		case permanentTerminalRejection(code):
 			// Permanent (§1.5): a replay would only be refused again.
-			s.pendingReports.Drop(e.TaskID)
+			s.pendingReports.Drop(ctx, e.TaskID)
 		}
 	}
 	if err == nil {
@@ -2118,13 +2217,21 @@ func (s *Scheduler) DrainPendingReports(ctx context.Context) (int, error) {
 	return s.pendingReports.Drain(ctx, s)
 }
 
+// RestorePendingReports rebuilds the queue from its carriers (§4.3). It is
+// idempotent: once the list succeeded every later round is a no-op. An error
+// means the queue is not rebuilt — the recovery loop must settle nothing that
+// round (a failed list is not an empty queue).
+func (s *Scheduler) RestorePendingReports(ctx context.Context) error {
+	return s.pendingReports.Restore(ctx)
+}
+
 // DeliverQueued re-delivers one queued terminal report through the same
 // terminal face every other forward uses (ADR-031's single entry): the
 // instance's decided body wins, the 404 in-place decision runs here, and a
 // 2xx deletes the Job. It is the sender the queue's Drain calls, so a replay
 // is never an inbound report — it does not enter the attribution gate and
 // cannot emit a second attribution decision.
-func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID string, body []byte) (int, []byte, error) {
+func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID string, body []byte, failureReason string) (int, []byte, error) {
 	e, ok := s.reg.Get(taskID)
 	if !ok {
 		// The credential was reclaimed before the report landed: the entry is
@@ -2134,7 +2241,7 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID strin
 		if err == nil && ep.IsTerminal() && permanentTerminalRejection(code) {
 			// A replay of a permanently refused report would only be refused
 			// again: the queue entry goes now instead of at the TTL.
-			s.pendingReports.Drop(taskID)
+			s.pendingReports.Drop(ctx, taskID)
 			s.log.ErrorContext(ctx, "task.forward_dropped",
 				"task_id", taskID, "endpoint", string(ep), "status", code,
 				"reason", "permanent_4xx")
@@ -2183,20 +2290,53 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID strin
 			return code, resp, nil
 		}
 		// 2xx and 409: the verdict is written on the server side. 409 means it
-		// was already there, so nothing is replayed again.
+		// was already there, so nothing is replayed again. A rebuilt entry
+		// carries no verdict, so the replay's endpoint supplies it — without
+		// this the later missing-Job path would synthesize a failure for a
+		// completed task (§4.3).
+		s.settleReplayed(ctx, taskID, ep, failureReason)
 		s.deleteJob(ctx, e)
 	case permanentTerminalRejection(code):
 		// §1.5: a permanent 4xx is never retried. The queue entry goes so the
 		// drain cannot replay it to the TTL (and SettleTerminal's Queued gate
 		// cannot keep the Job around for it); the Job is torn down like every
 		// other terminal path.
-		s.pendingReports.Drop(taskID)
+		s.pendingReports.Drop(ctx, taskID)
 		s.log.ErrorContext(ctx, "task.forward_dropped",
 			"task_id", taskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 			"endpoint", string(ep), "status", code, "reason", "permanent_4xx")
 		s.deleteJob(ctx, e)
 	}
 	return code, resp, nil
+}
+
+// settleReplayed records the verdict a successful replay establishes on a
+// rebuilt entry. In the same-process form the entry is already terminal (the
+// write-ahead enqueue preceded the verdict), so this is a no-op; after a
+// restart the rebuilt entry carries no verdict and the queued report is its
+// only terminal source (§4.3). A decided entry keeps its own result (§4.4).
+// failureReason is the attribution the queued entry was decided with: a
+// synthesized failure replayed across a restart must project the same
+// failure_reason, never an empty one (§4.1).
+func (s *Scheduler) settleReplayed(ctx context.Context, taskID string, ep Endpoint, failureReason string) {
+	unlock := s.taskMu.Lock(taskID)
+	defer unlock()
+	fresh, ok := s.reg.Get(taskID)
+	if !ok || fresh.IsTerminal() || len(fresh.DecidedReport) > 0 {
+		return
+	}
+	result := registry.Result(ep.TerminalResult())
+	reason := ""
+	if result == registry.ResultFailed {
+		reason = failureReason
+	}
+	if _, err := s.reg.MarkTerminal(taskID, result, reason, s.now()); err != nil {
+		s.log.ErrorContext(ctx, "task.settle_failed",
+			"task_id", taskID, "job_name", fresh.JobName, "daemon_id", fresh.DaemonID,
+			"reason", "queued report delivered", "err", err)
+		return
+	}
+	s.metrics.TaskTerminal(string(result))
 }
 
 // deleteJob removes the Job object of a settled task — the "撤下调度与资源"

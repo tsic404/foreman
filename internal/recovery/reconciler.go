@@ -315,6 +315,16 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 	r.settler.SyncInflight()
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	// §4.3: the carrier list is the premise of "this task has no pending
+	// report". Until it completes, no entry is settled — a failed list must
+	// never read as an empty queue (and must never emit a synthetic
+	// terminal). Known queue entries still replay: that is delivery, not a
+	// settlement decision.
+	if err := r.settler.RestorePendingReports(ctx); err != nil {
+		r.log.WarnContext(ctx, "pending.restore_failed", "err", err)
+		r.drainPending(ctx)
+		return nil
+	}
 	r.drainPending(ctx)
 	r.reportSuspects(ctx)
 	err := r.round(ctx)

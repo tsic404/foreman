@@ -159,11 +159,15 @@ func run() error {
 
 	// Terminal reports that exhausted the retry budget are queued on the
 	// node-local state root and re-sent through the scheduler's single
-	// terminal face (contract §10, ADR-031).
+	// terminal face (contract §10, ADR-031). Each entry also lands on a
+	// Foreman-created Secret carrier, so it survives a process exit
+	// (ADR-046).
+	jobs := scheduler.NewJobClient(clientset, schedCfg.JobNamespace)
 	pending, err := scheduler.NewPendingReports(
 		scheduler.PendingReportsDir(getenv),
 		scheduler.WithPendingReportsGauge(metrics.PendingReports),
 		scheduler.WithPendingReportsLogger(baseLog),
+		scheduler.WithPendingReportsCarrier(scheduler.NewSecretCarrierStore(jobs)),
 	)
 	if err != nil {
 		return err
@@ -195,7 +199,7 @@ func run() error {
 	sched, err := scheduler.New(
 		schedCfg,
 		reg,
-		scheduler.NewJobClient(clientset, schedCfg.JobNamespace),
+		jobs,
 		builder,
 		client,
 		metrics,

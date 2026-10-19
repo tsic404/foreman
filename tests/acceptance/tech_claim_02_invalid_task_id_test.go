@@ -41,11 +41,25 @@ func TestClaimInvalidTaskIDLeavesReclaimableEntry(t *testing.T) {
 		t.Fatalf("OnClaim error = %v, want ErrInvalidTaskID", err)
 	}
 
+	// No Job or credential Secret may be created for an unresolvable name.
+	// The terminal report's carrier is a queue object, not a task object, and
+	// it settles with the report's own forward — so the judgement is the
+	// objects still live, not the create events.
 	h.jobs.mu.Lock()
-	createdJobs, createdSecrets := len(h.jobs.createdJobs), len(h.jobs.createdSecrets)
+	createdJobs := len(h.jobs.createdJobs)
+	deleted := make(map[string]bool, len(h.jobs.deletedSecrets))
+	for _, name := range h.jobs.deletedSecrets {
+		deleted[name] = true
+	}
+	liveSecrets := 0
+	for _, secret := range h.jobs.createdSecrets {
+		if !deleted[secret.Name] {
+			liveSecrets++
+		}
+	}
 	h.jobs.mu.Unlock()
-	if createdJobs != 0 || createdSecrets != 0 {
-		t.Fatalf("objects created for an unresolvable name: jobs=%d secrets=%d", createdJobs, createdSecrets)
+	if createdJobs != 0 || liveSecrets != 0 {
+		t.Fatalf("objects created for an unresolvable name: jobs=%d secrets=%d", createdJobs, liveSecrets)
 	}
 
 	entry, ok := h.reg.Get("TASK-1")

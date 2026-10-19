@@ -105,6 +105,64 @@ func TestDiscardTaskKeepsStartedEntry(t *testing.T) {
 	}
 }
 
+// An outstanding carrier list is not an empty queue: no settlement may act on
+// it (§4.3). FailJob is reachable outside the recovery round (the proxy's
+// refused-registration path), so the gate must sit at the settlement entry
+// points, not only in the round.
+func TestSettlementWaitsForTheQueueRebuild(t *testing.T) {
+	f := newFixture(t)
+	f.pending.notRebuilt = true
+	f.claim(t, "task-1")
+
+	if err := f.sched.FailJob(context.Background(), "fm-task-1", FailureReasonDaemonNotRegistered); err != nil {
+		t.Fatalf("FailJob: %v", err)
+	}
+	if err := f.sched.SettleTerminal(context.Background(), "task-1", "completed"); err != nil {
+		t.Fatalf("SettleTerminal: %v", err)
+	}
+	if e, ok := f.reg.Get("task-1"); !ok || e.IsTerminal() {
+		t.Fatalf("entry = %+v, %v; want it unsettled while the queue is not rebuilt", e, ok)
+	}
+	if len(f.server.forwards) != 0 {
+		t.Fatalf("forwards = %+v, want none while the queue is not rebuilt", f.server.forwards)
+	}
+	if !f.hasJob("fm-task-1") {
+		t.Fatal("the Job must survive while the queue is not rebuilt")
+	}
+
+	// The list completes: the same call settles normally.
+	f.pending.notRebuilt = false
+	if err := f.sched.SettleTerminal(context.Background(), "task-1", "completed"); err != nil {
+		t.Fatalf("SettleTerminal after the rebuild: %v", err)
+	}
+	e, ok := f.reg.Get("task-1")
+	if !ok || !e.IsTerminal() || e.Result != registry.ResultCompleted {
+		t.Fatalf("entry = %+v, %v; want the completed verdict after the rebuild", e, ok)
+	}
+	if f.hasJob("fm-task-1") {
+		t.Fatal("the Job must be deleted once the settlement is allowed")
+	}
+}
+
+// The write-ahead decision is not a settlement decision: an uncompleted
+// carrier list must not suppress the queue write of a late duplicate report.
+func TestOnReportQueuesADuplicateWhileTheQueueIsNotRebuilt(t *testing.T) {
+	f := newFixture(t)
+	p := f.withPendingReports()
+	p.notRebuilt = true
+	e := f.claim(t, "task-1")
+	if _, err := f.reg.MarkTerminal("task-1", registry.ResultCompleted, "", f.now); err != nil {
+		t.Fatalf("MarkTerminal: %v", err)
+	}
+
+	if _, _, err := f.sched.OnReport(context.Background(), EPComplete, e, []byte(`{"result":"ok"}`), ""); err != nil {
+		t.Fatalf("OnReport: %v", err)
+	}
+	if len(p.reports) != 1 {
+		t.Fatalf("enqueued reports = %d, want the duplicate's write-ahead entry", len(p.reports))
+	}
+}
+
 // A terminal entry whose report is still queued keeps its Job: the deletion
 // waits for the drain that lands the report (§10) — a deleted Job
 // must never stand in for a delivered report.
@@ -115,7 +173,7 @@ func TestSettleTerminalKeepsJobWhileReportIsQueued(t *testing.T) {
 	if _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, "", f.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
-	if err := p.Enqueue("task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"failure_reason":"job_missing"}`)); err != nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"failure_reason":"job_missing"}`), ""); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 

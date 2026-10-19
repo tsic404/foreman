@@ -241,7 +241,7 @@ func TestReclaimGatesTheJobDeletionOnTheQueuedReport(t *testing.T) {
 	if _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, "", f.now); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
-	if err := p.Enqueue("task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"failure_reason":"job_missing"}`)); err != nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"failure_reason":"job_missing"}`), ""); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
@@ -357,6 +357,44 @@ func TestSweepOrphanSecretsSkipsNameLabelMismatch(t *testing.T) {
 	}
 	if len(f.jobs.deletedSecrets) != 1 || f.jobs.deletedSecrets[0] != "fm-task-orphan-cred" {
 		t.Fatalf("deleted secrets = %v, want only the name-label-consistent orphan", f.jobs.deletedSecrets)
+	}
+}
+
+// The carrier domain is disjoint from the credential domain: a role-labelled
+// Secret is never a credential candidate even though it carries a task-id
+// label, and a carrier is swept only once its entry settled (§6.5).
+func TestSweepSecretDomainsKeepCarriersOutOfTheCredentialCriterion(t *testing.T) {
+	f := newFixture(t)
+	f.pending.queued = map[string]bool{"task-pending": true}
+	secret := func(name, taskID, role string) corev1.Secret {
+		labels := map[string]string{
+			registry.LabelManagedBy: registry.ManagedByForeman,
+			registry.LabelTaskID:    taskID,
+		}
+		if role != "" {
+			labels[registry.LabelRole] = role
+		}
+		return corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}}
+	}
+	f.jobs.secrets = []corev1.Secret{
+		secret("fm-task-orphan-cred", "task-orphan", ""),
+		secret("fm-carrier-pending", "task-pending", registry.RolePendingReport),
+		secret("fm-carrier-settled", "task-settled", registry.RolePendingReport),
+		secret("fm-catalog-probe-cred", "probe-1", registry.RoleCatalogProbe),
+	}
+
+	if err := f.sched.SweepOrphanSecrets(context.Background()); err != nil {
+		t.Fatalf("SweepOrphanSecrets: %v", err)
+	}
+	// The credential domain runs first, then the carrier domain.
+	want := []string{"fm-task-orphan-cred", "fm-carrier-settled"}
+	if len(f.jobs.deletedSecrets) != len(want) {
+		t.Fatalf("deleted secrets = %v, want %v", f.jobs.deletedSecrets, want)
+	}
+	for i, name := range want {
+		if f.jobs.deletedSecrets[i] != name {
+			t.Fatalf("deleted secrets = %v, want %v", f.jobs.deletedSecrets, want)
+		}
 	}
 }
 

@@ -450,7 +450,7 @@ func TestDeliverQueued404SettlesWithoutResult(t *testing.T) {
 	e := f.claim(t, "task-1")
 	f.server.forwardCode = 404
 
-	code, _, err := f.sched.DeliverQueued(context.Background(), EPFail, "task-1", []byte(`{"failure_reason":"job_failed"}`))
+	code, _, err := f.sched.DeliverQueued(context.Background(), EPFail, "task-1", []byte(`{"failure_reason":"job_failed"}`), "")
 	if err != nil || code != 404 {
 		t.Fatalf("DeliverQueued = %d, %v", code, err)
 	}
@@ -483,7 +483,7 @@ func TestDeliverQueued404KeepsAVerdictDecidedDuringReplay(t *testing.T) {
 		}
 	}
 
-	code, _, err := f.sched.DeliverQueued(context.Background(), EPFail, "task-1", []byte(`{"failure_reason":"job_failed"}`))
+	code, _, err := f.sched.DeliverQueued(context.Background(), EPFail, "task-1", []byte(`{"failure_reason":"job_failed"}`), "")
 	if err != nil || code != 404 {
 		t.Fatalf("DeliverQueued = %d, %v", code, err)
 	}
@@ -515,7 +515,7 @@ func TestDeliverQueuedUsesTheDecidedBody(t *testing.T) {
 		t.Fatal("RegisterDecidedReport: entry missing")
 	}
 
-	code, _, err := f.sched.DeliverQueued(context.Background(), EPFail, "task-1", []byte(`{"error":"queued daemon body"}`))
+	code, _, err := f.sched.DeliverQueued(context.Background(), EPFail, "task-1", []byte(`{"error":"queued daemon body"}`), "")
 	if err != nil || code != 200 {
 		t.Fatalf("DeliverQueued = %d, %v", code, err)
 	}

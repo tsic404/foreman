@@ -289,14 +289,16 @@ const (
 	LabelManagedBy   = "app.kubernetes.io/managed-by"
 	ManagedByForeman = "foreman"
 
-	// LabelRole and RoleCatalogProbe mark a catalog-probe Job/Secret; they are
-	// the probe domain's discriminator, mutually exclusive with LabelTaskID
-	// (§6.5).
-	LabelRole        = "foreman.tsic.top/role"
-	RoleCatalogProbe = "catalog-probe"
-	LabelTaskID      = "foreman.tsic.top/task-id"
-	LabelAgentID     = "foreman.tsic.top/agent-id"
-	LabelWorkspaceID = "foreman.tsic.top/workspace-id"
+	// LabelRole discriminates the non-credential Secret domains (§3, §6.5):
+	// RoleCatalogProbe marks a catalog-probe Job/Secret, RolePendingReport
+	// marks a pending-report carrier Secret. Credential Secrets carry no role
+	// label — that absence is the credential domain's membership test.
+	LabelRole         = "foreman.tsic.top/role"
+	RoleCatalogProbe  = "catalog-probe"
+	RolePendingReport = "pending-report"
+	LabelTaskID       = "foreman.tsic.top/task-id"
+	LabelAgentID      = "foreman.tsic.top/agent-id"
+	LabelWorkspaceID  = "foreman.tsic.top/workspace-id"
 
 	AnnoIssueID         = "foreman.tsic.top/issue-id"
 	AnnoIssueIdentifier = "foreman.tsic.top/issue-identifier"

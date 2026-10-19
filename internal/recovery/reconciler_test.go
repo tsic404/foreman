@@ -113,6 +113,9 @@ type fakeSettler struct {
 	drainCalls     int
 	drainRemaining int
 	drainErr       error
+	// RestorePendingReports' programmed answer.
+	restoreCalls int
+	restoreErr   error
 }
 
 func (f *fakeSettler) OnJobGone(_ context.Context, jobName string) error {
@@ -220,6 +223,15 @@ func (f *fakeSettler) DrainPendingReports(context.Context) (int, error) {
 	defer f.mu.Unlock()
 	f.drainCalls++
 	return f.drainRemaining, f.drainErr
+}
+
+// RestorePendingReports is the carrier-list gate: while it errors the round
+// settles nothing (§4.3).
+func (f *fakeSettler) RestorePendingReports(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.restoreCalls++
+	return f.restoreErr
 }
 
 func (f *fakeSettler) calls() (int, int, int, int, int) {
@@ -981,6 +993,41 @@ func TestReconcileDrainsPendingReports(t *testing.T) {
 	}
 	if set.drainCalls != 1 {
 		t.Fatalf("drain calls = %d, want 1", set.drainCalls)
+	}
+}
+
+// TestReconcileSettlesNothingWhileTheCarrierListFails pins §4.3: a failed
+// carrier list is not an empty queue, so the round settles nothing (a
+// terminal entry waits, and no synthetic terminal can be emitted). The known
+// queue entries still replay — that is delivery, not a settlement decision —
+// and the next round retries the list.
+func TestReconcileSettlesNothingWhileTheCarrierListFails(t *testing.T) {
+	entry := testEntry("t1")
+	entry.State = registry.StateTerminal
+	entry.Result = registry.ResultCompleted
+	reg := newRegistry(t, entry)
+	set := &fakeSettler{restoreErr: errors.New("list secrets: apiserver unavailable")}
+	r := newTestReconciler(t, reg, &fakeObjects{}, &fakeStatus{}, set)
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if set.restoreCalls != 1 {
+		t.Fatalf("restore calls = %d, want 1", set.restoreCalls)
+	}
+	if len(set.settles) != 0 {
+		t.Fatalf("settles = %v, want none while the queue is not rebuilt", set.settles)
+	}
+	if set.drainCalls != 1 {
+		t.Fatalf("drain calls = %d, want the known entries replayed", set.drainCalls)
+	}
+
+	set.restoreErr = nil
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile retry: %v", err)
+	}
+	if len(set.settles) != 1 || set.settles[0].taskID != "t1" {
+		t.Fatalf("settles after the retry = %v, want the terminal entry", set.settles)
 	}
 }
 
