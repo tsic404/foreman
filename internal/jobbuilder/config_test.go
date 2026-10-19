@@ -52,8 +52,8 @@ func TestLoadConfigDefaults(t *testing.T) {
 // TestLoadConfigIgnoresTemplateShapeKeys: the template is the only Job shape
 // source (ADR-030), so the keys that used to tune the deleted built-in
 // template must not be read at all. An arbitrary value — an illegal one
-// included — is ignored and never refuses startup; the five resource/placement
-// keys are the idle entries whose deletion follows ADR-028 / ADR-035.
+// included — is ignored and never refuses startup. The five resource /
+// placement keys stay in the sample: re-introducing a consumer fails here.
 func TestLoadConfigIgnoresTemplateShapeKeys(t *testing.T) {
 	cfg, err := LoadConfig(envFrom(map[string]string{
 		"FOREMAN_JOB_IMAGE_PULL_SECRETS": `["a"]`,
