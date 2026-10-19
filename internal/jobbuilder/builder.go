@@ -146,7 +146,17 @@ func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, string, erro
 		return nil, nil, "", fmt.Errorf("issue Job Token: %w", err)
 	}
 	b.logPolicyApplied(e, name, ev)
+	b.recordPolicyHits(ev)
 	return job, b.credentialSecret(daemonID, e.TaskID, token), b.cfg.Issuer.Hash(token), nil
+}
+
+// recordPolicyHits counts one evaluation per axis by source (§9.2 策略命中):
+// the source is the same policy.applied *_source value the event carries, so
+// the metric and the log agree on the miss shape.
+func (b *Builder) recordPolicyHits(ev Evaluation) {
+	b.cfg.metrics().PolicyHit("resources", ev.resourceSource)
+	b.cfg.metrics().PolicyHit("capabilities_add", ev.capSource)
+	b.cfg.metrics().PolicyHit("node_selector", ev.nodeSelectorSource)
 }
 
 // nameSource reports whether the template expresses a name format (ADR-034):

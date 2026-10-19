@@ -35,6 +35,11 @@ func TestMetricsExposeAllDesignedNames(t *testing.T) {
 		metricTokenUsageTotal, metricDuplicateDispatch, metricPendingReports,
 		metricWSConnected, metricWSReconnectsTotal, metricHeartbeatSuspect,
 		metricDeliveryClaimsTotal, metricDeliveryLatency, metricDeliveryUnconfirmedTotal,
+		metricModelCatalogRelays, metricModelCatalogSecond,
+		metricSkillCacheResolves, metricSkillCacheEntries, metricSkillCacheBytes,
+		metricSkillCacheEvictions, metricWorkspaceStateRefreshes,
+		metricRuntimeProfileRefreshes, metricPolicyHits,
+		metricPolicyNameResolutions,
 	} {
 		if !strings.Contains(out, name) {
 			t.Fatalf("metric %s missing from exposition:\n%s", name, out)
@@ -133,6 +138,42 @@ func TestMetricsIsolatedRegistries(t *testing.T) {
 	a.TaskClaimed()
 	if strings.Contains(scrape(t, b), `foreman_task_claims_total 1`) {
 		t.Fatal("metrics instances share registry state")
+	}
+}
+
+// TestPolicyAndRefreshSeries records the four §9.2 families this change and
+// the profile/workspace work expose: the policy hit counter keeps axis and
+// source apart, the resolution counter keeps the four conclusions apart, and
+// the two refresh counters keep their result vocabularies.
+func TestPolicyAndRefreshSeries(t *testing.T) {
+	m := NewMetrics()
+	m.PolicyHit("resources", "direct")
+	m.PolicyHit("capabilities_add", "no_definition")
+	m.PolicyHit("node_selector", "no_identity")
+	m.PolicyNameResolution("resolved")
+	m.PolicyNameResolution("unavailable")
+	m.RuntimeProfileRefresh("unchanged")
+	m.RuntimeProfileRefresh("failed")
+	m.WorkspaceStateRefresh("stale_replay")
+
+	out := scrape(t, m)
+	for _, want := range []string{
+		`foreman_policy_hits_total{axis="resources",source="direct"} 1`,
+		`foreman_policy_hits_total{axis="capabilities_add",source="no_definition"} 1`,
+		`foreman_policy_hits_total{axis="node_selector",source="no_identity"} 1`,
+		`foreman_policy_hits_total{axis="resources",source="no_identity"} 0`,
+		`foreman_policy_name_resolutions_total{conclusion="resolved"} 1`,
+		`foreman_policy_name_resolutions_total{conclusion="unavailable"} 1`,
+		`foreman_policy_name_resolutions_total{conclusion="absent"} 0`,
+		`foreman_runtime_profile_refreshes_total{result="unchanged"} 1`,
+		`foreman_runtime_profile_refreshes_total{result="failed"} 1`,
+		`foreman_runtime_profile_refreshes_total{result="success"} 0`,
+		`foreman_workspace_state_refreshes_total{result="stale_replay"} 1`,
+		`foreman_workspace_state_refreshes_total{result="success"} 0`,
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("want series %q in exposition:\n%s", want, out)
+		}
 	}
 }
 

@@ -456,9 +456,10 @@ func parseCapabilities(field string, raw *fileCapabilities) (*capabilityDefiniti
 
 // resolvePolicyNames performs the startup name resolution (ADR-035 decision 4):
 // one attempt per key, inside one bounded window, with the conclusion of every
-// key recorded as a policy.name_resolution event. absent and ambiguous refuse
-// startup; unavailable only warns — the runtime comparison stays exact-match on
-// names, and nothing is cached or refreshed.
+// key recorded as a policy.name_resolution event and counted by conclusion
+// (§9.2). absent and ambiguous refuse startup; unavailable only warns — the
+// runtime comparison stays exact-match on names, and nothing is cached or
+// refreshed.
 func resolvePolicyNames(cfg Config, policy Policy, log logger) error {
 	keys := sortedPolicyKeys(policy)
 	if len(keys) == 0 {
@@ -469,6 +470,7 @@ func resolvePolicyNames(cfg Config, policy Policy, log logger) error {
 	var refusals []string
 	for _, key := range keys {
 		conclusion, err := resolveOneName(cfg, resolver, deadline, key)
+		cfg.metrics().PolicyNameResolution(string(conclusion))
 		fields := []any{"kind", key.kind, "name", key.name, "conclusion", string(conclusion)}
 		if conclusion == NameUnavailable {
 			log.Warn("policy.name_resolution", fields...)
@@ -1017,9 +1019,9 @@ type logger interface {
 // logPolicyApplied emits the per-task policy.applied event
 // (§9.1): the declared tiers, the per-axis source, the project and name
 // sources, the definition-side overrides, the faces actually written, and the
-// soft-affinity decision's cause. It is the only observable face of a policy
-// that silently does not apply; there is no policy metric
-// (cardinality discipline).
+// soft-affinity decision's cause. The event is the per-task face; the
+// aggregate face is foreman_policy_hits_total, whose closed axis×source
+// vocabulary carries no task identifier (cardinality discipline, §9.2).
 func (b *Builder) logPolicyApplied(e TaskEntry, jobName string, ev Evaluation) {
 	b.cfg.logger().Info("policy.applied",
 		"task_id", e.TaskID,

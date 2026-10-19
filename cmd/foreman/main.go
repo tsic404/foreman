@@ -175,6 +175,7 @@ func run() error {
 	}
 	jbCfg.Issuer = issuer
 	jbCfg.Nodes = reg
+	jbCfg.Metrics = metrics
 	jbCfg.Logger = baseLog
 	// The probe Job Token TTL is budget + drain timeout, so the builder needs
 	// the same bound the scheduler reclaims credentials under.

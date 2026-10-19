@@ -58,9 +58,9 @@ const (
 	DefaultPolicyNameResolutionTimeout = 5 * time.Second
 )
 
-// Config is the jobbuilder module's runtime configuration. Issuer and Nodes
-// are dependency seams, not env values: set them after LoadConfig. The Job's
-// shape is not configured here — it comes from the template (ADR-030).
+// Config is the jobbuilder module's runtime configuration. Issuer, Nodes and
+// Metrics are dependency seams, not env values: set them after LoadConfig. The
+// Job's shape is not configured here — it comes from the template (ADR-030).
 type Config struct {
 	JobNamespace string
 	JobImage     string
@@ -98,7 +98,35 @@ type Config struct {
 
 	Issuer TokenIssuer
 	Nodes  NodeIndex
-	Logger *slog.Logger
+	// Metrics is the policy-face observability seam (§9.2): the per-axis hit
+	// counter and the startup name-resolution conclusions. Nil degrades to
+	// no-ops, exactly like the other seams.
+	Metrics Metrics
+	Logger  *slog.Logger
+}
+
+// Metrics is the policy-face observability seam (§9.2). The observability
+// module provides the Prometheus implementation; nil degrades to no-ops.
+type Metrics interface {
+	// PolicyHit records one axis evaluation by axis (resources /
+	// capabilities_add / node_selector) and source (direct / no_definition /
+	// no_identity).
+	PolicyHit(axis, source string)
+	// PolicyNameResolution records one startup key's conclusion (resolved /
+	// absent / ambiguous / unavailable).
+	PolicyNameResolution(conclusion string)
+}
+
+type noopMetrics struct{}
+
+func (noopMetrics) PolicyHit(string, string)    {}
+func (noopMetrics) PolicyNameResolution(string) {}
+
+func (c Config) metrics() Metrics {
+	if c.Metrics == nil {
+		return noopMetrics{}
+	}
+	return c.Metrics
 }
 
 // logger falls back to the process default so the module logs through the

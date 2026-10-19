@@ -1391,6 +1391,7 @@ func (h *harness) useRealBuilderWithPolicy(t *testing.T, templatePath, policyPat
 	}
 	jbCfg.Issuer = h.issuer
 	jbCfg.Nodes = h.reg
+	jbCfg.Metrics = h.metrics
 	jbCfg.Logger = slog.New(slog.NewJSONHandler(h.logs, nil))
 	if mutate != nil {
 		mutate(&jbCfg)
@@ -1544,6 +1545,9 @@ type recordingMetrics struct {
 	skillBytes       int64
 	profileResults   []string
 	workspaceResults []string
+	taskResults      []string
+	policyHits       map[string]int
+	nameConclusions  []string
 	pendingReports   int
 }
 
@@ -1564,8 +1568,12 @@ func (m *recordingMetrics) AuthFailure(reason string) {
 // The scheduler's own seam: recorded only where a scenario reads it, no-ops
 // otherwise (the scheduler must never change behaviour because a metric
 // changed).
-func (m *recordingMetrics) TaskClaimed()                  {}
-func (m *recordingMetrics) TaskTerminal(string)           {}
+func (m *recordingMetrics) TaskClaimed() {}
+func (m *recordingMetrics) TaskTerminal(result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.taskResults = append(m.taskResults, result)
+}
 func (m *recordingMetrics) JobBootSeconds(float64)        {}
 func (m *recordingMetrics) JobCreateSeconds(float64)      {}
 func (m *recordingMetrics) InflightJobs(int)              {}
@@ -1648,6 +1656,56 @@ func (m *recordingMetrics) WorkspaceStateRefresh(result string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.workspaceResults = append(m.workspaceResults, result)
+}
+
+// PolicyHit records one policy axis evaluation by axis and source (§9.2).
+func (m *recordingMetrics) PolicyHit(axis, source string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.policyHits == nil {
+		m.policyHits = map[string]int{}
+	}
+	m.policyHits[axis+"/"+source]++
+}
+
+// PolicyNameResolution records one startup key's conclusion (§9.2).
+func (m *recordingMetrics) PolicyNameResolution(conclusion string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.nameConclusions = append(m.nameConclusions, conclusion)
+}
+
+// policyHitCount counts the axis evaluations recorded under one axis/source.
+func (m *recordingMetrics) policyHitCount(axis, source string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.policyHits[axis+"/"+source]
+}
+
+// nameResolutionCount counts the startup conclusions recorded under one value.
+func (m *recordingMetrics) nameResolutionCount(conclusion string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, recorded := range m.nameConclusions {
+		if recorded == conclusion {
+			n++
+		}
+	}
+	return n
+}
+
+// taskResultCount counts the terminal results recorded under one value.
+func (m *recordingMetrics) taskResultCount(result string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, recorded := range m.taskResults {
+		if recorded == result {
+			n++
+		}
+	}
+	return n
 }
 
 // skillResultCount counts the recorded resolve faces per result.
