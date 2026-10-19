@@ -2,6 +2,8 @@ package observability
 
 import (
 	"context"
+	"encoding/json"
+	"fmt"
 	"io"
 	"log/slog"
 	"regexp"
@@ -24,7 +26,7 @@ const redactedValue = "[redacted]"
 // that as the shared base, so components that tag their own component
 // (slog.Default().With("component", …)) emit exactly one component field.
 func NewLogger(w io.Writer, level slog.Level, component string) *slog.Logger {
-	json := slog.NewJSONHandler(w, &slog.HandlerOptions{
+	jsonHandler := slog.NewJSONHandler(w, &slog.HandlerOptions{
 		Level: level,
 		// The fixed field is called ts (§9.1), not
 		// slog's default "time".
@@ -35,7 +37,7 @@ func NewLogger(w io.Writer, level slog.Level, component string) *slog.Logger {
 			return a
 		},
 	})
-	log := slog.New(&redactHandler{next: json})
+	log := slog.New(&redactHandler{next: jsonHandler})
 	if component == "" {
 		return log
 	}
@@ -94,9 +96,27 @@ func redactAttr(a slog.Attr) slog.Attr {
 		}
 		return slog.Attr{Key: a.Key, Value: slog.GroupValue(scrubbed...)}
 	case slog.KindAny:
-		if s, ok := a.Value.Any().(string); ok {
-			return slog.String(a.Key, redactString(s))
+		// Errors and other non-native values arrive here as-is; their
+		// rendered text is what reaches the line, so scrub it too.
+		v := a.Value.Any()
+		if v == nil {
+			return a
 		}
+		if err, ok := v.(error); ok {
+			// Mirror slog.JSONHandler's KindAny dispatch: Marshaler errors
+			// render via MarshalJSON, only plain errors via Error(). Dropping
+			// this exception would silently flatten the former to text.
+			if _, jm := v.(json.Marshaler); !jm {
+				return slog.String(a.Key, redactString(err.Error()))
+			}
+		}
+		// Non-error values, and errors implementing json.Marshaler, keep
+		// their JSON shape: encode, scrub the encoded text, emit raw bytes.
+		encoded, err := json.Marshal(v)
+		if err != nil {
+			return slog.String(a.Key, redactString(fmt.Sprint(v)))
+		}
+		return slog.Attr{Key: a.Key, Value: slog.AnyValue(json.RawMessage(redactString(string(encoded))))}
 	}
 	return a
 }

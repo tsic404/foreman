@@ -3,6 +3,7 @@ package observability
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"strings"
 	"testing"
@@ -100,6 +101,100 @@ func TestLoggerRedactsTokens(t *testing.T) {
 	}
 }
 
+// TestLoggerRedactsErrorAttrs covers the dominant "err", err call shape:
+// the value is an error, not a string, so it lands in KindAny. Before the
+// KindAny fix the token rode through verbatim; the rendered text must now be
+// scrubbed like any other string.
+func TestLoggerRedactsErrorAttrs(t *testing.T) {
+	var buf bytes.Buffer
+	l := NewLogger(&buf, slog.LevelInfo, "proxy")
+	l.Error("upstream.failed",
+		"err", errors.New("upstream rejected Bearer fmj_errorleak12345"),
+		slog.Group("nested", "err", errors.New("peer echoed mat_groupleak12345")))
+	out := buf.String()
+	for _, tok := range []string{"fmj_errorleak12345", "mat_groupleak12345"} {
+		if strings.Contains(out, tok) {
+			t.Fatalf("token %q leaked in %q", tok, out)
+		}
+	}
+	m := logLine(t, &buf)
+	if got, want := m["err"], "upstream rejected Bearer "+redactedValue; got != want {
+		t.Fatalf("err = %v, want %q", got, want)
+	}
+}
+
+// namedInt is a non-native KindAny value: a named type whose underlying type
+// is numeric does not become KindInt64.
+type namedInt int
+
+// unmarshalableStringer forces the fmt.Sprint fallback: json.Marshal rejects
+// it, and its String method carries a token.
+type unmarshalableStringer struct{ token string }
+
+func (u unmarshalableStringer) String() string { return "auth " + u.token }
+
+func (unmarshalableStringer) MarshalJSON() ([]byte, error) {
+	return nil, errors.New("unmarshalable")
+}
+
+// TestLoggerRedactsNonStringAnyAttrs covers KindAny values that are neither
+// strings nor errors (structs, named numerics): the value keeps its JSON shape
+// and the encoded text is scrubbed, so a token inside a struct cannot leak.
+func TestLoggerRedactsNonStringAnyAttrs(t *testing.T) {
+	var buf bytes.Buffer
+	l := NewLogger(&buf, slog.LevelInfo, "scheduler")
+	l.Info("relay.failed",
+		"cause", struct{ Detail string }{Detail: "peer echoed mat_structleak1234"},
+		"attempt", namedInt(7),
+		"fallback", unmarshalableStringer{token: "mul_fallbackleak1234"})
+	out := buf.String()
+	for _, tok := range []string{"mat_structleak1234", "mul_fallbackleak1234"} {
+		if strings.Contains(out, tok) {
+			t.Fatalf("token %q leaked in %q", tok, out)
+		}
+	}
+	m := logLine(t, &buf)
+	cause, ok := m["cause"].(map[string]any)
+	if !ok || cause["Detail"] != "peer echoed "+redactedValue {
+		t.Fatalf("cause = %v, want the JSON object with the token replaced", m["cause"])
+	}
+	if got := m["attempt"]; got != float64(7) {
+		t.Fatalf("attempt = %v, want the numeric 7", got)
+	}
+	if got := m["fallback"]; got != "auth "+redactedValue {
+		t.Fatalf("fallback = %v, want the fmt.Sprint text with the token replaced", got)
+	}
+}
+
+// marshalerError is both an error and a json.Marshaler. slog.JSONHandler
+// renders it through MarshalJSON, not Error(), so the redactor must keep that
+// JSON shape while scrubbing the encoded text.
+type marshalerError struct{ token string }
+
+func (e marshalerError) Error() string { return "raw " + e.token }
+
+func (e marshalerError) MarshalJSON() ([]byte, error) {
+	return []byte(`{"detail":"echoed ` + e.token + `"}`), nil
+}
+
+// TestLoggerRedactsMarshalerErrorAttrs pins the dispatch exception: a
+// Marshaler error keeps its JSON shape (not Error() text) and is still
+// scrubbed, so removing the exception cannot silently change the rendering.
+func TestLoggerRedactsMarshalerErrorAttrs(t *testing.T) {
+	var buf bytes.Buffer
+	NewLogger(&buf, slog.LevelInfo, "proxy").
+		Error("upstream.failed", "err", marshalerError{token: "fmj_marshalerleak123"})
+	out := buf.String()
+	if strings.Contains(out, "fmj_marshalerleak123") {
+		t.Fatalf("token leaked in %q", out)
+	}
+	m := logLine(t, &buf)
+	errObj, ok := m["err"].(map[string]any)
+	if !ok || errObj["detail"] != "echoed "+redactedValue {
+		t.Fatalf("err = %v, want the JSON object with the token replaced", m["err"])
+	}
+}
+
 func TestLoggerKeepsNonTokenStrings(t *testing.T) {
 	var buf bytes.Buffer
 	NewLogger(&buf, slog.LevelInfo, "scheduler").Info("job.created", "job_name", "fm-12345")
@@ -114,10 +209,12 @@ func TestLoggerKeepsNonTokenStrings(t *testing.T) {
 func TestLoggerRedactsPreboundAttrs(t *testing.T) {
 	var buf bytes.Buffer
 	l := NewLogger(&buf, slog.LevelInfo, "proxy").
-		With("auth_token", "mat_preboundtoken99", "job_tok", "fmj_boundtoken123")
+		With("auth_token", "mat_preboundtoken99", "job_tok", "fmj_boundtoken123",
+			"err", errors.New("renewal failed for mdt_prebounderr1234"))
 	l.Info("daemon.registered", "task_id", "t-1")
 	out := buf.String()
-	if strings.Contains(out, "mat_preboundtoken99") || strings.Contains(out, "fmj_boundtoken123") {
+	if strings.Contains(out, "mat_preboundtoken99") || strings.Contains(out, "fmj_boundtoken123") ||
+		strings.Contains(out, "mdt_prebounderr1234") {
 		t.Fatalf("pre-bound token leaked: %q", out)
 	}
 	m := logLine(t, &buf)
