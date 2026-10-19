@@ -17,10 +17,10 @@
 //     that owes one loses it.
 //  3. Routes Foreman forwards are probed: the upstream must see the declared
 //     path, and its status, header set and body must reach the daemon verbatim.
-//  4. The carriers that reproduce upstream fields are field-checked, and every
-//     upstream-sourced field the daemon reads but Foreman does not carry is
-//     registered with the ADR that rules on it (settings / profile_id /
-//     runtime-profiles; ADR-043 / ADR-044 proposed).
+//  4. The carriers that reproduce upstream fields are field-checked
+//     (TestDaemonFaceCarriedWorkspaceFields): settings / repos / repos_version
+//     travel verbatim on S-2 and S-4, the runtime-profiles route replays the
+//     C-18 snapshot, and S-4 echoes profile_id (ADR-043 / ADR-044).
 //
 // Snapshot provenance — multica server 18fa9f7: cmd/server/router.go:1559-1613
 // (the /api/daemon group), :1919 (/api/tokens/current/renew), :1694
@@ -41,6 +41,8 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/tsic404/foreman/internal/registry"
 )
 
 // daemonFaceHandling is how the local daemon face treats an upstream route.
@@ -56,8 +58,8 @@ const (
 	faceForwarded daemonFaceHandling = "forwarded"
 	// faceRefused: the route is registered and answers the declared 404 without
 	// touching the upstream, which is what switches the daemon off the path
-	// (§1.2 S3/S22/S27/S32). The 404 is what a task Job gets; S27's models path
-	// is the one member with a probe-session branch behind it (see its entry).
+	// (§1.2 S22/S27/S32). The 404 is what a task Job gets; S27's models path is
+	// the one member with a probe-session branch behind it (see its entry).
 	faceRefused daemonFaceHandling = "refused"
 	// faceUnmodelled: the upstream serves the route, Foreman has no local
 	// pattern for it, and an fmj_ call lands on the catch-all 404.
@@ -100,7 +102,7 @@ var upstreamDaemonFace = []daemonFaceEntry{
 		name: "S-4 register", upstream: "POST /api/daemon/register",
 		caller: "internal/daemon/client.go:1083",
 		local:  "POST /api/daemon/register", design: "S-4", handling: faceServed,
-		note: "answers exactly one job runtime (provider selection); repos/repos_version replay the C1 cache",
+		note: "answers exactly one job runtime selected by (provider, profile_id) and echoes its profile_id (builtin null); settings/repos/repos_version replay the workspace state cache",
 	},
 	{
 		name: "S-19 deregister", upstream: "POST /api/daemon/deregister",
@@ -129,7 +131,7 @@ var upstreamDaemonFace = []daemonFaceEntry{
 		name: "S-2 repos", upstream: "GET /api/daemon/workspaces/{workspaceId}/repos",
 		caller: "internal/daemon/client.go:1098",
 		local:  "GET /api/daemon/workspaces/{ws}/repos", design: "S-2", handling: faceServed,
-		note: "repos/repos_version replay the C1 cache verbatim; settings is a declared deviation (see TestDaemonFaceDeclaredDeviations)",
+		note: "triggers C-22 and replays settings/repos/repos_version verbatim (key presence faithful); a failed refresh replays the last snapshot",
 	},
 	{
 		name: "S-6 claim", upstream: "POST /api/daemon/tasks/claim",
@@ -235,9 +237,8 @@ var upstreamDaemonFace = []daemonFaceEntry{
 	{
 		name: "S-3 runtime profiles", upstream: "GET /api/daemon/workspaces/{workspaceId}/runtime-profiles",
 		caller: "internal/daemon/client.go:1136",
-		local:  "GET /api/daemon/workspaces/{ws}/runtime-profiles", design: "S-3", handling: faceRefused,
-		note:  "the daemon tolerates any 404 here (client.go:1133-1135); carrying the profiles is ADR-043 (proposed)",
-		probe: &daemonFaceProbe{method: "GET", path: "/api/daemon/workspaces/ws-1/runtime-profiles", want: 404},
+		local:  "GET /api/daemon/workspaces/{ws}/runtime-profiles", design: "S-3", handling: faceServed,
+		note: "200 replays the C-18 snapshot byte for byte; C-18 404 ⇒ 404; an unsuccessful snapshot ⇒ 503, which the daemon treats as best-effort (ADR-043 §1.6)",
 	},
 	{
 		name: "S-32 legacy per-runtime claim", upstream: "POST /api/daemon/runtimes/{runtimeId}/tasks/claim",
@@ -713,8 +714,8 @@ func stubFaceRegister(answer map[string]any) func(*stubUpstream) {
 }
 
 // faceRegisterAnswer is the C1 answer above. The field set is the point: the
-// deviations in TestDaemonFaceDeclaredDeviations are only observable because
-// these upstream fields are present.
+// carried-field assertions in TestDaemonFaceCarriedWorkspaceFields are only
+// meaningful because these upstream fields are present.
 func faceRegisterAnswer() map[string]any {
 	return map[string]any{
 		"runtimes": []map[string]any{{
@@ -735,44 +736,71 @@ func faceRegisterAnswer() map[string]any {
 // rather than assumed.
 const faceReposCarrier = `[{"url":"https://example.invalid/r","description":"d","ref":"main","x_repo_key":{"nested":1}}]`
 
-// TestDaemonFaceDeclaredDeviations is the executable register of the
-// upstream-sourced fields the Job daemon reads but Foreman does not carry.
-//
-// The declared shape is asserted on purpose: the deviation is a decision, not
-// an accident, so it must not drift in either direction unnoticed. The moment
-// the passthrough lands (ADR-043 for profile_id and the runtime-profiles route,
-// ADR-044 for settings; design PR #79 — proposed, not merged), its assertion
-// moves with it. A half-carried field — settings on S-4 but not on S-2 — fails
-// here, which is exactly the trap the manual audit flagged.
-func TestDaemonFaceDeclaredDeviations(t *testing.T) {
+// TestDaemonFaceCarriedWorkspaceFields is the reversal of the old deviation
+// register: the fields the Job daemon reads (settings, repos, profile_id and the
+// runtime-profiles route) now travel with the declared semantics of ADR-043 /
+// ADR-044. The test asserts the carried shapes on purpose — a half-carried
+// field (settings on S-4 but not S-2, a profile_id that never reaches the
+// daemon) fails here, which is exactly the trap the manual audit flagged.
+func TestDaemonFaceCarriedWorkspaceFields(t *testing.T) {
 	answer := faceRegisterAnswer()
 	raw, err := json.Marshal(answer)
 	if err != nil {
 		t.Fatalf("register answer: %v", err)
 	}
 	// Non-vacuity: the upstream answer really presents the fields under test,
-	// so "the daemon does not see them" is a statement about Foreman, not about
-	// the fixture.
+	// so "the daemon sees them" is a statement about Foreman, not the fixture.
 	for _, want := range []string{`"co_authored_by_enabled":false`, `"profile_id":"prof-custom"`} {
 		if !bytes.Contains(raw, []byte(want)) {
 			t.Fatalf("C1 fixture does not present %s: %s", want, raw)
 		}
 	}
-
-	rig := newTestRigWithRegister(t, stubFaceRegister(answer))
+	discovery := registry.Discovery{
+		CLIVersion: "0.1.0",
+		Runtimes: []registry.DiscoveredRuntime{{
+			Name: "foreman-omp", Type: "omp", Version: "0.1.0", ProfileID: "prof-custom",
+		}},
+	}
+	rig := newTestRigWith(t, stubFaceRegister(answer), discovery)
 	taskID := "t-devia"
 	rig.claimTask(t, taskID)
 	tok := rig.token(t, taskID)
 
+	// S-3 before any C-18: the snapshot never succeeded → 503.
+	if code, _ := rig.call(t, "GET", "/api/daemon/workspaces/ws-1/runtime-profiles", tok, nil); code != 503 {
+		t.Fatalf("S-3 before C-18 = %d, want 503", code)
+	}
+	// C-18 success → S-3 replays the body byte for byte, unknown keys included.
+	profilesBody := []byte(`{"workspace_id":"ws-1","runtime_profiles":[{"id":"prof-custom","display_name":"Custom","runtime_type":"omp","protocol_family":"omp","command_name":"custom-cli","fixed_args":["--x"],"visibility":"workspace","enabled":true,"x_profile_key":{"nested":1}}],"x_future_field":true}`)
+	rig.stub.on("GET", "/api/daemon/workspaces/ws-1/runtime-profiles", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		_, _ = w.Write(profilesBody)
+	})
+	if err := rig.client.RuntimeProfiles(t.Context()); err != nil {
+		t.Fatalf("C18: %v", err)
+	}
+	code, s3 := rig.call(t, "GET", "/api/daemon/workspaces/ws-1/runtime-profiles", tok, nil)
+	if code != 200 || !bytes.Equal(s3, profilesBody) {
+		t.Fatalf("S-3 = %d %s, want the C-18 body verbatim", code, s3)
+	}
+	// C-18 404 → S-3 404 (the old-server shape).
+	rig.stub.on("GET", "/api/daemon/workspaces/ws-1/runtime-profiles", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		w.WriteHeader(http.StatusNotFound)
+		_, _ = w.Write([]byte(`{"error":"not found"}`))
+	})
+	if err := rig.client.RuntimeProfiles(t.Context()); err != nil {
+		t.Fatalf("C18 404: %v", err)
+	}
+	if code, _ := rig.call(t, "GET", "/api/daemon/workspaces/ws-1/runtime-profiles", tok, nil); code != 404 {
+		t.Fatalf("S-3 after C-18 404 = %d, want 404", code)
+	}
+
 	_, s2 := rig.call(t, "GET", "/api/daemon/workspaces/ws-1/repos", tok, nil)
 	_, s4 := rig.call(t, "POST", "/api/daemon/register", tok,
-		[]byte(`{"daemon_id":"fm-`+taskID+`","runtimes":[{"name":"foreman-job","type":"omp"}]}`))
+		[]byte(`{"daemon_id":"fm-`+taskID+`","runtimes":[{"name":"foreman-omp","type":"omp","profile_id":"prof-custom"}]}`))
 
-	// Deviation 1 (ADR-044, proposed): settings. The upstream answer carries
-	// it, the daemon writes it into its workspace state and gates the GitHub
-	// hook and the Co-authored-by trailer on it; the local face answers null,
-	// so the daemon falls back to "enabled" (server/internal/daemon/daemon.go
-	// :3261-3281).
+	// ADR-044: settings travel verbatim on both carriers, and repos keep every
+	// per-repo key the upstream gave. (The C-22 refresh fails in this rig —
+	// stub has no repos route — so both answers replay the C-1 seed.)
 	for name, body := range map[string][]byte{"S-2 repos": s2, "S-4 register": s4} {
 		var resp map[string]json.RawMessage
 		if err := json.Unmarshal(body, &resp); err != nil {
@@ -780,14 +808,10 @@ func TestDaemonFaceDeclaredDeviations(t *testing.T) {
 		}
 		settings, ok := resp["settings"]
 		if !ok {
-			t.Errorf("%s: settings key absent — the deviation is \"answered null\", not \"omitted\"", name)
+			t.Errorf("%s: settings key absent — the upstream gave it, so it must be carried", name)
 			continue
 		}
-		if string(settings) != "null" {
-			t.Errorf("%s: settings = %s, want the declared deviation (null) — if the ADR-044 passthrough landed, flip this register", name, settings)
-		}
-		// The carrier half that does work: repos round-trips as upstream gave
-		// it, unknown per-repo keys included.
+		assertSameJSON(t, settings, mustMarshal(answer["settings"]))
 		var got, want any
 		if err := decodeJSON(resp["repos"], &got); err != nil {
 			t.Fatalf("%s: repos: %v", name, err)
@@ -800,16 +824,15 @@ func TestDaemonFaceDeclaredDeviations(t *testing.T) {
 		}
 	}
 
-	// Deviation 2 (ADR-043, proposed): profile_id. The daemon selects a custom
-	// profile's start command from it; the local face omits it, so a profile
-	// task starts as builtin.
+	// ADR-043: the answered entry echoes the profile_id the Job daemon needs to
+	// start the profile's command instead of the builtin one.
 	var reg struct {
 		Runtimes []map[string]json.RawMessage `json:"runtimes"`
 	}
 	if err := json.Unmarshal(s4, &reg); err != nil || len(reg.Runtimes) != 1 {
 		t.Fatalf("S-4 body = %s (%v)", s4, err)
 	}
-	if _, has := reg.Runtimes[0]["profile_id"]; has {
-		t.Errorf("S-4 runtime carries profile_id — if the ADR-043 passthrough landed, flip this register: %s", s4)
+	if got := string(reg.Runtimes[0]["profile_id"]); got != `"prof-custom"` {
+		t.Errorf("S-4 profile_id = %s, want the declared profile id", got)
 	}
 }

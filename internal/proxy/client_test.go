@@ -226,9 +226,9 @@ func TestRegisterSendsContractBody(t *testing.T) {
 	if got := c.CLIVersion(); got != "18.0.0" {
 		t.Errorf("X-Client-Version after C1 = %q, want the discovery's cli_version", got)
 	}
-	repos, version := c.Registration()
-	if version != "abc123" || len(repos) == 0 {
-		t.Errorf("registration cache = %s %q", repos, version)
+	state := c.WorkspaceState()
+	if !state.Seeded || string(state.ReposVersion) != `"abc123"` || len(state.Repos) == 0 {
+		t.Errorf("seeded workspace state = %+v", state)
 	}
 }
 
@@ -1146,13 +1146,12 @@ func TestSkillBundlesUsesRealRuntimeAndForemanCredential(t *testing.T) {
 	}
 }
 
-func TestPreflightCoversC1C16C17C18(t *testing.T) {
+func TestPreflightCoversC1C16C17(t *testing.T) {
 	srv, stub := newStubUpstream(t)
 	stubRegister(stub, "rid-1")
 	stub.on("GET", "/api/daemon/workspaces", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
 		writeJSONStub(w, 200, []map[string]string{{"id": "ws-1", "name": "foreman-ws"}})
 	})
-	// C18 404 is tolerated.
 	stub.on("POST", "/api/tokens/current/renew", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
 		writeJSONStub(w, 200, map[string]any{"expires_at": time.Now().Add(72 * time.Hour), "renewed": true})
 	})
@@ -1171,8 +1170,17 @@ func TestPreflightCoversC1C16C17C18(t *testing.T) {
 	if got := len(stub.calls("POST", "/api/tokens/current/renew")); got != 1 {
 		t.Errorf("C16 renew calls = %d", got)
 	}
-	if got := len(stub.calls("GET", "/api/daemon/workspaces/ws-1/runtime-profiles")); got != 1 {
-		t.Errorf("C18 calls = %d", got)
+	// C-18 belongs to the startup order, not the preflight (§1.6): the
+	// snapshot is fetched before the startup probe and stays the probe's S-3.
+	if got := len(stub.calls("GET", "/api/daemon/workspaces/ws-1/runtime-profiles")); got != 0 {
+		t.Errorf("C18 calls in preflight = %d, want 0", got)
+	}
+	// C18 404 is tolerated and recorded as the S-3 missing state.
+	if err := c.RuntimeProfiles(t.Context()); err != nil {
+		t.Fatalf("C18 404: %v", err)
+	}
+	if code, _ := c.S3Response(); code != http.StatusNotFound {
+		t.Errorf("S-3 after C18 404 = %d, want 404", code)
 	}
 }
 
@@ -1230,21 +1238,23 @@ func TestGCCheckForwardedVerbatim(t *testing.T) {
 
 // fakeMetrics records the proxy metrics seam.
 type fakeMetrics struct {
-	mu             sync.Mutex
-	forwards       []string
-	codes          []int
-	claimErrors    []string
-	authFails      []string
-	wsConnected    map[string]int
-	wsReconnect    []string
-	catalogCodes   []string
-	catalogSpans   []float64
-	deliveryClaims []string
-	deliverSpans   []float64
-	skillResults   []string
-	skillEvicts    []string
-	skillEntries   int
-	skillBytes     int64
+	mu                 sync.Mutex
+	forwards           []string
+	codes              []int
+	claimErrors        []string
+	authFails          []string
+	wsConnected        map[string]int
+	wsReconnect        []string
+	catalogCodes       []string
+	catalogSpans       []float64
+	deliveryClaims     []string
+	deliverSpans       []float64
+	skillResults       []string
+	skillEvicts        []string
+	skillEntries       int
+	skillBytes         int64
+	profileRefreshes   []string
+	workspaceRefreshes []string
 }
 
 func (m *fakeMetrics) Forward(endpoint string, code int, _ time.Duration) {
@@ -1326,6 +1336,18 @@ func (m *fakeMetrics) SkillCacheEviction(reason string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.skillEvicts = append(m.skillEvicts, reason)
+}
+
+func (m *fakeMetrics) RuntimeProfileRefresh(result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.profileRefreshes = append(m.profileRefreshes, result)
+}
+
+func (m *fakeMetrics) WorkspaceStateRefresh(result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.workspaceRefreshes = append(m.workspaceRefreshes, result)
 }
 
 // deliveryClaimCount counts the recorded S6 claim outcomes per result.
@@ -1535,13 +1557,11 @@ func TestFailedRebuildIsRememberedPerRuntime(t *testing.T) {
 	}
 }
 
-// TestSuccessfulRegisterKeepsAConcurrentLostMark pins C-15 under a race: a
-// rebuild that fails while another C1 is in flight marks its own provider lost,
-// and the successful C1 consumes only the marks it started with. A global clear
-// would silently drop that row's C15 (`recover-orphans` + `runtime.rebuilt`)
-// even though the row came back — under the same id — and needs the rebuild
-// signal.
-func TestSuccessfulRegisterKeepsAConcurrentLostMark(t *testing.T) {
+// TestRebuildWaitsForAnInFlightRegisterAndKeepsItsLostMark pins the
+// serialization §1.6 needs: a rebuild waits for an in-flight C1 instead of
+// racing it, and the mark it writes when its own register fails survives to the
+// next successful C1 (that row still owes its C15).
+func TestRebuildWaitsForAnInFlightRegisterAndKeepsItsLostMark(t *testing.T) {
 	srv, stub := newStubUpstream(t)
 	ids := map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
 	var fail atomic.Bool
@@ -1549,15 +1569,18 @@ func TestSuccessfulRegisterKeepsAConcurrentLostMark(t *testing.T) {
 	entered := make(chan struct{}, 1)
 	release := make(chan struct{})
 	stub.on("POST", "/api/daemon/register", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
-		if hold.CompareAndSwap(true, false) {
-			// Hold this C1 inside the handler: its ledger snapshot is already
-			// taken, and the rebuild below writes the mark it must not clear.
-			entered <- struct{}{}
-			<-release
-		}
+		// The verdict is taken at entry: the held C1 below was admitted
+		// before fail was set and still succeeds, while the rebuild's C1 —
+		// arriving after it — is the one that fails.
 		if fail.Load() {
 			writeJSONStub(w, 503, map[string]string{"error": "boom"})
 			return
+		}
+		if hold.CompareAndSwap(true, false) {
+			// Hold this C1 inside the handler: the rebuild below must wait for
+			// it (both write C1), and its own failure must still be marked.
+			entered <- struct{}{}
+			<-release
 		}
 		answers := make([]map[string]string, 0, len(ids))
 		for provider, id := range ids {
@@ -1595,15 +1618,27 @@ func TestSuccessfulRegisterKeepsAConcurrentLostMark(t *testing.T) {
 		t.Fatal("the in-flight register never reached the server")
 	}
 	// omp's own row is proved gone and its rebuild fails: only omp is marked.
+	// The rebuild waits for the in-flight C1 (both write C1), so it must not
+	// finish while that request is held.
 	fail.Store(true)
-	if _, err := c.rebuildRuntime(t.Context(), "rid-omp"); err == nil {
-		t.Fatal("the rebuild must surface the register failure")
+	rebuildDone := make(chan error, 1)
+	go func() {
+		_, err := c.rebuildRuntime(t.Context(), "rid-omp")
+		rebuildDone <- err
+	}()
+	select {
+	case err := <-rebuildDone:
+		t.Fatalf("rebuild finished while C1 was in flight (err=%v)", err)
+	case <-time.After(150 * time.Millisecond):
 	}
-	fail.Store(false)
 	close(release)
 	if err := <-inFlight; err != nil {
 		t.Fatalf("the in-flight Register: %v", err)
 	}
+	if err := <-rebuildDone; err == nil {
+		t.Fatal("the rebuild must surface the register failure")
+	}
+	fail.Store(false)
 
 	// omp answers with the id it already had: the mark still owes a C15.
 	if err := c.Register(t.Context()); err != nil {

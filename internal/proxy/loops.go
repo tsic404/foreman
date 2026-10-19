@@ -192,22 +192,22 @@ func (l *HeartbeatLoop) Run(ctx context.Context) error {
 		declared := map[string]RuntimeRef{}
 		for _, ref := range l.client.RuntimeRefs() {
 			if ref.ID != "" {
-				declared[ref.Provider] = ref
+				declared[ref.Key()] = ref
 			}
 		}
-		for provider, stream := range streams {
-			ref, ok := declared[provider]
+		for key, stream := range streams {
+			ref, ok := declared[key]
 			if !ok || ref.ID != stream.runtimeID {
 				stream.cancel()
-				delete(streams, provider)
+				delete(streams, key)
 			}
 		}
-		for provider, ref := range declared {
-			if _, ok := streams[provider]; ok {
+		for key, ref := range declared {
+			if _, ok := streams[key]; ok {
 				continue
 			}
 			streamCtx, cancel := context.WithCancel(ctx)
-			streams[provider] = heartbeatStream{runtimeID: ref.ID, cancel: cancel}
+			streams[key] = heartbeatStream{runtimeID: ref.ID, cancel: cancel}
 			go func(runtimeID string) {
 				err := l.stream(streamCtx, runtimeID)
 				select {

@@ -18,6 +18,7 @@ type CatalogSlot struct {
 type SlotState struct {
 	RuntimeID  string    `json:"runtime_id"`
 	Provider   string    `json:"provider"`
+	ProfileID  string    `json:"profile_id"`
 	Cached     bool      `json:"cached"`
 	LandedAt   time.Time `json:"landed_at"`
 	AgeSeconds float64   `json:"age_seconds"`
@@ -56,13 +57,21 @@ func (s *CatalogSlots) Put(runtimeID string, body []byte, at time.Time) {
 	s.mu.Unlock()
 }
 
+// Delete drops the slot bound to runtimeID: an entry that left the declaration
+// no longer owns a catalog slot (§1.6 退出条目的目录槽随条目失效).
+func (s *CatalogSlots) Delete(runtimeID string) {
+	s.mu.Lock()
+	delete(s.byRuntime, runtimeID)
+	s.mu.Unlock()
+}
+
 // Snapshot projects the slots for the operator endpoint, in the refs order.
 func (s *CatalogSlots) Snapshot(refs []RuntimeRef, now time.Time) []SlotState {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	states := make([]SlotState, 0, len(refs))
 	for _, ref := range refs {
-		state := SlotState{RuntimeID: ref.ID, Provider: ref.Provider}
+		state := SlotState{RuntimeID: ref.ID, Provider: ref.Provider, ProfileID: ref.ProfileID}
 		if slot, ok := s.byRuntime[ref.ID]; ok {
 			state.Cached = true
 			state.LandedAt = slot.LandedAt

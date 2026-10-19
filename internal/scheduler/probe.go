@@ -76,9 +76,12 @@ func probeJobName(requestID string) string { return "fm-catalog-" + requestID }
 // in that fixed order — the session must exist before the pod can register, and
 // the Secret before the Job that mounts it.
 //
-// realRuntimeID is empty in startup-discovery mode, where the probe's own
-// minted command id (== requestID) is what S5 delivers.
-func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID string, budget time.Duration) (ProbeHandle, error) {
+// mode fixes the session's command face (registry.ProbeMode): a startup probe
+// mints its own command id, a command-driven probe relays the C2 ack's id
+// verbatim (realRuntimeID names the runtime it belongs to), and a
+// registration-discovery probe owns no command at all. An id that does not
+// belong to the mode is rejected rather than silently ignored.
+func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID string, mode registry.ProbeMode, budget time.Duration) (ProbeHandle, error) {
 	if s.probes == nil {
 		return ProbeHandle{}, errors.New("probe session table is not wired")
 	}
@@ -88,17 +91,29 @@ func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID str
 	jobName := probeJobName(requestID)
 	jobRuntime := jobRuntimeID(jobName)
 	session := registry.ProbeSession{
-		JobName:       jobName,
-		SelfMintedID:  requestID,
-		JobRuntime:    jobRuntime,
-		RealRuntimeID: realRuntimeID,
-		Deadline:      s.now().Add(budget),
+		JobName:    jobName,
+		Mode:       mode,
+		JobRuntime: jobRuntime,
+		Deadline:   s.now().Add(budget),
 	}
-	if realRuntimeID != "" {
-		// Command-driven probe: the id came from the server's ack and is
-		// relayed verbatim; the minted id is not used.
-		session.SelfMintedID = ""
+	switch mode {
+	case registry.ProbeStartupDiscovery:
+		if realRuntimeID != "" {
+			return ProbeHandle{}, errors.New("startup-discovery probe carries no real runtime id")
+		}
+		session.SelfMintedID = requestID
+	case registry.ProbeCommandDriven:
+		if realRuntimeID == "" {
+			return ProbeHandle{}, errors.New("command-driven probe requires a real runtime id")
+		}
 		session.RequestID = requestID
+		session.RealRuntimeID = realRuntimeID
+	case registry.ProbeRegisterOnly:
+		if realRuntimeID != "" {
+			return ProbeHandle{}, errors.New("registration-only probe carries no real runtime id")
+		}
+	default:
+		return ProbeHandle{}, fmt.Errorf("unknown probe mode %d", mode)
 	}
 	job, cred, tokenHash, err := s.builder.BuildCatalogProbe(requestID, jobRuntime, s.cfg.WorkspaceID, budget)
 	if err != nil {
@@ -296,15 +311,36 @@ func isProbeObject(labels map[string]string) bool {
 // Only "no runtime registered inside the window" is fatal — the discovery not
 // landing is a visible failure event that does not stop startup (C-1, §10).
 func (s *Scheduler) RunStartupProbe(ctx context.Context) (registry.Discovery, error) {
+	return s.runProbe(ctx, true, "startup")
+}
+
+// RunDiscoveryProbe runs one registration-discovery probe (§1.6): the same
+// shape, the same window upper bound and the same cleanup as the startup
+// probe, but registration alone is the completion signal — no model catalog
+// discovery is performed (the profile list is what the probe's C1 body
+// declares). A failure is returned to the caller; it never exits the process.
+func (s *Scheduler) RunDiscoveryProbe(ctx context.Context) (registry.Discovery, error) {
+	return s.runProbe(ctx, false, "discovery")
+}
+
+// runProbe is the shared orchestration of the startup probe and the
+// registration-discovery probe. waitCatalog selects the startup path's extra
+// wait for the model catalog result (§1.3); the discovery probe stops at
+// registration and never owns a catalog command (§1.6).
+func (s *Scheduler) runProbe(ctx context.Context, waitCatalog bool, kind string) (registry.Discovery, error) {
 	window := s.cfg.StartupProbeTimeout
 	minted, err := mintedProbeID()
 	if err != nil {
-		return registry.Discovery{}, fmt.Errorf("mint startup probe id: %w", err)
+		return registry.Discovery{}, fmt.Errorf("mint %s probe id: %w", kind, err)
 	}
-	handle, err := s.StartProbe(ctx, minted, "", window)
+	mode := registry.ProbeRegisterOnly
+	if waitCatalog {
+		mode = registry.ProbeStartupDiscovery
+	}
+	handle, err := s.StartProbe(ctx, minted, "", mode, window)
 	if err != nil {
-		s.reportProbeFailure(ctx, probeJobName(minted), ProbeFailureJobCreateFailed, "", "", false)
-		return registry.Discovery{}, fmt.Errorf("startup probe: %w", err)
+		s.reportProbeFailure(ctx, kind, probeJobName(minted), ProbeFailureJobCreateFailed, "", "", false)
+		return registry.Discovery{}, fmt.Errorf("%s probe: %w", kind, err)
 	}
 	deadline := s.now().Add(window)
 	readRegistration := func() (registry.Discovery, bool) {
@@ -356,15 +392,15 @@ func (s *Scheduler) RunStartupProbe(ctx context.Context) (registry.Discovery, er
 		if _, ok := s.probes.ProbeByJob(handle.JobName); ok {
 			sessionExists = true
 		}
-		s.reportProbeFailure(ctx, handle.JobName, reason, podStatus, jobEvent, sessionExists)
+		s.reportProbeFailure(ctx, kind, handle.JobName, reason, podStatus, jobEvent, sessionExists)
 		s.teardownStartupProbe(ctx, handle)
 		return registry.Discovery{}, &StartupProbeFailure{JobName: handle.JobName, Reason: reason}
 	}
-	// The registration is in: when the catalog route is on, the startup
-	// discovery still has to land in its slot before the probe is torn down.
-	// With the route off, registration alone completes the orchestration —
-	// the catalog face is a supported deployment degradation, not a failure.
-	if s.cfg.ModelCatalogEnabled {
+	// The startup path's extra completion signal: when the catalog route is
+	// on, the startup discovery still has to land in its slot before the probe
+	// is torn down. With the route off — and for every discovery probe —
+	// registration alone completes the orchestration.
+	if waitCatalog && s.cfg.ModelCatalogEnabled {
 	waitLanding:
 		for s.now().Before(deadline) {
 			session, ok := s.probes.ProbeByJob(handle.JobName)
@@ -378,7 +414,7 @@ func (s *Scheduler) RunStartupProbe(ctx context.Context) (registry.Discovery, er
 			}
 		}
 		if session, ok := s.probes.ProbeByJob(handle.JobName); ok && session.RelayedAt.IsZero() {
-			s.reportProbeFailure(ctx, handle.JobName, ProbeFailureDiscoveryNotLanded, podStatus, jobEvent, true)
+			s.reportProbeFailure(ctx, kind, handle.JobName, ProbeFailureDiscoveryNotLanded, podStatus, jobEvent, true)
 		}
 	}
 	s.teardownStartupProbe(ctx, handle)
@@ -393,8 +429,12 @@ func (s *Scheduler) teardownStartupProbe(ctx context.Context, h ProbeHandle) {
 
 // reportProbeFailure emits the startup probe failure event; the exit path
 // carries the same reason in its error line (§10, §9.1).
-func (s *Scheduler) reportProbeFailure(ctx context.Context, jobName, reason, podStatus, jobEvent string, sessionExists bool) {
-	s.log.ErrorContext(ctx, "startup.probe_failed",
+func (s *Scheduler) reportProbeFailure(ctx context.Context, kind, jobName, reason, podStatus, jobEvent string, sessionExists bool) {
+	event := "startup.probe_failed"
+	if kind != "startup" {
+		event = "discovery.probe_failed"
+	}
+	s.log.ErrorContext(ctx, event,
 		"job_name", jobName, "reason", reason, "pod_status", podStatus,
 		"job_event", jobEvent, "session_exists", sessionExists)
 }

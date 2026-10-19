@@ -13,16 +13,17 @@ import (
 
 // Environment variable names read by the proxy module.
 const (
-	EnvServerURL            = "MULTICA_SERVER_URL"
-	EnvWorkspaceID          = "MULTICA_WORKSPACE_ID"
-	EnvDaemonID             = "FOREMAN_DAEMON_ID"
-	EnvClaimInterval        = "FOREMAN_CLAIM_INTERVAL"
-	EnvClaimIntervalIdle    = "FOREMAN_CLAIM_INTERVAL_IDLE"
-	EnvLeaseRefreshInterval = "FOREMAN_LEASE_REFRESH_INTERVAL"
-	EnvWSEnabled            = "FOREMAN_WS_ENABLED"
-	EnvModelCatalogEnabled  = "FOREMAN_MODEL_CATALOG_ENABLED"
-	EnvModelCatalogTimeout  = "FOREMAN_MODEL_CATALOG_TIMEOUT"
-	EnvModelCatalogCacheTTL = "FOREMAN_MODEL_CATALOG_CACHE_TTL"
+	EnvServerURL             = "MULTICA_SERVER_URL"
+	EnvWorkspaceID           = "MULTICA_WORKSPACE_ID"
+	EnvDaemonID              = "FOREMAN_DAEMON_ID"
+	EnvClaimInterval         = "FOREMAN_CLAIM_INTERVAL"
+	EnvClaimIntervalIdle     = "FOREMAN_CLAIM_INTERVAL_IDLE"
+	EnvLeaseRefreshInterval  = "FOREMAN_LEASE_REFRESH_INTERVAL"
+	EnvWSEnabled             = "FOREMAN_WS_ENABLED"
+	EnvModelCatalogEnabled   = "FOREMAN_MODEL_CATALOG_ENABLED"
+	EnvModelCatalogTimeout   = "FOREMAN_MODEL_CATALOG_TIMEOUT"
+	EnvModelCatalogCacheTTL  = "FOREMAN_MODEL_CATALOG_CACHE_TTL"
+	EnvWorkspaceStateTimeout = "FOREMAN_WORKSPACE_STATE_TIMEOUT"
 
 	EnvSkillCacheFreshTTL        = "FOREMAN_SKILL_CACHE_FRESH_TTL"
 	EnvSkillCacheDowngradeWindow = "FOREMAN_SKILL_CACHE_DOWNGRADE_WINDOW"
@@ -43,6 +44,9 @@ const (
 	DefaultModelCatalogEnabled  = true
 	DefaultModelCatalogTimeout  = 45 * time.Second
 	DefaultModelCatalogCacheTTL = 6 * time.Hour
+	// DefaultWorkspaceStateTimeout bounds one C-22 refresh (§1.7 有界超时):
+	// the S-2 answer may wait this long and then replays the last snapshot.
+	DefaultWorkspaceStateTimeout = 5 * time.Second
 
 	// Skill-bundle resolve cache (§1.8). The fresh window is the period a
 	// resolved payload answers without touching upstream; the downgrade window
@@ -99,6 +103,11 @@ type Config struct {
 	// it only logs a warning, it never stops answering (§10).
 	ModelCatalogCacheTTL time.Duration
 
+	// WorkspaceStateTimeout bounds one C-22 refresh triggered by an S-2 call
+	// (§1.7 有界超时). On expiry the answer replays the last successful
+	// snapshot; the checkout is never blocked.
+	WorkspaceStateTimeout time.Duration
+
 	// SkillCacheFreshTTL is the resolve cache's fresh window: an entry younger
 	// than it answers locally without touching upstream (§1.8).
 	SkillCacheFreshTTL time.Duration
@@ -121,15 +130,16 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		getenv = os.Getenv
 	}
 	cfg := Config{
-		DaemonID:             DefaultDaemonID,
-		Version:              "dev",
-		ClaimInterval:        DefaultClaimInterval,
-		ClaimIntervalIdle:    DefaultClaimIntervalIdle,
-		LeaseRefreshInterval: DefaultLeaseRefreshInterval,
-		WSEnabled:            DefaultWSEnabled,
-		ModelCatalogEnabled:  DefaultModelCatalogEnabled,
-		ModelCatalogTimeout:  DefaultModelCatalogTimeout,
-		ModelCatalogCacheTTL: DefaultModelCatalogCacheTTL,
+		DaemonID:              DefaultDaemonID,
+		Version:               "dev",
+		ClaimInterval:         DefaultClaimInterval,
+		ClaimIntervalIdle:     DefaultClaimIntervalIdle,
+		LeaseRefreshInterval:  DefaultLeaseRefreshInterval,
+		WSEnabled:             DefaultWSEnabled,
+		ModelCatalogEnabled:   DefaultModelCatalogEnabled,
+		ModelCatalogTimeout:   DefaultModelCatalogTimeout,
+		ModelCatalogCacheTTL:  DefaultModelCatalogCacheTTL,
+		WorkspaceStateTimeout: DefaultWorkspaceStateTimeout,
 
 		SkillCacheFreshTTL:        DefaultSkillCacheFreshTTL,
 		SkillCacheDowngradeWindow: DefaultSkillCacheDowngradeWindow,
@@ -190,6 +200,12 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	}
 	if cfg.ModelCatalogCacheTTL, err = envDuration(getenv, EnvModelCatalogCacheTTL, cfg.ModelCatalogCacheTTL); err != nil {
 		return Config{}, err
+	}
+	if cfg.WorkspaceStateTimeout, err = envDuration(getenv, EnvWorkspaceStateTimeout, cfg.WorkspaceStateTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.WorkspaceStateTimeout <= 0 {
+		return Config{}, fmt.Errorf("%s must be positive", EnvWorkspaceStateTimeout)
 	}
 	// §1.3 startup self-check: probeMinBudget (= timeout/3) must cover one
 	// heartbeat period, otherwise a probe started on the minimum budget can

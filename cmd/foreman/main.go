@@ -132,11 +132,20 @@ func run() error {
 	metrics := observability.NewMetrics()
 
 	// Fake client: the server credential never leaves this process (F3).
+	// The registration-discovery probe runner is wired late: the scheduler is
+	// built after the client (it consumes the client as its server seam).
+	var discoveryProbe proxy.DiscoveryProbeRunner
 	client := proxy.NewClient(proxyCfg, serverToken,
 		proxy.WithMetrics(metrics),
 		proxy.WithLogger(baseLog),
 		proxy.WithStartupCatalog(startupCatalog),
 		proxy.WithCatalogSlots(slots),
+		proxy.WithDiscoveryProbe(proxy.DiscoveryProbeFunc(func(ctx context.Context) (registry.Discovery, error) {
+			if discoveryProbe == nil {
+				return registry.Discovery{}, errors.New("scheduler not wired yet")
+			}
+			return discoveryProbe.RunDiscoveryProbe(ctx)
+		})),
 		// C4/C19/S8 address a task by the real runtime it was dispatched
 		// under (ADR-025); the dispatch record is the entry's.
 		proxy.WithTaskRuntime(func(taskID string) string {
@@ -193,10 +202,14 @@ func run() error {
 		scheduler.WithRevoker(issuer),
 		scheduler.WithProbeRegistry(probes),
 		scheduler.WithLogger(baseLog),
+		// The claim-time dispatch record S-4 matches on: ids move on a rebuild,
+		// identities do not (§2.3).
+		scheduler.WithRuntimeIdentity(client.RuntimeIdentity),
 	)
 	if err != nil {
 		return err
 	}
+	discoveryProbe = sched
 
 	objects := recovery.NewK8sObjects(clientset, schedCfg.JobNamespace)
 	reconciler, err := recovery.New(
@@ -267,6 +280,14 @@ func run() error {
 	serveErr := make(chan error, 1)
 	go func() { serveErr <- srv.Serve(listener) }()
 
+	// §1.6 startup order: the profile snapshot is fetched before the startup
+	// probe, so the probe's daemon reads S-3 as the truth for the profiles it
+	// declares. 404 (old server) and failure are not fatal: S-3 answers 404 or
+	// 503, and the probe continues with the builtin runtime.
+	if err := client.RuntimeProfiles(ctx); err != nil {
+		log.Warn("runtime.profiles_snapshot_failed", "err", err.Error())
+	}
+
 	discovery, err := sched.RunStartupProbe(ctx)
 	if err != nil {
 		// Fail-fast, visible: no registration inside the window means the
@@ -295,10 +316,25 @@ func run() error {
 	run("claim", claimLoop.Run)
 	run("heartbeat", proxy.NewHeartbeatLoop(client, reporter).Run)
 	run("lease", proxy.NewLeaseKeeper(client, reg, sched, proxyCfg.LeaseRefreshInterval).Run)
+	refresher := proxy.NewProfileRefresher(client, proxy.WithProfileRefresherLogger(baseLog))
 	if proxyCfg.WSEnabled {
-		run("ws-subscriber", proxy.NewWSSubscriber(client, claimLoop.Wake, metrics).Run)
+		// §1.6: the refresh trigger is the C-20 invalidation hint. With WS
+		// closed the loop is not started: profile changes degrade to
+		// "effective on the next restart", as the deployment note says.
+		run("ws-subscriber", proxy.NewWSSubscriber(client, claimLoop.Wake, metrics,
+			proxy.WithProfileChangeNotify(refresher.Notify)).Run)
+		run("profile-refresh", refresher.Run)
 	}
 	run("recovery", reconciler.Run)
+
+	// §1.6 降级面: without the WS subscription the runtime profile list is
+	// never re-fetched, so a profile change stays invisible until the next
+	// restart. The deployment note says the same; the running log must not
+	// claim otherwise.
+	if !proxyCfg.WSEnabled {
+		log.Warn("runtime.profiles_degraded",
+			"detail", "FOREMAN_WS_ENABLED=false: runtime profile changes take effect only after a restart")
+	}
 
 	log.Info("foreman.started",
 		"version", version,
@@ -351,9 +387,11 @@ func (l *lateReconciler) Reconcile(ctx context.Context) error {
 	return l.r.Reconcile(ctx)
 }
 
-// registerSourceView builds S31's read-only projection: the startup discovery,
-// the C1 declaration entry by entry, and every real runtime's catalog slot
-// state. It never triggers a discovery or a refresh (ADR-025).
+// registerSourceView builds S31's read-only projection: the discovery behind
+// the current declaration, the declaration entry by entry keyed by
+// (provider, profile_id), every real runtime's catalog slot state, and the
+// current S-3 replay source with its state (§9.3). It never triggers a
+// discovery or a refresh.
 func registerSourceView(client *proxy.Client, slots *proxy.CatalogSlots) func() any {
 	return func() any {
 		discovery := client.Declaration()
@@ -363,6 +401,7 @@ func registerSourceView(client *proxy.Client, slots *proxy.CatalogSlots) func() 
 			declaration = append(declaration, map[string]string{
 				"name":            ref.Name,
 				"provider":        ref.Provider,
+				"profile_id":      ref.ProfileID,
 				"real_runtime_id": ref.ID,
 			})
 		}
@@ -375,11 +414,13 @@ func registerSourceView(client *proxy.Client, slots *proxy.CatalogSlots) func() 
 			failed = []json.RawMessage{}
 		}
 		return map[string]any{
-			"runtimes":        runtimes,
-			"cli_version":     discovery.CLIVersion,
-			"failed_profiles": failed,
-			"declaration":     declaration,
-			"slots":           slots.Snapshot(refs, time.Now()),
+			"runtimes":           runtimes,
+			"cli_version":        discovery.CLIVersion,
+			"failed_profiles":    failed,
+			"declaration":        declaration,
+			"declaration_source": client.DeclarationSource(),
+			"runtime_profiles":   client.RuntimeProfileView(),
+			"slots":              slots.Snapshot(refs, time.Now()),
 		}
 	}
 }

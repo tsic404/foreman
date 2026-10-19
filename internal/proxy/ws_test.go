@@ -337,6 +337,55 @@ func TestWSSubscriberLifecycle(t *testing.T) {
 	waitFor(t, "ws.reconnect metric", func() bool { return metrics.reconnectCount(WSSideServer) >= 1 })
 }
 
+// TestWSSubscriberProfileChangeTriggersRefresh pins the §1.6 event face: a
+// daemon:runtime_profiles_changed frame naming this workspace notifies the
+// refresher exactly once, while another workspace's frame is ignored.
+func TestWSSubscriberProfileChangeTriggersRefresh(t *testing.T) {
+	srv, stub := newCombinedStub(t)
+	client := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, client)
+	notified := make(chan struct{}, 4)
+	sub := NewWSSubscriber(client, func() {}, nil,
+		WithProfileChangeNotify(func() { notified <- struct{}{} }))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() { _ = sub.Run(ctx) }()
+	waitFor(t, "ws dial", func() bool { return stub.dialCount() == 1 })
+
+	// Another workspace's change is not this instance's.
+	foreign, _ := json.Marshal(map[string]string{"workspace_id": "ws-other"})
+	stub.push(t, wsFrame{Type: FrameDaemonRuntimeProfilesChanged, Payload: foreign})
+	select {
+	case <-notified:
+		t.Fatal("a foreign workspace's profile change must not trigger a refresh")
+	case <-time.After(200 * time.Millisecond):
+	}
+	// The matching frame triggers exactly one notification (the refresher
+	// coalesces duplicates).
+	matching, _ := json.Marshal(map[string]string{"workspace_id": "ws-1"})
+	stub.push(t, wsFrame{Type: FrameDaemonRuntimeProfilesChanged, Payload: matching})
+	select {
+	case <-notified:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a matching profile change did not trigger the refresh")
+	}
+}
+
+// TestWSFrameWorkspaceIDReadsBothShapes keeps the invalidation hint tolerant:
+// upstream may put workspace_id in the payload or at the envelope level.
+func TestWSFrameWorkspaceIDReadsBothShapes(t *testing.T) {
+	if got := (wsFrame{Payload: json.RawMessage(`{"workspace_id":"payload-ws"}`)}).workspaceID(); got != "payload-ws" {
+		t.Errorf("payload workspace_id = %q", got)
+	}
+	if got := (wsFrame{WorkspaceID: "envelope-ws"}).workspaceID(); got != "envelope-ws" {
+		t.Errorf("envelope workspace_id = %q", got)
+	}
+	if got := (wsFrame{Payload: json.RawMessage(`{}`)}).workspaceID(); got != "" {
+		t.Errorf("absent workspace_id = %q", got)
+	}
+}
+
 // TestWSSubscriberHandshake404BacksOff: a persistent handshake 404 must not
 // spin a re-registration storm — the subscriber waits out the §1.5 backoff.
 func TestWSSubscriberHandshake404BacksOff(t *testing.T) {
@@ -883,7 +932,7 @@ func TestCancelledStreamDoesNotSpendTheRuntimeProgression(t *testing.T) {
 	sub := NewWSSubscriber(client, func() {}, nil)
 	sub.dialTimeout = 50 * time.Millisecond
 	sub.waitSteps = []time.Duration{7 * time.Millisecond, 9 * time.Millisecond}
-	state := &providerStreamState{backoff: sub.newReconnectBackoff()}
+	state := &runtimeStreamState{backoff: sub.newReconnectBackoff()}
 
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan streamOutcome, 1)
@@ -901,5 +950,33 @@ func TestCancelledStreamDoesNotSpendTheRuntimeProgression(t *testing.T) {
 	}
 	if wait := state.nextBackoff(); wait != 7*time.Millisecond {
 		t.Fatalf("the next reconnect wait = %s, want the progression's first step: the cancelled stream must not spend it", wait)
+	}
+}
+
+// TestWSProfileChangeFrameLiteral pins the wire name of the §1.6 trigger: it is
+// an upstream protocol string, so the test spells it out instead of reusing the
+// constant both sides are built from — a typo in the constant must fail here.
+func TestWSProfileChangeFrameLiteral(t *testing.T) {
+	if got := FrameDaemonRuntimeProfilesChanged; got != "daemon:runtime_profiles_changed" {
+		t.Fatalf("profile change frame = %q, want the upstream literal daemon:runtime_profiles_changed", got)
+	}
+
+	srv, stub := newCombinedStub(t)
+	client := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, client)
+	notified := make(chan struct{}, 4)
+	sub := NewWSSubscriber(client, func() {}, nil,
+		WithProfileChangeNotify(func() { notified <- struct{}{} }))
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() { _ = sub.Run(ctx) }()
+	waitFor(t, "ws dial", func() bool { return stub.dialCount() == 1 })
+
+	payload, _ := json.Marshal(map[string]string{"workspace_id": "ws-1"})
+	stub.push(t, wsFrame{Type: "daemon:runtime_profiles_changed", Payload: payload})
+	select {
+	case <-notified:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the literal frame name did not trigger the refresh")
 	}
 }

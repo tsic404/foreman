@@ -17,12 +17,32 @@ const (
 	FrameDaemonHeartbeatAck = "daemon:heartbeat_ack"
 	// FrameDaemonTaskAvailable pushes task availability (both directions).
 	FrameDaemonTaskAvailable = "daemon:task_available"
+	// FrameDaemonRuntimeProfilesChanged is the C-20 invalidation hint: the
+	// workspace's runtime profile list changed and must be re-fetched (§1.6).
+	FrameDaemonRuntimeProfilesChanged = "daemon:runtime_profiles_changed"
 )
 
-// wsFrame is the {type,payload} envelope of the daemon WS channel.
+// wsFrame is the {type,payload} envelope of the daemon WS channel. The
+// workspace_id member covers upstream frames that put it at the envelope level;
+// workspaceID() reads both shapes.
 type wsFrame struct {
-	Type    string          `json:"type"`
-	Payload json.RawMessage `json:"payload"`
+	Type        string          `json:"type"`
+	Payload     json.RawMessage `json:"payload"`
+	WorkspaceID string          `json:"workspace_id"`
+}
+
+// workspaceID returns the workspace id the frame names, looking at the payload
+// first and at the envelope second ("" when neither carries one).
+func (f wsFrame) workspaceID() string {
+	if len(f.Payload) > 0 {
+		var payload struct {
+			WorkspaceID string `json:"workspace_id"`
+		}
+		if err := json.Unmarshal(f.Payload, &payload); err == nil && payload.WorkspaceID != "" {
+			return payload.WorkspaceID
+		}
+	}
+	return f.WorkspaceID
 }
 
 // heartbeatAckOK is the pinned S-30 heartbeat ack payload (§2.2 S-30):

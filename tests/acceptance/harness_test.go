@@ -10,6 +10,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -173,7 +174,29 @@ type upstreamStub struct {
 	mu sync.Mutex
 	// registerIDs maps a declared provider type to the runtime id the server
 	// answers with; a missing entry means the provider is not registered.
+	// profileIDs holds the profile identities, keyed by RuntimeIdentityKey.
 	registerIDs map[string]string
+	profileIDs  map[string]string
+	// registerRepos / registerReposVersion / registerSettings are the C-1
+	// workspace state seed; a scenario replaces them to drive AC-58.
+	registerRepos        json.RawMessage
+	registerReposVersion string
+	registerSettings     json.RawMessage
+	// registerStatus/registerError program a failing C-1 (the refresh
+	// sequence's commit failure). profilesStatus/profilesBody are the C-18
+	// answer; reposStatus/reposBody the C-22 answer (default 404 keeps the
+	// pre-C-22 fixture shape). The counters are what a refresh scenario
+	// asserts against.
+	registerStatus int
+	registerError  string
+	profilesStatus int
+	profilesBody   []byte
+	profilesGate   chan struct{}
+	profilesCalls  int
+	reposStatus    int
+	reposBody      []byte
+	reposGate      chan struct{}
+	reposCalls     int
 	// heartbeats maps a real runtime id to the status the heartbeat answers
 	// with (default 200).
 	heartbeats map[string]int
@@ -204,12 +227,20 @@ type upstreamStub struct {
 func newUpstreamStub(t *testing.T) *upstreamStub {
 	t.Helper()
 	stub := &upstreamStub{
-		registerIDs:  map[string]string{},
-		heartbeats:   map[string]int{},
-		modelsStatus: 200,
-		models:       map[string]*modelCommand{},
-		skillStatus:  200,
-		skillBody:    []byte(`{"bundles":[]}`),
+		registerIDs:          map[string]string{},
+		profileIDs:           map[string]string{},
+		registerRepos:        json.RawMessage(`[]`),
+		registerReposVersion: "",
+		heartbeats:           map[string]int{},
+		modelsStatus:         200,
+		models:               map[string]*modelCommand{},
+		skillStatus:          200,
+		skillBody:            []byte(`{"bundles":[]}`),
+		registerStatus:       http.StatusOK,
+		profilesStatus:       http.StatusOK,
+		profilesBody:         []byte(`{"workspace_id":"ws-1","runtime_profiles":[]}`),
+		reposStatus:          http.StatusNotFound,
+		reposBody:            []byte(`{"error":"not found"}`),
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /api/daemon/register", func(w http.ResponseWriter, r *http.Request) {
@@ -217,23 +248,38 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		stub.record(r, "/api/daemon/register", body)
 		var req struct {
 			Runtimes []struct {
-				Name string `json:"name"`
-				Type string `json:"type"`
+				Name      string `json:"name"`
+				Type      string `json:"type"`
+				ProfileID string `json:"profile_id"`
 			} `json:"runtimes"`
 		}
 		_ = json.Unmarshal(body, &req)
-		answers := make([]map[string]string, 0, len(req.Runtimes))
+		stub.mu.Lock()
+		repos, version, settings := stub.registerRepos, stub.registerReposVersion, stub.registerSettings
+		status, errBody := stub.registerStatus, stub.registerError
+		stub.mu.Unlock()
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(errBody))
+			return
+		}
+		answers := make([]map[string]any, 0, len(req.Runtimes))
 		for _, rt := range req.Runtimes {
-			id, ok := stub.idFor(rt.Type)
+			id, ok := stub.idFor(rt.Type, rt.ProfileID)
 			if !ok {
 				continue
 			}
-			answers = append(answers, map[string]string{
+			answer := map[string]any{
 				"id": id, "name": rt.Name, "provider": rt.Type, "status": "online",
-			})
+				"profile_id": nil,
+			}
+			if rt.ProfileID != "" {
+				answer["profile_id"] = rt.ProfileID
+			}
+			answers = append(answers, answer)
 		}
 		writeJSON(w, http.StatusOK, map[string]any{
-			"runtimes": answers, "repos": []any{}, "repos_version": "", "settings": nil,
+			"runtimes": answers, "repos": repos, "repos_version": version, "settings": settings,
 		})
 	})
 	mux.HandleFunc("POST /api/daemon/heartbeat", func(w http.ResponseWriter, r *http.Request) {
@@ -331,7 +377,29 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 	})
 	mux.HandleFunc("GET /api/daemon/workspaces/{wid}/runtime-profiles", func(w http.ResponseWriter, r *http.Request) {
 		stub.record(r, r.URL.Path, nil)
-		writeJSON(w, http.StatusOK, []any{})
+		stub.mu.Lock()
+		status, body, gate := stub.profilesStatus, append([]byte(nil), stub.profilesBody...), stub.profilesGate
+		stub.profilesCalls++
+		stub.mu.Unlock()
+		if gate != nil {
+			<-gate
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
+	})
+	// C-22: the S-2 refresh face. The default 404 keeps the pre-C-22 fixtures
+	// replaying their C-1 seed; a workspace-state scenario programs this.
+	mux.HandleFunc("GET /api/daemon/workspaces/{wid}/repos", func(w http.ResponseWriter, r *http.Request) {
+		stub.record(r, r.URL.Path, nil)
+		stub.mu.Lock()
+		status, body, gate := stub.reposStatus, append([]byte(nil), stub.reposBody...), stub.reposGate
+		stub.reposCalls++
+		stub.mu.Unlock()
+		if gate != nil {
+			<-gate
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
 	})
 	mux.HandleFunc("POST /api/tokens/current/renew", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
@@ -352,11 +420,86 @@ func (s *upstreamStub) record(r *http.Request, path string, body []byte) {
 	})
 }
 
-func (s *upstreamStub) idFor(provider string) (string, bool) {
+func (s *upstreamStub) idFor(provider, profileID string) (string, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if id, ok := s.profileIDs[registry.RuntimeIdentityKey(provider, profileID)]; ok {
+		return id, true
+	}
 	id, ok := s.registerIDs[provider]
 	return id, ok
+}
+
+// setRuntimeID maps one identity to the runtime id the C1 answer carries.
+func (s *upstreamStub) setRuntimeID(provider, profileID, id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if profileID == "" {
+		s.registerIDs[provider] = id
+		return
+	}
+	s.profileIDs[registry.RuntimeIdentityKey(provider, profileID)] = id
+}
+
+// setProfiles programs the C-18 answer; a gate installed by gateProfiles holds
+// every answer until it closes, so a refresh can be observed in flight.
+func (s *upstreamStub) setProfiles(status int, body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.profilesStatus, s.profilesBody = status, []byte(body)
+}
+
+// gateProfiles holds every C-18 answer until the returned function is called:
+// it is how a scenario makes one refresh be in flight while events pile up.
+func (s *upstreamStub) gateProfiles() (release func()) {
+	gate := make(chan struct{})
+	s.mu.Lock()
+	s.profilesGate = gate
+	s.mu.Unlock()
+	var once sync.Once
+	return func() { once.Do(func() { close(gate) }) }
+}
+
+// profileCalls reads the C-18 call count.
+func (s *upstreamStub) profileCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.profilesCalls
+}
+
+// setRepos programs the C-22 answer; gate (when non-nil) holds every answer
+// until it closes, so a concurrency scenario can make one refresh in flight.
+func (s *upstreamStub) setRepos(status int, body string, gate chan struct{}) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.reposStatus, s.reposBody, s.reposGate = status, []byte(body), gate
+}
+
+// reposCallCount reads the C-22 call count.
+func (s *upstreamStub) reposCallCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.reposCalls
+}
+
+// setRegisterStatus programs a failing C-1 answer (the refresh commit path).
+func (s *upstreamStub) setRegisterStatus(status int, body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.registerStatus, s.registerError = status, body
+}
+
+// setRegisterWorkspace programs the C-1 workspace state seed.
+func (s *upstreamStub) setRegisterWorkspace(repos, version, settings string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.registerRepos = json.RawMessage(repos)
+	s.registerReposVersion = version
+	if settings == "" {
+		s.registerSettings = nil
+		return
+	}
+	s.registerSettings = json.RawMessage(settings)
 }
 
 func (s *upstreamStub) statusFor(runtimeID string) int {
@@ -1108,6 +1251,20 @@ func writePolicyFile(t *testing.T, policy string) string {
 	return path
 }
 
+// lateProbeRunner breaks the client/scheduler construction cycle: the client
+// needs the §1.6 discovery-probe runner, and the scheduler needs the client as
+// its server seam.
+type lateProbeRunner struct {
+	sched *scheduler.Scheduler
+}
+
+func (l *lateProbeRunner) RunDiscoveryProbe(ctx context.Context) (registry.Discovery, error) {
+	if l.sched == nil {
+		return registry.Discovery{}, errors.New("scheduler not wired")
+	}
+	return l.sched.RunDiscoveryProbe(ctx)
+}
+
 // schedulerServerClient is the scheduler's server seam.
 type schedulerServerClient struct {
 	mu       sync.Mutex
@@ -1162,17 +1319,19 @@ func (c *schedulerServerClient) forwarded(ep scheduler.Endpoint) []upstreamReque
 // recording the catalog outcomes, the daemon face's auth failures, the S6
 // delivery face and the skill-cache resolve faces.
 type recordingMetrics struct {
-	mu            sync.Mutex
-	catalogCodes  []string
-	catalogSecs   []float64
-	deliveryKinds []string
-	unconfirmed   int
-	authReasons   []string
-	duplicates    int
-	skillResults  []string
-	skillEvicts   []string
-	skillEntries  int
-	skillBytes    int64
+	mu               sync.Mutex
+	catalogCodes     []string
+	catalogSecs      []float64
+	deliveryKinds    []string
+	unconfirmed      int
+	authReasons      []string
+	duplicates       int
+	skillResults     []string
+	skillEvicts      []string
+	skillEntries     int
+	skillBytes       int64
+	profileResults   []string
+	workspaceResults []string
 }
 
 func (m *recordingMetrics) Forward(string, int, time.Duration) {}
@@ -1248,6 +1407,20 @@ func (m *recordingMetrics) SkillCacheEviction(reason string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.skillEvicts = append(m.skillEvicts, reason)
+}
+
+// RuntimeProfileRefresh records one §1.6 refresh outcome (§9.2).
+func (m *recordingMetrics) RuntimeProfileRefresh(result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.profileResults = append(m.profileResults, result)
+}
+
+// WorkspaceStateRefresh records one C-22 outcome (§9.2).
+func (m *recordingMetrics) WorkspaceStateRefresh(result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.workspaceResults = append(m.workspaceResults, result)
 }
 
 // skillResultCount counts the recorded resolve faces per result.
@@ -1469,6 +1642,9 @@ func newHarnessWithSkill(t *testing.T, catalogEnabled bool, window time.Duration
 		ModelCatalogEnabled:  catalogEnabled,
 		ModelCatalogTimeout:  45 * time.Second,
 		ModelCatalogCacheTTL: 6 * time.Hour,
+		// Bounded C-22 refresh: long enough for a controlled gate, short
+		// enough that a failing scenario never stalls the suite.
+		WorkspaceStateTimeout: 2 * time.Second,
 
 		SkillCacheFreshTTL:        skillFreshTTL,
 		SkillCacheDowngradeWindow: skillDowngradeWindow,
@@ -1479,9 +1655,13 @@ func newHarnessWithSkill(t *testing.T, catalogEnabled bool, window time.Duration
 	if skill != nil {
 		skill(&cfg)
 	}
+	probeRunner := &lateProbeRunner{}
+	metrics := &recordingMetrics{}
 	client := proxy.NewClient(cfg, "mdt_test",
 		proxy.WithStartupCatalog(startup),
 		proxy.WithCatalogSlots(slots),
+		proxy.WithDiscoveryProbe(probeRunner),
+		proxy.WithMetrics(metrics),
 		proxy.WithLogger(slog.New(slog.NewJSONHandler(io.Discard, nil))),
 		proxy.WithTaskRuntime(func(taskID string) string {
 			entry, ok := reg.Get(taskID)
@@ -1498,7 +1678,6 @@ func newHarnessWithSkill(t *testing.T, catalogEnabled bool, window time.Duration
 	jobs := newJobClient()
 	bld := &builder{issuer: issuer, probes: probes}
 	server := &schedulerServerClient{}
-	metrics := &recordingMetrics{}
 	schedCfg := scheduler.Config{
 		JobNamespace:           "multica-agents",
 		WorkspaceID:            "ws-1",
@@ -1517,10 +1696,12 @@ func newHarnessWithSkill(t *testing.T, catalogEnabled bool, window time.Duration
 		scheduler.WithRevoker(noRevoker{}),
 		scheduler.WithProbeRegistry(probes),
 		scheduler.WithLogger(slog.New(slog.NewJSONHandler(logs, nil))),
+		scheduler.WithRuntimeIdentity(client.RuntimeIdentity),
 	)
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
 	}
+	probeRunner.sched = sched
 	// The resolve cache gets its own clock: a scenario ages entries by stepping
 	// it instead of waiting the windows out.
 	skillClock := &steppedClock{}
@@ -1553,6 +1734,7 @@ func (h *harness) rebuildScheduler(t *testing.T, mutate func(*scheduler.Config))
 		scheduler.WithRevoker(credentialRevoker(h.revoker)),
 		scheduler.WithProbeRegistry(h.probes),
 		scheduler.WithLogger(slog.New(slog.NewJSONHandler(h.logs, nil))),
+		scheduler.WithRuntimeIdentity(h.client.RuntimeIdentity),
 	)
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)

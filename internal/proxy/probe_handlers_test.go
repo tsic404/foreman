@@ -13,7 +13,8 @@ import (
 
 // startProbeToken starts a probe through the scheduler and returns the handle
 // plus a Job Token whose digest matches the session (the real builder asks the
-// issuer for the token; the test fake cannot).
+// issuer for the token; the test fake cannot). A real runtime id selects the
+// command-driven mode, an empty one the startup-discovery mode.
 func startProbeToken(t *testing.T, r *testRig, requestID, realRuntimeID string) (string, registry.ProbeSession) {
 	t.Helper()
 	return startProbeTokenBudget(t, r, requestID, realRuntimeID, 30*time.Second)
@@ -23,7 +24,18 @@ func startProbeToken(t *testing.T, r *testRig, requestID, realRuntimeID string) 
 // C21 retry budget of the command-driven relay).
 func startProbeTokenBudget(t *testing.T, r *testRig, requestID, realRuntimeID string, budget time.Duration) (string, registry.ProbeSession) {
 	t.Helper()
-	handle, err := r.sched.StartProbe(t.Context(), requestID, realRuntimeID, budget)
+	mode := registry.ProbeStartupDiscovery
+	if realRuntimeID != "" {
+		mode = registry.ProbeCommandDriven
+	}
+	return startProbeTokenMode(t, r, requestID, realRuntimeID, mode, budget)
+}
+
+// startProbeTokenMode is startProbeTokenBudget with the probe mode under the
+// caller's control: the registration-discovery probe owns no command.
+func startProbeTokenMode(t *testing.T, r *testRig, requestID, realRuntimeID string, mode registry.ProbeMode, budget time.Duration) (string, registry.ProbeSession) {
+	t.Helper()
+	handle, err := r.sched.StartProbe(t.Context(), requestID, realRuntimeID, mode, budget)
 	if err != nil {
 		t.Fatalf("StartProbe: %v", err)
 	}
@@ -164,7 +176,7 @@ func TestProbeModelResultAbsorbsStartupDiscovery(t *testing.T) {
 	if got := len(r.stub.calls("POST", "/api/daemon/runtimes/rid-real/models/"+session.SelfMintedID+"/result")); got != 0 {
 		t.Error("a startup discovery must not produce any C21")
 	}
-	staged, ok := r.client.startup.Take("omp")
+	staged, ok := r.client.startup.Take("omp", "")
 	if !ok || string(staged) != string(discoveryBody) {
 		t.Fatalf("staged discovery = %q (ok=%v), want the reported bytes verbatim", staged, ok)
 	}
@@ -369,5 +381,50 @@ func TestProbeTokenScopeMismatchIsForbidden(t *testing.T) {
 		[]byte(`{"daemon_id": "fm-catalog-cmd-3", "runtime_ids": ["`+session.JobRuntime+`"], "max_tasks": 1}`))
 	if code != 200 {
 		t.Fatalf("probe claim = %d", code)
+	}
+}
+
+// TestProbeRegisterOnlyHeartbeatOwnsNoCommand pins the §1.6 discovery probe's
+// command face: it registers and is cleaned up, so its heartbeat ack must never
+// carry pending_model_list — and with no command there is nothing a result could
+// be absorbed for either.
+func TestProbeRegisterOnlyHeartbeatOwnsNoCommand(t *testing.T) {
+	r := newTestRig(t)
+	token, session := startProbeTokenMode(t, r, "discovery-1", "", registry.ProbeRegisterOnly, 30*time.Second)
+
+	code, body := r.call(t, "POST", "/api/daemon/register", token, []byte(`{
+		"daemon_id": "fm-catalog-discovery-1",
+		"cli_version": "0.9.9",
+		"runtimes": [{"name": "aa-omp", "type": "omp", "version": "1.0.0"}]
+	}`))
+	if code != 200 {
+		t.Fatalf("discovery probe register = %d: %s", code, body)
+	}
+	updated, _ := r.probes.ProbeByJob(session.JobName)
+	if updated.RegisteredAt.IsZero() {
+		t.Fatal("the discovery probe's registration body is the C1 truth source and must be recorded")
+	}
+	if updated.SelfMintedID != "" || updated.RequestID != "" {
+		t.Fatalf("a registration-only session owns no command: %+v", updated)
+	}
+
+	code, body = r.call(t, "POST", "/api/daemon/heartbeat", token,
+		[]byte(`{"runtime_id": "`+session.JobRuntime+`"}`))
+	if code != 200 {
+		t.Fatalf("probe heartbeat = %d: %s", code, body)
+	}
+	if strings.Contains(string(body), "pending_model_list") {
+		t.Errorf("a registration-only probe must never be handed a model catalog command: %s", body)
+	}
+	// A result for the id the startup path would have minted has no owner here:
+	// the session carries no command, so the probe token's scope rejects it
+	// before any handler runs.
+	code, body = r.call(t, "POST",
+		"/api/daemon/runtimes/"+session.JobRuntime+"/models/discovery-1/result", token, []byte(`{"models":[]}`))
+	if code == 200 {
+		t.Errorf("register-only result = %d: %s, want a refusal (no command, no slot)", code, body)
+	}
+	if staged, ok := r.client.startup.Take("omp", ""); ok {
+		t.Errorf("a registration-only probe must not stage a catalog body: %q", staged)
 	}
 }

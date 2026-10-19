@@ -40,7 +40,37 @@ type Metrics interface {
 	// SkillCacheEviction counts one reclaimed entry by reason: one of the
 	// SkillEvict values (§9.2 回收计数).
 	SkillCacheEviction(reason string)
+	// RuntimeProfileRefresh records one §1.6 refresh outcome
+	// (§9.2 runtime profile 刷新，按结果): one of the ProfileRefresh values.
+	RuntimeProfileRefresh(result string)
+	// WorkspaceStateRefresh records one C-22 refresh outcome
+	// (§9.2 workspace 状态刷新，按结果): one of the WorkspaceStateRefresh values.
+	WorkspaceStateRefresh(result string)
 }
+
+// Runtime profile refresh result label values (§9.2). One outcome per refresh
+// attempt: success = a changed list was committed; unchanged = the sequence
+// completed without moving the declaration, which covers both an unchanged
+// projection and a C-18 404 (the face is gone, so there is no list to compare —
+// the event's c18 field separates the two); failed = a step of the sequence
+// failed (C-18 error/5xx, probe failure, C-1 failure).
+const (
+	ProfileRefreshSuccess   = "success"
+	ProfileRefreshUnchanged = "unchanged"
+	ProfileRefreshFailed    = "failed"
+)
+
+// Workspace state refresh result label values (§9.2). One outcome per C-22
+// attempt: success = the carrier was replaced; stale_replay = the attempt
+// failed and the answer came from the last successful snapshot; failed = the
+// attempt failed with no snapshot to answer from. The third value cannot occur
+// while §1.7's register-before window is in force (C-22 is never attempted
+// before C-1 has seeded a snapshot) and stays part of the designed vocabulary.
+const (
+	WorkspaceStateSuccess     = "success"
+	WorkspaceStateStaleReplay = "stale_replay"
+	WorkspaceStateFailure     = "failed"
+)
 
 // EndpointAgentAPI is the foreman_forward_total endpoint label for S29
 // agent-API passthrough (§9.2).
@@ -79,6 +109,8 @@ func (noopMetrics) DeliveryLatency(float64)            {}
 func (noopMetrics) SkillCache(string)                  {}
 func (noopMetrics) SkillCacheSize(int, int64)          {}
 func (noopMetrics) SkillCacheEviction(string)          {}
+func (noopMetrics) RuntimeProfileRefresh(string)       {}
+func (noopMetrics) WorkspaceStateRefresh(string)       {}
 
 func orNoopMetrics(m Metrics) Metrics {
 	if m == nil {
