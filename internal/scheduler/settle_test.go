@@ -80,6 +80,31 @@ func TestDiscardTaskRevokesTheCredential(t *testing.T) {
 	}
 }
 
+// ADR-026 决策 5: the discard table's 成立面 is started_at == 0 and it is
+// re-read from the live entry under the task lock. A start fact that landed
+// after the caller's round snapshot (S8 during a C13 round trip) keeps both
+// the Job and the entry.
+func TestDiscardTaskKeepsStartedEntry(t *testing.T) {
+	f := newFixture(t)
+	f.claim(t, "task-1")
+	if _, ok := f.reg.MarkStarted("task-1", f.now); !ok {
+		t.Fatal("MarkStarted: entry missing")
+	}
+
+	if err := f.sched.DiscardTask(context.Background(), "task-1"); err != nil {
+		t.Fatalf("DiscardTask: %v", err)
+	}
+	if _, ok := f.reg.Get("task-1"); !ok {
+		t.Fatal("the adopted entry was discarded")
+	}
+	if len(f.jobs.deletedJobs) != 0 {
+		t.Fatalf("deletedJobs = %v, want none for an adopted entry", f.jobs.deletedJobs)
+	}
+	if len(f.revoker.revoked) != 0 {
+		t.Fatalf("revoked = %v, want no revocation for an adopted entry", f.revoker.revoked)
+	}
+}
+
 // A terminal entry whose report is still queued keeps its Job: the deletion
 // waits for the drain that lands the report (§10) — a deleted Job
 // must never stand in for a delivered report.

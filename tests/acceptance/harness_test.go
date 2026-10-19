@@ -1275,11 +1275,25 @@ type schedulerServerClient struct {
 	// "exactly once".
 	forwardCode int
 	accepted    map[scheduler.Endpoint]int
+	// onStatus fires after the C13 answer is read and the client lock is
+	// released, before the answer is returned. It lets a scenario land a
+	// transition inside the round trip (an S8 start whose MarkStarted must
+	// beat the caller's next deletion decision).
+	onStatus func()
 }
 
 func (c *schedulerServerClient) TaskStatus(_ context.Context, taskID string) (string, error) {
 	c.mu.Lock()
-	defer c.mu.Unlock()
+	status, err := c.statusAnswerLocked(taskID)
+	hook := c.onStatus
+	c.mu.Unlock()
+	if hook != nil {
+		hook()
+	}
+	return status, err
+}
+
+func (c *schedulerServerClient) statusAnswerLocked(taskID string) (string, error) {
 	if c.statuses == nil {
 		return "dispatched", nil
 	}
@@ -1288,6 +1302,13 @@ func (c *schedulerServerClient) TaskStatus(_ context.Context, taskID string) (st
 		return "", scheduler.ErrTaskNotFound
 	}
 	return status, nil
+}
+
+// setStatusHook programs the post-answer hook (nil clears it).
+func (c *schedulerServerClient) setStatusHook(h func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onStatus = h
 }
 
 // setStatus programs the C13 answer for one task: once any task has one, an

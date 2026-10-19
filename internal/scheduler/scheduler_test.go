@@ -793,6 +793,95 @@ func TestDuplicateClaimPreStartReplacesEntry(t *testing.T) {
 	}
 }
 
+// ADR-026 决策 5 / ADR-017's replace_pre_start: the replacement's 成立面 is
+// pre-start, and C13 alone is not the decision. A start fact that landed
+// after the round snapshot (S8 during the C13 round trip) keeps the old
+// attempt and its Job; the new claim is dropped and the credential stays
+// valid for the running attempt.
+func TestDuplicateClaimKeepsStartedEntry(t *testing.T) {
+	f := newFixture(t)
+	first := f.claim(t, "task-1")
+	if _, ok := f.reg.MarkStarted("task-1", f.now); !ok {
+		t.Fatal("MarkStarted: entry missing")
+	}
+	f.server.status = "queued"
+	buf := newLogScheduler(t, f, slog.LevelInfo)
+
+	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	if len(f.jobs.createdJobs) != 1 {
+		t.Fatalf("jobs created = %d, want the old Job only", len(f.jobs.createdJobs))
+	}
+	if len(f.jobs.deletedJobs) != 0 {
+		t.Fatalf("deletedJobs = %v, want none for a started entry", f.jobs.deletedJobs)
+	}
+	if len(f.revoker.revoked) != 0 {
+		t.Fatalf("revoked = %v, want no revocation for a started entry", f.revoker.revoked)
+	}
+	e, ok := f.reg.Get("task-1")
+	if !ok || e.StartedAt.IsZero() || e.State != registry.StateRunning ||
+		e.Attempt != first.Attempt || e.JobName != first.JobName {
+		t.Fatalf("entry = %+v, %v; want the started attempt kept", e, ok)
+	}
+	record := findLogRecord(t, buf.Bytes(), "duplicate_dispatch")
+	if got := record["task_id"]; got != "task-1" {
+		t.Fatalf("task_id = %v, want task-1", got)
+	}
+	if got := record["old_job_name"]; got != "fm-task-1" {
+		t.Fatalf("old_job_name = %v, want fm-task-1", got)
+	}
+	if got := record["action"]; got != "keep_started" {
+		t.Fatalf("action = %v, want keep_started", got)
+	}
+}
+
+// A duplicate claim whose C13 answers 404 takes §4.6's vanished face, not
+// the pre-start discard: the task will not be re-run, so the entry settles
+// terminal with an empty result and enters drain; the Job goes, no terminal
+// report is sent, and the credential is reclaimed when the Job terminates.
+// The new claim is dropped either way.
+func TestDuplicateClaimTaskGoneSettlesVanished(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		started bool
+	}{
+		{"pre_start", false},
+		{"started", true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.claim(t, "task-1")
+			if tc.started {
+				if _, ok := f.reg.MarkStarted("task-1", f.now); !ok {
+					t.Fatal("MarkStarted: entry missing")
+				}
+			}
+			f.server.statusErr = ErrTaskNotFound
+
+			if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
+				t.Fatalf("OnClaim: %v", err)
+			}
+			if len(f.jobs.createdJobs) != 1 {
+				t.Fatalf("jobs created = %d, want no second Job", len(f.jobs.createdJobs))
+			}
+			if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != "fm-task-1" {
+				t.Fatalf("deletedJobs = %v, want [fm-task-1]", f.jobs.deletedJobs)
+			}
+			e, ok := f.reg.Get("task-1")
+			if !ok || !e.IsTerminal() || !e.IsDraining() || e.Result != "" {
+				t.Fatalf("entry = %+v, %v; want a terminal draining entry with no result", e, ok)
+			}
+			if len(f.server.forwards) != 0 {
+				t.Fatalf("forwards = %v, want none for a vanished task", f.server.forwards)
+			}
+			if len(f.revoker.revoked) != 0 {
+				t.Fatalf("revoked = %v, want the credential kept until the Job terminates", f.revoker.revoked)
+			}
+		})
+	}
+}
+
 // A pre-start replacement deletes the old Job with Foreground, so the name
 // (fm-<task_id>) stays taken until the cascade finishes. The replacement
 // must wait for it instead of swallowing AlreadyExists as a restart replay:
@@ -1750,6 +1839,49 @@ func TestConvergePreStartReleasesForRedispatch(t *testing.T) {
 	}
 	if len(f.server.forwards) != 0 {
 		t.Fatal("report sent for a released task")
+	}
+}
+
+// ADR-026 决策 3: only a rebuilt entry (payload unavailable) belongs to the
+// discard row. An in-flight pre-start entry still holds its payload, so the
+// fallback convergence must keep it — it has a delivery to make.
+func TestConvergeQueuedKeepsInFlightEntry(t *testing.T) {
+	f := newFixture(t)
+	f.claim(t, "task-1") // live entry: payload present, no start fact
+	f.server.status = "dispatched"
+
+	if err := f.sched.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := f.reg.Get("task-1"); !ok {
+		t.Fatal("in-flight entry discarded on a pre-delivery status")
+	}
+	if len(f.jobs.deletedJobs) != 0 {
+		t.Fatalf("deletedJobs = %v, want none for an entry that still holds its payload", f.jobs.deletedJobs)
+	}
+}
+
+// ADR-026 决策 5: a start fact keeps the entry out of the discard row even
+// when C13 falls back to a pre-delivery status. The live re-read in
+// DiscardTask is the authoritative check for this path.
+func TestConvergeQueuedKeepsStartedEntry(t *testing.T) {
+	f := newFixture(t)
+	e := f.claim(t, "task-1")
+	e.Payload = nil // rebuilt from K8s
+	e.StartedAt = f.now.Add(-time.Minute)
+	if err := f.reg.Put(e); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	f.server.status = "queued"
+
+	if err := f.sched.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := f.reg.Get("task-1"); !ok || got.StartedAt.IsZero() {
+		t.Fatalf("entry = %+v, %v; want the adopted entry kept", got, ok)
+	}
+	if len(f.jobs.deletedJobs) != 0 {
+		t.Fatalf("deletedJobs = %v, want none for an adopted entry", f.jobs.deletedJobs)
 	}
 }
 

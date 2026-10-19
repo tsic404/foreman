@@ -735,15 +735,15 @@ func (s *Scheduler) resolveDuplicateClaim(ctx context.Context, existing registry
 	st, err := s.server.TaskStatus(ctx, existing.TaskID)
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
+		// The task no longer exists server-side: this is the vanished face of
+		// §4.6 (the status query reported it absent), not the pre-start
+		// replacement — the task will not be re-run, so its entry is settled
+		// terminal with an empty result and enters drain; the Job goes and
+		// the credential is reclaimed when it terminates (ADR-017). The new
+		// claim is dropped: nothing is built for a deleted task.
 		s.log.WarnContext(ctx, "duplicate_dispatch",
 			"task_id", existing.TaskID, "old_job_name", existing.JobName, "action", "drop_task_gone")
-		// The claim proceeds as a replacement: leftover objects are handled
-		// idempotently by the new claim (delete-then-create Secret, tolerated
-		// AlreadyExists Job), so a failed discard needs no retry handle — but
-		// the old credential is revoked first, because the replacement Job
-		// reuses its name (ADR-017).
-		s.discardQuietly(ctx, existing)
-		return false, 0, nil
+		return false, 0, s.OnTaskVanished(ctx, existing.TaskID)
 	case err != nil:
 		// Truth unknown: keep the existing entry, drop the new claim; the
 		// reconcile loop converges later.
@@ -765,17 +765,23 @@ func (s *Scheduler) resolveDuplicateClaim(ctx context.Context, existing registry
 			"task_id", existing.TaskID, "old_job_name", existing.JobName, "action", "drop_terminal")
 		return false, 0, nil
 	case st == "queued" || st == "dispatched":
-		// The old entry cannot have started: discard it (no duplicate
-		// execution) and let the new claim build a fresh Job.
-		s.log.WarnContext(ctx, "duplicate_dispatch",
-			"task_id", existing.TaskID, "old_job_name", existing.JobName, "action", "replace_pre_start")
+		// C13 says pre-start, but the round snapshot is not the decision:
+		// the start fact is re-read from the live entry under the task lock
+		// (ADR-026 决策 5). A start that landed while C13 was in flight
+		// keeps the old attempt — a replacement Job would double-run it.
+		if !s.discardQuietly(ctx, existing) {
+			s.log.WarnContext(ctx, "duplicate_dispatch",
+				"task_id", existing.TaskID, "old_job_name", existing.JobName, "action", "keep_started")
+			return false, 0, nil
+		}
 		// The claim proceeds as a replacement: leftover objects are handled
 		// idempotently by the new claim (delete-then-create Secret, tolerated
 		// AlreadyExists Job), so a failed discard needs no retry handle — but
 		// the old credential is revoked first, and that revoke is the point
 		// of this branch: the replacement Job reuses the name, so the old
 		// pod must never be able to claim the re-run task (ADR-017).
-		s.discardQuietly(ctx, existing)
+		s.log.WarnContext(ctx, "duplicate_dispatch",
+			"task_id", existing.TaskID, "old_job_name", existing.JobName, "action", "replace_pre_start")
 		return true, existing.Attempt, nil
 	default:
 		s.log.WarnContext(ctx, "duplicate_dispatch",
@@ -1378,26 +1384,42 @@ func (s *Scheduler) AdoptRunning(ctx context.Context, taskID, status string) err
 
 // DiscardTask removes the objects and the mapping of a task that will be
 // re-run, without any terminal report and without entering drain
-// (§4.3: discard and redispatch; §10: the pre-start half of the
-// duplicate-claim rule). A successor Job may be rendered under the same
-// display name (the template's format is deterministic per task), so the
+// (§4.3: discard and redispatch). A successor Job may be rendered under the
+// same display name (the template's format is deterministic per task), so the
 // predecessor's credential is revoked first: its pod must never be able to
 // claim the re-run task (ADR-017 — "宁可噪音、不可重跑"). A rebuilt entry
 // has no digest to revoke; that degradation is logged as
 // cred.revoke_unavailable. A failed deletion keeps the entry: it is the only
 // retry handle, and dropping it would leave a zombie Job or leak the
 // credential Secret (§6.4: the entry is the only retry handle).
+//
+// The discard row's 成立面 is read from the live entry under the task lock
+// (ADR-026 决策 5): a start fact S8 established while the caller's C13 round
+// trip was in flight makes the entry adopted and keeps it. The duplicate-claim
+// replacement (discardQuietly) applies the same gate to the entry it discards.
 func (s *Scheduler) DiscardTask(ctx context.Context, taskID string) error {
-	defer s.SyncInflight()
+	unlock := s.taskMu.Lock(taskID)
+	defer unlock()
 	e, ok := s.reg.Get(taskID)
 	if !ok {
 		return nil
 	}
+	if !e.StartedAt.IsZero() {
+		return nil
+	}
+	return s.discardTaskLocked(ctx, e)
+}
+
+// discardTaskLocked removes the objects and the mapping. The caller holds the
+// task lock, which is what makes re-reading the entry here a decision on the
+// live state rather than on a round snapshot.
+func (s *Scheduler) discardTaskLocked(ctx context.Context, e registry.TaskEntry) error {
+	defer s.SyncInflight()
 	s.revokeCredential(ctx, e)
 	if err := s.deleteObjects(ctx, e); err != nil {
 		return err
 	}
-	return s.reg.Delete(taskID)
+	return s.reg.Delete(e.TaskID)
 }
 
 // OnTaskVanished settles a task the server deleted (§4.6, C13/C4 404). No
@@ -1439,12 +1461,29 @@ func (s *Scheduler) revokeCredential(ctx context.Context, e registry.TaskEntry) 
 // and only logs a failure: the replacement handles leftover objects
 // idempotently (delete-then-create Secret, tolerated AlreadyExists Job), and
 // the revocation it performed first is what the branch depends on.
-func (s *Scheduler) discardQuietly(ctx context.Context, e registry.TaskEntry) {
-	if err := s.DiscardTask(ctx, e.TaskID); err != nil {
+//
+// The caller holds the task lock (OnClaim's duplicate-claim round), so the
+// entry re-read here is the live one: a start fact established since the
+// caller's snapshot (S8 during the C13 round trip) makes the entry adopted and
+// keeps it (ADR-026 决策 5; ADR-017 names this row replace_pre_start, whose
+// 成立面 is pre-start). It reports whether the replacement may proceed; false
+// means the live entry carries a start fact and was kept — the claim must be
+// dropped instead. An entry already gone, or a failed deletion, still lets the
+// replacement proceed: the new claim cleans up leftovers idempotently.
+func (s *Scheduler) discardQuietly(ctx context.Context, e registry.TaskEntry) bool {
+	fresh, ok := s.reg.Get(e.TaskID)
+	if !ok {
+		return true
+	}
+	if !fresh.StartedAt.IsZero() {
+		return false
+	}
+	if err := s.discardTaskLocked(ctx, fresh); err != nil {
 		s.log.WarnContext(ctx, "task.discard_failed",
 			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 			"err", err)
 	}
+	return true
 }
 
 // OnJobTerminated is the credential-reclaim entry point — the only one
@@ -1787,10 +1826,16 @@ func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) err
 		// means the entry turned terminal or was deleted mid-round — benign.
 		return s.AdoptRunning(ctx, e.TaskID, st)
 	case st == "queued" || st == "dispatched":
-		// Not started and the payload is gone with the restart: discard the
-		// objects so the server re-dispatches after its reclaim window. This
-		// path deliberately does not enter drain — the task will be re-run
+		// ADR-026 决策 3/5: the discard row is a rebuilt entry — payload lost
+		// with the restart and no start fact. Payload availability is stable
+		// for a live entry; the start fact is re-read from the live entry at
+		// the deletion surface (DiscardTask holds the task lock), so a
+		// concurrent S8 transition wins over this round's snapshot. This path
+		// deliberately does not enter drain — the task will be re-run
 		// (ADR-017).
+		if len(e.Payload) != 0 {
+			return nil
+		}
 		return s.DiscardTask(ctx, e.TaskID)
 	case registry.IsTerminalResult(st):
 		return s.SettleTerminal(ctx, e.TaskID, st)
