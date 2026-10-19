@@ -1270,6 +1270,11 @@ type schedulerServerClient struct {
 	mu       sync.Mutex
 	statuses map[string]string
 	forwards []upstreamRequest
+	// forwardCode programs the C5–C12 answer (0 = 200); accepted counts the
+	// writes the stub took (2xx) per endpoint, so a scenario can judge
+	// "exactly once".
+	forwardCode int
+	accepted    map[scheduler.Endpoint]int
 }
 
 func (c *schedulerServerClient) TaskStatus(_ context.Context, taskID string) (string, error) {
@@ -1300,7 +1305,31 @@ func (c *schedulerServerClient) Forward(_ context.Context, ep scheduler.Endpoint
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.forwards = append(c.forwards, upstreamRequest{Method: string(ep), Path: taskID, Body: body})
-	return 200, []byte(`{"status":"ok"}`), nil
+	code := c.forwardCode
+	if code == 0 {
+		code = 200
+	}
+	if code >= 200 && code < 300 {
+		if c.accepted == nil {
+			c.accepted = map[scheduler.Endpoint]int{}
+		}
+		c.accepted[ep]++
+	}
+	return code, []byte(`{"status":"ok"}`), nil
+}
+
+// setForwardCode programs the C5–C12 answer (0 restores 200).
+func (c *schedulerServerClient) setForwardCode(code int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.forwardCode = code
+}
+
+// acceptedFor counts the writes the stub took (2xx) for ep.
+func (c *schedulerServerClient) acceptedFor(ep scheduler.Endpoint) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.accepted[ep]
 }
 
 func (c *schedulerServerClient) forwarded(ep scheduler.Endpoint) []upstreamRequest {
@@ -1332,6 +1361,7 @@ type recordingMetrics struct {
 	skillBytes       int64
 	profileResults   []string
 	workspaceResults []string
+	pendingReports   int
 }
 
 func (m *recordingMetrics) Forward(string, int, time.Duration) {}
@@ -1364,6 +1394,20 @@ func (m *recordingMetrics) DuplicateDispatch() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.duplicates++
+}
+
+// PendingReports records the terminal-report queue depth (the gauge the
+// recovery loop keeps current).
+func (m *recordingMetrics) PendingReports(n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.pendingReports = n
+}
+
+func (m *recordingMetrics) pendingReportsDepth() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.pendingReports
 }
 
 func (m *recordingMetrics) ModelCatalogRelay(code string, seconds float64) {
@@ -1560,6 +1604,7 @@ type harness struct {
 	issuer   *auth.Issuer
 	client   *proxy.Client
 	sched    *scheduler.Scheduler
+	pending  *scheduler.PendingReports
 	upstream *upstreamStub
 	handler  http.Handler
 	jobsHTTP *httptest.Server
@@ -1678,6 +1723,13 @@ func newHarnessWithSkill(t *testing.T, catalogEnabled bool, window time.Duration
 	jobs := newJobClient()
 	bld := &builder{issuer: issuer, probes: probes}
 	server := &schedulerServerClient{}
+	// The terminal-report queue is the production one: the write-ahead
+	// discipline and the gauge are part of the face the scenarios judge.
+	pending, err := scheduler.NewPendingReports(t.TempDir(),
+		scheduler.WithPendingReportsGauge(metrics.PendingReports))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
 	schedCfg := scheduler.Config{
 		JobNamespace:           "multica-agents",
 		WorkspaceID:            "ws-1",
@@ -1692,7 +1744,7 @@ func newHarnessWithSkill(t *testing.T, catalogEnabled bool, window time.Duration
 		ReconcileInterval:      30 * time.Second,
 	}
 	sched, err := scheduler.New(schedCfg, reg, jobs, bld, server, metrics,
-		scheduler.WithPendingReports(noReports{}),
+		scheduler.WithPendingReports(pending),
 		scheduler.WithRevoker(noRevoker{}),
 		scheduler.WithProbeRegistry(probes),
 		scheduler.WithLogger(slog.New(slog.NewJSONHandler(logs, nil))),
@@ -1717,7 +1769,7 @@ func newHarnessWithSkill(t *testing.T, catalogEnabled bool, window time.Duration
 	return &harness{
 		t: t, cfg: cfg, reg: reg, probes: probes, startup: startup, slots: slots,
 		jobs: jobs, builder: bld, server: server, metrics: metrics, issuer: issuer,
-		client: client, sched: sched, upstream: upstream, handler: handler,
+		client: client, sched: sched, pending: pending, upstream: upstream, handler: handler,
 		jobsHTTP: httpServer, logs: logs, handlerLogs: handlerLogs,
 		bundles: bundles, skillClock: skillClock, schedCfg: schedCfg,
 	}
@@ -1730,7 +1782,7 @@ func (h *harness) rebuildScheduler(t *testing.T, mutate func(*scheduler.Config))
 	cfg := h.schedCfg
 	mutate(&cfg)
 	sched, err := scheduler.New(cfg, h.reg, h.jobs, h.builder, h.server, h.metrics,
-		scheduler.WithPendingReports(noReports{}),
+		scheduler.WithPendingReports(h.pending),
 		scheduler.WithRevoker(credentialRevoker(h.revoker)),
 		scheduler.WithProbeRegistry(h.probes),
 		scheduler.WithLogger(slog.New(slog.NewJSONHandler(h.logs, nil))),
@@ -1963,12 +2015,6 @@ func (h *harness) handlerEvents(msg string) []map[string]any {
 	}
 	return found
 }
-
-type noReports struct{}
-
-func (noReports) Enqueue(string, string, string, scheduler.Endpoint, []byte) error { return nil }
-func (noReports) Queued(string) bool                                               { return false }
-func (noReports) Drain(context.Context, scheduler.ReportSender) (int, error)       { return 0, nil }
 
 type noRevoker struct{}
 

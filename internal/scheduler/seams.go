@@ -96,14 +96,17 @@ type Reconciler interface {
 
 // PendingReportQueue is the durable terminal-report queue seam
 // (§10: terminal callbacks are never dropped). It is the scheduler's own
-// queue (ADR-031): OnReport enqueues the body it actually forwarded, and the
-// recovery loop drains it through the Settler seam. A queued report also
-// holds back the object cleanup of its task: a deleted Job must never stand
-// in for a delivered report.
+// queue (ADR-031): every terminal forward writes its body ahead of the
+// attempt, the direct answer drops it, and the recovery loop drains what is
+// left through the Settler seam. A queued report also holds back the object
+// cleanup of its task: a deleted Job must never stand in for a delivered
+// report.
 type PendingReportQueue interface {
 	Enqueue(taskID, jobName, daemonID string, ep Endpoint, body []byte) error
 	// Queued reports whether taskID's terminal report is still undelivered.
 	Queued(taskID string) bool
+	// Drop forgets taskID's report after its direct forward settled it.
+	Drop(taskID string)
 	// Drain re-delivers every queued report once through sender and returns
 	// how many are still undelivered.
 	Drain(ctx context.Context, sender ReportSender) (int, error)

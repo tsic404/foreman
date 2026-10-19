@@ -40,6 +40,9 @@ func (f *fakePendingReports) Enqueue(taskID, jobName, daemonID string, ep Endpoi
 // Queued reports whether the report is still undelivered.
 func (f *fakePendingReports) Queued(taskID string) bool { return f.queued[taskID] }
 
+// Drop forgets the report the direct forward settled.
+func (f *fakePendingReports) Drop(taskID string) { delete(f.queued, taskID) }
+
 // Drain models the recovery loop's round: every queued report is re-delivered
 // once through sender and the queue is reported empty.
 func (f *fakePendingReports) Drain(ctx context.Context, sender ReportSender) (int, error) {
@@ -61,6 +64,18 @@ func (f *fixture) withPendingReports() *fakePendingReports {
 	f.pending = &fakePendingReports{}
 	WithPendingReports(f.pending)(f.sched)
 	return f.pending
+}
+
+// withDurableReports swaps the fixture's recording fake for the real queue,
+// so a test can observe the durable file and reopen it as a new process.
+func (f *fixture) withDurableReports(t *testing.T) *PendingReports {
+	t.Helper()
+	p, err := NewPendingReports(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	WithPendingReports(p)(f.sched)
+	return p
 }
 
 func (f *fixture) hasJob(name string) bool {
@@ -286,7 +301,7 @@ func TestOnReportTerminalFailureEnqueuesPendingReport(t *testing.T) {
 	}
 }
 
-func TestOnReportTerminalPermanent4xxNotEnqueued(t *testing.T) {
+func TestOnReportTerminalPermanent4xxNotRetried(t *testing.T) {
 	f := newFixture(t)
 	p := f.withPendingReports()
 	e := f.claim(t, "t-perm")
@@ -296,8 +311,10 @@ func TestOnReportTerminalPermanent4xxNotEnqueued(t *testing.T) {
 	if err != nil || code != 400 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
-	if len(p.reports) != 0 {
-		t.Errorf("4xx is permanent: no queue entry expected, got %+v", p.reports)
+	// The report was written ahead of the attempt; a permanent refusal is
+	// never replayed, so the queue entry is dropped again.
+	if p.Queued("t-perm") {
+		t.Errorf("4xx is permanent: the write-ahead entry must be dropped, got %+v", p.reports)
 	}
 	if !f.hasJob("fm-t-perm") {
 		t.Error("Job must stay for inspection on a permanent failure")
@@ -314,8 +331,8 @@ func TestOnReportTerminal404IsIdempotentSuccess(t *testing.T) {
 	if err != nil || code != 200 {
 		t.Fatalf("OnReport = %d, %v (terminal 404 must map to 200)", code, err)
 	}
-	if len(p.reports) != 0 {
-		t.Errorf("404 terminal is moot, not queued: %+v", p.reports)
+	if p.Queued("t-404") {
+		t.Errorf("404 terminal is moot: the write-ahead entry must be dropped, got %+v", p.reports)
 	}
 	if f.hasJob("fm-t-404") {
 		t.Error("Job must be cleaned up on a terminal 404")
