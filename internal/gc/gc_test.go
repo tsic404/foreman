@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -76,6 +77,29 @@ func agePath(t *testing.T, path string, age time.Duration) {
 func exists(path string) bool {
 	_, err := os.Stat(path)
 	return err == nil
+}
+
+// growPack simulates a fetch landing in a bare cache after the scan: it bumps
+// the pack's mtime and appends extra bytes, so the pre-delete re-measure sees
+// both a newer usedAt and a larger size.
+func growPack(t *testing.T, cacheDir string, extra int) {
+	t.Helper()
+	pack := filepath.Join(cacheDir, "pack")
+	now := time.Now()
+	if err := os.Chtimes(pack, now, now); err != nil {
+		t.Fatalf("chtimes %s: %v", pack, err)
+	}
+	f, err := os.OpenFile(pack, os.O_APPEND|os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatalf("open %s: %v", pack, err)
+	}
+	if _, err := f.Write([]byte(strings.Repeat("x", extra))); err != nil {
+		f.Close()
+		t.Fatalf("append %s: %v", pack, err)
+	}
+	if err := f.Close(); err != nil {
+		t.Fatalf("close %s: %v", pack, err)
+	}
 }
 
 func TestRunOnceTTL(t *testing.T) {
@@ -219,6 +243,141 @@ func TestRunOnceCacheLimitLRU(t *testing.T) {
 	}
 	if st.CacheBytes != 20 {
 		t.Errorf("cache_bytes = %d, want 20", st.CacheBytes)
+	}
+}
+
+// A cache written after the TTL scan (an in-flight fetch/clone) must not be
+// the LRU victim: the eviction pass re-reads its mtime and size, skips it for
+// that round, and keeps evicting next-oldest caches until the true total fits.
+// This is the degradation face of AC-12 / TC-tech-cache-01: an in-flight cache
+// is never deleted and the reported remaining bytes stay truthful.
+func TestRunOnceCacheLimitSkipsRefreshedCache(t *testing.T) {
+	root := t.TempDir()
+	makeTree(t, root, map[string]string{
+		"workspaces/.repos/ws-1/old.git/pack":   "0123456789", // 10 bytes
+		"workspaces/.repos/ws-1/mid.git/pack":   "0123456789", // 10 bytes
+		"workspaces/.repos/ws-1/young.git/pack": "0123456789", // 10 bytes
+	})
+	ageTree(t, root, 10*time.Hour)
+	agePath(t, filepath.Join(root, "workspaces/.repos/ws-1/mid.git"), 5*time.Hour)
+	agePath(t, filepath.Join(root, "workspaces/.repos/ws-1/mid.git/pack"), 5*time.Hour)
+	agePath(t, filepath.Join(root, "workspaces/.repos/ws-1/young.git"), 2*time.Hour)
+	agePath(t, filepath.Join(root, "workspaces/.repos/ws-1/young.git/pack"), 2*time.Hour)
+
+	cfg := testConfig(root)
+	cfg.CacheMaxBytes = 25 // the scan sees 30 bytes, 5 over the cap
+	c := newTestCollector(t, cfg)
+	oldPath := filepath.Join(root, "workspaces/.repos/ws-1/old.git")
+	// The hook stands in for a fetch landing between the scan and the delete.
+	c.remeasure = func(ctx context.Context, path string) (time.Time, int64, error) {
+		if path == oldPath {
+			growPack(t, oldPath, 9) // 10 → 19 bytes
+		}
+		return measure(ctx, path)
+	}
+
+	st, err := c.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if st.BareRepos != 2 {
+		t.Fatalf("stats = %+v, want two bare repos reclaimed", st)
+	}
+	if !exists(oldPath) {
+		t.Error("old.git was reclaimed although it was refreshed after the scan")
+	}
+	if exists(filepath.Join(root, "workspaces/.repos/ws-1/mid.git")) {
+		t.Error("mid.git survived, want the next-oldest cache reclaimed")
+	}
+	if exists(filepath.Join(root, "workspaces/.repos/ws-1/young.git")) {
+		t.Error("young.git survived, want the corrected total to keep the pass evicting")
+	}
+	if st.CacheBytes != 19 {
+		t.Errorf("cache_bytes = %d, want the actual 19 bytes left behind", st.CacheBytes)
+	}
+}
+
+// A refreshed cache is skipped even when it is the only candidate: the round
+// must terminate with the actual remaining bytes, and the next round re-judges
+// the cache from a fresh scan.
+func TestRunOnceCacheLimitRefreshedSoleCache(t *testing.T) {
+	root := t.TempDir()
+	makeTree(t, root, map[string]string{
+		"workspaces/.repos/ws-1/only.git/pack": "012345678901234567890123456789", // 30 bytes
+	})
+	ageTree(t, root, 10*time.Hour)
+
+	cfg := testConfig(root)
+	cfg.CacheMaxBytes = 25
+	c := newTestCollector(t, cfg)
+	onlyPath := filepath.Join(root, "workspaces/.repos/ws-1/only.git")
+	c.remeasure = func(ctx context.Context, path string) (time.Time, int64, error) {
+		if path == onlyPath {
+			growPack(t, onlyPath, 9) // 30 → 39 bytes
+		}
+		return measure(ctx, path)
+	}
+
+	st, err := c.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if st.BareRepos != 0 {
+		t.Fatalf("stats = %+v, want the refreshed cache kept this round", st)
+	}
+	if !exists(onlyPath) {
+		t.Error("only.git was reclaimed although it was refreshed after the scan")
+	}
+	if st.CacheBytes != 39 {
+		t.Errorf("cache_bytes = %d, want the actual 39 bytes left behind", st.CacheBytes)
+	}
+}
+
+// The corrected total must keep the pass evicting even when the refreshed
+// cache alone stays over the cap: every other victim goes, and the round ends
+// reporting the true remaining bytes instead of exiting early on the stale
+// scan total.
+func TestRunOnceCacheLimitRefreshedCacheDrainsOtherVictims(t *testing.T) {
+	root := t.TempDir()
+	makeTree(t, root, map[string]string{
+		"workspaces/.repos/ws-1/old.git/pack":   "0123456789", // 10 bytes
+		"workspaces/.repos/ws-1/mid.git/pack":   "0123456789", // 10 bytes
+		"workspaces/.repos/ws-1/young.git/pack": "0123456789", // 10 bytes
+	})
+	ageTree(t, root, 10*time.Hour)
+	agePath(t, filepath.Join(root, "workspaces/.repos/ws-1/mid.git"), 5*time.Hour)
+	agePath(t, filepath.Join(root, "workspaces/.repos/ws-1/mid.git/pack"), 5*time.Hour)
+	agePath(t, filepath.Join(root, "workspaces/.repos/ws-1/young.git"), 2*time.Hour)
+	agePath(t, filepath.Join(root, "workspaces/.repos/ws-1/young.git/pack"), 2*time.Hour)
+
+	cfg := testConfig(root)
+	cfg.CacheMaxBytes = 25 // the scan sees 30 bytes, 5 over the cap
+	c := newTestCollector(t, cfg)
+	oldPath := filepath.Join(root, "workspaces/.repos/ws-1/old.git")
+	c.remeasure = func(ctx context.Context, path string) (time.Time, int64, error) {
+		if path == oldPath {
+			growPack(t, oldPath, 40) // 10 → 50 bytes, over the cap on its own
+		}
+		return measure(ctx, path)
+	}
+
+	st, err := c.RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if st.BareRepos != 2 {
+		t.Fatalf("stats = %+v, want both other caches reclaimed", st)
+	}
+	if !exists(oldPath) {
+		t.Error("old.git was reclaimed although it was refreshed after the scan")
+	}
+	for _, gone := range []string{"mid.git", "young.git"} {
+		if exists(filepath.Join(root, "workspaces/.repos/ws-1", gone)) {
+			t.Errorf("%s survived, want the corrected total to keep evicting", gone)
+		}
+	}
+	if st.CacheBytes != 50 {
+		t.Errorf("cache_bytes = %d, want the actual 50 bytes left behind", st.CacheBytes)
 	}
 }
 
