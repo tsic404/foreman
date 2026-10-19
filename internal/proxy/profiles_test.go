@@ -521,3 +521,24 @@ func TestWorkspaceStateKeepsReposVersionPresence(t *testing.T) {
 		t.Errorf("non-string repos_version = %q, want it replayed verbatim", got)
 	}
 }
+
+// TestWorkspaceStateRefreshBeforeSeedRecordsFailed pins §9.2's third outcome:
+// in §1.7's register-before window there is no snapshot to answer from, so the
+// refresh records `failed` and no C-22 leaves the process.
+func TestWorkspaceStateRefreshBeforeSeedRecordsFailed(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	var metrics fakeMetrics
+	c := NewClient(testConfig(srv.URL), "mdt_test", WithMetrics(&metrics))
+	if err := c.RefreshWorkspaceState(t.Context()); err != nil {
+		t.Fatalf("register-before refresh = %v, want nil", err)
+	}
+	metrics.mu.Lock()
+	got := append([]string(nil), metrics.workspaceRefreshes...)
+	metrics.mu.Unlock()
+	if len(got) != 1 || got[0] != WorkspaceStateFailure {
+		t.Fatalf("workspace refreshes = %v, want [%s]", got, WorkspaceStateFailure)
+	}
+	if calls := stub.calls(http.MethodGet, "/api/daemon/workspaces/ws-1/repos"); len(calls) != 0 {
+		t.Errorf("register-before refresh made %d C-22 calls, want 0", len(calls))
+	}
+}

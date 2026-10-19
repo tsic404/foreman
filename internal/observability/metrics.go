@@ -129,7 +129,8 @@ var skillCacheEvictReasons = []string{"capacity", "retention", "damaged"}
 
 // workspaceStateResults is the foreman_workspace_state_refreshes_total label
 // vocabulary (§9.2): a successful C-22, a failed refresh answered from the last
-// snapshot, and a failure with nothing to replay.
+// snapshot, and a refresh request with no seeded snapshot to replay (§1.7's
+// register-before window).
 var workspaceStateResults = []string{"success", "stale_replay", "failed"}
 
 // runtimeProfileResults is the foreman_runtime_profile_refreshes_total label

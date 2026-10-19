@@ -95,6 +95,9 @@ func TestTechWorkspaceState01SeedRefreshAndPresence(t *testing.T) {
 	if n := h.upstream.reposCallCount(); n != 0 {
 		t.Fatalf("pre-C1 C-22 calls = %d, want 0", n)
 	}
+	if got := workspaceRefreshCount(h, "failed"); got != 1 {
+		t.Errorf("failed refreshes in the register-before window = %d, want 1", got)
+	}
 
 	// C-1 seeds the carrier verbatim, unknown keys included.
 	seedRepos := `[{"url":"https://example.invalid/a","ref":"main","x_repo_key":{"n":1}}]`

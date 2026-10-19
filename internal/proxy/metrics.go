@@ -60,12 +60,12 @@ const (
 	ProfileRefreshFailed    = "failed"
 )
 
-// Workspace state refresh result label values (§9.2). One outcome per C-22
-// attempt: success = the carrier was replaced; stale_replay = the attempt
-// failed and the answer came from the last successful snapshot; failed = the
-// attempt failed with no snapshot to answer from. The third value cannot occur
-// while §1.7's register-before window is in force (C-22 is never attempted
-// before C-1 has seeded a snapshot) and stays part of the designed vocabulary.
+// Workspace state refresh result label values (§9.2). One outcome per refresh
+// attempt; the register-before window records one per request: success = the
+// carrier was replaced; stale_replay = the attempt failed and the answer came
+// from the last successful snapshot; failed = the request found no seeded
+// snapshot to answer from (§1.7's register-before window, where C-22 is never
+// attempted).
 const (
 	WorkspaceStateSuccess     = "success"
 	WorkspaceStateStaleReplay = "stale_replay"

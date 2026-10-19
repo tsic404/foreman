@@ -185,15 +185,20 @@ agents:
 }
 
 // TestTechObservability01RefreshFamilies drives both refresh sequences: C-22
-// records success and stale_replay, and §1.6 records unchanged, failed and
-// success. The third workspace value (failed, no snapshot) cannot occur inside
-// the register-before window and is covered by the boot presence check.
+// records failed (register-before window, no snapshot), success and
+// stale_replay, and §1.6 records unchanged, failed and success.
 func TestTechObservability01RefreshFamilies(t *testing.T) {
 	h := newHarness(t, false)
 	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
 	h.upstream.setRuntimeID("omp", "", "rid-omp")
 	h.upstream.setRuntimeID("omp", "prof-a", "rid-prof-a")
 	h.upstream.setRegisterWorkspace(`[]`, "v1", `{}`)
+
+	// §1.7's register-before window: the refresh has no snapshot to answer
+	// from, which is the designed `failed` outcome of §9.2.
+	if err := h.client.RefreshWorkspaceState(t.Context()); err != nil {
+		t.Fatalf("pre-register refresh: %v", err)
+	}
 	h.declare(declaredRuntimes())
 
 	// C-22: a failed refresh replays the last snapshot, a successful one
@@ -211,6 +216,9 @@ func TestTechObservability01RefreshFamilies(t *testing.T) {
 	}
 	if got := workspaceRefreshCount(h, "success"); got != 1 {
 		t.Errorf("successful refreshes = %d, want 1", got)
+	}
+	if got := workspaceRefreshCount(h, "failed"); got != 1 {
+		t.Errorf("failed refreshes = %d, want 1", got)
 	}
 
 	// §1.6: unchanged projection, failed C-18, then a committed change.
