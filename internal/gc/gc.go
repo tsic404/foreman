@@ -57,6 +57,9 @@ type Collector struct {
 	cfg Config
 	log *slog.Logger
 	now func() time.Time
+	// remeasure re-reads a bare cache right before the LRU pass deletes it.
+	// It is a field so a test can simulate a fetch landing after the scan.
+	remeasure func(context.Context, string) (time.Time, int64, error)
 }
 
 // New builds a Collector; a nil logger falls back to slog.Default.
@@ -65,9 +68,10 @@ func New(cfg Config, log *slog.Logger) *Collector {
 		log = slog.Default()
 	}
 	return &Collector{
-		cfg: cfg,
-		log: log,
-		now: time.Now,
+		cfg:       cfg,
+		log:       log,
+		now:       time.Now,
+		remeasure: measure,
 	}
 }
 
@@ -319,7 +323,10 @@ func (c *Collector) expireRepos(ctx context.Context, root, repos string) (cacheS
 }
 
 // enforceCacheLimit deletes the least recently used bare caches until the
-// total size of .repos is within FOREMAN_CACHE_MAX_BYTES.
+// total size of .repos is within FOREMAN_CACHE_MAX_BYTES. The scan's mtime is
+// only a snapshot: a Job may fetch into a cache after the scan, so each
+// victim is re-measured right before deletion and a cache written since the
+// scan is skipped for this round (it is no longer the least recently used).
 func (c *Collector) enforceCacheLimit(ctx context.Context, root string, entries []cache) (int, int64, int64, error) {
 	var total int64
 	live := make([]cache, 0, len(entries))
@@ -352,6 +359,25 @@ func (c *Collector) enforceCacheLimit(ctx context.Context, root string, entries 
 			break
 		}
 		e := &live[oldest]
+		// TTL expiry above keeps its scan-time semantics: its 168h/720h
+		// windows make the scan→delete race practically unreachable.
+		usedAt, bytes, err := c.remeasure(ctx, e.path)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				total -= e.bytes // already gone, not part of the remaining total
+			} else {
+				errs = append(errs, fmt.Errorf("re-measure %q: %w", e.path, err))
+			}
+			e.gone = true // do not retry the same path in this round
+			continue
+		}
+		if usedAt.After(e.usedAt) {
+			total += bytes - e.bytes
+			e.usedAt, e.bytes = usedAt, bytes
+			e.gone = true // in flight: skip it, evict the next oldest instead
+			c.log.Debug("cache.gc.lru_skip", "node", c.cfg.Node, "path", e.path, "reason", "cache refreshed since scan")
+			continue
+		}
 		n, err := c.delete(root, e.path, filepath.Base(e.path), "cache-lru")
 		if err != nil {
 			errs = append(errs, err)
