@@ -243,6 +243,20 @@ func WithRevoker(r Revoker) Option {
 	return func(s *Scheduler) { s.revoker = r }
 }
 
+// RuntimeIdentityResolver translates a claim's real runtime id into the
+// declared identity it was dispatched under (registry.RuntimeIdentityKey).
+// The proxy owns the declaration and supplies it; a nil resolver — or one that
+// cannot resolve the id — leaves the entry without an identity, which S-4
+// refuses rather than guesses (§2.3 零命中即拒绝注册).
+type RuntimeIdentityResolver func(runtimeID string) (identity string, ok bool)
+
+// WithRuntimeIdentity wires the claim-time identity resolution: the entry
+// carries the identity for its whole life, so a later rebuild of the runtime
+// set (ids move, identities do not) cannot blind S-4's selection.
+func WithRuntimeIdentity(r RuntimeIdentityResolver) Option {
+	return func(s *Scheduler) { s.runtimeIdentity = r }
+}
+
 // Scheduler owns the task mapping state machine and the Job/Secret
 // lifecycle. The claim loop lives in proxy; the scheduling actions are here.
 type Scheduler struct {
@@ -259,6 +273,9 @@ type Scheduler struct {
 	reconciler     Reconciler
 	pendingReports PendingReports
 	now            func() time.Time
+	// runtimeIdentity resolves a claim's real runtime id into its declared
+	// identity; nil leaves entries without one (S-4 then refuses).
+	runtimeIdentity RuntimeIdentityResolver
 
 	// taskMu serializes the per-task transitions (OnClaim and every
 	// settlement path): a settlement that ran concurrently with an in-flight
@@ -496,6 +513,10 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		// Memory-only: the runtime the server dispatched this claim under,
 		// which addresses C4/C19 and the S8 body translation (ADR-025).
 		RealRuntimeID: head.RuntimeID,
+		// Memory-only: the same dispatch record as an identity, so S-4 can
+		// match the Job's reported runtimes long after a rebuild moved the id
+		// (§2.3, ADR-043).
+		RuntimeIdentity: s.resolveRuntimeIdentity(head.RuntimeID),
 	}
 	// A switched-off bound (0 = no upper bound) writes no deadline at
 	// all: the zero value is "no bound", never an expired one, and must not
@@ -1645,6 +1666,21 @@ func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) err
 		// (§4.2).
 		return nil
 	}
+}
+
+// resolveRuntimeIdentity turns a claim's real runtime id into the declared
+// identity the entry carries (§2.3). A missing resolver or an unresolvable id
+// yields the empty identity: S-4 must refuse such a Job rather than answer for
+// an identity the process never learned.
+func (s *Scheduler) resolveRuntimeIdentity(runtimeID string) string {
+	if s.runtimeIdentity == nil || runtimeID == "" {
+		return ""
+	}
+	identity, ok := s.runtimeIdentity(runtimeID)
+	if !ok {
+		return ""
+	}
+	return identity
 }
 
 // failClaim settles a task whose Job could not be created

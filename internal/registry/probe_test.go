@@ -207,34 +207,39 @@ func TestProbeLookupsCopy(t *testing.T) {
 func TestStartupCatalogPutTakeSnapshot(t *testing.T) {
 	c := NewStartupCatalog()
 	body := []byte(`{"runtimes":[{"name":"claude"}]}`)
-	c.Put("anthropic", body)
-	c.Put("openai", []byte(`{"runtimes":[]}`))
+	c.Put("anthropic", "", body)
+	c.Put("openai", "", []byte(`{"runtimes":[]}`))
+	c.Put("anthropic", "prof-1", []byte(`{"runtimes":[{"profile_id":"prof-1"}]}`))
 
 	snap := c.Snapshot()
-	if len(snap) != 2 || !bytes.Equal(snap["anthropic"], body) {
+	if len(snap) != 3 || !bytes.Equal(snap[RuntimeIdentityKey("anthropic", "")], body) {
 		t.Fatalf("Snapshot = %q", snap)
 	}
-	snap["anthropic"][0] = 'X'
+	snap[RuntimeIdentityKey("anthropic", "")][0] = 'X'
 	snap["injected"] = []byte("x")
-	if again := c.Snapshot(); len(again) != 2 || !bytes.Equal(again["anthropic"], body) {
+	if again := c.Snapshot(); len(again) != 3 || !bytes.Equal(again[RuntimeIdentityKey("anthropic", "")], body) {
 		t.Fatalf("Snapshot aliased the catalog: %q", again)
 	}
 
 	// Put copies the caller's buffer.
 	body[0] = 'Y'
-	if got, ok := c.Take("openai"); !ok {
+	if got, ok := c.Take("openai", ""); !ok {
 		t.Fatalf("Take after buffer reuse = %q, %v", got, ok)
 	}
 
-	got, ok := c.Take("anthropic")
+	got, ok := c.Take("anthropic", "")
 	if !ok || !bytes.Equal(got, []byte(`{"runtimes":[{"name":"claude"}]}`)) {
 		t.Fatalf("Take = %s, %v", got, ok)
 	}
-	if got, ok := c.Take("anthropic"); ok || got != nil {
+	if got, ok := c.Take("anthropic", ""); ok || got != nil {
 		t.Fatalf("second Take = %s, %v", got, ok)
 	}
-	if got, ok := c.Take("never-seen"); ok || got != nil {
-		t.Fatalf("Take of unknown provider = %s, %v", got, ok)
+	// The builtin and the profile entry are separate identities.
+	if got, ok := c.Take("anthropic", "prof-1"); !ok || !bytes.Contains(got, []byte("prof-1")) {
+		t.Fatalf("profile Take = %s, %v", got, ok)
+	}
+	if got, ok := c.Take("never-seen", ""); ok || got != nil {
+		t.Fatalf("Take of unknown identity = %s, %v", got, ok)
 	}
 	if n := len(c.Snapshot()); n != 0 {
 		t.Fatalf("Snapshot after Take = %d entries", n)

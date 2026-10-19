@@ -40,12 +40,22 @@ type Client struct {
 	// which the S-8 body needs (S-8).
 	taskRuntime func(taskID string) string
 
-	mu           sync.RWMutex
-	disc         registry.Discovery
-	refs         []RuntimeRef
-	repos        json.RawMessage
-	reposVersion string
-	workspace    string // workspace display name from C17
+	mu             sync.RWMutex
+	disc           registry.Discovery
+	refs           []RuntimeRef
+	state          WorkspaceState
+	workspace      string // workspace display name from C17
+	source         string // declaration source: startup or discovery-probe
+	profiles       profileSnapshot
+	discoveryProbe DiscoveryProbeRunner
+
+	// opMu serializes every C1 write: the startup/rebuild register and the
+	// §1.6 refresh sequence (which also creates a probe Job while holding it).
+	opMu sync.Mutex
+
+	// reposMu guards reposCall, the C-22 single-flight slot.
+	reposMu   sync.Mutex
+	reposCall *reposRefresh
 
 	// lost records, per provider, that a 404 "runtime not found" proved that
 	// row deleted and its re-register failed (§1.5); it survives
@@ -102,9 +112,13 @@ func NewClient(cfg Config, token string, opts ...Option) *Client {
 		},
 		metrics: noopMetrics{},
 		log:     slog.Default().With("component", "proxy-client"),
+		source:  declarationSourceStartup,
 
 		terminalWaits: terminalRetryWaits,
 		changes:       make(chan RuntimeChange, 16),
+	}
+	if c.cfg.WorkspaceStateTimeout <= 0 {
+		c.cfg.WorkspaceStateTimeout = DefaultWorkspaceStateTimeout
 	}
 	for _, opt := range opts {
 		opt(c)
@@ -118,13 +132,13 @@ func NewClient(cfg Config, token string, opts ...Option) *Client {
 	return c
 }
 
-// Registration returns the cached C1 response fields the fake server hands
-// to Job daemons (S2/S4): repos verbatim plus repos_version. Both are empty in
-// the pre-C1 window, which is what S-2 must answer then (S-2).
-func (c *Client) Registration() (repos json.RawMessage, reposVersion string) {
+// WorkspaceState returns the workspace state carrier seeded by C-1 and
+// refreshed by C-22 (§1.7): repos / repos_version / settings verbatim plus the
+// seeded flag that marks the pre-C1 window.
+func (c *Client) WorkspaceState() WorkspaceState {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	return c.repos, c.reposVersion
+	return c.state.clone()
 }
 
 // Workspace returns the workspace id and the display name cached by C17
@@ -163,9 +177,11 @@ type runtimePayload struct {
 }
 
 type registerResponse struct {
-	Runtimes     []runtimeAnswer `json:"runtimes"`
+	Runtimes []runtimeAnswer `json:"runtimes"`
+	// Repos / repos_version / settings replay verbatim into the workspace state
+	// carrier (§1.7): a nil raw field means the upstream did not send the key.
 	Repos        json.RawMessage `json:"repos"`
-	ReposVersion string          `json:"repos_version"`
+	ReposVersion json.RawMessage `json:"repos_version"`
 	Settings     json.RawMessage `json:"settings"`
 }
 
@@ -189,11 +205,12 @@ func (c *Client) recoverOrphans(ctx context.Context, runtimeID string) {
 	}
 }
 
-// Preflight runs the startup checks: C1 register (unless a live runtime set
-// already exists — the declaration has exactly one trigger per startup,
-// C-1), C17 workspace validation (caches the workspace name for S1), C18
-// runtime-profiles (404 tolerated), C16 token renew (non-fatal). Callers retry
-// with the §1.5 backoff.
+// Preflight runs the post-registration startup checks: C17 workspace
+// validation (caches the workspace name for S1) and C16 token renew
+// (non-fatal). C1 is carried by the cached declaration unless a live runtime
+// set already exists. C18 is not part of the preflight: the profile snapshot is
+// taken before the startup probe (§1.6 startup order). Callers retry with the
+// §1.5 backoff.
 func (c *Client) Preflight(ctx context.Context) error {
 	if len(c.RuntimeIDs()) == 0 {
 		if err := c.Register(ctx); err != nil {
@@ -202,9 +219,6 @@ func (c *Client) Preflight(ctx context.Context) error {
 	}
 	if err := c.Workspaces(ctx); err != nil {
 		return fmt.Errorf("workspace check: %w", err)
-	}
-	if err := c.RuntimeProfiles(ctx); err != nil {
-		return err
 	}
 	if err := c.RenewToken(ctx); err != nil {
 		c.log.Warn("token renew failed (non-fatal)", "err", err)
@@ -564,27 +578,18 @@ func (c *Client) Workspaces(ctx context.Context) error {
 	return fmt.Errorf("workspace %s not visible to the server token", c.cfg.WorkspaceID)
 }
 
-// RuntimeProfiles is C18; a 404 is tolerated (no custom profiles, C-18).
-func (c *Client) RuntimeProfiles(ctx context.Context) error {
-	path := fmt.Sprintf("/api/daemon/workspaces/%s/runtime-profiles", url.PathEscape(c.cfg.WorkspaceID))
-	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodGet, path, nil)
-	if err != nil {
-		return err
-	}
-	if code == 404 {
-		return nil
-	}
-	if code < 200 || code >= 300 {
-		return &StatusError{Code: code, Body: raw}
-	}
-	return nil
-}
-
 // ---- transport ----
 
 // doOnce is the transport core: one attempt with the daemon identity
 // headers; the response body is returned verbatim.
 func (c *Client) doOnce(ctx context.Context, hc *http.Client, method, path string, body []byte) (int, []byte, error) {
+	return c.doOnceVersion(ctx, hc, method, path, c.CLIVersion(), body)
+}
+
+// doOnceVersion is doOnce with an explicit X-Client-Version. C-1 uses it: the
+// request declares a discovery whose cli_version the cache does not hold yet
+// (the declaration is committed by that very answer, §1.1 客户端版本头).
+func (c *Client) doOnceVersion(ctx context.Context, hc *http.Client, method, path, version string, body []byte) (int, []byte, error) {
 	var rdr io.Reader
 	if body != nil {
 		rdr = bytes.NewReader(body)
@@ -593,7 +598,7 @@ func (c *Client) doOnce(ctx context.Context, hc *http.Client, method, path strin
 	if err != nil {
 		return 0, nil, err
 	}
-	c.setHeaders(req, body != nil)
+	c.setHeaders(req, body != nil, version)
 	resp, err := hc.Do(req)
 	if err != nil {
 		return 0, nil, err
@@ -607,13 +612,13 @@ func (c *Client) doOnce(ctx context.Context, hc *http.Client, method, path strin
 }
 
 // setHeaders injects the daemon identity (§1.1): the capability string is
-// verbatim and must never gain or lose an entry. X-Client-Version carries the
-// startup discovery's cli_version once C1 has run, Foreman's own version
-// before that (C-1 的取值来源与声明域).
-func (c *Client) setHeaders(req *http.Request, hasBody bool) {
+// verbatim and must never gain or lose an entry. version is the
+// X-Client-Version value — the cached discovery's cli_version once C1 has run,
+// Foreman's own version before that (C-1 的取值来源与声明域).
+func (c *Client) setHeaders(req *http.Request, hasBody bool, version string) {
 	req.Header.Set("Authorization", "Bearer "+c.token)
 	req.Header.Set("X-Client-Platform", "daemon")
-	req.Header.Set("X-Client-Version", c.CLIVersion())
+	req.Header.Set("X-Client-Version", version)
 	req.Header.Set("X-Client-OS", "linux")
 	req.Header.Set("X-Client-Capabilities", ClientCapabilities)
 	if hasBody {

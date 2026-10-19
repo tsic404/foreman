@@ -123,7 +123,7 @@ func (s *FakeServer) routes() {
 	handleFn("GET /api/daemon/workspaces", s.handleWorkspaces)                                               // S1
 	handleFn("GET /api/workspaces", s.handleWorkspaces)                                                      // S28
 	handleFn("GET /api/daemon/workspaces/{ws}/repos", s.handleRepos)                                         // S2
-	handleFn("GET /api/daemon/workspaces/{ws}/runtime-profiles", s.handle404)                                // S3
+	handleFn("GET /api/daemon/workspaces/{ws}/runtime-profiles", s.handleRuntimeProfiles)                    // S3
 	handleFn("POST /api/daemon/workspaces/{ws}/issues/gc-check", s.handleIssueGCCheck)                       // S21
 	handleFn("POST /api/daemon/register", s.handleRegister)                                                  // S4
 	handleFn("POST /api/daemon/heartbeat", s.handleHeartbeat)                                                // S5
@@ -268,8 +268,8 @@ func (s *FakeServer) entryFor(w http.ResponseWriter, claims auth.Claims) (regist
 	return e, true
 }
 
-// handle404 covers S3/S22/S27: fixed 404s that switch the daemon off the
-// path (runtime profiles, legacy gc-checks, pending_* results).
+// handle404 covers S-22/S-27: fixed 404s that switch the daemon off the
+// path (legacy gc-checks, pending_* results).
 func (s *FakeServer) handle404(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.authenticate(w, r, auth.RequestScope{}); !ok {
 		return

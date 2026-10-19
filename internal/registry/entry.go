@@ -165,6 +165,16 @@ type TaskEntry struct {
 	// its start.
 	RealRuntimeID string `json:"-"`
 
+	// RuntimeIdentity is the declared identity the claim was dispatched under
+	// (registry.RuntimeIdentityKey of provider + runtime profile identifier),
+	// resolved once at claim time and never re-resolved: a rebuild moves the
+	// server-side row id, never the identity. S-4 matches the Job's reported
+	// runtimes against it (§2.3), so an empty value means the identity is
+	// unknown — a rebuilt entry, whose Job carries no dispatch record — and no
+	// entry of the declaration may answer for it. Memory-only, like
+	// RealRuntimeID.
+	RuntimeIdentity string `json:"-"`
+
 	// Payload: raw claim payload until MarkDelivering replaces it with the
 	// delivered body — the form the ops preview must serve (S6 / AC-07).
 	Payload json.RawMessage `json:"-"`

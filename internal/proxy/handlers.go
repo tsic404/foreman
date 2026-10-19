@@ -30,8 +30,10 @@ func (s *FakeServer) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 
 // ---- S2 repos ----
 
-// handleRepos returns the repos block cached from Foreman's own C1
-// registration (S2).
+// handleRepos answers S-2. Every request triggers C-22 (§1.7): the refreshed
+// workspace state replaces the cache on success and the last snapshot answers
+// on failure; the register-before window answers an empty repo set with no
+// settings and never calls C-22.
 func (s *FakeServer) handleRepos(w http.ResponseWriter, r *http.Request) {
 	claims, ok := s.authenticate(w, r, auth.RequestScope{})
 	if !ok {
@@ -41,19 +43,36 @@ func (s *FakeServer) handleRepos(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "workspace does not belong to this job")
 		return
 	}
-	repos, version := s.client.Registration()
-	if repos == nil {
-		// The register-before window (the startup probe's S1/S2 calls): C1 has
-		// not run yet, so there is nothing cached to hand back — an empty repos
-		// list, which never blocks the registration (S-2).
-		repos = noRepos
+	// A failed refresh is non-fatal: the answer replays the last successful
+	// snapshot and never blocks the checkout (§1.7). The failure event and
+	// metric are recorded by the client seam itself.
+	_ = s.client.RefreshWorkspaceState(r.Context())
+	body := workspaceStateResponse(s.client.WorkspaceState())
+	body["workspace_id"] = claims.WorkspaceID
+	writeRaw(w, http.StatusOK, mustMarshal(body))
+}
+
+// ---- S3 runtime profiles ----
+
+// handleRuntimeProfiles answers S-3 from the C-18 snapshot: 200 replays the
+// current replay source byte for byte, 404 stands for a C-18 404, and 503 for
+// a snapshot that never succeeded (§1.6). The daemon treats any failure as
+// best-effort and continues with its builtin runtimes.
+func (s *FakeServer) handleRuntimeProfiles(w http.ResponseWriter, r *http.Request) {
+	claims, ok := s.authenticate(w, r, auth.RequestScope{})
+	if !ok {
+		return
 	}
-	writeRaw(w, http.StatusOK, mustMarshal(map[string]any{
-		"workspace_id":  claims.WorkspaceID,
-		"repos":         repos,
-		"repos_version": version,
-		"settings":      nil,
-	}))
+	if ws := r.PathValue("ws"); ws != claims.WorkspaceID {
+		writeError(w, http.StatusForbidden, "workspace does not belong to this job")
+		return
+	}
+	code, body := s.client.S3Response()
+	if code == http.StatusOK {
+		writeRaw(w, code, body)
+		return
+	}
+	writeError(w, code, "runtime profiles unavailable")
 }
 
 // ---- S4 register ----
@@ -105,22 +124,23 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// The Job's provider is the provider of the real runtime its claim was
-	// dispatched under; the declared entry of that type is the one echoed
-	// back (§2.3).
-	jobProvider, known := s.client.ProviderForRuntime(e.RealRuntimeID)
-	if !known {
-		// A rebuilt entry has no dispatch record: fall back to the oldest
-		// behaviour (one Job, one provider) instead of refusing a running
-		// Job's daemon.
-		s.log.Warn("job provider unknown at register; using the declared entry as reported",
-			"task_id", e.TaskID, "job_name", e.JobName)
+	// The Job's runtime identity is the one its claim was dispatched under,
+	// recorded on the entry at claim time (§2.3): the server-side row id may
+	// have moved since — a rebuild rewrites it — but the identity cannot. An
+	// entry that carries no record (rebuilt after a restart, or a claim that
+	// raced a declaration move) falls back to the live declaration, which can
+	// only ever confirm an id it currently holds; when neither resolves, the
+	// registration is refused instead of answered for another profile or for
+	// the same type's builtin.
+	identity := e.RuntimeIdentity
+	if identity == "" {
+		identity, _ = s.client.RuntimeIdentity(e.RealRuntimeID)
 	}
-	declared, matched := selectDeclaredRuntime(req.Runtimes, jobProvider)
-	if known && !matched {
-		s.log.Error("job declared no runtime for its provider; refusing registration",
-			"task_id", e.TaskID, "job_name", e.JobName, "provider", jobProvider)
-		writeError(w, http.StatusConflict, "runtime provider not declared by this job")
+	declared, matched := selectDeclaredRuntime(req.Runtimes, identity)
+	if !matched {
+		s.log.Error("job declared no runtime for its identity; refusing registration",
+			"task_id", e.TaskID, "job_name", e.JobName, "identity", identity)
+		writeError(w, http.StatusConflict, "runtime identity not declared by this job")
 		if err := s.sched.FailJob(r.Context(), e.JobName, scheduler.FailureReasonDaemonNotRegistered); err != nil {
 			s.log.Error("settle refused registration failed", "task_id", e.TaskID, "err", err)
 		}
@@ -146,23 +166,22 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	s.log.Info("daemon.registered",
 		"task_id", e.TaskID, "job_name", e.JobName,
 		"daemon_id", claims.JobName, "job_runtime_id", e.JobRuntimeID,
+		"profile_id", declared.ProfileID,
 		"remote_addr", r.RemoteAddr)
 
-	repos, version := s.client.Registration()
-	if repos == nil {
-		repos = json.RawMessage("[]")
+	answer := map[string]any{
+		"id":         e.JobRuntimeID,
+		"name":       name,
+		"provider":   provider,
+		"status":     "online",
+		"profile_id": nil, // builtin: the wire shape the daemon expects (§2.3)
 	}
-	writeRaw(w, http.StatusOK, mustMarshal(map[string]any{
-		"runtimes": []map[string]string{{
-			"id":       e.JobRuntimeID,
-			"name":     name,
-			"provider": provider,
-			"status":   "online",
-		}},
-		"repos":         repos,
-		"repos_version": version,
-		"settings":      nil,
-	}))
+	if declared.ProfileID != "" {
+		answer["profile_id"] = declared.ProfileID
+	}
+	respBody := workspaceStateResponse(s.client.WorkspaceState())
+	respBody["runtimes"] = []map[string]any{answer}
+	writeRaw(w, http.StatusOK, mustMarshal(respBody))
 	// The task is deliverable from this moment (S30 push; idempotent —
 	// delivery itself is at-most-once via the registry).
 	if s.ws != nil {

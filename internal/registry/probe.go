@@ -8,6 +8,23 @@ import (
 	"time"
 )
 
+// ProbeMode is the probe session's command face: whether the heartbeat ack may
+// hand the probe daemon a model-catalog request at all (§1.3 ack, §1.6).
+type ProbeMode int
+
+const (
+	// ProbeStartupDiscovery mints the catalog command id on Foreman's side and
+	// absorbs its result into the startup slot store (ADR-025).
+	ProbeStartupDiscovery ProbeMode = iota
+	// ProbeCommandDriven carries a C2 ack's pending_model_list.id verbatim to
+	// the probe Job's daemon (§1.3 待办只有一处消费面).
+	ProbeCommandDriven
+	// ProbeRegisterOnly is the §1.6 registration-discovery probe: registration
+	// is the whole completion signal, so the session owns no command and its
+	// heartbeat ack never carries pending_model_list.
+	ProbeRegisterOnly
+)
+
 // ProbeSession is the authoritative in-memory state of one catalog-probe Job
 // (ADR-019). The probe never enters the task mapping table, so this row is the
 // only place its identity, command ownership and scope checks come from; the
@@ -17,11 +34,12 @@ import (
 // only touches its own face.
 type ProbeSession struct {
 	JobName       string
-	RequestID     string // C2 ack pending_model_list.id verbatim; "" in startup-discovery mode
-	SelfMintedID  string // startup-discovery command id; "" in command-driven mode
+	Mode          ProbeMode
+	RequestID     string // C2 ack pending_model_list.id verbatim; ProbeCommandDriven only
+	SelfMintedID  string // startup-discovery command id; ProbeStartupDiscovery only
 	TokenHash     string // sha256 hex of the probe Job Token
 	JobRuntime    string // uuid5(NS_JOB_RUNTIME, JobName)
-	RealRuntimeID string // real runtime id results are relayed to; "" in startup-discovery mode
+	RealRuntimeID string // real runtime id results are relayed to; ProbeCommandDriven only
 	Deadline      time.Time
 
 	// Result face (written by the fake server's S27 path / scheduler).
@@ -29,19 +47,30 @@ type ProbeSession struct {
 	RelayedCode int
 	NodeName    string
 
-	// Startup-discovery face: written by the fake server's S4 probe branch
-	// only in startup-discovery mode (RealRuntimeID == "").
+	// Registration face: written by the fake server's S4 probe branch for the
+	// modes whose registration body is a declaration (CapturesRegistration).
 	RegisteredAt   time.Time
 	CLIVersion     string
 	Runtimes       []DiscoveredRuntime
 	FailedProfiles []json.RawMessage
 }
 
+// CapturesRegistration reports whether the session's S4 body is the C1 truth
+// source: the startup and registration-discovery probes declare the runtime
+// set, while a command-driven probe's registration is not a declaration
+// (§1.2 C-1 的取值来源与声明域).
+func (s ProbeSession) CapturesRegistration() bool {
+	return s.Mode != ProbeCommandDriven
+}
+
 // DiscoveredRuntime is one entry of the probe's S4 registration body `runtimes[]`.
+// ProfileID is the custom runtime profile's identifier; the builtin entry
+// carries the empty string (ADR-043 identity `(type, profile_id)`).
 type DiscoveredRuntime struct {
-	Name    string `json:"name"`
-	Type    string `json:"type"`
-	Version string `json:"version"`
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Version   string `json:"version"`
+	ProfileID string `json:"profile_id"`
 }
 
 // Discovery is the S4 registration body of the startup probe = the truth
@@ -210,53 +239,62 @@ func (r *ProbeRegistry) dropRuntimeIndexLocked(jobRuntimeID, jobName string) {
 	}
 }
 
-// StartupCatalog stages the startup discovery result by provider until the C1
-// response binds providers to real runtime ids (§1.2 C-21).
+// RuntimeIdentityKey is the identity key of a real runtime: provider plus
+// runtime profile id, with the empty profile id naming the builtin entry
+// (ADR-043; §0 real runtime).
+func RuntimeIdentityKey(provider, profileID string) string {
+	return provider + "\x00" + profileID
+}
+
+// StartupCatalog stages the startup discovery result by real runtime identity
+// until the C1 response binds identities to real runtime ids (§1.2 C-21).
 // The startup probe registers before its runtime exists — C1 creates it — so
-// the body is parked under the provider type and taken once the real runtime id
-// is known; taking removes the entry, which is where 「已落槽」 is recorded.
+// the body is parked under `(provider, profile_id)` and taken once the real
+// runtime id is known; taking removes the entry, which is where 「已落槽」 is
+// recorded.
 type StartupCatalog struct {
 	mu         sync.RWMutex
-	byProvider map[string][]byte
+	byIdentity map[string][]byte
 }
 
 // NewStartupCatalog returns an empty catalog.
 func NewStartupCatalog() *StartupCatalog {
-	return &StartupCatalog{byProvider: make(map[string][]byte)}
+	return &StartupCatalog{byIdentity: make(map[string][]byte)}
 }
 
-// Put stores body as the staged catalog of provider, replacing an earlier
-// body: a repeated registration describes the same provider now, and the
+// Put stores body as the staged catalog of the identity, replacing an earlier
+// body: a repeated registration describes the same identity now, and the
 // replay must be verbatim. The bytes are copied, so the caller's buffer is
 // never aliased into the catalog.
-func (c *StartupCatalog) Put(provider string, body []byte) {
+func (c *StartupCatalog) Put(provider, profileID string, body []byte) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	c.byProvider[provider] = slices.Clone(body)
+	c.byIdentity[RuntimeIdentityKey(provider, profileID)] = slices.Clone(body)
 }
 
-// Take removes and returns the staged body of provider; ok=false when the
-// provider has no body (its runtime's normal initial state, answered by
-// starting a fresh probe).
-func (c *StartupCatalog) Take(provider string) ([]byte, bool) {
+// Take removes and returns the staged body of the identity; ok=false when the
+// identity has no body (the normal initial state, answered by starting a fresh
+// probe).
+func (c *StartupCatalog) Take(provider, profileID string) ([]byte, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	body, ok := c.byProvider[provider]
+	key := RuntimeIdentityKey(provider, profileID)
+	body, ok := c.byIdentity[key]
 	if !ok {
 		return nil, false
 	}
-	delete(c.byProvider, provider)
+	delete(c.byIdentity, key)
 	return body, true
 }
 
-// Snapshot returns a copy of every staged body, for observability and tests;
-// it leaves the catalog unchanged.
+// Snapshot returns a copy of every staged body, keyed by RuntimeIdentityKey,
+// for observability and tests; it leaves the catalog unchanged.
 func (c *StartupCatalog) Snapshot() map[string][]byte {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	out := make(map[string][]byte, len(c.byProvider))
-	for provider, body := range c.byProvider {
-		out[provider] = slices.Clone(body)
+	out := make(map[string][]byte, len(c.byIdentity))
+	for key, body := range c.byIdentity {
+		out[key] = slices.Clone(body)
 	}
 	return out
 }

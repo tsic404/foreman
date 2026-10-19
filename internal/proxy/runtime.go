@@ -15,21 +15,28 @@ import (
 	"github.com/tsic404/foreman/internal/scheduler"
 )
 
-// RuntimeRef is one declared real runtime: the provider it serves plus the id
-// and name the server answered for it (ID is empty before C1).
+// RuntimeRef is one declared real runtime: the identity it serves plus the id
+// and name the server answered for it (ID is empty before C1). Identity =
+// (Provider, ProfileID), with the empty ProfileID naming the builtin entry
+// (ADR-043).
 type RuntimeRef struct {
-	ID       string
-	Provider string
-	Name     string
+	ID        string
+	Provider  string
+	ProfileID string
+	Name      string
 }
+
+// Key is the identity key of a RuntimeRef (registry.RuntimeIdentityKey).
+func (r RuntimeRef) Key() string { return registry.RuntimeIdentityKey(r.Provider, r.ProfileID) }
 
 // RuntimeChange reports a change of the declared runtime set. NewID empty means
 // the runtime disappeared; OldID empty means it appeared. The WS subscriber
 // reconnects only the connections whose id moved (§1.4 按 runtime 粒度).
 type RuntimeChange struct {
-	Provider string
-	OldID    string
-	NewID    string
+	Provider  string
+	ProfileID string
+	OldID     string
+	NewID     string
 }
 
 // errAckUnparsable marks a C2 ack body Foreman could not read; the caller logs
@@ -107,10 +114,16 @@ func (c *Client) Declaration() registry.Discovery {
 func (c *Client) CLIVersion() string {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
-	if c.disc.CLIVersion == "" {
+	return c.cliVersionOf(c.disc)
+}
+
+// cliVersionOf is the X-Client-Version one discovery's own C-1 carries: that
+// discovery's cli_version, or Foreman's version when the probe reported none.
+func (c *Client) cliVersionOf(d registry.Discovery) string {
+	if d.CLIVersion == "" {
 		return c.cfg.Version
 	}
-	return c.disc.CLIVersion
+	return d.CLIVersion
 }
 
 // Declare caches the startup discovery as the C1 declaration without sending
@@ -120,17 +133,18 @@ func (c *Client) Declare(d registry.Discovery) {
 	c.mu.Lock()
 	c.disc = d
 	c.refs = declaredRefs(d)
+	c.source = declarationSourceStartup
 	c.mu.Unlock()
 }
 
-// RegisterWithDiscovery declares exactly the runtime set the startup probe
-// discovered and caches the ids the server answered with (C-1).
+// RegisterWithDiscovery declares exactly the runtime set a probe discovered and
+// caches the ids the server answered with (C-1). It is the startup
+// declaration path; a runtime-profile refresh commits through its own
+// sequence.
 func (c *Client) RegisterWithDiscovery(ctx context.Context, d registry.Discovery) error {
-	c.mu.Lock()
-	c.disc = d
-	c.refs = declaredRefs(d)
-	c.mu.Unlock()
-	return c.register(ctx)
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	return c.commitRegisterLocked(ctx, d, declarationSourceStartup)
 }
 
 // Register re-declares the cached startup discovery. It is the 404 rebuild path
@@ -138,48 +152,85 @@ func (c *Client) RegisterWithDiscovery(ctx context.Context, d registry.Discovery
 func (c *Client) Register(ctx context.Context) error { return c.register(ctx) }
 
 // declaredRefs turns a discovery into the declared runtime set, deduplicating
-// repeated provider types (a repeat merges into the first entry, C-1).
+// repeated identities: a repeat merges into the first entry and the identity is
+// (type, profile_id), so a builtin entry and profile entries of the same type
+// stay distinct (C-1; ADR-043).
 func declaredRefs(d registry.Discovery) []RuntimeRef {
 	refs := make([]RuntimeRef, 0, len(d.Runtimes))
 	seen := make(map[string]bool, len(d.Runtimes))
 	for _, rt := range d.Runtimes {
-		if rt.Type == "" || seen[rt.Type] {
+		if rt.Type == "" {
 			continue
 		}
-		seen[rt.Type] = true
-		refs = append(refs, RuntimeRef{Provider: rt.Type, Name: rt.Name})
+		key := registry.RuntimeIdentityKey(rt.Type, rt.ProfileID)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		refs = append(refs, RuntimeRef{Provider: rt.Type, ProfileID: rt.ProfileID, Name: rt.Name})
 	}
 	return refs
 }
 
-// runtimePayloads is the C1 `runtimes[]` array: the startup discovery handed
-// over entry by entry (status = online, profile_id always empty, C-1).
+// runtimePayloads is the C1 `runtimes[]` array: the discovery handed over entry
+// by entry (status = online, profile_id carried verbatim, C-1).
 func runtimePayloads(d registry.Discovery) []runtimePayload {
 	payloads := make([]runtimePayload, 0, len(d.Runtimes))
 	seen := make(map[string]bool, len(d.Runtimes))
 	for _, rt := range d.Runtimes {
-		if rt.Type == "" || seen[rt.Type] {
+		if rt.Type == "" {
 			continue
 		}
-		seen[rt.Type] = true
+		key := registry.RuntimeIdentityKey(rt.Type, rt.ProfileID)
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
 		payloads = append(payloads, runtimePayload{
-			Name:    rt.Name,
-			Type:    rt.Type,
-			Version: rt.Version,
-			Status:  "online",
+			Name:      rt.Name,
+			Type:      rt.Type,
+			Version:   rt.Version,
+			Status:    "online",
+			ProfileID: rt.ProfileID,
 		})
 	}
 	return payloads
 }
 
+// register re-declares the cached discovery. Callers hold no lock; the
+// registration sequence runs under opMu so a profile refresh and a
+// "runtime not found" rebuild can never write C1 concurrently (§1.6).
 func (c *Client) register(ctx context.Context) error {
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	return c.registerLocked(ctx)
+}
+
+// registerWithDiscoveryLocked is the name the refresh sequence uses: it commits
+// a discovery-probe result as the declaration. opMu must be held.
+func (c *Client) registerWithDiscoveryLocked(ctx context.Context, d registry.Discovery) error {
+	return c.commitRegisterLocked(ctx, d, declarationSourceDiscovery)
+}
+
+// registerLocked re-declares the cached discovery (the startup declaration or
+// a rebuild after "runtime not found"). The cached set is what is sent and the
+// declaration is not written until the server accepts it.
+func (c *Client) registerLocked(ctx context.Context) error {
 	c.mu.RLock()
 	disc := c.disc
-	prev := append([]RuntimeRef(nil), c.refs...)
-	lost := make(map[string]bool, len(c.lost))
-	maps.Copy(lost, c.lost)
+	source := c.source
 	c.mu.RUnlock()
-	if len(disc.Runtimes) == 0 {
+	return c.commitRegisterLocked(ctx, disc, source)
+}
+
+// commitRegisterLocked sends one C-1 for d and swaps the declaration to d plus
+// the ids the server answered only after that answer arrived (§1.6 提交点 =
+// C-1 成功). While the request is in flight the previous declaration stays
+// live, so heartbeats, subscriptions and the claim list keep running on it
+// instead of collapsing to an id-less set; a failure leaves the old set in
+// place, which is why no rollback is needed. opMu must be held.
+func (c *Client) commitRegisterLocked(ctx context.Context, d registry.Discovery, source string) error {
+	if len(d.Runtimes) == 0 {
 		return errors.New("register: no startup discovery; the startup probe must register before C1")
 	}
 	body := registerRequest{
@@ -187,16 +238,21 @@ func (c *Client) register(ctx context.Context) error {
 		DaemonID:        c.cfg.DaemonID,
 		LegacyDaemonIDs: []string{},
 		DeviceName:      "foreman",
-		CLIVersion:      disc.CLIVersion,
+		CLIVersion:      d.CLIVersion,
 		LaunchedBy:      "",
-		Runtimes:        runtimePayloads(disc),
-		FailedProfiles:  disc.FailedProfiles,
+		Runtimes:        runtimePayloads(d),
+		FailedProfiles:  d.FailedProfiles,
 	}
 	if len(body.Runtimes) == 0 {
 		return errors.New("register: startup discovery declares no runtime")
 	}
+	c.mu.RLock()
+	prev := append([]RuntimeRef(nil), c.refs...)
+	lost := make(map[string]bool, len(c.lost))
+	maps.Copy(lost, c.lost)
+	c.mu.RUnlock()
 	var resp registerResponse
-	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodPost, "/api/daemon/register", mustMarshal(body))
+	code, raw, err := c.doOnceVersion(ctx, c.ctrl, http.MethodPost, "/api/daemon/register", c.cliVersionOf(d), mustMarshal(body))
 	if err != nil {
 		return fmt.Errorf("register: %w", err)
 	}
@@ -212,15 +268,21 @@ func (c *Client) register(ctx context.Context) error {
 	}
 	now := time.Now()
 	c.mu.Lock()
+	c.disc = d
 	c.refs = next
+	c.source = source
 	// Consume only the marks this attempt started with: a rebuild that failed
-	// while this C1 was in flight recorded its own provider, and that row still
+	// while this C1 was in flight recorded its own identity, and that row still
 	// owes its C15 (C-15, §1.4 按 runtime 粒度).
-	for p := range lost {
-		delete(c.lost, p)
+	for key := range lost {
+		delete(c.lost, key)
 	}
-	c.repos = resp.Repos
-	c.reposVersion = resp.ReposVersion
+	c.state = WorkspaceState{
+		Repos:        resp.Repos,
+		ReposVersion: resp.ReposVersion,
+		Settings:     resp.Settings,
+		Seeded:       true,
+	}
 	c.mu.Unlock()
 
 	c.applyRuntimeChanges(prev, next, lost)
@@ -228,100 +290,114 @@ func (c *Client) register(ctx context.Context) error {
 	return nil
 }
 
-// runtimeAnswer is one entry of the C1 response `runtimes[]`.
+// runtimeAnswer is one entry of the C1 response `runtimes[]`. ProfileID is a
+// pointer because the server encodes the builtin entry as `null` while a
+// profile entry carries its identifier (ADR-043; §2.3 builtin 空串与 null 归一).
 type runtimeAnswer struct {
-	ID       string `json:"id"`
-	Name     string `json:"name"`
-	Provider string `json:"provider"`
-	Status   string `json:"status"`
+	ID        string  `json:"id"`
+	Name      string  `json:"name"`
+	Provider  string  `json:"provider"`
+	Status    string  `json:"status"`
+	ProfileID *string `json:"profile_id"`
+}
+
+func (a runtimeAnswer) profileID() string {
+	if a.ProfileID == nil {
+		return ""
+	}
+	return *a.ProfileID
 }
 
 // selectRuntimes binds every declared runtime to exactly one answered runtime
-// row: provider ↔ type by value, name matching first, then the lexicographically
-// smallest id with a warn naming the candidates (S-4 + §2.3 tie-break).
+// row: the identity (provider, profile_id) must match by value, name matching
+// first, then the lexicographically smallest id with a warn naming the
+// candidates (C-1 + §2.3 tie-break; ADR-043).
 func (c *Client) selectRuntimes(declared []runtimePayload, answers []runtimeAnswer) ([]RuntimeRef, error) {
-	byProvider := make(map[string][]runtimeAnswer, len(answers))
+	byIdentity := make(map[string][]runtimeAnswer, len(answers))
 	for _, a := range answers {
-		byProvider[a.Provider] = append(byProvider[a.Provider], a)
+		key := registry.RuntimeIdentityKey(a.Provider, a.profileID())
+		byIdentity[key] = append(byIdentity[key], a)
 	}
 	refs := make([]RuntimeRef, 0, len(declared))
 	for _, d := range declared {
-		candidates := byProvider[d.Type]
+		key := registry.RuntimeIdentityKey(d.Type, d.ProfileID)
+		candidates := byIdentity[key]
 		if len(candidates) == 0 {
-			return nil, fmt.Errorf("register: response carries no runtime for provider %q", d.Type)
+			return nil, fmt.Errorf("register: response carries no runtime for identity (%q, %q)", d.Type, d.ProfileID)
 		}
 		chosen := candidates[0]
-		var tied []string
-		for _, cand := range candidates {
-			tied = append(tied, cand.ID)
-		}
-		sort.Strings(tied)
 		if len(candidates) > 1 {
-			picked := ""
+			tied := make([]string, 0, len(candidates))
 			for _, cand := range candidates {
-				if cand.Status == "online" && cand.Name == d.Name && cand.ID == tied[0] {
-					picked = cand.ID
+				tied = append(tied, cand.ID)
+			}
+			sort.Strings(tied)
+			// §2.3 响应侧同键多条: online rows whose name matches this
+			// declaration come first; among those the lexicographically
+			// smallest id wins. Only when no candidate matches both does the
+			// whole set's smallest id decide.
+			eligible := make([]runtimeAnswer, 0, len(candidates))
+			for _, cand := range candidates {
+				if cand.Status == "online" && cand.Name == d.Name {
+					eligible = append(eligible, cand)
 				}
 			}
-			for _, cand := range candidates {
-				if picked == "" && cand.Status == "online" && cand.Name == d.Name {
-					picked = cand.ID
-				}
+			if len(eligible) == 0 {
+				eligible = candidates
 			}
-			if picked == "" {
-				picked = tied[0]
-			}
-			for _, cand := range candidates {
+			sort.SliceStable(eligible, func(i, j int) bool { return eligible[i].ID < eligible[j].ID })
+			picked := eligible[0].ID
+			for _, cand := range eligible {
 				if cand.ID == picked {
 					chosen = cand
 				}
 			}
 			c.log.Warn("runtime.set tied: picking one candidate",
-				"provider", d.Type, "picked", chosen.ID, "candidates", tied)
+				"provider", d.Type, "profile_id", d.ProfileID, "picked", chosen.ID, "candidates", tied)
 		}
 		if chosen.ID == "" {
-			return nil, fmt.Errorf("register: empty runtime id for provider %q", d.Type)
+			return nil, fmt.Errorf("register: empty runtime id for identity (%q, %q)", d.Type, d.ProfileID)
 		}
-		refs = append(refs, RuntimeRef{ID: chosen.ID, Provider: d.Type, Name: d.Name})
+		refs = append(refs, RuntimeRef{ID: chosen.ID, Provider: d.Type, ProfileID: d.ProfileID, Name: d.Name})
 	}
 	return refs, nil
 }
 
-// applyRuntimeChanges emits one change per provider that appeared or moved, runs
-// C15 only for the rebuilt rows, and moves the WS subscription of those
-// runtimes only. lost is per provider: only a runtime whose own row was proved
+// applyRuntimeChanges emits one change per identity that appeared or moved,
+// runs C15 only for the rebuilt rows, and moves the WS subscription of those
+// runtimes only. lost is per identity: only a runtime whose own row was proved
 // gone (a 404) counts as rebuilt, never every row of the declaration.
 func (c *Client) applyRuntimeChanges(prev, next []RuntimeRef, lost map[string]bool) {
-	prevByProvider := make(map[string]RuntimeRef, len(prev))
+	prevByIdentity := make(map[string]RuntimeRef, len(prev))
 	for _, ref := range prev {
-		prevByProvider[ref.Provider] = ref
+		prevByIdentity[ref.Key()] = ref
 	}
 	for _, ref := range next {
-		before, had := prevByProvider[ref.Provider]
+		before, had := prevByIdentity[ref.Key()]
 		// A rebuild is an id that moved, or any successful C1 that follows a
 		// 404 (the row came back, possibly under the same id). A first
 		// declaration is neither: C15 belongs to rebuilt rows only (C-15).
-		rebuilt := had && before.ID != "" && (before.ID != ref.ID || lost[ref.Provider])
+		rebuilt := had && before.ID != "" && (before.ID != ref.ID || lost[ref.Key()])
 		if had && before.ID != "" && !rebuilt {
 			continue
 		}
 		if rebuilt {
-			c.log.Warn("runtime.rebuilt", "provider", ref.Provider, "runtime_id", ref.ID, "previous", before.ID)
+			c.log.Warn("runtime.rebuilt", "provider", ref.Provider, "profile_id", ref.ProfileID, "runtime_id", ref.ID, "previous", before.ID)
 		} else {
-			c.log.Info("runtime.registered", "provider", ref.Provider, "runtime_id", ref.ID)
+			c.log.Info("runtime.registered", "provider", ref.Provider, "profile_id", ref.ProfileID, "runtime_id", ref.ID)
 		}
 		if rebuilt {
 			c.recoverOrphans(context.WithoutCancel(context.Background()), ref.ID)
 		}
-		c.notifyChange(RuntimeChange{Provider: ref.Provider, OldID: before.ID, NewID: ref.ID})
+		c.notifyChange(RuntimeChange{Provider: ref.Provider, ProfileID: ref.ProfileID, OldID: before.ID, NewID: ref.ID})
 	}
-	nextByProvider := make(map[string]bool, len(next))
+	nextByIdentity := make(map[string]bool, len(next))
 	for _, ref := range next {
-		nextByProvider[ref.Provider] = true
+		nextByIdentity[ref.Key()] = true
 	}
 	for _, ref := range prev {
-		if !nextByProvider[ref.Provider] {
-			c.notifyChange(RuntimeChange{Provider: ref.Provider, OldID: ref.ID})
+		if !nextByIdentity[ref.Key()] {
+			c.notifyChange(RuntimeChange{Provider: ref.Provider, ProfileID: ref.ProfileID, OldID: ref.ID})
 		}
 	}
 }
@@ -335,14 +411,15 @@ func (c *Client) notifyChange(change RuntimeChange) {
 	}
 }
 
-// bindStartupCatalog moves the startup discovery result staged by its provider
-// into the real runtime's catalog slot (§1.3).
+// bindStartupCatalog moves the startup discovery result staged by its identity
+// into the real runtime's catalog slot (§1.3: the slot key is the real runtime
+// identity, not the provider).
 func (c *Client) bindStartupCatalog(refs []RuntimeRef, at time.Time) {
 	if c.startup == nil || c.slots == nil {
 		return
 	}
 	for _, ref := range refs {
-		body, ok := c.startup.Take(ref.Provider)
+		body, ok := c.startup.Take(ref.Provider, ref.ProfileID)
 		if !ok {
 			continue
 		}
@@ -350,68 +427,175 @@ func (c *Client) bindStartupCatalog(refs []RuntimeRef, at time.Time) {
 	}
 }
 
-// ProviderForRuntime resolves the provider served by a real runtime id.
-func (c *Client) ProviderForRuntime(runtimeID string) (string, bool) {
+// RefForRuntime resolves the declared runtime that owns a real runtime id.
+func (c *Client) RefForRuntime(runtimeID string) (RuntimeRef, bool) {
 	if runtimeID == "" {
-		return "", false
+		return RuntimeRef{}, false
 	}
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, ref := range c.refs {
 		if ref.ID == runtimeID {
-			return ref.Provider, true
+			return ref, true
 		}
 	}
-	return "", false
+	return RuntimeRef{}, false
 }
 
-// stageStartupCatalog records the startup discovery result under the provider
+// RuntimeIdentity resolves the declared identity a real runtime id belongs to,
+// for the claim-time dispatch record the entry keeps (§2.3):
+// registry.RuntimeIdentityKey(provider, profile id). A runtime id the current
+// declaration does not carry has no identity.
+func (c *Client) RuntimeIdentity(runtimeID string) (string, bool) {
+	ref, ok := c.RefForRuntime(runtimeID)
+	if !ok {
+		return "", false
+	}
+	return ref.Key(), true
+}
+
+// stageStartupCatalog records the startup discovery result under the identity
 // that produced it, until C1 binds it to a real runtime id.
-func (c *Client) stageStartupCatalog(provider string, body []byte) {
+func (c *Client) stageStartupCatalog(provider, profileID string, body []byte) {
 	if c.startup == nil || provider == "" {
 		return
 	}
-	c.startup.Put(provider, body)
+	c.startup.Put(provider, profileID, body)
 }
 
 // rebuildRuntime re-registers (C1) after a 404 "runtime not found" and returns
-// the fresh id of the runtime that was lost. Only that runtime's id moves: the
-// other rows answer with the ids they already had (§1.5).
+// the fresh id of the runtime that was lost. §1.6: C-18 is re-fetched first —
+// an unchanged profile set re-declares the cached discovery, a changed set goes
+// through the refresh sequence, and an unavailable C-18 falls back to the cached
+// discovery for availability. Only that runtime's identity moves: the other
+// rows answer with the ids they already had.
 func (c *Client) rebuildRuntime(ctx context.Context, runtimeID string) (string, error) {
-	c.mu.RLock()
-	provider := ""
-	for _, ref := range c.refs {
-		if ref.ID == runtimeID {
-			provider = ref.Provider
-		}
-	}
-	c.mu.RUnlock()
-	if provider == "" {
+	identity, _, _, ok := c.identityOf(runtimeID)
+	if !ok {
 		// The id is already stale by the time the rebuild starts (a concurrent
 		// path moved it): re-declaring would only write another C1 without
 		// moving anything. The caller re-reads the set instead.
 		c.log.Warn("runtime rebuild skipped: id already replaced", "runtime_id", runtimeID)
 		return "", nil
 	}
-	if err := c.register(ctx); err != nil {
-		c.mu.Lock()
-		if c.lost == nil {
-			c.lost = map[string]bool{}
-		}
-		// Only this runtime's row is known lost; the other rows of the
-		// declaration did not fail (C15 is per runtime, §1.2).
-		c.lost[provider] = true
-		c.mu.Unlock()
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	// A concurrent path may have moved the identity while this caller waited
+	// for the sequence lock: hand back the fresh id instead of writing another
+	// C1 that cannot move anything.
+	if current := c.runtimeIDFor(identity); current != "" && current != runtimeID {
+		return current, nil
+	}
+	if err := c.rebuildLocked(ctx, identity); err != nil {
 		return "", err
 	}
+	return c.runtimeIDFor(identity), nil
+}
+
+// rebuildClaimRuntime is the same sequence for C-3: the claim carries the whole
+// declared set, so its 404 names no row and the re-register covers them all
+// (ADR-043 §9 — C-18 is re-fetched before any C-1, whatever triggered it). The
+// fresh ids arrive in that C1's answer, which is the set the caller re-claims
+// with; nothing per-identity is marked, because no row was identified.
+func (c *Client) rebuildClaimRuntime(ctx context.Context) error {
+	c.opMu.Lock()
+	defer c.opMu.Unlock()
+	return c.rebuildLocked(ctx, "")
+}
+
+// rebuildLocked runs the "runtime not found" sequence of §1.6/ADR-043 §9 and
+// records one refresh outcome on every branch (§9.1 event, §9.2 metric).
+// identity is the lost row when the caller knows it ("" for the claim face);
+// only a known row's failed re-register is recorded as lost, so its next
+// success still counts as a rebuild. opMu must be held.
+func (c *Client) rebuildLocked(ctx context.Context, identity string) error {
+	status, body, err := c.fetchRuntimeProfiles(ctx)
+	var rerr error
+	switch {
+	case err == nil && status == http.StatusOK:
+		if profileProjectionChanged(c.profileSnapshot().committed, body) {
+			// The changed branch is the refresh sequence, which records its own
+			// outcome (§1.6 已变 ⇒ 走刷新序列).
+			return c.refreshLocked(ctx, body, "runtime-not-found")
+		}
+		if rerr = c.registerLocked(ctx); rerr == nil {
+			c.acceptProfiles(body)
+			c.metrics.RuntimeProfileRefresh(ProfileRefreshUnchanged)
+			c.log.Info("runtime.profiles_refresh",
+				"trigger", "runtime-not-found", "c18", ProfileStateOK, "changed", false)
+		}
+	case status == http.StatusNotFound:
+		// The face is gone: S-3 answers 404 from now on. The declaration is
+		// unchanged (there is no profile list to compare against).
+		c.setProfilesMissing()
+		if rerr = c.registerLocked(ctx); rerr == nil {
+			c.metrics.RuntimeProfileRefresh(ProfileRefreshUnchanged)
+			c.log.Info("runtime.profiles_refresh",
+				"trigger", "runtime-not-found", "c18", ProfileStateMissing, "changed", false)
+		}
+	default:
+		// Availability first: C-18 unavailable keeps the current replay source
+		// and declares the cached discovery.
+		if rerr = c.registerLocked(ctx); rerr == nil {
+			c.metrics.RuntimeProfileRefresh(ProfileRefreshFailed)
+			fields := []any{
+				"trigger", "runtime-not-found", "stage", "c18", "status", status,
+				"replay", "committed", "register", "ok",
+			}
+			if err != nil {
+				fields = append(fields, "err", err)
+			}
+			c.log.Error("runtime.profiles_refresh_failed", fields...)
+		}
+	}
+	if rerr != nil {
+		if identity != "" {
+			c.markLost(identity)
+		}
+		c.metrics.RuntimeProfileRefresh(ProfileRefreshFailed)
+		c.log.Error("runtime.profiles_refresh_failed",
+			"trigger", "runtime-not-found", "stage", "register", "err", rerr)
+		return rerr
+	}
+	c.log.Debug("runtime.rebuild_settled")
+	return nil
+}
+
+// identityOf resolves the identity of a declared runtime id.
+func (c *Client) identityOf(runtimeID string) (key, provider, profileID string, ok bool) {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	for _, ref := range c.refs {
-		if ref.Provider == provider {
-			return ref.ID, nil
+		if ref.ID == runtimeID {
+			return ref.Key(), ref.Provider, ref.ProfileID, true
 		}
 	}
-	return "", nil
+	return "", "", "", false
+}
+
+// runtimeIDFor returns the declared id of an identity ("" when it is not
+// declared).
+func (c *Client) runtimeIDFor(key string) string {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	for _, ref := range c.refs {
+		if ref.Key() == key {
+			return ref.ID
+		}
+	}
+	return ""
+}
+
+// markLost records that a 404 proved this identity's row gone and its
+// re-register failed, so the next successful C1 still treats it as rebuilt
+// (C15 + runtime-set signal).
+func (c *Client) markLost(key string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.lost == nil {
+		c.lost = map[string]bool{}
+	}
+	c.lost[key] = true
 }
 
 // Heartbeat is C2 for one real runtime. A 404 "runtime not found" rebuilds that
@@ -478,7 +662,10 @@ func (c *Client) ClaimTasks(ctx context.Context, maxTasks int) ([]json.RawMessag
 	code, raw, err := c.claimOnce(ctx, c.RuntimeIDs(), maxTasks)
 	if err == nil && code == http.StatusNotFound && containsRuntimeNotFound(raw) {
 		c.log.Warn("runtime not found on claim; re-registering")
-		if rerr := c.register(ctx); rerr != nil {
+		// The claim carries the whole declared set, so the 404 names no row:
+		// the §1.6 sequence still re-fetches C-18 before it writes any C-1, and
+		// the answer moves every stale id at once (ADR-043 §9).
+		if rerr := c.rebuildClaimRuntime(ctx); rerr != nil {
 			return nil, fmt.Errorf("claim: re-register after runtime loss: %w", rerr)
 		}
 		code, raw, err = c.claimOnce(ctx, c.RuntimeIDs(), maxTasks)

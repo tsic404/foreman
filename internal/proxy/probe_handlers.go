@@ -23,25 +23,28 @@ func (s *FakeServer) probeSession(claims auth.Claims) (registry.ProbeSession, bo
 }
 
 // probeCommand returns the command id this probe must report on, and whether
-// one is still outstanding: command-driven probes carry the C2 ack's id
-// verbatim, a startup-discovery probe carries Foreman's own minted id
-// (S-5/S-27).
+// one is still outstanding. The session's mode is the only authority (§1.3):
+// a startup-discovery probe carries Foreman's own minted id, a command-driven
+// probe the C2 ack's id verbatim, and a registration-discovery probe owns no
+// command at all — its ack must never ask for a catalog run.
 func probeCommand(session registry.ProbeSession) (string, bool) {
 	if !session.RelayedAt.IsZero() {
 		return "", false
 	}
-	if session.SelfMintedID != "" {
-		return session.SelfMintedID, true
+	switch session.Mode {
+	case registry.ProbeStartupDiscovery:
+		return session.SelfMintedID, session.SelfMintedID != ""
+	case registry.ProbeCommandDriven:
+		return session.RequestID, session.RequestID != ""
+	default:
+		return "", false
 	}
-	if session.RequestID != "" {
-		return session.RequestID, true
-	}
-	return "", false
 }
 
 // registerProbe answers S4 for a catalog-probe Job: the probe's own job runtime
-// is echoed back, and (in startup-discovery mode) its registration body becomes
-// the truth source C1 declares.
+// is echoed back, and — for the modes whose registration is a declaration
+// (startup discovery, registration discovery) — its body becomes the truth
+// source C1 declares.
 func (s *FakeServer) registerProbe(w http.ResponseWriter, r *http.Request, claims auth.Claims, req daemonRegisterRequest) {
 	session, ok := s.probeSession(claims)
 	if !ok {
@@ -59,16 +62,17 @@ func (s *FakeServer) registerProbe(w http.ResponseWriter, r *http.Request, claim
 	first := probeServedRuntime(req.Runtimes)
 	now := time.Now()
 	updated, _ := s.probes.UpdateProbe(claims.JobName, func(session *registry.ProbeSession) {
-		if session.RealRuntimeID != "" {
+		if !session.CapturesRegistration() {
 			return
 		}
-		// Startup-discovery mode only: this registration body is C1's truth.
+		// Startup and registration-discovery probes only: this registration
+		// body is C1's truth.
 		session.RegisteredAt = now
 		session.CLIVersion = req.CLIVersion
 		session.Runtimes = discoveredRuntimes(req.Runtimes)
 		session.FailedProfiles = req.FailedProfiles
 	})
-	if updated.RegisteredAt.IsZero() && session.RealRuntimeID == "" {
+	if updated.RegisteredAt.IsZero() && session.CapturesRegistration() {
 		writeError(w, http.StatusUnauthorized, "unknown probe session")
 		return
 	}
@@ -77,53 +81,41 @@ func (s *FakeServer) registerProbe(w http.ResponseWriter, r *http.Request, claim
 		"job_runtime_id", session.JobRuntime, "probe", true,
 		"remote_addr", r.RemoteAddr)
 
-	repos, version := s.client.Registration()
-	if repos == nil {
-		repos = noRepos
+	repos := s.client.WorkspaceState()
+	respBody := workspaceStateResponse(repos)
+	answer := map[string]any{
+		"id":         session.JobRuntime,
+		"name":       first.Name,
+		"provider":   first.Type,
+		"status":     "online",
+		"profile_id": nil,
 	}
-	writeRaw(w, http.StatusOK, mustMarshal(map[string]any{
-		"runtimes": []map[string]string{{
-			"id":       session.JobRuntime,
-			"name":     first.Name,
-			"provider": first.Type,
-			"status":   "online",
-		}},
-		"repos":         repos,
-		"repos_version": version,
-		"settings":      nil,
-	}))
+	if first.ProfileID != "" {
+		answer["profile_id"] = first.ProfileID
+	}
+	respBody["runtimes"] = []map[string]any{answer}
+	writeRaw(w, http.StatusOK, mustMarshal(respBody))
 }
 
-// selectDeclaredRuntime picks the declared entry answering one Job: the type
-// must equal the Job's provider, an empty profile_id wins, and ties resolve by
-// name (§2.3).
-func selectDeclaredRuntime(runtimes []registerRuntime, provider string) (registerRuntime, bool) {
-	if len(runtimes) == 0 {
+// selectDeclaredRuntime picks the declared entry answering one Job: the
+// request-side identity (registry.RuntimeIdentityKey) must match by value, and
+// a repeated identity resolves by name order like the probe path (§2.3). An
+// unknown identity matches nothing — the caller refuses the registration.
+func selectDeclaredRuntime(runtimes []registerRuntime, identity string) (registerRuntime, bool) {
+	if identity == "" {
 		return registerRuntime{}, false
-	}
-	if provider == "" {
-		return runtimes[0], true
 	}
 	candidates := make([]registerRuntime, 0, len(runtimes))
 	for _, rt := range runtimes {
-		if rt.Type == provider {
+		if registry.RuntimeIdentityKey(rt.Type, rt.ProfileID) == identity {
 			candidates = append(candidates, rt)
 		}
 	}
 	if len(candidates) == 0 {
 		return registerRuntime{}, false
 	}
-	plain := make([]registerRuntime, 0, len(candidates))
-	for _, rt := range candidates {
-		if rt.ProfileID == "" {
-			plain = append(plain, rt)
-		}
-	}
-	if len(plain) == 0 {
-		plain = candidates
-	}
-	sort.SliceStable(plain, func(i, j int) bool { return plain[i].Name < plain[j].Name })
-	return plain[0], true
+	sort.SliceStable(candidates, func(i, j int) bool { return candidates[i].Name < candidates[j].Name })
+	return candidates[0], true
 }
 
 // probeServedRuntime picks the runtime a probe serves: the first entry by name,
@@ -137,7 +129,9 @@ func probeServedRuntime(runtimes []registerRuntime) registerRuntime {
 func discoveredRuntimes(runtimes []registerRuntime) []registry.DiscoveredRuntime {
 	discovered := make([]registry.DiscoveredRuntime, 0, len(runtimes))
 	for _, rt := range runtimes {
-		discovered = append(discovered, registry.DiscoveredRuntime{Name: rt.Name, Type: rt.Type, Version: rt.Version})
+		discovered = append(discovered, registry.DiscoveredRuntime{
+			Name: rt.Name, Type: rt.Type, Version: rt.Version, ProfileID: rt.ProfileID,
+		})
 	}
 	return discovered
 }
@@ -194,18 +188,18 @@ func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 	case session.SelfMintedID != "" && req == session.SelfMintedID:
 		// Startup discovery: no server request exists, so the result is
 		// absorbed locally and the daemon gets the C21 success shape back.
-		provider := ""
+		provider, profileID := "", ""
 		if len(session.Runtimes) > 0 {
 			discovered := session.Runtimes
 			sort.SliceStable(discovered, func(i, j int) bool { return discovered[i].Name < discovered[j].Name })
-			provider = discovered[0].Type
+			provider, profileID = discovered[0].Type, discovered[0].ProfileID
 		}
 		if provider == "" {
 			s.log.Error("startup discovery landed without a declared runtime", "job_name", claims.JobName)
 			writeError(w, http.StatusConflict, "no runtime declared")
 			return
 		}
-		s.client.stageStartupCatalog(provider, body)
+		s.client.stageStartupCatalog(provider, profileID, body)
 		s.probes.UpdateProbe(claims.JobName, func(probe *registry.ProbeSession) {
 			probe.RelayedAt = now
 			probe.RelayedCode = http.StatusOK

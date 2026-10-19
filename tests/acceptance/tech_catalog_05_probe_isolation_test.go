@@ -42,7 +42,7 @@ func TestCatalog05ProbeCredentialAndIsolationFaces(t *testing.T) {
 		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
 	t.Cleanup(ops.Close)
 
-	if _, err := h.sched.StartProbe(t.Context(), requestID, "rid-omp", h.schedCfg.ModelCatalogTimeout); err != nil {
+	if _, err := h.sched.StartProbe(t.Context(), requestID, "rid-omp", registry.ProbeCommandDriven, h.schedCfg.ModelCatalogTimeout); err != nil {
 		t.Fatalf("StartProbe: %v", err)
 	}
 	job := h.createdJob(t, probeName)

@@ -7,6 +7,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
 )
 
@@ -18,9 +19,10 @@ func codeLabel(code int) string { return strconv.Itoa(code) }
 // delete. The scheduler owns it (K8s objects); proxy only ever calls it and
 // shares state with it through the probe session table.
 type CatalogProbe interface {
-	// StartProbe builds the probe Job and its credential Secret;
-	// realRuntimeID is empty in startup-discovery mode.
-	StartProbe(ctx context.Context, requestID, realRuntimeID string, budget time.Duration) (scheduler.ProbeHandle, error)
+	// StartProbe builds the probe Job and its credential Secret; mode fixes the
+	// session's command face, and realRuntimeID names the runtime a
+	// command-driven probe relays for (registry.ProbeMode).
+	StartProbe(ctx context.Context, requestID, realRuntimeID string, mode registry.ProbeMode, budget time.Duration) (scheduler.ProbeHandle, error)
 	// AwaitProbeRelayed waits until the probe's result has landed (startup
 	// discovery) or been forwarded (command driven), or the deadline passes.
 	AwaitProbeRelayed(ctx context.Context, h scheduler.ProbeHandle, deadline time.Time) (nodeName string, relayed bool, relayedCode int, err error)
@@ -232,7 +234,7 @@ func (r *ModelCatalogReporter) run(ctx context.Context, runtimeID string, req *p
 		return
 	}
 	r.log.Info("model.catalog_requested", "request_id", req.reqID, "remaining_ms", remaining.Milliseconds())
-	probe, err := r.probes.StartProbe(ctx, req.reqID, runtimeID, remaining)
+	probe, err := r.probes.StartProbe(ctx, req.reqID, runtimeID, registry.ProbeCommandDriven, remaining)
 	if err != nil {
 		r.log.Warn("model.catalog_relay_failed", "request_id", req.reqID, "runtime_id", runtimeID, "reason", err)
 		r.metrics.ModelCatalogRelay("none", r.now().Sub(req.consumedAt).Seconds())

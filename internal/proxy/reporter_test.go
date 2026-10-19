@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
 )
 
@@ -35,7 +36,7 @@ type probeResult struct {
 	code    int
 }
 
-func (f *fakeProbe) StartProbe(_ context.Context, requestID, realRuntimeID string, budget time.Duration) (scheduler.ProbeHandle, error) {
+func (f *fakeProbe) StartProbe(_ context.Context, requestID, realRuntimeID string, _ registry.ProbeMode, budget time.Duration) (scheduler.ProbeHandle, error) {
 	if f.gate != nil {
 		<-f.gate
 	}

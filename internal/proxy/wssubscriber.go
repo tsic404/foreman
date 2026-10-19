@@ -36,8 +36,25 @@ type WSSubscriber struct {
 	// arms its retry again — §1.5 is "back off and reconnect", not "stop" — so a
 	// row that becomes dialable again under the same id returns on its own.
 	parkRetry time.Duration
+	// profilesChanged is the §1.6 trigger: called once per matching
+	// daemon:runtime_profiles_changed frame (nil keeps the subscriber inert on
+	// that event — the WS-disabled degradation).
+	profilesChanged func()
 	// now is the clock (overridable in tests).
 	now func() time.Time
+}
+
+// WSSubscriberOption customizes a WSSubscriber.
+type WSSubscriberOption func(*WSSubscriber)
+
+// WithProfileChangeNotify wires the §1.6 refresh trigger (ProfileRefresher.Notify).
+func WithProfileChangeNotify(fn func()) WSSubscriberOption {
+	return func(s *WSSubscriber) { s.profilesChanged = fn }
+}
+
+// WithWSSubscriberClock overrides the clock (tests).
+func WithWSSubscriberClock(now func() time.Time) WSSubscriberOption {
+	return func(s *WSSubscriber) { s.now = now }
 }
 
 // parkRetryInterval is the production park window (one §1.5 backoff ceiling).
@@ -72,8 +89,8 @@ func (s *WSSubscriber) newReconnectBackoff() reconnectBackoff {
 }
 
 // NewWSSubscriber builds the subscriber. wake is ClaimLoop.Wake.
-func NewWSSubscriber(client *Client, wake func(), metrics Metrics) *WSSubscriber {
-	return &WSSubscriber{
+func NewWSSubscriber(client *Client, wake func(), metrics Metrics, opts ...WSSubscriberOption) *WSSubscriber {
+	s := &WSSubscriber{
 		client:      client,
 		wake:        wake,
 		metrics:     orNoopMetrics(metrics),
@@ -82,6 +99,10 @@ func NewWSSubscriber(client *Client, wake func(), metrics Metrics) *WSSubscriber
 		parkRetry:   parkRetryInterval,
 		now:         time.Now,
 	}
+	for _, opt := range opts {
+		opt(s)
+	}
+	return s
 }
 
 // streamOutcome tells the supervisor why one per-runtime stream ended.
@@ -116,26 +137,26 @@ type wsSubscription struct {
 	cancel    context.CancelFunc
 }
 
-// providerStreamState survives stream replacement: the reconnect progression
+// runtimeStreamState survives stream replacement: the reconnect progression
 // and the stale-rebuild budget belong to the runtime, so an id that keeps
 // moving cannot reset the backoff by restarting the stream. A replaced stream
 // keeps running until it notices its cancel, so it and its replacement reach
 // these fields from two goroutines: every access goes through the mutex.
-type providerStreamState struct {
+type runtimeStreamState struct {
 	mu            sync.Mutex
 	backoff       reconnectBackoff
 	staleRebuilds int
 }
 
 // nextBackoff advances this runtime's §1.5 progression and returns the wait.
-func (st *providerStreamState) nextBackoff() time.Duration {
+func (st *runtimeStreamState) nextBackoff() time.Duration {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	return st.backoff.next()
 }
 
 // noteStaleRebuild counts one failed stale rebuild and reports the total.
-func (st *providerStreamState) noteStaleRebuild() int {
+func (st *runtimeStreamState) noteStaleRebuild() int {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.staleRebuilds++
@@ -146,7 +167,7 @@ func (st *providerStreamState) noteStaleRebuild() int {
 // budget both start over. It runs whenever the streak ends — a dial succeeded,
 // or a parked runtime's retry window expired — so staleRebuildLimit bounds
 // *consecutive* failures, never a runtime's lifetime (C-20, §1.5).
-func (st *providerStreamState) rearm() {
+func (st *runtimeStreamState) rearm() {
 	st.mu.Lock()
 	defer st.mu.Unlock()
 	st.staleRebuilds = 0
@@ -157,7 +178,7 @@ func (st *providerStreamState) rearm() {
 // names the stream instance — never (provider, id), which an id that moved away
 // and back still satisfies.
 type streamResult struct {
-	provider  string
+	identity  string
 	runtimeID string
 	epoch     uint64
 	outcome   streamOutcome
@@ -170,22 +191,22 @@ type streamResult struct {
 func (s *WSSubscriber) Run(ctx context.Context) error {
 	changes := s.client.Changes()
 	connections := map[string]wsSubscription{}
-	// parked holds the moment each provider's dialing is armed again. It is
-	// keyed by provider, not by id: an id that moves on every register is the
-	// same pathology as one that never moves, and only a bounded window (§1.5's
-	// 30s ceiling) keeps either from dialing at RTT speed. The retry comes back
-	// on its own when the window expires.
+	// parked holds the moment each runtime identity's dialing is armed again.
+	// It is keyed by (provider, profile_id), not by id: an id that moves on
+	// every register is the same pathology as one that never moves, and only a
+	// bounded window (§1.5's 30s ceiling) keeps either from dialing at RTT
+	// speed. The retry comes back on its own when the window expires.
 	parked := map[string]time.Time{}
 	// states carries the per-runtime reconnect progression and stale-rebuild
 	// budget across stream replacements (one id move must not reset either).
-	states := map[string]*providerStreamState{}
+	states := map[string]*runtimeStreamState{}
 	// epochs numbers the stream instances: an id may be reused, a stream
 	// instance never is (it is what the outcome is matched against).
 	var epochs uint64
 	stopAll := func() {
-		for provider, sub := range connections {
+		for key, sub := range connections {
 			sub.cancel()
-			delete(connections, provider)
+			delete(connections, key)
 		}
 	}
 	defer stopAll()
@@ -194,49 +215,49 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 		declared := map[string]RuntimeRef{}
 		for _, ref := range s.client.RuntimeRefs() {
 			if ref.ID != "" {
-				declared[ref.Provider] = ref
+				declared[ref.Key()] = ref
 			}
 		}
-		for provider, until := range parked {
-			_, declaredNow := declared[provider]
+		for key, until := range parked {
+			_, declaredNow := declared[key]
 			if !declaredNow || !s.now().Before(until) {
-				// The provider left or the retry window expired: arm it again
+				// The identity left or the retry window expired: arm it again
 				// with a fresh budget.
-				delete(parked, provider)
-				if state, ok := states[provider]; ok {
+				delete(parked, key)
+				if state, ok := states[key]; ok {
 					state.rearm()
 				}
 			}
 		}
-		for provider := range states {
-			if _, ok := declared[provider]; !ok {
-				delete(states, provider)
+		for key := range states {
+			if _, ok := declared[key]; !ok {
+				delete(states, key)
 			}
 		}
-		for provider, sub := range connections {
-			ref, ok := declared[provider]
+		for key, sub := range connections {
+			ref, ok := declared[key]
 			if !ok || ref.ID != sub.runtimeID {
 				sub.cancel()
-				delete(connections, provider)
+				delete(connections, key)
 			}
 		}
-		for provider, ref := range declared {
-			if _, ok := connections[provider]; ok {
+		for key, ref := range declared {
+			if _, ok := connections[key]; ok {
 				continue
 			}
-			if _, parking := parked[provider]; parking {
+			if _, parking := parked[key]; parking {
 				continue
 			}
-			state, ok := states[provider]
+			state, ok := states[key]
 			if !ok {
-				state = &providerStreamState{backoff: s.newReconnectBackoff()}
-				states[provider] = state
+				state = &runtimeStreamState{backoff: s.newReconnectBackoff()}
+				states[key] = state
 			}
 			subCtx, cancel := context.WithCancel(ctx)
 			epochs++
 			epoch := epochs
-			connections[provider] = wsSubscription{runtimeID: ref.ID, epoch: epoch, cancel: cancel}
-			go func(ref RuntimeRef, state *providerStreamState, epoch uint64) {
+			connections[key] = wsSubscription{runtimeID: ref.ID, epoch: epoch, cancel: cancel}
+			go func(ref RuntimeRef, state *runtimeStreamState, epoch uint64) {
 				result := s.listen(subCtx, ref, state, epoch)
 				select {
 				case outcomes <- result:
@@ -252,25 +273,25 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 			return nil
 		case result := <-outcomes:
 			if result.outcome == streamParked {
-				// Parking is a statement about the provider, not about one id:
+				// Parking is a statement about the identity, not about one id:
 				// the rebuild budget is shared across replacements, so even a
-				// replaced stream's park outcome must hold the provider back
+				// replaced stream's park outcome must hold the identity back
 				// for the window (an id that moves on every register is the
 				// same pathology as one that never moves). Idempotent: an
-				// already parked provider keeps its expiry.
-				if _, already := parked[result.provider]; !already {
-					parked[result.provider] = s.now().Add(s.parkRetry)
+				// already parked identity keeps its expiry.
+				if _, already := parked[result.identity]; !already {
+					parked[result.identity] = s.now().Add(s.parkRetry)
 				}
 			}
 			// Unregister by identity: the outcome names the stream instance,
-			// not (provider, id). An id that moved away and back names a
-			// different stream, and matching it here would delete that live
+			// not (provider, profile, id). An id that moved away and back names
+			// a different stream, and matching it here would delete that live
 			// connection and orphan its cancel (C-20).
-			sub, ok := connections[result.provider]
+			sub, ok := connections[result.identity]
 			if !ok || sub.epoch != result.epoch {
 				continue
 			}
-			delete(connections, result.provider)
+			delete(connections, result.identity)
 		case <-changes:
 			// Just wake up: parking is left to its own window, so a provider
 			// whose id moves on every register cannot re-arm by moving.
@@ -284,18 +305,18 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 // state, which outlives a stream replacement — an id that keeps moving must not
 // reset the rate limit by starting a fresh stream. epoch is this instance's own
 // identity and travels back with the outcome.
-func (s *WSSubscriber) listen(ctx context.Context, ref RuntimeRef, state *providerStreamState, epoch uint64) streamResult {
+func (s *WSSubscriber) listen(ctx context.Context, ref RuntimeRef, state *runtimeStreamState, epoch uint64) streamResult {
 	for {
 		outcome := s.iterate(ctx, ref, state)
 		if outcome != streamRetry {
-			return streamResult{provider: ref.Provider, runtimeID: ref.ID, epoch: epoch, outcome: outcome}
+			return streamResult{identity: ref.Key(), runtimeID: ref.ID, epoch: epoch, outcome: outcome}
 		}
 	}
 }
 
 // iterate runs one connect → read → reconnect cycle for a runtime, returning
 // the reason the loop must stop (or streamRetry to go around again).
-func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *providerStreamState) streamOutcome {
+func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *runtimeStreamState) streamOutcome {
 	runtimeID := ref.ID
 	u := wsURL(s.client.cfg.ServerURL) + "/api/daemon/ws?runtime_ids=" + url.QueryEscape(runtimeID)
 	hdr := http.Header{}
@@ -377,7 +398,8 @@ func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *provi
 }
 
 // readLoop consumes frames until the connection drops; task_available
-// coalesces into a single claim wakeup (S-6 + §10).
+// coalesces into a single claim wakeup (S-6 + §10), and a matching
+// daemon:runtime_profiles_changed triggers the §1.6 refresh.
 func (s *WSSubscriber) readLoop(ctx context.Context, conn *websocket.Conn) {
 	for {
 		_, data, err := conn.Read(ctx)
@@ -389,8 +411,22 @@ func (s *WSSubscriber) readLoop(ctx context.Context, conn *websocket.Conn) {
 			s.log.Debug("ws frame undecodable", "err", err)
 			continue
 		}
-		if frame.Type == FrameDaemonTaskAvailable {
+		switch frame.Type {
+		case FrameDaemonTaskAvailable:
 			s.wake()
+		case FrameDaemonRuntimeProfilesChanged:
+			if s.profilesChanged == nil {
+				continue
+			}
+			ws := frame.workspaceID()
+			if ws != s.client.cfg.WorkspaceID {
+				// Another workspace's change is not this instance's (§1.6:
+				// workspace_id 匹配本实例).
+				s.log.Debug("ws profile change ignored", "workspace_id", ws)
+				continue
+			}
+			s.log.Info("runtime.profiles_changed", "workspace_id", ws)
+			s.profilesChanged()
 		}
 	}
 }
@@ -406,7 +442,7 @@ func handshakeSaysRuntimeGone(resp *http.Response) bool {
 	return err == nil && containsRuntimeNotFound(body)
 }
 
-func (s *WSSubscriber) waitReconnect(ctx context.Context, err error, state *providerStreamState) {
+func (s *WSSubscriber) waitReconnect(ctx context.Context, err error, state *runtimeStreamState) {
 	// A stream that is already gone waits for nobody: both the sleep and the
 	// §1.5 step it would spend belong to the replacement.
 	if errors.Is(err, context.Canceled) || ctx.Err() != nil {

@@ -159,6 +159,13 @@ func newTestRig(t *testing.T) *testRig {
 // which the shared stub does not.
 func newTestRigWithRegister(t *testing.T, register func(*stubUpstream)) *testRig {
 	t.Helper()
+	return newTestRigWith(t, register, testDiscovery())
+}
+
+// newTestRigWith is newTestRigWithRegister with the declared discovery under
+// the caller's control (a profile identity needs its own discovery).
+func newTestRigWith(t *testing.T, register func(*stubUpstream), discovery registry.Discovery) *testRig {
+	t.Helper()
 	upstream, stub := newStubUpstream(t)
 	register(stub)
 
@@ -177,7 +184,7 @@ func newTestRigWithRegister(t *testing.T, register func(*stubUpstream)) *testRig
 		WithStartupCatalog(registry.NewStartupCatalog()),
 		WithCatalogSlots(rig.slots),
 		WithTaskRuntime(func(string) string { return "rid-real" }))
-	if err := rig.client.RegisterWithDiscovery(t.Context(), testDiscovery()); err != nil {
+	if err := rig.client.RegisterWithDiscovery(t.Context(), discovery); err != nil {
 		t.Fatalf("RegisterWithDiscovery: %v", err)
 	}
 	if err := rig.client.Preflight(t.Context()); err != nil {
@@ -205,6 +212,7 @@ func newTestRigWithRegister(t *testing.T, register func(*stubUpstream)) *testRig
 		scheduler.WithPendingReports(pending),
 		scheduler.WithRevoker(rig.revoker),
 		scheduler.WithProbeRegistry(rig.probes),
+		scheduler.WithRuntimeIdentity(rig.client.RuntimeIdentity),
 	)
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
@@ -657,9 +665,9 @@ func TestFixedEndpoints(t *testing.T) {
 	jobRID := rig.registerDaemon(t, "t-fix", tok)
 	e, _ := rig.reg.Get("t-fix")
 
-	// S3 runtime-profiles → 404.
-	if code, _ := rig.call(t, "GET", "/api/daemon/workspaces/ws-1/runtime-profiles", tok, nil); code != 404 {
-		t.Errorf("S3 = %d, want 404", code)
+	// S3 runtime-profiles → 503 before any successful C-18 (§1.6 three-state).
+	if code, _ := rig.call(t, "GET", "/api/daemon/workspaces/ws-1/runtime-profiles", tok, nil); code != 503 {
+		t.Errorf("S3 before C-18 = %d, want 503", code)
 	}
 	// S18 recover-orphans → zeros.
 	code, body := rig.call(t, "POST", "/api/daemon/runtimes/"+jobRID+"/recover-orphans", tok, []byte(`{}`))
@@ -1265,5 +1273,162 @@ func TestExpiredAndForgedTokensRejected(t *testing.T) {
 	}
 	if !strings.Contains(joined, "expired") || !strings.Contains(joined, "signature") {
 		t.Errorf("auth failure reasons = %v, want expired + signature", rig.metrics.authFails)
+	}
+}
+
+// registerIdentities answers C1 with one row per declared identity; rows maps
+// registry.RuntimeIdentityKey(provider, profile id) to the answered id.
+func registerIdentities(rows map[string]string) func(*stubUpstream) {
+	return func(stub *stubUpstream) {
+		stub.on("POST", "/api/daemon/register", func(w http.ResponseWriter, _ *http.Request, body []byte) {
+			var req struct {
+				Runtimes []struct {
+					Name      string `json:"name"`
+					Type      string `json:"type"`
+					ProfileID string `json:"profile_id"`
+				} `json:"runtimes"`
+			}
+			_ = json.Unmarshal(body, &req)
+			answers := make([]map[string]any, 0, len(req.Runtimes))
+			for _, rt := range req.Runtimes {
+				id, ok := rows[registry.RuntimeIdentityKey(rt.Type, rt.ProfileID)]
+				if !ok {
+					continue
+				}
+				answer := map[string]any{"id": id, "name": rt.Name, "provider": rt.Type, "status": "online", "profile_id": nil}
+				if rt.ProfileID != "" {
+					answer["profile_id"] = rt.ProfileID
+				}
+				answers = append(answers, answer)
+			}
+			writeJSONStub(w, 200, map[string]any{
+				"runtimes": answers, "repos": []any{}, "repos_version": "v1", "settings": nil,
+			})
+		})
+	}
+}
+
+// profileDiscovery is the two-identity declaration of the S-4 identity tests.
+func profileDiscovery() registry.Discovery {
+	return registry.Discovery{Runtimes: []registry.DiscoveredRuntime{
+		{Name: "foreman-omp", Type: "omp", Version: "1"},
+		{Name: "foreman-prof-a", Type: "omp", Version: "1", ProfileID: "prof-a"},
+	}}
+}
+
+// claimUnder seeds one claimed task dispatched under runtimeID.
+func claimUnder(t *testing.T, rig *testRig, taskID, runtimeID string) {
+	t.Helper()
+	payload := json.RawMessage(`{
+		"id": "` + taskID + `", "agent_id": "agent-1", "issue_id": "issue-1",
+		"issue_identifier": "TSI-1", "workspace_id": "ws-1",
+		"runtime_id": "` + runtimeID + `"
+	}`)
+	if err := rig.sched.OnClaim(t.Context(), payload); err != nil {
+		t.Fatalf("OnClaim(%s): %v", taskID, err)
+	}
+}
+
+// TestRegisterMatchesTheClaimIdentityAfterTheRowsMove pins §2.3's key: the Job's
+// identity is recorded at claim time, so a rebuild that moves the server-side
+// row ids cannot blind the selection — the entry's stale id is never what the
+// answer is matched against.
+func TestRegisterMatchesTheClaimIdentityAfterTheRowsMove(t *testing.T) {
+	rig := newTestRigWith(t, registerIdentities(map[string]string{
+		"omp\x00": "rid-builtin", "omp\x00prof-a": "rid-prof-a",
+	}), profileDiscovery())
+	claimUnder(t, rig, "t-moved", "rid-prof-a")
+	entry, ok := rig.reg.Get("t-moved")
+	if !ok || entry.RuntimeIdentity != registry.RuntimeIdentityKey("omp", "prof-a") {
+		t.Fatalf("entry identity = %+v, want the claim's identity recorded", entry)
+	}
+
+	// The rows are rebuilt: same identities, new ids.
+	registerIdentities(map[string]string{
+		"omp\x00": "rid-builtin-2", "omp\x00prof-a": "rid-prof-a-2",
+	})(rig.stub)
+	if err := rig.client.RegisterWithDiscovery(t.Context(), profileDiscovery()); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+	if got := rig.client.RuntimeIDs(); len(got) != 2 || got[1] != "rid-prof-a-2" {
+		t.Fatalf("runtime ids = %v, want the rebuilt rows", got)
+	}
+	// The entry still names the old id — the identity is what answers.
+	code, body := rig.call(t, "POST", "/api/daemon/register", rig.token(t, "t-moved"),
+		[]byte(`{"daemon_id":"fm-t-moved","runtimes":[
+			{"name":"foreman-omp","type":"omp"},
+			{"name":"foreman-prof-a","type":"omp","profile_id":"prof-a"}]}`))
+	if code != 200 {
+		t.Fatalf("S-4 after the id move = %d: %s", code, body)
+	}
+	var resp struct {
+		Runtimes []struct {
+			ProfileID *string `json:"profile_id"`
+		} `json:"runtimes"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil || len(resp.Runtimes) != 1 {
+		t.Fatalf("S-4 body = %s (%v)", body, err)
+	}
+	if resp.Runtimes[0].ProfileID == nil || *resp.Runtimes[0].ProfileID != "prof-a" {
+		t.Errorf("S-4 profile_id = %v, want the dispatched profile", resp.Runtimes[0].ProfileID)
+	}
+}
+
+// TestRegisterRefusesAJobThatDroppedItsIdentity: after the rows move, a Job
+// dispatched under one profile whose daemon reports only the same type's
+// builtin has zero hits for its identity — it must be refused, never answered
+// with the builtin (which would start it with another command). This is the
+// path a stale entry id used to take: the lookup failed and the first reported
+// entry answered for the Job (§2.3 零命中即拒绝注册, AC-57 negative).
+func TestRegisterRefusesAJobThatDroppedItsIdentity(t *testing.T) {
+	rig := newTestRigWith(t, registerIdentities(map[string]string{
+		"omp\x00": "rid-builtin", "omp\x00prof-a": "rid-prof-a",
+	}), profileDiscovery())
+	claimUnder(t, rig, "t-left", "rid-prof-a")
+	// C13 keeps the refusal on the daemon-not-registered path (a 404 would read
+	// as "the server deleted the task" and settle it without a report).
+	rig.stub.on("GET", "/api/daemon/tasks/t-left/status", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]string{"status": "dispatched"})
+	})
+
+	// The server-side rows are rebuilt: same identities, new ids.
+	registerIdentities(map[string]string{
+		"omp\x00": "rid-builtin-2", "omp\x00prof-a": "rid-prof-a-2",
+	})(rig.stub)
+	if err := rig.client.RegisterWithDiscovery(t.Context(), profileDiscovery()); err != nil {
+		t.Fatalf("re-register: %v", err)
+	}
+	code, body := rig.call(t, "POST", "/api/daemon/register", rig.token(t, "t-left"),
+		[]byte(`{"daemon_id":"fm-t-left","runtimes":[{"name":"foreman-omp","type":"omp"}]}`))
+	if code != 409 {
+		t.Fatalf("S-4 without the dispatched identity = %d: %s, want 409 (no builtin substitution)", code, body)
+	}
+	settled, ok := rig.reg.Get("t-left")
+	if !ok || !settled.IsTerminal() || settled.Result != registry.ResultFailed {
+		t.Errorf("the refused task did not settle: %+v (ok=%v)", settled, ok)
+	}
+}
+
+// TestRegisterRefusesAnEntryWithoutADispatchRecord: a rebuilt entry carries no
+// identity and no runtime id, so nothing can be matched — the daemon gets a
+// refusal instead of a guess.
+func TestRegisterRefusesAnEntryWithoutADispatchRecord(t *testing.T) {
+	rig := newTestRig(t)
+	rig.claimTask(t, "t-rebuilt")
+	e, ok := rig.reg.Get("t-rebuilt")
+	if !ok {
+		t.Fatal("entry missing")
+	}
+	rig.reg.Put(registry.TaskEntry{
+		TaskID: e.TaskID, DaemonID: e.DaemonID, JobName: e.JobName,
+		JobRuntimeID: e.JobRuntimeID, State: registry.StateJobCreated,
+	})
+	rig.stub.on("GET", "/api/daemon/tasks/t-rebuilt/status", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]string{"status": "dispatched"})
+	})
+	code, body := rig.call(t, "POST", "/api/daemon/register", rig.token(t, "t-rebuilt"),
+		[]byte(`{"daemon_id":"fm-t-rebuilt","runtimes":[{"name":"foreman-job","type":"omp"}]}`))
+	if code != 409 {
+		t.Fatalf("S-4 without a dispatch record = %d: %s, want 409", code, body)
 	}
 }

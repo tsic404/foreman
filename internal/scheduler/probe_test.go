@@ -115,7 +115,7 @@ func TestStartProbeSessionBeforeObjects(t *testing.T) {
 		order = append(order, "job")
 	}
 
-	handle, err := p.sched.StartProbe(t.Context(), "req-1", "rid-real", 30*time.Second)
+	handle, err := p.sched.StartProbe(t.Context(), "req-1", "rid-real", registry.ProbeCommandDriven, 30*time.Second)
 	if err != nil {
 		t.Fatalf("StartProbe: %v", err)
 	}
@@ -142,7 +142,7 @@ func TestStartProbeSessionBeforeObjects(t *testing.T) {
 
 func TestStartProbeStartupModeMintsItsOwnCommand(t *testing.T) {
 	p := newProbeFixture(t, probeConfig(t))
-	handle, err := p.sched.StartProbe(t.Context(), "startup-abc", "", 30*time.Second)
+	handle, err := p.sched.StartProbe(t.Context(), "startup-abc", "", registry.ProbeStartupDiscovery, 30*time.Second)
 	if err != nil {
 		t.Fatalf("StartProbe: %v", err)
 	}
@@ -156,7 +156,7 @@ func TestStartProbeRollsBackOnJobFailure(t *testing.T) {
 	p := newProbeFixture(t, probeConfig(t))
 	p.jobs.createJobErr = errors.New("apiserver down")
 
-	_, err := p.sched.StartProbe(t.Context(), "req-2", "rid-real", 30*time.Second)
+	_, err := p.sched.StartProbe(t.Context(), "req-2", "rid-real", registry.ProbeCommandDriven, 30*time.Second)
 	if err == nil {
 		t.Fatal("StartProbe must fail when the Job cannot be created")
 	}
@@ -173,7 +173,7 @@ func TestStartProbeRollsBackOnJobFailure(t *testing.T) {
 
 func TestAwaitProbeRelayedReadsSessionResult(t *testing.T) {
 	p := newProbeFixture(t, probeConfig(t))
-	handle, err := p.sched.StartProbe(t.Context(), "req-3", "rid-real", 30*time.Second)
+	handle, err := p.sched.StartProbe(t.Context(), "req-3", "rid-real", registry.ProbeCommandDriven, 30*time.Second)
 	if err != nil {
 		t.Fatalf("StartProbe: %v", err)
 	}
@@ -210,7 +210,7 @@ func TestAwaitProbeRelayedReadsSessionResult(t *testing.T) {
 
 func TestAwaitProbeRelayedStopsAtDeadline(t *testing.T) {
 	p := newProbeFixture(t, probeConfig(t))
-	handle, err := p.sched.StartProbe(t.Context(), "req-4", "rid-real", 30*time.Second)
+	handle, err := p.sched.StartProbe(t.Context(), "req-4", "rid-real", registry.ProbeCommandDriven, 30*time.Second)
 	if err != nil {
 		t.Fatalf("StartProbe: %v", err)
 	}
@@ -222,7 +222,7 @@ func TestAwaitProbeRelayedStopsAtDeadline(t *testing.T) {
 
 func TestDeleteProbeRemovesSessionFirst(t *testing.T) {
 	p := newProbeFixture(t, probeConfig(t))
-	handle, err := p.sched.StartProbe(t.Context(), "req-5", "rid-real", 30*time.Second)
+	handle, err := p.sched.StartProbe(t.Context(), "req-5", "rid-real", registry.ProbeCommandDriven, 30*time.Second)
 	if err != nil {
 		t.Fatalf("StartProbe: %v", err)
 	}
@@ -248,7 +248,7 @@ func TestDeleteProbeRemovesSessionFirst(t *testing.T) {
 
 func TestDeleteProbeAttemptsEveryStepOnFailure(t *testing.T) {
 	p := newProbeFixture(t, probeConfig(t))
-	handle, err := p.sched.StartProbe(t.Context(), "req-6", "rid-real", 30*time.Second)
+	handle, err := p.sched.StartProbe(t.Context(), "req-6", "rid-real", registry.ProbeCommandDriven, 30*time.Second)
 	if err != nil {
 		t.Fatalf("StartProbe: %v", err)
 	}

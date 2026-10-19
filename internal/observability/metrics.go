@@ -47,6 +47,10 @@ const (
 	metricSkillCacheEntries   = "foreman_skill_cache_entries"
 	metricSkillCacheBytes     = "foreman_skill_cache_bytes"
 	metricSkillCacheEvictions = "foreman_skill_cache_evictions_total"
+	// Workspace state refresh (§9.2): C-22 outcomes and the §1.6 runtime
+	// profile refresh outcomes, both by result.
+	metricWorkspaceStateRefreshes = "foreman_workspace_state_refreshes_total"
+	metricRuntimeProfileRefreshes = "foreman_runtime_profile_refreshes_total"
 )
 
 // Terminal result label values (§4.1).
@@ -118,6 +122,16 @@ var skillCacheResults = []string{"hit", "miss", "stale_hit", "degraded", "upstre
 // integrity check's own verdict.
 var skillCacheEvictReasons = []string{"capacity", "retention", "damaged"}
 
+// workspaceStateResults is the foreman_workspace_state_refreshes_total label
+// vocabulary (§9.2): a successful C-22, a failed refresh answered from the last
+// snapshot, and a failure with nothing to replay.
+var workspaceStateResults = []string{"success", "stale_replay", "failed"}
+
+// runtimeProfileResults is the foreman_runtime_profile_refreshes_total label
+// vocabulary (§9.2): a committed refresh, an unchanged projection, and a
+// failed sequence.
+var runtimeProfileResults = []string{"success", "unchanged", "failed"}
+
 // Metrics is the Prometheus implementation of the designed metric surface
 // (§9.2) plus the recorders for the remaining designed metrics. It owns
 // a private registry — no global state — so a collector panic is contained
@@ -125,32 +139,34 @@ var skillCacheEvictReasons = []string{"capacity", "retention", "damaged"}
 type Metrics struct {
 	reg *prometheus.Registry
 
-	tasksTotal        *prometheus.CounterVec
-	taskClaims        prometheus.Counter
-	claimErrors       *prometheus.CounterVec
-	deliveryClaims    *prometheus.CounterVec
-	deliveryLatency   prometheus.Histogram
-	deliveryUnconfirm prometheus.Counter
-	jobBootSeconds    prometheus.Histogram
-	jobCreateSeconds  prometheus.Histogram
-	inflightJobs      prometheus.Gauge
-	forwardTotal      *prometheus.CounterVec
-	forwardLatency    *prometheus.HistogramVec
-	authFailures      *prometheus.CounterVec
-	tokenUsage        *prometheus.CounterVec
-	duplicateDispatch prometheus.Counter
-	pendingReports    prometheus.Gauge
-	wsConnected       *prometheus.GaugeVec
-	wsReconnects      *prometheus.CounterVec
-	heartbeatSuspect  prometheus.Gauge
-	credReclaims      *prometheus.CounterVec
-	jobDrainSeconds   prometheus.Histogram
-	catalogRelays     *prometheus.CounterVec
-	catalogSeconds    prometheus.Histogram
-	skillResolves     *prometheus.CounterVec
-	skillEntries      prometheus.Gauge
-	skillBytes        prometheus.Gauge
-	skillEvictions    *prometheus.CounterVec
+	tasksTotal         *prometheus.CounterVec
+	taskClaims         prometheus.Counter
+	claimErrors        *prometheus.CounterVec
+	deliveryClaims     *prometheus.CounterVec
+	deliveryLatency    prometheus.Histogram
+	deliveryUnconfirm  prometheus.Counter
+	jobBootSeconds     prometheus.Histogram
+	jobCreateSeconds   prometheus.Histogram
+	inflightJobs       prometheus.Gauge
+	forwardTotal       *prometheus.CounterVec
+	forwardLatency     *prometheus.HistogramVec
+	authFailures       *prometheus.CounterVec
+	tokenUsage         *prometheus.CounterVec
+	duplicateDispatch  prometheus.Counter
+	pendingReports     prometheus.Gauge
+	wsConnected        *prometheus.GaugeVec
+	wsReconnects       *prometheus.CounterVec
+	heartbeatSuspect   prometheus.Gauge
+	credReclaims       *prometheus.CounterVec
+	jobDrainSeconds    prometheus.Histogram
+	catalogRelays      *prometheus.CounterVec
+	catalogSeconds     prometheus.Histogram
+	skillResolves      *prometheus.CounterVec
+	skillEntries       prometheus.Gauge
+	skillBytes         prometheus.Gauge
+	skillEvictions     *prometheus.CounterVec
+	workspaceRefreshes *prometheus.CounterVec
+	profileRefreshes   *prometheus.CounterVec
 
 	// wsMu guards wsJobs, the authoritative side=job connection count; the
 	// gauge is Set from it so a disconnect without a matching connect (e.g.
@@ -278,6 +294,14 @@ func NewMetrics() *Metrics {
 		Name: metricSkillCacheEvictions,
 		Help: "Skill-bundle cache entries reclaimed by reason.",
 	}, []string{"reason"})
+	m.workspaceRefreshes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricWorkspaceStateRefreshes,
+		Help: "Workspace state (settings/repos) refreshes by result.",
+	}, []string{"result"})
+	m.profileRefreshes = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricRuntimeProfileRefreshes,
+		Help: "Runtime profile refresh sequences by result.",
+	}, []string{"result"})
 
 	collectors := []prometheus.Collector{
 		m.tasksTotal, m.taskClaims, m.claimErrors, m.jobBootSeconds,
@@ -287,6 +311,7 @@ func NewMetrics() *Metrics {
 		m.wsConnected, m.wsReconnects, m.heartbeatSuspect,
 		m.credReclaims, m.jobDrainSeconds, m.catalogRelays, m.catalogSeconds,
 		m.skillResolves, m.skillEntries, m.skillBytes, m.skillEvictions,
+		m.workspaceRefreshes, m.profileRefreshes,
 	}
 	for _, c := range collectors {
 		m.reg.MustRegister(c)
@@ -326,6 +351,12 @@ func NewMetrics() *Metrics {
 	}
 	for _, reason := range skillCacheEvictReasons {
 		m.skillEvictions.WithLabelValues(reason)
+	}
+	for _, result := range workspaceStateResults {
+		m.workspaceRefreshes.WithLabelValues(result)
+	}
+	for _, result := range runtimeProfileResults {
+		m.profileRefreshes.WithLabelValues(result)
 	}
 	return m
 }
@@ -461,4 +492,14 @@ func (m *Metrics) SkillCacheSize(entries int, bytes int64) {
 // SkillCacheEviction counts one reclaimed entry by reason (§9.2 回收计数).
 func (m *Metrics) SkillCacheEviction(reason string) {
 	m.skillEvictions.WithLabelValues(reason).Inc()
+}
+
+// WorkspaceStateRefresh records one C-22 outcome (§9.2).
+func (m *Metrics) WorkspaceStateRefresh(result string) {
+	m.workspaceRefreshes.WithLabelValues(result).Inc()
+}
+
+// RuntimeProfileRefresh records one §1.6 refresh outcome (§9.2).
+func (m *Metrics) RuntimeProfileRefresh(result string) {
+	m.profileRefreshes.WithLabelValues(result).Inc()
 }

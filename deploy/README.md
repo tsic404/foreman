@@ -385,8 +385,58 @@ Foreman declares to the server; it also doubles as the template preflight.
   directory you advertise describes a different environment than the task Jobs
   run in.
 - Operations view: `curl -s localhost:8080/foreman/register-source` prints the
-  discovered list, the declared runtimes and each runtime's catalog slot state
-  (read-only — it never triggers a discovery).
+  discovered list, the declared runtimes, each runtime's catalog slot state and
+  the current runtime-profile replay source (read-only — it never triggers a
+  discovery).
+
+### Runtime profiles and workspace state (ADR-043 / ADR-044)
+
+Both are server-owned workspace state; Foreman carries the values and never
+interprets them.
+
+- **Runtime profiles**: Foreman fetches the workspace's profile list once
+  **before** the startup probe (S-3 replays it byte for byte; a 404 from an old
+  server stays 404, an unsuccessful fetch answers 503, which the daemon treats
+  as best-effort). The probe's registration body is what Foreman declares, so a
+  profile whose `command_name` the template image cannot resolve is never
+  declared and never appears as a server-side runtime. The template/image must
+  therefore provide every enabled profile's command. Enabling or disabling a
+  profile at runtime is picked up from the server's
+  `daemon:runtime_profiles_changed` event: Foreman re-fetches the list, makes
+  the new list the S-3 source, runs one short registration-discovery probe, and
+  only replaces the declaration after C-1 succeeds; entries that left the
+  declaration are deregistered one by one (the server keeps the row offline).
+  A failed refresh keeps the old declaration and the old S-3 source.
+- **WS degradation**: the refresh trigger is the WS subscription. With
+  `FOREMAN_WS_ENABLED=false`, or while the subscription is down, runtime
+  profile changes do **not** take effect until the next Foreman restart. This
+  is a known degradation, not a silent one: the restart re-fetches the list.
+- **Workspace state**: C-1 seeds `settings` / `repos` / `repos_version` and
+  every S-2 (repo checkout) triggers one C-22 refresh. Values are verbatim: the
+  settings key set is the server's, a `{}` or explicit `null` is replayed as
+  such, and a key the server did not send stays absent. A failed refresh
+  replays the last successful snapshot (`workspace.state_refresh_failed`,
+  metric `foreman_workspace_state_refreshes_total{result="stale_replay"}`) and
+  never blocks the checkout. Settings and repository changes therefore apply to
+  the next task, not to a running one.
+- `FOREMAN_WORKSPACE_STATE_TIMEOUT` (default `5s`) bounds one C-22 refresh;
+  concurrent S-2 requests share one in-flight call.
+- Metrics: `foreman_runtime_profile_refreshes_total{result}` (`success` /
+  `unchanged` / `failed`) and `foreman_workspace_state_refreshes_total{result}`
+  (`success` / `stale_replay` / `failed`). Events: `runtime.profiles_refresh`,
+  `runtime.profiles_refresh_failed`, `workspace.state_refresh_failed`; none
+  carries a task field.
+  - Profile refresh: one outcome per attempt, from every trigger (`change-event`
+    and `runtime-not-found`). `success` = a changed list was committed by a new
+    C-1; `unchanged` = the attempt completed without moving the declaration —
+    an unchanged content projection, or a C-18 404 (the event's `c18` field
+    separates them); `failed` = a step failed (C-18 error/5xx, probe failure,
+    C-1 failure).
+  - Workspace state refresh: `success` = the carrier was replaced;
+    `stale_replay` = the attempt failed and the answer came from the last
+    successful snapshot. `failed` (a failure with no snapshot to replay) is part
+    of the designed vocabulary but is unreachable while the register-before
+    window holds: C-22 is never attempted before C-1 has seeded a snapshot.
 
 ### Skill-bundle resolve cache (ADR-045)
 

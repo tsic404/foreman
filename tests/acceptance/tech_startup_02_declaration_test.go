@@ -27,8 +27,9 @@ func TestStartupDeclarationComesFromProbeRegistration(t *testing.T) {
 	h.useRealBuilder(t)
 	h.rebuildScheduler(t, func(c *schedulerConfig) { c.StartupProbeTimeout = 5 * time.Second })
 
-	// The template environment reports two providers with its own CLI version
-	// and one failed profile: all three travel into C1 verbatim.
+	// The template environment reports two providers (one with a resolvable
+	// custom runtime profile) with its own CLI version and one failed profile:
+	// all of it travels into C1 verbatim.
 	const cliVersion = "0.6.1"
 	const failedProfiles = `[{"profile_id":"pf-1","command_name":"foreman-zz","reason":"no such binary"}]`
 	emptyReposSeen := false
@@ -48,14 +49,18 @@ func TestStartupDeclarationComesFromProbeRegistration(t *testing.T) {
 			t.Errorf("S2 in the pre-C1 window = %d: %s", code, body)
 		}
 		var repos struct {
-			Repos        []any  `json:"repos"`
-			ReposVersion string `json:"repos_version"`
+			Repos        []any           `json:"repos"`
+			ReposVersion string          `json:"repos_version"`
+			Settings     json.RawMessage `json:"settings"`
 		}
 		if err := json.Unmarshal(body, &repos); err != nil {
 			t.Errorf("decode S2 body: %v (%s)", err, body)
 		}
 		if len(repos.Repos) != 0 || repos.ReposVersion != "" {
 			t.Errorf("pre-C1 repos = %s, want an empty list and version", body)
+		}
+		if repos.Settings != nil {
+			t.Errorf("pre-C1 S2 carries settings: %s", body)
 		}
 		emptyReposSeen = true
 
@@ -64,6 +69,7 @@ func TestStartupDeclarationComesFromProbeRegistration(t *testing.T) {
 			"cli_version": "`+cliVersion+`",
 			"runtimes": [
 				{"name": "foreman-omp", "type": "omp", "version": "`+cliVersion+`"},
+				{"name": "foreman-prof", "type": "omp", "version": "0.6.2", "profile_id": "prof-omp"},
 				{"name": "foreman-zz", "type": "zz", "version": "3.1.4"}
 			],
 			"failed_profiles": `+failedProfiles+`
@@ -80,8 +86,8 @@ func TestStartupDeclarationComesFromProbeRegistration(t *testing.T) {
 	if !emptyReposSeen {
 		t.Fatal("the pre-C1 S2 window was never exercised")
 	}
-	if discovery.CLIVersion != cliVersion || len(discovery.Runtimes) != 2 {
-		t.Fatalf("discovery = %+v, want the probe's registration body (N = 2)", discovery)
+	if discovery.CLIVersion != cliVersion || len(discovery.Runtimes) != 3 {
+		t.Fatalf("discovery = %+v, want the probe's registration body (N = 3)", discovery)
 	}
 	if len(discovery.FailedProfiles) != 1 {
 		t.Fatalf("discovery failed_profiles = %v, want the probe's entry", discovery.FailedProfiles)
@@ -89,7 +95,13 @@ func TestStartupDeclarationComesFromProbeRegistration(t *testing.T) {
 
 	// C1 declares the probe's discovery verbatim, and its declaration is what
 	// the runtime set (and every later C2/C3/C20) reads.
-	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+	h.upstream.setRuntimeID("omp", "", "rid-omp")
+	h.upstream.setRuntimeID("omp", "prof-omp", "rid-omp-prof")
+	h.upstream.setRuntimeID("zz", "", "rid-zz")
+	// C-1 seeds the workspace state carrier; S-2 replays it verbatim (§1.7).
+	seedRepos := `[{"url":"https://example.invalid/r","x_repo_key":{"n":1}}]`
+	seedSettings := `{"github_enabled":false,"co_authored_by_enabled":true}`
+	h.upstream.setRegisterWorkspace(seedRepos, "seed-v", seedSettings)
 	h.declare(discovery)
 	register := h.upstream.calls("POST", "/api/daemon/register")
 	if len(register) != 1 {
@@ -103,10 +115,11 @@ func TestStartupDeclarationComesFromProbeRegistration(t *testing.T) {
 			Reason      string `json:"reason"`
 		} `json:"failed_profiles"`
 		Runtimes []struct {
-			Name    string `json:"name"`
-			Type    string `json:"type"`
-			Version string `json:"version"`
-			Status  string `json:"status"`
+			Name      string `json:"name"`
+			Type      string `json:"type"`
+			Version   string `json:"version"`
+			Status    string `json:"status"`
+			ProfileID string `json:"profile_id"`
 		} `json:"runtimes"`
 	}
 	if err := json.Unmarshal(register[0].Body, &body); err != nil {
@@ -121,16 +134,16 @@ func TestStartupDeclarationComesFromProbeRegistration(t *testing.T) {
 	}
 	for i, rt := range body.Runtimes {
 		want := discovery.Runtimes[i]
-		if rt.Type != want.Type || rt.Version != want.Version || rt.Status != "online" {
-			t.Errorf("C1 runtime[%d] = %+v, want %+v carried verbatim with status online", i, rt, want)
+		if rt.Type != want.Type || rt.Version != want.Version || rt.ProfileID != want.ProfileID || rt.Status != "online" {
+			t.Errorf("C1 runtime[%d] = %+v, want %+v carried verbatim (with profile_id) and status online", i, rt, want)
 		}
 	}
 	if len(body.FailedProfiles) != 1 || body.FailedProfiles[0].ProfileID != "pf-1" ||
 		body.FailedProfiles[0].CommandName != "foreman-zz" || body.FailedProfiles[0].Reason != "no such binary" {
 		t.Errorf("C1 failed_profiles = %+v, want the probe's entry carried verbatim", body.FailedProfiles)
 	}
-	if got := h.client.RuntimeIDs(); len(got) != 2 || got[0] != "rid-omp" || got[1] != "rid-zz" {
-		t.Fatalf("real runtime ids = %v, want both declared runtimes", got)
+	if got := h.client.RuntimeIDs(); len(got) != 3 || got[0] != "rid-omp" || got[1] != "rid-omp-prof" || got[2] != "rid-zz" {
+		t.Fatalf("real runtime ids = %v, want all declared runtimes", got)
 	}
 	if got := h.client.CLIVersion(); got != cliVersion {
 		t.Errorf("X-Client-Version after C1 = %q, want the declaration's cli_version", got)
@@ -140,6 +153,35 @@ func TestStartupDeclarationComesFromProbeRegistration(t *testing.T) {
 	// Foreman's own.
 	if got := register[0].Header.Get("X-Client-Version"); got != cliVersion {
 		t.Errorf("C1 X-Client-Version = %q, want the template CLI's %q", got, cliVersion)
+	}
+
+	// AC-37's workspace-state leg: S-2 replays the C-1 seed (settings and
+	// repos verbatim) once the declaration is in.
+	h.jobs.onCreateJob = nil
+	payload := json.RawMessage(`{
+		"id": "task-1", "agent_id": "agent-1", "workspace_id": "ws-1",
+		"runtime_id": "rid-omp", "issue_id": "issue-1", "issue_identifier": "TSI-1"
+	}`)
+	if err := h.sched.OnClaim(t.Context(), payload); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	token := taskToken(t, h, "task-1")
+	code, s2 := h.call("GET", "/api/daemon/workspaces/ws-1/repos", token, nil)
+	if code != 200 {
+		t.Fatalf("S-2 after C-1 = %d: %s", code, s2)
+	}
+	var wsState struct {
+		Repos    json.RawMessage `json:"repos"`
+		Settings json.RawMessage `json:"settings"`
+	}
+	if err := json.Unmarshal(s2, &wsState); err != nil {
+		t.Fatalf("decode S-2: %v (%s)", err, s2)
+	}
+	if string(wsState.Settings) != seedSettings {
+		t.Errorf("S-2 settings = %s, want the C-1 seed %s", wsState.Settings, seedSettings)
+	}
+	if string(wsState.Repos) != seedRepos {
+		t.Errorf("S-2 repos = %s, want the C-1 seed %s", wsState.Repos, seedRepos)
 	}
 
 	// A heartbeat now runs against the declared runtime (per-runtime stream).
