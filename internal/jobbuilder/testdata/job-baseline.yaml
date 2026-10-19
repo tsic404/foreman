@@ -12,6 +12,7 @@
 # issue-identifier / autopilot-run-id / chat-session-id）由 A1.2 先清 `foreman.tsic.top/*` 域再按字段增删 ⇒ CM 写不写都不影响产物，
 # 故基线（= CM 字面）不含；归一化时从实际对象删除，形状由 TC-tech-job-01（issue 触发分支）与 TC-tech-job-04（**首跑**分支）单独断言。
 # **软亲和项在渲染面上的取舍（取值 → 恰一项 / 不满足条件 → 删项并上收空结构）由 TC-tech-job-01 步骤 3b 与 TC-tech-cache-05/06 断言（ADR-015）。**
+# `prepare` 的 chown 目标含 `/state/workspaces`（ADR-011 / AC-13 的属主面；由 tests/acceptance/tech_security_01_permission_boundary_test.go 的字面断言锁定）。
 # 修订参考模板时：基线夹具与部署清单两处必须同 PR 同步（同一份字面，AC-20 断言逐字一致）。
 # 末段 Secret 文档是该夹具的**凭据回归面**，不是模板内容（模板 = 单份 `batch/v1 Job`）。
 apiVersion: batch/v1
@@ -116,7 +117,7 @@ spec:
               rm -rf /home/agent/.multica/daemon_task_context.json
               cp /cred/config.json /credout/config.json
               chmod 0400 /credout/config.json
-              chown -R 1000:1000 /home/agent /credout
+              chown -R 1000:1000 /home/agent /state/workspaces /credout
           securityContext:
             runAsUser: 0
             runAsNonRoot: false

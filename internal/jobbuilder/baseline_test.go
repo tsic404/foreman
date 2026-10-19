@@ -15,11 +15,14 @@ import (
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 )
 
-// baselinePath is the AC-20 authority: the in-repo baseline below, whose Job
-// document is the reference template the deployment publishes
-// (deploy/25-job-template.yaml) — one copy each, same bytes — so editing
-// the reference template means syncing this copy and the ConfigMap in the
-// same change.
+// baselinePath is the AC-20 authority: the in-repo baseline whose Job document
+// is the reference template the deployment publishes
+// (deploy/25-job-template.yaml) — one copy each, same bytes. Editing the
+// reference template means syncing this copy, the ConfigMap and the design
+// statement that carries the authority (docs/03-acceptance.md AC-20, a design PR
+// in the same change); the design's requirements (ADR-011's ownership targets,
+// AC-13) are what the content is held to — see the prepare assertion in
+// tech_security_01_permission_boundary_test.go.
 const baselinePath = "testdata/job-baseline.yaml"
 
 // referenceTemplatePath writes the baseline's Job document — the reference
