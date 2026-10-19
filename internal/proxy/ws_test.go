@@ -454,6 +454,43 @@ func TestWSSubscriberHandshake404BacksOff(t *testing.T) {
 	cancel()
 }
 
+// TestWSSubscriberStopsOnHandshake403: a 403 handshake is the
+// credential/identity mismatch of §1.5 — a configuration error, not a
+// transient one. The subscriber must report it instead of backing off
+// forever: the process fails visibly (its restart is the alarm).
+func TestWSSubscriberStopsOnHandshake403(t *testing.T) {
+	var dials atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/daemon/ws", func(w http.ResponseWriter, _ *http.Request) {
+		dials.Add(1)
+		w.WriteHeader(http.StatusForbidden)
+		_, _ = w.Write([]byte(`{"error":"token does not match daemon_id"}`))
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	client := NewClient(testConfig(srv.URL), "mdt_test")
+	// The declaration normally comes from the startup probe; seeding it
+	// directly keeps this test on the handshake branch alone.
+	client.refs = []RuntimeRef{{ID: "rid-real", Provider: "omp", Name: "foreman-omp"}}
+	sub := NewWSSubscriber(client, func() {}, nil)
+	sub.waitSteps = []time.Duration{time.Millisecond}
+
+	done := make(chan error, 1)
+	go func() { done <- sub.Run(t.Context()) }()
+	select {
+	case err := <-done:
+		if err == nil || !strings.Contains(err.Error(), "403") {
+			t.Fatalf("Run error = %v, want the 403 config error", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("Run must stop on a 403 handshake instead of retrying")
+	}
+	if got := dials.Load(); got != 1 {
+		t.Errorf("dials = %d, want exactly 1 (no blind retry)", got)
+	}
+}
+
 // TestWSSubscriberDialTimeout: a peer that accepts TCP but never answers
 // the upgrade must not wedge the subscriber (§1.5 control-plane timeout).
 func TestWSSubscriberDialTimeout(t *testing.T) {

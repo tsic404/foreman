@@ -17,7 +17,6 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
-	"sync"
 	"syscall"
 	"time"
 
@@ -241,11 +240,15 @@ func run() error {
 	}
 	fakeServer := proxy.NewFakeServer(issuer, reg, sched, client, ws, metrics, proxy.WithProbeRegistry(probes))
 	reporter := proxy.NewModelCatalogReporter(proxyCfg, client, sched, slots, metrics, proxy.WithReporterLogger(baseLog))
+	// The liveness view the health endpoint serves (§9.3): the loops register
+	// as they start, and a critical loop that stops turns the probe red.
+	health := observability.NewHealth()
 	ops := observability.NewOpsHandler(metrics, reg, observability.NewK8sPodLogReader(clientset), observability.OpsConfig{
 		Version:        version,
 		JobImage:       jbCfg.JobImage,
 		RuntimeIDs:     client.RuntimeIDs,
 		RegisterSource: registerSourceView(client, slots),
+		Health:         health,
 		StartedAt:      started,
 		Logger:         baseLog,
 	})
@@ -261,19 +264,11 @@ func run() error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	var wg sync.WaitGroup
-	run := func(component string, f func(context.Context) error) {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			// Loops return nil on cancellation; anything else is reported
-			// and must not take the whole server down (its siblings keep
-			// serving; the container's liveness probe owns restarts).
-			if err := f(ctx); err != nil && ctx.Err() == nil {
-				baseLog.Error("component.stopped", "component", component, "err", err.Error())
-			}
-		}()
-	}
+	// The loops are supervised: a stop with a live context is a process-level
+	// failure (§1.5) and takes the process down for a visible restart, while
+	// the ordinary cancellation path stays a graceful shutdown.
+	sup := newSupervisor(baseLog, health, stop)
+	run := func(component string, f func(context.Context) error) { sup.run(ctx, component, f) }
 
 	// Startup orchestration (ADR-025): the startup probe runs before C1, so
 	// the server sees the template environment's real runtimes. The listener
@@ -371,11 +366,21 @@ func run() error {
 		return nil
 	}
 
+	// A component error recorded before the root context ended is fatal: the
+	// credential/identity defect cannot be retried into working, and a
+	// non-zero exit is what makes the Deployment restart (and eventually
+	// CrashLoopBackOff) — the alarm §1.5 requires.
+	fatalErr := sup.failure()
+	reason := "signal"
+	if fatalErr != nil {
+		reason = "component failure"
+	}
+
 	// Shutdown: stop the loops, deregister the runtime (C14) so the server
 	// releases it immediately, then drain HTTP.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
-	log.Info("foreman.stopping", "reason", "signal")
+	log.Info("foreman.stopping", "reason", reason)
 	if err := client.Deregister(shutdownCtx); err != nil {
 		log.Warn("daemon.deregister_failed", "err", err.Error())
 	}
@@ -384,19 +389,15 @@ func run() error {
 	}
 	// The loop drain shares the shutdown budget: kubelet SIGKILLs at the
 	// deployment's terminationGracePeriodSeconds (30s), and the 20s budget
-	// here stays inside it — an unbounded wg.Wait would leave no
+	// here stays inside it — an unbounded wait would leave no
 	// foreman.stopped line at all.
-	loopsDone := make(chan struct{})
-	go func() {
-		wg.Wait()
-		close(loopsDone)
-	}()
-	select {
-	case <-loopsDone:
-	case <-shutdownCtx.Done():
+	if !sup.wait(shutdownCtx) {
 		log.Warn("loops.shutdown_timeout", "err", shutdownCtx.Err().Error())
 	}
 	log.Info("foreman.stopped")
+	if fatalErr != nil {
+		return fatalErr
+	}
 	return nil
 }
 
