@@ -51,6 +51,12 @@ type Settler interface {
 	// SweepOrphanSecrets deletes credential Secrets whose task has no
 	// registry entry (any state) and no Job object (§6.5).
 	SweepOrphanSecrets(ctx context.Context) error
+	// DrainPendingReports re-delivers the durable terminal-report queue
+	// through the single terminal face and returns how many reports are
+	// still undelivered (§10). The queue is the scheduler's (ADR-031), so the
+	// recovery loop reaches it through this seam — the existing
+	// recovery → scheduler direction.
+	DrainPendingReports(ctx context.Context) (int, error)
 	// SyncInflight re-derives the inflight gauge from the live index. The
 	// round calls it on entry and a ticker repeats it every interval, so a
 	// settlement path that missed its own refresh cannot keep a stale count.

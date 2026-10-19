@@ -309,12 +309,46 @@ func (r *Registry) MarkTerminal(taskID string, result Result, reason string, com
 }
 
 // settledRecord strips the memory-only secrets from the entry the settled
-// index retains: the retention window must never hold a payload body (F3) or
-// a token digest (ADR-017).
+// index retains: the retention window must never hold a payload body (F3), a
+// token digest (ADR-017) or a decided terminal body (the durable queue keeps
+// its own copy).
 func settledRecord(e TaskEntry) TaskEntry {
 	e.Payload = nil
 	e.TokenHash = ""
+	e.DecidedReport = nil
 	return e
+}
+
+// DecidedReport returns the terminal body registered for the instance. Its
+// presence is the "already decided" criterion of the attribution gate
+// (§4.4, ADR-031).
+func (r *Registry) DecidedReport(taskID string) ([]byte, bool) {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	e, ok := r.live[taskID]
+	if !ok || len(e.DecidedReport) == 0 {
+		return nil, false
+	}
+	return e.DecidedReport, true
+}
+
+// RegisterDecidedReport records body as the instance's decided terminal body
+// unless one is already registered — the first decision wins, so a replay, a
+// compensation or a late report can never displace the body its verdict was
+// forwarded with (§4.4, ADR-031). A missing entry leaves the registry
+// untouched. It returns the entry as it stands after the call.
+func (r *Registry) RegisterDecidedReport(taskID string, body []byte) (TaskEntry, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.live[taskID]
+	if !ok {
+		return TaskEntry{}, false
+	}
+	if len(e.DecidedReport) == 0 && len(body) > 0 {
+		e.DecidedReport = body
+		r.live[taskID] = e
+	}
+	return e, true
 }
 
 // SetTokenHash records sha256(token) of the Job's credential. OnClaim is the

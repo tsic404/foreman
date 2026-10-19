@@ -92,6 +92,10 @@ type fakeSettler struct {
 	alivePodsErr     error
 	reclaimErr       error
 	sweepErr         error
+	// DrainPendingReports' programmed answer.
+	drainCalls     int
+	drainRemaining int
+	drainErr       error
 }
 
 func (f *fakeSettler) OnJobGone(_ context.Context, jobName string) error {
@@ -179,6 +183,15 @@ func (f *fakeSettler) SyncInflight() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.syncs++
+}
+
+// DrainPendingReports stands in for the scheduler's queue drain: the queue is
+// the scheduler's own (ADR-031), so the round reaches it here.
+func (f *fakeSettler) DrainPendingReports(context.Context) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.drainCalls++
+	return f.drainRemaining, f.drainErr
 }
 
 func (f *fakeSettler) calls() (int, int, int, int, int) {
@@ -747,38 +760,21 @@ func TestSuspectIgnoresUnregisteredDaemons(t *testing.T) {
 
 // ---- §4.6/§10: durable report queue -------------------------------------
 
+// TestReconcileDrainsPendingReports pins the round's queue call: the queue is
+// the scheduler's own (ADR-031), so the recovery loop reaches it through the
+// settlement surface once per round, and a failing drain never fails the
+// round.
 func TestReconcileDrainsPendingReports(t *testing.T) {
 	reg := newRegistry(t)
-	set := &fakeSettler{}
-	queue, err := NewPendingReports(t.TempDir())
-	if err != nil {
-		t.Fatalf("NewPendingReports: %v", err)
-	}
-	if err := queue.Enqueue("t1", "fm-t1", "fm-t1", scheduler.EPComplete, []byte(`{"status":"completed"}`)); err != nil {
-		t.Fatalf("Enqueue: %v", err)
-	}
-	sender := &recordingSender{}
-	r := newTestReconciler(t, reg, &fakeObjects{}, &fakeStatus{}, set,
-		WithPendingReports(queue, sender))
+	set := &fakeSettler{drainRemaining: 1, drainErr: errors.New("upstream down")}
+	r := newTestReconciler(t, reg, &fakeObjects{}, &fakeStatus{}, set)
 
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if len(sender.calls) != 1 || sender.calls[0] != "t1" {
-		t.Fatalf("delivered = %v, want [t1]", sender.calls)
+	if set.drainCalls != 1 {
+		t.Fatalf("drain calls = %d, want 1", set.drainCalls)
 	}
-	if queue.Len() != 0 {
-		t.Fatalf("queue.Len() = %d, want 0 after a successful drain", queue.Len())
-	}
-}
-
-type recordingSender struct {
-	calls []string
-}
-
-func (s *recordingSender) Forward(_ context.Context, _ scheduler.Endpoint, taskID string, _ []byte) (int, []byte, error) {
-	s.calls = append(s.calls, taskID)
-	return 200, nil, nil
 }
 
 // ---- error handling -----------------------------------------------------

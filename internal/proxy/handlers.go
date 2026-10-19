@@ -444,10 +444,14 @@ func (s *FakeServer) reportHandler(ep scheduler.Endpoint) http.HandlerFunc {
 		if !ok {
 			return
 		}
+		// The learning slot is the only place a report body's field is read:
+		// it hands the S13/S14 session value to the report face, which the
+		// attribution gate's compensation body carries back (ADR-031).
+		sessionID := ""
 		if learnsSession(ep) {
-			s.learnSession(e, body)
+			sessionID = s.learnSession(e, body)
 		}
-		code, resp, err := s.sched.OnReport(r.Context(), ep, e, body)
+		code, resp, err := s.sched.OnReport(r.Context(), ep, e, body, sessionID)
 		if err != nil {
 			s.log.Error("report forward failed",
 				"task_id", e.TaskID, "job_name", e.JobName, "endpoint", string(ep), "err", err)
@@ -477,18 +481,22 @@ func learnsSession(ep scheduler.Endpoint) bool {
 // queue rather than dropped. A body without a session id, or a task whose pod
 // placement was never observed, teaches nothing — the index holds no key that
 // could not hit.
-func (s *FakeServer) learnSession(e registry.TaskEntry, body []byte) {
-	if e.NodeName == "" {
-		return
-	}
+//
+// It returns the raw session value the same read produced, even when nothing
+// was learned: the attribution gate's compensation body carries it back to
+// the server (ADR-031), so the single-field read stays in this one place.
+func (s *FakeServer) learnSession(e registry.TaskEntry, body []byte) string {
 	var report struct {
 		SessionID string `json:"session_id"`
 	}
 	// Only session_id is read; a body that is not an object simply has none.
 	if err := json.Unmarshal(body, &report); err != nil {
-		return
+		return ""
 	}
-	s.reg.LearnSession(registry.SessionKey(report.SessionID), e.NodeName)
+	if e.NodeName != "" {
+		s.reg.LearnSession(registry.SessionKey(report.SessionID), e.NodeName)
+	}
+	return report.SessionID
 }
 
 // ---- S18 recover-orphans ----

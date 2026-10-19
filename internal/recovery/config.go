@@ -3,14 +3,12 @@ package recovery
 import (
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"time"
 )
 
 // Environment variable names read by the recovery module.
 const (
-	EnvStateRoot         = "FOREMAN_STATE_ROOT"
 	EnvReconcileInterval = "FOREMAN_RECONCILE_INTERVAL"
 	// EnvAgentStateTTL is shared with foreman-gc: there it is the retention of
 	// the node-local agent state, here the expiry window of the session index
@@ -20,8 +18,6 @@ const (
 
 // Default values applied when the environment variable is unset.
 const (
-	DefaultStateRoot = "/var/lib/foreman"
-
 	// DefaultReconcileInterval is how often the convergence loop runs.
 	DefaultReconcileInterval = 30 * time.Second
 
@@ -29,19 +25,6 @@ const (
 	// uses for the same env.
 	DefaultAgentStateTTL = 336 * time.Hour
 )
-
-// PendingReportsDir resolves the durable queue directory:
-// FOREMAN_STATE_ROOT/pending-reports (contract §10).
-func PendingReportsDir(getenv func(string) string) string {
-	if getenv == nil {
-		getenv = os.Getenv
-	}
-	root := strings.TrimSpace(getenv(EnvStateRoot))
-	if root == "" {
-		root = DefaultStateRoot
-	}
-	return filepath.Join(root, "pending-reports")
-}
 
 // Config is the recovery module's runtime configuration. The dependency
 // seams (Registry, Objects, Server, Settler, ...) are set on the Reconciler

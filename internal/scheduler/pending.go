@@ -1,9 +1,4 @@
-// Package recovery implements the failure-compensation and recovery side of
-// Foreman: the durable pending terminal-report queue, the restart/failure
-// reconciler over the Job/Pod facts and the server's C13 truth, the K8s
-// object watcher, the heartbeat-suspect signal and the cancel-ack timeout.
-// Design: 02-contracts.md §4.2, §10.
-package recovery
+package scheduler
 
 import (
 	"context"
@@ -18,17 +13,38 @@ import (
 	"strings"
 	"sync"
 	"time"
-
-	"github.com/tsic404/foreman/internal/scheduler"
 )
 
 // PendingReportTTL caps how long a queued terminal report is retried before
 // it is dropped with an error log (§10: 上限 24h).
 const PendingReportTTL = 24 * time.Hour
 
-// ReportSender re-delivers a queued report; satisfied by proxy.Client.
+// EnvStateRoot is FOREMAN_STATE_ROOT: the node-local state root the queue
+// lives under (the same root the GC module reclaims).
+const EnvStateRoot = "FOREMAN_STATE_ROOT"
+
+// DefaultStateRoot is the state root applied when FOREMAN_STATE_ROOT is unset.
+const DefaultStateRoot = "/var/lib/foreman"
+
+// PendingReportsDir resolves the durable queue directory:
+// FOREMAN_STATE_ROOT/pending-reports (contract §10).
+func PendingReportsDir(getenv func(string) string) string {
+	if getenv == nil {
+		getenv = os.Getenv
+	}
+	root := strings.TrimSpace(getenv(EnvStateRoot))
+	if root == "" {
+		root = DefaultStateRoot
+	}
+	return filepath.Join(root, "pending-reports")
+}
+
+// ReportSender re-delivers a queued terminal report through the scheduler's
+// single terminal face; satisfied by *Scheduler (DeliverQueued). A replay is
+// not an inbound report: it never enters the attribution gate, and it sends
+// the instance's decided body when one is registered (ADR-031).
 type ReportSender interface {
-	Forward(ctx context.Context, ep scheduler.Endpoint, taskID string, body []byte) (int, []byte, error)
+	DeliverQueued(ctx context.Context, ep Endpoint, taskID string, body []byte) (int, []byte, error)
 }
 
 // pendingReport is one queued terminal report (contract §10). The file is
@@ -50,7 +66,10 @@ var taskIDFileChars = regexp.MustCompile(`^[a-zA-Z0-9-]+$`)
 func validTaskID(taskID string) bool { return taskIDFileChars.MatchString(taskID) }
 
 // PendingReports is the durable terminal-report queue
-// (FOREMAN_STATE_ROOT/pending-reports/<taskid>.json, contract §10).
+// (FOREMAN_STATE_ROOT/pending-reports/<taskid>.json, contract §10). Its host
+// is the scheduler (ADR-031): every enqueue carries the body that was actually
+// forwarded, and the recovery loop drains the queue through the Settler seam,
+// so there is one queue behind every terminal-report path.
 type PendingReports struct {
 	dir string
 	now func() time.Time
@@ -117,7 +136,7 @@ func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReport
 // reports it as undelivered, so the task's objects stay until it landed. The
 // returned error is that error row's "记 error" half — never a reason to
 // discard the report.
-func (p *PendingReports) Enqueue(taskID, jobName, daemonID string, ep scheduler.Endpoint, body []byte) error {
+func (p *PendingReports) Enqueue(taskID, jobName, daemonID string, ep Endpoint, body []byte) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	rep := pendingReport{
@@ -200,7 +219,7 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 			p.mu.Unlock()
 			continue
 		}
-		code, _, err := sender.Forward(ctx, scheduler.Endpoint(rep.Endpoint), rep.TaskID, rep.Body)
+		code, _, err := sender.DeliverQueued(ctx, Endpoint(rep.Endpoint), rep.TaskID, rep.Body)
 		delivered := err == nil && ((code >= 200 && code < 300) || code == 404 || code == 409)
 		p.mu.Lock()
 		if delivered {

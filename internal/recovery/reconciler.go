@@ -1,3 +1,9 @@
+// Package recovery implements the failure-compensation and recovery side of
+// Foreman: the restart/failure reconciler over the Job/Pod facts and the
+// server's C13 truth, the K8s object watcher, the heartbeat-suspect signal
+// and the cancel-ack timeout. The durable terminal-report queue is the
+// scheduler's own (ADR-031) and is drained through the settlement surface.
+// Design: 02-contracts.md §4.2, §10.
 package recovery
 
 import (
@@ -101,8 +107,6 @@ type Reconciler struct {
 	jobGoneWindow    time.Duration
 
 	watcher Watcher
-	pending *PendingReports
-	sender  ReportSender
 
 	// mu serializes rounds: reconcileOne is reentrant-safe because the
 	// watcher and the timer only ever ask for another round, never settle
@@ -134,15 +138,6 @@ type Option func(*Reconciler)
 // WithWatcher wires the K8s object watcher that triggers immediate rounds.
 func WithWatcher(w Watcher) Option {
 	return func(r *Reconciler) { r.watcher = w }
-}
-
-// WithPendingReports wires the durable terminal-report queue and the sender
-// that re-delivers its entries (contract §10).
-func WithPendingReports(p *PendingReports, sender ReportSender) Option {
-	return func(r *Reconciler) {
-		r.pending = p
-		r.sender = sender
-	}
 }
 
 // WithMetrics wires the observability seam.
@@ -436,7 +431,7 @@ func (r *Reconciler) reconcileOne(ctx context.Context, e registry.TaskEntry, pod
 		return r.settler.OnJobGone(ctx, e.JobName)
 	}
 	delete(r.missing, e.JobName)
-	if reason, ended := jobEndReason(job, pods); ended {
+	if reason, ended := jobEndReason(job, pods, e.JobCreatedAt); ended {
 		return r.settleEnded(ctx, e, reason)
 	}
 	delete(r.ended, e.JobName)
@@ -660,12 +655,11 @@ func (r *Reconciler) reportSuspects(ctx context.Context) {
 
 // drainPending re-delivers the durable terminal-report queue every round
 // (§4.6/§10): the contract bounds a restored Foreman's catch-up to
-// 2×FOREMAN_RECONCILE_INTERVAL (§10 可靠性).
+// 2×FOREMAN_RECONCILE_INTERVAL (§10 可靠性). The queue is the scheduler's
+// (ADR-031), so the drain is a call on the settlement surface — the existing
+// recovery → scheduler direction.
 func (r *Reconciler) drainPending(ctx context.Context) {
-	if r.pending == nil || r.sender == nil {
-		return
-	}
-	if n, err := r.pending.Drain(ctx, r.sender); err != nil {
+	if n, err := r.settler.DrainPendingReports(ctx); err != nil {
 		r.log.WarnContext(ctx, "pending.drain_failed", "queued", n, "err", err)
 	}
 }

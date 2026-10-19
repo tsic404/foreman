@@ -132,7 +132,7 @@ func TestIntegrationTerminalReportTransportErrorKeepsInflightGaugeInSync(t *test
 	}
 
 	server.setForwardErr(errors.New("dial tcp 10.0.0.1:443: connect: connection refused"))
-	code, _, err := sched.OnReport(ctx, scheduler.EPFail, entry, []byte(`{"error":"boom"}`))
+	code, _, err := sched.OnReport(ctx, scheduler.EPFail, entry, []byte(`{"error":"boom"}`), "")
 	if err != nil {
 		t.Fatalf("OnReport: %v", err)
 	}
@@ -165,9 +165,9 @@ func TestIntegrationInflightGaugeConvergesWhileARoundIsBusy(t *testing.T) {
 	if err := pending.Enqueue("t1", "fm-t1", "fm-t1", scheduler.EPFail, []byte(`{"error":"boom"}`)); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
-	busy := &stallingSender{entered: make(chan struct{}, 1), release: make(chan struct{})}
+	busy := &stallingSettler{Settler: sched, entered: make(chan struct{}, 1), release: make(chan struct{})}
 	rec := newReconciler(&fakeObjects{job: runningJob(fakeJobName("t1"))})
-	WithPendingReports(pending, busy)(rec)
+	rec.settler = busy
 	rec.cfg.ReconcileInterval = interval
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -197,13 +197,16 @@ func TestIntegrationInflightGaugeConvergesWhileARoundIsBusy(t *testing.T) {
 		scrapeGauge(t, metrics.Handler(), "foreman_inflight_jobs"), reg.Inflight())
 }
 
-// stallingSender parks the queue drain of a round until it is released.
-type stallingSender struct {
+// stallingSettler parks the round's queue drain until it is released: the
+// queue is the scheduler's own (ADR-031), so the round reaches it through the
+// settlement surface.
+type stallingSettler struct {
+	Settler
 	entered chan struct{}
 	release chan struct{}
 }
 
-func (s *stallingSender) Forward(ctx context.Context, _ scheduler.Endpoint, _ string, _ []byte) (int, []byte, error) {
+func (s *stallingSettler) DrainPendingReports(ctx context.Context) (int, error) {
 	select {
 	case s.entered <- struct{}{}:
 	default:
@@ -211,8 +214,9 @@ func (s *stallingSender) Forward(ctx context.Context, _ scheduler.Endpoint, _ st
 	select {
 	case <-s.release:
 	case <-ctx.Done():
+		return 0, ctx.Err()
 	}
-	return 200, nil, nil
+	return s.Settler.DrainPendingReports(ctx)
 }
 
 // The boot-timeout path is the control the field report held up as working:

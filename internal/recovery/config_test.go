@@ -44,21 +44,6 @@ func TestLoadConfigRejectsBadInterval(t *testing.T) {
 	}
 }
 
-func TestPendingReportsDirFollowsStateRoot(t *testing.T) {
-	got := PendingReportsDir(func(key string) string {
-		if key == EnvStateRoot {
-			return "/srv/foreman/"
-		}
-		return ""
-	})
-	if got != "/srv/foreman/pending-reports" {
-		t.Fatalf("PendingReportsDir = %q", got)
-	}
-	if got := PendingReportsDir(func(string) string { return "" }); got != DefaultStateRoot+"/pending-reports" {
-		t.Fatalf("PendingReportsDir default = %q", got)
-	}
-}
-
 func TestCompensatorFailDelegatesAndSurfacesErrors(t *testing.T) {
 	set := &fakeSettler{}
 	c := NewCompensator(set, nil)

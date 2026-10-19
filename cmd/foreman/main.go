@@ -158,11 +158,12 @@ func run() error {
 	)
 
 	// Terminal reports that exhausted the retry budget are queued on the
-	// node-local state root and re-sent by the reconciler (contract §10).
-	pending, err := recovery.NewPendingReports(
-		recovery.PendingReportsDir(getenv),
-		recovery.WithPendingReportsGauge(metrics.PendingReports),
-		recovery.WithPendingReportsLogger(baseLog),
+	// node-local state root and re-sent through the scheduler's single
+	// terminal face (contract §10, ADR-031).
+	pending, err := scheduler.NewPendingReports(
+		scheduler.PendingReportsDir(getenv),
+		scheduler.WithPendingReportsGauge(metrics.PendingReports),
+		scheduler.WithPendingReportsLogger(baseLog),
 	)
 	if err != nil {
 		return err
@@ -219,7 +220,6 @@ func run() error {
 		client,
 		sched,
 		recovery.WithWatcher(objects),
-		recovery.WithPendingReports(pending, client),
 		recovery.WithMetrics(metrics),
 		recovery.WithLogger(baseLog),
 	)

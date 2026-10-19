@@ -197,15 +197,27 @@ func (k *keyedMutex) Lock(key string) func() {
 // not settle itself. A forward that does not land hands the very same bytes
 // to the durable pending-report queue (§10), so the report is
 // delivered even if this process dies right after.
+//
+// sessionID is the raw session value the learning slot already read from the
+// S13/S14 body (ADR-031): a suppression of the daemon's self-report would
+// otherwise lose the server's session record and the resuming task's
+// prior_session_id affinity. The convergence path has no session value to
+// carry — the daemon never reported — so it stays empty there.
 type failReport struct {
-	reason  string
-	message string
+	reason    string
+	message   string
+	sessionID string
 }
 
-// encode renders the C10 request body.
+// encode renders the C10 request body. session_id appears only when a raw
+// value exists; the no-session form keeps the existing two-key shape.
 func (r failReport) encode() []byte {
+	fields := map[string]string{"error": r.message, "failure_reason": r.reason}
+	if r.sessionID != "" {
+		fields["session_id"] = r.sessionID
+	}
 	// A map[string]string cannot fail to marshal.
-	body, _ := json.Marshal(map[string]string{"error": r.message, "failure_reason": r.reason})
+	body, _ := json.Marshal(fields)
 	return body
 }
 
@@ -223,10 +235,10 @@ func WithReconciler(r Reconciler) Option {
 	return func(s *Scheduler) { s.reconciler = r }
 }
 
-// WithPendingReports wires the recovery module's durable terminal-report
-// queue; a terminal report whose forward failed outright or exhausted the
-// proxy's retry budget is enqueued instead of dropped (§10).
-func WithPendingReports(p PendingReports) Option {
+// WithPendingReports wires the durable terminal-report queue; a terminal
+// report whose forward failed outright or exhausted the proxy's retry budget
+// is enqueued instead of dropped (§10).
+func WithPendingReports(p PendingReportQueue) Option {
 	return func(s *Scheduler) { s.pendingReports = p }
 }
 
@@ -271,11 +283,17 @@ type Scheduler struct {
 
 	probes         *registry.ProbeRegistry
 	reconciler     Reconciler
-	pendingReports PendingReports
+	pendingReports PendingReportQueue
 	now            func() time.Time
 	// runtimeIdentity resolves a claim's real runtime id into its declared
 	// identity; nil leaves entries without one (S-4 then refuses).
 	runtimeIdentity RuntimeIdentityResolver
+
+	// attributionWait is the attribution gate's wait upper bound (ADR-031):
+	// the implementation constant defaultAttributionWait. It is kept as a
+	// field only so package tests can shrink it — it is not a configuration
+	// item and no env carries it.
+	attributionWait time.Duration
 
 	// taskMu serializes the per-task transitions (OnClaim and every
 	// settlement path): a settlement that ran concurrently with an in-flight
@@ -310,6 +328,8 @@ func New(cfg Config, reg *registry.Registry, jobs JobClient, builder JobBuilder,
 		now:     time.Now,
 
 		taskMu: newKeyedMutex(),
+
+		attributionWait: defaultAttributionWait,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -845,13 +865,21 @@ func (s *Scheduler) Deliver(daemonID string, runtimeID string, maxTasks int) ([]
 // settles it through OnStartRejected — and its whole round (forward, answer,
 // transition) runs under the task's lock, so no settlement path can settle
 // the entry while that answer is still outstanding.
-func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEntry, body []byte) (int, []byte, error) {
+//
+// sessionID is the raw session value the learning slot read from an S13/S14
+// body: an S14 the attribution gate suppresses reports it back in the
+// compensation body (ADR-031).
+func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEntry, body []byte, sessionID string) (int, []byte, error) {
 	unlock := func() {}
 	if ep == EPStart {
 		unlock = s.taskMu.Lock(e.TaskID)
 	}
 	defer unlock()
 	now := s.now()
+	// undecided is the instance's first terminal decision inside this report:
+	// it separates a fresh verdict from an already-decided replay, which
+	// §4.4's 404 branch must not rewrite.
+	undecided := false
 	if ep.IsTerminal() {
 		// The gauge follows the index on every exit of a terminal report —
 		// including the transport-error exit below, which only queues the
@@ -859,18 +887,46 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		// refresh registered after the forward would leave the pre-terminal
 		// value standing (§9.2, AC-10).
 		defer s.SyncInflight()
-		if !e.IsTerminal() {
+		verdict := gateUndecided
+		if !e.IsTerminal() && len(e.DecidedReport) == 0 && ep == EPFail {
+			// §4.4/ADR-031: the S14 branch's first step is the attribution
+			// gate. It faces only this shape — an undecided inbound daemon
+			// failure self-report; a decided instance and the forwards
+			// produced by a verdict (compensation, queue replay) never enter.
+			e, body, verdict = s.attributionGate(ctx, e, body, sessionID)
+			now = s.now()
+		}
+		// The terminal write and the decided-body registration run under the
+		// task's lock, on a fresh read: the gate's wait opens a window in
+		// which another path (the convergence compensation, a late report)
+		// can settle this instance, and §4.4 forbids rewriting a decided one.
+		// The gate's verdict distinguishes its own settlement from such a
+		// decision; both skip this report's write.
+		unlockTerminal := s.taskMu.Lock(e.TaskID)
+		if fresh, ok := s.reg.Get(e.TaskID); ok {
+			e = fresh
+		}
+		undecided = verdict == gateUndecided && !e.IsTerminal() && len(e.DecidedReport) == 0
+		if undecided {
 			result := registry.Result(ep.TerminalResult())
 			if _, err := s.reg.MarkTerminal(e.TaskID, result, "", now); err != nil {
+				unlockTerminal()
 				return 0, nil, err
 			}
-			e.State = registry.StateTerminal
-			e.Result = result
 			s.metrics.TaskTerminal(string(result))
 			s.log.InfoContext(ctx, "task.terminal",
 				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 				"result", string(result),
 				"duration_seconds", now.Sub(e.ClaimedAt).Seconds())
+			// The instance's first terminal forward decides its body: every
+			// later terminal forward takes this one (§4.4).
+			if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body); ok {
+				e = registered
+			}
+		}
+		unlockTerminal()
+		if decided, ok := s.reg.DecidedReport(e.TaskID); ok {
+			body = decided
 		}
 	}
 
@@ -879,7 +935,9 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		if ep.IsTerminal() {
 			// The proxy's retry budget is exhausted (or the transport is
 			// down): §10 forbids dropping the report — queue it and
-			// tell the daemon the upstream is unavailable.
+			// tell the daemon the upstream is unavailable. The queued body is
+			// the one actually forwarded: the decided body when one is
+			// registered.
 			s.enqueuePending(ctx, e, ep, body)
 			return http.StatusBadGateway, upstreamUnavailableBody, nil
 		}
@@ -890,8 +948,18 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		case code >= 200 && code < 300:
 			s.deleteJob(ctx, e)
 		case code == 404:
-			// The server already forgot the task: the report is moot and the
-			// cleanup idempotent (§4.4: nothing left to write).
+			// §4.4's in-place decision: the server no longer holds the task,
+			// so nothing is writable. A report that was still undecided
+			// settles with no result; an already-decided replay keeps the
+			// verdict it was decided with. Nothing is queued or retried, and
+			// the Job deletion is idempotent.
+			if undecided {
+				if _, err := s.reg.MarkTerminal(e.TaskID, "", "", s.now()); err != nil {
+					s.log.ErrorContext(ctx, "task.settle_failed",
+						"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+						"reason", "server has no record of the task", "err", err)
+				}
+			}
 			s.deleteJob(ctx, e)
 			return 200, resp, nil
 		case code == 400 || code == 403 || code == 409:
@@ -959,12 +1027,13 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 // undeliverable forward.
 var upstreamUnavailableBody = []byte(`{"error":"upstream unavailable"}`)
 
-// enqueuePending lands a terminal report in the recovery module's durable
-// queue (§10: terminal callbacks are never dropped). A write that
-// fails is the queue's own error row: it keeps the report staged and retries
-// it every drain (§1.5 退避后重试), and Queued reports it as
-// undelivered so the entry's objects stay put. The error is logged, never
-// acted on — dropping the report here is exactly what §10 forbids.
+// enqueuePending lands a terminal report in the scheduler's durable queue
+// (§10: terminal callbacks are never dropped) — the body actually forwarded,
+// so a replay sends the instance's decided body. A write that fails is the
+// queue's own error row: it keeps the report staged and retries it every
+// drain (§1.5 退避后重试), and Queued reports it as undelivered so the
+// entry's objects stay put. The error is logged, never acted on — dropping
+// the report here is exactly what §10 forbids.
 func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep Endpoint, body []byte) {
 	if err := s.pendingReports.Enqueue(e.TaskID, e.JobName, e.DaemonID, ep, body); err != nil {
 		s.log.ErrorContext(ctx, "task.forward_undelivered",
@@ -1175,21 +1244,19 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 }
 
 // failEntry settles a task as failed on the daemon's behalf: the terminal
-// write first (markTerminal is the single write path, §4.2), then the
-// C10 report, then the Job deletion. The verdict also starts the drain, so
-// the credential and the entry stay until the Job terminates or the upper
-// bound expires (ADR-017). A report that does not land is in the durable
-// queue now, so the Job stays until a drain lands it (§10) —
-// deleting it would let a Job deletion stand in for a delivered report.
+// write and the decided-body registration first (markTerminal is the single
+// write path, §4.2), then the C10 report, then the Job deletion. The verdict
+// also starts the drain, so the credential and the entry stay until the Job
+// terminates or the upper bound expires (ADR-017). A report that does not
+// land is in the durable queue now, so the Job stays until a drain lands it
+// (§10) — deleting it would let a Job deletion stand in for a delivered
+// report.
 func (s *Scheduler) failEntry(ctx context.Context, e registry.TaskEntry, report failReport) error {
-	s.log.ErrorContext(ctx, "task.failed_compensated",
-		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
-		"failure_reason", report.reason)
-	if _, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, report.reason, s.now()); err != nil {
+	_, body, err := s.settleFailure(ctx, e, report)
+	if err != nil {
 		return err
 	}
-	s.metrics.TaskTerminal(string(registry.ResultFailed))
-	if err := s.reportFail(ctx, e, report); err != nil {
+	if err := s.reportFail(ctx, e, body); err != nil {
 		return nil
 	}
 	e, ok := s.reg.Get(e.TaskID)
@@ -1197,6 +1264,31 @@ func (s *Scheduler) failEntry(ctx context.Context, e registry.TaskEntry, report 
 		return nil
 	}
 	return s.deleteJob(ctx, e)
+}
+
+// settleFailure writes the failed verdict Foreman judged itself: the
+// compensation event, the terminal write and the decided-body registration,
+// all before any forward and independent of its result (§4.4, ADR-031). The
+// returned body is the instance's decided body — the report's own encoding,
+// unless a body was already registered, in which case the first decision
+// wins.
+func (s *Scheduler) settleFailure(ctx context.Context, e registry.TaskEntry, report failReport) (registry.TaskEntry, []byte, error) {
+	body := report.encode()
+	s.log.ErrorContext(ctx, "task.failed_compensated",
+		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+		"failure_reason", report.reason)
+	settled, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, report.reason, s.now())
+	if err != nil {
+		return e, body, err
+	}
+	if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body); ok {
+		settled = registered
+	}
+	if decided, ok := s.reg.DecidedReport(e.TaskID); ok {
+		body = decided
+	}
+	s.metrics.TaskTerminal(string(registry.ResultFailed))
+	return settled, body, nil
 }
 
 // SettleTerminal converges an entry the server already holds as terminal
@@ -1695,25 +1787,25 @@ func (s *Scheduler) failClaim(ctx context.Context, e registry.TaskEntry, cause e
 	if errors.Is(cause, jobbuilder.ErrInvalidTaskID) {
 		reason = FailureReasonInvalidTaskID
 	}
-	if _, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, reason, time.Time{}); err != nil {
+	_, body, err := s.settleFailure(ctx, e, failReport{reason: reason, message: cause.Error()})
+	if err != nil {
 		s.log.ErrorContext(ctx, "mark terminal failed", "task_id", e.TaskID, "err", err)
 	}
-	s.metrics.TaskTerminal(string(registry.ResultFailed))
-	s.log.ErrorContext(ctx, "task.failed_compensated",
-		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
-		"failure_reason", reason, "err", cause.Error())
-	report := failReport{reason: reason, message: cause.Error()}
 	// A report whose forward does not land goes to the durable queue
 	// (场景 #10); the entry stays terminal until a round drains it.
-	_ = s.reportFail(ctx, e, report)
+	_ = s.reportFail(ctx, e, body)
 }
 
 // reportFail forwards a synthetic fail report (C10) for a task the daemon
 // could not settle itself. A 404/409 means the server already settled it, so
 // it counts as delivered. A forward that does not land is handed to the
-// durable queue (场景 #10), so the report survives this process.
-func (s *Scheduler) reportFail(ctx context.Context, e registry.TaskEntry, report failReport) error {
-	body := report.encode()
+// durable queue (场景 #10), so the report survives this process. body is the
+// instance's decided body (§4.4): when one is registered it wins over the
+// body this call synthesized, so a replay can never displace the verdict.
+func (s *Scheduler) reportFail(ctx context.Context, e registry.TaskEntry, body []byte) error {
+	if decided, ok := s.reg.DecidedReport(e.TaskID); ok {
+		body = decided
+	}
 	code, _, err := s.server.Forward(ctx, EPFail, e.TaskID, body)
 	if err == nil && ((code >= 200 && code < 300) || code == 404 || code == 409) {
 		return nil
@@ -1726,6 +1818,71 @@ func (s *Scheduler) reportFail(ctx context.Context, e registry.TaskEntry, report
 		"endpoint", string(EPFail), "status", code, "err", err)
 	s.enqueuePending(ctx, e, EPFail, body)
 	return err
+}
+
+// DrainPendingReports re-delivers the durable terminal-report queue through
+// the single terminal face (ADR-031) and reports how many entries are still
+// undelivered. The recovery loop calls it once per round, so a restored
+// Foreman catches up within the contract's two-round bound (§10).
+func (s *Scheduler) DrainPendingReports(ctx context.Context) (int, error) {
+	return s.pendingReports.Drain(ctx, s)
+}
+
+// DeliverQueued re-delivers one queued terminal report through the same
+// terminal face every other forward uses (ADR-031's single entry): the
+// instance's decided body wins, the 404 in-place decision runs here, and a
+// 2xx deletes the Job. It is the sender the queue's Drain calls, so a replay
+// is never an inbound report — it does not enter the attribution gate and
+// cannot emit a second attribution decision.
+func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID string, body []byte) (int, []byte, error) {
+	e, ok := s.reg.Get(taskID)
+	if !ok {
+		// The credential was reclaimed before the report landed: the entry is
+		// gone, but the report still goes — a terminal callback is never
+		// dropped (§10). No objects are left to clean up.
+		return s.server.Forward(ctx, ep, taskID, body)
+	}
+	if decided, ok := s.reg.DecidedReport(taskID); ok {
+		body = decided
+	}
+	code, resp, err := s.server.Forward(ctx, ep, taskID, body)
+	if err != nil {
+		return code, resp, err
+	}
+	if !ep.IsTerminal() {
+		return code, resp, nil
+	}
+	switch {
+	case code >= 200 && code < 300:
+		s.deleteJob(ctx, e)
+	case code == 404:
+		// §4.4's in-place decision: the server no longer holds the task. The
+		// verdict is re-read under the task lock after the forward: the replay
+		// can stay in flight for the retry budget, and a settlement path may
+		// have decided the instance meanwhile — a decided instance keeps its
+		// result (§4.2, §4.4). Only an instance that never reached a verdict
+		// settles with no result, and the Job deletion uses the fresh entry.
+		unlock := s.taskMu.Lock(taskID)
+		fresh, ok := s.reg.Get(taskID)
+		if !ok {
+			// Reclaimed while the replay was in flight: the pre-forward
+			// snapshot is the only Job handle left, and the deletion is
+			// idempotent.
+			unlock()
+			s.deleteJob(ctx, e)
+			return code, resp, nil
+		}
+		if !fresh.IsTerminal() && len(fresh.DecidedReport) == 0 {
+			if _, err := s.reg.MarkTerminal(taskID, "", "", s.now()); err != nil {
+				s.log.ErrorContext(ctx, "task.settle_failed",
+					"task_id", taskID, "job_name", fresh.JobName, "daemon_id", fresh.DaemonID,
+					"reason", "server has no record of the task", "err", err)
+			}
+		}
+		unlock()
+		s.deleteJob(ctx, fresh)
+	}
+	return code, resp, nil
 }
 
 // deleteJob removes the Job object of a settled task — the "撤下调度与资源"
