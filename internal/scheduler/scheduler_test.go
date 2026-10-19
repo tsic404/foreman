@@ -16,6 +16,7 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -1452,6 +1453,124 @@ func TestOnReportUsageMalformedBodyIsForwardedWithoutMetric(t *testing.T) {
 	if len(f.server.forwards) != 1 || f.server.forwards[0].body != string(body) {
 		t.Fatalf("forwards = %+v, want the malformed body verbatim", f.server.forwards)
 	}
+}
+
+// TestOnReportUsageBoundsLabelSpace: the usage body is the Job daemon's own
+// report, so its provider and model strings are task-controlled. Each bound is
+// judged on its own, and the counts stay complete under both.
+func TestOnReportUsageBoundsLabelSpace(t *testing.T) {
+	t.Run("an overlong value is cut to the bound", func(t *testing.T) {
+		f := newFixture(t)
+		e := f.claim(t, "task-1")
+		long := strings.Repeat("p", usageLabelMaxBytes+40)
+		body := []byte(fmt.Sprintf(`{"usage":[{"provider":%q,"model":%q,"input_tokens":7}]}`, long, long))
+
+		code, _, err := f.sched.OnReport(context.Background(), EPUsage, e, body, "")
+		if err != nil || code != 200 {
+			t.Fatalf("OnReport = %d, %v", code, err)
+		}
+		if len(f.metrics.tokenUsage) != 1 {
+			t.Fatalf("token usage = %+v, want one entry", f.metrics.tokenUsage)
+		}
+		got := f.metrics.tokenUsage[0]
+		want := long[:usageLabelMaxBytes]
+		if got.provider != want || got.model != want {
+			t.Errorf("labels = (%d bytes, %d bytes), want both cut to %d bytes",
+				len(got.provider), len(got.model), usageLabelMaxBytes)
+		}
+		if got.input != 7 {
+			t.Errorf("input tokens = %d, want 7", got.input)
+		}
+	})
+
+	t.Run("a multibyte value is cut at a rune boundary", func(t *testing.T) {
+		f := newFixture(t)
+		e := f.claim(t, "task-1")
+		// Three bytes per rune: the byte bound falls inside a sequence.
+		long := strings.Repeat("中", usageLabelMaxBytes)
+		body := []byte(fmt.Sprintf(`{"usage":[{"provider":%q,"model":%q,"input_tokens":3}]}`, long, long))
+
+		code, _, err := f.sched.OnReport(context.Background(), EPUsage, e, body, "")
+		if err != nil || code != 200 {
+			t.Fatalf("OnReport = %d, %v", code, err)
+		}
+		if len(f.metrics.tokenUsage) != 1 {
+			t.Fatalf("token usage = %+v, want one entry", f.metrics.tokenUsage)
+		}
+		got := f.metrics.tokenUsage[0]
+		want := strings.Repeat("中", usageLabelMaxBytes/3)
+		if got.provider != want || got.model != want {
+			t.Errorf("labels = (%d bytes, %d bytes), want the first %d runes",
+				len(got.provider), len(got.model), usageLabelMaxBytes/3)
+		}
+		if !utf8.ValidString(got.provider) || !utf8.ValidString(got.model) {
+			t.Error("label value is not valid UTF-8")
+		}
+		if got.input != 3 {
+			t.Errorf("input tokens = %d, want 3", got.input)
+		}
+	})
+
+	t.Run("pairs past the budget fold onto the overflow label", func(t *testing.T) {
+		f := newFixture(t)
+		e := f.claim(t, "task-1")
+
+		const extra = 10
+		entries := make([]string, 0, usageSeriesLimit+extra)
+		for i := range usageSeriesLimit + extra {
+			entries = append(entries, fmt.Sprintf(`{"provider":"p%d","model":"m%d","input_tokens":1}`, i, i))
+		}
+		body := []byte(`{"usage":[` + strings.Join(entries, ",") + `]}`)
+
+		code, _, err := f.sched.OnReport(context.Background(), EPUsage, e, body, "")
+		if err != nil || code != 200 {
+			t.Fatalf("OnReport = %d, %v", code, err)
+		}
+		pairs := make(map[string]int)
+		var total int64
+		for _, u := range f.metrics.tokenUsage {
+			pairs[u.provider+"\x00"+u.model]++
+			total += u.input
+		}
+		if want := int64(usageSeriesLimit + extra); total != want {
+			t.Errorf("input tokens = %d, want %d: folding must not drop counts", total, want)
+		}
+		if want := usageSeriesLimit + 1; len(pairs) > want {
+			t.Errorf("distinct label pairs = %d, want at most %d", len(pairs), want)
+		}
+		if want := extra; pairs[usageOverflowLabel+"\x00"+usageOverflowLabel] != want {
+			t.Errorf("overflow entries = %d, want %d",
+				pairs[usageOverflowLabel+"\x00"+usageOverflowLabel], want)
+		}
+	})
+
+	t.Run("NUL in a label does not merge pairs", func(t *testing.T) {
+		f := newFixture(t)
+		e := f.claim(t, "task-1")
+
+		// Both pairs of one index concatenate to the same "a<i>\x00\x00b<i>"
+		// under a delimiter-joined key; each pair must still take its own slot.
+		entries := make([]string, 0, 2*usageSeriesLimit)
+		for i := range usageSeriesLimit {
+			entries = append(entries,
+				fmt.Sprintf(`{"provider":"a%d","model":"\u0000b%d","input_tokens":1}`, i, i),
+				fmt.Sprintf(`{"provider":"a%d\u0000","model":"b%d","input_tokens":1}`, i, i))
+		}
+		body := []byte(`{"usage":[` + strings.Join(entries, ",") + `]}`)
+
+		code, _, err := f.sched.OnReport(context.Background(), EPUsage, e, body, "")
+		if err != nil || code != 200 {
+			t.Fatalf("OnReport = %d, %v", code, err)
+		}
+		seen := make(map[usageLabelPair]struct{})
+		for _, u := range f.metrics.tokenUsage {
+			seen[usageLabelPair{provider: u.provider, model: u.model}] = struct{}{}
+		}
+		if want := usageSeriesLimit + 1; len(seen) > want {
+			t.Errorf("distinct label pairs = %d, want at most %d: NUL must not widen the budget",
+				len(seen), want)
+		}
+	})
 }
 
 // A refused start (409 状态不允许, S-8 + §1.5)

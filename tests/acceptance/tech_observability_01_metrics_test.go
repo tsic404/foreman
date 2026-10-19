@@ -18,6 +18,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/observability"
@@ -415,6 +416,97 @@ func TestTechObservability01RefreshFamilies(t *testing.T) {
 			t.Errorf("profile refreshes result=%s = %d, want %d", want.result, got, want.count)
 		}
 	}
+}
+
+// TestTechObservability01UsageLabelSpaceBounded: the S-12 body is the Job
+// daemon's own report, so its provider and model strings are task-controlled.
+// The two bounds are judged separately, and the counts stay complete under both.
+func TestTechObservability01UsageLabelSpaceBounded(t *testing.T) {
+	// The ceilings are the acceptance face's bounds, not the implementation's
+	// limits: the metric may admit fewer, never more.
+	const (
+		usageLabelCeiling = 2048
+		usageLabelBytes   = 128
+		seriesEntries     = 4096
+	)
+
+	// postUsage drives one claimed task to S-12 with body and returns the
+	// harness whose seam recorded the outcome.
+	postUsage := func(t *testing.T, body []byte) *harness {
+		t.Helper()
+		h := newHarnessWithRealServer(t, false)
+		const taskID = "task-usage-labels"
+		payload, err := json.Marshal(map[string]any{
+			"id": taskID, "agent_id": "agent-1", "workspace_id": "ws-1",
+			"runtime_id": "rid-zz", "issue_id": "issue-1", "issue_identifier": "TSI-1",
+			"agent": map[string]any{"name": "agent-a"},
+		})
+		if err != nil {
+			t.Fatalf("marshal claim: %v", err)
+		}
+		tcPolicyAxisClaimRaw(t, h, payload)
+		token := issueJobToken(t, h, taskID)
+		registerTaskDaemon(t, h, taskID, token)
+		claimTask(t, h, taskID, token)
+		if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/start", token, []byte(`{}`)); code != http.StatusOK {
+			t.Fatalf("S8 = %d: %s", code, answer)
+		}
+		if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/usage", token, body); code != http.StatusOK {
+			t.Fatalf("S12 = %d: %s", code, answer)
+		}
+		return h
+	}
+
+	t.Run("an overlong value is cut to the bound", func(t *testing.T) {
+		// Three bytes per rune: the cut must not leave half a rune behind.
+		long := strings.Repeat("中", 200)
+		h := postUsage(t, []byte(fmt.Sprintf(
+			`{"usage":[{"provider":%q,"model":%q,"input_tokens":1}]}`, long, long)))
+
+		got := h.metrics.tokenUsageSnapshot()
+		if len(got) != 1 {
+			t.Fatalf("usage entries = %d, want 1", len(got))
+		}
+		for _, label := range []struct {
+			name  string
+			value string
+		}{
+			{"provider", got[0].provider},
+			{"model", got[0].model},
+		} {
+			if label.value == "" || len(label.value) > usageLabelBytes || !strings.HasPrefix(long, label.value) {
+				t.Errorf("%s label = %d bytes, want a non-empty prefix of the reported value within %d bytes",
+					label.name, len(label.value), usageLabelBytes)
+			}
+			if !utf8.ValidString(label.value) {
+				t.Errorf("%s label is not valid UTF-8", label.name)
+			}
+		}
+		if got[0].input != 1 {
+			t.Errorf("input tokens = %d, want 1", got[0].input)
+		}
+	})
+
+	t.Run("pairs past the budget fold onto one label", func(t *testing.T) {
+		reports := make([]string, 0, seriesEntries)
+		for i := range seriesEntries {
+			reports = append(reports, fmt.Sprintf(`{"provider":"provider-%d","model":"model-%d","input_tokens":1}`, i, i))
+		}
+		h := postUsage(t, []byte(`{"usage":[`+strings.Join(reports, ",")+`]}`))
+
+		pairs := make(map[string]struct{})
+		var total int64
+		for _, u := range h.metrics.tokenUsageSnapshot() {
+			pairs[u.provider+"\x00"+u.model] = struct{}{}
+			total += u.input
+		}
+		if total != seriesEntries {
+			t.Errorf("usage entries counted = %d, want %d: folding must not drop counts", total, seriesEntries)
+		}
+		if len(pairs) > usageLabelCeiling {
+			t.Errorf("distinct (provider, model) pairs = %d, want at most %d", len(pairs), usageLabelCeiling)
+		}
+	})
 }
 
 // observability01RunTask drives one claimed task to a terminal result through

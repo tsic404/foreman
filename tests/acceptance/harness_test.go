@@ -2073,6 +2073,13 @@ func (m *recordingMetrics) tokenUsageFor(provider, model string) (input, output,
 	return input, output, cacheRead, cacheWrite
 }
 
+// tokenUsageSnapshot returns the recorded usage entries under the lock.
+func (m *recordingMetrics) tokenUsageSnapshot() []tokenUsageRecord {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]tokenUsageRecord(nil), m.tokenUsage...)
+}
+
 // probeBuilder is the jobbuilder seam plus the test-only credential reader.
 type probeBuilder interface {
 	scheduler.JobBuilder
