@@ -475,7 +475,7 @@ func TestDaemonFaceCensus(t *testing.T) {
 	}
 
 	registered := map[string]bool{}
-	for _, pattern := range fs.registeredPatterns() {
+	for _, pattern := range fs.RegisteredPatterns() {
 		if registered[pattern] {
 			t.Errorf("pattern %q is registered twice", pattern)
 		}
