@@ -1,6 +1,7 @@
 package jobbuilder
 
 import (
+	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -10,6 +11,7 @@ import (
 	"io"
 	"io/fs"
 	"os"
+	"strconv"
 	"strings"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -115,6 +117,33 @@ func LoadJobTemplate(cfg Config) (map[string]any, error) {
 	return template, nil
 }
 
+// countYAMLDocuments counts the non-empty YAML documents in data.
+// utilyaml.ToJSON converts only the first document and reports no error for the
+// rest, so without this count a second document would be dropped silently
+// instead of failing startup (§8.1). A comment-only document counts as empty —
+// the shipped policy skeleton is one.
+func countYAMLDocuments(data []byte) (int, error) {
+	reader := utilyaml.NewYAMLReader(bufio.NewReader(bytes.NewReader(data)))
+	documents := 0
+	for {
+		document, err := reader.Read()
+		if errors.Is(err, io.EOF) {
+			return documents, nil
+		}
+		if err != nil {
+			return 0, err
+		}
+		jsonBytes, err := utilyaml.ToJSON(document)
+		if err != nil {
+			return 0, err
+		}
+		if string(bytes.TrimSpace(jsonBytes)) == "null" {
+			continue
+		}
+		documents++
+	}
+}
+
 // parseJobTemplate decodes the template file into the raw map each Build
 // copies. It decides the two rules of failure class 3 the file can break: the
 // document must declare the Job's apiVersion/kind (a bare manifest fragment is
@@ -122,6 +151,13 @@ func LoadJobTemplate(cfg Config) (map[string]any, error) {
 // kept as json.Number: the map is written back per Build, and a float64 round
 // trip would silently rewrite int64 fields above 2^53.
 func parseJobTemplate(path string, data []byte) (map[string]any, error) {
+	documents, err := countYAMLDocuments(data)
+	if err != nil {
+		return nil, fmt.Errorf("job template %s is not parseable as YAML: %w", path, err)
+	}
+	if documents > 1 {
+		return nil, fmt.Errorf("job template %s must hold one Job manifest object: got %d YAML documents", path, documents)
+	}
 	jsonBytes, err := utilyaml.ToJSON(data)
 	if err != nil {
 		return nil, fmt.Errorf("job template %s is not parseable as YAML: %w", path, err)
@@ -244,6 +280,7 @@ const (
 	placeholderChatSessionID   = "<chat_session_id>"
 	placeholderJobRuntimeID    = "<job runtime uuid>"
 	placeholderClaimedAt       = "<RFC3339>"
+	placeholderAttempt         = "<attempt>"
 	placeholderJobImage        = "<job-image>"
 	placeholderJobName         = "<job-name>"
 	placeholderDaemonID        = "<daemon-id>"
@@ -263,7 +300,8 @@ var placeholderRegistry = []string{
 	placeholderTaskID, placeholderAgentID, placeholderWorkspaceID,
 	placeholderIssueID, placeholderIssueIdentifier, placeholderAutopilotRunID,
 	placeholderChatSessionID, placeholderJobRuntimeID, placeholderClaimedAt,
-	placeholderJobImage, placeholderJobName, placeholderDaemonID, placeholderAgentName,
+	placeholderAttempt, placeholderJobImage, placeholderJobName, placeholderDaemonID,
+	placeholderAgentName,
 }
 
 // placeholderValues resolves each registered placeholder for one task.
@@ -277,6 +315,7 @@ type placeholderValues struct {
 	chatSessionID   string
 	jobRuntimeID    string
 	claimedAt       string
+	attempt         int
 	jobImage        string
 	// jobName is the final display name (ADR-034): the name composition step
 	// runs before the substitution, so a template can reference it outside
@@ -312,6 +351,8 @@ func (v placeholderValues) replacement(placeholder string) string {
 		return v.jobRuntimeID
 	case placeholderClaimedAt:
 		return v.claimedAt
+	case placeholderAttempt:
+		return strconv.Itoa(v.attempt)
 	case placeholderJobImage:
 		return v.jobImage
 	case placeholderJobName:
@@ -360,16 +401,34 @@ func substituteValue(node any, v substitution) any {
 // recognition site only, so a template that writes it elsewhere keeps it
 // verbatim — the apiserver, not this walk, is what refuses such a position
 // (§8.3's failure face).
+//
+// One left-to-right pass, and a replacement is never rescanned: a payload
+// value that itself carries a registered literal (a chat session id that looks
+// like <agent-name>) must stay that literal, not become the value of another
+// field by position (§8.3: substitution applies to the template's own text).
 func substituteString(value string, v substitution) string {
 	if !strings.Contains(value, "<") {
 		return value
 	}
-	for _, placeholder := range placeholderRegistry {
-		if strings.Contains(value, placeholder) {
-			value = strings.ReplaceAll(value, placeholder, v.replacement(placeholder))
+	var out strings.Builder
+	out.Grow(len(value))
+	for i := 0; i < len(value); {
+		matched := false
+		for _, placeholder := range placeholderRegistry {
+			if !strings.HasPrefix(value[i:], placeholder) {
+				continue
+			}
+			out.WriteString(v.replacement(placeholder))
+			i += len(placeholder)
+			matched = true
+			break
+		}
+		if !matched {
+			out.WriteByte(value[i])
+			i++
 		}
 	}
-	return value
+	return out.String()
 }
 
 // deepCopyTemplate clones the parsed template so Build never mutates the

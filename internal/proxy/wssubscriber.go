@@ -187,9 +187,10 @@ type streamResult struct {
 // Run keeps one connection per declared real runtime until ctx ends. A runtime
 // whose id moved is reconnected on its own; the other connections stay up
 // (§1.4 多 runtime 的失败面按 runtime 粒度). It is never started when
-// FORMANET_WS_ENABLED=false (ADR-010 degradation switch).
+// FOREMAN_WS_ENABLED=false (ADR-010 degradation switch).
 func (s *WSSubscriber) Run(ctx context.Context) error {
-	changes := s.client.Changes()
+	changes, unsubscribe := s.client.SubscribeChanges()
+	defer unsubscribe()
 	connections := map[string]wsSubscription{}
 	// parked holds the moment each runtime identity's dialing is armed again.
 	// It is keyed by (provider, profile_id), not by id: an id that moves on
@@ -380,8 +381,12 @@ func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *runti
 	s.readLoop(ctx, conn)
 	_ = conn.Close(websocket.StatusNormalClosure, "closing")
 	s.metrics.WSDisconnect(WSSideServer)
-	s.metrics.WSReconnect(WSSideServer)
-	s.log.Info("ws.reconnect", "side", WSSideServer, "runtime_id", runtimeID)
+	// A shutdown closes every connection; it is not a reconnect. Counting it
+	// would inflate the reconnect metric on every process stop.
+	if ctx.Err() == nil {
+		s.metrics.WSReconnect(WSSideServer)
+		s.log.Info("ws.reconnect", "side", WSSideServer, "runtime_id", runtimeID)
+	}
 	// A replaced stream must not spend the runtime's progression: the select
 	// below evaluates its operands even once the cancel arrived, and that step
 	// belongs to the replacement's first dial (§1.5).

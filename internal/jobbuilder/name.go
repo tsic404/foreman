@@ -270,16 +270,25 @@ func templateNameFormat(template map[string]any) string {
 	return name
 }
 
-// daemonIDFor is the identity name: fm-<task_id>, never the display name
+// DaemonIDFor is the identity name: fm-<task_id>, never the display name
 // (ADR-034 decision 8). The daemon-id label, the daemon-id annotation, the
-// credential Secret name and the Job Token's j claim all derive from it.
-func daemonIDFor(taskID string) string {
+// credential Secret name and the Job Token's j claim all derive from it. It is
+// exported as the one source of the derivation: the scheduler reads it instead
+// of rebuilding the literal.
+func DaemonIDFor(taskID string) string {
 	return "fm-" + taskID
+}
+
+// CredentialSecretName is the credential Secret of a Job: the identity name
+// plus the fixed suffix (§3). Like the identity it never follows the template's
+// display name.
+func CredentialSecretName(daemonID string) string {
+	return daemonID + secretCredSuffix
 }
 
 // fallbackJobName is the display name when the template expresses none — equal
 // to the identity name, which is what makes the legacy template
 // (`metadata.name: fm-<task_id>`) behave exactly as before.
 func fallbackJobName(taskID string) string {
-	return daemonIDFor(taskID)
+	return DaemonIDFor(taskID)
 }

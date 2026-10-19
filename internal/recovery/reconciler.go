@@ -342,10 +342,14 @@ func (r *Reconciler) round(ctx context.Context) error {
 		return nil
 	}
 	// One pod read per round, grouped by owning Job, instead of one call
-	// per entry (the judgement reads both objects).
-	pods, err := r.objects.ListPods(ctx)
-	if err != nil {
-		return fmt.Errorf("list foreman pods: %w", err)
+	// per entry (the judgement reads both objects). A failed read must not
+	// freeze the paths that never consume pods: terminal Job deletion and
+	// drain closure move on, only the end-reason judgement of live entries is
+	// deferred (§4.4: a read failure is not a teardown sign).
+	pods, listErr := r.objects.ListPods(ctx)
+	if listErr != nil {
+		listErr = fmt.Errorf("list foreman pods: %w", listErr)
+		r.log.WarnContext(ctx, "reconcile.pods_unavailable", "err", listErr)
 	}
 	byJob := indexPods(pods)
 
@@ -353,6 +357,9 @@ func (r *Reconciler) round(ctx context.Context) error {
 	for _, e := range entries {
 		if ctx.Err() != nil {
 			break
+		}
+		if listErr != nil && !e.IsTerminal() && !r.releasing[e.TaskID] {
+			continue
 		}
 		// Node placement is the fact the per-node soft cap counts
 		// (FOREMAN_MAX_JOBS_PER_NODE, contract §3: Pod 读 spec.nodeName),
@@ -371,6 +378,9 @@ func (r *Reconciler) round(ctx context.Context) error {
 				firstErr = err
 			}
 		}
+	}
+	if firstErr == nil {
+		firstErr = listErr
 	}
 	return firstErr
 }
@@ -500,6 +510,13 @@ func (r *Reconciler) settleTerminalEntry(ctx context.Context, e registry.TaskEnt
 func (r *Reconciler) reclaimIfDue(ctx context.Context, e registry.TaskEntry) error {
 	if !e.IsDraining() {
 		return nil
+	}
+	if e.FailureReason == scheduler.FailureReasonInvalidTaskID {
+		// No Job or Secret ever existed for this instance (an invalid task id,
+		// or a malformed claim dead letter). Its identity-derived names may be
+		// illegal selectors, and there is no termination fact to read: reclaim
+		// now instead of issuing reads the apiserver rejects every round.
+		return r.settler.OnJobTerminated(ctx, e.JobName, scheduler.JobTerminationReasonNoObjects, time.Time{}, 0)
 	}
 	since := e.JobCreatedAt
 	// The Job's termination is the primary fact and is read every round: a

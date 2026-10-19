@@ -164,7 +164,7 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		Online:          true,
 		LastHeartbeatAt: time.Now(),
 	})
-	s.reg.MarkDaemonRegistered(claims.JobName, time.Now())
+	registered, stillLive := s.reg.MarkDaemonRegistered(claims.JobName, time.Now())
 	s.log.Info("daemon.registered",
 		"task_id", e.TaskID, "job_name", e.JobName,
 		"daemon_id", claims.JobName, "job_runtime_id", e.JobRuntimeID,
@@ -185,9 +185,11 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	respBody["runtimes"] = []map[string]any{answer}
 	writeRaw(w, http.StatusOK, mustMarshal(respBody))
 	// The task is deliverable from this moment (S30 push; idempotent —
-	// delivery itself is at-most-once via the registry).
-	if s.ws != nil {
-		s.ws.NotifyTaskAvailable(claims.JobName, e.TaskID)
+	// delivery itself is at-most-once via the registry). An entry that settled
+	// or entered drain between the lookup and the state write wakes nobody:
+	// the daemon's claim would only receive an empty batch.
+	if s.ws != nil && stillLive && !registered.IsTerminal() && !registered.IsDraining() {
+		s.ws.NotifyTaskAvailable(claims.JobName, registered.TaskID)
 	}
 }
 
@@ -243,8 +245,7 @@ func (s *FakeServer) handleDeregister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if rt, ok := s.reg.RuntimeByDaemon(claims.JobName); ok {
-		rt.Online = false
-		s.reg.PutRuntime(rt)
+		s.reg.SetRuntimeOffline(rt.JobRuntimeID)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -389,15 +390,16 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 
 // ---- S9 status ----
 
-// handleTaskStatus forwards C13 so the daemon can discover cancellation. A
-// server-side 404 settles the mapping locally (the forward switch:
-// non-terminal 404 → OnTaskVanished; §4.6).
+// handleTaskStatus forwards C13 so the daemon can discover cancellation. The
+// upstream status code and body bytes go back verbatim — it is the daemon's
+// own status face, and only the task-vanished 404 is settled locally (the
+// forward switch: non-terminal 404 → OnTaskVanished; §4.6).
 func (s *FakeServer) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 	tid := r.PathValue("tid")
 	if _, ok := s.authenticate(w, r, auth.RequestScope{TaskID: tid}); !ok {
 		return
 	}
-	status, err := s.client.TaskStatus(r.Context(), tid)
+	code, resp, err := s.client.TaskStatusRaw(r.Context(), tid)
 	if errors.Is(err, scheduler.ErrTaskNotFound) {
 		if verr := s.sched.OnTaskVanished(r.Context(), tid); verr != nil {
 			s.log.Error("task vanish settlement failed", "task_id", tid, "err", verr)
@@ -409,7 +411,7 @@ func (s *FakeServer) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadGateway, "upstream unavailable")
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]string{"status": status})
+	writeRaw(w, code, resp)
 }
 
 // ---- S20 task gc-check ----

@@ -1,8 +1,6 @@
 package auth
 
 import (
-	"crypto/sha256"
-	"encoding/hex"
 	"sync"
 	"time"
 )
@@ -49,11 +47,12 @@ func (r *RevocationSet) Revoke(hash string, validUntil time.Time) {
 	r.entries[hash] = validUntil
 }
 
-// IsRevoked reports whether the token digest is in the set; lapsed entries
-// are evicted on lookup as a fast path (insert-time sweep is the bound).
-func (r *RevocationSet) IsRevoked(token string) bool {
-	sum := sha256.Sum256([]byte(token))
-	hash := hex.EncodeToString(sum[:])
+// IsRevoked reports whether the credential digest (the hex SHA-256 of the
+// token, Issuer.Hash) is in the set; lapsed entries are evicted on lookup as a
+// fast path (insert-time sweep is the bound). Both this method and Revoke take
+// the digest: the set is keyed by it, and a raw-token lookup could only ever
+// answer false and leave the caller believing a revocation had failed.
+func (r *RevocationSet) IsRevoked(hash string) bool {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	until, ok := r.entries[hash]

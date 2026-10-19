@@ -273,7 +273,7 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 	// exactly the same-name reuse face (a re-dispatched task or a rebuilt Job
 	// brought the entry back): the predecessor's token must never be
 	// accepted again (ADR-017).
-	if i.revocations.IsRevoked(token) {
+	if i.revocations.IsRevoked(i.Hash(token)) {
 		return Claims{}, ErrRevoked
 	}
 	// 6. The request resource must match the token scope.

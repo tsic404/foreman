@@ -66,7 +66,13 @@ type Client struct {
 	terminalWaits []time.Duration // §10 terminal retry budget
 	relayWaits    []time.Duration // C-21 relay budget progression (tests)
 
-	changes chan RuntimeChange // runtime set moved → per-runtime WS reconnect
+	// changes is the legacy fan-in channel every notifyChange also feeds;
+	// changeSubs are the per-consumer streams. The loops must each see every
+	// notification, so they subscribe (Changes alone would let the two
+	// consumers race for one queue item).
+	changes    chan RuntimeChange
+	changesMu  sync.Mutex
+	changeSubs []chan RuntimeChange
 }
 
 // Option customizes a Client.
@@ -310,8 +316,10 @@ func (c *Client) Forward(ctx context.Context, ep scheduler.Endpoint, taskID stri
 // §2.2) — so the field is translated like S7's {rid}.
 // The id comes from the task's own dispatch record; a task without one (a
 // rebuilt entry) falls back to the only declared runtime, and a set that is
-// not registered yet leaves the body verbatim. Every other field stays
-// byte-equal, and a body naming no runtime is forwarded verbatim.
+// not registered yet leaves the body verbatim. Every other field keeps its
+// value: the re-marshal may reorder keys and HTML-escape, which §2.4 excludes
+// from the fidelity face (key order has no HTTP or JSON semantics), and a body
+// naming no runtime is forwarded byte-for-byte.
 func (c *Client) translateStartBody(taskID string, body []byte) ([]byte, error) {
 	if len(body) == 0 {
 		return body, nil
@@ -499,12 +507,12 @@ func (c *Client) Passthrough(ctx context.Context, method, rawPath, rawQuery stri
 
 // TaskStatus is C13; a server-side 404 maps to scheduler.ErrTaskNotFound.
 func (c *Client) TaskStatus(ctx context.Context, taskID string) (string, error) {
-	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodGet, "/api/daemon/tasks/"+url.PathEscape(taskID)+"/status", nil)
-	if err != nil {
+	code, raw, err := c.taskStatusRaw(ctx, taskID)
+	if errors.Is(err, scheduler.ErrTaskNotFound) {
 		return "", err
 	}
-	if code == 404 {
-		return "", scheduler.ErrTaskNotFound
+	if err != nil {
+		return "", err
 	}
 	if code < 200 || code >= 300 {
 		return "", &StatusError{Code: code, Body: raw}
@@ -516,6 +524,24 @@ func (c *Client) TaskStatus(ctx context.Context, taskID string) (string, error) 
 		return "", fmt.Errorf("decode task status: %w", err)
 	}
 	return resp.Status, nil
+}
+
+// TaskStatusRaw is C13's response face for S-9: the upstream status code and
+// body bytes, with only 404 mapped to the task-vanished sentinel. Everything
+// else is the upstream's answer and S-9 returns it verbatim (§2.2).
+func (c *Client) TaskStatusRaw(ctx context.Context, taskID string) (int, []byte, error) {
+	return c.taskStatusRaw(ctx, taskID)
+}
+
+func (c *Client) taskStatusRaw(ctx context.Context, taskID string) (int, []byte, error) {
+	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodGet, "/api/daemon/tasks/"+url.PathEscape(taskID)+"/status", nil)
+	if err != nil {
+		return 0, nil, err
+	}
+	if code == 404 {
+		return 0, nil, scheduler.ErrTaskNotFound
+	}
+	return code, raw, nil
 }
 
 // GCCheck forwards the S20 gc-check query to the server verbatim (GC is

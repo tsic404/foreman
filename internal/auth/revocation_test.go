@@ -6,7 +6,7 @@ import (
 )
 
 // digest is the key the revocation set stores: the hex SHA-256 of the token
-// (Issuer.Hash). IsRevoked still takes the raw token and hashes it itself.
+// (Issuer.Hash). Both Revoke and IsRevoked take that digest.
 func digest(token string) string { return new(Issuer).Hash(token) }
 
 func TestRevocationSetRevokeAndCheck(t *testing.T) {
@@ -14,17 +14,17 @@ func TestRevocationSetRevokeAndCheck(t *testing.T) {
 	set := NewRevocationSet(fixedClock(now))
 
 	set.Revoke(digest("token-a"), now.Add(time.Hour))
-	if !set.IsRevoked("token-a") {
+	if !set.IsRevoked(digest("token-a")) {
 		t.Fatal("token-a should be revoked")
 	}
-	if set.IsRevoked("token-b") {
+	if set.IsRevoked(digest("token-b")) {
 		t.Fatal("token-b was never revoked")
 	}
 
-	// The set is keyed by digest, never the raw token: revoking the token
-	// string itself records a different key and must not revoke it.
+	// The set is keyed by digest: revoking the raw token string records a key
+	// no digest lookup can match, which is why both sides take the digest.
 	set.Revoke("token-c", now.Add(time.Hour))
-	if set.IsRevoked("token-c") {
+	if set.IsRevoked(digest("token-c")) {
 		t.Fatal("revocation must be keyed by digest, not the raw token")
 	}
 }
@@ -34,7 +34,7 @@ func TestRevocationSetSkipsExpiredWindow(t *testing.T) {
 	set := NewRevocationSet(fixedClock(now))
 
 	set.Revoke(digest("token-a"), now.Add(-time.Minute))
-	if set.IsRevoked("token-a") {
+	if set.IsRevoked(digest("token-a")) {
 		t.Fatal("a token past its validity window needs no revocation entry")
 	}
 	if len(set.entries) != 0 {
@@ -49,7 +49,7 @@ func TestRevocationSetEvictsExpiredEntries(t *testing.T) {
 
 	set.Revoke(digest("token-a"), start.Add(time.Hour))
 	now = start.Add(2 * time.Hour)
-	if set.IsRevoked("token-a") {
+	if set.IsRevoked(digest("token-a")) {
 		t.Fatal("entry should lapse with the token validity window")
 	}
 	if len(set.entries) != 0 {
@@ -72,7 +72,7 @@ func TestRevocationSetSweepOnInsert(t *testing.T) {
 	if len(set.entries) != 1 {
 		t.Fatalf("entries = %d, want 1 (lapsed entries swept on insert)", len(set.entries))
 	}
-	if !set.IsRevoked("token-c") {
+	if !set.IsRevoked(digest("token-c")) {
 		t.Fatal("token-c should be revoked")
 	}
 }
@@ -91,14 +91,14 @@ func TestIssuerRevokeUsesTokenValidityWindow(t *testing.T) {
 	}
 
 	iss.Revoke(iss.Hash(token))
-	if !iss.revocations.IsRevoked(token) {
+	if !iss.revocations.IsRevoked(iss.Hash(token)) {
 		t.Fatal("token should be revoked")
 	}
 
 	// The revocation entry outlives the skew window; afterwards Verify
 	// rejects on expiry, not revocation.
 	now = issued.Add(time.Hour).Add(ClockSkew).Add(time.Second)
-	if iss.revocations.IsRevoked(token) {
+	if iss.revocations.IsRevoked(iss.Hash(token)) {
 		t.Fatal("revocation entry should lapse with the validity window")
 	}
 }

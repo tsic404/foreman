@@ -37,6 +37,7 @@ const (
 	metricHeartbeatSuspect         = "foreman_heartbeat_suspect"
 	metricCredReclaimTotal         = "foreman_cred_reclaim_total"
 	metricJobDrainSeconds          = "foreman_job_drain_seconds"
+	metricJobDeleteFailed          = "foreman_job_delete_failed_total"
 	// Catalog relay metrics (ADR-019 / ADR-025): the relay outcome by C21
 	// status code ("none" = abandoned) and the consumption-to-answer span.
 	metricModelCatalogRelays = "foreman_model_catalog_relays_total"
@@ -159,6 +160,7 @@ type Metrics struct {
 	heartbeatSuspect   prometheus.Gauge
 	credReclaims       *prometheus.CounterVec
 	jobDrainSeconds    prometheus.Histogram
+	jobDeleteFailures  *prometheus.CounterVec
 	catalogRelays      *prometheus.CounterVec
 	catalogSeconds     prometheus.Histogram
 	skillResolves      *prometheus.CounterVec
@@ -267,6 +269,10 @@ func NewMetrics() *Metrics {
 		Help:    "Task verdict -> credential reclaim duration.",
 		Buckets: []float64{1, 5, 15, 30, 60, 120, 300, 600},
 	})
+	m.jobDeleteFailures = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricJobDeleteFailed,
+		Help: "Job deletions that failed on a path with no retry handle, by stage.",
+	}, []string{"stage"})
 
 	m.catalogRelays = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: metricModelCatalogRelays,
@@ -309,7 +315,7 @@ func NewMetrics() *Metrics {
 		m.jobCreateSeconds, m.inflightJobs, m.forwardTotal, m.forwardLatency,
 		m.authFailures, m.tokenUsage, m.duplicateDispatch, m.pendingReports,
 		m.wsConnected, m.wsReconnects, m.heartbeatSuspect,
-		m.credReclaims, m.jobDrainSeconds, m.catalogRelays, m.catalogSeconds,
+		m.credReclaims, m.jobDrainSeconds, m.jobDeleteFailures, m.catalogRelays, m.catalogSeconds,
 		m.skillResolves, m.skillEntries, m.skillBytes, m.skillEvictions,
 		m.workspaceRefreshes, m.profileRefreshes,
 	}
@@ -323,6 +329,7 @@ func NewMetrics() *Metrics {
 		m.tasksTotal.WithLabelValues(result)
 	}
 	m.claimErrors.WithLabelValues("transport")
+	m.jobDeleteFailures.WithLabelValues("catch_up")
 	for _, ep := range forwardEndpoints {
 		m.forwardTotal.WithLabelValues(ep, "200")
 		m.forwardLatency.WithLabelValues(ep)
@@ -477,6 +484,13 @@ func (m *Metrics) ModelCatalogRelay(code string, seconds float64) {
 func (m *Metrics) CredReclaimed(reason string, drainSeconds float64) {
 	m.credReclaims.WithLabelValues(reason).Inc()
 	m.jobDrainSeconds.Observe(drainSeconds)
+}
+
+// JobDeleteFailed counts a Job deletion that failed where the caller has no
+// retry handle left (the post-reclaim catch-up: the entry is already gone, so
+// only the template's TTL remains).
+func (m *Metrics) JobDeleteFailed(stage string) {
+	m.jobDeleteFailures.WithLabelValues(stage).Inc()
 }
 
 // SkillCache records one skill-bundle resolve by result (§9.2): the proxy's

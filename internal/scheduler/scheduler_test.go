@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -51,6 +52,7 @@ type fakeJobs struct {
 	getJobErr       error
 	listJobsErr     error
 	listPodsErr     error
+	listPodsCalls   atomic.Int64
 
 	// existingJobs models Jobs already in the cluster: CreateJob answers
 	// AlreadyExists for their names and GetJob returns them (terminating,
@@ -178,6 +180,7 @@ func (f *fakeJobs) ListSecrets(context.Context) ([]corev1.Secret, error) { retur
 // ListPods applies the selector the scheduler passes (job-name=<job>), so the
 // tests exercise the same ownership key the informer-based path uses.
 func (f *fakeJobs) ListPods(_ context.Context, labelSelector string) ([]corev1.Pod, error) {
+	f.listPodsCalls.Add(1)
 	if f.listPodsErr != nil {
 		return nil, f.listPodsErr
 	}
@@ -193,8 +196,6 @@ func (f *fakeJobs) ListPods(_ context.Context, labelSelector string) ([]corev1.P
 	}
 	return out, nil
 }
-
-func (f *fakeJobs) WatchJobs(context.Context, JobEventHandler) error { return nil }
 
 type forwardCall struct {
 	ep     Endpoint
@@ -324,13 +325,27 @@ func (f *fakeBuilder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID str
 type fakeMetrics struct {
 	mu sync.Mutex
 
-	claimed     int
-	terminal    []string
-	inflight    []int
-	duplicates  int
-	unconfirmed int
-	reclaim     []string
-	drainSecond []float64
+	claimed           int
+	terminal          []string
+	inflight          []int
+	duplicates        int
+	unconfirmed       int
+	reclaim           []string
+	drainSecond       []float64
+	claimErrors       []string
+	jobDeleteFailures []string
+}
+
+func (f *fakeMetrics) ClaimError(reason string) {
+	f.mu.Lock()
+	f.claimErrors = append(f.claimErrors, reason)
+	f.mu.Unlock()
+}
+
+func (f *fakeMetrics) JobDeleteFailed(stage string) {
+	f.mu.Lock()
+	f.jobDeleteFailures = append(f.jobDeleteFailures, stage)
+	f.mu.Unlock()
 }
 
 func (f *fakeMetrics) TaskClaimed() {
@@ -712,8 +727,8 @@ func TestOnClaimNameResolutionFailureLeavesReclaimableEntry(t *testing.T) {
 	if e.JobName == "" {
 		t.Fatal("empty JobName: the entry can never be found by its Job name")
 	}
-	if e.JobName != daemonIDFor("TASK-1") {
-		t.Errorf("JobName = %q, want the identity name %q", e.JobName, daemonIDFor("TASK-1"))
+	if e.JobName != jobbuilder.DaemonIDFor("TASK-1") {
+		t.Errorf("JobName = %q, want the identity name %q", e.JobName, jobbuilder.DaemonIDFor("TASK-1"))
 	}
 	indexed, ok := f.reg.ByJob(e.JobName)
 	if !ok || indexed.TaskID != "TASK-1" {
@@ -2266,6 +2281,11 @@ func TestJobCreatedLogsImageReference(t *testing.T) {
 	if _, stale := record["image_digest"]; stale {
 		t.Error("job.created still carries the removed image_digest field")
 	}
+	// §9.1: every task-face line carries task id, Job name and daemon
+	// identity.
+	if got, want := record["daemon_id"], jobbuilder.DaemonIDFor("t1"); got != want {
+		t.Errorf("job.created daemon_id = %v, want %q", got, want)
+	}
 }
 
 // newLogScheduler rebuilds the fixture's scheduler over the process logger —
@@ -2838,5 +2858,108 @@ func TestOnClaimWithoutIssueContext(t *testing.T) {
 	record := findLogRecord(t, buf.Bytes(), "task.claimed")
 	if record["autopilot_run_id"] != "run-1" || record["chat_session_id"] != "" || record["issue_identifier"] != "" {
 		t.Errorf("task.claimed trigger context = %v", record)
+	}
+}
+
+// TestOnClaimMalformedHeadDeadLetters pins the dead-letter face of a claim
+// whose id is readable but whose head is not: without an entry the server
+// would re-dispatch the same payload on every lease expiry, forever.
+func TestOnClaimMalformedHeadDeadLetters(t *testing.T) {
+	f := newFixture(t)
+	payload := json.RawMessage(`{"id":"t-bad","agent":"not-an-object"}`)
+	if err := f.sched.OnClaim(t.Context(), payload); err != nil {
+		t.Fatalf("OnClaim: %v (a readable id must be settled, not returned as an error)", err)
+	}
+	e, ok := f.reg.Get("t-bad")
+	if !ok {
+		t.Fatal("entry missing: the claim was neither executed nor settled")
+	}
+	if !e.IsTerminal() || e.FailureReason != FailureReasonInvalidTaskID {
+		t.Fatalf("entry = %+v, want terminal / %s", e, FailureReasonInvalidTaskID)
+	}
+	if len(f.jobs.createdJobs) != 0 || len(f.jobs.createdSecrets) != 0 {
+		t.Fatalf("objects created for a malformed claim: jobs=%d secrets=%d",
+			len(f.jobs.createdJobs), len(f.jobs.createdSecrets))
+	}
+	var fails []forwardCall
+	for _, call := range f.server.forwards {
+		if call.ep == EPFail {
+			fails = append(fails, call)
+		}
+	}
+	if len(fails) != 1 {
+		t.Fatalf("fail forwards = %d, want one", len(fails))
+	}
+	// The dead letter is reclaimable without touching K8s: no object ever
+	// existed under the identity-derived names.
+	if err := f.sched.OnJobTerminated(t.Context(), e.JobName,
+		JobTerminationReasonNoObjects, time.Time{}, 0); err != nil {
+		t.Fatalf("OnJobTerminated: %v", err)
+	}
+	if _, ok := f.reg.Get("t-bad"); ok {
+		t.Fatal("entry survived the reclaim")
+	}
+	if !f.reg.IsDone("t-bad") {
+		t.Fatal("terminal record lost by the reclaim")
+	}
+	if len(f.jobs.deletedSecrets) != 0 || len(f.jobs.deletedJobs) != 0 {
+		t.Fatalf("objectless reclaim deleted objects: secrets=%v jobs=%v",
+			f.jobs.deletedSecrets, f.jobs.deletedJobs)
+	}
+}
+
+// TestOnClaimUnnameableIsRateLimited pins the other half: a payload without a
+// readable id has no dead-letter face, so the claim is counted and the error
+// log is bounded — the server's lease expiry is the only convergence.
+func TestOnClaimUnnameableIsRateLimited(t *testing.T) {
+	f := newFixture(t)
+	logs := &strings.Builder{}
+	f.sched.log = slog.New(slog.NewJSONHandler(logs, nil))
+	payload := json.RawMessage(`not json`)
+	for range 2 {
+		err := f.sched.OnClaim(t.Context(), payload)
+		if err == nil {
+			t.Fatal("an unnameable claim must return an error")
+		}
+		if !errors.Is(err, ErrUnnameableClaim) {
+			t.Fatalf("error = %v, want the ErrUnnameableClaim sentinel the claim loop skips", err)
+		}
+	}
+	if _, ok := f.reg.Get(""); ok {
+		t.Fatal("an unnameable claim must not register an entry")
+	}
+	f.metrics.mu.Lock()
+	counted := len(f.metrics.claimErrors)
+	f.metrics.mu.Unlock()
+	if counted != 2 {
+		t.Fatalf("malformed claim metric = %d, want every occurrence counted", counted)
+	}
+	// The log is bounded independently of the redispatch cadence: two calls at
+	// one instant produce one line.
+	if got := strings.Count(logs.String(), "claim.malformed"); got != 1 {
+		t.Fatalf("claim.malformed lines = %d, want one across two calls:\n%s", got, logs.String())
+	}
+}
+
+// TestCatchUpJobDeleteFailureIsCounted pins the only alarm left when the
+// post-reclaim Job deletion fails: the entry is already gone, so nothing
+// retries it and the template's TTL owns the leftover.
+func TestCatchUpJobDeleteFailureIsCounted(t *testing.T) {
+	f := newFixture(t)
+	e := f.claim(t, "t-del")
+	if _, err := f.reg.MarkTerminal("t-del", registry.ResultCompleted, "", time.Time{}); err != nil {
+		t.Fatalf("MarkTerminal: %v", err)
+	}
+	f.jobs.deleteJobErr = errors.New("apiserver unavailable")
+
+	if err := f.sched.OnJobTerminated(t.Context(), e.JobName,
+		JobTerminationReasonJobTerminated, time.Time{}, 0); err != nil {
+		t.Fatalf("OnJobTerminated: %v", err)
+	}
+	f.metrics.mu.Lock()
+	stages := append([]string(nil), f.metrics.jobDeleteFailures...)
+	f.metrics.mu.Unlock()
+	if len(stages) != 1 || stages[0] != "catch_up" {
+		t.Fatalf("job delete failure stages = %v, want [catch_up]", stages)
 	}
 }

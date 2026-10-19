@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"log/slog"
@@ -537,5 +538,48 @@ func TestRunStartupProbeCountsABoundaryRegistration(t *testing.T) {
 	}
 	if events := p.events("startup.probe_failed"); len(events) != 0 {
 		t.Fatalf("no failure event expected: %+v", events)
+	}
+}
+
+// TestProbeNodeTrackerStopsWithTheProcess pins the shutdown face: the tracker
+// is detached from the caller (the HTTP request dies before the probe lands)
+// but not from the process. Cancelling Run's context must stop the 1s ListPods
+// poll instead of letting it run to the probe budget.
+func TestProbeNodeTrackerStopsWithTheProcess(t *testing.T) {
+	p := newProbeFixture(t, probeConfig(t))
+	ctx, cancel := context.WithCancel(t.Context())
+	runDone := make(chan struct{})
+	go func() {
+		_ = p.sched.Run(ctx)
+		close(runDone)
+	}()
+	waitUntil(t, "Run to install its lifecycle", func() bool {
+		p.sched.lifecycleMu.Lock()
+		defer p.sched.lifecycleMu.Unlock()
+		return p.sched.lifecycle != nil
+	})
+
+	if _, err := p.sched.StartProbe(t.Context(), "startup-track", "", registry.ProbeStartupDiscovery, 30*time.Second); err != nil {
+		t.Fatalf("StartProbe: %v", err)
+	}
+	waitUntil(t, "the tracker's first poll", func() bool { return p.jobs.listPodsCalls.Load() > 0 })
+
+	cancel()
+	<-runDone
+	settled := p.jobs.listPodsCalls.Load()
+	time.Sleep(3 * probePodPollInterval)
+	if got := p.jobs.listPodsCalls.Load(); got != settled {
+		t.Fatalf("ListPods calls grew after shutdown: %d -> %d", settled, got)
+	}
+}
+
+func waitUntil(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	for !cond() {
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out waiting for %s", what)
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }

@@ -189,8 +189,8 @@ func TestBuildCatalogProbeTemplateRender(t *testing.T) {
 
 	// A1.1 writes the three daemon keys over the template's values.
 	daemon := job.Spec.Template.Spec.Containers[0]
-	if got := envByName(t, daemon.Env, "MULTICA_SERVER_URL").Value; got != foremanServerURL {
-		t.Errorf("MULTICA_SERVER_URL = %q, want Foreman's %q", got, foremanServerURL)
+	if got := envByName(t, daemon.Env, "MULTICA_SERVER_URL").Value; got != DefaultJobServerURL {
+		t.Errorf("MULTICA_SERVER_URL = %q, want Foreman's %q", got, DefaultJobServerURL)
 	}
 	daemonID := envByName(t, daemon.Env, "MULTICA_DAEMON_ID")
 	if daemonID.ValueFrom == nil || daemonID.ValueFrom.FieldRef == nil ||

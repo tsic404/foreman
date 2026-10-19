@@ -75,9 +75,6 @@ func (f *fakeJobs) ListSecrets(context.Context) ([]corev1.Secret, error) {
 	return nil, nil
 }
 func (f *fakeJobs) ListPods(context.Context, string) ([]corev1.Pod, error) { return nil, nil }
-func (f *fakeJobs) WatchJobs(context.Context, scheduler.JobEventHandler) error {
-	return nil
-}
 
 func (f *fakeJobs) deleted(name string) bool {
 	f.mu.Lock()
@@ -908,12 +905,17 @@ func TestS9StatusForwarded(t *testing.T) {
 	rig.claimTask(t, "t-status")
 	tok := rig.token(t, "t-status")
 
+	// S-9 forwards the upstream status code and bytes verbatim: fields beyond
+	// status (the daemon's own shape) must survive (§2.2 S-9).
+	upstream := []byte(`{"status":"cancelled","cancel_requested_at":"2026-10-05T00:00:00Z","unknown":"kept"}`)
 	rig.stub.on("GET", "/api/daemon/tasks/t-status/status", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
-		writeJSONStub(w, 200, map[string]string{"status": "cancelled"})
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(upstream)
 	})
 	code, body := rig.call(t, "GET", "/api/daemon/tasks/t-status/status", tok, nil)
-	if code != 200 || string(body) != `{"status":"cancelled"}` {
-		t.Fatalf("S9 = %d %s", code, body)
+	if code != http.StatusOK || string(body) != string(upstream) {
+		t.Fatalf("S9 = %d %s, want the upstream bytes verbatim", code, body)
 	}
 }
 

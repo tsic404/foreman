@@ -125,7 +125,7 @@ func NewBuilder(cfg Config) (*Builder, error) {
 // An invalid task id, or a name that leaves the name face, fails before any
 // object is produced.
 func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
-	daemonID := daemonIDFor(e.TaskID)
+	daemonID := DaemonIDFor(e.TaskID)
 	if len(daemonID) > maxJobNameLength || !dns1123Label.MatchString(daemonID) {
 		return nil, nil, "", fmt.Errorf("%w: %q does not yield a valid daemon id %q", ErrInvalidTaskID, e.TaskID, daemonID)
 	}
@@ -233,6 +233,7 @@ func (b *Builder) placeholderValues(name, daemonID string, e TaskEntry) placehol
 		chatSessionID:   e.ChatSessionID,
 		jobRuntimeID:    e.JobRuntimeID,
 		claimedAt:       e.ClaimedAt.UTC().Format(time.RFC3339),
+		attempt:         e.Attempt,
 		jobImage:        b.cfg.JobImage,
 		jobName:         name,
 		daemonID:        daemonID,
@@ -244,7 +245,7 @@ func (b *Builder) placeholderValues(name, daemonID string, e TaskEntry) placehol
 // kinds a template passthrough allows (§8.2 A1.1/A1.2): the env keys on
 // containers[0], the per-task metadata, and the per-side key set.
 func (b *Builder) applyWrites(job *batchv1.Job, name, daemonID string, e TaskEntry) {
-	injectContainerEnv(job)
+	injectContainerEnv(job, b.cfg.serverURL())
 
 	job.Name = name
 	job.Namespace = b.cfg.JobNamespace
@@ -284,12 +285,12 @@ func (b *Builder) applyWrites(job *batchv1.Job, name, daemonID string, e TaskEnt
 // leaving the later entry would let the template's value win over Foreman's.
 // A template without containers is left alone — the apiserver rejects the Job
 // and the scheduler reports the existing job_create_failed.
-func injectContainerEnv(job *batchv1.Job) {
+func injectContainerEnv(job *batchv1.Job, serverURL string) {
 	containers := job.Spec.Template.Spec.Containers
 	if len(containers) == 0 {
 		return
 	}
-	injected := injectedEnv()
+	injected := injectedEnv(serverURL)
 	wanted := make(map[string]corev1.EnvVar, len(injected))
 	for _, entry := range injected {
 		wanted[entry.Name] = entry

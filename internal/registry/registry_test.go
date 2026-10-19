@@ -3,6 +3,7 @@ package registry
 import (
 	"encoding/json"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 )
@@ -587,5 +588,41 @@ func TestDeliveryWindowUnarmedWithoutTheOption(t *testing.T) {
 	}
 	if !delivered.DeliveryDeadline.IsZero() {
 		t.Fatalf("delivery deadline = %v, want none without the option", delivered.DeliveryDeadline)
+	}
+}
+
+// TestRuntimeFieldSettersPreserveEachOther pins the lock-scoped single-field
+// writes: a concurrent heartbeat and a delivery record must both survive. The
+// old read-modify-write from a snapshot would write the stale heartbeat fields
+// back and lose one of the two.
+func TestRuntimeFieldSettersPreserveEachOther(t *testing.T) {
+	r := New(time.Now)
+	r.PutRuntime(JobRuntime{JobRuntimeID: "rid-1", DaemonID: "fm-1", Online: true})
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			r.TouchHeartbeat("rid-1", time.Unix(int64(i+1), 0))
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 100; i++ {
+			r.SetRuntimeDeliveredTask("rid-1", "task-1")
+		}
+	}()
+	wg.Wait()
+
+	rt, ok := r.RuntimeByID("rid-1")
+	if !ok {
+		t.Fatal("runtime missing")
+	}
+	if rt.DeliveredTaskID != "task-1" {
+		t.Errorf("DeliveredTaskID = %q, want the delivered task", rt.DeliveredTaskID)
+	}
+	if rt.LastHeartbeatAt.IsZero() || !rt.Online {
+		t.Errorf("heartbeat fields lost: %+v", rt)
 	}
 }

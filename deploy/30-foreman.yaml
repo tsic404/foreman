@@ -81,6 +81,11 @@ spec:
             # --- Job placement / lifecycle ---
             - name: FOREMAN_JOB_NAMESPACE
               value: "multica-agents"
+            # The address every Job daemon dials (this Foreman's Service). Must
+            # match the Service below; renaming it here without updating this
+            # key breaks the Job→Foreman loop (F5).
+            - name: FOREMAN_JOB_SERVER_URL
+              value: "http://foreman.foreman.svc.cluster.local:8080"
             - name: FOREMAN_JOB_IMAGE
               value: "ghcr.io/tsic404/foreman-job:latest"
             - name: FOREMAN_MAX_INFLIGHT_JOBS
@@ -174,8 +179,6 @@ spec:
             # --- observability ---
             - name: FOREMAN_LOG_LEVEL
               value: "info"
-            - name: FOREMAN_METRICS_ENABLED
-              value: "true"
             - name: FOREMAN_WS_ENABLED
               value: "true"
           livenessProbe:

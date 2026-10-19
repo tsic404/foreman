@@ -9,20 +9,17 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"strconv"
 	"strings"
 )
 
 // Environment variable names of the observability module.
 const (
-	EnvLogLevel       = "FOREMAN_LOG_LEVEL"
-	EnvMetricsEnabled = "FOREMAN_METRICS_ENABLED"
+	EnvLogLevel = "FOREMAN_LOG_LEVEL"
 )
 
 // Config is the observability module's runtime configuration.
 type Config struct {
-	LogLevel       slog.Level
-	MetricsEnabled bool
+	LogLevel slog.Level
 }
 
 // LoadConfig reads the observability configuration from env (os.Getenv when
@@ -31,7 +28,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
-	cfg := Config{LogLevel: slog.LevelInfo, MetricsEnabled: true}
+	cfg := Config{LogLevel: slog.LevelInfo}
 
 	if raw := strings.TrimSpace(getenv(EnvLogLevel)); raw != "" {
 		level, err := parseLevel(raw)
@@ -39,13 +36,6 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			return Config{}, err
 		}
 		cfg.LogLevel = level
-	}
-	if raw := strings.TrimSpace(getenv(EnvMetricsEnabled)); raw != "" {
-		enabled, err := strconv.ParseBool(raw)
-		if err != nil {
-			return Config{}, fmt.Errorf("%s must be a bool, got %q", EnvMetricsEnabled, raw)
-		}
-		cfg.MetricsEnabled = enabled
 	}
 	return cfg, nil
 }

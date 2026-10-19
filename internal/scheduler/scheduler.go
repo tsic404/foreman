@@ -28,6 +28,11 @@ import (
 // created Job before the missing-Job compensation engages (§4.6).
 const jobGoneGracePeriod = 60 * time.Second
 
+// malformedClaimLogInterval bounds the log noise of a server that keeps
+// re-dispatching a claim Foreman cannot name: the loop is unbounded, the log
+// is not. The metric counts every occurrence.
+const malformedClaimLogInterval = time.Minute
+
 // jobNamePollInterval is the cadence at which a claim retries a Job create
 // whose name is still held by a foreground-terminating predecessor.
 const jobNamePollInterval = 500 * time.Millisecond
@@ -105,6 +110,11 @@ const (
 const (
 	JobTerminationReasonJobTerminated = "job_terminated"
 	JobTerminationReasonDrainTimeout  = "drain_timeout"
+	// JobTerminationReasonNoObjects is the reclaim reason of an entry whose
+	// instance never produced a Job or Secret (an invalid task id, or a claim
+	// payload that could not be mapped): there is no termination fact to wait
+	// for and no object to inspect.
+	JobTerminationReasonNoObjects = "no_objects"
 )
 
 // Pod termination clock domains (§10): k8s = the kubelet's
@@ -306,6 +316,16 @@ type Scheduler struct {
 	// transition twice.
 	nodeMu sync.Mutex
 
+	// lifecycle is the process context Run was started with; detached probe
+	// trackers derive from it so shutdown stops them. Nil before Run (tests
+	// calling StartProbe directly).
+	lifecycleMu sync.Mutex
+	lifecycle   context.Context
+
+	// malformedClaimLoggedAt rate-limits the unnameable-claim log.
+	malformedClaimMu       sync.Mutex
+	malformedClaimLoggedAt time.Time
+
 	// project memoizes the read-only project reverse lookup per issue id, so a
 	// burst of tasks from one issue does not query the platform once per task
 	// (ADR-035 decision 3 — the cache is not a contract face).
@@ -358,6 +378,9 @@ func New(cfg Config, reg *registry.Registry, jobs JobClient, builder JobBuilder,
 // converge once against the server, then serve until ctx is done. The claim
 // ticker lives in proxy; the periodic convergence in recovery.
 func (s *Scheduler) Run(ctx context.Context) error {
+	s.lifecycleMu.Lock()
+	s.lifecycle = ctx
+	s.lifecycleMu.Unlock()
 	if err := s.Rebuild(ctx); err != nil {
 		return fmt.Errorf("rebuild registry from k8s jobs: %w", err)
 	}
@@ -470,10 +493,19 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	defer s.SyncInflight()
 	var head claimHead
 	if err := json.Unmarshal(task, &head); err != nil {
-		return fmt.Errorf("parse claim payload head: %w", err)
+		// The full head parse failed. A tolerant id read is the difference
+		// between a dead letter (the task can be settled on the server) and an
+		// unnameable claim (only the lease/expiry converges).
+		if id := claimID(task); id != "" {
+			return s.settleMalformedClaim(ctx, id, task, err)
+		}
+		s.noteUnnameableClaim(ctx, err, len(task))
+		return fmt.Errorf("%w: %v", ErrUnnameableClaim, err)
 	}
 	if head.ID == "" {
-		return errors.New("claim payload has no id")
+		err := errors.New("claim payload has no id")
+		s.noteUnnameableClaim(ctx, err, len(task))
+		return fmt.Errorf("%w: %v", ErrUnnameableClaim, err)
 	}
 	unlock := s.taskMu.Lock(head.ID)
 	defer unlock()
@@ -501,7 +533,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	// Job Token's j claim and the uuid5 seed of job_runtime_id (ADR-034
 	// decision 8). The display name is the template's business, so it is
 	// resolved through the builder — the same function Build runs.
-	daemonID := daemonIDFor(head.ID)
+	daemonID := jobbuilder.DaemonIDFor(head.ID)
 	e := registry.TaskEntry{
 		TaskID:          head.ID,
 		AgentID:         head.AgentID,
@@ -521,7 +553,6 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		// the zero value (§10).
 		LeaseKeepUntil: now.Add(PrepareLeaseTTL),
 		Payload:        append(json.RawMessage(nil), task...),
-		PayloadVersion: 1,
 		// Memory-only: the session key of the Built Job's affinity item
 		// (ADR-015) — never annotated, never projected.
 		PriorSessionID: head.PriorSessionID,
@@ -600,7 +631,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	// (NotFound counts as success inside the JobClient). The clear is
 	// best-effort and does not settle the claim — the CreateSecret below
 	// surfaces residue or a denied permission as a phase=secret failure.
-	_ = s.jobs.DeleteSecret(ctx, credName(daemonID))
+	_ = s.jobs.DeleteSecret(ctx, jobbuilder.CredentialSecretName(daemonID))
 	trace(createStepClearStaleSecret)
 	err = s.jobs.CreateSecret(ctx, secret)
 	trace(createStepCreateSecret)
@@ -618,7 +649,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		// not this task's failure — the entry goes and the server
 		// re-dispatches the task once the lease lapses, the same recovery
 		// as an undeliverable claim (§4.3).
-		_ = s.jobs.DeleteSecret(ctx, credName(daemonID))
+		_ = s.jobs.DeleteSecret(ctx, jobbuilder.CredentialSecretName(daemonID))
 		if errors.Is(err, errJobNameHeld) {
 			_ = s.reg.Delete(e.TaskID)
 			s.metrics.InflightJobs(s.reg.Inflight())
@@ -660,7 +691,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	// are Foreman's, while job_created_at is the apiserver's.
 	s.metrics.JobCreateSeconds(placedAt.Sub(e.ClaimedAt).Seconds())
 	s.log.InfoContext(ctx, "job.created",
-		"task_id", e.TaskID, "job_name", e.JobName,
+		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 		"node_name", e.NodeName, "image", jobImage(job))
 	return nil
 }
@@ -839,10 +870,7 @@ func (s *Scheduler) Deliver(daemonID string, runtimeID string, maxTasks int) ([]
 	if !ok {
 		return nil, nil
 	}
-	if rt, ok := s.reg.RuntimeByID(e.JobRuntimeID); ok {
-		rt.DeliveredTaskID = e.TaskID
-		s.reg.PutRuntime(rt)
-	}
+	s.reg.SetRuntimeDeliveredTask(e.JobRuntimeID, e.TaskID)
 	s.log.Info("task.delivered",
 		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 		"deliver_latency_ms", now.Sub(e.ClaimedAt).Milliseconds())
@@ -961,17 +989,17 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 	}
 	if ep.IsTerminal() {
 		switch {
-		case code >= 200 && code < 300:
+		case terminalReportDelivered(code):
+			// 2xx = written; 404 = the server no longer holds the task;
+			// 409 = it already holds a verdict. All three leave nothing to
+			// retry: the write-ahead entry goes, and the Job goes now (the
+			// convergence round would delete it anyway).
 			s.pendingReports.Drop(e.TaskID)
-			s.deleteJob(ctx, e)
-		case code == 404:
-			// §4.4's in-place decision: the server no longer holds the task,
-			// so nothing is writable and the report is moot. A report that
-			// was still undecided settles with no result; an already-decided
-			// replay keeps the verdict it was decided with. The write-ahead
-			// entry goes too, and the Job deletion is idempotent.
-			s.pendingReports.Drop(e.TaskID)
-			if undecided {
+			if code == 404 && undecided {
+				// §4.4's in-place decision: the server no longer holds the
+				// task, so nothing is writable. A report that was still
+				// undecided settles with no result; an already-decided replay
+				// keeps the verdict it was decided with.
 				if _, err := s.reg.MarkTerminal(e.TaskID, "", "", s.now()); err != nil {
 					s.log.ErrorContext(ctx, "task.settle_failed",
 						"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
@@ -979,15 +1007,19 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 				}
 			}
 			s.deleteJob(ctx, e)
-			return 200, resp, nil
-		case code == 400 || code == 403 || code == 409:
+			if code == 404 || code == 409 {
+				return 200, resp, nil
+			}
+		case permanentTerminalRejection(code):
 			// Permanent failure (§1.5: 4xx is a permanent failure): no retry,
-			// so the write-ahead entry goes too; the entry stays terminal and
-			// the objects stay for inspection.
+			// no queue — the write-ahead entry goes too. The verdict is
+			// written, so the Job is torn down like every other terminal
+			// path; only the log records the loss.
 			s.pendingReports.Drop(e.TaskID)
 			s.log.ErrorContext(ctx, "task.forward_failed",
 				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 				"endpoint", string(ep), "status", code)
+			s.deleteJob(ctx, e)
 		default:
 			// Transient failure with the retry budget exhausted: the
 			// write-ahead entry stays queued; recovery drains it until the
@@ -1486,6 +1518,25 @@ func (s *Scheduler) discardQuietly(ctx context.Context, e registry.TaskEntry) bo
 	return true
 }
 
+// reclaimObjectless closes an entry whose instance never had K8s objects. The
+// revoke still runs first (it is in-process and the digest may exist in the
+// set); the Secret and Job steps are skipped because nothing was ever created
+// under names that may not even be legal.
+func (s *Scheduler) reclaimObjectless(ctx context.Context, e registry.TaskEntry) error {
+	s.revokeCredential(ctx, e)
+	drainSeconds := s.drainSeconds(e.TaskID)
+	if err := s.reg.Delete(e.TaskID); err != nil {
+		return err
+	}
+	s.metrics.CredReclaimed(JobTerminationReasonNoObjects, drainSeconds)
+	s.log.InfoContext(ctx, "cred.reclaimed",
+		"task_id", e.TaskID, "job_name", e.JobName, "reason", JobTerminationReasonNoObjects,
+		"drain_seconds", drainSeconds,
+		"pod_terminated_at", "", "pod_terminated_at_source", PodTerminatedAtSourceObserved,
+		"orphan_pods", 0)
+	return nil
+}
+
 // OnJobTerminated is the credential-reclaim entry point — the only one
 // (ADR-017). It runs the teardown in its fixed order: ① revoke the digest
 // (in-process, no K8s dependency) → ② delete the Secret → ③ drop the entry.
@@ -1509,6 +1560,13 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 	if !ok || !e.IsDraining() {
 		return nil
 	}
+	if e.FailureReason == FailureReasonInvalidTaskID {
+		// The instance never produced an object: there is no Secret to delete,
+		// no Job to catch up, and the identity-derived names can be illegal
+		// object names (the task id itself is unusable). Waiting for pod
+		// evidence would only issue rejected reads until the drain bound.
+		return s.reclaimObjectless(ctx, e)
+	}
 	source := PodTerminatedAtSourceK8s
 	switch {
 	case reason == JobTerminationReasonDrainTimeout:
@@ -1527,7 +1585,7 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 	s.revokeCredential(ctx, e)
 	// ② The Secret is the credential's carrier; a failure here keeps the
 	// entry as the retry handle (顺序与幂等规则 7).
-	if err := s.jobs.DeleteSecret(ctx, credName(e.DaemonID)); err != nil {
+	if err := s.jobs.DeleteSecret(ctx, jobbuilder.CredentialSecretName(e.DaemonID)); err != nil {
 		s.log.ErrorContext(ctx, "cred.reclaim_failed",
 			"task_id", e.TaskID, "job_name", jobName, "err", err)
 		return err
@@ -1558,7 +1616,12 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 	// bound nor keeps the entry — the template's ttlSecondsAfterFinished owns
 	// the leftover Job (§8.1).
 	if !s.pendingReports.Queued(e.TaskID) {
-		_ = s.deleteJob(ctx, e)
+		if err := s.deleteJob(ctx, e); err != nil {
+			// The entry is gone, so nothing retries this deletion: the
+			// counter is the only alarm that the Job will live until the
+			// template's ttlSecondsAfterFinished reclaims it.
+			s.metrics.JobDeleteFailed("catch_up")
+		}
 	}
 	return nil
 }
@@ -1716,7 +1779,7 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		// is no object to read a name from and the identity name is the one
 		// value the sweep can name (§9.1: cred.orphan_secret_removed).
 		s.log.InfoContext(ctx, "cred.orphan_secret_removed",
-			"task_id", taskID, "job_name", daemonIDFor(taskID), "secret", secret.Name)
+			"task_id", taskID, "job_name", jobbuilder.DaemonIDFor(taskID), "secret", secret.Name)
 	}
 	return firstErr
 }
@@ -1879,6 +1942,106 @@ func (s *Scheduler) failClaim(ctx context.Context, e registry.TaskEntry, cause e
 	_ = s.reportFail(ctx, e, body)
 }
 
+// terminalReportDelivered reports whether a terminal forward reached a state
+// with nothing left to retry: the server wrote the verdict (2xx), no longer
+// holds the task (404), or already holds a verdict (409). The inbound report
+// path, the compensation forward, the queue sender and the queue drain all use
+// this one predicate — a 409 must never mean "delivered" on one path and
+// "permanent failure" on another.
+func terminalReportDelivered(code int) bool {
+	return (code >= 200 && code < 300) || code == http.StatusNotFound || code == http.StatusConflict
+}
+
+// permanentTerminalRejection reports a 4xx that retrying cannot fix (§1.5):
+// every 4xx except 408 and 429. 404 and 409 are not rejections — they are the
+// task-vanished and already-settled faces terminalReportDelivered owns. Every
+// terminal path (inbound report, compensation forward, queue replay) uses this
+// one boundary, so a permanent refusal can never stay queued on one of them.
+func permanentTerminalRejection(code int) bool {
+	return code >= 400 && code < 500 &&
+		code != http.StatusRequestTimeout && code != http.StatusTooManyRequests &&
+		code != http.StatusNotFound && code != http.StatusConflict
+}
+
+// ErrUnnameableClaim marks a claim with no readable task id. Nothing can be
+// registered or settled for it, and the caller must not log it per attempt:
+// the scheduler itself counts it and logs at a bounded rate, while the
+// server's lease expiry is the only convergence.
+var ErrUnnameableClaim = errors.New("claim payload has no readable task id")
+
+// claimID reads just the task id from a claim payload whose full head parse
+// failed. An id that cannot be read leaves nothing to settle.
+func claimID(task json.RawMessage) string {
+	var head struct {
+		ID string `json:"id"`
+	}
+	if err := json.Unmarshal(task, &head); err != nil {
+		return ""
+	}
+	return head.ID
+}
+
+// settleMalformedClaim dead-letters a claim whose id is readable but whose
+// rest is not: the entry is registered without any object and settled with the
+// documented invalid-task-id attribution, so the server stops re-dispatching
+// it. Without this the same claim would be re-delivered on every lease expiry
+// forever, since no entry exists for any other path to converge it.
+func (s *Scheduler) settleMalformedClaim(ctx context.Context, id string, task json.RawMessage, parseErr error) error {
+	unlock := s.taskMu.Lock(id)
+	defer unlock()
+	cause := fmt.Errorf("%w: malformed claim payload: %v", jobbuilder.ErrInvalidTaskID, parseErr)
+	if existing, ok := s.reg.Get(id); ok {
+		if !existing.IsTerminal() {
+			s.failClaim(ctx, existing, cause)
+		}
+		return nil
+	}
+	if s.reg.IsDone(id) {
+		s.metrics.DuplicateDispatch()
+		s.log.WarnContext(ctx, "duplicate_dispatch",
+			"task_id", id, "old_job_name", "", "action", "drop_terminal_done")
+		return nil
+	}
+	daemonID := jobbuilder.DaemonIDFor(id)
+	e := registry.TaskEntry{
+		TaskID:       id,
+		JobNamespace: s.cfg.JobNamespace,
+		// No object exists (or ever will); the identity name is the key the
+		// reclaim path's Job-name lookup needs.
+		JobName:      daemonID,
+		DaemonID:     daemonID,
+		JobRuntimeID: jobRuntimeID(daemonID),
+		State:        registry.StatePending,
+		Attempt:      1,
+		ClaimedAt:    s.now(),
+		Payload:      append(json.RawMessage(nil), task...),
+	}
+	if err := s.reg.Put(e); err != nil {
+		return err
+	}
+	s.failClaim(ctx, e, cause)
+	return nil
+}
+
+// noteUnnameableClaim counts a claim with no readable id and logs it at a
+// bounded rate: the server's lease/expiry is the only convergence, and the
+// loop would otherwise repeat the error at claim cadence.
+func (s *Scheduler) noteUnnameableClaim(ctx context.Context, err error, size int) {
+	s.metrics.ClaimError("malformed_claim")
+	s.malformedClaimMu.Lock()
+	due := s.now().Sub(s.malformedClaimLoggedAt) >= malformedClaimLogInterval
+	if due {
+		s.malformedClaimLoggedAt = s.now()
+	}
+	s.malformedClaimMu.Unlock()
+	if !due {
+		return
+	}
+	s.log.ErrorContext(ctx, "claim.malformed",
+		"err", err, "body_bytes", size,
+		"note", "no readable task id: the server's lease expires and re-dispatches")
+}
+
 // reportFail forwards a synthetic fail report (C10) for a task the daemon
 // could not settle itself. Its write-ahead entry was queued by the verdict
 // (settleFailure), so a forward that does not land leaves it for the recovery
@@ -1893,10 +2056,10 @@ func (s *Scheduler) reportFail(ctx context.Context, e registry.TaskEntry, body [
 	code, _, err := s.server.Forward(ctx, EPFail, e.TaskID, body)
 	if err == nil {
 		switch {
-		case code >= 200 && code < 300, code == 404, code == 409:
+		case terminalReportDelivered(code):
 			s.pendingReports.Drop(e.TaskID)
 			return nil
-		case code >= 400 && code < 500 && code != http.StatusRequestTimeout && code != http.StatusTooManyRequests:
+		case permanentTerminalRejection(code):
 			// Permanent (§1.5): a replay would only be refused again.
 			s.pendingReports.Drop(e.TaskID)
 		}
@@ -1930,7 +2093,16 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID strin
 		// The credential was reclaimed before the report landed: the entry is
 		// gone, but the report still goes — a terminal callback is never
 		// dropped (§10). No objects are left to clean up.
-		return s.server.Forward(ctx, ep, taskID, body)
+		code, resp, err := s.server.Forward(ctx, ep, taskID, body)
+		if err == nil && ep.IsTerminal() && permanentTerminalRejection(code) {
+			// A replay of a permanently refused report would only be refused
+			// again: the queue entry goes now instead of at the TTL.
+			s.pendingReports.Drop(taskID)
+			s.log.ErrorContext(ctx, "task.forward_dropped",
+				"task_id", taskID, "endpoint", string(ep), "status", code,
+				"reason", "permanent_4xx")
+		}
+		return code, resp, err
 	}
 	if decided, ok := s.reg.DecidedReport(taskID); ok {
 		body = decided
@@ -1943,34 +2115,49 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID strin
 		return code, resp, nil
 	}
 	switch {
-	case code >= 200 && code < 300:
-		s.deleteJob(ctx, e)
-	case code == 404:
-		// §4.4's in-place decision: the server no longer holds the task. The
-		// verdict is re-read under the task lock after the forward: the replay
-		// can stay in flight for the retry budget, and a settlement path may
-		// have decided the instance meanwhile — a decided instance keeps its
-		// result (§4.2, §4.4). Only an instance that never reached a verdict
-		// settles with no result, and the Job deletion uses the fresh entry.
-		unlock := s.taskMu.Lock(taskID)
-		fresh, ok := s.reg.Get(taskID)
-		if !ok {
-			// Reclaimed while the replay was in flight: the pre-forward
-			// snapshot is the only Job handle left, and the deletion is
-			// idempotent.
+	case terminalReportDelivered(code):
+		if code == 404 {
+			// §4.4's in-place decision: the server no longer holds the task.
+			// The verdict is re-read under the task lock after the forward: the
+			// replay can stay in flight for the retry budget, and a settlement
+			// path may have decided the instance meanwhile — a decided instance
+			// keeps its result (§4.2, §4.4). Only an instance that never
+			// reached a verdict settles with no result, and the Job deletion
+			// uses the fresh entry.
+			unlock := s.taskMu.Lock(taskID)
+			fresh, ok := s.reg.Get(taskID)
+			if !ok {
+				// Reclaimed while the replay was in flight: the pre-forward
+				// snapshot is the only Job handle left, and the deletion is
+				// idempotent.
+				unlock()
+				s.deleteJob(ctx, e)
+				return code, resp, nil
+			}
+			if !fresh.IsTerminal() && len(fresh.DecidedReport) == 0 {
+				if _, err := s.reg.MarkTerminal(taskID, "", "", s.now()); err != nil {
+					s.log.ErrorContext(ctx, "task.settle_failed",
+						"task_id", taskID, "job_name", fresh.JobName, "daemon_id", fresh.DaemonID,
+						"reason", "server has no record of the task", "err", err)
+				}
+			}
 			unlock()
-			s.deleteJob(ctx, e)
+			s.deleteJob(ctx, fresh)
 			return code, resp, nil
 		}
-		if !fresh.IsTerminal() && len(fresh.DecidedReport) == 0 {
-			if _, err := s.reg.MarkTerminal(taskID, "", "", s.now()); err != nil {
-				s.log.ErrorContext(ctx, "task.settle_failed",
-					"task_id", taskID, "job_name", fresh.JobName, "daemon_id", fresh.DaemonID,
-					"reason", "server has no record of the task", "err", err)
-			}
-		}
-		unlock()
-		s.deleteJob(ctx, fresh)
+		// 2xx and 409: the verdict is written on the server side. 409 means it
+		// was already there, so nothing is replayed again.
+		s.deleteJob(ctx, e)
+	case permanentTerminalRejection(code):
+		// §1.5: a permanent 4xx is never retried. The queue entry goes so the
+		// drain cannot replay it to the TTL (and SettleTerminal's Queued gate
+		// cannot keep the Job around for it); the Job is torn down like every
+		// other terminal path.
+		s.pendingReports.Drop(taskID)
+		s.log.ErrorContext(ctx, "task.forward_dropped",
+			"task_id", taskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+			"endpoint", string(ep), "status", code, "reason", "permanent_4xx")
+		s.deleteJob(ctx, e)
 	}
 	return code, resp, nil
 }
@@ -1999,10 +2186,10 @@ func (s *Scheduler) deleteObjects(ctx context.Context, e registry.TaskEntry) err
 			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
 		errs = append(errs, fmt.Errorf("delete job %s: %w", e.JobName, err))
 	}
-	if err := s.jobs.DeleteSecret(ctx, credName(e.DaemonID)); err != nil {
+	if err := s.jobs.DeleteSecret(ctx, jobbuilder.CredentialSecretName(e.DaemonID)); err != nil {
 		s.log.ErrorContext(ctx, "job.delete_failed",
 			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
-		errs = append(errs, fmt.Errorf("delete secret %s: %w", credName(e.DaemonID), err))
+		errs = append(errs, fmt.Errorf("delete secret %s: %w", jobbuilder.CredentialSecretName(e.DaemonID), err))
 	}
 	return errors.Join(errs...)
 }
@@ -2025,21 +2212,6 @@ func jobbuilderEntry(e registry.TaskEntry) jobbuilder.TaskEntry {
 		ProjectName:     e.ProjectName,
 		ProjectSource:   e.ProjectSource,
 	}
-}
-
-// daemonIDFor is the identity name of a task's Job: fm-<task_id>, never the
-// template's display name (ADR-034 decision 8). The daemon-id label and
-// annotation, the credential Secret's base name and the Job Token's j claim
-// all derive from it; the display name is a locator-free label-only face.
-func daemonIDFor(taskID string) string {
-	return "fm-" + taskID
-}
-
-// credName is the credential Secret of a Job: the daemon identity plus the
-// -cred suffix (§3: fm-<taskid>-cred). It takes the daemon id, not
-// the display name — a template-expressed name never moves the credential.
-func credName(daemonID string) string {
-	return daemonID + "-cred"
 }
 
 // jobImage extracts the agent container's image reference for the job.created

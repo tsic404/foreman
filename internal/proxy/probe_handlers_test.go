@@ -159,6 +159,35 @@ func TestProbeHeartbeatRejectsForeignRuntime(t *testing.T) {
 	}
 }
 
+func TestProbeStartupSlotUsesDeclarationOrder(t *testing.T) {
+	r := newTestRig(t)
+	token, session := startProbeToken(t, r, "startup-order", "")
+	code, body := r.call(t, "POST", "/api/daemon/register", token, []byte(`{
+		"daemon_id": "fm-catalog-startup-order",
+		"runtimes": [
+			{"name": "zz-omp", "type": "omp", "version": "1.0.0"},
+			{"name": "aa-claude", "type": "claude", "version": "1.0.0"}
+		]
+	}`))
+	if code != 200 {
+		t.Fatalf("probe register = %d: %s", code, body)
+	}
+	discovery := []byte(`{"status":"completed","models":[{"id":"m1"}]}`)
+	code, body = r.call(t, "POST",
+		"/api/daemon/runtimes/"+session.JobRuntime+"/models/"+session.SelfMintedID+"/result", token, discovery)
+	if code != 200 {
+		t.Fatalf("startup absorb = %d: %s", code, body)
+	}
+	// §1.3: the startup slot is the declaration's first entry, not the
+	// name-first one (aa-claude would win a name sort).
+	if staged, ok := r.client.startup.Take("omp", ""); !ok || string(staged) != string(discovery) {
+		t.Fatalf("omp slot = %q (ok=%v), want the discovery body", staged, ok)
+	}
+	if _, ok := r.client.startup.Take("claude", ""); ok {
+		t.Error("the name-first entry got the startup slot; the declaration order is the rule")
+	}
+}
+
 func TestProbeModelResultAbsorbsStartupDiscovery(t *testing.T) {
 	r := newTestRig(t)
 	token, session := startProbeToken(t, r, "startup-4", "")
@@ -190,17 +219,26 @@ func TestProbeModelResultRelaysCommandDriven(t *testing.T) {
 	r := newTestRig(t)
 	token, session := startProbeToken(t, r, "cmd-1", "rid-real")
 	upstreamBody := []byte(`{"status":"completed","models":[]}`)
+	// §1.3: the upstream success response is replayed to the probe daemon
+	// verbatim ("原样回给探针 daemon") — a fixed local confirmation would
+	// drop fields the daemon's own report face carries.
+	upstreamAck := []byte(`{"status":"ok","request_id":"cmd-1"}`)
 	r.stub.on("POST", "/api/daemon/runtimes/rid-real/models/cmd-1/result", func(w http.ResponseWriter, _ *http.Request, body []byte) {
 		if string(body) != string(upstreamBody) {
 			t.Errorf("C21 body = %s, want it verbatim", body)
 		}
-		writeJSONStub(w, 200, map[string]string{"status": "ok"})
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(upstreamAck)
 	})
 
 	code, body := r.call(t, "POST",
 		"/api/daemon/runtimes/"+session.JobRuntime+"/models/cmd-1/result", token, upstreamBody)
 	if code != 200 {
 		t.Fatalf("command relay = %d: %s", code, body)
+	}
+	if string(body) != string(upstreamAck) {
+		t.Errorf("S27 response = %s, want the upstream success body verbatim", body)
 	}
 	if got := len(r.stub.calls("POST", "/api/daemon/runtimes/rid-real/models/cmd-1/result")); got != 1 {
 		t.Fatalf("C21 calls = %d, want 1", got)

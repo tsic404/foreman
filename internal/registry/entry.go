@@ -112,7 +112,6 @@ type TaskEntry struct {
 	// stamped after the response returned (Registry.SetLeaseKeepUntil).
 	LeaseKeepUntil time.Time `json:"lease_keep_until"`
 	LastStatusSeen string    `json:"last_status_seen"`
-	PayloadVersion int       `json:"payload_version"`
 
 	// Job lifecycle fields (§4.3): memory-only — never projected
 	// into /foreman/tasks, never written to annotations, never persisted.
@@ -192,18 +191,21 @@ type TaskEntry struct {
 
 // MarshalJSON renders the entry as /foreman/tasks projects it (§4.1,
 // §9.3): the projection is TaskEntry's own JSON — no second
-// view type to keep in step — with started_at and boot_deadline rendered as an
-// empty string while their fact does not exist yet. Both keys stay present, and
-// the RFC3339 zero is banned: it would satisfy a consumer's `!= ""` test (the
-// adoption poll of AC-09) before the fact exists. A set value goes through the
-// same time.Time encoder every other projected time field uses.
+// view type to keep in step — with lease_keep_until, started_at and
+// boot_deadline rendered as an empty string while their fact does not exist
+// yet. Those keys stay present, and the RFC3339 zero is banned: it would
+// satisfy a consumer's `!= ""` test (the adoption poll of AC-09) before the
+// fact exists. A set value goes through the same time.Time encoder every other
+// projected time field uses.
 func (e TaskEntry) MarshalJSON() ([]byte, error) {
 	type entry TaskEntry
 	return json.Marshal(struct {
 		entry
-		StartedAt    string `json:"started_at"`
-		BootDeadline string `json:"boot_deadline"`
-	}{entry(e), projectedOptionalTime(e.StartedAt), projectedOptionalTime(e.BootDeadline)})
+		StartedAt      string `json:"started_at"`
+		BootDeadline   string `json:"boot_deadline"`
+		LeaseKeepUntil string `json:"lease_keep_until"`
+	}{entry(e), projectedOptionalTime(e.StartedAt), projectedOptionalTime(e.BootDeadline),
+		projectedOptionalTime(e.LeaseKeepUntil)})
 }
 
 // projectedOptionalTime renders a time field whose fact may not exist yet: an
@@ -225,6 +227,12 @@ func projectedOptionalTime(t time.Time) string {
 // (year outside [0,9999]) yields "" — the projection itself cannot encode it
 // either.
 func ProjectedTime(t time.Time) string {
+	if t.IsZero() {
+		// The projection renders an absent fact as the empty string (the
+		// lease deadline included); a log mirroring it must not invent the
+		// RFC3339 zero.
+		return ""
+	}
 	b, err := t.MarshalJSON()
 	if err != nil {
 		return ""

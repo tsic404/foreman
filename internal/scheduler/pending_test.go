@@ -476,3 +476,76 @@ func TestPendingReportsDirFollowsStateRoot(t *testing.T) {
 		t.Fatalf("PendingReportsDir default = %q", got)
 	}
 }
+
+// TestDrainKeepsAReportReplacedMidFlight pins §10's no-loss face under the
+// snapshot race: the delivered body is dropped only while the queue still holds
+// it; a body a concurrent Enqueue wrote mid-flight stays queued.
+func TestDrainKeepsAReportReplacedMidFlight(t *testing.T) {
+	p, err := NewPendingReports(t.TempDir())
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	if err := p.Enqueue("task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"old":1}`)); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	replaced := false
+	sender := &senderFunc{send: func(_ string, _ []byte) (int, []byte, error) {
+		if !replaced {
+			replaced = true
+			if err := p.Enqueue("task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"new":2}`)); err != nil {
+				t.Errorf("mid-flight Enqueue: %v", err)
+			}
+		}
+		return 200, nil, nil
+	}}
+
+	remaining, err := p.Drain(context.Background(), sender)
+	if err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	if remaining != 1 {
+		t.Fatalf("remaining = %d, want the replaced report still queued", remaining)
+	}
+	cur, ok := p.readLocked("task-1")
+	if !ok || string(cur.Body) != `{"new":2}` {
+		t.Fatalf("queued report = %+v (ok=%v), want the mid-flight body", cur, ok)
+	}
+}
+
+// senderFunc adapts a closure to ReportSender.
+type senderFunc struct {
+	send func(taskID string, body []byte) (int, []byte, error)
+}
+
+func (f *senderFunc) DeliverQueued(_ context.Context, _ Endpoint, taskID string, body []byte) (int, []byte, error) {
+	return f.send(taskID, body)
+}
+
+// TestMalformedFileQuarantineFailureIsLoggedOnce pins the retry bound: a
+// quarantine rename that keeps failing must not repeat both error lines on
+// every Drain/Len call.
+func TestMalformedFileQuarantineFailureIsLoggedOnce(t *testing.T) {
+	dir := t.TempDir()
+	// The .bad target is a directory, so the rename can never succeed.
+	if err := os.Mkdir(filepath.Join(dir, "t.json.bad"), 0o700); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "t.json"), []byte(`not json`), 0o600); err != nil {
+		t.Fatalf("write malformed file: %v", err)
+	}
+	logs := &strings.Builder{}
+	p, err := NewPendingReports(dir, WithPendingReportsLogger(
+		slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	_ = p.Len()
+	_ = p.Len()
+	_ = p.Queued("t")
+	if got := strings.Count(logs.String(), "quarantining malformed pending report"); got != 1 {
+		t.Fatalf("quarantine log lines = %d, want one across repeated reads", got)
+	}
+	if got := strings.Count(logs.String(), "quarantine failed"); got != 1 {
+		t.Fatalf("quarantine-failure log lines = %d, want one", got)
+	}
+}

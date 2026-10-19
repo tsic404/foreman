@@ -1,7 +1,8 @@
-// TC-tech-concurrency-01 / AC-02 (first clause): FOREMAN_MAX_INFLIGHT_JOBS
-// bounds the task Jobs Foreman holds at once, and every task beyond it stays
-// queued on the server — Foreman claims only what fits and prefetches nothing
-// (02-contracts.md §10; 01-scope.md NG4). The claim batch is pinned to
+// TC-tech-concurrency-01 / AC-02 (all three clauses): FOREMAN_MAX_INFLIGHT_JOBS
+// bounds the task Jobs Foreman holds at once (cap); every task beyond it stays
+// queued on the server and Foreman claims only what fits, prefetching nothing
+// (excess queue; 02-contracts.md §10; 01-scope.md NG4); and each task has
+// exactly one active Job (uniqueness). The claim batch is pinned to
 // n = min(MAX_INFLIGHT − Inflight, CLAIM_BATCH_MAX) on both arms. The scenario
 // drives the production claim loop against a server-side queue and reads the
 // Job count through the injected JobClient seam, so no cluster is involved.

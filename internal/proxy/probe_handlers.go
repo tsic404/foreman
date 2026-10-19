@@ -188,11 +188,12 @@ func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 	case session.SelfMintedID != "" && req == session.SelfMintedID:
 		// Startup discovery: no server request exists, so the result is
 		// absorbed locally and the daemon gets the C21 success shape back.
+		// The slot is filled for the declaration's first entry (§1.3: 按声明
+		// 顺序), never a name-sorted pick — sorting would also mutate the
+		// slice the probe session shares.
 		provider, profileID := "", ""
 		if len(session.Runtimes) > 0 {
-			discovered := session.Runtimes
-			sort.SliceStable(discovered, func(i, j int) bool { return discovered[i].Name < discovered[j].Name })
-			provider, profileID = discovered[0].Type, discovered[0].ProfileID
+			provider, profileID = session.Runtimes[0].Type, session.Runtimes[0].ProfileID
 		}
 		if provider == "" {
 			s.log.Error("startup discovery landed without a declared runtime", "job_name", claims.JobName)

@@ -856,7 +856,7 @@ func TestTemplateAuthoritativeMetadataWins(t *testing.T) {
 		}
 	}
 	wantAnnotations := map[string]string{
-		annoDaemonID:        daemonIDFor(entry.TaskID),
+		annoDaemonID:        DaemonIDFor(entry.TaskID),
 		annoJobRuntimeID:    entry.JobRuntimeID,
 		annoClaimedAt:       entry.ClaimedAt.UTC().Format(time.RFC3339),
 		annoAttempt:         strconv.Itoa(entry.Attempt),
@@ -874,7 +874,7 @@ func TestTemplateAuthoritativeMetadataWins(t *testing.T) {
 
 	podLabels := job.Spec.Template.Labels
 	if len(podLabels) != 3 || podLabels["app.kubernetes.io/name"] != jobAppName ||
-		podLabels[labelTaskID] != entry.TaskID || podLabels[labelDaemonID] != daemonIDFor(entry.TaskID) {
+		podLabels[labelTaskID] != entry.TaskID || podLabels[labelDaemonID] != DaemonIDFor(entry.TaskID) {
 		t.Errorf("pod labels = %v, want exactly the three §8.2 A1.2 labels", podLabels)
 	}
 	// app.kubernetes.io/managed-by is a Job-side key (§8.2 A1.2): Foreman owns
@@ -965,20 +965,100 @@ func TestTemplateCopyPerBuild(t *testing.T) {
 		t.Fatalf("Build second: %v", err)
 	}
 
-	wantSecond := daemonIDFor(second.TaskID) + "-cred"
+	wantSecond := DaemonIDFor(second.TaskID) + "-cred"
 	if got := volumeByName(t, secondJob.Spec.Template.Spec.Volumes, "cred-src").Secret.SecretName; got != wantSecond {
 		t.Errorf("second Job cred-src = %q, want %q", got, wantSecond)
 	}
-	if secondSecret.Name != wantSecond || secondJob.Annotations[annoDaemonID] != daemonIDFor(second.TaskID) {
+	if secondSecret.Name != wantSecond || secondJob.Annotations[annoDaemonID] != DaemonIDFor(second.TaskID) {
 		t.Errorf("second Job/Secret = %q/%q, want the second task's", secondSecret.Name, secondJob.Annotations[annoDaemonID])
 	}
 	if got := canonicalJSON(secondJob); strings.Contains(got, first.TaskID) {
 		t.Errorf("second Job carries the first task's values:\n%s", got)
 	}
-	if got := volumeByName(t, firstJob.Spec.Template.Spec.Volumes, "cred-src").Secret.SecretName; got != daemonIDFor(first.TaskID)+"-cred" {
+	if got := volumeByName(t, firstJob.Spec.Template.Spec.Volumes, "cred-src").Secret.SecretName; got != DaemonIDFor(first.TaskID)+"-cred" {
 		t.Errorf("first Job cred-src = %q, want it left alone by the second Build", got)
 	}
 	if got := canonicalJSON(firstJob); strings.Contains(got, second.TaskID) {
 		t.Errorf("first Job was mutated by the second Build:\n%s", got)
+	}
+}
+
+// placeholderTemplate exposes the registered placeholders whose substitution
+// rules are under test; the rest of the template is the minimum a Job allows.
+const placeholderTemplate = `
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fm-<task_id>
+  annotations:
+    example.com/attempt: "<attempt>"
+    example.com/chat: "<chat_session_id>"
+    example.com/agent: "<agent-name>"
+    example.com/mixed: "<task_id>:<agent-name>"
+    example.com/literal: "<not-registered>"
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: agent
+          image: <job-image>
+`
+
+// TestAttemptPlaceholder pins §8.3's registry: attempt is a registered value,
+// not a literal that survives into the Job.
+func TestAttemptPlaceholder(t *testing.T) {
+	entry := testEntry()
+	entry.Attempt = 3
+	job, _ := mustBuildTemplate(t, placeholderTemplate, entry, nil)
+	if got := job.Annotations["example.com/attempt"]; got != "3" {
+		t.Errorf("attempt annotation = %q, want 3", got)
+	}
+}
+
+// TestSubstitutionDoesNotRescanValues pins the replacement as one left-to-right
+// pass: a payload value that carries another registered literal stays that
+// literal (§8.3: substitution applies to the template's own text, and the
+// design fixes no field-order semantics).
+func TestSubstitutionDoesNotRescanValues(t *testing.T) {
+	entry := testEntry()
+	entry.ChatSessionID = "<agent-name>"
+	entry.AgentName = "alice"
+	job, _ := mustBuildTemplate(t, placeholderTemplate, entry, nil)
+	if got := job.Annotations["example.com/chat"]; got != "<agent-name>" {
+		t.Errorf("chat annotation = %q, want the payload value's literal", got)
+	}
+	if got := job.Annotations["example.com/agent"]; got != "alice" {
+		t.Errorf("agent annotation = %q, want the agent name", got)
+	}
+	if got := job.Annotations["example.com/mixed"]; got != entry.TaskID+":alice" {
+		t.Errorf("mixed annotation = %q, want both placeholders replaced", got)
+	}
+	if got := job.Annotations["example.com/literal"]; got != "<not-registered>" {
+		t.Errorf("literal annotation = %q, want the unregistered literal preserved", got)
+	}
+}
+
+// TestTemplateRefusesMultipleDocuments pins §8.1's "整份 Job 对象": the YAML
+// reader converts only the first document, so a second one must refuse startup
+// instead of disappearing.
+func TestTemplateRefusesMultipleDocuments(t *testing.T) {
+	manifest := placeholderTemplate + `
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: extra
+`
+	cfg, logs := templateConfig(t, manifest)
+	template, err := LoadJobTemplate(cfg)
+	if err == nil {
+		t.Fatalf("a two-document template must refuse startup, got %v", template)
+	}
+	if !strings.Contains(err.Error(), "2 YAML documents") {
+		t.Errorf("error %q must name the document count", err)
+	}
+	if !strings.Contains(logs.String(), "job template rejected") {
+		t.Errorf("the refusal must use the startup-gate log: %s", logs.String())
 	}
 }

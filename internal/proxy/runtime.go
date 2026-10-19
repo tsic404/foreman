@@ -76,8 +76,30 @@ func WithTaskRuntime(fn func(taskID string) string) Option {
 	return func(cl *Client) { cl.taskRuntime = fn }
 }
 
-// Changes returns the channel that receives every declared-runtime-set change.
+// Changes returns the client-wide change channel. It is a single queue, kept
+// for tests and one-shot observers; consumers that must see every change (the
+// heartbeat supervisor and the WS subscriber) each use SubscribeChanges, so
+// neither can steal the other's notification.
 func (c *Client) Changes() <-chan RuntimeChange { return c.changes }
+
+// SubscribeChanges returns a private change stream plus its release. The
+// channel is buffered and never closed; release removes it from the fan-out.
+func (c *Client) SubscribeChanges() (<-chan RuntimeChange, func()) {
+	ch := make(chan RuntimeChange, 16)
+	c.changesMu.Lock()
+	c.changeSubs = append(c.changeSubs, ch)
+	c.changesMu.Unlock()
+	return ch, func() {
+		c.changesMu.Lock()
+		defer c.changesMu.Unlock()
+		for i, sub := range c.changeSubs {
+			if sub == ch {
+				c.changeSubs = append(c.changeSubs[:i], c.changeSubs[i+1:]...)
+				return
+			}
+		}
+	}
+}
 
 // RuntimeRefs returns the declared runtime set (declaration order).
 func (c *Client) RuntimeRefs() []RuntimeRef {
@@ -406,8 +428,16 @@ func (c *Client) notifyChange(change RuntimeChange) {
 	select {
 	case c.changes <- change:
 	default:
-		// The subscriber re-reads the whole set on every wake-up, so a dropped
-		// notification only delays the reconnect by one tick.
+	}
+	c.changesMu.Lock()
+	defer c.changesMu.Unlock()
+	for _, ch := range c.changeSubs {
+		select {
+		case ch <- change:
+		default:
+			// The subscriber re-reads the whole set on every wake-up, so a
+			// dropped notification only delays its reconcile by one tick.
+		}
 	}
 }
 

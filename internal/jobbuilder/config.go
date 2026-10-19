@@ -22,12 +22,19 @@ const (
 	EnvPreferNodeReuse     = "FOREMAN_PREFER_NODE_REUSE"
 	EnvJobDrainTimeout     = "FOREMAN_JOB_DRAIN_TIMEOUT"
 	EnvPolicyNameResolveIn = "FOREMAN_POLICY_NAME_RESOLUTION_TIMEOUT"
+	// EnvJobServerURL is the address a Job daemon dials: this Foreman's own
+	// Service. The default is the reference deployment's address; renaming the
+	// Service without setting this key breaks F5 silently at the Job side.
+	EnvJobServerURL = "FOREMAN_JOB_SERVER_URL"
 )
 
 // Contract defaults.
 const (
 	DefaultJobNamespace = "multica-agents"
 	DefaultJobImage     = "ghcr.io/tsic404/foreman-job:latest"
+	// DefaultJobServerURL is the reference deployment's Job-side entry point
+	// (§8.2 A1.1): the Service a Job daemon's MULTICA_SERVER_URL resolves to.
+	DefaultJobServerURL = "http://foreman.foreman.svc.cluster.local:8080"
 
 	// DefaultJobTokenTTL is the §6.1 value 24h7m = boot 300s + task 86400s +
 	// drain 120s. This module signs the token, while auth runs the startup
@@ -65,6 +72,10 @@ type Config struct {
 	JobNamespace string
 	JobImage     string
 	JobTokenTTL  time.Duration
+	// ServerURL is FOREMAN_JOB_SERVER_URL: the address written into every Job
+	// daemon's MULTICA_SERVER_URL (§8.2 A1.1). Empty falls back to
+	// DefaultJobServerURL.
+	ServerURL string
 	// PreferNodeReuse is FOREMAN_PREFER_NODE_REUSE: false deletes the
 	// template's <preferred node> item instead of filling it in.
 	PreferNodeReuse bool
@@ -110,6 +121,15 @@ func (c Config) logger() *slog.Logger {
 	return slog.Default()
 }
 
+// serverURL is the injected server address, with the reference deployment's
+// value standing in for a Config built without LoadConfig.
+func (c Config) serverURL() string {
+	if c.ServerURL != "" {
+		return c.ServerURL
+	}
+	return DefaultJobServerURL
+}
+
 // probeHeartbeat is the heartbeat interval the probe Job carries. A Config
 // built without LoadConfig has no loaded value, and an empty interval would
 // render "0s" — the daemon would then spin on its heartbeat — so the fixed
@@ -150,6 +170,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		JobNamespace:    DefaultJobNamespace,
 		JobImage:        DefaultJobImage,
 		JobTokenTTL:     DefaultJobTokenTTL,
+		ServerURL:       DefaultJobServerURL,
 		PreferNodeReuse: true,
 		TemplatePath:    TemplatePath,
 		PolicyPath:      PolicyPath,
@@ -161,6 +182,9 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 
 	if v := strings.TrimSpace(getenv(EnvJobNamespace)); v != "" {
 		cfg.JobNamespace = v
+	}
+	if v := strings.TrimSpace(getenv(EnvJobServerURL)); v != "" {
+		cfg.ServerURL = v
 	}
 	// FOREMAN_JOB_IMAGE is a full image reference, taken verbatim (ADR-012):
 	// `<registry>/<repo>[:<tag>][@sha256:<digest>]` — shape is not a predicate.
