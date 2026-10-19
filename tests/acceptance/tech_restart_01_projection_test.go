@@ -7,6 +7,7 @@
 package acceptance
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -258,6 +259,61 @@ func TestRestart01DeletedJobLeavesNoGhostEntry(t *testing.T) {
 	}
 	if entries := projectedList(t, ops.URL); len(entries) != 0 {
 		t.Fatalf("a discarded Job came back as a ghost entry: %v", entries)
+	}
+}
+
+// TestRestart01OverlappingRebuildKeepsLiveClaim covers the startup race of
+// AC-09: a rebuild that overlaps the claim loop lists the Job the claim just
+// created, and its projection — no payload, no token digest, no boot/lease
+// deadline — must not replace the live entry. The claim's next S6 must still
+// deliver the task instead of answering an empty batch (task.payload_missing).
+func TestRestart01OverlappingRebuildKeepsLiveClaim(t *testing.T) {
+	h := newHarness(t, false)
+	h.useRealBuilder(t)
+	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+	h.declare(declaredRuntimes())
+	ops := httptest.NewServer(observability.NewOpsHandler(
+		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
+	t.Cleanup(ops.Close)
+
+	if err := h.sched.OnClaim(t.Context(), deliveryPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	live, ok := h.reg.Get("task-1")
+	if !ok || len(live.Payload) == 0 {
+		t.Fatalf("live entry = %+v, want the claimed payload", live)
+	}
+
+	// The overlapping rebuild: ListJobs returns the Job created above, and
+	// its projection would be written over the live entry.
+	if err := h.sched.Rebuild(t.Context()); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+
+	kept, ok := h.reg.Get("task-1")
+	if !ok {
+		t.Fatal("the live entry disappeared")
+	}
+	if len(kept.Payload) == 0 {
+		t.Error("the rebuild dropped the live payload")
+	}
+	if kept.TokenHash == "" {
+		t.Error("the rebuild dropped the token digest")
+	}
+	if kept.BootDeadline.IsZero() || kept.LeaseKeepUntil.IsZero() {
+		t.Errorf("the rebuild dropped a deadline: boot=%v lease=%v", kept.BootDeadline, kept.LeaseKeepUntil)
+	}
+	assertProjectedTime(t, ops.URL, "task-1", "boot_deadline", true)
+	assertProjectedTime(t, ops.URL, "task-1", "lease_keep_until", true)
+
+	// The delivery face: the daemon's next claim still gets the task body.
+	token := issueJobToken(t, h, "task-1")
+	registerTaskDaemon(t, h, "task-1", token)
+	if raw := claimTask(t, h, "task-1", token); !bytes.Contains(raw, []byte(`"id":"task-1"`)) {
+		t.Fatalf("S6 after the rebuild = %s, want the task payload", raw)
+	}
+	if events := h.events("task.payload_missing"); len(events) != 0 {
+		t.Fatalf("task.payload_missing events = %d, want 0", len(events))
 	}
 }
 

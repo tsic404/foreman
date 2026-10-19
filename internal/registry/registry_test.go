@@ -63,6 +63,41 @@ func TestPutUpdateRefreshesIndexes(t *testing.T) {
 	}
 }
 
+func TestPutIfAbsentKeepsTheLiveEntry(t *testing.T) {
+	r := New(fixedClock())
+	live := entryFor("t1")
+	live.State = StateRunning
+	if err := r.Put(live); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	projection := entryFor("t1")
+	projection.State = StateJobCreated
+	projection.JobName = "fm-other"
+	inserted, err := r.PutIfAbsent(projection)
+	if err != nil || inserted {
+		t.Fatalf("PutIfAbsent over a live entry = %v, %v; want false, nil", inserted, err)
+	}
+	got, _ := r.Get("t1")
+	if got.State != StateRunning || got.JobName != "fm-t1" {
+		t.Fatalf("entry = %+v, want the live entry untouched", got)
+	}
+	if _, ok := r.ByJob("fm-other"); ok {
+		t.Fatal("index written for a rejected entry")
+	}
+
+	inserted, err = r.PutIfAbsent(entryFor("t2"))
+	if err != nil || !inserted {
+		t.Fatalf("PutIfAbsent on an absent task = %v, %v; want true, nil", inserted, err)
+	}
+	if got, ok := r.ByJob("fm-t2"); !ok || got.TaskID != "t2" {
+		t.Fatalf("ByJob after insert = %v, %v", got, ok)
+	}
+	if _, err := r.PutIfAbsent(TaskEntry{}); err == nil {
+		t.Fatal("PutIfAbsent without task_id accepted")
+	}
+}
+
 func TestInflightCountsOnlyNonTerminal(t *testing.T) {
 	r := New(fixedClock())
 	_ = r.Put(entryFor("t1"))
