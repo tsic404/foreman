@@ -1,15 +1,20 @@
-// TC-tech-observability-02 implements AC-10's log-chain face: one task's
-// events are traceable by its task id from claim to deletion, so every
-// task-face event line carries the task id, the Job name and the daemon
-// identity (02-contracts.md §9.1). Both paths that write the terminal line are
-// covered — the forwarded terminal report and the settlement of an entry the
-// server already holds as terminal — and the daemon key is present with an
-// empty value where the identity is unknown, never omitted.
+// TC-tech-observability-02 implements AC-10's log faces: one task's events are
+// traceable by its task id from claim to deletion, and no log line carries a
+// credential. The chain half covers every path that writes the terminal line
+// (forwarded report and server-already-terminal settlement); the no-token half
+// drives the production logger with the dominant "err", err call shape, whose
+// value is an error rather than a string.
 package acceptance
 
 import (
+	"bytes"
+	"encoding/json"
+	"errors"
+	"log/slog"
+	"strings"
 	"testing"
 
+	"github.com/tsic404/foreman/internal/observability"
 	"github.com/tsic404/foreman/internal/registry"
 )
 
@@ -94,5 +99,36 @@ func assertEventKeys(t *testing.T, event map[string]any, keys []string) {
 		if _, ok := event[key]; !ok {
 			t.Errorf("event %v: missing required field %q", event, key)
 		}
+	}
+}
+
+// TestObservability02ErrorAttrCarriesNoToken covers the no-token half of the
+// TC: the production logger is driven with an error value (KindAny, not a
+// string) and a struct value, each carrying a token. Neither may reach the
+// line, and the error field stays the rendered text with the token replaced.
+func TestObservability02ErrorAttrCarriesNoToken(t *testing.T) {
+	var buf bytes.Buffer
+	log := observability.NewLogger(&buf, slog.LevelInfo, "proxy")
+	log.Error("forward.failed",
+		"err", errors.New("upstream rejected Bearer fmj_errorleak12345"),
+		"cause", struct{ Detail string }{Detail: "peer echoed mat_structleak1234"})
+
+	out := buf.String()
+	for _, token := range []string{"fmj_errorleak12345", "mat_structleak1234"} {
+		if strings.Contains(out, token) {
+			t.Fatalf("token %q leaked into the log line: %q", token, out)
+		}
+	}
+	var line map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(buf.Bytes()), &line); err != nil {
+		t.Fatalf("log line is not JSON: %v (%q)", err, out)
+	}
+	errText, ok := line["err"].(string)
+	if !ok || !strings.Contains(errText, "[redacted]") {
+		t.Fatalf("err field = %v, want the redacted error text", line["err"])
+	}
+	cause, ok := line["cause"].(map[string]any)
+	if !ok || cause["Detail"] != "peer echoed [redacted]" {
+		t.Fatalf("cause = %v, want the JSON object with the token replaced", line["cause"])
 	}
 }
