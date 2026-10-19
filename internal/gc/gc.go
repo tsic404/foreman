@@ -39,16 +39,19 @@ const (
 )
 
 // Stats is one round's outcome; byte counts are FreedBytes (reclaimed) and
-// CacheBytes (the .repos total left behind).
+// CacheBytes (the .repos total left behind). CacheMeasured tells whether the
+// total came from a completed scan: a skipped or interrupted round leaves it
+// false, so its zero value is never read as an empty cache.
 type Stats struct {
-	Skipped     bool  `json:"skipped"`
-	TaskDirs    int   `json:"task_dirs"`
-	TaskRoots   int   `json:"task_roots"`
-	BareRepos   int   `json:"bare_repos"`
-	AgentState  int   `json:"agent_state"`
-	AgentMemory int   `json:"agent_memory"`
-	FreedBytes  int64 `json:"freed_bytes"`
-	CacheBytes  int64 `json:"cache_bytes"`
+	Skipped       bool  `json:"skipped"`
+	TaskDirs      int   `json:"task_dirs"`
+	TaskRoots     int   `json:"task_roots"`
+	BareRepos     int   `json:"bare_repos"`
+	AgentState    int   `json:"agent_state"`
+	AgentMemory   int   `json:"agent_memory"`
+	FreedBytes    int64 `json:"freed_bytes"`
+	CacheBytes    int64 `json:"cache_bytes"`
+	CacheMeasured bool  `json:"cache_measured"`
 }
 
 // Collector runs the cleanup rules over one state root. It is safe for a
@@ -130,11 +133,15 @@ func (c *Collector) RunOnce(ctx context.Context) (Stats, error) {
 	}
 
 	// Bare caches: <root>/workspaces/.repos/<workspace>/<repo>.git.
-	caches, freed, err := c.expireRepos(ctx, root, filepath.Join(workspaces, reposDir))
+	caches, freed, scanErr := c.expireRepos(ctx, root, filepath.Join(workspaces, reposDir))
 	st.BareRepos, st.FreedBytes = caches.expired, st.FreedBytes+freed
-	if err != nil {
-		errs = append(errs, err)
+	if scanErr != nil {
+		errs = append(errs, scanErr)
 	}
+	// The total is only a measurement when the whole tree was walked: a
+	// failed or cancelled scan leaves entries out, so the count would read
+	// low rather than unknown.
+	scanComplete := scanErr == nil && ctx.Err() == nil
 
 	// Orphan task roots: <root>/workspaces/.task_roots/<hash>.
 	if n, freed, err := c.expireDirs(ctx, root, filepath.Join(workspaces, taskRootsDir), c.cfg.TaskDirTTL); err != nil {
@@ -148,6 +155,7 @@ func (c *Collector) RunOnce(ctx context.Context) (Stats, error) {
 	st.BareRepos += reclaimed
 	st.FreedBytes += freed
 	st.CacheBytes = remaining
+	st.CacheMeasured = scanComplete
 	if err != nil {
 		errs = append(errs, err)
 	}
@@ -637,6 +645,8 @@ func (c *Collector) report(st Stats) {
 		"freed_bytes", st.FreedBytes,
 		"task_dirs", st.TaskDirs,
 		"bare_repos", st.BareRepos,
+		"cache_bytes", st.CacheBytes,
+		"cache_measured", st.CacheMeasured,
 	)
 }
 
