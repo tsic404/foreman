@@ -1438,6 +1438,12 @@ type schedulerServerClient struct {
 	// "exactly once".
 	forwardCode int
 	accepted    map[scheduler.Endpoint]int
+	// appliedTerminal is the first accepted terminal callback per task. The
+	// server applies that one and ignores later callbacks for the same task
+	// (§4.4: the terminal verdict is irreversible); a scenario judging "one
+	// write" reads this set, not the wire-call count, because a daemon retry
+	// is a legitimate second call that carries the same decided body.
+	appliedTerminal map[string]upstreamRequest
 	// onStatus fires after the C13 answer is read and the client lock is
 	// released, before the answer is returned. It lets a scenario land a
 	// transition inside the round trip (an S8 start whose MarkStarted must
@@ -1498,8 +1504,31 @@ func (c *schedulerServerClient) Forward(_ context.Context, ep scheduler.Endpoint
 			c.accepted = map[scheduler.Endpoint]int{}
 		}
 		c.accepted[ep]++
+		if ep.IsTerminal() {
+			if c.appliedTerminal == nil {
+				c.appliedTerminal = map[string]upstreamRequest{}
+			}
+			if _, applied := c.appliedTerminal[taskID]; !applied {
+				c.appliedTerminal[taskID] = upstreamRequest{
+					Method: string(ep), Path: taskID, Body: append([]byte(nil), body...),
+				}
+			}
+		}
 	}
 	return code, []byte(`{"status":"ok"}`), nil
+}
+
+// appliedTerminalWrites returns the terminal write the stub applied for the
+// task: the first accepted callback, later ones being the server's idempotent
+// no-ops.
+func (c *schedulerServerClient) appliedTerminalWrites(taskID string) []upstreamRequest {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	write, ok := c.appliedTerminal[taskID]
+	if !ok {
+		return nil
+	}
+	return []upstreamRequest{write}
 }
 
 // setForwardCode programs the C5–C12 answer (0 restores 200).
