@@ -14,6 +14,7 @@ import (
 	"sort"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -330,6 +331,12 @@ type Scheduler struct {
 	// burst of tasks from one issue does not query the platform once per task
 	// (ADR-035 decision 3 — the cache is not a contract face).
 	project projectCache
+
+	// usageMu guards usagePairs, the token metric's admitted (provider, model)
+	// label space (§9.2). Both values come from a task-controlled S-12 body,
+	// so the space is bounded rather than trusted.
+	usageMu    sync.Mutex
+	usagePairs map[usageLabelPair]struct{}
 }
 
 // New builds a Scheduler. reg, jobs, builder and server are required.
@@ -350,6 +357,7 @@ func New(cfg Config, reg *registry.Registry, jobs JobClient, builder JobBuilder,
 		taskMu: newKeyedMutex(),
 
 		attributionWait: defaultAttributionWait,
+		usagePairs:      make(map[usageLabelPair]struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -931,6 +939,27 @@ type usageReport struct {
 	} `json:"usage"`
 }
 
+// The S-12 body is the Job daemon's own report, so its provider and model
+// strings are task-controlled. Both are cut to usageLabelMaxBytes and the
+// admitted label pairs are capped at usageSeriesLimit: unbounded, one task
+// could pin arbitrary label values and series in the process's memory. An
+// entry past the bound still counts under usageOverflowLabel, so the tokens
+// are never lost — only their label granularity.
+const (
+	usageLabelMaxBytes = 64
+	usageSeriesLimit   = 1024
+	usageOverflowLabel = "other"
+)
+
+// usageLabelPair is the token metric's label key (§9.2). It is a struct, not a
+// separator-joined string: both values come from a task-controlled body, so a
+// pair like ("a\x00b", "c") and ("a", "b\x00c") would share one joined key and
+// one budget slot.
+type usageLabelPair struct {
+	provider string
+	model    string
+}
+
 // recordTokenUsage accumulates one S-12 report's entries into the token
 // metric (§9.2 / ADR-009 decision 4). A body that does not decode is
 // forwarded verbatim and contributes nothing: the upstream owns its
@@ -941,9 +970,41 @@ func (s *Scheduler) recordTokenUsage(body []byte) {
 		return
 	}
 	for _, u := range report.Usage {
-		s.metrics.TokenUsage(u.Provider, u.Model,
+		provider, model := s.usageLabels(u.Provider, u.Model)
+		s.metrics.TokenUsage(provider, model,
 			u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
 	}
+}
+
+// usageLabels admits one report entry's provider and model into the token
+// metric's label space, returning the values the metric records.
+func (s *Scheduler) usageLabels(provider, model string) (string, string) {
+	provider, model = boundUsageLabel(provider), boundUsageLabel(model)
+	key := usageLabelPair{provider: provider, model: model}
+	s.usageMu.Lock()
+	defer s.usageMu.Unlock()
+	if _, ok := s.usagePairs[key]; ok {
+		return provider, model
+	}
+	if len(s.usagePairs) >= usageSeriesLimit {
+		return usageOverflowLabel, usageOverflowLabel
+	}
+	s.usagePairs[key] = struct{}{}
+	return provider, model
+}
+
+// boundUsageLabel cuts one label value to usageLabelMaxBytes at a rune
+// boundary: the body is decoded JSON, so its values are valid UTF-8, and a cut
+// inside a sequence would be the one place this process emits an invalid one.
+func boundUsageLabel(v string) string {
+	if len(v) <= usageLabelMaxBytes {
+		return v
+	}
+	cut := usageLabelMaxBytes
+	for cut > 0 && !utf8.RuneStart(v[cut]) {
+		cut--
+	}
+	return v[:cut]
 }
 
 // OnReport applies the state transition for a forwarded lifecycle callback
