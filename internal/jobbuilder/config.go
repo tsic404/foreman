@@ -10,14 +10,11 @@ import (
 )
 
 // Environment variable names from the deployment manifest that this module
-// reads. Five keys the manifest still lists are deliberately absent here:
-// FOREMAN_JOB_IMAGE_PULL_SECRETS / FOREMAN_JOB_TOLERATIONS /
-// FOREMAN_JOB_TTL_SECONDS / FOREMAN_REPO_CACHE_MODE are deleted by ADR-030,
-// and FOREMAN_JOB_CPU_REQUEST / _MEMORY_REQUEST / _CPU_LIMIT / _MEMORY_LIMIT /
-// FOREMAN_JOB_NODE_SELECTOR are idle entries whose deletion follows ADR-028 /
-// ADR-035. Foreman reads none of them: the template is the only shape source,
-// so an arbitrary value — an illegal one included — is ignored, never a
-// startup refusal.
+// reads. The Job-shape tuning keys are gone by design: ADR-030 deleted the
+// four template-only keys, and the resource / nodeSelector five followed once
+// ADR-028 / ADR-035 took over those axes. Foreman reads none of them — the
+// template is the only shape source, so an arbitrary value, an illegal one
+// included, is ignored and never refuses startup.
 const (
 	EnvJobNamespace        = "FOREMAN_JOB_NAMESPACE"
 	EnvJobImage            = "FOREMAN_JOB_IMAGE"

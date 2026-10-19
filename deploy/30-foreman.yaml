@@ -171,21 +171,6 @@ spec:
             # "0" disables expiry.
             - name: FOREMAN_AGENT_STATE_TTL
               value: "336h"
-            # --- Job shape: template-only (ADR-030) ---
-            # The five keys below are idle contract entries: the Job's
-            # resources and nodeSelector come from the template, and Foreman
-            # reads none of them (an arbitrary value, an illegal one included,
-            # is ignored). Their deletion follows ADR-028 / ADR-035 (§8.5).
-            - name: FOREMAN_JOB_CPU_REQUEST
-              value: "1"
-            - name: FOREMAN_JOB_MEMORY_REQUEST
-              value: "2Gi"
-            - name: FOREMAN_JOB_CPU_LIMIT
-              value: "4"
-            - name: FOREMAN_JOB_MEMORY_LIMIT
-              value: "8Gi"
-            - name: FOREMAN_JOB_NODE_SELECTOR
-              value: '{"kubernetes.io/os":"linux"}'
             # --- observability ---
             - name: FOREMAN_LOG_LEVEL
               value: "info"
