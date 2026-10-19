@@ -41,8 +41,12 @@ type OpsConfig struct {
 	JobImage       string
 	RuntimeIDs     func() []string
 	RegisterSource func() any
-	StartedAt      time.Time
-	Logger         *slog.Logger
+	// Health is the liveness view of the process's critical loops; nil keeps
+	// the endpoint's always-ok shape (a handler mounted without loops, as in
+	// the ops tests).
+	Health    *Health
+	StartedAt time.Time
+	Logger    *slog.Logger
 }
 
 // NewOpsHandler mounts the cluster-internal ops surface (§2.2 S-25): /metrics
@@ -67,12 +71,23 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 				runtimeIDs = ids
 			}
 		}
-		writeJSON(w, http.StatusOK, map[string]any{
+		body := map[string]any{
 			"status":      "ok",
 			"inflight":    index.Inflight(),
 			"runtime_ids": runtimeIDs,
 			"uptime_s":    int64(time.Since(cfg.StartedAt).Seconds()),
-		})
+		}
+		// §9.3: this endpoint feeds the liveness probe. A critical loop that
+		// stopped while the process kept serving is exactly the half-dead
+		// state the probe exists to end, so it must not answer ok (§1.5: a
+		// config error is logged and alarmed, not silently absorbed).
+		status := http.StatusOK
+		if stopped := cfg.Health.Stopped(); len(stopped) > 0 {
+			status = http.StatusServiceUnavailable
+			body["status"] = "failed"
+			body["stopped_components"] = stopped
+		}
+		writeJSON(w, status, body)
 	})
 	mux.HandleFunc("GET /foreman/tasks", func(w http.ResponseWriter, _ *http.Request) {
 		// TaskEntry.Payload is json:"-" — the list never leaks payloads (F3).

@@ -543,3 +543,12 @@ curl -s localhost:8080/foreman/healthz
 curl -s localhost:8080/foreman/register-source
 curl -s localhost:8080/metrics | grep -cE '^foreman_'
 ```
+
+`/foreman/healthz` is the input of both probes: it answers `503` (and names the
+stopped component) once a critical loop — claim, heartbeat, lease, recovery,
+WS subscriber, profile-refresh (the last two only with
+`FOREMAN_WS_ENABLED=true`) — has stopped. A loop that stops with an error while
+the process is still serving is a configuration error (§1.5; today the
+credential/identity mismatch `403`): the process logs `component.failed` and
+exits non-zero, so the Deployment restarts it visibly instead of running
+half-dead (§9.3).

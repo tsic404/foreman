@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -119,6 +120,12 @@ const (
 	// hammering the handshake; the supervisor un-parks on the next runtime-set
 	// change, which is exactly when dialing can work again (§1.5 退避面).
 	streamParked
+	// streamConfigError means the handshake was rejected with 403: the
+	// credential does not match the daemon identity/workspace (§1.5
+	// configuration error). Neither a backoff nor a park makes it
+	// connectable, so the subscriber reports it and the process fails
+	// visibly instead of serving a subscription that can never come up.
+	streamConfigError
 	// streamDone means the context ended.
 	streamDone
 )
@@ -273,6 +280,12 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case result := <-outcomes:
+			if result.outcome == streamConfigError {
+				// §1.5: the credential cannot be retried into working. The
+				// error travels to the process supervisor, which exits
+				// non-zero — the Deployment's restart is the alarm.
+				return fmt.Errorf("ws subscription: 403 config error on runtime %s", result.runtimeID)
+			}
 			if result.outcome == streamParked {
 				// Parking is a statement about the identity, not about one id:
 				// the rebuild budget is shared across replacements, so even a
@@ -344,6 +357,13 @@ func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *runti
 			// on, and the next runtime-set change gives it another chance.
 			s.log.Error("ws handshake rejected (bad request); staying on polling", "status", code, "runtime_id", runtimeID)
 			return streamParked
+		case code == http.StatusForbidden:
+			// §1.5: 403 is the credential/identity mismatch — a
+			// configuration error, not a transient failure. Retrying or
+			// parking only hides it; report it so the process fails (the same
+			// face the claim and heartbeat loops take).
+			s.log.Error("ws handshake rejected: 403 config error (credential does not match daemon_id/workspace_id)", "status", code, "runtime_id", runtimeID)
+			return streamConfigError
 		case code == http.StatusNotFound && handshakeSaysRuntimeGone(resp):
 			// The runtime row is gone: rebuild it (C1) and reconnect under the
 			// fresh id. A row that cannot be moved parks this stream instead of

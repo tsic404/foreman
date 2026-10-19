@@ -77,6 +77,36 @@ func TestHealthz(t *testing.T) {
 	}
 }
 
+// TestHealthzReflectsCriticalLoopLiveness: the endpoint feeds the liveness
+// probe (§9.3), so a critical loop that stopped must turn it red instead of
+// leaving a half-dead process reported healthy (§1.5: a config error is
+// alarmed, not absorbed).
+func TestHealthzReflectsCriticalLoopLiveness(t *testing.T) {
+	health := NewHealth()
+	stopClaim := health.Running("claim")
+	health.Running("heartbeat")
+	h := NewOpsHandler(NewMetrics(), registry.New(time.Now), nil, OpsConfig{Health: health})
+
+	rec := do(t, h, "/foreman/healthz")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 while every critical loop runs", rec.Code)
+	}
+
+	stopClaim()
+	rec = do(t, h, "/foreman/healthz")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status = %d, want 503 after a critical loop stopped", rec.Code)
+	}
+	var body struct {
+		Status            string   `json:"status"`
+		StoppedComponents []string `json:"stopped_components"`
+	}
+	decodeBody(t, rec, &body)
+	if body.Status != "failed" || len(body.StoppedComponents) != 1 || body.StoppedComponents[0] != "claim" {
+		t.Fatalf("healthz = %+v, want status failed and stopped_components [claim]", body)
+	}
+}
+
 func TestTasksListOmitsPayload(t *testing.T) {
 	reg := registry.New(time.Now)
 	_ = reg.Put(registry.TaskEntry{
