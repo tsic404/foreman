@@ -101,6 +101,12 @@ func (f *fakeJobs) DeleteJob(_ context.Context, name string) error {
 		return f.deleteJobErr
 	}
 	f.deletedJobs = append(f.deletedJobs, name)
+	// A Background deletion removes the Job object at once (its pods are
+	// reaped asynchronously), so the name frees. A name already listed as
+	// terminating models a deletion that is still in progress.
+	if !f.terminatingJobs[name] {
+		delete(f.existingJobs, name)
+	}
 	return nil
 }
 
@@ -957,23 +963,104 @@ func TestClaimDefersWhileJobNameStillHeld(t *testing.T) {
 	}
 }
 
-// The other meaning of AlreadyExists: the Job is already there and not
-// terminating (restart replay). It is kept and the claim proceeds to
-// job_created without waiting.
-func TestClaimKeepsReplayedJobOnAlreadyExists(t *testing.T) {
+// AlreadyExists on the claim path is never an adoption: adoption is the
+// rebuild row of the disposal table and needs the payload (§4.3), while this
+// entry carries no facts of any existing Job. The object is a predecessor
+// corpse — it is deleted and the claim creates its own Job within the same
+// bound. Adopting it would record the corpse's creationTimestamp as this
+// instance's pod-filter basis and burn the whole boot bound (AC-08: no zombie
+// task).
+func TestClaimReclaimsStaleJobInsteadOfAdoptingIt(t *testing.T) {
 	f := newFixture(t)
-	f.jobs.createJobErr = apierrors.NewAlreadyExists(schema.GroupResource{Group: "batch", Resource: "jobs"}, "fm-task-1")
-	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
+	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "fm-task-1",
+			Labels: map[string]string{
+				registry.LabelManagedBy: registry.ManagedByForeman,
+				registry.LabelTaskID:    "task-1",
+			},
+			CreationTimestamp: metav1.Time{Time: createJobCreationTimestamp.Add(-time.Hour)},
+		},
+	}}
 
-	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
-		t.Fatalf("OnClaim: %v", err)
+	e := f.claim(t, "task-1")
+
+	if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != "fm-task-1" {
+		t.Fatalf("deletedJobs = %v, want the stale Job reclaimed", f.jobs.deletedJobs)
 	}
-	e, ok := f.reg.Get("task-1")
-	if !ok || e.State != registry.StateJobCreated {
-		t.Fatalf("entry = %+v", e)
+	if len(f.jobs.createdJobs) != 1 || f.jobs.createdJobs[0].Name != "fm-task-1" {
+		t.Fatalf("jobs created = %v, want one fresh Job", f.jobs.createdJobs)
+	}
+	if e.State != registry.StateJobCreated {
+		t.Fatalf("state = %v, want job_created", e.State)
+	}
+	if !e.JobCreatedAt.Equal(createJobCreationTimestamp) {
+		t.Fatalf("job_created_at = %v, want the new Job's %v (not the corpse's)",
+			e.JobCreatedAt, createJobCreationTimestamp)
 	}
 	if len(f.server.forwards) != 0 {
-		t.Fatalf("replay reported a failure: %+v", f.server.forwards)
+		t.Fatalf("reclaimed claim reported a failure: %+v", f.server.forwards)
+	}
+}
+
+// The name is not a locating face for deletion (§3): an object this task does
+// not own is never removed. The claim is deferred instead, visibly through
+// task.claim_deferred, and the server re-dispatches it once the lease lapses.
+func TestClaimDefersOnNameHeldByAnotherTasksJob(t *testing.T) {
+	f := newFixture(t)
+	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "fm-task-1",
+			Labels: map[string]string{
+				registry.LabelManagedBy: registry.ManagedByForeman,
+				registry.LabelTaskID:    "task-2",
+			},
+		},
+	}}
+
+	err := f.sched.OnClaim(context.Background(), claimPayload("task-1"))
+	if !errors.Is(err, errJobNameHeld) {
+		t.Fatalf("OnClaim err = %v, want errJobNameHeld", err)
+	}
+	if len(f.jobs.deletedJobs) != 0 {
+		t.Fatalf("deletedJobs = %v, want no deletion of an object this task does not own", f.jobs.deletedJobs)
+	}
+	if _, ok := f.reg.Get("task-1"); ok {
+		t.Fatal("deferred claim kept the entry: its lease would be renewed, never re-dispatched")
+	}
+	if len(f.server.forwards) != 0 {
+		t.Fatalf("deferred claim reported a failure: %+v", f.server.forwards)
+	}
+}
+
+// A stale Job whose deletion keeps failing is a deferred claim, never a task
+// failure: the entry goes and the server re-dispatches once the lease lapses.
+func TestClaimDefersWhenStaleJobDeletionFails(t *testing.T) {
+	f := newFixture(t)
+	f.jobs.deleteJobErr = errors.New("apiserver unavailable")
+	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "fm-task-1",
+			Labels: map[string]string{
+				registry.LabelManagedBy: registry.ManagedByForeman,
+				registry.LabelTaskID:    "task-1",
+			},
+		},
+	}}
+	f.jobs.onGetJob = func() { f.now = f.now.Add(jobNameWait + time.Second) }
+
+	err := f.sched.OnClaim(context.Background(), claimPayload("task-1"))
+	if !errors.Is(err, errJobNameHeld) {
+		t.Fatalf("OnClaim err = %v, want errJobNameHeld", err)
+	}
+	if len(f.jobs.createdJobs) != 0 {
+		t.Fatalf("jobs created = %v, want none while the stale name is held", f.jobs.createdJobs)
+	}
+	if _, ok := f.reg.Get("task-1"); ok {
+		t.Fatal("deferred claim kept the entry: its lease would be renewed, never re-dispatched")
+	}
+	if len(f.server.forwards) != 0 {
+		t.Fatalf("deferred claim reported a failure: %+v", f.server.forwards)
 	}
 }
 
