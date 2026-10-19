@@ -311,7 +311,16 @@ func run() error {
 		"cli_version", discovery.CLIVersion,
 		"failed_profiles", len(discovery.FailedProfiles))
 
-	run("scheduler", sched.Run)
+	// §4.3: rebuild the index before any loop that can create a Job or
+	// converge an entry. The claim loop creates Jobs; a rebuild running
+	// beside it can list one of those Jobs and write its payload-less
+	// projection over the live entry — losing the payload, the token digest
+	// and the boot/lease deadlines.
+	if err := sched.Start(ctx); err != nil {
+		log.Error("foreman.startup_aborted", "stage", "rebuild", "err", err.Error())
+		return err
+	}
+
 	claimLoop := proxy.NewClaimLoop(proxyCfg, client, sched)
 	run("claim", claimLoop.Run)
 	run("heartbeat", proxy.NewHeartbeatLoop(client, reporter).Run)

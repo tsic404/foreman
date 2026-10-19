@@ -316,8 +316,8 @@ type Scheduler struct {
 	// transition twice.
 	nodeMu sync.Mutex
 
-	// lifecycle is the process context Run was started with; detached probe
-	// trackers derive from it so shutdown stops them. Nil before Run (tests
+	// lifecycle is the process context Start was called with; detached probe
+	// trackers derive from it so shutdown stops them. Nil before Start (tests
 	// calling StartProbe directly).
 	lifecycleMu sync.Mutex
 	lifecycle   context.Context
@@ -374,10 +374,12 @@ func New(cfg Config, reg *registry.Registry, jobs JobClient, builder JobBuilder,
 	return s, nil
 }
 
-// Run is the orchestration main loop: rebuild the index from K8s (ADR-002),
-// converge once against the server, then serve until ctx is done. The claim
-// ticker lives in proxy; the periodic convergence in recovery.
-func (s *Scheduler) Run(ctx context.Context) error {
+// Start installs the process lifecycle, rebuilds the index from K8s
+// (ADR-002) and converges once against the server. It returns only after the
+// rebuild is complete, and callers must not start a claim or recovery loop
+// before that: a Job created by a claim can be listed by the rebuild, and the
+// payload-less projection would overwrite the live entry (§4.3).
+func (s *Scheduler) Start(ctx context.Context) error {
 	s.lifecycleMu.Lock()
 	s.lifecycle = ctx
 	s.lifecycleMu.Unlock()
@@ -387,7 +389,6 @@ func (s *Scheduler) Run(ctx context.Context) error {
 	if err := s.Reconcile(ctx); err != nil {
 		s.log.WarnContext(ctx, "initial reconcile failed", "err", err)
 	}
-	<-ctx.Done()
 	return nil
 }
 
@@ -1760,7 +1761,7 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		if taskID == "" {
 			continue
 		}
-		if secret.Name != credName(daemonIDFor(taskID)) {
+		if secret.Name != jobbuilder.CredentialSecretName(jobbuilder.DaemonIDFor(taskID)) {
 			continue
 		}
 		if _, ok := s.reg.Get(taskID); ok {
@@ -1836,9 +1837,19 @@ func (s *Scheduler) Rebuild(ctx context.Context) error {
 			s.log.ErrorContext(ctx, "skip malformed job", "job_name", job.GetName(), "err", err)
 			continue
 		}
-		if err := s.reg.Put(e); err != nil {
+		// A live entry is this process's claim and carries what the rebuilt
+		// projection cannot restore: the payload, the token digest and the
+		// boot/lease deadlines. PutIfAbsent checks and inserts in one locked
+		// step, so a claim landing on either side of it is never replaced
+		// (§4.3).
+		inserted, err := s.reg.PutIfAbsent(e)
+		if err != nil {
 			s.log.ErrorContext(ctx, "restore entry failed",
 				"task_id", e.TaskID, "job_name", e.JobName, "err", err)
+			continue
+		}
+		if !inserted {
+			s.log.DebugContext(ctx, "keep live entry", "task_id", e.TaskID, "job_name", e.JobName)
 			continue
 		}
 		s.reg.PutRuntime(registry.JobRuntime{

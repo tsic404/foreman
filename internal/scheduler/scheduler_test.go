@@ -54,6 +54,10 @@ type fakeJobs struct {
 	listPodsErr     error
 	listPodsCalls   atomic.Int64
 
+	// onListJobs runs inside ListJobs: a test can hold the rebuild's list
+	// open and observe whether Start returns before it completes.
+	onListJobs func()
+
 	// existingJobs models Jobs already in the cluster: CreateJob answers
 	// AlreadyExists for their names and GetJob returns them (terminating,
 	// with a deletionTimestamp, for the names listed in terminatingJobs).
@@ -169,6 +173,9 @@ func (f *fakeJobs) secretDeleted(name string) bool {
 }
 
 func (f *fakeJobs) ListJobs(context.Context) ([]batchv1.Job, error) {
+	if f.onListJobs != nil {
+		f.onListJobs()
+	}
 	if f.listJobsErr != nil {
 		return nil, f.listJobsErr
 	}
@@ -2026,35 +2033,61 @@ func TestNewRequiresProbeRegistry(t *testing.T) {
 	}
 }
 
-// ---- Run ----
+// ---- Start ----
 
-func TestRunRebuildsThenBlocksUntilCancel(t *testing.T) {
+// §4.3: Start rebuilds the index and converges once before it returns, so
+// the loops main starts afterwards begin on the rebuilt index.
+func TestStartRebuildsIndexBeforeReturning(t *testing.T) {
 	f := newFixture(t)
 	f.jobs.jobs = []batchv1.Job{jobObject("task-1")}
 	f.server.status = "running"
 
-	ctx, cancel := context.WithCancel(context.Background())
-	done := make(chan error, 1)
-	go func() { done <- f.sched.Run(ctx) }()
-
-	deadline := time.After(2 * time.Second)
-	for {
-		if _, ok := f.reg.Get("task-1"); ok {
-			cancel()
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatal("Run did not rebuild")
-		default:
-			time.Sleep(time.Millisecond)
-		}
-	}
-	if err := <-done; err != nil {
-		t.Fatalf("Run = %v", err)
+	if err := f.sched.Start(context.Background()); err != nil {
+		t.Fatalf("Start: %v", err)
 	}
 	if e, _ := f.reg.Get("task-1"); e.State != registry.StateJobCreated || e.StartedAt.IsZero() {
 		t.Fatalf("entry = %+v, want the rebuild phase with the start fact only", e)
+	}
+}
+
+// §4.3: Start must not return while the rebuild's ListJobs is in flight.
+// main starts the claim loop only after Start returns; if the rebuild ran
+// beside that loop, a Job the claim just created could be listed and its
+// payload-less projection written over the live entry.
+func TestStartWaitsForRebuildToFinish(t *testing.T) {
+	f := newFixture(t)
+	listing := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	f.jobs.onListJobs = func() {
+		once.Do(func() {
+			close(listing)
+			<-release
+		})
+	}
+
+	done := make(chan error, 1)
+	go func() { done <- f.sched.Start(context.Background()) }()
+
+	select {
+	case <-listing:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start never reached ListJobs")
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("Start returned (%v) while ListJobs was still blocked", err)
+	case <-time.After(100 * time.Millisecond):
+	}
+
+	close(release)
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Start: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start did not return after ListJobs was released")
 	}
 }
 

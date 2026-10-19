@@ -543,21 +543,14 @@ func TestRunStartupProbeCountsABoundaryRegistration(t *testing.T) {
 
 // TestProbeNodeTrackerStopsWithTheProcess pins the shutdown face: the tracker
 // is detached from the caller (the HTTP request dies before the probe lands)
-// but not from the process. Cancelling Run's context must stop the 1s ListPods
-// poll instead of letting it run to the probe budget.
+// but not from the process. Cancelling the lifecycle context must stop the 1s
+// ListPods poll instead of letting it run to the probe budget.
 func TestProbeNodeTrackerStopsWithTheProcess(t *testing.T) {
 	p := newProbeFixture(t, probeConfig(t))
 	ctx, cancel := context.WithCancel(t.Context())
-	runDone := make(chan struct{})
-	go func() {
-		_ = p.sched.Run(ctx)
-		close(runDone)
-	}()
-	waitUntil(t, "Run to install its lifecycle", func() bool {
-		p.sched.lifecycleMu.Lock()
-		defer p.sched.lifecycleMu.Unlock()
-		return p.sched.lifecycle != nil
-	})
+	if err := p.sched.Start(ctx); err != nil {
+		t.Fatalf("Start: %v", err)
+	}
 
 	if _, err := p.sched.StartProbe(t.Context(), "startup-track", "", registry.ProbeStartupDiscovery, 30*time.Second); err != nil {
 		t.Fatalf("StartProbe: %v", err)
@@ -565,7 +558,6 @@ func TestProbeNodeTrackerStopsWithTheProcess(t *testing.T) {
 	waitUntil(t, "the tracker's first poll", func() bool { return p.jobs.listPodsCalls.Load() > 0 })
 
 	cancel()
-	<-runDone
 	settled := p.jobs.listPodsCalls.Load()
 	time.Sleep(3 * probePodPollInterval)
 	if got := p.jobs.listPodsCalls.Load(); got != settled {

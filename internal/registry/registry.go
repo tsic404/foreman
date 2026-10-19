@@ -127,13 +127,36 @@ func (r *Registry) Put(e TaskEntry) error {
 		r.dropIndexesLocked(old)
 	}
 	r.live[e.TaskID] = e
+	r.indexLocked(e)
+	return nil
+}
+
+// PutIfAbsent inserts e only when no entry with its TaskID is live. It reports
+// whether the insert happened; a present entry — terminal or not — is never
+// replaced. The check and the write are one locked step, so a caller racing a
+// claim cannot clobber the entry the claim just wrote.
+func (r *Registry) PutIfAbsent(e TaskEntry) (bool, error) {
+	if e.TaskID == "" {
+		return false, errors.New("task_id is required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, ok := r.live[e.TaskID]; ok {
+		return false, nil
+	}
+	r.live[e.TaskID] = e
+	r.indexLocked(e)
+	return true, nil
+}
+
+// indexLocked writes e's secondary indexes. The caller holds r.mu.
+func (r *Registry) indexLocked(e TaskEntry) {
 	if e.JobName != "" {
 		r.byJob[e.JobName] = e.TaskID
 	}
 	if e.DaemonID != "" {
 		r.byDaemon[e.DaemonID] = e.TaskID
 	}
-	return nil
 }
 
 // Get returns the entry for taskID.
