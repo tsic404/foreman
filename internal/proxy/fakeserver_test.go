@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -1429,5 +1430,115 @@ func TestRegisterRefusesAnEntryWithoutADispatchRecord(t *testing.T) {
 		[]byte(`{"daemon_id":"fm-t-rebuilt","runtimes":[{"name":"foreman-job","type":"omp"}]}`))
 	if code != 409 {
 		t.Fatalf("S-4 without a dispatch record = %d: %s, want 409", code, body)
+	}
+}
+
+// The local daemon face's body bound is announced, not disguised: a body past
+// it gets 413 with the bound and how much was read, so the caller can tell the
+// proxy's refusal from a malformed request, and the handler never runs on
+// truncated bytes. The same facts land in the event log.
+func TestLocalFaceOversizeBodyAnswers413WithFacts(t *testing.T) {
+	var logs bytes.Buffer
+	saved := slog.Default()
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&logs, nil)))
+	t.Cleanup(func() { slog.SetDefault(saved) })
+
+	rig := newTestRig(t)
+	rig.claimTask(t, "t-oversize")
+	tok := rig.token(t, "t-oversize")
+
+	body := bytes.Repeat([]byte("a"), maxLocalBodyBytes+1)
+	code, raw := rig.call(t, "POST", "/api/daemon/heartbeat", tok, body)
+	if code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("oversize local body = %d %s, want 413", code, raw)
+	}
+	var payload struct {
+		Error      string `json:"error"`
+		LimitBytes int64  `json:"limit_bytes"`
+		ReadBytes  int    `json:"read_bytes"`
+	}
+	if err := json.Unmarshal(raw, &payload); err != nil {
+		t.Fatalf("413 body %s: %v", raw, err)
+	}
+	if payload.LimitBytes != maxLocalBodyBytes || payload.ReadBytes != maxLocalBodyBytes {
+		t.Errorf("413 facts = %+v, want the bound and the bytes read up to it", payload)
+	}
+	if !strings.Contains(payload.Error, "bound") {
+		t.Errorf("413 error = %q, want it to name the face's bound", payload.Error)
+	}
+	// The handler did not run: no heartbeat reached the scheduler state and the
+	// entry still has no start fact.
+	if !strings.Contains(logs.String(), "request body over the local face's bound") {
+		t.Errorf("no event for the refused body: %s", logs.String())
+	}
+	if !strings.Contains(logs.String(), `"limit_bytes":33554432`) {
+		t.Errorf("event lacks the bound fact: %s", logs.String())
+	}
+}
+
+// S29 is not subject to the local face's bound: an agent upload past it reaches
+// the upstream byte-for-byte. The bound would otherwise show up as the
+// misleading 400 the passthrough used to answer with.
+func TestPassthroughCarriesBodiesPastTheLocalFaceBound(t *testing.T) {
+	rig := newTestRig(t)
+	const path = "/api/upload-file"
+	rig.stub.on("POST", path, func(w http.ResponseWriter, _ *http.Request, body []byte) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(201)
+		_, _ = w.Write([]byte(`{"received":` + strconv.Itoa(len(body)) + `}`))
+	})
+
+	body := bytes.Repeat([]byte{0x5a}, maxLocalBodyBytes+1)
+	code, _, resp := rig.callWithHeaders(t, "POST", path, http.Header{
+		"Authorization": {"Bearer mat_tasktoken"},
+		"Content-Type":  {"application/octet-stream"},
+	}, body)
+	if code != 201 || string(resp) != `{"received":33554433}` {
+		t.Fatalf("S29 oversize upload = %d %s, want the upstream verdict", code, resp)
+	}
+	got := singleCall(t, rig.stub, "POST", path)
+	if len(got.Body) != len(body) {
+		t.Errorf("upstream body = %d bytes, want %d", len(got.Body), len(body))
+	}
+}
+
+// An upstream that drops its body mid-stream must not look complete to the
+// caller: with chunked framing a plain return would end the caller's stream at
+// the last byte received, which is indistinguishable from a whole answer. The
+// passthrough drops the connection instead, the shape a direct connection
+// produces (§2.4).
+func TestPassthroughTruncatedUpstreamDoesNotLookComplete(t *testing.T) {
+	rig := newTestRig(t)
+	rig.stub.on("GET", "/api/truncated", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		// One chunk, then the connection: no terminating chunk.
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nshort\r\n")
+		_ = buf.Flush()
+		_ = conn.Close()
+	})
+
+	req, err := http.NewRequest("GET", rig.server.URL+"/api/truncated", nil)
+	if err != nil {
+		t.Fatalf("NewRequest: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer mat_tasktoken")
+	resp, err := bareCaller.Do(req)
+	if err != nil {
+		t.Fatalf("the answer head must still arrive: %v", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("status = %d, want the upstream's 200", resp.StatusCode)
+	}
+	body, readErr := io.ReadAll(resp.Body)
+	if readErr == nil {
+		t.Fatal("a truncated answer must not look complete to the caller")
+	}
+	if string(body) != "short" {
+		t.Errorf("truncated answer body = %q, want the bytes the upstream produced", body)
 	}
 }

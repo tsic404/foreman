@@ -9,6 +9,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -18,6 +20,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -169,6 +172,50 @@ const (
 	taskStatusDispatched = "dispatched"
 )
 
+// forwardProbeObservation is one S29 fidelity probe's upstream view: what the
+// proxy forwarded, with the body digested rather than held, so a payload larger
+// than any proxy-side buffer can be compared without buffering it here.
+type forwardProbeObservation struct {
+	Method   string
+	Path     string
+	RawQuery string
+	Header   http.Header
+	Host     string
+	BodyLen  int64
+	BodySHA  string
+}
+
+// forwardPattern yields a deterministic byte stream of any length without
+// holding it in memory (the S29 payload probes' content).
+type forwardPattern struct{ off int64 }
+
+func (p *forwardPattern) Read(b []byte) (int, error) {
+	for i := range b {
+		b[i] = byte(p.off*31 + p.off>>7)
+		p.off++
+	}
+	return len(b), nil
+}
+
+// forwardDigest is the digest forwardPattern's first n bytes hash to.
+func forwardDigest(t *testing.T, n int64) string {
+	t.Helper()
+	sum := sha256.New()
+	if _, err := io.CopyN(sum, &forwardPattern{}, n); err != nil {
+		t.Fatalf("digest the probe pattern: %v", err)
+	}
+	return hex.EncodeToString(sum.Sum(nil))
+}
+
+// forwardProbeAnswer is the non-JSON verdict body the fidelity probe returns:
+// bytes a passthrough must not re-encode or re-type.
+var forwardProbeAnswer = []byte{0x00, 0x01, 0xfe, 0xff, 'o', 'k'}
+
+// forwardProbeBulkBytes is the download probe's size: past the bound the local
+// daemon face used to impose on every body, so a proxy-side buffer cannot hold
+// it.
+const forwardProbeBulkBytes = 33<<20 + 7
+
 // upstreamStub is the server side of C1–C21 as the scenarios need it.
 type upstreamStub struct {
 	mu sync.Mutex
@@ -222,6 +269,12 @@ type upstreamStub struct {
 	ackShape ackRuntimeIDShape
 	requests []upstreamRequest
 	server   *httptest.Server
+	// forwardProbes records the S29 fidelity probe's upstream view.
+	forwardProbes []forwardProbeObservation
+	// forwardStreamed / forwardGate program the streaming probe: the answer's
+	// first chunk signals the channel, the rest waits for the gate.
+	forwardStreamed chan struct{}
+	forwardGate     chan struct{}
 }
 
 func newUpstreamStub(t *testing.T) *upstreamStub {
@@ -406,6 +459,80 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		stub.record(r, "/api/tokens/current/renew", body)
 		writeJSON(w, http.StatusOK, map[string]string{"token": "mdt_test"})
 	})
+	// S29 fidelity probes: the upstream observes what arrived (body digested,
+	// never held) and answers with a non-JSON verdict the proxy must replay
+	// unchanged.
+	mux.HandleFunc("POST /api/forward-probe", func(w http.ResponseWriter, r *http.Request) {
+		stub.observeForward(r)
+		h := w.Header()
+		h.Set("Content-Type", "application/octet-stream")
+		h.Set("X-Probe-Verdict", "kept")
+		h.Add("X-Probe-Multi", "a")
+		h.Add("X-Probe-Multi", "b")
+		h.Add("Set-Cookie", "a=1")
+		h.Add("Set-Cookie", "b=2")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write(forwardProbeAnswer)
+	})
+	// The bulk download probe: the body is generated, so its size is bounded by
+	// the caller's read, not by the stub's memory.
+	mux.HandleFunc("GET /api/forward-probe-bulk", func(w http.ResponseWriter, r *http.Request) {
+		stub.observeForward(r)
+		w.Header().Set("Content-Type", "application/octet-stream")
+		w.Header().Set("Content-Length", strconv.FormatInt(forwardProbeBulkBytes, 10))
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.CopyN(w, &forwardPattern{}, forwardProbeBulkBytes)
+	})
+	// The streaming probe: the head and a first chunk go out, then the answer
+	// waits for the scenario's release. A proxy that buffers the whole body
+	// cannot deliver that chunk before the release.
+	mux.HandleFunc("GET /api/forward-probe-stream", func(w http.ResponseWriter, r *http.Request) {
+		stub.observeForward(r)
+		stub.mu.Lock()
+		streamed, gate := stub.forwardStreamed, stub.forwardGate
+		stub.mu.Unlock()
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write(bytes.Repeat([]byte("f"), 16<<10))
+		w.(http.Flusher).Flush()
+		if streamed != nil {
+			close(streamed)
+		}
+		if gate != nil {
+			<-gate
+		}
+		_, _ = w.Write([]byte("-last"))
+	})
+	// The S29 failure probes (TC-tech-forward-05): a head that never arrives, an
+	// upstream 5xx, and a head whose body is cut short. Each records the request
+	// so a scenario can count what one caller request produced upstream.
+	mux.HandleFunc("GET /api/forward-probe-refused", func(w http.ResponseWriter, r *http.Request) {
+		stub.record(r, r.URL.Path, nil)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		_ = conn.Close()
+	})
+	mux.HandleFunc("GET /api/forward-probe-5xx", func(w http.ResponseWriter, r *http.Request) {
+		stub.record(r, r.URL.Path, nil)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusServiceUnavailable)
+		_, _ = w.Write([]byte(`{"error":"upstream overloaded"}`))
+	})
+	mux.HandleFunc("GET /api/forward-probe-truncated", func(w http.ResponseWriter, r *http.Request) {
+		stub.record(r, r.URL.Path, nil)
+		conn, buf, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			return
+		}
+		// One chunk, then the connection: no terminating chunk and no declared
+		// length, so the caller-side framing is chunked — the shape in which a
+		// buffered byte is lost rather than merely cut short.
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nshort\r\n")
+		_ = buf.Flush()
+		_ = conn.Close()
+	})
 	server := httptest.NewServer(mux)
 	t.Cleanup(server.Close)
 	stub.server = server
@@ -418,6 +545,41 @@ func (s *upstreamStub) record(r *http.Request, path string, body []byte) {
 	s.requests = append(s.requests, upstreamRequest{
 		Method: r.Method, Path: path, Body: body, Header: r.Header.Clone(), At: time.Now(),
 	})
+}
+
+// observeForward records one fidelity probe's upstream view; the body is read
+// through a digest, so the probe never depends on the payload fitting memory.
+func (s *upstreamStub) observeForward(r *http.Request) {
+	sum := sha256.New()
+	n, _ := io.Copy(sum, r.Body)
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.forwardProbes = append(s.forwardProbes, forwardProbeObservation{
+		Method: r.Method, Path: r.URL.Path, RawQuery: r.URL.RawQuery,
+		Header: r.Header.Clone(), Host: r.Host,
+		BodyLen: n, BodySHA: hex.EncodeToString(sum.Sum(nil)),
+	})
+}
+
+// forwardObservations returns the fidelity probes the upstream saw, in order.
+func (s *upstreamStub) forwardObservations() []forwardProbeObservation {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]forwardProbeObservation(nil), s.forwardProbes...)
+}
+
+// forwardStreamGate programs the streaming probe and returns the first-chunk
+// signal plus the release function (idempotent, so a failing test can clean up
+// without a double close).
+func (s *upstreamStub) forwardStreamGate() (<-chan struct{}, func()) {
+	streamed := make(chan struct{})
+	gate := make(chan struct{})
+	var once sync.Once
+	release := func() { once.Do(func() { close(gate) }) }
+	s.mu.Lock()
+	s.forwardStreamed, s.forwardGate = streamed, gate
+	s.mu.Unlock()
+	return streamed, release
 }
 
 func (s *upstreamStub) idFor(provider, profileID string) (string, bool) {

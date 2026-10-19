@@ -3,7 +3,9 @@ package proxy
 import (
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
+	"strconv"
 	"time"
 
 	"github.com/tsic404/foreman/internal/auth"
@@ -103,7 +105,7 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	body, ok := readBody(w, r)
+	body, ok := s.readBody(w, r)
 	if !ok {
 		return
 	}
@@ -199,7 +201,7 @@ func (s *FakeServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	body, ok := readBody(w, r)
+	body, ok := s.readBody(w, r)
 	if !ok {
 		return
 	}
@@ -261,7 +263,7 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	body, ok := readBody(w, r)
+	body, ok := s.readBody(w, r)
 	if !ok {
 		return
 	}
@@ -448,7 +450,7 @@ func (s *FakeServer) reportHandler(ep scheduler.Endpoint) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		body, ok := readBody(w, r)
+		body, ok := s.readBody(w, r)
 		if !ok {
 			return
 		}
@@ -555,7 +557,7 @@ func (s *FakeServer) handleSkillBundles(w http.ResponseWriter, r *http.Request) 
 	if _, ok := s.authenticate(w, r, auth.RequestScope{TaskID: tid, RuntimeID: rid}); !ok {
 		return
 	}
-	body, ok := readBody(w, r)
+	body, ok := s.readBody(w, r)
 	if !ok {
 		return
 	}
@@ -580,32 +582,36 @@ func (s *FakeServer) handleS23(w http.ResponseWriter, r *http.Request) {
 // ---- S29 passthrough ----
 
 // handlePassthrough forwards any non-fmj_ /api/* call to the real server
-// verbatim (§2.1 rule 2 + ADR-020): the caller's whole header set and body
-// go out as given, the upstream status, header set and body come back as
-// given. This call site neither picks nor adds fields — the exclusion set
-// lives in Passthrough alone. Upstream 5xx and transport failures map to 502.
+// verbatim (§2.1 rule 2 + ADR-020 + ADR-046): the caller's whole header set and
+// body go out as given, the upstream status, header set and body come back as
+// given. This call site neither picks nor adds fields — the exclusion set lives
+// in Passthrough alone. Upstream 5xx and failures before a response head map to
+// 502; a body that breaks once the head is out reaches the caller as a
+// truncated response, which is what a direct connection produces too.
 func (s *FakeServer) handlePassthrough(w http.ResponseWriter, r *http.Request) {
-	body, ok := readBody(w, r)
-	if !ok {
-		return
-	}
-	code, header, resp, err := s.client.Passthrough(r.Context(), r.Method, r.URL.EscapedPath(), r.URL.RawQuery, r.Header, body)
-	if err != nil || code >= http.StatusInternalServerError {
+	resp, err := s.client.Passthrough(r.Context(), r.Method, r.URL.EscapedPath(), r.URL.RawQuery, r.Header, r.Body, r.ContentLength)
+	if err != nil || resp.StatusCode >= http.StatusInternalServerError {
+		if resp != nil {
+			_ = resp.Body.Close()
+		}
 		writeError(w, http.StatusBadGateway, "upstream unavailable")
 		return
 	}
-	writeUpstream(w, code, header, resp)
+	defer resp.Body.Close()
+	writeUpstream(w, resp)
 }
 
-// writeUpstream replays a passthrough response verbatim (S-29): the
-// upstream's fields, then its status, then its body bytes. It is not the
+// writeUpstream streams a passthrough response verbatim (S-29): the upstream's
+// fields, then its status, then its body as it arrives. It is not the
 // local-response outlet — writeRaw stamps Content-Type: application/json on
-// the responses Foreman synthesizes, which would rewrite this one. Nil
-// values suppress the headers net/http would otherwise add by itself
-// (Content-Type sniffing, Date), so the caller sees exactly what came back.
-func writeUpstream(w http.ResponseWriter, code int, header http.Header, body []byte) {
+// the responses Foreman synthesizes, which would rewrite this one. Nil values
+// suppress the headers net/http would otherwise add by itself (Content-Type
+// sniffing, Date), so the caller sees exactly what came back. A body length the
+// upstream declared is restated as the caller-side framing; an undeclared one
+// becomes chunked framing.
+func writeUpstream(w http.ResponseWriter, resp *PassthroughResponse) {
 	dst := w.Header()
-	for k, vv := range header {
+	for k, vv := range resp.Header {
 		dst[k] = append([]string(nil), vv...)
 	}
 	if _, ok := dst["Content-Type"]; !ok {
@@ -614,6 +620,43 @@ func writeUpstream(w http.ResponseWriter, code int, header http.Header, body []b
 	if _, ok := dst["Date"]; !ok {
 		dst["Date"] = nil
 	}
-	w.WriteHeader(code)
-	_, _ = w.Write(body)
+	if resp.ContentLength >= 0 && resp.StatusCode != http.StatusNoContent && resp.StatusCode != http.StatusNotModified {
+		dst["Content-Length"] = []string{strconv.FormatInt(resp.ContentLength, 10)}
+	}
+	w.WriteHeader(resp.StatusCode)
+	// The head goes out before the body is copied: the caller must see the
+	// upstream's status even if the body breaks below, and a large answer must
+	// start arriving while the upstream is still writing it.
+	rc := http.NewResponseController(w)
+	if err := rc.Flush(); err != nil {
+		return
+	}
+	if _, err := io.Copy(flushWriter{w: w, rc: rc}, resp.Body); err != nil {
+		// A body that breaks mid-stream must not look complete: returning
+		// normally would end chunked framing at the last byte received, which
+		// the caller cannot tell from a whole answer. Dropping the connection
+		// is the shape a direct connection produces (§2.4).
+		panic(http.ErrAbortHandler)
+	}
+}
+
+// flushWriter flushes every written chunk before the copy reads the next one.
+// Without the per-chunk flush the chunked framing buffer keeps the tail, and
+// the abort above drops bytes the upstream had already produced: the delivered
+// prefix would then depend on the upstream's chunk size rather than match a
+// direct connection (§2.4).
+type flushWriter struct {
+	w  io.Writer
+	rc *http.ResponseController
+}
+
+func (f flushWriter) Write(p []byte) (int, error) {
+	n, err := f.w.Write(p)
+	if err != nil {
+		return n, err
+	}
+	if err := f.rc.Flush(); err != nil {
+		return n, err
+	}
+	return n, nil
 }

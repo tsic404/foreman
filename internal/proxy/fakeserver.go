@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -15,9 +16,11 @@ import (
 	"github.com/tsic404/foreman/internal/scheduler"
 )
 
-// maxRequestBody bounds daemon/agent request bodies (cluster-internal
-// surface; the contract pins no limit).
-const maxRequestBody = 32 << 20
+// maxLocalBodyBytes bounds the local daemon face's request bodies. The face
+// carries control-plane JSON, not agent payloads, so a body past this bound is
+// an anomaly the caller is told about; S29 passthrough does not use it (its
+// bodies stream through unread).
+const maxLocalBodyBytes = 32 << 20
 
 // TaskScheduler is the fake server's scheduling surface (§2.1):
 // S6 delivery, S8–S17 report handling, task-vanish settlement.
@@ -226,13 +229,29 @@ func bearerToken(r *http.Request) (string, bool) {
 	return strings.TrimSpace(token), true
 }
 
-func readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxRequestBody))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, "unreadable request body")
+// readBody reads a local endpoint's body under the face's bound. A body past
+// the bound answers 413 carrying the bound and how much was read — the caller
+// must be able to tell "the proxy refused this body" from "this request is
+// malformed" — and logs the same facts. Bytes past the bound never reach a
+// handler.
+func (s *FakeServer) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxLocalBodyBytes))
+	if err == nil {
+		return body, true
+	}
+	var tooLarge *http.MaxBytesError
+	if errors.As(err, &tooLarge) {
+		s.log.Warn("request body over the local face's bound",
+			"path", r.URL.Path, "limit_bytes", tooLarge.Limit, "read_bytes", len(body))
+		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
+			"error":       "request body over the local face's bound",
+			"limit_bytes": tooLarge.Limit,
+			"read_bytes":  len(body),
+		})
 		return nil, false
 	}
-	return body, true
+	writeError(w, http.StatusBadRequest, "unreadable request body")
+	return nil, false
 }
 
 func writeJSON(w http.ResponseWriter, code int, v any) {

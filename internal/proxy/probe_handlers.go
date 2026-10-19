@@ -174,7 +174,7 @@ func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
-	body, ok := readBody(w, r)
+	body, ok := s.readBody(w, r)
 	if !ok {
 		return
 	}
