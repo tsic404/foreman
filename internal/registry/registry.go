@@ -288,19 +288,14 @@ func (r *Registry) Settled(taskID string) (TaskEntry, bool) {
 // deadline test and the stamp disagree at the boundary.
 func (r *Registry) Now() time.Time { return r.now() }
 
-// MarkTerminal is the single write path into the terminal state
-// (§4.2 markTerminal): it sets state+result atomically with the settled
-// record. completedAt defaults to now. reason is the
-// externally observable attribution of a failure Foreman judged itself; an
-// empty one leaves any recorded attribution in place, and the server's own
-// verdicts carry none (§4.1).
-//
-// It is also the drain entry point (ADR-017): the alive → draining transition
-// writes drain_deadline, the completion time and the settled record exactly
-// once, so a repeated terminal report (daemon retries, pending-report
-// replays) only overwrites the result and can neither reset the upper bound
-// nor restart the drain duration.
-func (r *Registry) MarkTerminal(taskID string, result Result, reason string, completedAt time.Time) (TaskEntry, error) {
+// MarkTerminal is the single write path into the terminal state (§4.2). The
+// first call writes state, result, attribution, the drain bound and the
+// settled record atomically and reports that transition. Terminal is
+// irreversible: a repeated report (daemon retry, queue replay, late replay)
+// only gets the settled entry back (first=false), with its verdict, drain
+// bound and settled record untouched. reason is the attribution of a failure
+// Foreman judged itself; the server's own verdicts carry none (§4.1).
+func (r *Registry) MarkTerminal(taskID string, result Result, reason string, completedAt time.Time) (TaskEntry, bool, error) {
 	if completedAt.IsZero() {
 		completedAt = r.now()
 	}
@@ -308,27 +303,46 @@ func (r *Registry) MarkTerminal(taskID string, result Result, reason string, com
 	defer r.mu.Unlock()
 	e, ok := r.live[taskID]
 	if !ok {
-		return TaskEntry{}, fmt.Errorf("unknown task %s", taskID)
+		return TaskEntry{}, false, fmt.Errorf("unknown task %s", taskID)
 	}
-	first := e.State != StateTerminal
-	if first {
-		e.JobPhase = JobPhaseDraining
-		e.DrainDeadline = r.now().Add(r.drainTimeout)
-		e.CompletedAt = completedAt
+	if e.State == StateTerminal {
+		return e, false, nil
 	}
 	e.State = StateTerminal
+	e.JobPhase = JobPhaseDraining
+	e.DrainDeadline = r.now().Add(r.drainTimeout)
+	e.CompletedAt = completedAt
 	e.Result = result
 	if reason != "" {
 		e.FailureReason = reason
 	}
-	if first {
-		// The settled record is the projection at the verdict instant: it is
-		// what the ops endpoint keeps answering with once the credential
-		// reclaim deletes the live row (ADR-032).
-		r.done.put(taskID, e.CompletedAt, settledRecord(e))
-	}
+	// The settled record is the projection at the verdict instant: it is
+	// what the ops endpoint keeps answering with once the credential
+	// reclaim deletes the live row (ADR-032).
+	r.done.put(taskID, e.CompletedAt, settledRecord(e))
 	r.live[taskID] = e
-	return e, nil
+	return e, true, nil
+}
+
+// SettleNoResult applies §4.4's in-place decision to the report that was still
+// being decided when the server answered 404: the task no longer exists, so
+// nothing is writable and the verdict carries no result. expected is the
+// result that report wrote; a mismatch means another path already decided the
+// entry, and the settled verdict stands (§4.2).
+func (r *Registry) SettleNoResult(taskID string, expected Result) (TaskEntry, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.live[taskID]
+	if !ok || e.State != StateTerminal || e.Result != expected {
+		return e, false
+	}
+	e.Result = ""
+	e.FailureReason = ""
+	r.live[taskID] = e
+	if _, at, ok := r.done.get(taskID); ok {
+		r.done.put(taskID, at, settledRecord(e))
+	}
+	return e, true
 }
 
 // settledRecord strips the memory-only secrets from the entry the settled

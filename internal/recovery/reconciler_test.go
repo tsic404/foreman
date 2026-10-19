@@ -1233,7 +1233,7 @@ func TestReconcileExpiresSessionIndexEntries(t *testing.T) {
 // closure keep moving.
 func TestReconcileCleanupProceedsWhenPodsUnreadable(t *testing.T) {
 	reg := newRegistry(t, testEntry("t1"))
-	if _, err := reg.MarkTerminal("t1", registry.ResultCompleted, "", time.Time{}); err != nil {
+	if _, _, err := reg.MarkTerminal("t1", registry.ResultCompleted, "", time.Time{}); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	set := &fakeSettler{terminated: true}
@@ -1257,7 +1257,7 @@ func TestReconcileCleanupProceedsWhenPodsUnreadable(t *testing.T) {
 // with the objectless reason instead.
 func TestReclaimObjectlessEntrySkipsJobEvidence(t *testing.T) {
 	reg := newRegistry(t, testEntry("t1"))
-	if _, err := reg.MarkTerminal("t1", registry.ResultFailed, scheduler.FailureReasonInvalidTaskID, time.Time{}); err != nil {
+	if _, _, err := reg.MarkTerminal("t1", registry.ResultFailed, scheduler.FailureReasonInvalidTaskID, time.Time{}); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	set := &fakeSettler{}

@@ -1652,6 +1652,7 @@ type recordingMetrics struct {
 	jobDeleteFailed  []string
 	forwards         []metricForward
 	tokenUsage       []tokenUsageRecord
+	terminalResults  []string
 }
 
 // Forward records one lifecycle forward by endpoint and status code
@@ -1700,12 +1701,6 @@ func (m *recordingMetrics) TaskClaimed() {
 	m.taskClaims++
 }
 
-func (m *recordingMetrics) TaskTerminal(result string) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	m.taskResults = append(m.taskResults, result)
-}
-
 func (m *recordingMetrics) JobBootSeconds(seconds float64) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -1738,6 +1733,28 @@ func (m *recordingMetrics) JobDeleteFailed(stage string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.jobDeleteFailed = append(m.jobDeleteFailed, stage)
+}
+
+// TaskTerminal records the result label of every counted terminal transition
+// (foreman_tasks_total{result}).
+func (m *recordingMetrics) TaskTerminal(result string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.taskResults = append(m.taskResults, result)
+	m.terminalResults = append(m.terminalResults, result)
+}
+
+// terminalCount is the number of counted terminal transitions with result.
+func (m *recordingMetrics) terminalCount(result string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, got := range m.terminalResults {
+		if got == result {
+			n++
+		}
+	}
+	return n
 }
 
 // DuplicateDispatch counts a server redispatch of a known task

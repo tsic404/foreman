@@ -381,7 +381,7 @@ func TestOnReportDecidedInstanceForwardsItsDecidedBody(t *testing.T) {
 	g := newGateFixture(t)
 	e := g.runningTask(t, "task-1", "running")
 	decided := []byte(`{"error":"platform terminated","failure_reason":"job_deadline_exceeded"}`)
-	if _, err := g.reg.MarkTerminal("task-1", registry.ResultFailed, FailureReasonJobDeadline, testNow); err != nil {
+	if _, _, err := g.reg.MarkTerminal("task-1", registry.ResultFailed, FailureReasonJobDeadline, testNow); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	if _, ok := g.reg.RegisterDecidedReport("task-1", decided); !ok {
@@ -426,7 +426,7 @@ func TestOnReportTerminal404SettlesWithoutResult(t *testing.T) {
 func TestOnReportTerminal404KeepsADecidedResult(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "task-1")
-	if _, err := f.reg.MarkTerminal("task-1", registry.ResultCompleted, "", testNow); err != nil {
+	if _, _, err := f.reg.MarkTerminal("task-1", registry.ResultCompleted, "", testNow); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	f.server.forwardCode = 404
@@ -475,7 +475,7 @@ func TestDeliverQueued404KeepsAVerdictDecidedDuringReplay(t *testing.T) {
 	decided := []byte(`{"error":"container ended without a terminal report","failure_reason":"job_failed"}`)
 	f.server.onForward = func() {
 		// The other path settles the instance while the replay is in flight.
-		if _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, FailureReasonJobFailed, testNow); err != nil {
+		if _, _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, FailureReasonJobFailed, testNow); err != nil {
 			t.Fatalf("MarkTerminal: %v", err)
 		}
 		if _, ok := f.reg.RegisterDecidedReport("task-1", decided); !ok {
@@ -508,7 +508,7 @@ func TestDeliverQueuedUsesTheDecidedBody(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "task-1")
 	decided := []byte(`{"error":"platform terminated","failure_reason":"job_deadline_exceeded"}`)
-	if _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, FailureReasonJobDeadline, testNow); err != nil {
+	if _, _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, FailureReasonJobDeadline, testNow); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	if _, ok := f.reg.RegisterDecidedReport("task-1", decided); !ok {
@@ -573,7 +573,7 @@ func TestOnReportAttributionGateDecidedDuringWait(t *testing.T) {
 				}
 				// The convergence path settles the instance while the gate
 				// waits: a completed verdict and its decided body.
-				if _, err := g.reg.MarkTerminal("task-1", registry.ResultCompleted, "", testNow); err != nil {
+				if _, _, err := g.reg.MarkTerminal("task-1", registry.ResultCompleted, "", testNow); err != nil {
 					t.Fatalf("MarkTerminal: %v", err)
 				}
 				if _, ok := g.reg.RegisterDecidedReport("task-1", decided); !ok {
@@ -629,7 +629,7 @@ func TestOnReportStaleSnapshotDoesNotRewriteADecidedInstance(t *testing.T) {
 			e := g.runningTask(t, "task-1", "running")
 			g.server.forwardCode = tt.forwardCode
 			decided := []byte(`{"error":"the other path decided","failure_reason":"job_failed"}`)
-			if _, err := g.reg.MarkTerminal("task-1", registry.ResultCompleted, "", testNow); err != nil {
+			if _, _, err := g.reg.MarkTerminal("task-1", registry.ResultCompleted, "", testNow); err != nil {
 				t.Fatalf("MarkTerminal: %v", err)
 			}
 			if _, ok := g.reg.RegisterDecidedReport("task-1", decided); !ok {

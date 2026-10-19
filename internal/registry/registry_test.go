@@ -105,7 +105,7 @@ func TestInflightCountsOnlyNonTerminal(t *testing.T) {
 	if n := r.Inflight(); n != 2 {
 		t.Fatalf("Inflight = %d, want 2", n)
 	}
-	if _, err := r.MarkTerminal("t1", ResultCompleted, "", testNow); err != nil {
+	if _, _, err := r.MarkTerminal("t1", ResultCompleted, "", testNow); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	if n := r.Inflight(); n != 1 {
@@ -120,9 +120,12 @@ func TestInflightCountsOnlyNonTerminal(t *testing.T) {
 func TestMarkTerminalWritesDoneIndexAndIsImmutable(t *testing.T) {
 	r := New(fixedClock())
 	_ = r.Put(entryFor("t1"))
-	e, err := r.MarkTerminal("t1", ResultFailed, "", testNow)
+	e, first, err := r.MarkTerminal("t1", ResultFailed, "", testNow)
 	if err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
+	}
+	if !first {
+		t.Fatal("the first terminal write did not report the transition")
 	}
 	if e.State != StateTerminal || e.Result != ResultFailed {
 		t.Fatalf("entry = %v/%v", e.State, e.Result)
@@ -130,19 +133,59 @@ func TestMarkTerminalWritesDoneIndexAndIsImmutable(t *testing.T) {
 	if !r.IsDone("t1") {
 		t.Fatal("IsDone false after MarkTerminal")
 	}
+	// A repeated terminal write is an idempotent cleanup: the first verdict
+	// stands and the caller is told it did not transition the entry.
+	if replay, first, err := r.MarkTerminal("t1", ResultCompleted, "job_failed", testNow); err != nil {
+		t.Fatalf("repeated MarkTerminal: %v", err)
+	} else if first || replay.Result != ResultFailed || replay.FailureReason != "" {
+		t.Fatalf("replay = %+v, first=%v; want the original verdict", replay, first)
+	}
 	e.State = StateRunning
 	if err := r.Put(e); !errors.Is(err, ErrTerminalImmutable) {
 		t.Fatalf("terminal regression accepted: %v", err)
 	}
-	if _, err := r.MarkTerminal("unknown", ResultFailed, "", testNow); err == nil {
+	if _, _, err := r.MarkTerminal("unknown", ResultFailed, "", testNow); err == nil {
 		t.Fatal("MarkTerminal on unknown task accepted")
+	}
+}
+
+func TestSettleNoResultOnlyReplacesTheReportsOwnVerdict(t *testing.T) {
+	r := New(fixedClock())
+	_ = r.Put(entryFor("t1"))
+	_, first, err := r.MarkTerminal("t1", ResultCompleted, "", testNow)
+	if err != nil || !first {
+		t.Fatalf("MarkTerminal = first %v, %v", first, err)
+	}
+
+	// Another path's verdict is not the report's to replace.
+	if _, ok := r.SettleNoResult("t1", ResultFailed); ok {
+		t.Fatal("the in-place decision replaced another verdict")
+	}
+	if got, _ := r.Get("t1"); got.Result != ResultCompleted {
+		t.Fatalf("result = %q, want the standing verdict", got.Result)
+	}
+
+	// The report's own verdict becomes the empty result, live and settled.
+	got, ok := r.SettleNoResult("t1", ResultCompleted)
+	if !ok || got.Result != "" || got.FailureReason != "" {
+		t.Fatalf("in-place decision = %+v, %v; want no result", got, ok)
+	}
+	record, ok := r.Settled("t1")
+	if !ok || record.Result != "" {
+		t.Fatalf("settled record = %+v, %v; want the empty result", record, ok)
+	}
+
+	// A replay carrying the old expected value matches nothing: the empty
+	// result is a decided verdict too.
+	if _, ok := r.SettleNoResult("t1", ResultCompleted); ok {
+		t.Fatal("a replay re-applied the in-place decision")
 	}
 }
 
 func TestDeleteKeepsDoneRecord(t *testing.T) {
 	r := New(fixedClock())
 	_ = r.Put(entryFor("t1"))
-	_, _ = r.MarkTerminal("t1", ResultCompleted, "", testNow)
+	_, _, _ = r.MarkTerminal("t1", ResultCompleted, "", testNow)
 	if err := r.Delete("t1"); err != nil {
 		t.Fatalf("Delete: %v", err)
 	}
@@ -166,7 +209,7 @@ func TestDoneIndexExpires(t *testing.T) {
 	now := testNow
 	r := New(func() time.Time { return now })
 	_ = r.Put(entryFor("t1"))
-	_, _ = r.MarkTerminal("t1", ResultCompleted, "", now)
+	_, _, _ = r.MarkTerminal("t1", ResultCompleted, "", now)
 	now = now.Add(DoneIndexTTL + time.Minute)
 	if r.IsDone("t1") {
 		t.Fatal("done record past TTL still reported")
@@ -233,7 +276,7 @@ func TestActiveJobsByNode(t *testing.T) {
 		t.Fatalf("ActiveJobsByNode = %v, want node-a=2 node-b=1", load)
 	}
 	// Terminal Jobs do not hold node capacity: their pod is on its way out.
-	if _, err := r.MarkTerminal("t2", ResultCompleted, "", testNow); err != nil {
+	if _, _, err := r.MarkTerminal("t2", ResultCompleted, "", testNow); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	if load = r.ActiveJobsByNode(); load["node-a"] != 1 {
@@ -282,7 +325,7 @@ func TestMarkStarted(t *testing.T) {
 		t.Fatalf("started_at overwritten: %v", e.StartedAt)
 	}
 	// Terminal wins over a late start.
-	_, _ = r.MarkTerminal("t1", ResultCompleted, "", testNow)
+	_, _, _ = r.MarkTerminal("t1", ResultCompleted, "", testNow)
 	if _, ok := r.MarkStarted("t1", testNow); ok {
 		t.Fatal("late start regressed a terminal entry")
 	}
@@ -309,7 +352,7 @@ func TestMarkStartFact(t *testing.T) {
 		t.Fatalf("started_at overwritten: %v", got.StartedAt)
 	}
 	// Terminal wins over a late fact.
-	_, _ = r.MarkTerminal("t1", ResultCompleted, "", testNow)
+	_, _, _ = r.MarkTerminal("t1", ResultCompleted, "", testNow)
 	if _, ok := r.MarkStartFact("t1", testNow); ok {
 		t.Fatal("late start fact regressed a terminal entry")
 	}
@@ -576,8 +619,10 @@ func TestSettledRecordRetainsVerdictAndDropsSecrets(t *testing.T) {
 	if !ok || delivered.DeliveryDeadline != now.Add(30*time.Second) {
 		t.Fatalf("delivery window = %v (ok %v), want the commit plus 30s", delivered.DeliveryDeadline, ok)
 	}
-	if _, err := r.MarkTerminal("t1", ResultFailed, "delivery_unconfirmed", time.Time{}); err != nil {
+	if _, first, err := r.MarkTerminal("t1", ResultFailed, "delivery_unconfirmed", time.Time{}); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
+	} else if !first {
+		t.Fatal("the first terminal write did not report the transition")
 	}
 	record, ok := r.Settled("t1")
 	if !ok {
@@ -590,13 +635,23 @@ func TestSettledRecordRetainsVerdictAndDropsSecrets(t *testing.T) {
 		t.Errorf("the retained record kept the payload or the token digest: %+v", record)
 	}
 
-	// A repeated terminal report overwrites the result but must not erase the
-	// attribution that started the drain.
-	if _, err := r.MarkTerminal("t1", ResultFailed, "", time.Time{}); err != nil {
+	// A repeated terminal report is an idempotent cleanup: it must neither
+	// reclassify the verdict nor erase the attribution that started the drain.
+	again, first, err := r.MarkTerminal("t1", ResultCompleted, "job_failed", time.Time{})
+	if err != nil {
 		t.Fatalf("repeated MarkTerminal: %v", err)
 	}
-	if again, _ := r.Settled("t1"); again.FailureReason != "delivery_unconfirmed" {
-		t.Errorf("a reasonless replay erased the attribution: %q", again.FailureReason)
+	if first {
+		t.Error("a repeated terminal report reported a first transition")
+	}
+	if again.Result != ResultFailed || again.FailureReason != "delivery_unconfirmed" {
+		t.Errorf("replay rewrote the verdict: result=%q reason=%q", again.Result, again.FailureReason)
+	}
+	if !again.CompletedAt.Equal(record.CompletedAt) || !again.DrainDeadline.Equal(record.DrainDeadline) {
+		t.Errorf("replay moved the verdict instant or the drain bound: %+v", again)
+	}
+	if retained, _ := r.Settled("t1"); retained.Result != ResultFailed || retained.FailureReason != "delivery_unconfirmed" {
+		t.Errorf("replay rewrote the settled record: result=%q reason=%q", retained.Result, retained.FailureReason)
 	}
 
 	// Past the retention window the record is gone, and a reclaimed task is
