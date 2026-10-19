@@ -1011,19 +1011,22 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			// report; the rebuilt Job then read a completed task as failed.
 			s.enqueuePending(ctx, e, ep, "", body)
 			result := registry.Result(ep.TerminalResult())
-			if _, err := s.reg.MarkTerminal(e.TaskID, result, "", now); err != nil {
+			_, first, err := s.reg.MarkTerminal(e.TaskID, result, "", now)
+			if err != nil {
 				unlockTerminal()
 				return 0, nil, err
 			}
-			s.metrics.TaskTerminal(string(result))
-			s.log.InfoContext(ctx, "task.terminal",
-				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
-				"result", string(result),
-				"duration_seconds", now.Sub(e.ClaimedAt).Seconds())
-			// The instance's first terminal forward decides its body: every
-			// later terminal forward takes this one (§4.4).
-			if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body); ok {
-				e = registered
+			if first {
+				s.metrics.TaskTerminal(string(result))
+				s.log.InfoContext(ctx, "task.terminal",
+					"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+					"result", string(result),
+					"duration_seconds", now.Sub(e.ClaimedAt).Seconds())
+				// The instance's first terminal forward decides its body:
+				// every later terminal forward takes this one (§4.4).
+				if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body); ok {
+					e = registered
+				}
 			}
 		}
 		unlockTerminal()
@@ -1064,12 +1067,9 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 				// §4.4's in-place decision: the server no longer holds the
 				// task, so nothing is writable. A report that was still
 				// undecided settles with no result; an already-decided replay
-				// keeps the verdict it was decided with.
-				if _, err := s.reg.MarkTerminal(e.TaskID, "", "", s.now()); err != nil {
-					s.log.ErrorContext(ctx, "task.settle_failed",
-						"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
-						"reason", "server has no record of the task", "err", err)
-				}
+				// keeps the verdict it was decided with. The compare-and-set
+				// guard keeps any other path's verdict (§4.2).
+				s.reg.SettleNoResult(e.TaskID, registry.Result(ep.TerminalResult()))
 			}
 			s.deleteJob(ctx, e)
 			if code == 404 || code == 409 {
@@ -1189,7 +1189,7 @@ func (s *Scheduler) OnStartRejected(ctx context.Context, taskID string) error {
 		// reports (§4.3).
 		return s.AdoptRunning(ctx, taskID, st)
 	case registry.IsTerminalResult(st):
-		return s.SettleTerminal(ctx, taskID, st)
+		return s.settleTerminalLocked(ctx, taskID, st)
 	case st == "queued" || st == "dispatched":
 		return s.failEntry(ctx, e, failReport{
 			reason:  FailureReasonStaleClaim,
@@ -1290,7 +1290,7 @@ func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) err
 		s.reg.MarkStartFact(taskID, s.now())
 		return nil
 	case registry.IsTerminalResult(st):
-		if _, err := s.reg.MarkTerminal(taskID, registry.Result(st), "", s.now()); err != nil {
+		if _, _, err := s.reg.MarkTerminal(taskID, registry.Result(st), "", s.now()); err != nil {
 			return err
 		}
 		return s.deleteJob(ctx, e)
@@ -1395,7 +1395,7 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 	}
 	s.reg.SetLastStatusSeen(e.TaskID, st)
 	if registry.IsTerminalResult(st) {
-		return s.SettleTerminal(ctx, e.TaskID, st)
+		return s.settleTerminalLocked(ctx, e.TaskID, st)
 	}
 	return s.failEntry(ctx, e, failReport{
 		reason:  reason,
@@ -1441,26 +1441,28 @@ func (s *Scheduler) failEntry(ctx context.Context, e registry.TaskEntry, report 
 // wins.
 func (s *Scheduler) settleFailure(ctx context.Context, e registry.TaskEntry, report failReport) (registry.TaskEntry, []byte, error) {
 	body := report.encode()
-	s.log.ErrorContext(ctx, "task.failed_compensated",
-		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
-		"failure_reason", report.reason)
 	// §10 write-ahead: durable before the verdict write, exactly like an
 	// inbound terminal report — a crash cannot leave a failure verdict whose
 	// report only lived in the process. The attribution rides the queue entry:
 	// the rebuilt entry has no in-memory verdict, and the replay must restore
 	// failure_reason from the entry, never from the body (§4.1).
 	s.enqueuePending(ctx, e, EPFail, report.reason, body)
-	settled, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, report.reason, s.now())
+	settled, first, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, report.reason, s.now())
 	if err != nil {
 		return e, body, err
 	}
-	if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body); ok {
-		settled = registered
+	if first {
+		s.log.ErrorContext(ctx, "task.failed_compensated",
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+			"failure_reason", report.reason)
+		s.metrics.TaskTerminal(string(registry.ResultFailed))
+		if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body); ok {
+			settled = registered
+		}
 	}
 	if decided, ok := s.reg.DecidedReport(e.TaskID); ok {
 		body = decided
 	}
-	s.metrics.TaskTerminal(string(registry.ResultFailed))
 	return settled, body, nil
 }
 
@@ -1472,7 +1474,20 @@ func (s *Scheduler) settleFailure(ctx context.Context, e registry.TaskEntry, rep
 // still waiting in the durable queue holds the Job back until it lands
 // (§10): the recovery loop drains the queue every round and the
 // round that saw it delivered deletes the Job.
+//
+// The task's lock serializes this write with every other settlement path, so
+// a C13 answer can never reclassify an entry a concurrent report decided
+// (§4.2: terminal is irreversible).
 func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) error {
+	unlock := s.taskMu.Lock(taskID)
+	defer unlock()
+	return s.settleTerminalLocked(ctx, taskID, result)
+}
+
+// settleTerminalLocked is SettleTerminal for callers that already hold the
+// task's lock: the S8 answer round (OnStartRejected) and the Job compensation
+// (FailJob).
+func (s *Scheduler) settleTerminalLocked(ctx context.Context, taskID, result string) error {
 	defer s.SyncInflight()
 	// §4.3: an uncompleted carrier list is not an empty queue. Converging an
 	// entry now could delete the Job of a task whose queued report the
@@ -1489,10 +1504,11 @@ func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) e
 		// report — a deleted Job must never stand in for a delivered one.
 		return nil
 	}
-	if !e.IsTerminal() {
-		if _, err := s.reg.MarkTerminal(taskID, registry.Result(result), "", s.now()); err != nil {
-			return err
-		}
+	_, first, err := s.reg.MarkTerminal(taskID, registry.Result(result), "", s.now())
+	if err != nil {
+		return err
+	}
+	if first {
 		s.metrics.TaskTerminal(result)
 		s.log.InfoContext(ctx, "task.terminal",
 			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
@@ -1570,12 +1586,15 @@ func (s *Scheduler) OnTaskVanished(ctx context.Context, taskID string) error {
 	if !ok {
 		return nil
 	}
-	if !e.IsTerminal() {
+	// A decided entry keeps its verdict: the in-place settlement only writes
+	// the empty result when this path is the first to decide (§4.2, §4.4).
+	_, first, err := s.reg.MarkTerminal(taskID, "", "", s.now())
+	if err != nil {
+		return err
+	}
+	if first {
 		s.log.InfoContext(ctx, "task.vanished",
 			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID)
-		if _, err := s.reg.MarkTerminal(taskID, "", "", s.now()); err != nil {
-			return err
-		}
 	}
 	return s.deleteJob(ctx, e)
 }
@@ -2315,7 +2334,7 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID strin
 				return code, resp, nil
 			}
 			if !fresh.IsTerminal() && len(fresh.DecidedReport) == 0 {
-				if _, err := s.reg.MarkTerminal(taskID, "", "", s.now()); err != nil {
+				if _, _, err := s.reg.MarkTerminal(taskID, "", "", s.now()); err != nil {
 					s.log.ErrorContext(ctx, "task.settle_failed",
 						"task_id", taskID, "job_name", fresh.JobName, "daemon_id", fresh.DaemonID,
 						"reason", "server has no record of the task", "err", err)
@@ -2366,13 +2385,16 @@ func (s *Scheduler) settleReplayed(ctx context.Context, taskID string, ep Endpoi
 	if result == registry.ResultFailed {
 		reason = failureReason
 	}
-	if _, err := s.reg.MarkTerminal(taskID, result, reason, s.now()); err != nil {
+	_, first, err := s.reg.MarkTerminal(taskID, result, reason, s.now())
+	if err != nil {
 		s.log.ErrorContext(ctx, "task.settle_failed",
 			"task_id", taskID, "job_name", fresh.JobName, "daemon_id", fresh.DaemonID,
 			"reason", "queued report delivered", "err", err)
 		return
 	}
-	s.metrics.TaskTerminal(string(result))
+	if first {
+		s.metrics.TaskTerminal(string(result))
+	}
 }
 
 // deleteJob removes the Job object of a settled task — the "撤下调度与资源"

@@ -220,7 +220,7 @@ func TestRegisterDoesNotWakeASettledTask(t *testing.T) {
 	defer conn.Close(websocket.StatusNormalClosure, "done")
 	_ = readFrame(t, conn) // catch-up push
 
-	if _, err := rig.reg.MarkTerminal("t-settled", registry.ResultCompleted, "", time.Time{}); err != nil {
+	if _, _, err := rig.reg.MarkTerminal("t-settled", registry.ResultCompleted, "", time.Time{}); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
 	code, body := rig.call(t, "POST", "/api/daemon/register", tok, []byte(`{

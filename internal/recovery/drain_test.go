@@ -28,7 +28,7 @@ func newDrainRegistry(t *testing.T, timeout time.Duration, entries ...registry.T
 // the test exercises the same transition production uses.
 func drainingEntry(t *testing.T, reg *registry.Registry, taskID string) registry.TaskEntry {
 	t.Helper()
-	e, err := reg.MarkTerminal(taskID, registry.ResultFailed, "", time.Now())
+	e, _, err := reg.MarkTerminal(taskID, registry.ResultFailed, "", time.Now())
 	if err != nil {
 		t.Fatalf("MarkTerminal(%s): %v", taskID, err)
 	}
