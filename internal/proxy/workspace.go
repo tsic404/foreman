@@ -48,7 +48,10 @@ type reposRefresh struct {
 // answers from the last successful snapshot (§1.7).
 func (c *Client) RefreshWorkspaceState(ctx context.Context) error {
 	if !c.WorkspaceState().Seeded {
-		// The pre-C1 window never calls C-22 (§1.7 注册前窗口).
+		// The pre-C1 window never calls C-22 (§1.7 注册前窗口), so the refresh
+		// has no snapshot to answer from: §9.2's `failed` outcome. The S-2
+		// answer itself stays the designed empty pre-C1 body.
+		c.metrics.WorkspaceStateRefresh(WorkspaceStateFailure)
 		return nil
 	}
 	c.reposMu.Lock()
@@ -79,10 +82,9 @@ func (c *Client) RefreshWorkspaceState(ctx context.Context) error {
 	close(call.done)
 
 	if call.err != nil {
-		// The refresh failed with a snapshot in hand (§1.7's register-before
-		// window means C-22 is never attempted before C-1 seeded one), so the
-		// answer replays it: stale_replay. WorkspaceStateFailure is the
-		// designed third outcome for a failure with nothing to replay.
+		// The refresh failed with a seeded snapshot in hand, so the answer
+		// replays it: stale_replay (§1.7). The register-before window has no
+		// snapshot and records `failed` instead.
 		c.metrics.WorkspaceStateRefresh(WorkspaceStateStaleReplay)
 		c.log.Warn("workspace.state_refresh_failed",
 			"err", call.err, "replay", "last_snapshot")

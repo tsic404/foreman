@@ -435,9 +435,10 @@ interprets them.
     C-1 failure).
   - Workspace state refresh: `success` = the carrier was replaced;
     `stale_replay` = the attempt failed and the answer came from the last
-    successful snapshot. `failed` (a failure with no snapshot to replay) is part
-    of the designed vocabulary but is unreachable while the register-before
-    window holds: C-22 is never attempted before C-1 has seeded a snapshot.
+    successful snapshot; `failed` = the request arrived with no seeded snapshot
+    to answer from — §1.7's register-before window records one per request,
+    since C-22 is never attempted before C-1 has seeded a snapshot. The S-2
+    answer itself stays the designed empty pre-C1 body.
 
 ### Skill-bundle resolve cache (ADR-045)
 
