@@ -356,6 +356,14 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	if entry.RealRuntimeID == "" {
+		// A rebuilt entry has no dispatch record, so C4 cannot be addressed:
+		// the malformed path's 404 would read as a vanished task. Startup
+		// convergence owns the entry (ADR-026), and no server lease exists to
+		// restamp locally.
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
 	ready, err := s.client.PrepareLease(r.Context(), entry.RealRuntimeID, tid)
 	switch {
 	case errors.Is(err, scheduler.ErrTaskNotFound):

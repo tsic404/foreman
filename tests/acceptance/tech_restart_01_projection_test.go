@@ -12,6 +12,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -113,6 +114,81 @@ func TestRestart01DeletedJobLeavesNoGhostEntry(t *testing.T) {
 	}
 	if entries := projectedList(t, ops.URL); len(entries) != 0 {
 		t.Fatalf("a discarded Job came back as a ghost entry: %v", entries)
+	}
+}
+
+// TestRestart01RebuiltEntryLeaseSkipsC4 covers the S7 half of AC-09: a
+// rebuilt entry carries no dispatch record, so a forward would address
+// /api/daemon/runtimes//tasks/{tid}/prepare-lease, whose bare 404 reads as
+// "the task was deleted" and settles a live task as vanished. The renewal is
+// answered locally and the entry stays for the startup convergence (ADR-026).
+func TestRestart01RebuiltEntryLeaseSkipsC4(t *testing.T) {
+	h := newHarness(t, false)
+	h.useRealBuilder(t)
+
+	if err := h.sched.OnClaim(t.Context(), claimPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	claimed, ok := h.reg.Get("task-1")
+	if !ok || claimed.RealRuntimeID != "rt-1" {
+		t.Fatalf("claimed entry = %+v, want the dispatch record rt-1", claimed)
+	}
+
+	// Restart: the in-memory index is gone, the Job is not. The rebuilt entry
+	// has no payload and no dispatch record.
+	if err := h.reg.Delete("task-1"); err != nil {
+		t.Fatalf("drop entry: %v", err)
+	}
+	if err := h.sched.Rebuild(t.Context()); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	rebuilt, ok := h.reg.Get("task-1")
+	if !ok {
+		t.Fatal("the Job was not rebuilt into an entry")
+	}
+	if rebuilt.RealRuntimeID != "" {
+		t.Fatalf("rebuilt RealRuntimeID = %q, want empty", rebuilt.RealRuntimeID)
+	}
+
+	token := issueJobToken(t, h, "task-1")
+	code, body := h.call("POST",
+		"/api/daemon/runtimes/"+rebuilt.JobRuntimeID+"/tasks/task-1/prepare-lease",
+		token, []byte(`{}`))
+	if code != http.StatusOK || string(body) != `{"status":"ok"}` {
+		t.Fatalf("S7 = %d %s, want 200 {\"status\":\"ok\"}", code, body)
+	}
+	for _, req := range h.upstream.pathCalls("/api/daemon/runtimes/") {
+		if strings.HasSuffix(req.Path, "/prepare-lease") {
+			t.Errorf("C4 was forwarded for a rebuilt entry: %s", req.Path)
+		}
+	}
+
+	// Not settled as vanished: the entry survives for the convergence round,
+	// which adopts the running task and keeps its Job.
+	after, ok := h.reg.Get("task-1")
+	if !ok {
+		t.Fatal("S7 removed the rebuilt entry")
+	}
+	if after.IsTerminal() {
+		t.Fatalf("S7 settled the rebuilt entry as %s/%s", after.State, after.Result)
+	}
+	if h.jobs.jobDeleted("fm-task-1") {
+		t.Fatal("S7 deleted the rebuilt entry's Job")
+	}
+	if !after.LeaseKeepUntil.Equal(rebuilt.LeaseKeepUntil) {
+		t.Errorf("S7 moved lease_keep_until to %v without a server renewal", after.LeaseKeepUntil)
+	}
+
+	h.server.setStatus("task-1", "running")
+	if err := h.sched.Reconcile(t.Context()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	adopted, ok := h.reg.Get("task-1")
+	if !ok || adopted.StartedAt.IsZero() {
+		t.Fatalf("the rebuilt entry was not adopted by convergence: %+v", adopted)
+	}
+	if h.jobs.jobDeleted("fm-task-1") {
+		t.Error("the adopted task's Job was deleted")
 	}
 }
 
