@@ -347,6 +347,16 @@ type fakeMetrics struct {
 	drainSecond       []float64
 	claimErrors       []string
 	jobDeleteFailures []string
+	tokenUsage        []tokenUsageSample
+}
+
+type tokenUsageSample struct {
+	provider   string
+	model      string
+	input      int64
+	output     int64
+	cacheRead  int64
+	cacheWrite int64
 }
 
 func (f *fakeMetrics) ClaimError(reason string) {
@@ -358,6 +368,15 @@ func (f *fakeMetrics) ClaimError(reason string) {
 func (f *fakeMetrics) JobDeleteFailed(stage string) {
 	f.mu.Lock()
 	f.jobDeleteFailures = append(f.jobDeleteFailures, stage)
+	f.mu.Unlock()
+}
+
+func (f *fakeMetrics) TokenUsage(provider, model string, input, output, cacheRead, cacheWrite int64) {
+	f.mu.Lock()
+	f.tokenUsage = append(f.tokenUsage, tokenUsageSample{
+		provider: provider, model: model,
+		input: input, output: output, cacheRead: cacheRead, cacheWrite: cacheWrite,
+	})
 	f.mu.Unlock()
 }
 
@@ -1375,6 +1394,63 @@ func TestOnReportStartMarksRunning(t *testing.T) {
 	}
 	if f.server.forwards[0].ep != EPStart {
 		t.Fatalf("forwards = %+v", f.server.forwards)
+	}
+}
+
+// TestOnReportUsageRecordsTokenMetric: S-12 is the one report body Foreman
+// reads for the metric face (§9.2 / ADR-009 decision 4). Every entry's
+// provider/model labels and input/output counters reach the seam, while the
+// body itself is still forwarded verbatim.
+func TestOnReportUsageRecordsTokenMetric(t *testing.T) {
+	f := newFixture(t)
+	e := f.claim(t, "task-1")
+	body := []byte(`{"usage":[` +
+		`{"provider":"omp","model":"kimi","input_tokens":100,"output_tokens":50,` +
+		`"cache_read_tokens":30,"cache_write_tokens":20},` +
+		`{"provider":"zz","model":"glm","input_tokens":7,"output_tokens":3,` +
+		`"cache_read_tokens":4,"cache_write_tokens":2}]}`)
+
+	code, _, err := f.sched.OnReport(context.Background(), EPUsage, e, body, "")
+	if err != nil || code != 200 {
+		t.Fatalf("OnReport = %d, %v", code, err)
+	}
+	want := []tokenUsageSample{
+		{provider: "omp", model: "kimi", input: 100, output: 50, cacheRead: 30, cacheWrite: 20},
+		{provider: "zz", model: "glm", input: 7, output: 3, cacheRead: 4, cacheWrite: 2},
+	}
+	if len(f.metrics.tokenUsage) != len(want) {
+		t.Fatalf("token usage = %+v, want %+v", f.metrics.tokenUsage, want)
+	}
+	for i := range want {
+		if f.metrics.tokenUsage[i] != want[i] {
+			t.Errorf("token usage[%d] = %+v, want %+v", i, f.metrics.tokenUsage[i], want[i])
+		}
+	}
+	if len(f.server.forwards) != 1 || f.server.forwards[0].ep != EPUsage {
+		t.Fatalf("forwards = %+v", f.server.forwards)
+	}
+	if got := f.server.forwards[0].body; got != string(body) {
+		t.Errorf("forwarded usage body = %s, want the daemon's bytes verbatim", got)
+	}
+}
+
+// A malformed usage body is still forwarded verbatim; the metric simply has
+// nothing to add. The upstream owns validation, so the forward's outcome
+// must not depend on Foreman's decode.
+func TestOnReportUsageMalformedBodyIsForwardedWithoutMetric(t *testing.T) {
+	f := newFixture(t)
+	e := f.claim(t, "task-1")
+	body := []byte(`{"usage":`)
+
+	code, _, err := f.sched.OnReport(context.Background(), EPUsage, e, body, "")
+	if err != nil || code != 200 {
+		t.Fatalf("OnReport = %d, %v", code, err)
+	}
+	if len(f.metrics.tokenUsage) != 0 {
+		t.Errorf("token usage = %+v, want none", f.metrics.tokenUsage)
+	}
+	if len(f.server.forwards) != 1 || f.server.forwards[0].body != string(body) {
+		t.Fatalf("forwards = %+v, want the malformed body verbatim", f.server.forwards)
 	}
 }
 

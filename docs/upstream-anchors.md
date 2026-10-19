@@ -11,6 +11,17 @@ defensive form instead of being relied on.
 `github.com/multica-ai/multica@2ea01ae4` — the `v0.6.1` release commit, the same
 artifact the test cluster pins and the Job image carries.
 
+## S-12 token usage (contracts §9.2 / ADR-009 decision 4)
+
+Premise: the daemon's S-12 usage report is the wire source of the token
+metric. Each entry carries the provider, model and the four token counters;
+the optional cost figure is not consumed by Foreman.
+
+| Fact | Anchor |
+|---|---|
+| The daemon posts `{"usage":[{provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_ticks?}]}` to `POST /api/daemon/tasks/{taskId}/usage` | `server/internal/daemon/client.go` → `(*Client).ReportTaskUsage` |
+| The usage entry carries the four token counters; `cost_usd_ticks` is optional | `server/internal/daemon/types.go` → `TaskUsageEntry` |
+
 ## Skill-bundle resolve (contracts §1.8 / §7, ADR-045)
 
 Premise: the resolve response is content-addressed — the same reference set

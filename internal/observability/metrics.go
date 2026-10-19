@@ -423,12 +423,14 @@ func (m *Metrics) JobBootSeconds(seconds float64) { m.jobBootSeconds.Observe(sec
 // InflightJobs sets the current non-terminal entry count (§9.2).
 func (m *Metrics) InflightJobs(n int) { m.inflightJobs.Set(float64(n)) }
 
-// TokenUsage accumulates a forwarded usage report (§9.2). The
-// forwarded report carries input/output only; cache directions exist in
-// the label vocabulary for a future report shape.
-func (m *Metrics) TokenUsage(provider, model string, input, output int64) {
+// TokenUsage accumulates a forwarded usage report (§9.2). The upstream S-12
+// entry carries input/output and the two prompt-cache directions; the
+// optional cost figure stays with the upstream (ADR-009 decision 4).
+func (m *Metrics) TokenUsage(provider, model string, input, output, cacheRead, cacheWrite int64) {
 	m.tokenUsage.WithLabelValues(provider, model, "input").Add(float64(input))
 	m.tokenUsage.WithLabelValues(provider, model, "output").Add(float64(output))
+	m.tokenUsage.WithLabelValues(provider, model, "cache_read").Add(float64(cacheRead))
+	m.tokenUsage.WithLabelValues(provider, model, "cache_write").Add(float64(cacheWrite))
 }
 
 // Forward records one forwarded call's outcome and latency (§9.2).

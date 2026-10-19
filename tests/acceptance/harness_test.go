@@ -379,6 +379,19 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		_ = json.Unmarshal(body, &req)
 		writeJSON(w, http.StatusOK, map[string]any{"tasks": stub.claim(req.MaxTasks)})
 	})
+	// C5–C12: the lifecycle forwards the scheduler sends through the
+	// production client. The stub answers 200 and records the call; a
+	// scenario wiring the real client reads the forward metric off these.
+	for _, ep := range []string{
+		"start", "progress", "messages", "usage", "complete", "fail",
+		"cancel-ack", "session", "wait-local-directory",
+	} {
+		mux.HandleFunc("POST /api/daemon/tasks/{tid}/"+ep, func(w http.ResponseWriter, r *http.Request) {
+			body, _ := io.ReadAll(r.Body)
+			stub.record(r, r.URL.Path, body)
+			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		})
+	}
 	// C4: the lease keeper's renewal. Without this route the stub's 404 would
 	// read as "the server deleted the task" and settle every pre-start entry
 	// as vanished.
@@ -1587,9 +1600,30 @@ func (c *schedulerServerClient) forwarded(ep scheduler.Endpoint) []upstreamReque
 	return found
 }
 
+// metricForward is one forwarded lifecycle call: the endpoint and the
+// status the upstream answered with (the two label values of
+// foreman_forward_total).
+type metricForward struct {
+	endpoint string
+	code     int
+}
+
+// tokenUsageRecord is one usage-report entry as the scheduler seam sees it
+// (the two label values of foreman_token_usage_total plus the four token
+// counters).
+type tokenUsageRecord struct {
+	provider   string
+	model      string
+	input      int64
+	output     int64
+	cacheRead  int64
+	cacheWrite int64
+}
+
 // recordingMetrics implements proxy.Metrics and the scheduler's metric seam,
 // recording the catalog outcomes, the daemon face's auth failures, the S6
-// delivery face and the skill-cache resolve faces.
+// delivery face, the skill-cache resolve faces and the task-driven §9.2
+// families the observability scenarios judge.
 type recordingMetrics struct {
 	mu               sync.Mutex
 	catalogCodes     []string
@@ -1608,13 +1642,47 @@ type recordingMetrics struct {
 	policyHits       map[string]int
 	nameConclusions  []string
 	pendingReports   int
+	taskClaims       int
+	claimErrors      []string
+	jobCreateSamples []float64
+	jobBootSamples   []float64
+	inflight         []int
+	credReclaims     map[string]int
+	drainSamples     []float64
+	jobDeleteFailed  []string
+	forwards         []metricForward
+	tokenUsage       []tokenUsageRecord
 }
 
-func (m *recordingMetrics) Forward(string, int, time.Duration) {}
-func (m *recordingMetrics) ClaimError(string)                  {}
-func (m *recordingMetrics) WSConnect(string)                   {}
-func (m *recordingMetrics) WSDisconnect(string)                {}
-func (m *recordingMetrics) WSReconnect(string)                 {}
+// Forward records one lifecycle forward by endpoint and status code
+// (foreman_forward_total / foreman_forward_latency_seconds).
+func (m *recordingMetrics) Forward(endpoint string, code int, _ time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.forwards = append(m.forwards, metricForward{endpoint: endpoint, code: code})
+}
+
+// ClaimError records one failed claim cycle by status or reason.
+func (m *recordingMetrics) ClaimError(code string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.claimErrors = append(m.claimErrors, code)
+}
+
+// TokenUsage records one usage-report entry by provider and model
+// (foreman_token_usage_total).
+func (m *recordingMetrics) TokenUsage(provider, model string, input, output, cacheRead, cacheWrite int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.tokenUsage = append(m.tokenUsage, tokenUsageRecord{
+		provider: provider, model: model,
+		input: input, output: output, cacheRead: cacheRead, cacheWrite: cacheWrite,
+	})
+}
+
+func (m *recordingMetrics) WSConnect(string)    {}
+func (m *recordingMetrics) WSDisconnect(string) {}
+func (m *recordingMetrics) WSReconnect(string)  {}
 
 // AuthFailure records the reason the daemon face rejected a request
 // (foreman_auth_failures_total{reason}).
@@ -1624,20 +1692,53 @@ func (m *recordingMetrics) AuthFailure(reason string) {
 	m.authReasons = append(m.authReasons, reason)
 }
 
-// The scheduler's own seam: recorded only where a scenario reads it, no-ops
-// otherwise (the scheduler must never change behaviour because a metric
-// changed).
-func (m *recordingMetrics) TaskClaimed() {}
+// The scheduler's own seam. Recording is passive: the scheduler must never
+// change behaviour because a metric changed.
+func (m *recordingMetrics) TaskClaimed() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.taskClaims++
+}
+
 func (m *recordingMetrics) TaskTerminal(result string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.taskResults = append(m.taskResults, result)
 }
-func (m *recordingMetrics) JobBootSeconds(float64)        {}
-func (m *recordingMetrics) JobCreateSeconds(float64)      {}
-func (m *recordingMetrics) InflightJobs(int)              {}
-func (m *recordingMetrics) CredReclaimed(string, float64) {}
-func (m *recordingMetrics) JobDeleteFailed(string)        {}
+
+func (m *recordingMetrics) JobBootSeconds(seconds float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.jobBootSamples = append(m.jobBootSamples, seconds)
+}
+
+func (m *recordingMetrics) JobCreateSeconds(seconds float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.jobCreateSamples = append(m.jobCreateSamples, seconds)
+}
+
+func (m *recordingMetrics) InflightJobs(n int) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.inflight = append(m.inflight, n)
+}
+
+func (m *recordingMetrics) CredReclaimed(reason string, drainSeconds float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.credReclaims == nil {
+		m.credReclaims = map[string]int{}
+	}
+	m.credReclaims[reason]++
+	m.drainSamples = append(m.drainSamples, drainSeconds)
+}
+
+func (m *recordingMetrics) JobDeleteFailed(stage string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.jobDeleteFailed = append(m.jobDeleteFailed, stage)
+}
 
 // DuplicateDispatch counts a server redispatch of a known task
 // (foreman_duplicate_dispatch_total).
@@ -1856,6 +1957,122 @@ func (m *recordingMetrics) authFailureCount(reason string) int {
 	return n
 }
 
+// authFailureTotal counts every daemon-face rejection
+// (foreman_auth_failures_total across reasons).
+func (m *recordingMetrics) authFailureTotal() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.authReasons)
+}
+
+// taskClaimCount counts the claims the scheduler accepted
+// (foreman_task_claims_total).
+func (m *recordingMetrics) taskClaimCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.taskClaims
+}
+
+// claimErrorCount counts the failed claim cycles
+// (foreman_claim_errors_total).
+func (m *recordingMetrics) claimErrorCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.claimErrors)
+}
+
+// jobCreateSampleCount and jobBootSampleCount count the latency
+// observations of the two histograms (foreman_job_create_seconds /
+// foreman_job_boot_seconds).
+func (m *recordingMetrics) jobCreateSampleCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.jobCreateSamples)
+}
+
+func (m *recordingMetrics) jobBootSampleCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.jobBootSamples)
+}
+
+// inflightLast is the current in-flight gauge reading
+// (foreman_inflight_jobs).
+func (m *recordingMetrics) inflightLast() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if len(m.inflight) == 0 {
+		return -1
+	}
+	return m.inflight[len(m.inflight)-1]
+}
+
+// inflightSaw reports whether the gauge ever read n.
+func (m *recordingMetrics) inflightSaw(n int) bool {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, got := range m.inflight {
+		if got == n {
+			return true
+		}
+	}
+	return false
+}
+
+// credReclaimCount counts the credential reclaims recorded under one reason
+// (foreman_cred_reclaim_total).
+func (m *recordingMetrics) credReclaimCount(reason string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.credReclaims[reason]
+}
+
+// drainSampleCount counts the drain-duration observations
+// (foreman_job_drain_seconds).
+func (m *recordingMetrics) drainSampleCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.drainSamples)
+}
+
+// jobDeleteFailureCount counts the Job deletions that failed with no retry
+// handle (foreman_job_delete_failed_total).
+func (m *recordingMetrics) jobDeleteFailureCount() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.jobDeleteFailed)
+}
+
+// forwardCount counts the forwards recorded under one endpoint and status
+// code (foreman_forward_total).
+func (m *recordingMetrics) forwardCount(endpoint string, code int) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, call := range m.forwards {
+		if call.endpoint == endpoint && call.code == code {
+			n++
+		}
+	}
+	return n
+}
+
+// tokenUsageFor sums the usage-report entries recorded under one
+// provider/model label pair (foreman_token_usage_total).
+func (m *recordingMetrics) tokenUsageFor(provider, model string) (input, output, cacheRead, cacheWrite int64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	for _, got := range m.tokenUsage {
+		if got.provider == provider && got.model == model {
+			input += got.input
+			output += got.output
+			cacheRead += got.cacheRead
+			cacheWrite += got.cacheWrite
+		}
+	}
+	return input, output, cacheRead, cacheWrite
+}
+
 // probeBuilder is the jobbuilder seam plus the test-only credential reader.
 type probeBuilder interface {
 	scheduler.JobBuilder
@@ -1892,24 +2109,28 @@ func (b *syncBuffer) String() string {
 
 // harness wires the real components against the stubs.
 type harness struct {
-	t        *testing.T
-	cfg      proxy.Config
-	reg      *registry.Registry
-	probes   *registry.ProbeRegistry
-	startup  *registry.StartupCatalog
-	slots    *proxy.CatalogSlots
-	jobs     *jobClient
-	builder  probeBuilder
-	server   *schedulerServerClient
-	metrics  *recordingMetrics
-	issuer   *auth.Issuer
-	client   *proxy.Client
-	sched    *scheduler.Scheduler
-	pending  *scheduler.PendingReports
-	upstream *upstreamStub
-	handler  http.Handler
-	jobsHTTP *httptest.Server
-	logs     *syncBuffer
+	t       *testing.T
+	cfg     proxy.Config
+	reg     *registry.Registry
+	probes  *registry.ProbeRegistry
+	startup *registry.StartupCatalog
+	slots   *proxy.CatalogSlots
+	jobs    *jobClient
+	builder probeBuilder
+	server  *schedulerServerClient
+	// serverClient is the seam the scheduler forwards through. It is the stub
+	// above by default; a scenario that judges the production forward metric
+	// wires the real proxy client instead.
+	serverClient scheduler.ServerClient
+	metrics      *recordingMetrics
+	issuer       *auth.Issuer
+	client       *proxy.Client
+	sched        *scheduler.Scheduler
+	pending      *scheduler.PendingReports
+	upstream     *upstreamStub
+	handler      http.Handler
+	jobsHTTP     *httptest.Server
+	logs         *syncBuffer
 	// handlerLogs captures the fake server's own event lines (the job-facing
 	// face), separate from the scheduler's.
 	handlerLogs *syncBuffer
@@ -1968,6 +2189,20 @@ const (
 // at construction.
 func newHarnessWithSkill(t *testing.T, catalogEnabled bool, window time.Duration, skill func(*proxy.Config)) *harness {
 	t.Helper()
+	return newHarnessWithOptions(t, catalogEnabled, window, skill, false)
+}
+
+// newHarnessWithRealServer is newHarness with the production proxy client as
+// the scheduler's server seam instead of the recording stub. A scenario that
+// judges the forward metric must drive the client that records it, not a
+// stand-in for it.
+func newHarnessWithRealServer(t *testing.T, catalogEnabled bool) *harness {
+	t.Helper()
+	return newHarnessWithOptions(t, catalogEnabled, deliveryConfirmWindow, nil, true)
+}
+
+func newHarnessWithOptions(t *testing.T, catalogEnabled bool, window time.Duration, skill func(*proxy.Config), realServer bool) *harness {
+	t.Helper()
 	upstream := newUpstreamStub(t)
 	reg := registry.New(time.Now, registry.WithDeliveryConfirmTimeout(window))
 	probes := registry.NewProbeRegistry()
@@ -2024,6 +2259,10 @@ func newHarnessWithSkill(t *testing.T, catalogEnabled bool, window time.Duration
 	jobs := newJobClient()
 	bld := &builder{issuer: issuer, probes: probes}
 	server := &schedulerServerClient{}
+	var serverClient scheduler.ServerClient = server
+	if realServer {
+		serverClient = client
+	}
 	// The terminal-report queue is the production one: the write-ahead
 	// discipline and the gauge are part of the face the scenarios judge.
 	pending, err := scheduler.NewPendingReports(t.TempDir(),
@@ -2051,7 +2290,7 @@ func newHarnessWithSkill(t *testing.T, catalogEnabled bool, window time.Duration
 		ModelCatalogTimeout:    45 * time.Second,
 		ReconcileInterval:      30 * time.Second,
 	}
-	sched, err := scheduler.New(schedCfg, reg, jobs, bld, server, metrics,
+	sched, err := scheduler.New(schedCfg, reg, jobs, bld, serverClient, metrics,
 		scheduler.WithPendingReports(pending),
 		scheduler.WithRevoker(noRevoker{}),
 		scheduler.WithProbeRegistry(probes),
@@ -2076,7 +2315,7 @@ func newHarnessWithSkill(t *testing.T, catalogEnabled bool, window time.Duration
 
 	return &harness{
 		t: t, cfg: cfg, reg: reg, probes: probes, startup: startup, slots: slots,
-		jobs: jobs, builder: bld, server: server, metrics: metrics, issuer: issuer,
+		jobs: jobs, builder: bld, server: server, serverClient: serverClient, metrics: metrics, issuer: issuer,
 		client: client, sched: sched, pending: pending, upstream: upstream, handler: handler,
 		jobsHTTP: httpServer, logs: logs, handlerLogs: handlerLogs,
 		bundles: bundles, skillClock: skillClock, schedCfg: schedCfg,
@@ -2089,7 +2328,7 @@ func (h *harness) rebuildScheduler(t *testing.T, mutate func(*scheduler.Config))
 	t.Helper()
 	cfg := h.schedCfg
 	mutate(&cfg)
-	sched, err := scheduler.New(cfg, h.reg, h.jobs, h.builder, h.server, h.metrics,
+	sched, err := scheduler.New(cfg, h.reg, h.jobs, h.builder, h.serverClient, h.metrics,
 		scheduler.WithPendingReports(h.pending),
 		scheduler.WithRevoker(credentialRevoker(h.revoker)),
 		scheduler.WithProbeRegistry(h.probes),
