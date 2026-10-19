@@ -1,31 +1,79 @@
-// TC-tech-observability-01 implements AC-10's metric face: the §9.2 families
-// exist before any recording, and the policy / refresh families carry the
-// designed labels. The semantic half drives production paths — a completed and
-// a failed task through the real builder, the startup policy gate, and both
-// refresh sequences — so the counters are read from the seams those paths use.
+// TC-tech-observability-01 implements AC-10's metric face: every §9.2 family
+// is exposed before any recording, the task-driven counters and labels are
+// read after one completed and one failed task, and the policy / refresh
+// families carry the designed labels. The task half drives the production
+// paths — the real builder, the daemon face, the scheduler's terminal
+// settlement and the production forward client — so the counters are read
+// from the seams those paths use.
 package acceptance
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/observability"
+	"github.com/tsic404/foreman/internal/proxy"
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/scheduler"
 )
 
+// observability01Families is the §9.2 metric surface. Every family must be
+// visible from process start (ADR-009's confirmation: a scrape greps the
+// whole designed vocabulary), including the families whose series are only
+// materialised by a recorder.
+var observability01Families = []string{
+	"foreman_tasks_total",
+	"foreman_task_claims_total",
+	"foreman_claim_errors_total",
+	"foreman_job_create_seconds",
+	"foreman_job_boot_seconds",
+	"foreman_inflight_jobs",
+	"foreman_forward_total",
+	"foreman_forward_latency_seconds",
+	"foreman_auth_failures_total",
+	"foreman_token_usage_total",
+	"foreman_duplicate_dispatch_total",
+	"foreman_pending_reports",
+	"foreman_ws_connected",
+	"foreman_ws_reconnects_total",
+	"foreman_heartbeat_suspect",
+	"foreman_delivery_claims_total",
+	"foreman_delivery_latency_seconds",
+	"foreman_delivery_unconfirmed_total",
+	"foreman_cred_reclaim_total",
+	"foreman_job_drain_seconds",
+	"foreman_job_delete_failed_total",
+	"foreman_model_catalog_relays_total",
+	"foreman_model_catalog_seconds",
+	"foreman_skill_cache_resolves_total",
+	"foreman_skill_cache_entries",
+	"foreman_skill_cache_bytes",
+	"foreman_skill_cache_evictions_total",
+	"foreman_workspace_state_refreshes_total",
+	"foreman_runtime_profile_refreshes_total",
+	"foreman_policy_hits_total",
+	"foreman_policy_name_resolutions_total",
+}
+
 // TestTechObservability01DesignedFamiliesAtBoot is the presence half: every
-// designed series of the four families is exposed with its zero value before
-// the first task or refresh, so a scrape at process start already shows the
-// vocabulary.
+// designed §9.2 family is exposed before the first task or refresh, so a
+// scrape at process start already shows the vocabulary.
 func TestTechObservability01DesignedFamiliesAtBoot(t *testing.T) {
 	exposition := scrapeMetrics(t, observability.NewMetrics())
+	for _, family := range observability01Families {
+		if !strings.Contains(exposition, family) {
+			t.Errorf("missing designed family %q in the boot exposition", family)
+		}
+	}
 	for _, want := range []string{
 		`foreman_policy_hits_total{axis="resources",source="direct"} 0`,
 		`foreman_policy_hits_total{axis="resources",source="no_definition"} 0`,
@@ -143,6 +191,109 @@ projects:
 	for _, field := range []string{"resource_source", "cap_source", "node_selector_source"} {
 		if got := miss[field]; got != "no_identity" {
 			t.Errorf("task-2 policy.applied %s = %v, want no_identity", field, got)
+		}
+	}
+}
+
+// TestTechObservability01TaskFaces is the semantic half of AC-10: one
+// completed and one failed task run through the daemon face, then the
+// task-driven §9.2 families are read. The scheduler forwards through the
+// production proxy client, so the forward counter is the one the deployment
+// records, not a test stand-in.
+func TestTechObservability01TaskFaces(t *testing.T) {
+	h := newHarnessWithRealServer(t, false)
+	observability01RunTask(t, h, "task-1", "", true)
+	observability01RunTask(t, h, "task-2", "", false)
+
+	// The Job-termination face: both verdicts delete their Job, and the
+	// reclaim that follows is the job_terminated branch (ADR-017).
+	for _, taskID := range []string{"task-1", "task-2"} {
+		if err := h.sched.OnJobTerminated(t.Context(), "fm-"+taskID,
+			scheduler.JobTerminationReasonJobTerminated, time.Now(), 0); err != nil {
+			t.Fatalf("OnJobTerminated(%s): %v", taskID, err)
+		}
+	}
+
+	for _, want := range []struct {
+		name string
+		got  int
+		want int
+	}{
+		{"foreman_task_claims_total", h.metrics.taskClaimCount(), 2},
+		{"foreman_job_create_seconds samples", h.metrics.jobCreateSampleCount(), 2},
+		{"foreman_job_boot_seconds samples", h.metrics.jobBootSampleCount(), 2},
+		{"foreman_job_drain_seconds samples", h.metrics.drainSampleCount(), 2},
+		{"foreman_claim_errors_total", h.metrics.claimErrorCount(), 0},
+		{"foreman_duplicate_dispatch_total", h.metrics.duplicateDispatchCount(), 0},
+		{"foreman_pending_reports", h.metrics.pendingReportsDepth(), 0},
+		{"foreman_auth_failures_total", h.metrics.authFailureTotal(), 0},
+		{"foreman_job_delete_failed_total", h.metrics.jobDeleteFailureCount(), 0},
+	} {
+		if want.got != want.want {
+			t.Errorf("%s = %d, want %d", want.name, want.got, want.want)
+		}
+	}
+
+	if got := h.metrics.taskResultCount(string(registry.ResultCompleted)); got != 1 {
+		t.Errorf("foreman_tasks_total{result=completed} = %d, want 1", got)
+	}
+	if got := h.metrics.taskResultCount(string(registry.ResultFailed)); got != 1 {
+		t.Errorf("foreman_tasks_total{result=failed} = %d, want 1", got)
+	}
+	if got := h.metrics.inflightLast(); got != 0 {
+		t.Errorf("foreman_inflight_jobs = %d after both terminals, want 0", got)
+	}
+	if !h.metrics.inflightSaw(1) {
+		t.Error("foreman_inflight_jobs never read 1 while a task was in flight")
+	}
+	if got := h.metrics.credReclaimCount(scheduler.JobTerminationReasonJobTerminated); got != 2 {
+		t.Errorf("foreman_cred_reclaim_total{reason=job_terminated} = %d, want 2", got)
+	}
+	if got := h.metrics.credReclaimCount(scheduler.JobTerminationReasonDrainTimeout); got != 0 {
+		t.Errorf("foreman_cred_reclaim_total{reason=drain_timeout} = %d, want 0", got)
+	}
+	if got := h.metrics.deliveryClaimCount(proxy.DeliveryClaimDelivered); got != 2 {
+		t.Errorf("foreman_delivery_claims_total{result=delivered} = %d, want 2", got)
+	}
+	for _, want := range []struct {
+		endpoint string
+		count    int
+	}{
+		{"start", 2},
+		{"complete", 1},
+		{"fail", 1},
+	} {
+		if got := h.metrics.forwardCount(want.endpoint, http.StatusOK); got != want.count {
+			t.Errorf("foreman_forward_total{endpoint=%s,code=200} = %d, want %d",
+				want.endpoint, got, want.count)
+		}
+	}
+	for _, want := range []struct {
+		provider   string
+		model      string
+		input      int64
+		output     int64
+		cacheRead  int64
+		cacheWrite int64
+	}{
+		{"omp", "kimi", 100, 50, 30, 20},
+		{"zz", "glm", 200, 25, 40, 10},
+	} {
+		input, output, cacheRead, cacheWrite := h.metrics.tokenUsageFor(want.provider, want.model)
+		for _, direction := range []struct {
+			name string
+			got  int64
+			want int64
+		}{
+			{"input", input, want.input},
+			{"output", output, want.output},
+			{"cache_read", cacheRead, want.cacheRead},
+			{"cache_write", cacheWrite, want.cacheWrite},
+		} {
+			if direction.got != direction.want {
+				t.Errorf("foreman_token_usage_total{provider=%q,model=%q,direction=%s} = %d, want %d",
+					want.provider, want.model, direction.name, direction.got, direction.want)
+			}
 		}
 	}
 }
@@ -285,6 +436,23 @@ func observability01RunTask(t *testing.T, h *harness, taskID, agentName string, 
 	claimTask(t, h, taskID, token)
 	if code, body := h.call("POST", "/api/daemon/tasks/"+taskID+"/start", token, []byte(`{}`)); code != http.StatusOK {
 		t.Fatalf("S8 %s = %d: %s", taskID, code, body)
+	}
+	// S12: the usage report is accumulated on the forward path (§9.2 /
+	// ADR-009 decision 4). The success and failure tasks carry distinct
+	// provider/model labels so both label values are judged.
+	provider, model := "omp", "kimi"
+	input, output := int64(100), int64(50)
+	cacheRead, cacheWrite := int64(30), int64(20)
+	if !isSuccess {
+		provider, model = "zz", "glm"
+		input, output = 200, 25
+		cacheRead, cacheWrite = 40, 10
+	}
+	usage := fmt.Sprintf(`{"usage":[{"provider":%q,"model":%q,"input_tokens":%d,"output_tokens":%d,`+
+		`"cache_read_tokens":%d,"cache_write_tokens":%d}]}`,
+		provider, model, input, output, cacheRead, cacheWrite)
+	if code, body := h.call("POST", "/api/daemon/tasks/"+taskID+"/usage", token, []byte(usage)); code != http.StatusOK {
+		t.Fatalf("S12 %s = %d: %s", taskID, code, body)
 	}
 	if isSuccess {
 		if code, body := h.call("POST", "/api/daemon/tasks/"+taskID+"/complete", token, []byte(`{"exit_code":0}`)); code != http.StatusOK {

@@ -92,6 +92,11 @@ type Metrics interface {
 	// JobDeleteFailed counts a Job deletion that failed with no retry handle
 	// left, by stage (currently catch_up: the entry was already dropped).
 	JobDeleteFailed(stage string)
+	// TokenUsage accumulates one usage report entry by provider and model
+	// (§9.2 / ADR-009 decision 4: Foreman adds the usage while forwarding
+	// the report, without a new persistence face). The four counters are the
+	// S-12 entry's input/output and its two prompt-cache directions.
+	TokenUsage(provider, model string, input, output, cacheRead, cacheWrite int64)
 }
 
 // Reconciler is the recovery module's convergence driver. When wired,
@@ -134,16 +139,17 @@ type PendingReportQueue interface {
 // noopMetrics keeps every Metrics call site nil-safe.
 type noopMetrics struct{}
 
-func (noopMetrics) TaskClaimed()                  {}
-func (noopMetrics) TaskTerminal(string)           {}
-func (noopMetrics) JobBootSeconds(float64)        {}
-func (noopMetrics) JobCreateSeconds(float64)      {}
-func (noopMetrics) InflightJobs(int)              {}
-func (noopMetrics) DuplicateDispatch()            {}
-func (noopMetrics) CredReclaimed(string, float64) {}
-func (noopMetrics) DeliveryUnconfirmed()          {}
-func (noopMetrics) ClaimError(string)             {}
-func (noopMetrics) JobDeleteFailed(string)        {}
+func (noopMetrics) TaskClaimed()                                          {}
+func (noopMetrics) TaskTerminal(string)                                   {}
+func (noopMetrics) JobBootSeconds(float64)                                {}
+func (noopMetrics) JobCreateSeconds(float64)                              {}
+func (noopMetrics) InflightJobs(int)                                      {}
+func (noopMetrics) DuplicateDispatch()                                    {}
+func (noopMetrics) CredReclaimed(string, float64)                         {}
+func (noopMetrics) DeliveryUnconfirmed()                                  {}
+func (noopMetrics) ClaimError(string)                                     {}
+func (noopMetrics) JobDeleteFailed(string)                                {}
+func (noopMetrics) TokenUsage(string, string, int64, int64, int64, int64) {}
 
 func orNoopMetrics(m Metrics) Metrics {
 	if m == nil {

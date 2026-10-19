@@ -917,6 +917,35 @@ func (s *Scheduler) Deliver(daemonID string, runtimeID string, maxTasks int) ([]
 	return []json.RawMessage{out}, nil
 }
 
+// usageReport is the token-usage shape the upstream daemon sends on S-12.
+// Only the metric's label values and the four token counters are read; the
+// optional cost figure stays with the upstream.
+type usageReport struct {
+	Usage []struct {
+		Provider         string `json:"provider"`
+		Model            string `json:"model"`
+		InputTokens      int64  `json:"input_tokens"`
+		OutputTokens     int64  `json:"output_tokens"`
+		CacheReadTokens  int64  `json:"cache_read_tokens"`
+		CacheWriteTokens int64  `json:"cache_write_tokens"`
+	} `json:"usage"`
+}
+
+// recordTokenUsage accumulates one S-12 report's entries into the token
+// metric (§9.2 / ADR-009 decision 4). A body that does not decode is
+// forwarded verbatim and contributes nothing: the upstream owns its
+// validation, and a metric must never change the forward's outcome.
+func (s *Scheduler) recordTokenUsage(body []byte) {
+	var report usageReport
+	if err := json.Unmarshal(body, &report); err != nil {
+		return
+	}
+	for _, u := range report.Usage {
+		s.metrics.TokenUsage(u.Provider, u.Model,
+			u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
+	}
+}
+
 // OnReport applies the state transition for a forwarded lifecycle callback
 // (S8–S15) and returns the upstream status and body for the daemon. The Job
 // is deleted only after the terminal report succeeded — never the other way
@@ -936,6 +965,13 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		unlock = s.taskMu.Lock(e.TaskID)
 	}
 	defer unlock()
+	if ep == EPUsage {
+		// §9.2 / ADR-009 decision 4: the usage face is accumulated while the
+		// report is forwarded. The body stays opaque everywhere else; only
+		// the metric's two label values and the four token counters are read,
+		// and a malformed report is still forwarded verbatim.
+		s.recordTokenUsage(body)
+	}
 	now := s.now()
 	// undecided is the instance's first terminal decision inside this report:
 	// it separates a fresh verdict from an already-decided replay, which

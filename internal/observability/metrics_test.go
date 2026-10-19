@@ -55,7 +55,7 @@ func TestMetricsCardinalityDiscipline(t *testing.T) {
 	m.JobBootSeconds(12.5)
 	m.JobCreateSeconds(1.5)
 	m.InflightJobs(3)
-	m.TokenUsage("omp", "kimi", 100, 50)
+	m.TokenUsage("omp", "kimi", 100, 50, 30, 20)
 	m.Forward("complete", 200, 250*time.Millisecond)
 	m.Forward(ForwardAgentAPI, 502, time.Second)
 	m.ClaimError("503")
@@ -79,6 +79,8 @@ func TestMetricsCardinalityDiscipline(t *testing.T) {
 		`foreman_tasks_total{result="completed"} 1`,
 		`foreman_token_usage_total{direction="input",model="kimi",provider="omp"} 100`,
 		`foreman_token_usage_total{direction="output",model="kimi",provider="omp"} 50`,
+		`foreman_token_usage_total{direction="cache_read",model="kimi",provider="omp"} 30`,
+		`foreman_token_usage_total{direction="cache_write",model="kimi",provider="omp"} 20`,
 		`foreman_forward_total{code="200",endpoint="complete"} 1`,
 		`foreman_claim_errors_total{code="503"} 1`,
 		`foreman_auth_failures_total{reason="expired"} 1`,
