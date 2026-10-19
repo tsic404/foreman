@@ -38,7 +38,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"net/http"
+	"os"
 	"reflect"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -134,6 +136,12 @@ var upstreamDaemonFace = []daemonFaceEntry{
 		note: "triggers C-22 and replays settings/repos/repos_version verbatim (key presence faithful); a failed refresh replays the last snapshot",
 	},
 	{
+		name: "S-3 runtime profiles", upstream: "GET /api/daemon/workspaces/{workspaceId}/runtime-profiles",
+		caller: "internal/daemon/client.go:1136",
+		local:  "GET /api/daemon/workspaces/{ws}/runtime-profiles", design: "S-3", handling: faceServed,
+		note: "200 replays the C-18 snapshot byte for byte; C-18 404 ⇒ 404; an unsuccessful snapshot ⇒ 503, which the daemon treats as best-effort (ADR-043 §1.6)",
+	},
+	{
 		name: "S-6 claim", upstream: "POST /api/daemon/tasks/claim",
 		caller: "internal/daemon/client.go:306",
 		local:  "POST /api/daemon/tasks/claim", design: "S-6", handling: faceServed,
@@ -149,7 +157,7 @@ var upstreamDaemonFace = []daemonFaceEntry{
 		name: "S-26 skill-bundles resolve", upstream: "POST /api/daemon/runtimes/{runtimeId}/tasks/{taskId}/skill-bundles/resolve",
 		caller: "internal/daemon/client.go:419",
 		local:  "POST /api/daemon/runtimes/{rid}/tasks/{tid}/skill-bundles/resolve", design: "S-26", handling: faceServed,
-		note: "forwarded with the real runtime id and Foreman's credential; upstream status/bytes replayed",
+		note: "a fresh cache hit answers from the cached body without touching the upstream (§1.8); a miss forwards with the real runtime id and Foreman's credential, replaying upstream status/bytes",
 	},
 	{
 		name: "S-9 task status", upstream: "GET /api/daemon/tasks/{taskId}/status",
@@ -234,12 +242,6 @@ var upstreamDaemonFace = []daemonFaceEntry{
 	},
 
 	// ---- refused (registered, always 404) ----
-	{
-		name: "S-3 runtime profiles", upstream: "GET /api/daemon/workspaces/{workspaceId}/runtime-profiles",
-		caller: "internal/daemon/client.go:1136",
-		local:  "GET /api/daemon/workspaces/{ws}/runtime-profiles", design: "S-3", handling: faceServed,
-		note: "200 replays the C-18 snapshot byte for byte; C-18 404 ⇒ 404; an unsuccessful snapshot ⇒ 503, which the daemon treats as best-effort (ADR-043 §1.6)",
-	},
 	{
 		name: "S-32 legacy per-runtime claim", upstream: "POST /api/daemon/runtimes/{runtimeId}/tasks/claim",
 		caller: "internal/daemon/client.go:335 (batch-claim 404 fallback only)",
@@ -366,10 +368,104 @@ var upstreamDaemonFace = []daemonFaceEntry{
 	},
 }
 
+// censusSectionHandling is the section-header word → handling contract. The
+// census groups entries under a header comment per handling; a header that
+// names no handling is itself a drift.
+var censusSectionHandling = map[string]daemonFaceHandling{
+	"served":     faceServed,
+	"refused":    faceRefused,
+	"forwarded":  faceForwarded,
+	"unmodelled": faceUnmodelled,
+}
+
+// checkCensusSections fails when an entry's section disagrees with its
+// handling. Membership exists only in the header comments, so the check reads
+// the source back: moving an entry without flipping its handling is the
+// registration drift AC-59's "偏差登记与当前应答一致" criterion names.
+func checkCensusSections(t *testing.T) {
+	t.Helper()
+	src, err := os.ReadFile(censusSourceFile(t))
+	if err != nil {
+		t.Fatalf("read census source: %v", err)
+	}
+	sectionOf := map[string]daemonFaceHandling{}
+	section := daemonFaceHandling("")
+	inCensus := false
+	for i, line := range strings.Split(string(src), "\n") {
+		if !inCensus {
+			if strings.HasPrefix(line, "var upstreamDaemonFace = []daemonFaceEntry{") {
+				inCensus = true
+			}
+			continue
+		}
+		if line == "}" {
+			break
+		}
+		if header, ok := strings.CutPrefix(strings.TrimSpace(line), "// ---- "); ok {
+			fields := strings.Fields(header)
+			if len(fields) == 0 {
+				t.Fatalf("line %d: section header names no handling", i+1)
+			}
+			h, ok := censusSectionHandling[fields[0]]
+			if !ok {
+				t.Fatalf("line %d: section %q names no handling", i+1, fields[0])
+			}
+			section = h
+			continue
+		}
+		name, ok := censusEntryName(line)
+		if !ok {
+			continue
+		}
+		if section == "" {
+			t.Errorf("line %d: %s sits outside any section", i+1, name)
+			continue
+		}
+		sectionOf[name] = section
+	}
+	for _, e := range upstreamDaemonFace {
+		section, ok := sectionOf[e.name]
+		if !ok {
+			t.Errorf("%s: entry is not declared under a census section", e.name)
+			continue
+		}
+		if section != e.handling {
+			t.Errorf("%s: declared %s under the %s section", e.name, e.handling, section)
+		}
+	}
+}
+
+// censusSourceFile locates this test file; go test runs in the package
+// directory, so the bare name covers a trimpath build.
+func censusSourceFile(t *testing.T) string {
+	t.Helper()
+	if _, file, _, ok := runtime.Caller(0); ok {
+		if _, err := os.Stat(file); err == nil {
+			return file
+		}
+	}
+	if _, err := os.Stat("protocol_test.go"); err != nil {
+		t.Fatalf("locate protocol_test.go: %v", err)
+	}
+	return "protocol_test.go"
+}
+
+// censusEntryName extracts the name field that opens an entry line.
+func censusEntryName(line string) (string, bool) {
+	rest, ok := strings.CutPrefix(strings.TrimSpace(line), `name: "`)
+	if !ok {
+		return "", false
+	}
+	name, _, ok := strings.Cut(rest, `"`)
+	return name, ok
+}
+
 // TestDaemonFaceCensus keeps the local face and the census in step: every
 // upstream route is declared, every declared local pattern is registered, and
 // no pattern is registered without being declared.
 func TestDaemonFaceCensus(t *testing.T) {
+	checkCensusSections(t)
+
 	// The WS endpoint is conditional (§1.2 S30); the WS rig is the setup where
 	// the full table is registered.
 	rig, _ := newTestRigWS(t)
@@ -701,7 +797,7 @@ func decodeJSON(raw []byte, out *any) error {
 	return dec.Decode(out)
 }
 
-// stubFaceRegister registers the C1 answer the deviation register below reads:
+// stubFaceRegister registers the C1 answer the carried-field assertions below read:
 // the workspace settings block, a profile_id on the answered runtime, and a key
 // this build does not model — everything the real server can put on the
 // register response.
@@ -731,7 +827,7 @@ func faceRegisterAnswer() map[string]any {
 	}
 }
 
-// faceReposCarrier is the C1 repos array the deviation tests use: it carries a
+// faceReposCarrier is the C1 repos array the carried-field tests use: it carries a
 // per-repo key this build does not model, so "replayed verbatim" is observable
 // rather than assumed.
 const faceReposCarrier = `[{"url":"https://example.invalid/r","description":"d","ref":"main","x_repo_key":{"nested":1}}]`
