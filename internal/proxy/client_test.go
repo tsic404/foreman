@@ -554,6 +554,30 @@ func upstreamFields(h http.Header) http.Header {
 	return out
 }
 
+// passthroughOnce performs one S29 forward and hands back the answer with its
+// body still streaming, the way handlePassthrough does.
+func passthroughOnce(t *testing.T, c *Client, method, path, query string, header http.Header, body []byte) *PassthroughResponse {
+	t.Helper()
+	resp, err := c.Passthrough(t.Context(), method, path, query, header, bytes.NewReader(body), int64(len(body)))
+	if err != nil {
+		t.Fatalf("Passthrough: %v", err)
+	}
+	t.Cleanup(func() { _ = resp.Body.Close() })
+	return resp
+}
+
+// passthroughAnswer drains one S29 forward: a test that judges the whole
+// answer reads it here instead of in the handler.
+func passthroughAnswer(t *testing.T, c *Client, method, path, query string, header http.Header, body []byte) (int, http.Header, []byte) {
+	t.Helper()
+	resp := passthroughOnce(t, c, method, path, query, header, body)
+	raw, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read passthrough body: %v", err)
+	}
+	return resp.StatusCode, resp.Header, raw
+}
+
 // upstreamAuthority is the Host the stub upstream must see: the proxy's own
 // address is never forwarded (§2.4 exclusion set).
 func upstreamAuthority(srv *httptest.Server) string {
@@ -572,9 +596,9 @@ func TestPassthroughIsVerbatim(t *testing.T) {
 
 	body := multipartProbeBody("----s29probe")
 	header := s29ProbeHeader("multipart/form-data; boundary=----s29probe")
-	code, respHeader, resp, err := c.Passthrough(t.Context(), "POST", "/api/upload-file", "b=2&a=1", header, body)
-	if err != nil || code != 201 {
-		t.Fatalf("Passthrough = %d, %v", code, err)
+	code, respHeader, resp := passthroughAnswer(t, c, "POST", "/api/upload-file", "b=2&a=1", header, body)
+	if code != 201 {
+		t.Fatalf("Passthrough = %d", code)
 	}
 	if string(resp) != `{"id":7}` || respHeader.Get("Content-Type") != "application/json" {
 		t.Errorf("response = %v %s, want the upstream verdict as-is", respHeader, resp)
@@ -698,9 +722,7 @@ func TestPassthroughAddsNoClientDefaults(t *testing.T) {
 	// A caller that sends no User-Agent and no Accept-Encoding gets exactly
 	// that upstream: the client library may not speak for it.
 	header := http.Header{"Authorization": {"Bearer mat_probe"}}
-	if _, _, _, err := c.Passthrough(t.Context(), "POST", "/api/daemon/tasks/whatever/status", "", header, multipartProbeBody("----s29probe")); err != nil {
-		t.Fatalf("Passthrough: %v", err)
-	}
+	passthroughAnswer(t, c, "POST", "/api/daemon/tasks/whatever/status", "", header, multipartProbeBody("----s29probe"))
 	got := singleCall(t, stub, "POST", "/api/daemon/tasks/whatever/status")
 	if got.Header.Get("User-Agent") != "" || got.Header.Get("Accept-Encoding") != "" {
 		t.Errorf("upstream saw invented fields: %v", got.Header)
@@ -724,9 +746,7 @@ func TestPassthroughKeepsCallerEncodingNegotiation(t *testing.T) {
 		"Cookie":           {"a=1", "b=2"},
 		"X-Client-Version": {"caller-supplied"},
 	}
-	if _, _, _, err := c.Passthrough(t.Context(), "GET", "/api/issues/42", "", header, nil); err != nil {
-		t.Fatalf("Passthrough: %v", err)
-	}
+	passthroughAnswer(t, c, "GET", "/api/issues/42", "", header, nil)
 	got := singleCall(t, stub, "GET", "/api/issues/42")
 	for field, want := range header {
 		if v := got.Header.Values(field); !slices.Equal(v, want) {
@@ -751,9 +771,9 @@ func TestPassthroughKeepsUpstreamContentEncoding(t *testing.T) {
 	})
 	c := NewClient(testConfig(srv.URL), "mdt_test")
 
-	code, header, body, err := c.Passthrough(t.Context(), "GET", "/api/blob", "", http.Header{"Authorization": {"Bearer mat_x"}, "Accept-Encoding": {"gzip"}}, nil)
-	if err != nil || code != 200 {
-		t.Fatalf("Passthrough = %d, %v", code, err)
+	code, header, body := passthroughAnswer(t, c, "GET", "/api/blob", "", http.Header{"Authorization": {"Bearer mat_x"}, "Accept-Encoding": {"gzip"}}, nil)
+	if code != 200 {
+		t.Fatalf("Passthrough = %d", code)
 	}
 	// The body is never decoded: the encoding field and the bytes it
 	// describes travel together (§2.4 逐字段裁定).
@@ -780,9 +800,7 @@ func TestPassthroughDropsExclusionSetOnTheWire(t *testing.T) {
 		"X-Probe-Drop":  {"nope"},
 		"X-Probe-Multi": {"a", "b"},
 	}
-	if _, _, _, err := c.Passthrough(t.Context(), "POST", "/api/issues/42/comments", "", header, []byte(`{"body":"hi"}`)); err != nil {
-		t.Fatalf("Passthrough: %v", err)
-	}
+	passthroughAnswer(t, c, "POST", "/api/issues/42/comments", "", header, []byte(`{"body":"hi"}`))
 	got := singleCall(t, stub, "POST", "/api/issues/42/comments")
 	for _, field := range []string{"Connection", "TE", "Trailer", "X-Probe-Drop"} {
 		if v := got.Header.Values(field); len(v) != 0 {
@@ -815,9 +833,9 @@ func TestPassthroughKeepsResponseHeadersVerbatim(t *testing.T) {
 	})
 	c := NewClient(testConfig(srv.URL), "mdt_test")
 
-	code, header, body, err := c.Passthrough(t.Context(), "GET", "/api/attachments/7/download", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil)
-	if err != nil || code != 200 {
-		t.Fatalf("Passthrough = %d, %v", code, err)
+	code, header, body := passthroughAnswer(t, c, "GET", "/api/attachments/7/download", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil)
+	if code != 200 {
+		t.Fatalf("Passthrough = %d", code)
 	}
 	for field, want := range map[string][]string{
 		"Content-Type":        {"application/octet-stream"},
@@ -856,9 +874,9 @@ func TestPassthroughReproducesNoFramingOrTrailers(t *testing.T) {
 	})
 	c := NewClient(testConfig(srv.URL), "mdt_test")
 
-	code, header, body, err := c.Passthrough(t.Context(), "GET", "/api/plain", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil)
-	if err != nil || code != 200 || string(body) != "plain" {
-		t.Fatalf("Passthrough = %d %q, %v", code, body, err)
+	code, header, body := passthroughAnswer(t, c, "GET", "/api/plain", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil)
+	if code != 200 || string(body) != "plain" {
+		t.Fatalf("Passthrough = %d %q", code, body)
 	}
 	if v := header.Values("Trailer"); len(v) != 0 {
 		t.Errorf("Trailer field survived: %v", v)
@@ -883,9 +901,9 @@ func TestPassthroughDoesNotFollowRedirects(t *testing.T) {
 	})
 	c := NewClient(testConfig(srv.URL), "mdt_test")
 
-	code, header, _, err := c.Passthrough(t.Context(), "GET", "/api/moved", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil)
-	if err != nil || code != 302 {
-		t.Fatalf("Passthrough = %d, %v; want the upstream 302 handed to the caller", code, err)
+	code, header, _ := passthroughAnswer(t, c, "GET", "/api/moved", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil)
+	if code != 302 {
+		t.Fatalf("Passthrough = %d, want the upstream 302 handed to the caller", code)
 	}
 	// Location travels verbatim; the caller decides whether to follow.
 	if got := header.Get("Location"); got != "https://elsewhere.example/api/moved" {
@@ -903,9 +921,7 @@ func TestPassthroughNoContentTypeFallback(t *testing.T) {
 	// A caller that declares no Content-Type gets none upstream: a fallback
 	// would put the proxied request on a different upstream branch than the
 	// same direct request (§2.4 逐字段裁定).
-	if _, _, _, err := c.Passthrough(t.Context(), "POST", "/api/issues/42/comments", "", http.Header{"Authorization": {"Bearer mat_x"}}, []byte(`{"body":"hi"}`)); err != nil {
-		t.Fatalf("Passthrough: %v", err)
-	}
+	passthroughAnswer(t, c, "POST", "/api/issues/42/comments", "", http.Header{"Authorization": {"Bearer mat_x"}}, []byte(`{"body":"hi"}`))
 	got := singleCall(t, stub, "POST", "/api/issues/42/comments")
 	if got.Header.Get("Content-Type") != "" {
 		t.Errorf("Content-Type = %q, want it absent", got.Header.Get("Content-Type"))
@@ -926,16 +942,16 @@ func TestPassthroughMetricCarriesCallerVisibleCode(t *testing.T) {
 	var metrics fakeMetrics
 	c := NewClient(testConfig(srv.URL), "mdt_test", WithMetrics(&metrics))
 
-	if code, _, _, _ := c.Passthrough(t.Context(), "GET", "/api/boom", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil); code != 500 {
-		t.Fatalf("upstream 500 = %d", code)
+	if resp := passthroughOnce(t, c, "GET", "/api/boom", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil); resp.StatusCode != 500 {
+		t.Fatalf("upstream 500 = %d", resp.StatusCode)
 	}
-	if code, _, _, _ := c.Passthrough(t.Context(), "GET", "/api/rejected", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil); code != 400 {
-		t.Fatalf("upstream 400 = %d", code)
+	if resp := passthroughOnce(t, c, "GET", "/api/rejected", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil); resp.StatusCode != 400 {
+		t.Fatalf("upstream 400 = %d", resp.StatusCode)
 	}
 	// An unreachable upstream is the third shape: the caller gets 502 and so
 	// does the metric, never a zero.
 	down := NewClient(testConfig("http://127.0.0.1:9"), "mdt_test", WithMetrics(&metrics))
-	if _, _, _, err := down.Passthrough(t.Context(), "GET", "/api/boom", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil); err == nil {
+	if _, err := down.Passthrough(t.Context(), "GET", "/api/boom", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil, 0); err == nil {
 		t.Fatal("unreachable upstream must report an error")
 	}
 	metrics.mu.Lock()
@@ -948,10 +964,11 @@ func TestPassthroughMetricCarriesCallerVisibleCode(t *testing.T) {
 	}
 }
 
-// A body the upstream never finishes (truncated/dropped stream) is a
-// transport failure: the caller gets 502, so the agent-api metric must say
-// 502 rather than the upstream's status line.
-func TestPassthroughCountsTruncatedBodyAs502(t *testing.T) {
+// A body the upstream never finishes (truncated/dropped stream) breaks after
+// the response head is already on its way: the caller sees the status line the
+// upstream gave and a body that ends short — the same shape a direct connection
+// produces (§2.4), not a 502 the proxy could no longer send.
+func TestPassthroughTruncatedBodyReachesCallerAsShortRead(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		conn, buf, err := w.(http.Hijacker).Hijack()
 		if err != nil {
@@ -967,13 +984,90 @@ func TestPassthroughCountsTruncatedBodyAs502(t *testing.T) {
 
 	var metrics fakeMetrics
 	c := NewClient(testConfig(srv.URL), "mdt_test", WithMetrics(&metrics))
-	if _, _, _, err := c.Passthrough(t.Context(), "GET", "/api/truncated", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil); err == nil {
-		t.Fatal("a truncated upstream body must surface as an error")
+	resp, err := c.Passthrough(t.Context(), "GET", "/api/truncated", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil, 0)
+	if err != nil {
+		t.Fatalf("Passthrough: %v (the head arrived, so the forward itself succeeded)", err)
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(resp.Body)
+	if err == nil {
+		t.Fatal("a truncated upstream body must surface as a read error")
+	}
+	if resp.StatusCode != http.StatusOK || string(raw) != "short" {
+		t.Errorf("caller saw %d %q, want the upstream head and the bytes it delivered", resp.StatusCode, raw)
 	}
 	metrics.mu.Lock()
 	defer metrics.mu.Unlock()
-	if !slices.Equal(metrics.codes, []int{http.StatusBadGateway}) {
-		t.Errorf("metric codes = %v, want [502] (the code the caller sees)", metrics.codes)
+	// §9.2: code = the status returned to the caller. The head said 200 and
+	// the caller got it.
+	if !slices.Equal(metrics.codes, []int{http.StatusOK}) {
+		t.Errorf("metric codes = %v, want [200] (the code the caller sees)", metrics.codes)
+	}
+}
+
+// The response body is not buffered: the forward returns with the upstream's
+// head and the bytes it has already produced, while the upstream is still
+// writing (§2.4 / ADR-046). A buffered forward would not return until the gate
+// below opens.
+func TestPassthroughStreamsUpstreamBody(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	gate := make(chan struct{})
+	release := func() {
+		select {
+		case <-gate:
+		default:
+			close(gate)
+		}
+	}
+	defer release()
+	firstChunkOut := make(chan struct{})
+	stub.on("GET", "/api/stream", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(200)
+		_, _ = w.Write([]byte("first"))
+		w.(http.Flusher).Flush()
+		close(firstChunkOut)
+		<-gate
+		_, _ = w.Write([]byte("-last"))
+	})
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+
+	type answer struct {
+		resp *PassthroughResponse
+		err  error
+	}
+	answered := make(chan answer, 1)
+	go func() {
+		resp, err := c.Passthrough(t.Context(), "GET", "/api/stream", "", http.Header{"Authorization": {"Bearer mat_x"}}, nil, 0)
+		answered <- answer{resp, err}
+	}()
+	var resp *PassthroughResponse
+	select {
+	case a := <-answered:
+		if a.err != nil {
+			t.Fatalf("Passthrough: %v", a.err)
+		}
+		resp = a.resp
+	case <-time.After(3 * time.Second):
+		t.Fatal("Passthrough did not return while the upstream body was still open: the response is buffered")
+	}
+	defer resp.Body.Close()
+	select {
+	case <-firstChunkOut:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the upstream never wrote its first chunk")
+	}
+	head := make([]byte, len("first"))
+	if _, err := io.ReadFull(resp.Body, head); err != nil {
+		t.Fatalf("read first chunk: %v", err)
+	}
+	if string(head) != "first" {
+		t.Fatalf("first chunk = %q, want %q", head, "first")
+	}
+	release()
+	rest, err := io.ReadAll(resp.Body)
+	if err != nil || string(rest) != "-last" {
+		t.Fatalf("rest = %q, %v; want -last", rest, err)
 	}
 }
 
@@ -997,6 +1091,11 @@ func TestPassthroughTransportFallsBackOnForeignDefault(t *testing.T) {
 	if tr.Proxy == nil || !tr.ForceAttemptHTTP2 || tr.DialContext == nil {
 		t.Errorf("fallback lost the defaults: proxy=%v http2=%v dial=%v", tr.Proxy != nil, tr.ForceAttemptHTTP2, tr.DialContext != nil)
 	}
+	// The head phase is bounded and the body phase is not: the client itself
+	// carries no whole-request deadline (ADR-046).
+	if tr.ResponseHeaderTimeout != controlTimeout {
+		t.Errorf("ResponseHeaderTimeout = %v, want %v", tr.ResponseHeaderTimeout, controlTimeout)
+	}
 }
 
 func TestPassthroughKeepsEscapedPathSegments(t *testing.T) {
@@ -1008,9 +1107,9 @@ func TestPassthroughKeepsEscapedPathSegments(t *testing.T) {
 	})
 	c := NewClient(testConfig(srv.URL), "mdt_test")
 
-	code, _, _, err := c.Passthrough(t.Context(), "GET", "/api/issues/a%2Fb", "", http.Header{"Authorization": {"Bearer mat_tasktoken"}}, nil)
-	if err != nil || code != 200 {
-		t.Fatalf("Passthrough = %d, %v", code, err)
+	code, _, _ := passthroughAnswer(t, c, "GET", "/api/issues/a%2Fb", "", http.Header{"Authorization": {"Bearer mat_tasktoken"}}, nil)
+	if code != 200 {
+		t.Fatalf("Passthrough = %d", code)
 	}
 	calls := stub.calls("GET", "/api/issues/a/b")
 	if len(calls) != 1 || calls[0].EscapedPath != "/api/issues/a%2Fb" {

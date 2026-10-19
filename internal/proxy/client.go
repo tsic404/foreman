@@ -102,8 +102,12 @@ func NewClient(cfg Config, token string, opts ...Option) *Client {
 		ctrl:  &http.Client{Timeout: controlTimeout},
 		lease: &http.Client{Timeout: leaseTimeout},
 		pass: &http.Client{
-			Timeout:   controlTimeout,
 			Transport: passthroughTransport(),
+			// No whole-request deadline: with the body streamed in both
+			// directions (ADR-046) a client timeout would cut a transfer that
+			// is merely slow instead of bounding a dead upstream. The bound
+			// that matters — no response head within the control budget —
+			// lives on the transport.
 			// A 3xx is the upstream's answer to hand back verbatim: the caller
 			// decides whether to follow it (§2.4: S-29 已知边界).
 			CheckRedirect: func(*http.Request, []*http.Request) error {
@@ -413,6 +417,8 @@ func callerVisible(upstream int) int {
 // sent none and no upstream-encoded body is transparently decoded. A
 // DefaultTransport that is not an *http.Transport falls back to the same
 // connection defaults instead of panicking at startup over a mutable global.
+// Only the head phase is bounded — an upstream that never answers converges to
+// 502 — while the body phase has no proxy-side deadline (ADR-046).
 func passthroughTransport() http.RoundTripper {
 	base, ok := http.DefaultTransport.(*http.Transport)
 	if !ok {
@@ -428,23 +434,44 @@ func passthroughTransport() http.RoundTripper {
 	}
 	t := base.Clone()
 	t.DisableCompression = true
+	t.ResponseHeaderTimeout = controlTimeout
 	return t
 }
 
+// PassthroughResponse is one S29 upstream answer: the status line, the
+// caller-visible header set (§2.4 exclusion set already applied) and the body,
+// still unread. The receiver owns the body and must close it.
+type PassthroughResponse struct {
+	StatusCode    int
+	Header        http.Header
+	ContentLength int64
+	Body          io.ReadCloser
+}
+
 // Passthrough forwards an agent-API call to the real server verbatim
-// (§2.1 rule 2 + ADR-020): method, raw path (EscapedPath, keeping %2F-style
-// segments), raw query (no decode/re-encode), the caller's whole header set
-// and body go out as given; the upstream status, whole header set and body
-// come back as given. The exclusion set is applied here, once;
+// (§2.1 rule 2 + ADR-020 + ADR-046): method, raw path (EscapedPath, keeping
+// %2F-style segments), raw query (no decode/re-encode), the caller's whole
+// header set and body go out as given; the upstream status, whole header set
+// and body come back as given. The exclusion set is applied here, once;
 // application/json is not a fallback and Foreman's own fields never appear.
-func (c *Client) Passthrough(ctx context.Context, method, rawPath, rawQuery string, header http.Header, body []byte) (int, http.Header, []byte, error) {
+// Neither body is buffered: both stream through, so payload size bounds neither
+// memory nor success, and response bytes reach the caller as the upstream
+// produces them.
+func (c *Client) Passthrough(ctx context.Context, method, rawPath, rawQuery string, header http.Header, body io.Reader, contentLength int64) (*PassthroughResponse, error) {
 	u := c.cfg.ServerURL + rawPath
 	if rawQuery != "" {
 		u += "?" + rawQuery
 	}
-	req, err := http.NewRequestWithContext(ctx, method, u, bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, method, u, body)
 	if err != nil {
-		return 0, nil, nil, err
+		return nil, err
+	}
+	if body != nil && contentLength >= 0 {
+		// Content-Length is never forwarded as a field (§2.4 exclusion set);
+		// the forwarded body's length comes from here. The caller's own
+		// framing thus survives: a declared length stays declared, an
+		// undeclared body stays chunked.
+		req.ContentLength = contentLength
 	}
 	req.Header = forwardableHeader(header)
 	if _, ok := req.Header["User-Agent"]; !ok {
@@ -457,19 +484,15 @@ func (c *Client) Passthrough(ctx context.Context, method, rawPath, rawQuery stri
 	resp, err := c.pass.Do(req)
 	if err != nil {
 		c.metrics.Forward(EndpointAgentAPI, http.StatusBadGateway, time.Since(start))
-		return 0, nil, nil, err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		// A truncated or dropped body is a transport failure: the caller gets
-		// 502, so the agent-api metric records 502 too (§9.2:
-		// code = the status returned to the caller).
-		c.metrics.Forward(EndpointAgentAPI, http.StatusBadGateway, time.Since(start))
-		return 0, nil, nil, err
+		return nil, err
 	}
 	c.metrics.Forward(EndpointAgentAPI, callerVisible(resp.StatusCode), time.Since(start))
-	return resp.StatusCode, forwardableHeader(resp.Header), data, nil
+	return &PassthroughResponse{
+		StatusCode:    resp.StatusCode,
+		Header:        forwardableHeader(resp.Header),
+		ContentLength: resp.ContentLength,
+		Body:          resp.Body,
+	}, nil
 }
 
 // ---- C13 status / S20 gc-check ----
