@@ -1667,18 +1667,13 @@ func podTerminated(pod *corev1.Pod) bool {
 }
 
 // SweepOrphanSecrets deletes credential Secrets left behind by a reclaim a
-// restart interrupted (§6.5). The criterion is
-// two-sided: the registry holds no entry for the task-id (any state) AND no
-// task Job carries that task-id. Either half alone would delete a Secret that
-// is still needed — the OnClaim CreateSecret → CreateJob window has the entry
-// but no Job yet, and a Job without its Secret boots into a silent
-// job_auth_failed.
-//
-// The Job's presence is answered by listing task Jobs and reading their
-// foreman.tsic.top/task-id labels, never by deriving a name: the display name
-// is the template's business, so a name built from the task id would resolve
-// to nothing for every custom format and delete a live Job's credential
-// (ADR-034 decision 9 — the label is the only locator).
+// restart interrupted (§6.5). The criterion is two-sided: no registry entry
+// for the task-id (any state) AND no task Job carrying it; either half alone
+// deletes a Secret still needed (CreateSecret → CreateJob window, or a Job
+// that boots job_auth_failed). A Secret whose name is not fm-<task-id>-cred
+// is not a design product and is skipped — deleting by label would hit a
+// same-named in-flight credential. Job presence is read from the task-id
+// label, never a derived name (ADR-034 decision 9).
 func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 	secrets, err := s.jobs.ListSecrets(ctx)
 	if err != nil {
@@ -1700,6 +1695,9 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 	for _, secret := range secrets {
 		taskID := secret.Labels[registry.LabelTaskID]
 		if taskID == "" {
+			continue
+		}
+		if secret.Name != credName(daemonIDFor(taskID)) {
 			continue
 		}
 		if _, ok := s.reg.Get(taskID); ok {
