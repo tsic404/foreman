@@ -159,3 +159,58 @@ func TestLoadConfigSkillCache(t *testing.T) {
 		t.Errorf("overrides = %d entries / %d bytes, want 8 / 512Mi", cfg.SkillCacheMaxEntries, cfg.SkillCacheMaxBytes)
 	}
 }
+
+// TestLoadConfigModelCatalogBudget pins §1.3's startup self-check: the catalog
+// budget must cover three probe heartbeat intervals, because a probe starts on
+// a third of the budget as its floor and that floor has to last one heartbeat
+// delivery. The refused value names the env, the value and the bound, so the
+// resulting CrashLoop is attributable.
+func TestLoadConfigModelCatalogBudget(t *testing.T) {
+	env := func(timeout string) func(string) string {
+		base := map[string]string{
+			EnvServerURL:   "http://multica.example",
+			EnvWorkspaceID: "ws-test",
+		}
+		if timeout != "" {
+			base[EnvModelCatalogTimeout] = timeout
+		}
+		return func(key string) string { return base[key] }
+	}
+
+	// The default equals the bound (3 x 15s): the boundary is accepted, and a
+	// legal override must reach the returned value — a loader that dropped or
+	// clamped it to the default would otherwise pass.
+	accepted := []struct {
+		timeout string
+		want    time.Duration
+	}{
+		{"", 45 * time.Second},
+		{"45s", 45 * time.Second},
+		{"1h", time.Hour},
+	}
+	for _, tc := range accepted {
+		cfg, err := LoadConfig(env(tc.timeout))
+		if err != nil {
+			t.Errorf("LoadConfig(%q): %v", tc.timeout, err)
+			continue
+		}
+		if cfg.ModelCatalogTimeout != tc.want {
+			t.Errorf("LoadConfig(%q): ModelCatalogTimeout = %s, want %s", tc.timeout, cfg.ModelCatalogTimeout, tc.want)
+		}
+	}
+
+	for _, timeout := range []string{"30s", "44.999s"} {
+		_, err := LoadConfig(env(timeout))
+		if err == nil {
+			t.Errorf("LoadConfig(%q) was accepted, want a refusal", timeout)
+			continue
+		}
+		// The refusal must state the inequality and the actual value: the
+		// operator reads it out of a CrashLoop line.
+		for _, want := range []string{EnvModelCatalogTimeout, ">= 3x", timeout, ProbeHeartbeatInterval.String()} {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("LoadConfig(%q): error %q does not name %q", timeout, err, want)
+			}
+		}
+	}
+}

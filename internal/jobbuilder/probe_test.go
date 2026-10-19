@@ -323,6 +323,39 @@ spec:
               - secret: { name: fm-<task_id>-cred }
 `
 
+// TestWriteProbeDeadlineRoundsUp pins the probe deadline's whole-second
+// representation (§8.4): activeDeadlineSeconds counts seconds, so a positive
+// budget rounds up — a sub-second budget renders one second, never the zero
+// that would kill the Job at creation — while a non-positive budget writes
+// nothing and leaves the template's value in place.
+func TestWriteProbeDeadlineRoundsUp(t *testing.T) {
+	positive := []struct {
+		name   string
+		budget time.Duration
+		want   int64
+	}{
+		{"sub-second rounds up", 500 * time.Millisecond, 1},
+		{"fraction rounds up", 1500 * time.Millisecond, 2},
+		{"whole seconds are exact", 45 * time.Second, 45},
+	}
+	for _, tc := range positive {
+		job := &batchv1.Job{}
+		writeProbeDeadline(job, tc.budget)
+		if job.Spec.ActiveDeadlineSeconds == nil || *job.Spec.ActiveDeadlineSeconds != tc.want {
+			t.Errorf("%s: deadline = %v, want %d", tc.name, job.Spec.ActiveDeadlineSeconds, tc.want)
+		}
+	}
+
+	template := int64(86400)
+	for _, budget := range []time.Duration{0, -time.Second} {
+		job := &batchv1.Job{Spec: batchv1.JobSpec{ActiveDeadlineSeconds: &template}}
+		writeProbeDeadline(job, budget)
+		if job.Spec.ActiveDeadlineSeconds == nil || *job.Spec.ActiveDeadlineSeconds != template {
+			t.Errorf("budget %s: the template's deadline was overwritten (%v)", budget, job.Spec.ActiveDeadlineSeconds)
+		}
+	}
+}
+
 // TestBuildCatalogProbeKeepsTemplateLiterals (AC-13's shape rule, AC-32): the
 // two probe literals are renamed only on the faces A1.4 ④ declares, so a
 // template's own image references — and every other position off those faces —
