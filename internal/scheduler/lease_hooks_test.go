@@ -16,18 +16,22 @@ type fakePendingReports struct {
 	reports []pendingCall
 	queued  map[string]bool
 	err     error // Enqueue's durable-write failure
+	// notRebuilt models an outstanding carrier list: Queued answers true for
+	// every task (unknown is not empty) and Rebuilt answers false.
+	notRebuilt bool
 }
 
 type pendingCall struct {
-	taskID   string
-	jobName  string
-	daemonID string
-	ep       Endpoint
-	body     string
+	taskID        string
+	jobName       string
+	daemonID      string
+	ep            Endpoint
+	body          string
+	failureReason string
 }
 
-func (f *fakePendingReports) Enqueue(taskID, jobName, daemonID string, ep Endpoint, body []byte) error {
-	f.reports = append(f.reports, pendingCall{taskID, jobName, daemonID, ep, string(body)})
+func (f *fakePendingReports) Enqueue(_ context.Context, taskID, jobName, daemonID string, ep Endpoint, body []byte, failureReason string) error {
+	f.reports = append(f.reports, pendingCall{taskID, jobName, daemonID, ep, string(body), failureReason})
 	if f.err != nil {
 		return f.err
 	}
@@ -38,17 +42,33 @@ func (f *fakePendingReports) Enqueue(taskID, jobName, daemonID string, ep Endpoi
 	return nil
 }
 
-// Queued reports whether the report is still undelivered.
-func (f *fakePendingReports) Queued(taskID string) bool { return f.queued[taskID] }
+// Queued reports whether the report is still undelivered. An outstanding
+// carrier list reads as "may be queued" (§4.3).
+func (f *fakePendingReports) Queued(taskID string) bool {
+	if f.notRebuilt {
+		return true
+	}
+	return f.queued[taskID]
+}
+
+// Rebuilt reports whether the carrier list completed.
+func (f *fakePendingReports) Rebuilt() bool { return !f.notRebuilt }
+
+// HasQueuedEntry reports the known membership, ignoring the uncompleted-list
+// conservatism.
+func (f *fakePendingReports) HasQueuedEntry(taskID string) bool { return f.queued[taskID] }
 
 // Drop forgets the report the direct forward settled.
-func (f *fakePendingReports) Drop(taskID string) { delete(f.queued, taskID) }
+func (f *fakePendingReports) Drop(_ context.Context, taskID string) { delete(f.queued, taskID) }
+
+// Restore is the carrier rebuild: the fake has no carriers.
+func (f *fakePendingReports) Restore(context.Context) error { return nil }
 
 // Drain models the recovery loop's round: every queued report is re-delivered
 // once through sender and the queue is reported empty.
 func (f *fakePendingReports) Drain(ctx context.Context, sender ReportSender) (int, error) {
 	for taskID := range f.queued {
-		if _, _, err := sender.DeliverQueued(ctx, EPFail, taskID, nil); err != nil {
+		if _, _, err := sender.DeliverQueued(ctx, EPFail, taskID, nil, ""); err != nil {
 			return len(f.queued), err
 		}
 		delete(f.queued, taskID)
@@ -467,7 +487,7 @@ func TestReportFailDropsPermanent4xxAndKeepsTransient(t *testing.T) {
 			e := f.claim(t, "t-rf")
 			// The verdict path queued the report ahead of the forward; this
 			// test models that state directly.
-			if err := p.Enqueue(e.TaskID, e.JobName, e.DaemonID, EPFail, []byte(`{}`)); err != nil {
+			if err := p.Enqueue(context.Background(), e.TaskID, e.JobName, e.DaemonID, EPFail, []byte(`{}`), ""); err != nil {
 				t.Fatalf("Enqueue: %v", err)
 			}
 			f.server.forwardCode = tc.code
@@ -502,12 +522,12 @@ func TestDeliverQueuedSettlesPermanent4xx(t *testing.T) {
 			f := newFixture(t)
 			p := f.withDurableReports(t)
 			e := f.claim(t, "t-dq")
-			if err := p.Enqueue(e.TaskID, e.JobName, e.DaemonID, EPFail, []byte(`{}`)); err != nil {
+			if err := p.Enqueue(context.Background(), e.TaskID, e.JobName, e.DaemonID, EPFail, []byte(`{}`), ""); err != nil {
 				t.Fatalf("Enqueue: %v", err)
 			}
 			f.server.forwardCode = tc.code
 
-			code, _, err := f.sched.DeliverQueued(t.Context(), EPFail, e.TaskID, []byte(`{}`))
+			code, _, err := f.sched.DeliverQueued(t.Context(), EPFail, e.TaskID, []byte(`{}`), "")
 			if err != nil || code != tc.code {
 				t.Fatalf("DeliverQueued = %d, %v; want the upstream code %d", code, err, tc.code)
 			}
@@ -549,7 +569,7 @@ func TestDeliverQueuedWithoutEntrySettlesPermanent4xx(t *testing.T) {
 			f := newFixture(t)
 			p := f.withDurableReports(t)
 			e := f.claim(t, "t-dq-gone")
-			if err := p.Enqueue(e.TaskID, e.JobName, e.DaemonID, EPFail, []byte(`{}`)); err != nil {
+			if err := p.Enqueue(context.Background(), e.TaskID, e.JobName, e.DaemonID, EPFail, []byte(`{}`), ""); err != nil {
 				t.Fatalf("Enqueue: %v", err)
 			}
 			// The credential was reclaimed before the replay landed: the
@@ -561,7 +581,7 @@ func TestDeliverQueuedWithoutEntrySettlesPermanent4xx(t *testing.T) {
 			f.sched.log = slog.New(slog.NewJSONHandler(logs, nil))
 			f.server.forwardCode = tc.code
 
-			code, _, err := f.sched.DeliverQueued(t.Context(), EPFail, e.TaskID, []byte(`{}`))
+			code, _, err := f.sched.DeliverQueued(t.Context(), EPFail, e.TaskID, []byte(`{}`), "")
 			if err != nil || code != tc.code {
 				t.Fatalf("DeliverQueued = %d, %v; want the upstream code %d", code, err, tc.code)
 			}

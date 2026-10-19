@@ -109,14 +109,26 @@ type Reconciler interface {
 // cleanup of its task: a deleted Job must never stand in for a delivered
 // report.
 type PendingReportQueue interface {
-	Enqueue(taskID, jobName, daemonID string, ep Endpoint, body []byte) error
+	Enqueue(ctx context.Context, taskID, jobName, daemonID string, ep Endpoint, body []byte, failureReason string) error
 	// Queued reports whether taskID's terminal report is still undelivered.
+	// It is conservative: while the carrier list has not completed every task
+	// reads as queued (§4.3 — an uncompleted rebuild is not an empty queue).
 	Queued(taskID string) bool
+	// Rebuilt reports whether the carrier list completed, so the queue's
+	// state is authoritative and a settlement may act on it.
+	Rebuilt() bool
+	// HasQueuedEntry reports the queue membership the process actually
+	// holds; the write-ahead decision uses it so an unknown list never
+	// suppresses a report write.
+	HasQueuedEntry(taskID string) bool
 	// Drop forgets taskID's report after its direct forward settled it.
-	Drop(taskID string)
+	Drop(ctx context.Context, taskID string)
 	// Drain re-delivers every queued report once through sender and returns
 	// how many are still undelivered.
 	Drain(ctx context.Context, sender ReportSender) (int, error)
+	// Restore rebuilds the queue from its cluster carriers (§4.3). An error
+	// means the list did not complete — not that the queue is empty.
+	Restore(ctx context.Context) error
 }
 
 // noopMetrics keeps every Metrics call site nil-safe.

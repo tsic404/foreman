@@ -58,6 +58,10 @@ type Settler interface {
 	// recovery loop reaches it through this seam — the existing
 	// recovery → scheduler direction.
 	DrainPendingReports(ctx context.Context) (int, error)
+	// RestorePendingReports rebuilds the queue from its cluster carriers
+	// (§4.3). An error means the list did not complete: the round must settle
+	// nothing, because a failed list is not an empty queue.
+	RestorePendingReports(ctx context.Context) error
 	// SyncInflight re-derives the inflight gauge from the live index. The
 	// round calls it on entry and a ticker repeats it every interval, so a
 	// settlement path that missed its own refresh cannot keep a stale count.

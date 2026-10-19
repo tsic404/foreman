@@ -16,13 +16,15 @@ import (
 
 // fakeSender programs Drain outcomes per task.
 type fakeSender struct {
-	code int
-	err  error
-	sent []string
+	code    int
+	err     error
+	sent    []string
+	reasons []string
 }
 
-func (f *fakeSender) DeliverQueued(_ context.Context, ep Endpoint, taskID string, body []byte) (int, []byte, error) {
+func (f *fakeSender) DeliverQueued(_ context.Context, ep Endpoint, taskID string, body []byte, failureReason string) (int, []byte, error) {
 	f.sent = append(f.sent, taskID+":"+string(ep)+":"+string(body))
+	f.reasons = append(f.reasons, failureReason)
 	if f.err != nil {
 		return 0, nil, f.err
 	}
@@ -35,7 +37,7 @@ func TestEnqueueWritesDurableFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	if err := p.Enqueue("task-1", "fm-task-1", "fm-task-1", EPComplete, []byte(`{"result":"ok"}`)); err != nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPComplete, []byte(`{"result":"ok"}`), ""); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if p.Len() != 1 {
@@ -71,7 +73,7 @@ func TestEnqueueRejectsUnsafeNames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	if err := p.Enqueue("../evil", "", "", EPFail, []byte(`{}`)); err == nil {
+	if err := p.Enqueue(context.Background(), "../evil", "", "", EPFail, []byte(`{}`), ""); err == nil {
 		t.Error("path-unsafe task ids must be rejected")
 	}
 }
@@ -81,7 +83,7 @@ func TestDrainDeliversAndRemoves(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	_ = p.Enqueue("task-1", "fm-task-1", "fm-task-1", EPComplete, []byte(`{"a":1}`))
+	_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPComplete, []byte(`{"a":1}`), "")
 	sender := &fakeSender{code: 200}
 
 	remaining, err := p.Drain(context.Background(), sender)
@@ -99,7 +101,7 @@ func TestDrainDeliversAndRemoves(t *testing.T) {
 func TestDrainTreats404And409AsDelivered(t *testing.T) {
 	for _, code := range []int{404, 409} {
 		p, _ := NewPendingReports(t.TempDir())
-		_ = p.Enqueue("task-1", "fm-task-1", "fm-task-1", EPCancelAck, []byte(`{}`))
+		_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPCancelAck, []byte(`{}`), "")
 		remaining, err := p.Drain(context.Background(), &fakeSender{code: code})
 		if err != nil || remaining != 0 {
 			t.Errorf("code %d: Drain = %d, %v (a settled/gone task makes the report moot)", code, remaining, err)
@@ -112,7 +114,7 @@ func TestDrainKeepsFailuresAndCountsAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	_ = p.Enqueue("task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{}`))
+	_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{}`), "")
 	sender := &fakeSender{code: 503}
 
 	remaining, err := p.Drain(context.Background(), sender)
@@ -136,7 +138,7 @@ func TestDrainDropsExpiredReports(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	_ = p.Enqueue("task-old", "fm-task-old", "fm-task-old", EPFail, []byte(`{}`))
+	_ = p.Enqueue(context.Background(), "task-old", "fm-task-old", "fm-task-old", EPFail, []byte(`{}`), "")
 
 	// 25h later the report exceeds the TTL and is dropped with an error log
 	// (§10).
@@ -158,11 +160,11 @@ func TestEnqueuePreservesOriginalEnqueueTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	_ = p.Enqueue("task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"v":1}`))
+	_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"v":1}`), "")
 
 	later := now.Add(time.Hour)
 	p2, _ := NewPendingReports(p.dir, WithPendingReportsClock(func() time.Time { return later }))
-	if err := p2.Enqueue("task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"v":2}`)); err != nil {
+	if err := p2.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"v":2}`), ""); err != nil {
 		t.Fatalf("re-Enqueue: %v", err)
 	}
 	raw, _ := os.ReadFile(filepath.Join(p.dir, "task-1.json"))
@@ -178,7 +180,7 @@ func TestEnqueuePreservesOriginalEnqueueTime(t *testing.T) {
 
 func TestDrainSurfacesTransportErrors(t *testing.T) {
 	p, _ := NewPendingReports(t.TempDir())
-	_ = p.Enqueue("task-1", "fm-task-1", "fm-task-1", EPComplete, []byte(`{}`))
+	_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPComplete, []byte(`{}`), "")
 	remaining, err := p.Drain(context.Background(), &fakeSender{err: errors.New("dial refused")})
 	if err == nil || remaining != 1 {
 		t.Fatalf("Drain = %d, %v", remaining, err)
@@ -217,7 +219,7 @@ func TestDrainDoesNotBlockEnqueue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	_ = p.Enqueue("task-slow", "fm-task-slow", "fm-task-slow", EPComplete, []byte(`{}`))
+	_ = p.Enqueue(context.Background(), "task-slow", "fm-task-slow", "fm-task-slow", EPComplete, []byte(`{}`), "")
 
 	release := make(chan struct{})
 	blocking := newBlockingSender(release)
@@ -231,7 +233,7 @@ func TestDrainDoesNotBlockEnqueue(t *testing.T) {
 	<-blocking.entered
 	enqueued := make(chan error, 1)
 	go func() {
-		enqueued <- p.Enqueue("task-fast", "fm-task-fast", "fm-task-fast", EPFail, []byte(`{}`))
+		enqueued <- p.Enqueue(context.Background(), "task-fast", "fm-task-fast", "fm-task-fast", EPFail, []byte(`{}`), "")
 	}()
 	select {
 	case err := <-enqueued:
@@ -260,7 +262,7 @@ func newBlockingSender(release chan struct{}) *blockingSender {
 	return &blockingSender{release: release, entered: make(chan struct{})}
 }
 
-func (s *blockingSender) DeliverQueued(context.Context, Endpoint, string, []byte) (int, []byte, error) {
+func (s *blockingSender) DeliverQueued(context.Context, Endpoint, string, []byte, string) (int, []byte, error) {
 	s.once.Do(func() { close(s.entered) })
 	<-s.release
 	return 503, nil, nil
@@ -286,7 +288,7 @@ func TestEnqueueFailureStagesReportUntilWritable(t *testing.T) {
 	if err := os.WriteFile(dir, []byte("not a directory"), 0o600); err != nil {
 		t.Fatalf("break dir: %v", err)
 	}
-	if err := p.Enqueue("task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"failure_reason":"job_failed"}`)); err == nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"failure_reason":"job_failed"}`), ""); err == nil {
 		t.Fatal("Enqueue against an unwritable queue: want the write error")
 	}
 	if p.Len() != 0 {
@@ -335,7 +337,7 @@ func TestDrainDeliversUnstorableTaskIDFromStaging(t *testing.T) {
 	if p.Queued("../escape") {
 		t.Fatal("Queued must not claim an unsafe task id is a queue entry")
 	}
-	if err := p.Enqueue("../escape", "", "", EPFail, []byte(`{"failure_reason":"invalid_task_id"}`)); err == nil {
+	if err := p.Enqueue(context.Background(), "../escape", "", "", EPFail, []byte(`{"failure_reason":"invalid_task_id"}`), ""); err == nil {
 		t.Fatal("Enqueue with an unsafe task id: want an error")
 	}
 	if p.Len() != 0 {
@@ -383,7 +385,7 @@ func TestReportEventsCarryTaskIdentity(t *testing.T) {
 	if err := os.WriteFile(dir, []byte("not a directory"), 0o600); err != nil {
 		t.Fatalf("break dir: %v", err)
 	}
-	if err := p.Enqueue("task-staged", "fm-task-staged", "fm-daemon-staged", EPFail, []byte(`{}`)); err == nil {
+	if err := p.Enqueue(context.Background(), "task-staged", "fm-task-staged", "fm-daemon-staged", EPFail, []byte(`{}`), ""); err == nil {
 		t.Fatal("Enqueue against an unwritable queue: want the write error")
 	}
 	if err := os.Remove(dir); err != nil {
@@ -397,7 +399,7 @@ func TestReportEventsCarryTaskIdentity(t *testing.T) {
 	}
 
 	// The durable file carries the identity across a reopened queue.
-	if err := p.Enqueue("task-1", "fm-task-1", "fm-daemon-1", EPComplete, []byte(`{}`)); err != nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-daemon-1", EPComplete, []byte(`{}`), ""); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	p2, err := NewPendingReports(dir, WithPendingReportsLogger(logger), WithPendingReportsClock(clock))
@@ -410,7 +412,7 @@ func TestReportEventsCarryTaskIdentity(t *testing.T) {
 
 	// An unknown identity keeps both keys with empty values, on the queue and
 	// on the TTL drop.
-	if err := p2.Enqueue("task-2", "", "", EPFail, []byte(`{}`)); err != nil {
+	if err := p2.Enqueue(context.Background(), "task-2", "", "", EPFail, []byte(`{}`), ""); err != nil {
 		t.Fatalf("Enqueue without identity: %v", err)
 	}
 	now = now.Add(PendingReportTTL + time.Hour)
@@ -485,14 +487,14 @@ func TestDrainKeepsAReportReplacedMidFlight(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	if err := p.Enqueue("task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"old":1}`)); err != nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"old":1}`), ""); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	replaced := false
 	sender := &senderFunc{send: func(_ string, _ []byte) (int, []byte, error) {
 		if !replaced {
 			replaced = true
-			if err := p.Enqueue("task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"new":2}`)); err != nil {
+			if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"new":2}`), ""); err != nil {
 				t.Errorf("mid-flight Enqueue: %v", err)
 			}
 		}
@@ -517,7 +519,7 @@ type senderFunc struct {
 	send func(taskID string, body []byte) (int, []byte, error)
 }
 
-func (f *senderFunc) DeliverQueued(_ context.Context, _ Endpoint, taskID string, body []byte) (int, []byte, error) {
+func (f *senderFunc) DeliverQueued(_ context.Context, _ Endpoint, taskID string, body []byte, _ string) (int, []byte, error) {
 	return f.send(taskID, body)
 }
 

@@ -30,8 +30,10 @@ type JobClient interface {
 	DeleteSecret(ctx context.Context, name string) error
 	// ListJobs returns the foreman-managed Jobs in the configured namespace.
 	ListJobs(ctx context.Context) ([]batchv1.Job, error)
-	// ListSecrets returns the foreman-managed credential Secrets in the
-	// configured namespace — the list face of the orphan sweep (§6.5).
+	// ListSecrets returns the foreman-managed Secrets in the configured
+	// namespace — both the credential domain and the pending-report carrier
+	// domain. It is the list face of the orphan/carrier sweeps and of the
+	// queue rebuild (§3, §4.3, §6.5).
 	ListSecrets(ctx context.Context) ([]corev1.Secret, error)
 	// ListPods returns the pods matching labelSelector in the configured
 	// namespace — the value surface of jobTerminated.
