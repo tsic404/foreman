@@ -1084,7 +1084,7 @@ func (s *Scheduler) OnStartRejected(ctx context.Context, taskID string) error {
 	case st == "running":
 		// The start landed after all: keep the Job, wait for the daemon's
 		// reports (§4.3).
-		return s.AdoptRunning(ctx, taskID)
+		return s.AdoptRunning(ctx, taskID, st)
 	case registry.IsTerminalResult(st):
 		return s.SettleTerminal(ctx, taskID, st)
 	case st == "queued" || st == "dispatched":
@@ -1092,9 +1092,13 @@ func (s *Scheduler) OnStartRejected(ctx context.Context, taskID string) error {
 			reason:  FailureReasonStaleClaim,
 			message: "server rejected the task start: task claim is stale or task is no longer startable",
 		})
+	case st == "waiting_local_directory":
+		// The daemon holds the task but has not started it: no decisive fact
+		// for the refused start (S-7 + §10: 租约不超时) — the daemon's own
+		// reports converge this entry.
+		return nil
 	default:
-		// waiting_*: no decisive fact (S-7 + §10: 租约不超时) — the
-		// daemon's own reports converge this entry.
+		s.logUnclassifiedStatus(ctx, e, st)
 		return nil
 	}
 }
@@ -1155,9 +1159,10 @@ func (s *Scheduler) OnDeliveryUnconfirmed(ctx context.Context, taskID string) er
 
 // ConvergeLeaseRefused settles an entry whose prepare-lease was refused
 // (C4 400: the task left the renewable pre-start state). C13 decides:
-// running marks the entry started (leasing stops), terminal settles and
-// cleans up, a deleted task vanishes; anything else waits for the next
-// lease round (S-7 + §10: 租约不超时).
+// a post-delivery status records the start fact (leasing stops, state
+// untouched), terminal settles and cleans up, a deleted task vanishes;
+// pre-start statuses retry next round, any value outside the domain is
+// reported and never guessed (S-7 + §10: 租约不超时, ADR-026 决策结果 1/3).
 func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) error {
 	defer s.SyncInflight()
 	unlock := s.taskMu.Lock(taskID)
@@ -1175,20 +1180,34 @@ func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) err
 	}
 	s.reg.SetLastStatusSeen(taskID, st)
 	switch {
-	case st == "running":
-		// The daemon started without Foreman seeing S8 (e.g. a restart):
-		// stop leasing, keep the Job, wait for the daemon's reports.
-		s.reg.MarkStarted(taskID, s.now())
+	case st == "running" || st == "waiting_local_directory":
+		// The daemon holds the task without Foreman seeing S8 (e.g. a
+		// restart): record the start fact, stop leasing, keep the Job and
+		// wait for the daemon's reports. Only a report advances the state.
+		s.reg.MarkStartFact(taskID, s.now())
 		return nil
 	case registry.IsTerminalResult(st):
 		if _, err := s.reg.MarkTerminal(taskID, registry.Result(st), "", s.now()); err != nil {
 			return err
 		}
 		return s.deleteJob(ctx, e)
+	case st == "queued" || st == "dispatched":
+		// Pre-start: no decisive fact — retry next round.
+		return nil
 	default:
-		// queued/dispatched/waiting_*: no decisive fact — retry next round.
+		s.logUnclassifiedStatus(ctx, e, st)
 		return nil
 	}
+}
+
+// logUnclassifiedStatus reports a C13 value outside the enumerated domain
+// (§4.2: queued, dispatched, running, waiting_local_directory and the
+// terminal trio). The conservative branch keeps the entry, so this report is
+// its only visible signal; widening the domain is a design change, not a
+// guess (ADR-026 决策结果 3).
+func (s *Scheduler) logUnclassifiedStatus(ctx context.Context, e registry.TaskEntry, status string) {
+	s.log.ErrorContext(ctx, "task.status_unclassified",
+		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID, "status", status)
 }
 
 // OnJobGone is the compensation entry for a Job object that disappeared
@@ -1340,17 +1359,20 @@ func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) e
 	return s.deleteJob(ctx, e)
 }
 
-// AdoptRunning records that the server considers the task running (C13),
+// AdoptRunning records that the server reports the task post-delivery (C13),
 // e.g. after a restart rebuilt the entry: the Job is kept, lease renewals
 // stop (started_at is set) and the daemon's reports are accepted
-// (§4.3: the adopt branch).
-func (s *Scheduler) AdoptRunning(ctx context.Context, taskID string) error {
-	e, ok := s.reg.MarkStarted(taskID, s.now())
+// (§4.3: the adopt branch). The observed status rides on the event so an
+// adoption is never read back as "running". Adoption is an observation, not
+// a report: only started_at moves, so the projection keeps the rebuild's
+// initial phase (ADR-026 决策结果 1 / 后果).
+func (s *Scheduler) AdoptRunning(ctx context.Context, taskID, status string) error {
+	e, ok := s.reg.MarkStartFact(taskID, s.now())
 	if !ok {
 		return nil
 	}
-	s.log.InfoContext(ctx, "task.adopted_running",
-		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID)
+	s.log.InfoContext(ctx, "task.adopted",
+		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID, "status", status)
 	return nil
 }
 
@@ -1740,10 +1762,11 @@ func (s *Scheduler) Rebuild(ctx context.Context) error {
 }
 
 // convergeEntry settles one rebuilt or lingering entry against the server's
-// status (C13): running keeps the Job, queued/dispatched releases it for
-// server redispatch, terminal cleans up, 404 cleans up without a report.
-// Every registry write is an in-lock transition — a snapshot Put after the
-// network round-trip could clobber a concurrent daemon callback.
+// status (C13): a post-delivery status adopts the entry (Job kept, start fact
+// recorded), queued/dispatched releases it for server redispatch, terminal
+// cleans up, 404 cleans up without a report. Every registry write is an
+// in-lock transition — a snapshot Put after the network round-trip could
+// clobber a concurrent daemon callback.
 func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) error {
 	if e.IsTerminal() {
 		return s.SettleTerminal(ctx, e.TaskID, string(e.Result))
@@ -1757,12 +1780,12 @@ func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) err
 	}
 	s.reg.SetLastStatusSeen(e.TaskID, st)
 	switch {
-	case st == "running":
-		// The task is executing: keep the Job and accept the daemon's
-		// reports. AdoptRunning sets started_at once; it only gates the boot
-		// timeout, so the rebuild-time approximation is safe. A miss means
-		// the entry turned terminal or was deleted mid-round — benign.
-		return s.AdoptRunning(ctx, e.TaskID)
+	case st == "running" || st == "waiting_local_directory":
+		// The task is in the daemon's hands: keep the Job and accept its
+		// reports. AdoptRunning records started_at once; it only gates the
+		// boot timeout, so the rebuild-time approximation is safe. A miss
+		// means the entry turned terminal or was deleted mid-round — benign.
+		return s.AdoptRunning(ctx, e.TaskID, st)
 	case st == "queued" || st == "dispatched":
 		// Not started and the payload is gone with the restart: discard the
 		// objects so the server re-dispatches after its reclaim window. This
@@ -1772,8 +1795,7 @@ func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) err
 	case registry.IsTerminalResult(st):
 		return s.SettleTerminal(ctx, e.TaskID, st)
 	default:
-		// e.g. waiting_local_directory: no decisive fact yet — keep waiting
-		// (§4.2).
+		s.logUnclassifiedStatus(ctx, e, st)
 		return nil
 	}
 }

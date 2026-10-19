@@ -50,10 +50,11 @@ const (
 
 // C13 statuses the convergence switches on (§1.2).
 const (
-	statusRunning    = "running"
-	statusQueued     = "queued"
-	statusDispatched = "dispatched"
-	statusCancelled  = "cancelled"
+	statusRunning               = "running"
+	statusQueued                = "queued"
+	statusDispatched            = "dispatched"
+	statusWaitingLocalDirectory = "waiting_local_directory"
+	statusCancelled             = "cancelled"
 )
 
 // StatusClient is the recovery module's view of the fake client's C13
@@ -577,7 +578,7 @@ func (r *Reconciler) settleFromServer(ctx context.Context, e registry.TaskEntry)
 		// renewals and accept the daemon's reports (a rebuilt entry has no
 		// delivery to replay).
 		delete(r.cancels, e.TaskID)
-		return r.settler.AdoptRunning(ctx, e.TaskID)
+		return r.settler.AdoptRunning(ctx, e.TaskID, st)
 	case st == statusQueued || st == statusDispatched:
 		// §4.3: only a rebuilt entry (payload lost with the restart,
 		// F3) has nothing to deliver — release the Job so the server
@@ -588,8 +589,20 @@ func (r *Reconciler) settleFromServer(ctx context.Context, e registry.TaskEntry)
 			return r.release(ctx, e.TaskID)
 		}
 		return nil
+	case st == statusWaitingLocalDirectory:
+		// §4.3: the daemon holds the task, so a rebuilt entry adopts (start
+		// fact recorded, no renewals). An in-flight entry still holds its
+		// payload and is simply waiting for the daemon to start it.
+		if len(e.Payload) == 0 {
+			delete(r.cancels, e.TaskID)
+			return r.settler.AdoptRunning(ctx, e.TaskID, st)
+		}
+		return nil
 	default:
-		// waiting_local_directory and friends: no decisive fact yet.
+		// Outside the C13 domain: keep the entry and report it — a value
+		// extension is a design change, not a guess (ADR-026 决策结果 3).
+		r.log.ErrorContext(ctx, "task.status_unclassified",
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID, "status", st)
 		return nil
 	}
 }

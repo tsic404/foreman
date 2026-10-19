@@ -1244,8 +1244,10 @@ func TestOnReportStart409RunningAdoptsEntry(t *testing.T) {
 		t.Fatalf("OnReport = %d, %v (the daemon keeps the server's 409)", code, err)
 	}
 	got, ok := f.reg.Get("t-adopt")
-	if !ok || got.State != registry.StateRunning || got.StartedAt.IsZero() {
-		t.Fatalf("entry = %+v, want running (the lost 200 must not fail the task)", got)
+	// Adoption is not a report: the lost 200 must not fail the task, but the
+	// state stays where the delivery left it (ADR-026 后果).
+	if !ok || got.State != registry.StateDelivering || got.StartedAt.IsZero() {
+		t.Fatalf("entry = %+v, want delivering with the start fact (the lost 200 must not fail the task)", got)
 	}
 	if !f.hasJob("fm-t-adopt") {
 		t.Fatal("the Job of an adopted running task must be kept")
@@ -1255,6 +1257,35 @@ func TestOnReportStart409RunningAdoptsEntry(t *testing.T) {
 	}
 	if got := f.metrics.terminal; len(got) != 0 {
 		t.Fatalf("terminal metric = %v, want none (顺序规则 4: 不发假终态)", got)
+	}
+}
+
+// A C13 value outside the domain gets no disposition: the entry is kept and
+// the value is reported, never guessed (ADR-026 决策结果 3).
+func TestOnReportStart409UnclassifiedStatusIsReported(t *testing.T) {
+	f := newFixture(t)
+	buf := newLogScheduler(t, f, slog.LevelInfo)
+	e := f.claim(t, "t-409u")
+	e.State = registry.StateDelivering
+	f.reg.Put(e)
+	f.server.forwardCode = 409
+	f.server.status = "paused"
+
+	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`), "")
+	if err != nil || code != 409 {
+		t.Fatalf("OnReport = %d, %v", code, err)
+	}
+	record := findLogRecord(t, buf.Bytes(), "task.status_unclassified")
+	assertErrorLevel(t, record)
+	assertTaskIdentity(t, record, "t-409u", "fm-t-409u", "fm-t-409u")
+	if got := record["status"]; got != "paused" {
+		t.Errorf("status = %v, want paused", got)
+	}
+	if got, ok := f.reg.Get("t-409u"); !ok || got.IsTerminal() {
+		t.Fatalf("entry = %+v, %v; want retained non-terminal", got, ok)
+	}
+	if !f.hasJob("fm-t-409u") {
+		t.Fatal("an unclassified status must keep the Job")
 	}
 }
 
@@ -1624,6 +1655,7 @@ func TestRebuildRestoresIndexAndRuntime(t *testing.T) {
 
 func TestConvergeRunningKeepsJob(t *testing.T) {
 	f := newFixture(t)
+	buf := newLogScheduler(t, f, slog.LevelInfo)
 	f.jobs.jobs = []batchv1.Job{jobObject("task-1")}
 	f.server.status = "running"
 
@@ -1634,11 +1666,68 @@ func TestConvergeRunningKeepsJob(t *testing.T) {
 		t.Fatal(err)
 	}
 	e, ok := f.reg.Get("task-1")
-	if !ok || e.State != registry.StateRunning {
-		t.Fatalf("entry = %+v, %v", e, ok)
+	// Adoption records the start fact and leaves the state at the rebuild's
+	// initial phase — only a report advances it (ADR-026 后果).
+	if !ok || e.State != registry.StateJobCreated || e.StartedAt.IsZero() {
+		t.Fatalf("entry = %+v, %v; want the adopted rebuild phase", e, ok)
+	}
+	if got := findLogRecord(t, buf.Bytes(), "task.adopted")["status"]; got != "running" {
+		t.Errorf("adopted status = %v, want running", got)
 	}
 	if len(f.jobs.deletedJobs) != 0 {
 		t.Fatal("running Job deleted")
+	}
+}
+
+func TestConvergeWaitingLocalDirectoryAdopts(t *testing.T) {
+	f := newFixture(t)
+	buf := newLogScheduler(t, f, slog.LevelInfo)
+	f.jobs.jobs = []batchv1.Job{jobObject("task-1")}
+	f.server.status = "waiting_local_directory"
+
+	if err := f.sched.Rebuild(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.sched.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	e, ok := f.reg.Get("task-1")
+	// Post-delivery adoption: the start fact is recorded, the state stays at
+	// the rebuild's initial phase (ADR-026 决策结果 1/3).
+	if !ok || e.State != registry.StateJobCreated || e.StartedAt.IsZero() {
+		t.Fatalf("entry = %+v, %v; want the adopted rebuild phase", e, ok)
+	}
+	if got := findLogRecord(t, buf.Bytes(), "task.adopted")["status"]; got != "waiting_local_directory" {
+		t.Errorf("adopted status = %v, want waiting_local_directory", got)
+	}
+	if len(f.jobs.deletedJobs) != 0 {
+		t.Fatal("a daemon-held Job must survive")
+	}
+}
+
+func TestConvergeUnclassifiedStatusKeepsEntryAndReports(t *testing.T) {
+	f := newFixture(t)
+	buf := newLogScheduler(t, f, slog.LevelInfo)
+	f.jobs.jobs = []batchv1.Job{jobObject("task-1")}
+	f.server.status = "paused"
+
+	if err := f.sched.Rebuild(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := f.sched.Reconcile(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	record := findLogRecord(t, buf.Bytes(), "task.status_unclassified")
+	assertErrorLevel(t, record)
+	assertTaskIdentity(t, record, "task-1", "fm-task-1", "fm-task-1")
+	if got := record["status"]; got != "paused" {
+		t.Errorf("status = %v, want paused", got)
+	}
+	if e, ok := f.reg.Get("task-1"); !ok || e.IsTerminal() {
+		t.Fatalf("entry = %+v, %v; want retained non-terminal", e, ok)
+	}
+	if len(f.jobs.deletedJobs) != 0 {
+		t.Fatal("an unclassified status must keep the Job")
 	}
 }
 
@@ -1817,8 +1906,8 @@ func TestRunRebuildsThenBlocksUntilCancel(t *testing.T) {
 	if err := <-done; err != nil {
 		t.Fatalf("Run = %v", err)
 	}
-	if e, _ := f.reg.Get("task-1"); e.State != registry.StateRunning {
-		t.Fatalf("entry = %+v", e)
+	if e, _ := f.reg.Get("task-1"); e.State != registry.StateJobCreated || e.StartedAt.IsZero() {
+		t.Fatalf("entry = %+v, want the rebuild phase with the start fact only", e)
 	}
 }
 
@@ -2262,6 +2351,16 @@ func collectLogRecords(t *testing.T, raw []byte, event string) []map[string]any 
 	return out
 }
 
+// assertErrorLevel pins the record's level: at the default Info threshold a
+// handler logging the event as Info or Warn still emits it, so only the
+// level field can tell the conservative-wait report from routine chatter.
+func assertErrorLevel(t *testing.T, record map[string]any) {
+	t.Helper()
+	if got := record["level"]; got != "ERROR" {
+		t.Errorf("level = %v, want ERROR", got)
+	}
+}
+
 // assertTaskIdentity checks the three keys every task event row must carry.
 // daemon_id is asserted by presence as well as value: an unknown identity is
 // an empty value, never a missing key.
@@ -2531,14 +2630,18 @@ func TestTaskEventsCarryIdentity(t *testing.T) {
 		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.settle_failed"), "task-1", "fm-task-1", "fm-task-1")
 	})
 
-	t.Run("adopted_running", func(t *testing.T) {
+	t.Run("adopted", func(t *testing.T) {
 		f := newFixture(t)
 		buf := newLogScheduler(t, f, slog.LevelInfo)
 		f.claim(t, "task-1")
-		if err := f.sched.AdoptRunning(context.Background(), "task-1"); err != nil {
+		if err := f.sched.AdoptRunning(context.Background(), "task-1", "running"); err != nil {
 			t.Fatalf("AdoptRunning: %v", err)
 		}
-		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.adopted_running"), "task-1", "fm-task-1", "fm-task-1")
+		record := findLogRecord(t, buf.Bytes(), "task.adopted")
+		assertTaskIdentity(t, record, "task-1", "fm-task-1", "fm-task-1")
+		if got := record["status"]; got != "running" {
+			t.Errorf("status = %v, want running", got)
+		}
 	})
 
 	t.Run("discard_failed", func(t *testing.T) {

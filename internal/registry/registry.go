@@ -462,10 +462,34 @@ func (r *Registry) NoteClaimAfterDelivery(taskID string) {
 // MarkStarted records S8 under the registry lock so a concurrent terminal
 // write always wins over a late start. started_at is set once; the state
 // advances to running from any non-terminal state (a rebuilt job_created
-// entry must accept its running daemon's reports).
+// entry must accept its running daemon's reports). This is the report path
+// only: the C13 adoption paths record the fact with MarkStartFact and leave
+// the state untouched.
 func (r *Registry) MarkStarted(taskID string, at time.Time) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	e, ok := r.startFactLocked(taskID, at)
+	if !ok {
+		return TaskEntry{}, false
+	}
+	e.State = StateRunning
+	r.live[taskID] = e
+	return e, true
+}
+
+// MarkStartFact records the start fact without advancing the state
+// (ADR-026 决策结果 1): adoption observes a post-delivery server status, it is
+// not a report, and the projection must keep showing the rebuild's initial
+// phase. started_at is written once; a terminal entry is never reopened.
+func (r *Registry) MarkStartFact(taskID string, at time.Time) (TaskEntry, bool) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.startFactLocked(taskID, at)
+}
+
+// startFactLocked applies the once-only started_at write; the caller holds
+// r.mu and decides whether the state moves.
+func (r *Registry) startFactLocked(taskID string, at time.Time) (TaskEntry, bool) {
 	e, ok := r.live[taskID]
 	if !ok || e.State == StateTerminal {
 		return TaskEntry{}, false
@@ -473,7 +497,6 @@ func (r *Registry) MarkStarted(taskID string, at time.Time) (TaskEntry, bool) {
 	if e.StartedAt.IsZero() {
 		e.StartedAt = at
 	}
-	e.State = StateRunning
 	r.live[taskID] = e
 	return e, true
 }

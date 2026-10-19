@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -57,6 +58,7 @@ func (f *fakeStatus) TaskStatus(context.Context, string) (string, error) {
 
 type failCall struct{ jobName, reason string }
 type settleCall struct{ taskID, result string }
+type adoptCall struct{ taskID, status string }
 type reclaimCall struct {
 	jobName string
 	reason  string
@@ -72,7 +74,7 @@ type fakeSettler struct {
 	onJobGone []string
 	failJobs  []failCall
 	settles   []settleCall
-	adopts    []string
+	adopts    []adoptCall
 	discards  []string
 	vanished  []string
 	sweeps    int
@@ -119,10 +121,10 @@ func (f *fakeSettler) SettleTerminal(_ context.Context, taskID, result string) e
 	return f.err
 }
 
-func (f *fakeSettler) AdoptRunning(_ context.Context, taskID string) error {
+func (f *fakeSettler) AdoptRunning(_ context.Context, taskID, status string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.adopts = append(f.adopts, taskID)
+	f.adopts = append(f.adopts, adoptCall{taskID, status})
 	return f.err
 }
 
@@ -296,6 +298,22 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
+// logRecord returns the first JSON record whose msg equals event.
+func logRecord(t *testing.T, raw []byte, event string) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(string(raw)), "\n") {
+		var record map[string]any
+		if json.Unmarshal([]byte(line), &record) != nil {
+			continue
+		}
+		if record["msg"] == event {
+			return record
+		}
+	}
+	t.Fatalf("no %s record in logs:\n%s", event, raw)
+	return nil
+}
+
 // ---- §4.3: restart rebuild ----------------------------------------------
 
 func TestReconcileTerminalEntryRetriesCleanup(t *testing.T) {
@@ -465,8 +483,79 @@ func TestReconcileRunningTaskIsAdopted(t *testing.T) {
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if len(set.adopts) != 1 || set.adopts[0] != "t1" {
-		t.Fatalf("adopts = %v, want [t1]", set.adopts)
+	if len(set.adopts) != 1 || set.adopts[0] != (adoptCall{"t1", "running"}) {
+		t.Fatalf("adopts = %v, want [t1/running]", set.adopts)
+	}
+}
+
+// A rebuilt entry has lost its payload with the restart, so a daemon-held
+// status is the post-delivery evidence the adoption face needs (§4.3,
+// ADR-026 决策结果 1/3).
+func TestReconcileRebuiltWaitingEntryIsAdopted(t *testing.T) {
+	e := testEntry("t1")
+	e.Payload = nil // rebuilt: the payload never left process memory
+	e.State = registry.StateJobCreated
+	reg := newRegistry(t, e)
+	set := &fakeSettler{}
+
+	r := newTestReconciler(t, reg, &fakeObjects{job: runningJob("fm-t1")}, &fakeStatus{status: "waiting_local_directory"}, set)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if len(set.adopts) != 1 || set.adopts[0] != (adoptCall{"t1", "waiting_local_directory"}) {
+		t.Fatalf("adopts = %v, want [t1/waiting_local_directory]", set.adopts)
+	}
+}
+
+// An in-flight entry still holds its payload: waiting_local_directory is the
+// normal pre-start face of its own delivery, not adoption evidence.
+func TestReconcileLiveWaitingEntryIsLeftAlone(t *testing.T) {
+	reg := newRegistry(t, testEntry("t1")) // still holds its payload
+	set := &fakeSettler{}
+
+	r := newTestReconciler(t, reg, &fakeObjects{job: runningJob("fm-t1")}, &fakeStatus{status: "waiting_local_directory"}, set)
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, _, _, adopts, _ := set.calls(); adopts != 0 {
+		t.Fatalf("adopts = %d, want 0 (an in-flight entry keeps waiting)", adopts)
+	}
+}
+
+// A value outside the C13 domain is kept and reported: the disposition table
+// has no branch for it and widening the domain is a design change
+// (ADR-026 决策结果 3).
+func TestReconcileUnclassifiedStatusIsReportedAndKept(t *testing.T) {
+	reg := newRegistry(t, testEntry("t1"))
+	set := &fakeSettler{}
+	var logs bytes.Buffer
+	r := newTestReconciler(t, reg, &fakeObjects{job: runningJob("fm-t1")}, &fakeStatus{status: "paused"}, set,
+		WithLogger(slog.New(slog.NewJSONHandler(&logs, nil))))
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if _, ok := reg.Get("t1"); !ok {
+		t.Fatal("an unclassified status must keep the entry")
+	}
+	if _, fails, settles, adopts, discards := set.calls(); fails+settles+adopts+discards != 0 {
+		t.Fatalf("calls = fails %d, settles %d, adopts %d, discards %d; want no disposition", fails, settles, adopts, discards)
+	}
+	record := logRecord(t, logs.Bytes(), "task.status_unclassified")
+	if got := record["level"]; got != "ERROR" {
+		t.Errorf("level = %v, want ERROR (an Info/Warn downgrade must fail the test)", got)
+	}
+	if got := record["task_id"]; got != "t1" {
+		t.Errorf("task_id = %v, want t1", got)
+	}
+	if got := record["job_name"]; got != "fm-t1" {
+		t.Errorf("job_name = %v, want fm-t1", got)
+	}
+	if got := record["daemon_id"]; got != "fm-t1" {
+		t.Errorf("daemon_id = %v, want fm-t1", got)
+	}
+	if got := record["status"]; got != "paused" {
+		t.Errorf("status = %v, want paused", got)
 	}
 }
 
@@ -819,8 +908,8 @@ func TestReconcileContinuesAfterOneEntryFails(t *testing.T) {
 	if err := r.Reconcile(context.Background()); err == nil {
 		t.Fatal("Reconcile: want the first error surfaced")
 	}
-	if len(set.adopts) != 1 || set.adopts[0] != "t2" {
-		t.Fatalf("adopts = %v, want [t2] — one broken entry must not stop the round", set.adopts)
+	if len(set.adopts) != 1 || set.adopts[0] != (adoptCall{"t2", "running"}) {
+		t.Fatalf("adopts = %v, want [t2/running] — one broken entry must not stop the round", set.adopts)
 	}
 }
 
