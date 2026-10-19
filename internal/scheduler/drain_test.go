@@ -338,6 +338,28 @@ func TestSweepOrphanSecretsCriterion(t *testing.T) {
 	}
 }
 
+// A Secret whose name and task-id label disagree is not a design product:
+// the creation path writes both from one task id. Deleting by label would hit
+// a same-named in-flight credential, so both positive criteria hold and the
+// Secret still survives (TC-tech-auth-06 负向).
+func TestSweepOrphanSecretsSkipsNameLabelMismatch(t *testing.T) {
+	f := newFixture(t)
+
+	// Paired with a genuine orphan in the same round: its deletion proves the
+	// sweep ran, so the survivor is attributable to the mismatch alone.
+	f.jobs.secrets = []corev1.Secret{
+		secretObject("fm-task-orphan-cred", "task-orphan"),
+		secretObject("fm-task-other-cred", "task-orphan"),
+	}
+
+	if err := f.sched.SweepOrphanSecrets(context.Background()); err != nil {
+		t.Fatalf("SweepOrphanSecrets: %v", err)
+	}
+	if len(f.jobs.deletedSecrets) != 1 || f.jobs.deletedSecrets[0] != "fm-task-orphan-cred" {
+		t.Fatalf("deleted secrets = %v, want only the name-label-consistent orphan", f.jobs.deletedSecrets)
+	}
+}
+
 // A ListJobs that fails is not a NotFound: the criterion demands an explicit
 // absence, so the Secret survives the round.
 func TestSweepOrphanSecretsKeepsSecretOnAPIError(t *testing.T) {
