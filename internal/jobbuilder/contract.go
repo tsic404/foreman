@@ -92,16 +92,13 @@ func (b *Builder) identityAnnotations(daemonID string, e TaskEntry) map[string]s
 // pod-template label Foreman writes with the identity name — not the Job
 // controller's job-name label, which now carries the template's display name
 // (ADR-034 decision 8 / §8.2 A1.1).
-func injectedEnv() []corev1.EnvVar {
+func injectedEnv(serverURL string) []corev1.EnvVar {
 	return []corev1.EnvVar{
-		{Name: "MULTICA_SERVER_URL", Value: foremanServerURL},
+		{Name: "MULTICA_SERVER_URL", Value: serverURL},
 		{Name: "MULTICA_DAEMON_ID", ValueFrom: envFieldRef("metadata.labels['" + labelDaemonID + "']")},
 		{Name: "MULTICA_DAEMON_MAX_CONCURRENT_TASKS", Value: "1"},
 	}
 }
-
-// foremanServerURL is the one server a Job daemon may dial (F5 收窄, A1.1).
-const foremanServerURL = "http://foreman.foreman.svc.cluster.local:8080"
 
 // envFieldRef is the fieldRef form A1.1 uses for the daemon identity keys.
 func envFieldRef(fieldPath string) *corev1.EnvVarSource {
@@ -123,7 +120,7 @@ func (b *Builder) credentialSecret(daemonID, taskID, token string) *corev1.Secre
 	configJSON := `{"token":` + strconv.Quote(token) + `}`
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      daemonID + secretCredSuffix,
+			Name:      CredentialSecretName(daemonID),
 			Namespace: b.cfg.JobNamespace,
 			Labels: map[string]string{
 				labelManagedBy: managedByForeman,

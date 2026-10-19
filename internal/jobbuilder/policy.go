@@ -290,6 +290,13 @@ func LoadPolicy(cfg Config) (Policy, error) {
 // and refusing it would crash-loop a deployment that shipped the skeleton
 // unedited.
 func parsePolicyFile(path string, data []byte) (filePolicy, error) {
+	documents, err := countYAMLDocuments(data)
+	if err != nil {
+		return filePolicy{}, fmt.Errorf("job policy %s is not parseable as YAML: %w", path, err)
+	}
+	if documents > 1 {
+		return filePolicy{}, fmt.Errorf("job policy %s must hold one YAML document, got %d", path, documents)
+	}
 	jsonBytes, err := utilyaml.ToJSON(data)
 	if err != nil {
 		return filePolicy{}, fmt.Errorf("job policy %s is not parseable as YAML: %w", path, err)

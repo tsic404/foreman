@@ -137,3 +137,24 @@ func TestLoadConfigRejectsBadValues(t *testing.T) {
 		})
 	}
 }
+
+// TestLoadConfigServerURL pins §8.2 A1.1's value source: the address written
+// into every Job daemon's MULTICA_SERVER_URL is deployment configuration, with
+// the reference deployment's value as the default.
+func TestLoadConfigServerURL(t *testing.T) {
+	cfg, err := LoadConfig(envFrom(map[string]string{}))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.ServerURL != DefaultJobServerURL {
+		t.Errorf("ServerURL = %q, want %q", cfg.ServerURL, DefaultJobServerURL)
+	}
+
+	cfg, err = LoadConfig(envFrom(map[string]string{EnvJobServerURL: "http://foreman.other.svc:9000"}))
+	if err != nil {
+		t.Fatalf("LoadConfig override: %v", err)
+	}
+	if cfg.ServerURL != "http://foreman.other.svc:9000" {
+		t.Errorf("ServerURL = %q, want the configured address", cfg.ServerURL)
+	}
+}

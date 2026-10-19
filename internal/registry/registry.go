@@ -594,6 +594,35 @@ func (r *Registry) TouchHeartbeat(jobRuntimeID string, at time.Time) {
 	r.runtimes[jobRuntimeID] = rt
 }
 
+// SetRuntimeDeliveredTask records the task the runtime's last delivery handed
+// over, without touching the heartbeat fields. A read-modify-write from a
+// snapshot would write back a stale LastHeartbeatAt/Online and lose a
+// concurrent heartbeat; every field write on a runtime row goes through a
+// lock-scoped setter like this one.
+func (r *Registry) SetRuntimeDeliveredTask(jobRuntimeID, taskID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rt, ok := r.runtimes[jobRuntimeID]
+	if !ok {
+		return
+	}
+	rt.DeliveredTaskID = taskID
+	r.runtimes[jobRuntimeID] = rt
+}
+
+// SetRuntimeOffline marks the runtime row offline (S19), preserving every
+// other field under the same lock.
+func (r *Registry) SetRuntimeOffline(jobRuntimeID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	rt, ok := r.runtimes[jobRuntimeID]
+	if !ok {
+		return
+	}
+	rt.Online = false
+	r.runtimes[jobRuntimeID] = rt
+}
+
 // DeleteRuntime removes a job runtime and its daemon reverse index.
 func (r *Registry) DeleteRuntime(jobRuntimeID string) {
 	r.mu.Lock()

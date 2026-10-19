@@ -8,6 +8,8 @@ import (
 	"net/http"
 	"sync"
 	"time"
+
+	"github.com/tsic404/foreman/internal/scheduler"
 )
 
 // heartbeatInterval is the C2 cadence (§1.2: every 15s per real runtime).
@@ -125,6 +127,12 @@ func (l *ClaimLoop) iterate(ctx context.Context) error {
 	}
 	for _, task := range tasks {
 		if err := l.sched.OnClaim(ctx, task); err != nil {
+			if errors.Is(err, scheduler.ErrUnnameableClaim) {
+				// The scheduler counted it and logged at a bounded rate; the
+				// server's lease expiry is the convergence. A per-attempt line
+				// here would defeat that bound at the redispatch cadence.
+				continue
+			}
 			l.log.Error("on-claim failed", "err", err)
 		}
 	}
@@ -175,7 +183,8 @@ func NewHeartbeatLoop(client *Client, reporter *ModelCatalogReporter) *Heartbeat
 // ends or a 403 marks the credential misbound. A runtime whose id moved is
 // restarted on its own; the other streams keep running (§1.4).
 func (l *HeartbeatLoop) Run(ctx context.Context) error {
-	changes := l.client.Changes()
+	changes, unsubscribe := l.client.SubscribeChanges()
+	defer unsubscribe()
 	streams := map[string]heartbeatStream{}
 	stopAll := func() {
 		for provider, stream := range streams {
@@ -274,16 +283,24 @@ func (l *HeartbeatLoop) stream(ctx context.Context, runtimeID string) error {
 			}
 		} else {
 			backoff.reset()
+			// §1.3 回显不取数: the ack's runtime identity is advisory. Missing,
+			// empty and pointing at another runtime are the same defect — one
+			// warning per heartbeat stream, and the stream's own runtime keeps
+			// the slot and the C21 path.
+			if ack.RuntimeID != runtimeID && !ackMismatchWarned {
+				ackMismatchWarned = true
+				requestID := ""
+				if ack.PendingModelList != nil {
+					requestID = ack.PendingModelList.ID
+				}
+				l.log.Warn("model.catalog_ack_mismatch", "request_id", requestID,
+					"runtime_id", runtimeID, "ack_runtime_id", ack.RuntimeID)
+			}
 			if ack.PendingModelList != nil && l.reporter != nil {
 				// The command belongs to the runtime this stream heartbeats —
 				// the slot key and the C21 {rid} both come from here. Keying by
 				// the ack body would send the command to another runtime's slot
 				// (or, when the body carries nothing, to none at all).
-				if ack.RuntimeID != "" && ack.RuntimeID != runtimeID && !ackMismatchWarned {
-					ackMismatchWarned = true
-					l.log.Warn("model.catalog_ack_mismatch", "request_id", ack.PendingModelList.ID,
-						"runtime_id", runtimeID, "ack_runtime_id", ack.RuntimeID)
-				}
 				l.reporter.OnAck(ctx, runtimeID, ack.PendingModelList.ID)
 			}
 		}

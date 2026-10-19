@@ -14,6 +14,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
+	"github.com/tsic404/foreman/internal/registry"
 )
 
 // newTestRigWS builds a rig with the S30 WS endpoint enabled.
@@ -202,6 +204,38 @@ func TestWSHandlerTaskAvailablePush(t *testing.T) {
 	defer cancel()
 	if _, _, err := conn.Read(ctx); err == nil {
 		t.Error("connection must close on terminal/teardown")
+	}
+}
+
+func TestRegisterDoesNotWakeASettledTask(t *testing.T) {
+	rig, _ := newTestRigWS(t)
+	rig.claimTask(t, "t-settled")
+	tok := rig.token(t, "t-settled")
+	jobRID := rig.registerDaemon(t, "t-settled", tok)
+
+	conn, _, err := wsDial(t, rig.server.URL, tok, []string{jobRID})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.Close(websocket.StatusNormalClosure, "done")
+	_ = readFrame(t, conn) // catch-up push
+
+	if _, err := rig.reg.MarkTerminal("t-settled", registry.ResultCompleted, "", time.Time{}); err != nil {
+		t.Fatalf("MarkTerminal: %v", err)
+	}
+	code, body := rig.call(t, "POST", "/api/daemon/register", tok, []byte(`{
+		"daemon_id": "fm-t-settled",
+		"runtimes": [{"name": "foreman-job", "type": "omp"}]
+	}`))
+	if code != 200 {
+		t.Fatalf("re-register = %d: %s", code, body)
+	}
+	// The entry is terminal: waking the daemon would only produce an empty
+	// claim batch.
+	ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+	defer cancel()
+	if _, _, err := conn.Read(ctx); err == nil {
+		t.Fatal("a settled entry must not emit task_available")
 	}
 }
 
@@ -929,7 +963,8 @@ func TestCancelledStreamDoesNotSpendTheRuntimeProgression(t *testing.T) {
 	client := NewClient(testConfig(srv.URL), "mdt_test")
 	ref := RuntimeRef{ID: "rid-real", Provider: "omp", Name: "foreman-omp"}
 	client.refs = []RuntimeRef{ref}
-	sub := NewWSSubscriber(client, func() {}, nil)
+	metrics := &fakeMetrics{}
+	sub := NewWSSubscriber(client, func() {}, metrics)
 	sub.dialTimeout = 50 * time.Millisecond
 	sub.waitSteps = []time.Duration{7 * time.Millisecond, 9 * time.Millisecond}
 	state := &runtimeStreamState{backoff: sub.newReconnectBackoff()}
@@ -950,6 +985,9 @@ func TestCancelledStreamDoesNotSpendTheRuntimeProgression(t *testing.T) {
 	}
 	if wait := state.nextBackoff(); wait != 7*time.Millisecond {
 		t.Fatalf("the next reconnect wait = %s, want the progression's first step: the cancelled stream must not spend it", wait)
+	}
+	if got := len(metrics.wsReconnect); got != 0 {
+		t.Fatalf("WSReconnect counted %d shutdown, want none", got)
 	}
 }
 

@@ -29,7 +29,7 @@ const (
 // profile literal (jobProfile) it renames to the probe profile. The task
 // Secret's own name derives from the identity name, never from the display
 // name (ADR-034 decision 8).
-var taskCredSecretLiteral = daemonIDFor(placeholderTaskID) + secretCredSuffix
+var taskCredSecretLiteral = CredentialSecretName(DaemonIDFor(placeholderTaskID))
 
 // ErrInvalidRequestID marks a request id that cannot name a probe Job: no
 // object is created, and the caller reports the relay as failed.
@@ -44,7 +44,7 @@ var ErrInvalidRequestID = errors.New("invalid request id")
 // (§8.4) — and the token always outlives the Job by the drain bound
 // (ADR-017).
 func (b *Builder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
-	name := probeJobName(requestID)
+	name := ProbeJobName(requestID)
 	if len(name) > 63 || !dns1123Label.MatchString(name) {
 		return nil, nil, "", fmt.Errorf("%w: %q does not yield a valid probe Job name %q", ErrInvalidRequestID, requestID, name)
 	}
@@ -62,10 +62,12 @@ func (b *Builder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string,
 	return job, b.probeCredentialSecret(name, token), b.cfg.Issuer.Hash(token), nil
 }
 
-// probeJobName is the probe naming convention: the Job, its credential Secret
+// ProbeJobName is the probe naming convention: the Job, its credential Secret
 // (plus the -cred suffix) and the daemon's own identity all carry the request
-// id, so a probe is recognizable and sweepable by label and by name.
-func probeJobName(requestID string) string {
+// id, so a probe is recognizable and sweepable by label and by name. Exported
+// as the one source: the scheduler creates the probe with the same name the
+// builder renders into it.
+func ProbeJobName(requestID string) string {
 	return probeJobPrefix + requestID
 }
 
@@ -91,7 +93,7 @@ func (b *Builder) renderProbe(name, jobRuntimeID string, budget time.Duration) (
 		jobRuntimeID: jobRuntimeID,
 		jobName:      name,
 		daemonID:     name,
-		credSecret:   name + secretCredSuffix,
+		credSecret:   CredentialSecretName(name),
 	})
 	if err != nil {
 		return nil, err
@@ -120,7 +122,7 @@ func writeProbeDeadline(job *batchv1.Job, budget time.Duration) {
 // that domain: a probe maps no task, so it carries none of the task
 // annotations (§4.3).
 func (b *Builder) applyProbeWrites(job *batchv1.Job, name string) {
-	injectContainerEnv(job)
+	injectContainerEnv(job, b.cfg.serverURL())
 
 	job.Name = name
 	job.Namespace = b.cfg.JobNamespace
@@ -173,7 +175,7 @@ func (b *Builder) probeCredentialSecret(name, token string) *corev1.Secret {
 	configJSON := `{"token":` + strconv.Quote(token) + `}`
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      name + secretCredSuffix,
+			Name:      CredentialSecretName(name),
 			Namespace: b.cfg.JobNamespace,
 			Labels:    probeLabels(name),
 		},

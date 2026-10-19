@@ -149,8 +149,8 @@ spec:
 		if err != nil {
 			t.Fatalf("ResolveName: %v", err)
 		}
-		if name != daemonIDFor(entry.TaskID) {
-			t.Errorf("name = %q, want the fallback %q", name, daemonIDFor(entry.TaskID))
+		if name != DaemonIDFor(entry.TaskID) {
+			t.Errorf("name = %q, want the fallback %q", name, DaemonIDFor(entry.TaskID))
 		}
 		if got := builder.nameSource(); got != "fallback" {
 			t.Errorf("name source = %q, want fallback", got)

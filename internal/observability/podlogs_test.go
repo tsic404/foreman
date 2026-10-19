@@ -93,3 +93,21 @@ func TestK8sPodLogReaderStreamError(t *testing.T) {
 		t.Fatalf("err = %v, want wrapped stream error, not unavailable", err)
 	}
 }
+
+// TestK8sPodLogReaderBoundsBytes pins the response bound: tailLines is a line
+// count, so a single huge line must not be read whole.
+func TestK8sPodLogReaderBoundsBytes(t *testing.T) {
+	pod := podWithJobLabel("fm-t-big", "fm-t-big", time.Now())
+	client := fake.NewSimpleClientset(pod)
+	client.Fake.PrependReactor("get", "pods/log",
+		func(cgtesting.Action) (bool, runtime.Object, error) {
+			return true, &runtime.Unknown{Raw: make([]byte, maxLogBytes+4096)}, nil
+		})
+	data, err := NewK8sPodLogReader(client).ReadLogs(context.Background(), "multica-agents", "fm-t-big", 10)
+	if err != nil {
+		t.Fatalf("ReadLogs: %v", err)
+	}
+	if len(data) != maxLogBytes {
+		t.Fatalf("logs = %d bytes, want the %d-byte bound", len(data), maxLogBytes)
+	}
+}

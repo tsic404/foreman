@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"testing"
 
@@ -316,8 +317,30 @@ func TestOnReportTerminalPermanent4xxNotRetried(t *testing.T) {
 	if p.Queued("t-perm") {
 		t.Errorf("4xx is permanent: the write-ahead entry must be dropped, got %+v", p.reports)
 	}
-	if !f.hasJob("fm-t-perm") {
-		t.Error("Job must stay for inspection on a permanent failure")
+	// The verdict is written, so the Job is torn down like every other
+	// terminal path — the same conclusion 2xx/404/409 reach.
+	if f.hasJob("fm-t-perm") {
+		t.Error("Job must be deleted on a permanent failure")
+	}
+}
+
+func TestOnReportTerminal409IsMootSuccess(t *testing.T) {
+	f := newFixture(t)
+	p := f.withPendingReports()
+	e := f.claim(t, "t-409")
+	f.server.forwardCode = 409
+
+	code, _, err := f.sched.OnReport(context.Background(), EPFail, e, []byte(`{"error":"x"}`), "")
+	if err != nil || code != 200 {
+		t.Fatalf("OnReport = %d, %v (terminal 409 must map to 200)", code, err)
+	}
+	// The write-ahead entry is queued before the forward and dropped when the
+	// server answers with a verdict that is already written.
+	if p.Queued("t-409") {
+		t.Errorf("409 terminal is moot: the write-ahead entry must be dropped, got %+v", p.reports)
+	}
+	if f.hasJob("fm-t-409") {
+		t.Error("Job must be cleaned up on a terminal 409")
 	}
 }
 
@@ -374,5 +397,150 @@ func TestOnReportNonTerminalTransientMaps502(t *testing.T) {
 	}
 	if code != 502 || !strings.Contains(string(resp), "upstream unavailable") {
 		t.Fatalf("OnReport = %d %s, want 502 upstream unavailable", code, resp)
+	}
+}
+
+// TestReportFailDropsPermanent4xxAndKeepsTransient pins the compensation
+// forward's queue face under the write-ahead design: a permanent 4xx must drop
+// the already-queued report instead of leaving it for a replay that can only be
+// refused again; a transient failure leaves it for the drain.
+func TestReportFailDropsPermanent4xxAndKeepsTransient(t *testing.T) {
+	cases := []struct {
+		name       string
+		code       int
+		wantErr    bool
+		wantQueued bool
+	}{
+		{"400 permanent", 400, true, false},
+		{"403 permanent", 403, true, false},
+		{"409 already settled", 409, false, false},
+		{"408 retryable", 408, true, true},
+		{"429 retryable", 429, true, true},
+		{"503 transient", 503, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			p := f.withPendingReports()
+			e := f.claim(t, "t-rf")
+			// The verdict path queued the report ahead of the forward; this
+			// test models that state directly.
+			if err := p.Enqueue(e.TaskID, e.JobName, e.DaemonID, EPFail, []byte(`{}`)); err != nil {
+				t.Fatalf("Enqueue: %v", err)
+			}
+			f.server.forwardCode = tc.code
+
+			err := f.sched.reportFail(t.Context(), e, []byte(`{}`))
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("reportFail(%d) err = %v, wantErr %v", tc.code, err, tc.wantErr)
+			}
+			if got := p.Queued(e.TaskID); got != tc.wantQueued {
+				t.Errorf("Queued after %d = %v, want %v (queue %+v)", tc.code, got, tc.wantQueued, p.reports)
+			}
+		})
+	}
+}
+
+// TestDeliverQueuedSettlesPermanent4xx pins the queue replay's §1.5 face: a
+// permanent 4xx leaves the queue (no drain replay to the TTL) and deletes the
+// Job, while 408/429 stay queued for the retry budget.
+func TestDeliverQueuedSettlesPermanent4xx(t *testing.T) {
+	cases := []struct {
+		name       string
+		code       int
+		wantQueued bool
+	}{
+		{"400 permanent", 400, false},
+		{"403 permanent", 403, false},
+		{"408 retryable", 408, true},
+		{"429 retryable", 429, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			p := f.withDurableReports(t)
+			e := f.claim(t, "t-dq")
+			if err := p.Enqueue(e.TaskID, e.JobName, e.DaemonID, EPFail, []byte(`{}`)); err != nil {
+				t.Fatalf("Enqueue: %v", err)
+			}
+			f.server.forwardCode = tc.code
+
+			code, _, err := f.sched.DeliverQueued(t.Context(), EPFail, e.TaskID, []byte(`{}`))
+			if err != nil || code != tc.code {
+				t.Fatalf("DeliverQueued = %d, %v; want the upstream code %d", code, err, tc.code)
+			}
+			if got := p.Queued(e.TaskID); got != tc.wantQueued {
+				t.Fatalf("Queued after %d = %v, want %v", tc.code, got, tc.wantQueued)
+			}
+			if !tc.wantQueued && f.hasJob(e.JobName) {
+				t.Error("a permanent rejection must delete the Job")
+			}
+			if tc.wantQueued && !f.hasJob(e.JobName) {
+				t.Error("a retryable failure must keep the Job")
+			}
+		})
+	}
+}
+
+// TestDeliverQueuedWithoutEntrySettlesPermanent4xx pins the replay face once
+// the credential is reclaimed: the entry is gone, so no Job can be deleted,
+// but a permanent 4xx must still leave the queue instead of being replayed to
+// the TTL. 404/409 are the delivered faces, not rejections: they leave through
+// the drain's delivered branch and log no permanent drop.
+func TestDeliverQueuedWithoutEntrySettlesPermanent4xx(t *testing.T) {
+	cases := []struct {
+		name        string
+		code        int
+		wantQueued  bool
+		wantDropped bool
+		wantDrained bool
+	}{
+		{"400 permanent", 400, false, true, false},
+		{"403 permanent", 403, false, true, false},
+		{"408 retryable", 408, true, false, false},
+		{"429 retryable", 429, true, false, false},
+		{"404 delivered", 404, true, false, true},
+		{"409 delivered", 409, true, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			p := f.withDurableReports(t)
+			e := f.claim(t, "t-dq-gone")
+			if err := p.Enqueue(e.TaskID, e.JobName, e.DaemonID, EPFail, []byte(`{}`)); err != nil {
+				t.Fatalf("Enqueue: %v", err)
+			}
+			// The credential was reclaimed before the replay landed: the
+			// entry is gone and there is no Job handle left to delete.
+			if err := f.reg.Delete(e.TaskID); err != nil {
+				t.Fatalf("reg.Delete: %v", err)
+			}
+			logs := &strings.Builder{}
+			f.sched.log = slog.New(slog.NewJSONHandler(logs, nil))
+			f.server.forwardCode = tc.code
+
+			code, _, err := f.sched.DeliverQueued(t.Context(), EPFail, e.TaskID, []byte(`{}`))
+			if err != nil || code != tc.code {
+				t.Fatalf("DeliverQueued = %d, %v; want the upstream code %d", code, err, tc.code)
+			}
+			if got := strings.Contains(logs.String(), `"reason":"permanent_4xx"`); got != tc.wantDropped {
+				t.Errorf("permanent_4xx drop log = %v, want %v; logs:\n%s", got, tc.wantDropped, logs)
+			}
+			if got := p.Queued(e.TaskID); got != tc.wantQueued {
+				t.Fatalf("Queued after %d = %v, want %v", tc.code, got, tc.wantQueued)
+			}
+			if len(f.jobs.deletedJobs) != 0 {
+				t.Errorf("entry-gone replay deleted Jobs: %v", f.jobs.deletedJobs)
+			}
+			if !tc.wantDrained {
+				return
+			}
+			// 404/409 still leave the queue: the drain's delivered branch
+			// drops the snapshot after the replay lands.
+			remaining, err := p.Drain(t.Context(), f.sched)
+			if err != nil || remaining != 0 {
+				t.Fatalf("Drain = %d, %v; want the delivered report dropped", remaining, err)
+			}
+		})
 	}
 }

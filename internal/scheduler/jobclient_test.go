@@ -9,7 +9,6 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
-	"k8s.io/apimachinery/pkg/watch"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -157,64 +156,5 @@ func TestJobClientListSecretsAndPods(t *testing.T) {
 	}
 	if len(pods) != 1 || pods[0].Name != "fm-a-pod" {
 		t.Fatalf("ListPods = %+v, want only fm-a's pod", pods)
-	}
-}
-
-func TestWatchJobsDeliversInformerEvents(t *testing.T) {
-	clientset := fake.NewSimpleClientset()
-	c := NewJobClient(clientset, "multica-agents")
-
-	// The fake clientset gives no sync marker (the reflector's watch-list
-	// bookmark never arrives), so gate on the watch actually being
-	// established before mutating objects.
-	watchStarted := make(chan struct{})
-	clientset.PrependWatchReactor("jobs", func(k8stesting.Action) (bool, watch.Interface, error) {
-		select {
-		case <-watchStarted:
-		default:
-			close(watchStarted)
-		}
-		return false, nil, nil
-	})
-
-	events := make(chan JobEvent, 4)
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	watchDone := make(chan error, 1)
-	go func() { watchDone <- c.WatchJobs(ctx, func(e JobEvent) { events <- e }) }()
-
-	select {
-	case <-watchStarted:
-	case <-time.After(10 * time.Second):
-		t.Fatal("informer never started watching")
-	}
-
-	if _, err := c.CreateJob(ctx, managedJob("fm-watch")); err != nil {
-		t.Fatalf("CreateJob: %v", err)
-	}
-	select {
-	case e := <-events:
-		if e.Kind != JobAdded || e.Job.Name != "fm-watch" {
-			t.Fatalf("event = %+v", e)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("no add event")
-	}
-
-	if err := c.DeleteJob(ctx, "fm-watch"); err != nil {
-		t.Fatalf("DeleteJob: %v", err)
-	}
-	select {
-	case e := <-events:
-		if e.Kind != JobDeleted || e.Job.Name != "fm-watch" {
-			t.Fatalf("event = %+v", e)
-		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("no delete event")
-	}
-
-	cancel()
-	if err := <-watchDone; err != nil {
-		t.Fatalf("WatchJobs = %v", err)
 	}
 }

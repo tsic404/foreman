@@ -589,3 +589,31 @@ func mustQuantityRaw(value string) resource.Quantity {
 	}
 	return quantity
 }
+
+// TestPolicyRefusesMultipleDocuments pins §8.5's "不可解析": the YAML reader
+// keeps only the first document, so a second one must refuse startup rather
+// than be dropped silently. Both documents are valid policies on their own:
+// were the first invalid, strict decoding would refuse it with or without the
+// document-count guard and the case would prove nothing.
+func TestPolicyRefusesMultipleDocuments(t *testing.T) {
+	cfg, _ := policyConfig(t, `
+agents:
+  alice:
+    resourcePolicy: agent
+---
+projects:
+  proj:
+    nodeSelector:
+      kubernetes.io/os: linux
+`)
+	policy, err := LoadPolicy(cfg)
+	if err == nil {
+		t.Fatalf("a two-document policy must refuse startup, got %+v", policy)
+	}
+	if !errors.Is(err, ErrInvalidPolicy) {
+		t.Errorf("error = %v, want ErrInvalidPolicy", err)
+	}
+	if !strings.Contains(err.Error(), "must hold one YAML document, got 2") {
+		t.Errorf("error = %v, want the multi-document refusal", err)
+	}
+}

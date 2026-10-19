@@ -223,8 +223,9 @@ Foreman writes exactly four things into that template:
    `MULTICA_DAEMON_MAX_CONCURRENT_TASKS` on `containers[0]` — the first entry in
    writing order, not a container matched by name; a same-name entry is
    replaced whole, so those three keys are Foreman's whatever the template
-   says. `MULTICA_DAEMON_ID` reads the pod-template label
-   `foreman.tsic.top/daemon-id`;
+   says. `MULTICA_SERVER_URL` is `FOREMAN_JOB_SERVER_URL` (the Job-side entry
+   point below, defaulting to the reference Service). `MULTICA_DAEMON_ID` reads
+   the pod-template label `foreman.tsic.top/daemon-id`;
 2. the name and the per-task metadata: `metadata.name` is the template's name
    **format** rendered per task (empty ⇒ `fm-<task_id>`), `metadata.namespace`
    is `FOREMAN_JOB_NAMESPACE`, and the A1.2 label/annotation set is written
@@ -248,7 +249,7 @@ added or normalized.
 |---|---|
 | `<task_id>` / `<agent_id>` / `<workspace_id>` | the task's ids |
 | `<issue_id>` / `<issue-identifier>` / `<autopilot_run_id>` / `<chat_session_id>` | the task's trigger context |
-| `<job runtime uuid>` / `<RFC3339>` | the Job runtime id / the claim time |
+| `<job runtime uuid>` / `<RFC3339>` / `<attempt>` | the Job runtime id / the claim time / the task's attempt number |
 | `<job-image>` | `FOREMAN_JOB_IMAGE` |
 | `<job-name>` / `<daemon-id>` | the final display name / the identity name `fm-<task_id>` |
 | `<agent-name>` | the payload's raw `agent.name` (any characters; only the name face normalizes it) |

@@ -659,11 +659,6 @@ func (c *fakeJobClient) ListJobs(context.Context) ([]batchv1.Job, error) {
 	return out, nil
 }
 
-func (c *fakeJobClient) WatchJobs(ctx context.Context, _ scheduler.JobEventHandler) error {
-	<-ctx.Done()
-	return nil
-}
-
 func (c *fakeJobClient) has(name string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()

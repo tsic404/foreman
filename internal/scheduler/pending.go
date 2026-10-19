@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -86,6 +87,11 @@ type PendingReports struct {
 	// durable depth. A crash inside the window loses the report — the disk
 	// cannot take it either way.
 	staged map[string]pendingReport
+
+	// quarantineTried remembers malformed file names whose isolation was
+	// already attempted: a rename that keeps failing (permissions, a taken
+	// .bad name) is not retried and re-logged every Drain.
+	quarantineTried map[string]bool
 }
 
 // PendingReportsOption customizes a PendingReports queue.
@@ -115,10 +121,11 @@ func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReport
 		return nil, fmt.Errorf("create pending-reports dir: %w", err)
 	}
 	p := &PendingReports{
-		dir:    dir,
-		now:    time.Now,
-		log:    slog.Default().With("component", "pending-reports"),
-		staged: make(map[string]pendingReport),
+		dir:             dir,
+		now:             time.Now,
+		log:             slog.Default().With("component", "pending-reports"),
+		staged:          make(map[string]pendingReport),
+		quarantineTried: make(map[string]bool),
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -218,18 +225,22 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 				"endpoint", rep.Endpoint,
 				"attempts", rep.Attempts, "reason", "pending report TTL exceeded")
 			p.mu.Lock()
-			p.dropLocked(rep.TaskID)
+			p.dropIfUnchangedLocked(rep)
 			p.mu.Unlock()
 			continue
 		}
 		code, _, err := sender.DeliverQueued(ctx, Endpoint(rep.Endpoint), rep.TaskID, rep.Body)
-		delivered := err == nil && ((code >= 200 && code < 300) || code == 404 || code == 409)
+		delivered := err == nil && terminalReportDelivered(code)
 		p.mu.Lock()
 		if delivered {
 			p.log.Info("task.forward_delivered",
 				"task_id", rep.TaskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
 				"endpoint", rep.Endpoint, "attempts", rep.Attempts+1)
-			p.dropLocked(rep.TaskID)
+			// Drop only the snapshot that was just delivered: a concurrent
+			// Enqueue may have replaced the body (the decided body, a late
+			// replay) while the forward was in flight, and deleting it by task
+			// id would lose a report §10 forbids dropping.
+			p.dropIfUnchangedLocked(rep)
 		} else {
 			p.bumpAttemptsLocked(rep.TaskID)
 		}
@@ -310,6 +321,25 @@ func (p *PendingReports) bumpAttemptsLocked(taskID string) {
 	if rep, ok := p.staged[taskID]; ok {
 		rep.Attempts++
 		p.staged[taskID] = rep
+	}
+}
+
+// dropIfUnchangedLocked removes the queue record only when it still holds the
+// snapshot that was just delivered (or TTL-dropped). A concurrent Enqueue may
+// have replaced the body while the forward was in flight; the newer record then
+// stays queued for the next drain instead of being deleted by task id.
+func (p *PendingReports) dropIfUnchangedLocked(sent pendingReport) {
+	same := func(rep pendingReport) bool {
+		return rep.Endpoint == sent.Endpoint && bytes.Equal(rep.Body, sent.Body)
+	}
+	if validTaskID(sent.TaskID) {
+		if cur, ok := p.readLocked(sent.TaskID); ok && !same(cur) {
+			return
+		}
+		p.removeLocked(sent.TaskID)
+	}
+	if cur, ok := p.staged[sent.TaskID]; ok && same(cur) {
+		delete(p.staged, sent.TaskID)
 	}
 }
 
@@ -411,6 +441,12 @@ func (p *PendingReports) readFileLocked(name string) (pendingReport, bool) {
 	}
 	var rep pendingReport
 	if err := json.Unmarshal(raw, &rep); err != nil || rep.TaskID == "" || rep.Endpoint == "" {
+		if p.quarantineTried[name] {
+			// A previous isolation attempt failed; retrying it every Drain
+			// would only repeat the two error lines.
+			return pendingReport{}, false
+		}
+		p.quarantineTried[name] = true
 		p.log.Error("quarantining malformed pending report", "file", name)
 		if rerr := os.Rename(filepath.Join(p.dir, name), filepath.Join(p.dir, name+".bad")); rerr != nil {
 			p.log.Error("quarantine failed", "file", name, "err", rerr)

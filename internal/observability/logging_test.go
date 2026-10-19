@@ -16,15 +16,11 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.LogLevel != slog.LevelInfo {
 		t.Fatalf("default log level = %v, want info", cfg.LogLevel)
 	}
-	if !cfg.MetricsEnabled {
-		t.Fatal("default metrics enabled = false, want true")
-	}
 }
 
 func TestLoadConfigFromEnv(t *testing.T) {
 	env := map[string]string{
-		EnvLogLevel:       "debug",
-		EnvMetricsEnabled: "false",
+		EnvLogLevel: "debug",
 	}
 	cfg, err := LoadConfig(func(k string) string { return env[k] })
 	if err != nil {
@@ -33,15 +29,11 @@ func TestLoadConfigFromEnv(t *testing.T) {
 	if cfg.LogLevel != slog.LevelDebug {
 		t.Fatalf("log level = %v, want debug", cfg.LogLevel)
 	}
-	if cfg.MetricsEnabled {
-		t.Fatal("metrics enabled = true, want false")
-	}
 }
 
 func TestLoadConfigRejectsBadValues(t *testing.T) {
 	for _, env := range []map[string]string{
 		{EnvLogLevel: "trace"},
-		{EnvMetricsEnabled: "maybe"},
 	} {
 		if _, err := LoadConfig(func(k string) string { return env[k] }); err == nil {
 			t.Fatalf("env %v: expected error", env)

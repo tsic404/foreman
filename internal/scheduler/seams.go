@@ -85,6 +85,13 @@ type Metrics interface {
 	// DeliveryUnconfirmed counts one S6 delivery the confirmation window
 	// judged undelivered (§9.2, foreman_delivery_unconfirmed_total, ADR-032).
 	DeliveryUnconfirmed()
+	// ClaimError counts a claim Foreman could not map, by reason. A claim
+	// with no readable task id has no other convergence than this signal and
+	// the server-side lease expiry.
+	ClaimError(reason string)
+	// JobDeleteFailed counts a Job deletion that failed with no retry handle
+	// left, by stage (currently catch_up: the entry was already dropped).
+	JobDeleteFailed(stage string)
 }
 
 // Reconciler is the recovery module's convergence driver. When wired,
@@ -123,6 +130,8 @@ func (noopMetrics) InflightJobs(int)              {}
 func (noopMetrics) DuplicateDispatch()            {}
 func (noopMetrics) CredReclaimed(string, float64) {}
 func (noopMetrics) DeliveryUnconfirmed()          {}
+func (noopMetrics) ClaimError(string)             {}
+func (noopMetrics) JobDeleteFailed(string)        {}
 
 func orNoopMetrics(m Metrics) Metrics {
 	if m == nil {

@@ -32,6 +32,11 @@ func NewK8sPodLogReader(client kubernetes.Interface) *K8sPodLogReader {
 	return &K8sPodLogReader{client: client}
 }
 
+// maxLogBytes bounds one pod-log response. tailLines bounds the line count,
+// not the bytes a single line can carry; the ops endpoint must not be able to
+// pull an unbounded stream into a 512Mi process.
+const maxLogBytes = 1 << 20 // 1 MiB
+
 // ReadLogs returns the tail of the newest pod of jobName. The Job's pods
 // carry the batch.kubernetes.io/job-name label (K8s >= 1.27).
 func (r *K8sPodLogReader) ReadLogs(ctx context.Context, namespace, jobName string, tailLines int64) ([]byte, error) {
@@ -52,7 +57,7 @@ func (r *K8sPodLogReader) ReadLogs(ctx context.Context, namespace, jobName strin
 		return nil, fmt.Errorf("stream pod %s logs: %w", pod.Name, err)
 	}
 	defer stream.Close()
-	data, err := io.ReadAll(stream)
+	data, err := io.ReadAll(io.LimitReader(stream, maxLogBytes))
 	if err != nil {
 		return nil, fmt.Errorf("read pod %s logs: %w", pod.Name, err)
 	}

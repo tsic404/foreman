@@ -4,18 +4,23 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/tsic404/foreman/internal/scheduler"
 )
 
 // fakeClaimScheduler records claimed tasks and reports a fixed budget.
 type fakeClaimScheduler struct {
-	mu      sync.Mutex
-	budget  int
-	claimed []json.RawMessage
+	mu         sync.Mutex
+	budget     int
+	claimed    []json.RawMessage
+	onClaimErr error
 }
 
 func (f *fakeClaimScheduler) ClaimBudget() int {
@@ -28,7 +33,7 @@ func (f *fakeClaimScheduler) OnClaim(_ context.Context, task json.RawMessage) er
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.claimed = append(f.claimed, task)
-	return nil
+	return f.onClaimErr
 }
 
 func (f *fakeClaimScheduler) claimedCount() int {
@@ -49,6 +54,32 @@ func TestBackoffProgression(t *testing.T) {
 	b.reset()
 	if got := b.next(); got != time.Second {
 		t.Errorf("after reset = %s, want 1s", got)
+	}
+}
+
+func TestClaimLoopDoesNotLogUnnameableClaims(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stubRegister(stub, "rid-1")
+	stub.on("POST", "/api/daemon/tasks/claim", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]any{"tasks": []json.RawMessage{
+			json.RawMessage(`"unreadable"`), json.RawMessage(`[1]`),
+		}})
+	})
+	cfg := testConfig(srv.URL)
+	client := NewClient(cfg, "mdt_test")
+	registerDeclared(t, client)
+	loop := NewClaimLoop(cfg, client, &fakeClaimScheduler{
+		budget:     2,
+		onClaimErr: fmt.Errorf("%w: unreadable", scheduler.ErrUnnameableClaim),
+	})
+	logs := &lockedBuffer{}
+	loop.log = slog.New(slog.NewJSONHandler(logs, nil))
+
+	if err := loop.iterate(t.Context()); err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if got := strings.Count(logs.String(), "on-claim failed"); got != 0 {
+		t.Fatalf("on-claim failed lines = %d, want none for the sentinel (the scheduler logs at a bounded rate): %s", got, logs.String())
 	}
 }
 
@@ -278,21 +309,22 @@ func TestClaimLoopRetriesTransientPreflight(t *testing.T) {
 func TestHeartbeatAckConsumesUnderTheStreamsRuntime(t *testing.T) {
 	cases := []struct {
 		name  string
+		echo  string
 		shape func(w http.ResponseWriter)
 	}{
-		{"echoed runtime_id", func(w http.ResponseWriter) {
+		{"echoed runtime_id", "rid-1", func(w http.ResponseWriter) {
 			writeJSONStub(w, 200, map[string]any{
 				"status": "ok", "runtime_id": "rid-1",
 				"pending_model_list": map[string]string{"id": "req-cmd"},
 			})
 		}},
-		{"absent runtime_id", func(w http.ResponseWriter) {
+		{"absent runtime_id", "", func(w http.ResponseWriter) {
 			writeJSONStub(w, 200, map[string]any{
 				"status":             "ok",
 				"pending_model_list": map[string]string{"id": "req-cmd"},
 			})
 		}},
-		{"foreign runtime_id", func(w http.ResponseWriter) {
+		{"foreign runtime_id", "rid-other", func(w http.ResponseWriter) {
 			writeJSONStub(w, 200, map[string]any{
 				"status": "ok", "runtime_id": "rid-other",
 				"pending_model_list": map[string]string{"id": "req-cmd"},
@@ -345,17 +377,21 @@ func TestHeartbeatAckConsumesUnderTheStreamsRuntime(t *testing.T) {
 			if probes.startCount() != 0 {
 				t.Error("a cached slot must never start a probe")
 			}
+			// The mismatch line is a registered event (§1.3/
+			// §9.2 model.catalog_ack_mismatch): one when the echo is
+			// missing, empty or foreign (§1.3's three forms), none when it
+			// agrees.
 			records := logRecords(t, []byte(logs.String()), "model.catalog_ack_mismatch")
-			if tc.name != "foreign runtime_id" {
+			if tc.echo == "rid-1" {
 				if len(records) != 0 {
-					t.Errorf("model.catalog_ack_mismatch records = %d, want none when the echo is absent or agrees", len(records))
+					t.Errorf("model.catalog_ack_mismatch records = %d, want none when the echo agrees", len(records))
 				}
 				return
 			}
 			if len(records) != 1 {
-				t.Fatalf("model.catalog_ack_mismatch records = %d, want one for a foreign echo", len(records))
+				t.Fatalf("model.catalog_ack_mismatch records = %d, want one for a missing/foreign echo", len(records))
 			}
-			for field, want := range map[string]string{"request_id": "req-cmd", "runtime_id": "rid-1", "ack_runtime_id": "rid-other"} {
+			for field, want := range map[string]string{"request_id": "req-cmd", "runtime_id": "rid-1", "ack_runtime_id": tc.echo} {
 				if got := records[0][field]; got != want {
 					t.Errorf("model.catalog_ack_mismatch %s = %v, want %q", field, got, want)
 				}

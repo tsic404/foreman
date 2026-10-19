@@ -11,6 +11,7 @@ import (
 
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/registry"
 )
 
@@ -68,9 +69,6 @@ func WithProbeRegistry(probes *registry.ProbeRegistry) Option {
 	return func(s *Scheduler) { s.probes = probes }
 }
 
-// probeJobName is the probe Job name of one request id (§3).
-func probeJobName(requestID string) string { return "fm-catalog-" + requestID }
-
 // StartProbe builds one catalog-probe Job: it mints the job runtime id, issues
 // the probe Job Token, writes the session, then creates the Secret and the Job
 // in that fixed order — the session must exist before the pod can register, and
@@ -88,7 +86,7 @@ func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID str
 	if requestID == "" {
 		return ProbeHandle{}, errors.New("probe request id is required")
 	}
-	jobName := probeJobName(requestID)
+	jobName := jobbuilder.ProbeJobName(requestID)
 	jobRuntime := jobRuntimeID(jobName)
 	session := registry.ProbeSession{
 		JobName:    jobName,
@@ -133,8 +131,25 @@ func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID str
 		return ProbeHandle{}, fmt.Errorf("create probe job %s: %w", jobName, err)
 	}
 	s.log.InfoContext(ctx, "probe.started", "job_name", jobName, "job_runtime_id", jobRuntime, "budget", budget)
-	go s.trackProbeNode(context.WithoutCancel(ctx), handle, session.Deadline)
+	trackCtx, stopTracking := context.WithDeadline(s.trackerContext(ctx), session.Deadline)
+	go func() {
+		defer stopTracking()
+		s.trackProbeNode(trackCtx, handle, session.Deadline)
+	}()
 	return handle, nil
+}
+
+// trackerContext is what a detached probe tracker runs under: the scheduler's
+// process context once Run has started, so shutdown cancels it; before that
+// (tests calling StartProbe directly) the caller's values without its
+// cancellation, with the probe budget still bounding the loop.
+func (s *Scheduler) trackerContext(caller context.Context) context.Context {
+	s.lifecycleMu.Lock()
+	defer s.lifecycleMu.Unlock()
+	if s.lifecycle != nil {
+		return s.lifecycle
+	}
+	return context.WithoutCancel(caller)
 }
 
 // rollbackProbe removes what StartProbe built so far, in the teardown order
@@ -208,8 +223,8 @@ func (s *Scheduler) DeleteProbe(ctx context.Context, h ProbeHandle) error {
 	if err := s.probes.DeleteProbe(h.JobName); err != nil {
 		errs = append(errs, fmt.Errorf("remove probe session %s: %w", h.JobName, err))
 	}
-	if err := s.jobs.DeleteSecret(ctx, credName(h.JobName)); err != nil {
-		errs = append(errs, fmt.Errorf("delete probe secret %s: %w", credName(h.JobName), err))
+	if err := s.jobs.DeleteSecret(ctx, jobbuilder.CredentialSecretName(h.JobName)); err != nil {
+		errs = append(errs, fmt.Errorf("delete probe secret %s: %w", jobbuilder.CredentialSecretName(h.JobName), err))
 	}
 	if err := s.jobs.DeleteJob(ctx, h.JobName); err != nil {
 		errs = append(errs, fmt.Errorf("delete probe job %s: %w", h.JobName, err))
@@ -247,7 +262,7 @@ func (s *Scheduler) SweepStaleProbes(ctx context.Context) error {
 			continue
 		}
 		s.log.InfoContext(ctx, "probe.swept", "job_name", job.GetName(), "age_seconds", s.now().Sub(job.CreationTimestamp.Time).Seconds())
-		if derr := s.jobs.DeleteSecret(ctx, credName(job.GetName())); derr != nil {
+		if derr := s.jobs.DeleteSecret(ctx, jobbuilder.CredentialSecretName(job.GetName())); derr != nil {
 			record(derr)
 		}
 		if derr := s.jobs.DeleteJob(ctx, job.GetName()); derr != nil {
@@ -339,7 +354,7 @@ func (s *Scheduler) runProbe(ctx context.Context, waitCatalog bool, kind string)
 	}
 	handle, err := s.StartProbe(ctx, minted, "", mode, window)
 	if err != nil {
-		s.reportProbeFailure(ctx, kind, probeJobName(minted), ProbeFailureJobCreateFailed, "", "", false)
+		s.reportProbeFailure(ctx, kind, jobbuilder.ProbeJobName(minted), ProbeFailureJobCreateFailed, "", "", false)
 		return registry.Discovery{}, fmt.Errorf("%s probe: %w", kind, err)
 	}
 	deadline := s.now().Add(window)

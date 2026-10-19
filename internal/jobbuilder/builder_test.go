@@ -468,3 +468,16 @@ func testConfigWithIssuer() Config {
 	cfg.Issuer = &fakeIssuer{token: "fmj_test.sig"}
 	return cfg
 }
+
+// TestBuildInjectsConfiguredServerURL pins the deployment-configurable
+// Job-side entry point (§8.2 A1.1): the injected MULTICA_SERVER_URL follows
+// Config.ServerURL instead of a package literal.
+func TestBuildInjectsConfiguredServerURL(t *testing.T) {
+	cfg := testConfig()
+	cfg.ServerURL = "http://foreman.other.svc:9000"
+	job, _ := mustBuild(t, cfg, testEntry())
+	got := envByName(t, job.Spec.Template.Spec.Containers[0].Env, "MULTICA_SERVER_URL").Value
+	if got != cfg.ServerURL {
+		t.Errorf("MULTICA_SERVER_URL = %q, want the configured %q", got, cfg.ServerURL)
+	}
+}

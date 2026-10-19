@@ -2,39 +2,16 @@ package scheduler
 
 import (
 	"context"
-	"fmt"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/labels"
-	"k8s.io/client-go/informers"
 	"k8s.io/client-go/kubernetes"
-	"k8s.io/client-go/tools/cache"
 
 	"github.com/tsic404/foreman/internal/registry"
 )
-
-// JobEventKind classifies a watched Job change.
-type JobEventKind string
-
-// Watch event kinds delivered to a JobEventHandler.
-const (
-	JobAdded   JobEventKind = "added"
-	JobUpdated JobEventKind = "updated"
-	JobDeleted JobEventKind = "deleted"
-)
-
-// JobEvent is one observed change of a foreman Job.
-type JobEvent struct {
-	Kind JobEventKind
-	Job  *batchv1.Job
-}
-
-// JobEventHandler consumes Job watch events; recovery wires OnJobGone to the
-// deleted kind.
-type JobEventHandler func(JobEvent)
 
 // JobClient is the scheduler's K8s object access.
 // Deletes are idempotent: a missing object counts as success.
@@ -59,8 +36,6 @@ type JobClient interface {
 	// ListPods returns the pods matching labelSelector in the configured
 	// namespace — the value surface of jobTerminated.
 	ListPods(ctx context.Context, labelSelector string) ([]corev1.Pod, error)
-	// WatchJobs streams Job changes via a client-go informer until ctx ends.
-	WatchJobs(ctx context.Context, handler JobEventHandler) error
 }
 
 // k8sJobClient implements JobClient against the batch/v1 API.
@@ -153,52 +128,6 @@ func (c *k8sJobClient) ListPods(ctx context.Context, labelSelector string) ([]co
 		return nil, err
 	}
 	return list.Items, nil
-}
-
-// WatchJobs runs a shared informer scoped to the foreman Jobs and forwards
-// every add/update/delete to handler until ctx is cancelled. The initial
-// list arrives as JobAdded events; there is no separate synced gate (the
-// reflector's watch-list sync marker never arrives from some API clients,
-// and consumers reconcile periodically anyway).
-func (c *k8sJobClient) WatchJobs(ctx context.Context, handler JobEventHandler) error {
-	factory := informers.NewSharedInformerFactoryWithOptions(
-		c.client,
-		0, // no periodic resync: the stream plus the initial list suffices
-		informers.WithNamespace(c.namespace),
-		informers.WithTweakListOptions(func(opts *metav1.ListOptions) {
-			opts.LabelSelector = managedJobSelector()
-		}),
-	)
-	informer := factory.Batch().V1().Jobs().Informer()
-	if _, err := informer.AddEventHandler(cache.ResourceEventHandlerFuncs{
-		AddFunc: func(obj any) {
-			if job, ok := obj.(*batchv1.Job); ok {
-				handler(JobEvent{Kind: JobAdded, Job: job})
-			}
-		},
-		UpdateFunc: func(_, newObj any) {
-			if job, ok := newObj.(*batchv1.Job); ok {
-				handler(JobEvent{Kind: JobUpdated, Job: job})
-			}
-		},
-		DeleteFunc: func(obj any) {
-			if job, ok := obj.(*batchv1.Job); ok {
-				handler(JobEvent{Kind: JobDeleted, Job: job})
-				return
-			}
-			// A missed delete arrives as the tombstone wrapper.
-			if tombstone, ok := obj.(cache.DeletedFinalStateUnknown); ok {
-				if job, ok := tombstone.Obj.(*batchv1.Job); ok {
-					handler(JobEvent{Kind: JobDeleted, Job: job})
-				}
-			}
-		},
-	}); err != nil {
-		return fmt.Errorf("register job informer handler: %w", err)
-	}
-	factory.Start(ctx.Done())
-	<-ctx.Done()
-	return nil
 }
 
 // managedJobSelector selects exactly the Jobs Foreman owns (§4.3).

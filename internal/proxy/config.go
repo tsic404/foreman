@@ -152,8 +152,15 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if cfg.ServerURL == "" {
 		return Config{}, fmt.Errorf("%s is required", EnvServerURL)
 	}
-	if _, err := url.Parse(cfg.ServerURL); err != nil {
+	parsed, err := url.Parse(cfg.ServerURL)
+	if err != nil {
 		return Config{}, fmt.Errorf("%s is not a valid URL: %v", EnvServerURL, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return Config{}, fmt.Errorf("%s must use http or https, got %q", EnvServerURL, parsed.Scheme)
+	}
+	if parsed.Host == "" {
+		return Config{}, fmt.Errorf("%s must name a host", EnvServerURL)
 	}
 	cfg.WorkspaceID = strings.TrimSpace(getenv(EnvWorkspaceID))
 	if cfg.WorkspaceID == "" {
@@ -163,7 +170,6 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		cfg.DaemonID = v
 	}
 
-	var err error
 	if cfg.ClaimInterval, err = envDuration(getenv, EnvClaimInterval, cfg.ClaimInterval); err != nil {
 		return Config{}, err
 	}

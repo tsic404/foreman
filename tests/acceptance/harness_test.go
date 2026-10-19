@@ -864,6 +864,7 @@ type jobClient struct {
 	createdSecrets []*corev1.Secret
 	deletedJobs    []string
 	deletedSecrets []string
+	getJobs        []string
 	createJobErr   error
 	// onCreateJob runs before a create is answered (scenario setup hooks).
 	onCreateJob func(job *batchv1.Job)
@@ -915,6 +916,7 @@ func (c *jobClient) DeleteJob(_ context.Context, name string) error {
 func (c *jobClient) GetJob(_ context.Context, name string) (*batchv1.Job, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.getJobs = append(c.getJobs, name)
 	job, ok := c.existingJobs[name]
 	if !ok {
 		return nil, nil
@@ -962,8 +964,6 @@ func (c *jobClient) ListPods(context.Context, string) ([]corev1.Pod, error) {
 	defer c.mu.Unlock()
 	return append([]corev1.Pod(nil), c.pods...), nil
 }
-
-func (c *jobClient) WatchJobs(context.Context, scheduler.JobEventHandler) error { return nil }
 
 func (c *jobClient) jobCreated(name string) bool {
 	c.mu.Lock()
@@ -1387,6 +1387,7 @@ func (m *recordingMetrics) JobBootSeconds(float64)        {}
 func (m *recordingMetrics) JobCreateSeconds(float64)      {}
 func (m *recordingMetrics) InflightJobs(int)              {}
 func (m *recordingMetrics) CredReclaimed(string, float64) {}
+func (m *recordingMetrics) JobDeleteFailed(string)        {}
 
 // DuplicateDispatch counts a server redispatch of a known task
 // (foreman_duplicate_dispatch_total).

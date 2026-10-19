@@ -368,7 +368,20 @@ func run() error {
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		log.Warn("http.shutdown_failed", "err", err.Error())
 	}
-	wg.Wait()
+	// The loop drain shares the shutdown budget: kubelet SIGKILLs at the
+	// deployment's terminationGracePeriodSeconds (30s), and the 20s budget
+	// here stays inside it — an unbounded wg.Wait would leave no
+	// foreman.stopped line at all.
+	loopsDone := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(loopsDone)
+	}()
+	select {
+	case <-loopsDone:
+	case <-shutdownCtx.Done():
+		log.Warn("loops.shutdown_timeout", "err", shutdownCtx.Err().Error())
+	}
 	log.Info("foreman.stopped")
 	return nil
 }

@@ -246,3 +246,36 @@ func TestTaskEntryFromJobToleratesOptionalAnnotationsMissing(t *testing.T) {
 		t.Fatalf("unexpected defaults: %+v", e)
 	}
 }
+
+// TestProjectionRendersAbsentLeaseAsEmpty pins the §4.1 absent form for the
+// lease deadline: a rebuilt entry (no renewal observed) projects the key with
+// an empty string, never the RFC3339 zero.
+func TestProjectionRendersAbsentLeaseAsEmpty(t *testing.T) {
+	raw, err := json.Marshal(TaskEntry{TaskID: "t-1"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var projected map[string]any
+	if err := json.Unmarshal(raw, &projected); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	got, ok := projected["lease_keep_until"]
+	if !ok {
+		t.Fatalf("projection dropped lease_keep_until: %v", projected)
+	}
+	if got != "" {
+		t.Errorf("lease_keep_until = %v, want the empty string for an absent fact", got)
+	}
+
+	at := time.Date(2026, 10, 16, 12, 0, 0, 0, time.UTC)
+	raw, err = json.Marshal(TaskEntry{TaskID: "t-2", LeaseKeepUntil: at})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if err := json.Unmarshal(raw, &projected); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if got = projected["lease_keep_until"]; got != ProjectedTime(at) {
+		t.Errorf("lease_keep_until = %v, want %q", projected["lease_keep_until"], ProjectedTime(at))
+	}
+}

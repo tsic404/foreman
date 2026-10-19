@@ -1090,6 +1090,29 @@ func TestRebuildSignalSurvivesFailedReregister(t *testing.T) {
 	}
 }
 
+func TestChangesFanOutToEverySubscriber(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stubRegister(stub, "rid-1")
+	c := NewClient(testConfig(srv.URL), "mdt_test")
+	first, releaseFirst := c.SubscribeChanges()
+	defer releaseFirst()
+	second, releaseSecond := c.SubscribeChanges()
+	defer releaseSecond()
+
+	registerDeclared(t, c)
+
+	for i, ch := range []<-chan RuntimeChange{first, second} {
+		select {
+		case change := <-ch:
+			if change.NewID != "rid-1" {
+				t.Errorf("subscriber %d change = %+v", i, change)
+			}
+		case <-time.After(time.Second):
+			t.Fatalf("subscriber %d missed the runtime-set change", i)
+		}
+	}
+}
+
 func TestTerminalRetryBudgetMatchesContract(t *testing.T) {
 	want := []time.Duration{0, 4 * time.Second, 8 * time.Second, 16 * time.Second, 32 * time.Second, 64 * time.Second}
 	if !slices.Equal(terminalRetryWaits, want) {

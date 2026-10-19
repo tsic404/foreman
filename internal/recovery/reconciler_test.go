@@ -27,10 +27,20 @@ type fakeObjects struct {
 	pods    []corev1.Pod
 	podsErr error
 	rounds  int
+	jobGets int
 }
 
 func (f *fakeObjects) GetJob(context.Context, string) (*batchv1.Job, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.jobGets++
 	return f.job, f.jobErr
+}
+
+func (f *fakeObjects) jobGetsSeen() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.jobGets
 }
 
 func (f *fakeObjects) ListPods(context.Context) ([]corev1.Pod, error) {
@@ -92,6 +102,11 @@ type fakeSettler struct {
 	alivePodsErr     error
 	reclaimErr       error
 	sweepErr         error
+	// Evidence-call counters: the objectless reclaim must not read Job/pod
+	// termination evidence at all.
+	jobTerminatedCalls int
+	lastPodCalls       int
+	alivePodsCalls     int
 	// DrainPendingReports' programmed answer.
 	drainCalls     int
 	drainRemaining int
@@ -157,19 +172,30 @@ func (f *fakeSettler) SweepOrphanSecrets(context.Context) error {
 func (f *fakeSettler) JobTerminated(context.Context, string, time.Time) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.jobTerminatedCalls++
 	return f.terminated, f.terminatedErr
 }
 
 func (f *fakeSettler) LastPodTerminatedAt(context.Context, string, time.Time) (time.Time, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.lastPodCalls++
 	return f.lastTerminatedAt, f.lastTermErr
 }
 
 func (f *fakeSettler) AlivePods(context.Context, string, time.Time) (int, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.alivePodsCalls++
 	return f.alivePods, f.alivePodsErr
+}
+
+// evidenceCalls reports how often the reclaim read Job/pod termination
+// evidence: the objectless path must answer zero.
+func (f *fakeSettler) evidenceCalls() (jobTerminated, lastPod, alivePods int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.jobTerminatedCalls, f.lastPodCalls, f.alivePodsCalls
 }
 
 func (f *fakeSettler) OnJobTerminated(_ context.Context, jobName, reason string, at time.Time, orphans int) error {
@@ -970,5 +996,65 @@ func TestReconcileExpiresSessionIndexEntries(t *testing.T) {
 	}
 	if got := reg.LastNodeForSession("sess-fresh"); got != "company-03" {
 		t.Fatalf("fresh entry = %q, want company-03", got)
+	}
+}
+
+// TestReconcileCleanupProceedsWhenPodsUnreadable pins the degraded round: a
+// failed pod read is not a teardown sign (§4.4), so only the end-reason
+// judgement of live entries waits — terminal Job deletion and the drain
+// closure keep moving.
+func TestReconcileCleanupProceedsWhenPodsUnreadable(t *testing.T) {
+	reg := newRegistry(t, testEntry("t1"))
+	if _, err := reg.MarkTerminal("t1", registry.ResultCompleted, "", time.Time{}); err != nil {
+		t.Fatalf("MarkTerminal: %v", err)
+	}
+	set := &fakeSettler{terminated: true}
+	objs := &fakeObjects{podsErr: errors.New("api server down")}
+	r := newTestReconciler(t, reg, objs, &fakeStatus{status: "running"}, set)
+
+	if err := r.Reconcile(context.Background()); err == nil {
+		t.Fatal("a blind round must still report the pod-read error")
+	}
+	set.mu.Lock()
+	reclaims := append([]reclaimCall(nil), set.reclaims...)
+	set.mu.Unlock()
+	if len(reclaims) != 1 || reclaims[0].jobName != "fm-t1" {
+		t.Fatalf("reclaims = %+v, want the terminal entry reclaimed despite the blind pod read", reclaims)
+	}
+}
+
+// TestReclaimObjectlessEntrySkipsJobEvidence pins the invalid-task-id drain:
+// no Job/Secret ever existed, so the identity-derived names may be illegal
+// selectors and there is no termination fact to read. The entry is reclaimed
+// with the objectless reason instead.
+func TestReclaimObjectlessEntrySkipsJobEvidence(t *testing.T) {
+	reg := newRegistry(t, testEntry("t1"))
+	if _, err := reg.MarkTerminal("t1", registry.ResultFailed, scheduler.FailureReasonInvalidTaskID, time.Time{}); err != nil {
+		t.Fatalf("MarkTerminal: %v", err)
+	}
+	set := &fakeSettler{}
+	objs := &fakeObjects{jobErr: errors.New("invalid label value")}
+	r := newTestReconciler(t, reg, objs, &fakeStatus{status: "running"}, set)
+
+	_ = r.Reconcile(context.Background())
+
+	set.mu.Lock()
+	reclaims := append([]reclaimCall(nil), set.reclaims...)
+	set.mu.Unlock()
+	if len(reclaims) != 1 {
+		t.Fatalf("reclaims = %+v, want one", reclaims)
+	}
+	if reclaims[0].reason != scheduler.JobTerminationReasonNoObjects {
+		t.Errorf("reclaim reason = %q, want %q", reclaims[0].reason, scheduler.JobTerminationReasonNoObjects)
+	}
+	// The branch must sit before every evidence read: moving any of them ahead
+	// of it turns this red.
+	terminated, lastPod, alive := set.evidenceCalls()
+	if terminated != 0 || lastPod != 0 || alive != 0 {
+		t.Errorf("termination evidence reads = JobTerminated:%d LastPodTerminatedAt:%d AlivePods:%d, want none",
+			terminated, lastPod, alive)
+	}
+	if got := objs.jobGetsSeen(); got != 0 {
+		t.Errorf("GetJob calls = %d, want none for an objectless entry", got)
 	}
 }

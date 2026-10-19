@@ -19,6 +19,35 @@ func leaseEnv(lease string) func(string) string {
 	return func(key string) string { return env[key] }
 }
 
+// TestLoadConfigServerURLScheme pins §1.5's configuration-error face for the
+// upstream address: the WS derivation only understands http(s), so any other
+// scheme must be refused at load time rather than silently producing a broken
+// ws:// URL.
+func TestLoadConfigServerURLScheme(t *testing.T) {
+	cases := map[string]struct {
+		url     string
+		wantErr bool
+	}{
+		"http":      {"http://multica.example", false},
+		"https":     {"https://multica.example", false},
+		"ftp":       {"ftp://multica.example", true},
+		"no scheme": {"multica.example:8080", true},
+		"no host":   {"http://", true},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			env := map[string]string{EnvServerURL: tc.url, EnvWorkspaceID: "ws-test"}
+			_, err := LoadConfig(func(key string) string { return env[key] })
+			if tc.wantErr != (err != nil) {
+				t.Fatalf("LoadConfig(%q) err = %v, wantErr %v", tc.url, err, tc.wantErr)
+			}
+			if err != nil && !strings.Contains(err.Error(), EnvServerURL) {
+				t.Errorf("error %q must name %s", err, EnvServerURL)
+			}
+		})
+	}
+}
+
 // TestLoadConfigLeaseRefreshBound pins §10: the accepted renewal cadence is at
 // most 20s, and a refused value names the env, the value and the bound so the
 // resulting CrashLoop is attributable.
