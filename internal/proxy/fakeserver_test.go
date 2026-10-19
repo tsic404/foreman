@@ -22,7 +22,6 @@ import (
 
 	"github.com/tsic404/foreman/internal/auth"
 	"github.com/tsic404/foreman/internal/jobbuilder"
-	"github.com/tsic404/foreman/internal/recovery"
 	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
 )
@@ -144,7 +143,7 @@ type testRig struct {
 	revoker *fakeRevoker
 	metrics *fakeMetrics
 	server  *httptest.Server
-	pending *recovery.PendingReports
+	pending *scheduler.PendingReports
 	handler http.Handler
 }
 
@@ -187,7 +186,7 @@ func newTestRigWithRegister(t *testing.T, register func(*stubUpstream)) *testRig
 	rig.reg = registry.New(time.Now)
 	rig.jobs = &fakeJobs{created: time.Now()}
 	rig.revoker = &fakeRevoker{}
-	pending, err := recovery.NewPendingReports(t.TempDir())
+	pending, err := scheduler.NewPendingReports(t.TempDir())
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
@@ -536,7 +535,7 @@ func TestTerminalForwardFailureLandsInPendingReports(t *testing.T) {
 	rig.stub.on("POST", "/api/daemon/tasks/t-pend/complete", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
 		writeJSONStub(w, 200, map[string]string{"id": "t-pend", "status": "completed"})
 	})
-	remaining, err := rig.pending.Drain(t.Context(), rig.client)
+	remaining, err := rig.pending.Drain(t.Context(), rig.sched)
 	if err != nil || remaining != 0 {
 		t.Fatalf("Drain = %d, %v", remaining, err)
 	}

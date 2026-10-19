@@ -23,7 +23,7 @@ const maxRequestBody = 32 << 20
 // S6 delivery, S8–S17 report handling, task-vanish settlement.
 type TaskScheduler interface {
 	Deliver(daemonID, runtimeID string, maxTasks int) ([]json.RawMessage, error)
-	OnReport(ctx context.Context, ep scheduler.Endpoint, e registry.TaskEntry, body []byte) (int, []byte, error)
+	OnReport(ctx context.Context, ep scheduler.Endpoint, e registry.TaskEntry, body []byte, sessionID string) (int, []byte, error)
 	OnTaskVanished(ctx context.Context, taskID string) error
 	// FailJob settles a Job whose daemon was refused at S4: the entry reaches
 	// terminal/failed without waiting out the boot deadline (S-4).

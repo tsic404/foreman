@@ -168,6 +168,16 @@ type TaskEntry struct {
 	// Payload: raw claim payload until MarkDelivering replaces it with the
 	// delivered body — the form the ops preview must serve (S6 / AC-07).
 	Payload json.RawMessage `json:"-"`
+
+	// DecidedReport is the terminal report body that stands for this instance
+	// once its verdict is written (§4.4, ADR-031): registered at the decision
+	// instant, before the forward, and taken by every later terminal forward
+	// of the instance — the enqueued copy, a queue replay, a late replay in
+	// the drain window and the convergence compensation. A platform-forced
+	// termination registers the compensation body; any other decision
+	// registers the body of that first terminal forward. Memory-only, like
+	// the rest of the drain bookkeeping (ADR-002), and never projected.
+	DecidedReport []byte `json:"-"`
 }
 
 // MarshalJSON renders the entry as /foreman/tasks projects it (§4.1,

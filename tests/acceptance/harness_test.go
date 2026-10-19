@@ -1786,6 +1786,7 @@ type noReports struct{}
 
 func (noReports) Enqueue(string, string, string, scheduler.Endpoint, []byte) error { return nil }
 func (noReports) Queued(string) bool                                               { return false }
+func (noReports) Drain(context.Context, scheduler.ReportSender) (int, error)       { return 0, nil }
 
 type noRevoker struct{}
 

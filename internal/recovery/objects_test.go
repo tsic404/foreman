@@ -87,10 +87,20 @@ func TestJobEndReason(t *testing.T) {
 			reason: scheduler.FailureReasonJobDeadline,
 			ended:  true,
 		},
+		{
+			// The fixed order (§4.4, ADR-031): the Job's Failed condition is
+			// read first, so a deadline-killed Job whose pod also lost its
+			// node is still the platform's deadline, never an eviction.
+			name:   "job condition wins over a lost pod",
+			job:    failedJob("fm-a", "DeadlineExceeded"),
+			pods:   []corev1.Pod{podFor("fm-a", func(p *corev1.Pod) { p.Status.Phase = corev1.PodUnknown })},
+			reason: scheduler.FailureReasonJobDeadline,
+			ended:  true,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reason, ended := jobEndReason(tt.job, tt.pods)
+			reason, ended := jobEndReason(tt.job, tt.pods, time.Time{})
 			if ended != tt.ended || reason != tt.reason {
 				t.Fatalf("jobEndReason = (%q, %v), want (%q, %v)", reason, ended, tt.reason, tt.ended)
 			}

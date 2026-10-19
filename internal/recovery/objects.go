@@ -3,6 +3,7 @@ package recovery
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -59,20 +60,21 @@ func podNodeName(pods []corev1.Pod) string {
 // jobEndReason applies the Job/Pod facts of 判据模型: the Job object says
 // whether the container ended, the pod refines why. A failed or succeeded
 // Job both mean the container is gone — the daemon (its main process) cannot
-// report anything after that, so the task must converge. Deadline kills
-// (§4.4) and node losses (§4.6) are named from the pod; anything else is
-// job_failed (§4.6).
+// report anything after that, so the task must converge.
 //
-// The pod evidence is read first: a lost node shows up there before the Job
-// controller marks the Job failed (§4.6).
-func jobEndReason(job *batchv1.Job, pods []corev1.Pod) (string, bool) {
+// The platform-forced termination fact comes from the single judgement
+// (scheduler.PlatformTermination, ADR-031) — the same function the S14
+// attribution gate calls — with its fixed order: the Job's Failed condition
+// first, the pod's container termination reason only on a miss. Node losses
+// (§4.6) are named from the pod; anything else is job_failed (§4.6).
+func jobEndReason(job *batchv1.Job, pods []corev1.Pod, since time.Time) (string, bool) {
 	if job == nil {
 		return "", false
 	}
+	if _, hit := scheduler.PlatformTermination(job, pods, since); hit {
+		return scheduler.FailureReasonJobDeadline, true
+	}
 	for i := range pods {
-		if podTerminatedByDeadline(&pods[i]) {
-			return scheduler.FailureReasonJobDeadline, true
-		}
 		if podLost(&pods[i]) {
 			return scheduler.FailureReasonJobEvicted, true
 		}
@@ -80,16 +82,13 @@ func jobEndReason(job *batchv1.Job, pods []corev1.Pod) (string, bool) {
 	return endReasonFromJob(job)
 }
 
-// endReasonFromJob reads the Job's own end evidence: the Failed condition
-// (the k8s Job controller sets reason DeadlineExceeded for
-// activeDeadlineSeconds kills) or a completed/failed pod count.
+// endReasonFromJob reads the Job's own end evidence: the Failed condition or
+// a completed/failed pod count. The deadline form is not read here — it
+// belongs to the single platform-fact judgement above.
 func endReasonFromJob(job *batchv1.Job) (string, bool) {
 	for _, cond := range job.Status.Conditions {
 		if cond.Type != batchv1.JobFailed || cond.Status != corev1.ConditionTrue {
 			continue
-		}
-		if cond.Reason == "DeadlineExceeded" {
-			return scheduler.FailureReasonJobDeadline, true
 		}
 		return scheduler.FailureReasonJobFailed, true
 	}
@@ -97,19 +96,6 @@ func endReasonFromJob(job *batchv1.Job) (string, bool) {
 		return scheduler.FailureReasonJobFailed, true
 	}
 	return "", false
-}
-
-// podTerminatedByDeadline reports a pod killed by activeDeadlineSeconds.
-func podTerminatedByDeadline(pod *corev1.Pod) bool {
-	if pod.Status.Reason == "DeadlineExceeded" {
-		return true
-	}
-	for _, cs := range pod.Status.ContainerStatuses {
-		if cs.State.Terminated != nil && cs.State.Terminated.Reason == "DeadlineExceeded" {
-			return true
-		}
-	}
-	return false
 }
 
 // podLost reports a pod whose node went away — evicted, or its status no
@@ -215,7 +201,7 @@ func notifyPod(obj any, notify func()) {
 			return
 		}
 	}
-	if pod.DeletionTimestamp != nil || podTerminatedByDeadline(pod) || podLost(pod) {
+	if pod.DeletionTimestamp != nil || scheduler.PodDeadlineTerminated(pod) || podLost(pod) {
 		notify()
 		return
 	}

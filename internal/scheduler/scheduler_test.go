@@ -968,7 +968,7 @@ func TestDuplicateClaimAgainstTerminalEntryNeverRebuilds(t *testing.T) {
 	// Terminal report got a 500: entry lingers terminal, Job still up.
 	f.server.forwardCode = 500
 	e, _ := f.reg.Get("task-1")
-	if _, _, err := f.sched.OnReport(context.Background(), EPFail, e, []byte(`{}`)); err != nil {
+	if _, _, err := f.sched.OnReport(context.Background(), EPFail, e, []byte(`{}`), ""); err != nil {
 		t.Fatal(err)
 	}
 	// Server never got the fail report and re-dispatches the task.
@@ -1167,7 +1167,7 @@ func TestOnReportStartMarksRunning(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`))
+	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`), "")
 	if err != nil || code != 200 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
@@ -1195,7 +1195,7 @@ func TestOnReportStart409SettlesStaleClaim(t *testing.T) {
 	f.server.forwardCode = 409
 	f.server.status = "dispatched" // C13: the claim is still the startable one
 
-	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`))
+	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`), "")
 	if err != nil || code != 409 {
 		t.Fatalf("OnReport = %d, %v (the daemon keeps the server's 409)", code, err)
 	}
@@ -1239,7 +1239,7 @@ func TestOnReportStart409RunningAdoptsEntry(t *testing.T) {
 	f.server.forwardCode = 409
 	f.server.status = "running"
 
-	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`))
+	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`), "")
 	if err != nil || code != 409 {
 		t.Fatalf("OnReport = %d, %v (the daemon keeps the server's 409)", code, err)
 	}
@@ -1268,7 +1268,7 @@ func TestOnReportStart409TerminalSettlesToServer(t *testing.T) {
 	f.server.forwardCode = 409
 	f.server.status = "completed"
 
-	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`))
+	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`), "")
 	if err != nil || code != 409 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
@@ -1299,7 +1299,7 @@ func TestOnReportStart409VanishedReleases(t *testing.T) {
 	f.server.forwardCode = 409
 	f.server.statusErr = ErrTaskNotFound
 
-	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`))
+	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`), "")
 	if err != nil || code != 409 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
@@ -1336,7 +1336,7 @@ func TestBootTimeoutWaitsForInFlightStart(t *testing.T) {
 	startDone := make(chan struct{})
 	go func() {
 		defer close(startDone)
-		if _, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`)); err != nil {
+		if _, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`), ""); err != nil {
 			t.Errorf("OnReport: %v", err)
 		}
 	}()
@@ -1384,7 +1384,7 @@ func TestOnReportStart409OnSettledEntryKeepsResult(t *testing.T) {
 	}
 	f.server.forwardCode = 409
 
-	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`))
+	code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`), "")
 	if err != nil || code != 409 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
@@ -1415,7 +1415,7 @@ func TestOnReportStartTransientKeepsEntryPreStart(t *testing.T) {
 	}
 	f.server.forwardCode = 503
 
-	code, resp, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`))
+	code, resp, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`), "")
 	if err != nil || code != 502 || !strings.Contains(string(resp), "upstream unavailable") {
 		t.Fatalf("OnReport = %d %s, %v", code, resp, err)
 	}
@@ -1426,7 +1426,7 @@ func TestOnReportStartTransientKeepsEntryPreStart(t *testing.T) {
 
 	// The daemon's retry reaches a healthy server: delivering → running.
 	f.server.forwardCode = 200
-	if code, _, err = f.sched.OnReport(context.Background(), EPStart, got, []byte(`{}`)); err != nil || code != 200 {
+	if code, _, err = f.sched.OnReport(context.Background(), EPStart, got, []byte(`{}`), ""); err != nil || code != 200 {
 		t.Fatalf("retried OnReport = %d, %v", code, err)
 	}
 	if got, _ = f.reg.Get("t-5xx"); got.State != registry.StateRunning || got.StartedAt.IsZero() {
@@ -1440,7 +1440,7 @@ func TestOnReportTerminalCleansUpAfterSuccess(t *testing.T) {
 	e.State = registry.StateRunning
 	f.reg.Put(e)
 
-	code, _, err := f.sched.OnReport(context.Background(), EPComplete, e, []byte(`{"x":1}`))
+	code, _, err := f.sched.OnReport(context.Background(), EPComplete, e, []byte(`{"x":1}`), "")
 	if err != nil || code != 200 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
@@ -1468,7 +1468,7 @@ func TestOnReportTerminal404StillCleansUp(t *testing.T) {
 	f.reg.Put(e)
 	f.server.forwardCode = 404
 
-	code, _, err := f.sched.OnReport(context.Background(), EPFail, e, []byte(`{}`))
+	code, _, err := f.sched.OnReport(context.Background(), EPFail, e, []byte(`{}`), "")
 	if err != nil || code != 200 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
@@ -1490,7 +1490,7 @@ func TestOnReportTerminalFailureKeepsObjects(t *testing.T) {
 	// The daemon still gets 502 (§1.5: the caller owns the retry) and the
 	// terminal entry keeps its objects: the report is in the durable queue
 	// now, not dropped.
-	code, _, err := f.sched.OnReport(context.Background(), EPComplete, e, []byte(`{}`))
+	code, _, err := f.sched.OnReport(context.Background(), EPComplete, e, []byte(`{}`), "")
 	if err != nil || code != 502 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
@@ -2419,7 +2419,7 @@ func TestTaskEventsCarryIdentity(t *testing.T) {
 		f := newFixture(t)
 		buf := newLogScheduler(t, f, slog.LevelInfo)
 		e := f.claim(t, "task-1")
-		if code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`)); err != nil || code != 200 {
+		if code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`), ""); err != nil || code != 200 {
 			t.Fatalf("OnReport = %d, %v", code, err)
 		}
 		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.started"), "task-1", "fm-task-1", "fm-task-1")
@@ -2460,7 +2460,7 @@ func TestTaskEventsCarryIdentity(t *testing.T) {
 		buf := newLogScheduler(t, f, slog.LevelInfo)
 		e := f.claim(t, "task-1")
 		f.server.forwardCode = 400
-		if _, _, err := f.sched.OnReport(context.Background(), EPFail, e, []byte(`{}`)); err != nil {
+		if _, _, err := f.sched.OnReport(context.Background(), EPFail, e, []byte(`{}`), ""); err != nil {
 			t.Fatalf("OnReport: %v", err)
 		}
 		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.forward_failed"), "task-1", "fm-task-1", "fm-task-1")
@@ -2525,7 +2525,7 @@ func TestTaskEventsCarryIdentity(t *testing.T) {
 		e := f.claim(t, "task-1")
 		f.server.forwardCode = 409
 		f.server.statusErr = errors.New("status lookup unavailable")
-		if code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`)); err != nil || code != 409 {
+		if code, _, err := f.sched.OnReport(context.Background(), EPStart, e, []byte(`{}`), ""); err != nil || code != 409 {
 			t.Fatalf("OnReport = %d, %v", code, err)
 		}
 		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.settle_failed"), "task-1", "fm-task-1", "fm-task-1")

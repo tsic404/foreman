@@ -40,6 +40,18 @@ func (f *fakePendingReports) Enqueue(taskID, jobName, daemonID string, ep Endpoi
 // Queued reports whether the report is still undelivered.
 func (f *fakePendingReports) Queued(taskID string) bool { return f.queued[taskID] }
 
+// Drain models the recovery loop's round: every queued report is re-delivered
+// once through sender and the queue is reported empty.
+func (f *fakePendingReports) Drain(ctx context.Context, sender ReportSender) (int, error) {
+	for taskID := range f.queued {
+		if _, _, err := sender.DeliverQueued(ctx, EPFail, taskID, nil); err != nil {
+			return len(f.queued), err
+		}
+		delete(f.queued, taskID)
+	}
+	return 0, nil
+}
+
 // deliver models the recovery loop's drain landing the report.
 func (f *fakePendingReports) deliver(taskID string) { delete(f.queued, taskID) }
 
@@ -251,7 +263,7 @@ func TestOnReportTerminalFailureEnqueuesPendingReport(t *testing.T) {
 	e := f.claim(t, "t-pend")
 	f.server.forwardCode = 503
 
-	code, resp, err := f.sched.OnReport(context.Background(), EPComplete, e, []byte(`{"result":"ok"}`))
+	code, resp, err := f.sched.OnReport(context.Background(), EPComplete, e, []byte(`{"result":"ok"}`), "")
 	if err != nil {
 		t.Fatalf("OnReport: %v", err)
 	}
@@ -280,7 +292,7 @@ func TestOnReportTerminalPermanent4xxNotEnqueued(t *testing.T) {
 	e := f.claim(t, "t-perm")
 	f.server.forwardCode = 400
 
-	code, _, err := f.sched.OnReport(context.Background(), EPFail, e, []byte(`{"error":"x"}`))
+	code, _, err := f.sched.OnReport(context.Background(), EPFail, e, []byte(`{"error":"x"}`), "")
 	if err != nil || code != 400 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
@@ -298,7 +310,7 @@ func TestOnReportTerminal404IsIdempotentSuccess(t *testing.T) {
 	e := f.claim(t, "t-404")
 	f.server.forwardCode = 404
 
-	code, _, err := f.sched.OnReport(context.Background(), EPComplete, e, []byte(`{}`))
+	code, _, err := f.sched.OnReport(context.Background(), EPComplete, e, []byte(`{}`), "")
 	if err != nil || code != 200 {
 		t.Fatalf("OnReport = %d, %v (terminal 404 must map to 200)", code, err)
 	}
@@ -315,7 +327,7 @@ func TestOnReportNonTerminal404Vanishes(t *testing.T) {
 	e := f.claim(t, "t-prog404")
 	f.server.forwardCode = 404
 
-	code, _, err := f.sched.OnReport(context.Background(), EPProgress, e, []byte(`{}`))
+	code, _, err := f.sched.OnReport(context.Background(), EPProgress, e, []byte(`{}`), "")
 	if err != nil || code != 404 {
 		t.Fatalf("OnReport = %d, %v", code, err)
 	}
@@ -339,7 +351,7 @@ func TestOnReportNonTerminalTransientMaps502(t *testing.T) {
 
 	// Transient upstream failure: upstream 5xx/408/429 on a non-terminal
 	// endpoint answers the daemon 502 {"error":"upstream unavailable"}.
-	code, resp, err := f.sched.OnReport(context.Background(), EPProgress, e, []byte(`{}`))
+	code, resp, err := f.sched.OnReport(context.Background(), EPProgress, e, []byte(`{}`), "")
 	if err != nil {
 		t.Fatalf("OnReport: %v", err)
 	}

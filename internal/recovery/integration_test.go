@@ -58,7 +58,7 @@ func drainPod(jobName string, phase corev1.PodPhase) corev1.Pod {
 // setupIntegration wires the composition root: the real scheduler and the
 // real reconciler over the real durable queue. dir empty means a fresh temp
 // directory; tests that need to break the queue open it themselves.
-func setupIntegration(t *testing.T, server *fakeServerClient, dir string, opts ...PendingReportsOption) (*registry.Registry, *fakeJobClient, *scheduler.Scheduler, *PendingReports, *fakeRevoker, func(ObjectClient) *Reconciler) {
+func setupIntegration(t *testing.T, server *fakeServerClient, dir string, opts ...scheduler.PendingReportsOption) (*registry.Registry, *fakeJobClient, *scheduler.Scheduler, *scheduler.PendingReports, *fakeRevoker, func(ObjectClient) *Reconciler) {
 	t.Helper()
 	return setupIntegrationWithMetrics(t, server, dir, nil, opts...)
 }
@@ -66,12 +66,12 @@ func setupIntegration(t *testing.T, server *fakeServerClient, dir string, opts .
 // setupIntegrationWithMetrics is setupIntegration with the observability
 // implementation wired into the scheduler, so a test can read the gauge off
 // the exposition the scrape endpoint serves rather than off the seam.
-func setupIntegrationWithMetrics(t *testing.T, server *fakeServerClient, dir string, metrics scheduler.Metrics, opts ...PendingReportsOption) (*registry.Registry, *fakeJobClient, *scheduler.Scheduler, *PendingReports, *fakeRevoker, func(ObjectClient) *Reconciler) {
+func setupIntegrationWithMetrics(t *testing.T, server *fakeServerClient, dir string, metrics scheduler.Metrics, opts ...scheduler.PendingReportsOption) (*registry.Registry, *fakeJobClient, *scheduler.Scheduler, *scheduler.PendingReports, *fakeRevoker, func(ObjectClient) *Reconciler) {
 	t.Helper()
 	if dir == "" {
 		dir = t.TempDir()
 	}
-	pending, err := NewPendingReports(dir, opts...)
+	pending, err := scheduler.NewPendingReports(dir, opts...)
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
@@ -89,8 +89,7 @@ func setupIntegrationWithMetrics(t *testing.T, server *fakeServerClient, dir str
 	}
 	return reg, jobs, sched, pending, revoker, func(objs ObjectClient) *Reconciler {
 		rec, err := New(Config{ReconcileInterval: 30 * time.Second}, reg, objs, server, sched,
-			WithMetrics(&fakeMetrics{}),
-			WithPendingReports(pending, server))
+			WithMetrics(&fakeMetrics{}))
 		if err != nil {
 			t.Fatalf("recovery.New: %v", err)
 		}
@@ -125,7 +124,7 @@ func TestIntegrationFailedJobIsCompensated(t *testing.T) {
 		t.Fatalf("Deliver: %v", err)
 	}
 	entry, _ = reg.Get("t1")
-	if _, _, err := sched.OnReport(ctx, scheduler.EPStart, entry, nil); err != nil {
+	if _, _, err := sched.OnReport(ctx, scheduler.EPStart, entry, nil, ""); err != nil {
 		t.Fatalf("OnReport(start): %v", err)
 	}
 
@@ -209,7 +208,7 @@ func TestIntegrationCompensatedReportIsQueuedAndDrained(t *testing.T) {
 	server := newFakeServerClient(map[string]string{"t1": "running"})
 	metrics := observability.NewMetrics()
 	reg, jobs, sched, pending, _, newReconciler := setupIntegration(t, server, "",
-		WithPendingReportsGauge(metrics.PendingReports))
+		scheduler.WithPendingReportsGauge(metrics.PendingReports))
 	ctx := context.Background()
 
 	claim := json.RawMessage(`{"id":"t1","agent_id":"a1","issue_id":"i1","issue_identifier":"TSI-1","workspace_id":"w1"}`)
@@ -224,7 +223,6 @@ func TestIntegrationCompensatedReportIsQueuedAndDrained(t *testing.T) {
 		})},
 	}
 	rec := newReconciler(objs)
-	WithPendingReports(pending, server)(rec)
 
 	// First round only records the sighting: the daemon gets its window.
 	if err := rec.Reconcile(ctx); err != nil {
@@ -323,7 +321,7 @@ func TestIntegrationStagedReportSurvivesWriteFailure(t *testing.T) {
 	queuePath := filepath.Join(t.TempDir(), "pending-reports")
 	metrics := observability.NewMetrics()
 	reg, jobs, sched, pending, _, newReconciler := setupIntegration(t, server, queuePath,
-		WithPendingReportsGauge(metrics.PendingReports))
+		scheduler.WithPendingReportsGauge(metrics.PendingReports))
 	ctx := context.Background()
 
 	// Break the queue directory: every write now fails (ENOTDIR), exactly
