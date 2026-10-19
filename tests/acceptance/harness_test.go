@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/coder/websocket"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -275,6 +276,13 @@ type upstreamStub struct {
 	// first chunk signals the channel, the rest waits for the gate.
 	forwardStreamed chan struct{}
 	forwardGate     chan struct{}
+	// wsDials counts the C-20 handshake attempts. wsStatus programs the answer
+	// (0 accepts, any other value is written as the rejection status — 403
+	// drives the §1.5 config-error face). wsConns is the live connection per
+	// runtime id, the push face a scenario drives.
+	wsDials  int
+	wsStatus int
+	wsConns  map[string]*websocket.Conn
 }
 
 func newUpstreamStub(t *testing.T) *upstreamStub {
@@ -472,6 +480,36 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		stub.record(r, "/api/tokens/current/renew", body)
 		writeJSON(w, http.StatusOK, map[string]string{"token": "mdt_test"})
 	})
+	// C-20: the server side of the subscription. The default accepts the
+	// handshake; a scenario programs a rejection status (403) to drive the
+	// §1.5 config-error face, and pushes frames through the live connection.
+	mux.HandleFunc("GET /api/daemon/ws", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer mdt_test" {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		stub.mu.Lock()
+		stub.wsDials++
+		status := stub.wsStatus
+		stub.mu.Unlock()
+		if status != 0 && status != http.StatusSwitchingProtocols {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":"rejected"}`))
+			return
+		}
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		runtimeID := r.URL.Query().Get("runtime_ids")
+		stub.mu.Lock()
+		if stub.wsConns == nil {
+			stub.wsConns = map[string]*websocket.Conn{}
+		}
+		stub.wsConns[runtimeID] = conn
+		stub.mu.Unlock()
+		_, _, _ = conn.Read(r.Context()) // hold the stream until the peer leaves
+	})
 	// S29 fidelity probes: the upstream observes what arrived (body digested,
 	// never held) and answers with a non-JSON verdict the proxy must replay
 	// unchanged.
@@ -558,6 +596,45 @@ func (s *upstreamStub) record(r *http.Request, path string, body []byte) {
 	s.requests = append(s.requests, upstreamRequest{
 		Method: r.Method, Path: path, Body: body, Header: r.Header.Clone(), At: time.Now(),
 	})
+}
+
+// wsDialCount counts the C-20 handshake attempts the stub observed.
+func (s *upstreamStub) wsDialCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.wsDials
+}
+
+// setWSStatus programs the WS handshake answer: 0 accepts, any other value is
+// the rejection status (403 = the §1.5 credential/identity mismatch).
+func (s *upstreamStub) setWSStatus(code int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.wsStatus = code
+}
+
+// pushTaskAvailable sends daemon:task_available over the runtime's live
+// connection, the C-20 push the claim loop's wakeup rides on.
+func (s *upstreamStub) pushTaskAvailable(t *testing.T, runtimeID, taskID string) {
+	t.Helper()
+	s.mu.Lock()
+	conn := s.wsConns[runtimeID]
+	s.mu.Unlock()
+	if conn == nil {
+		t.Fatalf("no WS connection for runtime %q", runtimeID)
+	}
+	raw, err := json.Marshal(map[string]any{
+		"type":    "daemon:task_available",
+		"payload": map[string]string{"task_id": taskID},
+	})
+	if err != nil {
+		t.Fatalf("marshal task_available: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := conn.Write(ctx, websocket.MessageText, raw); err != nil {
+		t.Fatalf("push task_available: %v", err)
+	}
 }
 
 // observeForward records one fidelity probe's upstream view; the body is read
@@ -1035,12 +1112,13 @@ func writeJSON(w http.ResponseWriter, code int, v any) {
 type jobClient struct {
 	mu sync.Mutex
 
-	createdJobs    []*batchv1.Job
-	createdSecrets []*corev1.Secret
-	deletedJobs    []string
-	deletedSecrets []string
-	getJobs        []string
-	createJobErr   error
+	createdJobs     []*batchv1.Job
+	createdSecrets  []*corev1.Secret
+	deletedJobs     []string
+	deletedSecrets  []string
+	getJobs         []string
+	createJobErr    error
+	createSecretErr error
 	// onCreateJob runs before a create is answered (scenario setup hooks).
 	onCreateJob func(job *batchv1.Job)
 
@@ -1106,6 +1184,12 @@ func (c *jobClient) GetJob(_ context.Context, name string) (*batchv1.Job, error)
 func (c *jobClient) CreateSecret(_ context.Context, secret *corev1.Secret) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// The injected failure models the apiserver refusing the claim chain's
+	// credential Secret; the pending-report carrier is the queue's durability
+	// face, not an object of that chain, so it keeps working.
+	if c.createSecretErr != nil && secret.Labels[registry.LabelRole] != registry.RolePendingReport {
+		return c.createSecretErr
+	}
 	c.createdSecrets = append(c.createdSecrets, secret)
 	// The list face sees the object too, exactly as the apiserver's does: a
 	// carrier written before a restart is what the rebuilt queue lists.
@@ -1187,6 +1271,18 @@ func (c *jobClient) jobDeleted(name string) bool {
 	defer c.mu.Unlock()
 	for _, deleted := range c.deletedJobs {
 		if deleted == name {
+			return true
+		}
+	}
+	return false
+}
+
+// hasSecret reports whether the Secret still exists on the live list face.
+func (c *jobClient) hasSecret(name string) bool {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	for _, secret := range c.secrets {
+		if secret.Name == name {
 			return true
 		}
 	}
@@ -1653,6 +1749,8 @@ type recordingMetrics struct {
 	forwards         []metricForward
 	tokenUsage       []tokenUsageRecord
 	terminalResults  []string
+	wsConnected      map[string]int
+	wsReconnects     map[string]int
 }
 
 // Forward records one lifecycle forward by endpoint and status code
@@ -1681,9 +1779,48 @@ func (m *recordingMetrics) TokenUsage(provider, model string, input, output, cac
 	})
 }
 
-func (m *recordingMetrics) WSConnect(string)    {}
-func (m *recordingMetrics) WSDisconnect(string) {}
-func (m *recordingMetrics) WSReconnect(string)  {}
+// WSConnect/WSDisconnect track the foreman_ws_connected gauge by side;
+// WSReconnect counts foreman_ws_reconnects_total.
+func (m *recordingMetrics) WSConnect(side string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.wsConnected == nil {
+		m.wsConnected = map[string]int{}
+	}
+	m.wsConnected[side]++
+}
+
+func (m *recordingMetrics) WSDisconnect(side string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.wsConnected == nil {
+		m.wsConnected = map[string]int{}
+	}
+	m.wsConnected[side]--
+}
+
+func (m *recordingMetrics) WSReconnect(side string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.wsReconnects == nil {
+		m.wsReconnects = map[string]int{}
+	}
+	m.wsReconnects[side]++
+}
+
+// wsConnectedCount is the gauge reading for one side.
+func (m *recordingMetrics) wsConnectedCount(side string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.wsConnected[side]
+}
+
+// wsReconnectCount is the reconnect counter for one side.
+func (m *recordingMetrics) wsReconnectCount(side string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return m.wsReconnects[side]
+}
 
 // AuthFailure records the reason the daemon face rejected a request
 // (foreman_auth_failures_total{reason}).
@@ -2225,8 +2362,20 @@ func newHarnessWithRealServer(t *testing.T, catalogEnabled bool) *harness {
 	return newHarnessWithOptions(t, catalogEnabled, deliveryConfirmWindow, nil, true)
 }
 
+// newHarnessWithWS is newHarness with FOREMAN_WS_ENABLED on: the Job-side
+// S-30 route is mounted and the config says so, so a scenario can drive the
+// subscriber and the daemon handshake against the same fixture.
+func newHarnessWithWS(t *testing.T, catalogEnabled bool) *harness {
+	t.Helper()
+	return buildHarness(t, catalogEnabled, deliveryConfirmWindow, nil, false, true)
+}
+
 func newHarnessWithOptions(t *testing.T, catalogEnabled bool, window time.Duration, skill func(*proxy.Config), realServer bool) *harness {
 	t.Helper()
+	return buildHarness(t, catalogEnabled, window, skill, realServer, false)
+}
+
+func buildHarness(t *testing.T, catalogEnabled bool, window time.Duration, skill func(*proxy.Config), realServer, wsEnabled bool) *harness {
 	upstream := newUpstreamStub(t)
 	reg := registry.New(time.Now, registry.WithDeliveryConfirmTimeout(window))
 	probes := registry.NewProbeRegistry()
@@ -2243,7 +2392,7 @@ func newHarnessWithOptions(t *testing.T, catalogEnabled bool, window time.Durati
 		ClaimInterval:        time.Second,
 		ClaimIntervalIdle:    time.Second,
 		LeaseRefreshInterval: time.Second,
-		WSEnabled:            false,
+		WSEnabled:            wsEnabled,
 		ModelCatalogEnabled:  catalogEnabled,
 		ModelCatalogTimeout:  45 * time.Second,
 		ModelCatalogCacheTTL: 6 * time.Hour,
@@ -2331,7 +2480,12 @@ func newHarnessWithOptions(t *testing.T, catalogEnabled bool, window time.Durati
 	bundles := proxy.NewSkillCache(cfg, client, metrics,
 		proxy.WithSkillCacheClock(skillClock.now),
 		proxy.WithSkillCacheLogger(slog.New(slog.NewJSONHandler(handlerLogs, nil))))
-	handler := proxy.NewFakeServer(issuer, reg, sched, client, nil, metrics, proxy.WithProbeRegistry(probes),
+	// The S-30 route exists only with WS enabled, exactly as in cmd/foreman.
+	var wsHandler *proxy.WSHandler
+	if wsEnabled {
+		wsHandler = proxy.NewWSHandler(issuer, reg, metrics)
+	}
+	handler := proxy.NewFakeServer(issuer, reg, sched, client, wsHandler, metrics, proxy.WithProbeRegistry(probes),
 		proxy.WithSkillBundles(bundles),
 		proxy.WithServerLogger(slog.New(slog.NewJSONHandler(handlerLogs, nil)).With("component", "fake-server")))
 	httpServer := httptest.NewServer(handler)
@@ -2350,13 +2504,21 @@ func newHarnessWithOptions(t *testing.T, catalogEnabled bool, window time.Durati
 // config; the seams (registry, job client, builder, probe table) stay.
 func (h *harness) rebuildScheduler(t *testing.T, mutate func(*scheduler.Config)) {
 	t.Helper()
+	h.rebuildSchedulerWithLevel(t, slog.LevelInfo, mutate)
+}
+
+// rebuildSchedulerWithLevel replaces the scheduler with one whose logger emits
+// at level: the job.create_step trace is the debug-only face, so a scenario
+// judging it has to run the handler at debug.
+func (h *harness) rebuildSchedulerWithLevel(t *testing.T, level slog.Level, mutate func(*scheduler.Config)) {
+	t.Helper()
 	cfg := h.schedCfg
 	mutate(&cfg)
 	sched, err := scheduler.New(cfg, h.reg, h.jobs, h.builder, h.serverClient, h.metrics,
 		scheduler.WithPendingReports(h.pending),
 		scheduler.WithRevoker(credentialRevoker(h.revoker)),
 		scheduler.WithProbeRegistry(h.probes),
-		scheduler.WithLogger(slog.New(slog.NewJSONHandler(h.logs, nil))),
+		scheduler.WithLogger(slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: level}))),
 		scheduler.WithRuntimeIdentity(h.client.RuntimeIdentity),
 	)
 	if err != nil {
