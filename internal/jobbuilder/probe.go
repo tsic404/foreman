@@ -103,13 +103,20 @@ func (b *Builder) renderProbe(name, jobRuntimeID string, budget time.Duration) (
 
 // writeProbeDeadline writes the probe's own budget into activeDeadlineSeconds:
 // it is the time the probe was bought for, and the one field Foreman overwrites
-// on a probe beyond the A1 faces (§8.4). A non-positive budget renders none
-// rather than an already-expired deadline.
+// on a probe beyond the A1 faces (§8.4). The field counts whole seconds, so the
+// budget is rounded up — the probe must never be killed before the time it was
+// bought for, and the truncating form rendered a sub-second budget as zero,
+// which is an already-expired deadline (immediate DeadlineExceeded). A
+// non-positive budget renders none and leaves the template's value alone.
 func writeProbeDeadline(job *batchv1.Job, budget time.Duration) {
 	if budget <= 0 {
 		return
 	}
-	job.Spec.ActiveDeadlineSeconds = new(int64(budget / time.Second))
+	seconds := int64(budget / time.Second)
+	if budget%time.Second != 0 {
+		seconds++
+	}
+	job.Spec.ActiveDeadlineSeconds = &seconds
 }
 
 // applyProbeWrites performs the probe's typed writes: the A1.1 env keys, the
