@@ -52,6 +52,10 @@ const (
 	// profile refresh outcomes, both by result.
 	metricWorkspaceStateRefreshes = "foreman_workspace_state_refreshes_total"
 	metricRuntimeProfileRefreshes = "foreman_runtime_profile_refreshes_total"
+	// Policy faces (§9.2): the three axes' hit counts by source, and the
+	// startup name-resolution conclusions.
+	metricPolicyHits            = "foreman_policy_hits_total"
+	metricPolicyNameResolutions = "foreman_policy_name_resolutions_total"
 )
 
 // Terminal result label values (§4.1).
@@ -133,6 +137,19 @@ var workspaceStateResults = []string{"success", "stale_replay", "failed"}
 // failed sequence.
 var runtimeProfileResults = []string{"success", "unchanged", "failed"}
 
+// policyAxes is the foreman_policy_hits_total axis label vocabulary: the three
+// faces the policy renderer writes (§8.2).
+var policyAxes = []string{"resources", "capabilities_add", "node_selector"}
+
+// policySources is the foreman_policy_hits_total source label vocabulary: the
+// policy.applied *_source values (§9.1), so a hit stays distinguishable from
+// the two documented miss shapes.
+var policySources = []string{"direct", "no_definition", "no_identity"}
+
+// policyNameConclusions is the foreman_policy_name_resolutions_total label
+// vocabulary (ADR-035 decision 4).
+var policyNameConclusions = []string{"resolved", "absent", "ambiguous", "unavailable"}
+
 // Metrics is the Prometheus implementation of the designed metric surface
 // (§9.2) plus the recorders for the remaining designed metrics. It owns
 // a private registry — no global state — so a collector panic is contained
@@ -169,6 +186,8 @@ type Metrics struct {
 	skillEvictions     *prometheus.CounterVec
 	workspaceRefreshes *prometheus.CounterVec
 	profileRefreshes   *prometheus.CounterVec
+	policyHits         *prometheus.CounterVec
+	policyResolutions  *prometheus.CounterVec
 
 	// wsMu guards wsJobs, the authoritative side=job connection count; the
 	// gauge is Set from it so a disconnect without a matching connect (e.g.
@@ -308,6 +327,14 @@ func NewMetrics() *Metrics {
 		Name: metricRuntimeProfileRefreshes,
 		Help: "Runtime profile refresh sequences by result.",
 	}, []string{"result"})
+	m.policyHits = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricPolicyHits,
+		Help: "Policy axis evaluations by axis (resources|capabilities_add|node_selector) and source (direct|no_definition|no_identity).",
+	}, []string{"axis", "source"})
+	m.policyResolutions = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricPolicyNameResolutions,
+		Help: "Startup policy name resolutions by conclusion.",
+	}, []string{"conclusion"})
 
 	collectors := []prometheus.Collector{
 		m.tasksTotal, m.taskClaims, m.claimErrors, m.jobBootSeconds,
@@ -317,7 +344,8 @@ func NewMetrics() *Metrics {
 		m.wsConnected, m.wsReconnects, m.heartbeatSuspect,
 		m.credReclaims, m.jobDrainSeconds, m.jobDeleteFailures, m.catalogRelays, m.catalogSeconds,
 		m.skillResolves, m.skillEntries, m.skillBytes, m.skillEvictions,
-		m.workspaceRefreshes, m.profileRefreshes,
+		m.workspaceRefreshes, m.profileRefreshes, m.policyHits,
+		m.policyResolutions,
 	}
 	for _, c := range collectors {
 		m.reg.MustRegister(c)
@@ -364,6 +392,14 @@ func NewMetrics() *Metrics {
 	}
 	for _, result := range runtimeProfileResults {
 		m.profileRefreshes.WithLabelValues(result)
+	}
+	for _, axis := range policyAxes {
+		for _, source := range policySources {
+			m.policyHits.WithLabelValues(axis, source)
+		}
+	}
+	for _, conclusion := range policyNameConclusions {
+		m.policyResolutions.WithLabelValues(conclusion)
 	}
 	return m
 }
@@ -516,4 +552,18 @@ func (m *Metrics) WorkspaceStateRefresh(result string) {
 // RuntimeProfileRefresh records one §1.6 refresh outcome (§9.2).
 func (m *Metrics) RuntimeProfileRefresh(result string) {
 	m.profileRefreshes.WithLabelValues(result).Inc()
+}
+
+// PolicyHit records one policy axis evaluation (§9.2 策略命中): axis is one of
+// resources / capabilities_add / node_selector, source is the policy.applied
+// *_source value (direct / no_definition / no_identity), so a hit and the two
+// miss shapes stay distinguishable.
+func (m *Metrics) PolicyHit(axis, source string) {
+	m.policyHits.WithLabelValues(axis, source).Inc()
+}
+
+// PolicyNameResolution records one startup policy key's conclusion (§9.2
+// 名字解析结论, ADR-035 decision 4).
+func (m *Metrics) PolicyNameResolution(conclusion string) {
+	m.policyResolutions.WithLabelValues(conclusion).Inc()
 }

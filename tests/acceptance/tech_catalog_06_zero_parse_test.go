@@ -72,7 +72,9 @@ func TestCatalog06ZeroParseNegative(t *testing.T) {
 	}
 
 	// Check 2 — metrics: no derived label. The outcome counter is labelled by
-	// the C21 status alone, the span histogram by bucket bounds alone.
+	// the C21 status alone, the span histogram by bucket bounds alone; a
+	// report-body field name may not appear on those families (other families
+	// carry their own designed vocabularies, e.g. the policy axis label).
 	exposition := scrapeMetrics(t, metrics)
 	for _, family := range []string{"foreman_model_catalog_relays_total", "foreman_model_catalog_seconds"} {
 		for _, labels := range seriesLabelNames(t, exposition, family) {
@@ -80,10 +82,15 @@ func TestCatalog06ZeroParseNegative(t *testing.T) {
 				t.Errorf("%s series carries labels %v, want the status code or the bucket bound only", family, labels)
 			}
 		}
-	}
-	for _, marker := range bodyFieldMarkers {
-		if strings.Contains(exposition, marker) {
-			t.Errorf("the metrics exposition carries the report-body field name %q: %s", marker, exposition)
+		for _, line := range strings.Split(exposition, "\n") {
+			if line == "" || strings.HasPrefix(line, "#") || !strings.HasPrefix(line, family) {
+				continue
+			}
+			for _, marker := range bodyFieldMarkers {
+				if strings.Contains(line, marker) {
+					t.Errorf("%s series carries the report-body field name %q: %s", family, marker, line)
+				}
+			}
 		}
 	}
 
