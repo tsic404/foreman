@@ -268,6 +268,12 @@ type upstreamStub struct {
 	skillGate   chan struct{}
 	// ackShape shapes the heartbeat ack's runtime_id field.
 	ackShape ackRuntimeIDShape
+	// taskStatuses is the C13 answer per task (an absent key is a 404, the
+	// shape a task the server no longer holds produces).
+	taskStatuses map[string]string
+	// gcStatus/gcBody are the S-20 answer (default 404).
+	gcStatus int
+	gcBody   []byte
 	requests []upstreamRequest
 	server   *httptest.Server
 	// forwardProbes records the S29 fidelity probe's upstream view.
@@ -297,6 +303,9 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		models:               map[string]*modelCommand{},
 		skillStatus:          200,
 		skillBody:            []byte(`{"bundles":[]}`),
+		taskStatuses:         map[string]string{},
+		gcStatus:             http.StatusNotFound,
+		gcBody:               []byte(`{"error":"not found"}`),
 		registerStatus:       http.StatusOK,
 		profilesStatus:       http.StatusOK,
 		profilesBody:         []byte(`{"workspace_id":"ws-1","runtime_profiles":[]}`),
@@ -510,6 +519,45 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		stub.mu.Unlock()
 		_, _, _ = conn.Read(r.Context()) // hold the stream until the peer leaves
 	})
+	// C13: the daemon's status poll. An unprogrammed task is a 404 — the same
+	// answer the server gives for a task it no longer holds.
+	mux.HandleFunc("GET /api/daemon/tasks/{tid}/status", func(w http.ResponseWriter, r *http.Request) {
+		stub.record(r, r.URL.Path, nil)
+		stub.mu.Lock()
+		status, ok := stub.taskStatuses[r.PathValue("tid")]
+		stub.mu.Unlock()
+		if !ok {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "task not found"})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]string{"status": status})
+	})
+	// S-20: the gc-check query the daemon's GC path calls. Programmable so a
+	// carrier scenario can assert status and bytes travel verbatim.
+	mux.HandleFunc("GET /api/daemon/tasks/{tid}/gc-check", func(w http.ResponseWriter, r *http.Request) {
+		stub.record(r, r.URL.Path, nil)
+		stub.mu.Lock()
+		status, body := stub.gcStatus, append([]byte(nil), stub.gcBody...)
+		stub.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = w.Write(body)
+	})
+	// S-23: the caller-credential forward paths. The answer is fixed so the
+	// census scenario can assert the upstream's own status, header and body
+	// reach the daemon unchanged.
+	faceAnswer := func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		stub.record(r, r.URL.Path, body)
+		w.Header().Set("X-Face-Upstream", "kept")
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusTeapot)
+		_, _ = w.Write([]byte(`{"credential_header":"x","credential":"v","x_future_field":true}`))
+	}
+	mux.HandleFunc("GET /api/daemon/tasks/{tid}/plugin-hooks", faceAnswer)
+	mux.HandleFunc("POST /api/daemon/tasks/{tid}/plugin-hooks", faceAnswer)
+	mux.HandleFunc("GET /api/daemon/tasks/{tid}/plugin-mcp/{cid}/credential", faceAnswer)
+	mux.HandleFunc("GET /api/daemon/tasks/{tid}/remote-mcp/{cid}/credential", faceAnswer)
 	// S29 fidelity probes: the upstream observes what arrived (body digested,
 	// never held) and answers with a non-JSON verdict the proxy must replay
 	// unchanged.
@@ -588,6 +636,28 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 	t.Cleanup(server.Close)
 	stub.server = server
 	return stub
+}
+
+// all snapshots every call the stub observed, in arrival order. It is the
+// denominator of "this route never reached the upstream".
+func (s *upstreamStub) all() []upstreamRequest {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]upstreamRequest(nil), s.requests...)
+}
+
+// setTaskStatus programs the C13 answer for one task.
+func (s *upstreamStub) setTaskStatus(taskID, status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.taskStatuses[taskID] = status
+}
+
+// setGCCheck programs the S-20 answer.
+func (s *upstreamStub) setGCCheck(status int, body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.gcStatus, s.gcBody = status, []byte(body)
 }
 
 func (s *upstreamStub) record(r *http.Request, path string, body []byte) {
@@ -1119,6 +1189,9 @@ type jobClient struct {
 	getJobs         []string
 	createJobErr    error
 	createSecretErr error
+	// deleteSecretErr makes the next Secret deletion fail (the reclaim's
+	// retry face): the entry must survive as the retry handle.
+	deleteSecretErr error
 	// onCreateJob runs before a create is answered (scenario setup hooks).
 	onCreateJob func(job *batchv1.Job)
 
@@ -1170,6 +1243,14 @@ func (c *jobClient) DeleteJob(_ context.Context, name string) error {
 	return nil
 }
 
+// setDeleteSecretError programs the next Secret deletion to fail (nil clears
+// it): the reclaim's retry face.
+func (c *jobClient) setDeleteSecretError(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deleteSecretErr = err
+}
+
 func (c *jobClient) GetJob(_ context.Context, name string) (*batchv1.Job, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1200,6 +1281,9 @@ func (c *jobClient) CreateSecret(_ context.Context, secret *corev1.Secret) error
 func (c *jobClient) DeleteSecret(_ context.Context, name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.deleteSecretErr != nil {
+		return c.deleteSecretErr
+	}
 	c.deletedSecrets = append(c.deletedSecrets, name)
 	// As on the Job side: a deleted object leaves the list face, or a sweep that
 	// reads the list again would find what it just removed.

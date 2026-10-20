@@ -129,6 +129,11 @@ func TestForward05PendingCarrierSurvivesForemanRestart(t *testing.T) {
 		t.Fatalf("accepted complete writes = %d, want exactly 1", got)
 	}
 	forwards := h.server.forwarded(scheduler.EPComplete)
+	// acceptedFor counts settled writes; the forward count is what catches a
+	// duplicate replay of the same terminal.
+	if got := len(forwards); got != 2 {
+		t.Fatalf("complete forwards = %d, want 2 (the failed report and its one replay)", got)
+	}
 	if last := forwards[len(forwards)-1]; !bytes.Equal(last.Body, report) {
 		t.Fatalf("replayed body = %s, want the enqueued %s", last.Body, report)
 	}
@@ -190,6 +195,9 @@ func TestForward05CarrierListFailureEmitsNoSyntheticTerminal(t *testing.T) {
 	if got := h.server.acceptedFor(scheduler.EPComplete); got != 0 {
 		t.Fatalf("terminal writes during the list window = %d, want 0", got)
 	}
+	if got := len(h.server.forwarded(scheduler.EPComplete)); got != 1 {
+		t.Fatalf("complete forwards during the list window = %d, want the one failed report", got)
+	}
 	if events := h.events("task.failed_compensated"); len(events) != 0 {
 		t.Fatalf("synthesized failure events = %d, want none", len(events))
 	}
@@ -212,6 +220,9 @@ func TestForward05CarrierListFailureEmitsNoSyntheticTerminal(t *testing.T) {
 	}
 	if got := h.server.acceptedFor(scheduler.EPComplete); got != 1 {
 		t.Fatalf("accepted complete writes = %d, want exactly 1", got)
+	}
+	if got := len(h.server.forwarded(scheduler.EPComplete)); got != 2 {
+		t.Fatalf("complete forwards after the list recovered = %d, want 2 (the failed report and its one replay)", got)
 	}
 	if !h.jobs.jobDeleted("fm-task-1") {
 		t.Fatal("the Job must be deleted after the replay landed")
@@ -288,6 +299,11 @@ func TestForward05ReplayedFailureKeepsItsAttribution(t *testing.T) {
 		t.Fatalf("accepted fail writes = %d, want exactly 1", got)
 	}
 	forwards := h.server.forwarded(scheduler.EPFail)
+	// acceptedFor counts settled writes; the forward count is what catches a
+	// duplicate replay of the same terminal.
+	if got := len(forwards); got != 2 {
+		t.Fatalf("fail forwards = %d, want 2 (the failed report and its one replay)", got)
+	}
 	if last := forwards[len(forwards)-1]; !bytes.Equal(last.Body, enqueued) {
 		t.Fatalf("replayed body = %s, want the enqueued %s", last.Body, enqueued)
 	}
@@ -373,6 +389,9 @@ func TestForward05RegistrationRefusedDuringCarrierListFailureSettlesNothing(t *t
 	if got := len(h.server.forwarded(scheduler.EPFail)); got != 0 {
 		t.Fatalf("synthesized fail forwards = %d, want none", got)
 	}
+	if got := len(h.server.forwarded(scheduler.EPComplete)); got != 1 {
+		t.Fatalf("complete forwards during the list window = %d, want the one failed report", got)
+	}
 	if got := len(h.jobs.carrierSecrets()); got != 1 {
 		t.Fatalf("carriers = %d, want the unsettled one kept", got)
 	}
@@ -400,6 +419,9 @@ func TestForward05RegistrationRefusedDuringCarrierListFailureSettlesNothing(t *t
 	}
 	if got := h.server.acceptedFor(scheduler.EPComplete); got != 1 {
 		t.Fatalf("accepted complete writes = %d, want exactly 1", got)
+	}
+	if got := len(h.server.forwarded(scheduler.EPComplete)); got != 2 {
+		t.Fatalf("complete forwards after the list recovered = %d, want 2 (the failed report and its one replay)", got)
 	}
 	if got := len(h.server.forwarded(scheduler.EPFail)); got != 0 {
 		t.Fatalf("synthesized fail forwards = %d, want none", got)

@@ -170,11 +170,12 @@ func (s *FakeServer) routes() {
 	handleFn("/api/", s.handleNotFound)
 }
 
-// registeredPatterns returns the patterns routes() registered, in order. It
-// is the read side of the daemon-face census (protocol_test.go): the census
-// asserts this set against the pinned upstream daemon API, so an undeclared
-// local route is a test failure rather than a silent addition to the face.
-func (s *FakeServer) registeredPatterns() []string {
+// RegisteredPatterns returns the patterns routes() registered, in order. It is
+// the read side of the daemon-face census: the in-package unit test and the
+// acceptance suite's AC-59 scenario both assert this set against the declared
+// upstream routes, so an undeclared local route is a test failure rather than a
+// silent addition to the face.
+func (s *FakeServer) RegisteredPatterns() []string {
 	return append([]string(nil), s.registered...)
 }
 

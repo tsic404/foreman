@@ -109,6 +109,11 @@ func TestForward02TerminalReportSurvivesTheUpstreamOutage(t *testing.T) {
 		t.Fatalf("accepted complete writes = %d, want exactly 1", got)
 	}
 	forwards := h.server.forwarded(scheduler.EPComplete)
+	// acceptedFor counts settled writes, so a duplicate replay is invisible
+	// there; the forward count is the face that catches it.
+	if got := len(forwards); got != 2 {
+		t.Fatalf("complete forwards = %d, want 2 (the failed report and its one replay)", got)
+	}
 	last := forwards[len(forwards)-1]
 	if !bytes.Equal(last.Body, report) {
 		t.Fatalf("delivered body = %s, want the daemon's %s", last.Body, report)
