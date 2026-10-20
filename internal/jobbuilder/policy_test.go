@@ -43,6 +43,20 @@ func loadPolicy(t *testing.T, manifest string) (Policy, *strings.Builder) {
 	return policy, logs
 }
 
+// loadPolicyWithResolver loads one policy file with the platform name
+// resolution seam installed, so resolved project keys produce the runtime
+// identifier index.
+func loadPolicyWithResolver(t *testing.T, manifest string, resolver PolicyNameResolver) (Policy, *strings.Builder) {
+	t.Helper()
+	cfg, logs := policyConfig(t, manifest)
+	cfg.NameResolver = resolver
+	policy, err := LoadPolicy(cfg)
+	if err != nil {
+		t.Fatalf("LoadPolicy: %v", err)
+	}
+	return policy, logs
+}
+
 // TestLoadPolicyMissingFileIsLegalDefault: an absent policy file is not an
 // error — all three axes read None — but it is not silent either: the warn and
 // the declaration sentence are the deployment's only signal that no axis is
@@ -184,22 +198,32 @@ projects:
 }
 
 // resolutionStub answers the startup name resolution from a fixed table and
-// records every key it was asked about.
+// records every key it was asked about. A resolved project key gets
+// "id:"+name unless the test names another identifier.
 type resolutionStub struct {
 	conclusions map[string]NameConclusion
+	identifiers map[string]string
 	err         error
 	calls       []string
 }
 
-func (s *resolutionStub) ResolveName(_ context.Context, kind, name string) (NameConclusion, error) {
+func (s *resolutionStub) ResolveName(_ context.Context, kind, name string) (NameResolution, error) {
 	s.calls = append(s.calls, kind+":"+name)
 	if s.err != nil {
-		return "", s.err
+		return NameResolution{}, s.err
 	}
-	if conclusion, ok := s.conclusions[name]; ok {
-		return conclusion, nil
+	conclusion := NameResolved
+	if c, ok := s.conclusions[name]; ok {
+		conclusion = c
 	}
-	return NameResolved, nil
+	identifier := ""
+	if kind == PolicyKeyProject && conclusion == NameResolved {
+		identifier = "id:" + name
+		if id, ok := s.identifiers[name]; ok {
+			identifier = id
+		}
+	}
+	return NameResolution{Conclusion: conclusion, Identifier: identifier}, nil
 }
 
 // TestLoadPolicyNameResolution: the four conclusions per key. absent and
@@ -304,6 +328,87 @@ projects:
 	})
 }
 
+// TestLoadPolicyProjectIdentifierIndex: the project section is matched
+// through the startup name → identifier index (ADR-048 decision 2/3), so the
+// configured name never selects a definition at runtime; two keys resolving to
+// one identifier refuse startup, and a resolved answer without an identifier
+// degrades to the documented unavailable class.
+func TestLoadPolicyProjectIdentifierIndex(t *testing.T) {
+	const manifest = `
+agents:
+  omp:
+    resourcePolicy: project
+projects:
+  rffmpeg:
+    resources:
+      limits: { gpu.intel.com/i915: "1" }
+`
+	t.Run("resolved name hits only through its identifier", func(t *testing.T) {
+		policy, _ := loadPolicyWithResolver(t, manifest, &resolutionStub{
+			identifiers: map[string]string{"rffmpeg": "proj-rffmpeg"},
+		})
+		if _, ok := policy.projectsByID["proj-rffmpeg"]; !ok {
+			t.Fatalf("project index entries = %v, want proj-rffmpeg", policy.projectsByID)
+		}
+		hit := policy.Evaluate(TaskEntry{TaskID: testTaskID, AgentName: "omp", ProjectID: "proj-rffmpeg"})
+		if hit.resourceSource != SourceDirect || hit.resources == nil {
+			t.Errorf("identifier identity = %s/%+v, want direct with the definition", hit.resourceSource, hit.resources)
+		}
+		byName := policy.Evaluate(TaskEntry{TaskID: testTaskID, AgentName: "omp", ProjectID: "rffmpeg"})
+		if byName.resourceSource != SourceNoDefinition || byName.resources != nil {
+			t.Errorf("name identity = %s/%+v, want no_definition: the name is not a runtime key",
+				byName.resourceSource, byName.resources)
+		}
+	})
+
+	t.Run("two keys resolving to one identifier refuse startup", func(t *testing.T) {
+		const two = `
+agents:
+  omp:
+    resourcePolicy: project
+projects:
+  first:
+    resources: { limits: { cpu: "1" } }
+  second:
+    resources: { limits: { cpu: "2" } }
+`
+		cfg, logs := policyConfig(t, two)
+		cfg.NameResolver = &resolutionStub{identifiers: map[string]string{
+			"first": "same-project", "second": "same-project",
+		}}
+		_, err := LoadPolicy(cfg)
+		if !errors.Is(err, ErrInvalidPolicy) {
+			t.Fatalf("LoadPolicy error = %v, want ErrInvalidPolicy", err)
+		}
+		if !strings.Contains(logs.String(), "same-project") {
+			t.Errorf("the refusal must name the shared identifier:\n%s", logs.String())
+		}
+	})
+
+	t.Run("resolved project without an identifier degrades to unavailable", func(t *testing.T) {
+		stub := &resolutionStub{conclusions: map[string]NameConclusion{"rffmpeg": NameResolved}}
+		// Drop the stub's default identifier to model a malformed platform
+		// answer.
+		policy, logs := loadPolicyWithResolver(t, manifest, noIdentifierProjectResolver{stub})
+		if len(policy.projectsByID) != 0 {
+			t.Errorf("project index = %v, want none without an identifier", policy.projectsByID)
+		}
+		if !strings.Contains(logs.String(), `"conclusion":"unavailable"`) {
+			t.Errorf("a resolved answer without an identifier must read unavailable:\n%s", logs.String())
+		}
+	})
+}
+
+// noIdentifierProjectResolver strips a project key's identifier, modelling a
+// platform answer that says resolved but carries no identity.
+type noIdentifierProjectResolver struct{ inner *resolutionStub }
+
+func (r noIdentifierProjectResolver) ResolveName(ctx context.Context, kind, name string) (NameResolution, error) {
+	resolution, err := r.inner.ResolveName(ctx, kind, name)
+	resolution.Identifier = ""
+	return resolution, err
+}
+
 // TestPolicyEvaluateAxes: the three tiers, their merge rules, the miss sources
 // and the identity precedence — one table over the axes this change owns.
 func TestPolicyEvaluateAxes(t *testing.T) {
@@ -332,10 +437,14 @@ projects:
       add: ["SYS_ADMIN", "DAC_OVERRIDE"]
     nodeSelector: { kubernetes.io/os: linux, disktype: hdd }
 `
-	policy, _ := loadPolicy(t, manifest)
+	policy, _ := loadPolicyWithResolver(t, manifest, &resolutionStub{})
+	projectID := "id:foreman"
+	if _, ok := policy.projectsByID[projectID]; !ok {
+		t.Fatal("the resolved project key produced no runtime index entry")
+	}
 
 	t.Run("projectWithAgent merges with the agent winning", func(t *testing.T) {
-		ev := policy.Evaluate(TaskEntry{TaskID: testTaskID, AgentName: "omp", ProjectName: "foreman", ProjectSource: ProjectSourcePayload})
+		ev := policy.Evaluate(TaskEntry{TaskID: testTaskID, AgentName: "omp", ProjectID: projectID, ProjectSource: ProjectSourcePayload})
 		if ev.resourcePolicy != AxisProjectWithAgent || ev.resourceSource != SourceDirect {
 			t.Fatalf("resource axis = %s/%s, want projectWithAgent/direct", ev.resourcePolicy, ev.resourceSource)
 		}
@@ -383,7 +492,7 @@ projects:
 	})
 
 	t.Run("projectWithAgent with one side present takes that side", func(t *testing.T) {
-		ev := policy.Evaluate(TaskEntry{TaskID: testTaskID, AgentName: "omp", ProjectName: "unlisted"})
+		ev := policy.Evaluate(TaskEntry{TaskID: testTaskID, AgentName: "omp", ProjectID: "not-in-the-index"})
 		if ev.nodeSelectorSource != SourceDirect {
 			t.Errorf("nodeSelector axis = %s, want direct (the agent side exists)", ev.nodeSelectorSource)
 		}
@@ -393,7 +502,7 @@ projects:
 	})
 
 	t.Run("projectWithAgent with neither side present is a miss", func(t *testing.T) {
-		ev := policy.Evaluate(TaskEntry{TaskID: testTaskID, AgentName: "plain", ProjectName: "foreman"})
+		ev := policy.Evaluate(TaskEntry{TaskID: testTaskID, AgentName: "plain", ProjectID: projectID})
 		if ev.capSource != SourceNoDefinition {
 			t.Errorf("cap source = %s, want no_definition", ev.capSource)
 		}
@@ -419,7 +528,7 @@ projects:
 	})
 
 	t.Run("unlisted agent keeps every tier None", func(t *testing.T) {
-		ev := policy.Evaluate(TaskEntry{TaskID: testTaskID, AgentName: "ghost", ProjectName: "foreman"})
+		ev := policy.Evaluate(TaskEntry{TaskID: testTaskID, AgentName: "ghost", ProjectID: projectID})
 		if ev.resourcePolicy != AxisNone || ev.capPolicy != AxisNone || ev.nodeSelectorPolicy != AxisNone {
 			t.Errorf("tiers = %s/%s/%s, want None/None/None", ev.resourcePolicy, ev.capPolicy, ev.nodeSelectorPolicy)
 		}
@@ -432,14 +541,14 @@ projects:
 	})
 
 	t.Run("agent identity unavailable", func(t *testing.T) {
-		ev := policy.Evaluate(TaskEntry{TaskID: testTaskID, ProjectName: "foreman"})
+		ev := policy.Evaluate(TaskEntry{TaskID: testTaskID, ProjectID: projectID})
 		if ev.capSource != SourceNoIdentity {
 			t.Errorf("cap source = %s, want no_identity without an agent name", ev.capSource)
 		}
 	})
 
 	t.Run("keys compare by exact equality", func(t *testing.T) {
-		ev := policy.Evaluate(TaskEntry{TaskID: testTaskID, AgentName: "OMP", ProjectName: "foreman"})
+		ev := policy.Evaluate(TaskEntry{TaskID: testTaskID, AgentName: "OMP", ProjectID: projectID})
 		if ev.capPolicy != AxisNone || len(ev.capabilityAdd) != 0 {
 			t.Errorf("a case variant hit the agent row: %s/%v", ev.capPolicy, ev.capabilityAdd)
 		}

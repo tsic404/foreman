@@ -73,7 +73,22 @@ const (
 	NameUnavailable NameConclusion = "unavailable"
 )
 
-// PolicyNameResolver is the platform-side seam ADR-035 leaves to the platform
+// Policy sections: the two keyspaces a policy table carries (§8.5).
+const (
+	PolicyKeyAgent   = "agent"
+	PolicyKeyProject = "project"
+)
+
+// NameResolution is one key's startup answer. Identifier is the platform's
+// opaque project identity, set only for a resolved project key: the project
+// section's definitions are matched on it at runtime, never on the name
+// (ADR-048 decision 2/3).
+type NameResolution struct {
+	Conclusion NameConclusion
+	Identifier string
+}
+
+// PolicyNameResolver is the platform-side seam ADR-048 leaves to the platform
 // (02-contracts.md §8.5: the query's shape is a platform contract).
 // Foreman calls it once per key at startup, never again: a nil resolver means
 // the platform offers no such query, so every key concludes unavailable and
@@ -82,7 +97,7 @@ type PolicyNameResolver interface {
 	// ResolveName reports what the platform's authority says about a policy
 	// key. An error means unreachable or no such query — the caller maps it to
 	// unavailable; it never becomes a startup refusal.
-	ResolveName(ctx context.Context, kind, name string) (NameConclusion, error)
+	ResolveName(ctx context.Context, kind, name string) (NameResolution, error)
 }
 
 // Axis sources: the evaluation outcome of one axis
@@ -108,10 +123,15 @@ const (
 )
 
 // Policy is the startup-parsed policy table: read-only, shared by every Build,
-// never reloaded while the process lives (ADR-035 decision 7).
+// never reloaded while the process lives (ADR-035 decision 7). projects stays
+// keyed by the configured name (startup logs and dead-definition warnings name
+// it); projectsByID is the runtime index the project section is selected
+// through — the platform project identity resolved once at startup (ADR-048
+// decision 2/3).
 type Policy struct {
-	agents   map[string]agentEntry
-	projects map[string]projectEntry
+	agents       map[string]agentEntry
+	projects     map[string]projectEntry
+	projectsByID map[string]projectEntry
 }
 
 // agentEntry is one agent's row: the three tiers plus that agent's own
@@ -276,7 +296,7 @@ func LoadPolicy(cfg Config) (Policy, error) {
 		return Policy{}, err
 	}
 
-	if err := resolvePolicyNames(cfg, policy, log); err != nil {
+	if err := resolvePolicyNames(cfg, &policy, log); err != nil {
 		log.Error("job policy name resolution refused startup",
 			"policy", path, "err", err.Error(), "declaration", policyEffectStatement)
 		return Policy{}, err
@@ -461,28 +481,42 @@ func parseCapabilities(field string, raw *fileCapabilities) (*capabilityDefiniti
 	return &capabilityDefinition{add: append([]string(nil), raw.Add...)}, nil
 }
 
-// resolvePolicyNames performs the startup name resolution (ADR-035 decision 4):
+// resolvePolicyNames performs the startup name resolution (ADR-048 decision 2):
 // one attempt per key, inside one bounded window, with the conclusion of every
 // key recorded as a policy.name_resolution event and counted by conclusion
-// (§9.2). absent and ambiguous refuse startup; unavailable only warns — the
-// runtime comparison stays exact-match on names, and nothing is cached or
+// (§9.1/§9.2). A resolved project key contributes its platform project
+// identifier to the runtime index; a resolved agent key is only a startup
+// check (the runtime match stays exact-name). absent and ambiguous refuse
+// startup, and so do two project keys that resolve to the same identifier (one
+// project's definitions would have two possible rows). unavailable only warns:
+// the agent section still matches by name and the project section reads as no
+// definition, with no fallback to name matching. Nothing is cached or
 // refreshed.
-func resolvePolicyNames(cfg Config, policy Policy, log logger) error {
-	keys := sortedPolicyKeys(policy)
+func resolvePolicyNames(cfg Config, policy *Policy, log logger) error {
+	keys := sortedPolicyKeys(*policy)
 	if len(keys) == 0 {
 		return nil
 	}
 	resolver := cfg.NameResolver
 	deadline := time.Now().Add(cfg.policyNameResolutionWindow())
 	var refusals []string
+	resolvedProjects := make(map[string]projectEntry, len(policy.projects))
+	owners := make(map[string]string, len(policy.projects))
 	for _, key := range keys {
-		conclusion, err := resolveOneName(cfg, resolver, deadline, key)
+		resolution, err := resolveOneName(cfg, resolver, deadline, key)
+		conclusion := resolution.Conclusion
+		// A resolved project key without an identifier cannot be matched at
+		// runtime; it is a malformed platform answer, which reads as the
+		// documented unavailable degradation rather than a silent empty index.
+		if conclusion == NameResolved && key.kind == PolicyKeyProject && resolution.Identifier == "" {
+			conclusion = NameUnavailable
+		}
 		cfg.metrics().PolicyNameResolution(string(conclusion))
 		fields := []any{"kind", key.kind, "name", key.name, "conclusion", string(conclusion)}
-		if conclusion == NameUnavailable {
-			log.Warn("policy.name_resolution", fields...)
-		} else {
+		if conclusion == NameResolved {
 			log.Info("policy.name_resolution", fields...)
+		} else {
+			log.Warn("policy.name_resolution", fields...)
 		}
 		if err != nil {
 			// The window is exhausted: every remaining key reads unavailable
@@ -493,12 +527,24 @@ func resolvePolicyNames(cfg Config, policy Policy, log logger) error {
 		switch conclusion {
 		case NameAbsent, NameAmbiguous:
 			refusals = append(refusals, fmt.Sprintf("%s %q: %s", key.kind, key.name, conclusion))
+		case NameResolved:
+			if key.kind != PolicyKeyProject {
+				continue
+			}
+			if owner, taken := owners[resolution.Identifier]; taken {
+				refusals = append(refusals, fmt.Sprintf("project %q and %q resolve to the same identifier %q",
+					owner, key.name, resolution.Identifier))
+				continue
+			}
+			owners[resolution.Identifier] = key.name
+			resolvedProjects[resolution.Identifier] = policy.projects[key.name]
 		}
 	}
 	if len(refusals) > 0 {
 		return fmt.Errorf("%w: platform name resolution refused: %s",
 			ErrInvalidPolicy, strings.Join(refusals, "; "))
 	}
+	policy.projectsByID = resolvedProjects
 	return nil
 }
 
@@ -513,10 +559,10 @@ type policyKey struct {
 func sortedPolicyKeys(policy Policy) []policyKey {
 	keys := make([]policyKey, 0, len(policy.agents)+len(policy.projects))
 	for name := range policy.agents {
-		keys = append(keys, policyKey{kind: "agent", name: name})
+		keys = append(keys, policyKey{kind: PolicyKeyAgent, name: name})
 	}
 	for name := range policy.projects {
-		keys = append(keys, policyKey{kind: "project", name: name})
+		keys = append(keys, policyKey{kind: PolicyKeyProject, name: name})
 	}
 	sort.Slice(keys, func(i, j int) bool {
 		if keys[i].kind != keys[j].kind {
@@ -530,27 +576,27 @@ func sortedPolicyKeys(policy Policy) []policyKey {
 // resolveOneName resolves one key inside the batch window; a nil resolver (no
 // platform query, or a window already exhausted) concludes unavailable without
 // an error.
-func resolveOneName(cfg Config, resolver PolicyNameResolver, deadline time.Time, key policyKey) (NameConclusion, error) {
+func resolveOneName(cfg Config, resolver PolicyNameResolver, deadline time.Time, key policyKey) (NameResolution, error) {
 	if resolver == nil {
-		return NameUnavailable, nil
+		return NameResolution{Conclusion: NameUnavailable}, nil
 	}
 	remaining := time.Until(deadline)
 	if remaining <= 0 {
-		return NameUnavailable, errors.New("policy name resolution window exhausted")
+		return NameResolution{Conclusion: NameUnavailable}, errors.New("policy name resolution window exhausted")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), remaining)
 	defer cancel()
-	conclusion, err := resolver.ResolveName(ctx, key.kind, key.name)
+	resolution, err := resolver.ResolveName(ctx, key.kind, key.name)
 	if err != nil {
 		cfg.logger().Warn("policy name resolution unavailable",
 			"kind", key.kind, "name", key.name, "err", err.Error())
-		return NameUnavailable, nil
+		return NameResolution{Conclusion: NameUnavailable}, nil
 	}
-	switch conclusion {
+	switch resolution.Conclusion {
 	case NameResolved, NameAbsent, NameAmbiguous, NameUnavailable:
-		return conclusion, nil
+		return resolution, nil
 	default:
-		return NameUnavailable, nil
+		return NameResolution{Conclusion: NameUnavailable}, nil
 	}
 }
 
@@ -608,14 +654,17 @@ func reachesProjectDefinition(policy Policy) bool {
 	return false
 }
 
-// Evaluate resolves the three axes for one task (ADR-035 decisions 1/2/5/6):
-// each axis selects its definition source by its own tier, compares names by
-// equality, merges projectWithAgent pairs, and reports a source even when
-// nothing is injected — the policy.applied event is the sole observable face of
-// the silent degradation cases.
+// Evaluate resolves the three axes for one task (ADR-048 decisions 1/2/3,
+// ADR-035 decisions 1/5/6): each axis selects its definition source by its own
+// tier, merges projectWithAgent pairs, and reports a source even when nothing
+// is injected — the policy.applied event is the sole observable face of the
+// silent degradation cases. The project section is selected through the startup
+// name → identifier index, so an identity that is not in it (including a
+// process whose platform resolution was unavailable) reads as no definition
+// for the project side; the name is never compared at runtime.
 func (p Policy) Evaluate(e TaskEntry) Evaluation {
 	agent, agentListed := p.agents[e.AgentName]
-	project := p.projects[e.ProjectName]
+	project := p.projectsByID[e.ProjectID]
 
 	ev := Evaluation{
 		projectSource: e.ProjectSource,
@@ -634,8 +683,8 @@ func (p Policy) Evaluate(e TaskEntry) Evaluation {
 	ev.nodeSelectorPolicy = tierFor(agentListed, agent.nodeSelectorPolicy)
 
 	identity := axisIdentity{
-		agentName:   e.AgentName,
-		projectName: e.ProjectName,
+		agentName: e.AgentName,
+		projectID: e.ProjectID,
 	}
 
 	// An empty agent name leaves the agent's row unreachable, so no axis
@@ -664,11 +713,13 @@ func (p Policy) Evaluate(e TaskEntry) Evaluation {
 	return ev
 }
 
-// axisIdentity is what one axis may read from the task: the two identity names
-// its tiers key on. An absent name is the axis's identity-unavailable face.
+// axisIdentity is what one axis may read from the task: the agent name its
+// agent tiers key on and the platform project identifier its project tiers
+// match through the startup index. An absent value is the axis's
+// identity-unavailable face.
 type axisIdentity struct {
-	agentName   string
-	projectName string
+	agentName string
+	projectID string
 }
 
 // tierFor reads a listed agent's tier; an agent that is absent from the table
@@ -687,7 +738,7 @@ func resolveResourceAxis(tier AxisPolicy, agentDef, projectDef *resourceDefiniti
 	source string, value *corev1.ResourceRequirements, overridden []string) {
 	switch tier {
 	case AxisProject:
-		if id.projectName == "" {
+		if id.projectID == "" {
 			return SourceNoIdentity, nil, nil
 		}
 		if projectDef.empty() {
@@ -704,9 +755,9 @@ func resolveResourceAxis(tier AxisPolicy, agentDef, projectDef *resourceDefiniti
 		return SourceDirect, agentResources(agentDef), nil
 	case AxisProjectWithAgent:
 		// Identity unavailability outranks single-side use (ADR-035
-		// decision 5): without the project name the project tier cannot be
+		// decision 5): without the project identity the project tier cannot be
 		// honoured, so the axis degrades instead of reading the agent's side.
-		if id.projectName == "" {
+		if id.projectID == "" {
 			return SourceNoIdentity, nil, nil
 		}
 		merged, keys := mergeResources(projectDef, agentDef)
@@ -725,7 +776,7 @@ func resolveCapabilityAxis(tier AxisPolicy, agentDef, projectDef *capabilityDefi
 	source string, add []string, overridden []string) {
 	switch tier {
 	case AxisProject:
-		if id.projectName == "" {
+		if id.projectID == "" {
 			return SourceNoIdentity, nil, nil
 		}
 		if projectDef.empty() {
@@ -741,7 +792,7 @@ func resolveCapabilityAxis(tier AxisPolicy, agentDef, projectDef *capabilityDefi
 		}
 		return SourceDirect, append([]string(nil), agentDef.add...), nil
 	case AxisProjectWithAgent:
-		if id.projectName == "" {
+		if id.projectID == "" {
 			return SourceNoIdentity, nil, nil
 		}
 		merged, keys := mergeCapabilities(projectDef, agentDef)
@@ -761,7 +812,7 @@ func resolveNodeSelectorAxis(tier AxisPolicy, agentDef, projectDef map[string]st
 	source string, value map[string]string, overridden []string) {
 	switch tier {
 	case AxisProject:
-		if id.projectName == "" {
+		if id.projectID == "" {
 			return SourceNoIdentity, nil, nil
 		}
 		if emptyNodeSelector(projectDef) {
@@ -777,7 +828,7 @@ func resolveNodeSelectorAxis(tier AxisPolicy, agentDef, projectDef map[string]st
 		}
 		return SourceDirect, copyNodeSelector(agentDef), nil
 	case AxisProjectWithAgent:
-		if id.projectName == "" {
+		if id.projectID == "" {
 			return SourceNoIdentity, nil, nil
 		}
 		merged, keys := mergeNodeSelector(projectDef, agentDef)
@@ -1001,7 +1052,7 @@ func injectCapabilities(container *corev1.Container, add []string) {
 // RequiresProjectIdentity reports whether any axis this task declares reads the
 // project side (project / projectWithAgent). An agent that is absent from the
 // table declares nothing, so the reverse lookup stays out of the claim path
-// entirely (ADR-035 decision 3: 反查只在需要时发生).
+// entirely (ADR-048 decision 4: 反查只在需要时发生).
 func (b *Builder) RequiresProjectIdentity(e TaskEntry) bool {
 	agent, listed := b.policy.agents[e.AgentName]
 	if !listed {

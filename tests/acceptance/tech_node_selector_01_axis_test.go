@@ -134,12 +134,12 @@ func TestNodeSelector01Axis(t *testing.T) {
 		policyPath := writePolicyFile(t, tcNodeProjectWithAgentPolicy)
 		h := newHarness(t, false)
 		h.useRealBuilderWithPolicy(t, templatePath, policyPath, nil)
-		identity := &tcProjectIdentity{apiName: "proj-x"}
+		identity := &countingProjectIdentity{}
 		h.rebuildScheduler(t, func(c *schedulerConfig) { c.Project = identity })
 		tcPrepareRuntimes(t, h)
 
 		body := tcBaseClaim("task-1")
-		body.Project = &tcProjectValue{Name: "proj-x"}
+		body.ProjectID = projectIDFor("proj-x")
 		tcClaimOnClaim(t, h, body)
 
 		pod := h.createdJob(t, "fm-task-1").Spec.Template.Spec
@@ -154,8 +154,8 @@ func TestNodeSelector01Axis(t *testing.T) {
 		if !tcHasString(event, "overridden_keys", "node_selector:disktype") {
 			t.Errorf("overridden_keys = %v, want node_selector:disktype", event["overridden_keys"])
 		}
-		if len(identity.calls()) != 0 {
-			t.Errorf("ByIssue calls = %v, want none (the payload carried the project key)", identity.calls())
+		if got := identity.lookupCount(); got != 0 {
+			t.Errorf("reverse lookups = %d, want none (the payload carried the project identifier)", got)
 		}
 	})
 

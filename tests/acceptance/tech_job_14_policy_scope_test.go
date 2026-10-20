@@ -49,7 +49,7 @@ func tcJob14Entry() jobbuilder.TaskEntry {
 	return jobbuilder.TaskEntry{
 		TaskID: "task-1", AgentID: "agent-1", WorkspaceID: "ws-1",
 		JobRuntimeID: "rid-1", ClaimedAt: testClaimTime, Attempt: 1,
-		AgentName: "omp", ProjectName: "proj-1", ProjectSource: jobbuilder.ProjectSourcePayload,
+		AgentName: "omp", ProjectID: projectIDFor("proj-1"), ProjectSource: jobbuilder.ProjectSourcePayload,
 	}
 }
 

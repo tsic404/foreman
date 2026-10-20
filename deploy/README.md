@@ -493,7 +493,9 @@ agents:                      # keys are agent names (agent.name), exact match
     capabilities:
       add: ["SYS_ADMIN"]     # appended to the container's own add list
     nodeSelector: { kubernetes.io/os: linux }
-projects:                    # keys are project names; definitions only
+projects:                    # keys are project names, resolved at startup to
+                             # platform project identifiers; definitions only
+                             # (the runtime match is by identifier, not name)
   foreman:
     resources:
       requests: { cpu: "500m" }
@@ -522,10 +524,20 @@ Startup expects a present policy file to be well formed:
   file that does not parse under strict decoding (an unknown key is refused), a
   definition that writes `capabilities.drop` (`Foreman` is the one writing
   capabilities, so an ignored `drop` would be a security intent that never took
-  effect), and a key the platform reports absent or ambiguous.
+  effect), a key the platform reports absent or ambiguous, and two project keys
+  resolving to the same platform identifier.
 - **Warns and continues**: a definition no axis references (dead config), a key
   the platform cannot resolve (unreachable / timeout / no such query — the
-  runtime match stays exact-name), and a missing file.
+  agent section still matches by exact name, the project section then reads as
+  no definition and there is no fallback to name matching), and a missing file.
+
+The project section's names are resolved once at startup through the server's
+read-only project list, and a task's missing project identifier is looked up
+once by issue id. Both are user-API routes, so `MULTICA_TOKEN` must be a `mul_`
+PAT for them to answer: a daemon-only `mdt_` token is rejected there, and the
+project keys then log `policy.name_resolution … conclusion=unavailable` while
+the boot continues (project tiers inject nothing; tasks and the agent section
+are unaffected).
 
 The file is loaded once: editing the ConfigMap needs a Foreman restart, and the
 startup log records its sha256.

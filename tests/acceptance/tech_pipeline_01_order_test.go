@@ -143,25 +143,21 @@ spec:
 
 // tcClaimPayloadBody is the minimal claim payload the pipeline scenarios need:
 // the head fields the scheduler indexes plus the agent object and the optional
-// structured project key.
+// top-level project identifier (the platform's project identity, ADR-048).
 type tcClaimPayloadBody struct {
-	ID              string          `json:"id"`
-	AgentID         string          `json:"agent_id"`
-	WorkspaceID     string          `json:"workspace_id"`
-	RuntimeID       string          `json:"runtime_id"`
-	IssueID         string          `json:"issue_id,omitempty"`
-	IssueIdentifier string          `json:"issue_identifier,omitempty"`
-	ChatSessionID   string          `json:"chat_session_id,omitempty"`
-	PriorSessionID  string          `json:"prior_session_id,omitempty"`
-	Agent           tcAgentObject   `json:"agent"`
-	Project         *tcProjectValue `json:"project,omitempty"`
+	ID              string        `json:"id"`
+	AgentID         string        `json:"agent_id"`
+	WorkspaceID     string        `json:"workspace_id"`
+	RuntimeID       string        `json:"runtime_id"`
+	IssueID         string        `json:"issue_id,omitempty"`
+	IssueIdentifier string        `json:"issue_identifier,omitempty"`
+	ChatSessionID   string        `json:"chat_session_id,omitempty"`
+	PriorSessionID  string        `json:"prior_session_id,omitempty"`
+	Agent           tcAgentObject `json:"agent"`
+	ProjectID       string        `json:"project_id,omitempty"`
 }
 
 type tcAgentObject struct {
-	Name string `json:"name"`
-}
-
-type tcProjectValue struct {
 	Name string `json:"name"`
 }
 

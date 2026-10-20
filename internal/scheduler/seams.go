@@ -51,7 +51,7 @@ type JobBuilder interface {
 	// RequiresProjectIdentity reports whether any of the task's declared axis
 	// tiers reads the project side (project / projectWithAgent). It is what
 	// keeps the read-only reverse lookup from happening when no axis needs it
-	// (ADR-035 decision 3).
+	// (ADR-048 decision 4).
 	RequiresProjectIdentity(e jobbuilder.TaskEntry) bool
 	// BuildCatalogProbe renders a catalog-probe Job and its credential Secret
 	// (ADR-019): shape = the template copy plus the probe write face, budget

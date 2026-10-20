@@ -48,3 +48,26 @@ before the edit. That is the version-lag class the upstream daemon already has
 bounded by `FOREMAN_SKILL_CACHE_FRESH_TTL`, and a claim taken after the edit
 carries the new hash — a different payload, hence a different key. Re-verify this
 anchor when the upstream changes the resolve semantics (ADR-045 复审触发).
+
+## Project identity queries (contracts §4.1 / §8.5, ADR-048)
+
+Premise: the platform exposes the two read-only project-identity lookups
+ADR-048 relies on — a workspace project name resolved to its opaque project
+identifier at startup, and an issue's project identifier read once per claim —
+and Foreman can call them with its existing server credential.
+
+| Fact | Anchor |
+|---|---|
+| The claim payload carries the project identifier at its **top-level** `project_id` (omitted when the task has no project); `project_title` / `project_description` are prompt context and are not the identity | `server/internal/handler/agent.go` → `AgentTaskResponse.ProjectID`, `AgentTaskResponse.ProjectTitle` |
+| Listing a workspace's projects is `GET /api/projects?workspace_id=<uuid>`, answering `{"projects":[{id,title,…}],"total":N}`; the human-readable project name is `title` and the opaque identifier is `id` | `server/cmd/server/router.go` → the workspace-scoped `/api/projects` route group; `server/internal/handler/project.go` → `(*Handler).ListProjects`, `ProjectResponse` |
+| No server-side project-name filter exists (the list accepts only `status` / `priority`), so a policy key is resolved by exact equality over the returned list: zero matches = absent, more than one = ambiguous | `server/internal/handler/project.go` → `(*Handler).ListProjects` |
+| Reading one issue is `GET /api/issues/{id}?workspace_id=<uuid>`; the answer carries `project_id` (nullable — a task without a project), which is the claim-time answer | `server/cmd/server/router.go` → the `GET /api/issues/{id}` registration; `server/internal/handler/issue.go` → `(*Handler).GetIssue`, `IssueResponse.ProjectID` |
+| Both routes are user-API routes: they authenticate the bearer token through `middleware.Auth` (PAT / JWT / task token) inside the workspace-membership group. A daemon-only `mdt_` token is not accepted there, so these two queries need the `mul_` PAT form (`MULTICA_TOKEN` accepts both); a rejected call converges on the documented unavailable/failure class, never on a silent empty answer | `server/cmd/server/router.go` → the `middleware.RequireWorkspaceMember` group and its `middleware.Auth`; `server/internal/middleware/auth.go` → `Auth` |
+| There is **no** workspace-wide, visibility-independent agent-name lookup: `GET /api/agents` filters private agents by the caller's membership/ownership, so an absent answer is not the platform's authority. Foreman therefore concludes `unavailable` for agent policy keys (the documented degradation: warn, boot continues, agent section still matches by exact name). | `server/internal/handler/agent.go` → `(*Handler).ListAgents`; `server/internal/handler/agent_access.go` → `memberAllowedToViewAgent` |
+
+**Scope of the premise.** The project name resolution above reads the project's
+`title`; the design's excluded option was promoting the claim payload's
+`project_title` to an identity name, not failing to resolve a configured name
+through the platform's project list. Title uniqueness is not promised, which is
+why more than one exact match refuses startup as ambiguous (ADR-048 decision 2)
+rather than picking one.

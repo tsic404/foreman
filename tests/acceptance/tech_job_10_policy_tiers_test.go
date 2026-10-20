@@ -344,21 +344,19 @@ agents:
 // --- helpers shared by TC-tech-job-10…14 ---
 
 // tcPolicyAxisProjectIdentity is the platform-side project-identity seam
-// (ADR-035 decision 3): the claim payload's structured project key carries the
-// name, and the read-only lookup knows nothing — an empty answer is "none",
-// never an error.
+// (ADR-048): the claim payload's top-level project_id carries the platform
+// identifier, and the read-only lookup knows nothing — an empty answer is
+// "none", never an error.
 type tcPolicyAxisProjectIdentity struct{}
 
 func (tcPolicyAxisProjectIdentity) FromPayload(task json.RawMessage) string {
 	var head struct {
-		Project struct {
-			Name string `json:"name"`
-		} `json:"project"`
+		ProjectID string `json:"project_id"`
 	}
 	if err := json.Unmarshal(task, &head); err != nil {
 		return ""
 	}
-	return strings.TrimSpace(head.Project.Name)
+	return strings.TrimSpace(head.ProjectID)
 }
 
 func (tcPolicyAxisProjectIdentity) ByIssue(context.Context, string) (string, error) {
@@ -369,16 +367,23 @@ func (tcPolicyAxisProjectIdentity) ByIssue(context.Context, string) (string, err
 // name" for every key.
 type tcPolicyAxisAbsentResolver struct{}
 
-func (tcPolicyAxisAbsentResolver) ResolveName(context.Context, string, string) (jobbuilder.NameConclusion, error) {
-	return jobbuilder.NameAbsent, nil
+func (tcPolicyAxisAbsentResolver) ResolveName(context.Context, string, string) (jobbuilder.NameResolution, error) {
+	return jobbuilder.NameResolution{Conclusion: jobbuilder.NameAbsent}, nil
 }
 
 // tcPolicyAxisResolvedResolver is a reachable authority that resolves every
 // key; the runtime comparison is still the exact-name one.
 type tcPolicyAxisResolvedResolver struct{}
 
-func (tcPolicyAxisResolvedResolver) ResolveName(context.Context, string, string) (jobbuilder.NameConclusion, error) {
-	return jobbuilder.NameResolved, nil
+// ResolveName resolves every key; a project key answers the name itself as its
+// platform identifier, which keeps the runtime index addressable from a claim
+// carrying the same identifier.
+func (tcPolicyAxisResolvedResolver) ResolveName(_ context.Context, kind, name string) (jobbuilder.NameResolution, error) {
+	identifier := ""
+	if kind == jobbuilder.PolicyKeyProject {
+		identifier = projectIDFor(name)
+	}
+	return jobbuilder.NameResolution{Conclusion: jobbuilder.NameResolved, Identifier: identifier}, nil
 }
 
 // tcPolicyAxisClaimRaw hands the scheduler one claim payload and declares the
@@ -402,7 +407,7 @@ func tcPolicyAxisClaim(t *testing.T, h *harness, taskID, agentName, projectName 
 		"agent": map[string]any{"name": agentName},
 	}
 	if projectName != "" {
-		payload["project"] = map[string]any{"name": projectName}
+		payload["project_id"] = projectIDFor(projectName)
 	}
 	raw, err := json.Marshal(payload)
 	if err != nil {
