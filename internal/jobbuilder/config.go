@@ -99,9 +99,10 @@ type Config struct {
 	// env switch — the mount is the deployment's contract — so only tests
 	// point it elsewhere.
 	PolicyPath string
-	// NameResolver is the platform-side name-resolution seam ADR-035 leaves to
+	// NameResolver is the platform-side name-resolution seam ADR-048 leaves to
 	// the platform. Nil means the platform offers no such query: every policy
-	// key concludes unavailable (warn, boot continues).
+	// key concludes unavailable (warn, boot continues; the project section
+	// then has no identifier index and reads as no definition).
 	NameResolver PolicyNameResolver
 	// PolicyNameResolutionTimeout is FOREMAN_POLICY_NAME_RESOLUTION_TIMEOUT:
 	// the bounded window the startup resolution of all policy keys shares.

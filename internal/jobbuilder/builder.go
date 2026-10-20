@@ -43,10 +43,12 @@ type TaskEntry struct {
 	// names). Empty means the agent's identity is unavailable, never a
 	// failure.
 	AgentName string
-	// ProjectName is the task's project identity (§4.1): the payload's
-	// structured project key name, or the read-only reverse lookup's answer.
-	ProjectName string
-	// ProjectSource records where ProjectName came from (payload / api / none);
+	// ProjectID is the task's project identity (§4.1): the platform's opaque
+	// project identifier carried by the claim payload, or the read-only
+	// reverse lookup's answer — never a project name. The policy table's
+	// project section is matched through the startup name → identifier index.
+	ProjectID string
+	// ProjectSource records where ProjectID came from (payload / api / none);
 	// it is projected into policy.applied only.
 	ProjectSource string
 	// NameSource is set by Build from the template's name format: "template"

@@ -1657,6 +1657,73 @@ func (h *harness) useRealBuilderWithTemplate(t *testing.T, templatePath string) 
 	h.useRealBuilderWithPolicy(t, templatePath, "", nil)
 }
 
+// projectIDFor is the fixture platform's project identifier for one policy
+// project name: opaque-looking, and deliberately different from the name, so a
+// runtime match through the name is a detectible failure (ADR-048 decision 3).
+func projectIDFor(name string) string { return "pid-" + name }
+
+// projectNameResolver is the fixture platform's policy name resolution: a
+// project key resolves to its identifier, an agent key reports the documented
+// unavailable conclusion (the workspace has no visibility-independent
+// agent-name query — docs/upstream-anchors.md). Unavailable only warns, so a
+// boot with this resolver proceeds for both sections.
+type projectNameResolver struct{}
+
+func (projectNameResolver) ResolveName(_ context.Context, kind, name string) (jobbuilder.NameResolution, error) {
+	if kind != jobbuilder.PolicyKeyProject {
+		return jobbuilder.NameResolution{Conclusion: jobbuilder.NameUnavailable}, nil
+	}
+	return jobbuilder.NameResolution{Conclusion: jobbuilder.NameResolved, Identifier: projectIDFor(name)}, nil
+}
+
+// payloadProjectIdentity is the fixture's claim-time project seam: it reads
+// the payload's top-level project_id and performs no reverse lookup. A
+// scenario that judges the lookup installs the production adapter through
+// rebuildScheduler.
+type payloadProjectIdentity struct{}
+
+func (payloadProjectIdentity) FromPayload(task json.RawMessage) string {
+	var head struct {
+		ProjectID string `json:"project_id"`
+	}
+	if err := json.Unmarshal(task, &head); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(head.ProjectID)
+}
+
+func (payloadProjectIdentity) ByIssue(context.Context, string) (string, error) { return "", nil }
+
+// countingProjectIdentity is payloadProjectIdentity with a reverse-lookup
+// counter, so "the lookup did not happen" is an assertion.
+type countingProjectIdentity struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (c *countingProjectIdentity) FromPayload(task json.RawMessage) string {
+	var head struct {
+		ProjectID string `json:"project_id"`
+	}
+	if err := json.Unmarshal(task, &head); err != nil {
+		return ""
+	}
+	return strings.TrimSpace(head.ProjectID)
+}
+
+func (c *countingProjectIdentity) ByIssue(_ context.Context, issueID string) (string, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.calls = append(c.calls, issueID)
+	return "", nil
+}
+
+func (c *countingProjectIdentity) lookupCount() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.calls)
+}
+
 // useRealBuilderWithPolicy is useRealBuilderWithTemplate plus the policy file
 // (02-contracts.md §8.5): an empty policyPath leaves the field at
 // the mounted path, which does not exist under test — the legal default of an
@@ -1681,6 +1748,10 @@ func (h *harness) useRealBuilderWithPolicy(t *testing.T, templatePath, policyPat
 	jbCfg.Nodes = h.reg
 	jbCfg.Metrics = h.metrics
 	jbCfg.Logger = slog.New(slog.NewJSONHandler(h.logs, nil))
+	// The fixture platform answers the startup name resolution with one
+	// identifier per configured project name; a scenario that judges the
+	// resolution installs its own resolver through mutate.
+	jbCfg.NameResolver = projectNameResolver{}
 	if mutate != nil {
 		mutate(&jbCfg)
 	}
@@ -2611,6 +2682,7 @@ func buildHarness(t *testing.T, catalogEnabled bool, window time.Duration, skill
 		ModelCatalogEnabled:    catalogEnabled,
 		ModelCatalogTimeout:    45 * time.Second,
 		ReconcileInterval:      30 * time.Second,
+		Project:                payloadProjectIdentity{},
 	}
 	sched, err := scheduler.New(schedCfg, reg, jobs, bld, serverClient, metrics,
 		scheduler.WithPendingReports(pending),

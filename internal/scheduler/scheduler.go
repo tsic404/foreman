@@ -334,7 +334,7 @@ type Scheduler struct {
 
 	// project memoizes the read-only project reverse lookup per issue id, so a
 	// burst of tasks from one issue does not query the platform once per task
-	// (ADR-035 decision 3 — the cache is not a contract face).
+	// (ADR-048 decision 4 — the cache is not a contract face).
 	project projectCache
 
 	// usageMu guards usagePairs, the token metric's admitted (provider, model)
@@ -571,9 +571,9 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		// (ADR-015) — never annotated, never projected.
 		PriorSessionID: head.PriorSessionID,
 		// Memory-only: the two identity inputs of the three-axis policy
-		// (ADR-035) — the agent name from the payload and the project identity
-		// from the payload's structured key or the read-only lookup, both
-		// filled in below once the policy table has had its say.
+		// (ADR-048) — the agent name from the payload and the platform project
+		// identifier from the payload's top-level key or the read-only lookup,
+		// both filled in below once the policy table has had its say.
 		AgentName: head.Agent.Name,
 		// Memory-only: the runtime the server dispatched this claim under,
 		// which addresses C4/C19 and the S8 body translation (ADR-025).
@@ -592,10 +592,10 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	// The name format was validated at startup, so this is the render-time
 	// final check; a failure refuses the claim before any object exists.
 	// The project identity is resolved only when a declared tier reads it
-	// (ADR-035 decision 3), and always before the name, which the policy
+	// (ADR-048 decision 4), and always before the name, which the policy
 	// cannot influence.
 	if s.builder.RequiresProjectIdentity(jobbuilderEntry(e)) {
-		e.ProjectName, e.ProjectSource = s.projectIdentity(ctx, task, head)
+		e.ProjectID, e.ProjectSource = s.projectIdentity(ctx, task, head)
 	}
 	name, nameErr := s.builder.ResolveName(jobbuilderEntry(e))
 	if nameErr != nil {
@@ -2586,7 +2586,7 @@ func jobbuilderEntry(e registry.TaskEntry) jobbuilder.TaskEntry {
 		Attempt:         e.Attempt,
 		PriorSessionID:  e.PriorSessionID,
 		AgentName:       e.AgentName,
-		ProjectName:     e.ProjectName,
+		ProjectID:       e.ProjectID,
 		ProjectSource:   e.ProjectSource,
 	}
 }

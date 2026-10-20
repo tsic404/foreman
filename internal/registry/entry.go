@@ -148,12 +148,13 @@ type TaskEntry struct {
 	// unavailable, which degrades the axes rather than failing the task.
 	AgentName string `json:"-"`
 
-	// ProjectName is the task's project identity (§4.1 项目身份):
-	// read at claim time from the payload's structured project key, or from
-	// the read-only reverse lookup by issue id. Memory-only: never annotated,
-	// never projected, never rebuilt.
-	ProjectName string `json:"-"`
-	// ProjectSource records where ProjectName came from (payload / api /
+	// ProjectID is the task's project identity (§4.1 项目身份): the
+	// platform's opaque project identifier, read at claim time from the
+	// payload's top-level project_id, or from the read-only reverse lookup by
+	// issue id. It is matched against the startup name → identifier index.
+	// Memory-only: never annotated, never projected, never rebuilt.
+	ProjectID string `json:"-"`
+	// ProjectSource records where ProjectID came from (payload / api /
 	// none); policy.applied projects it, nothing else reads it.
 	ProjectSource string `json:"-"`
 

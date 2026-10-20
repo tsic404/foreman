@@ -27,6 +27,7 @@ import (
 	"github.com/tsic404/foreman/internal/auth"
 	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/observability"
+	"github.com/tsic404/foreman/internal/platform"
 	"github.com/tsic404/foreman/internal/proxy"
 	"github.com/tsic404/foreman/internal/recovery"
 	"github.com/tsic404/foreman/internal/registry"
@@ -155,6 +156,14 @@ func run() error {
 			return e.RealRuntimeID
 		}),
 	)
+
+	// Project identity (ADR-048): one adapter answers both platform queries —
+	// the startup policy project name → identifier resolution the builder's
+	// policy gate performs, and the claim-time issue → identifier lookup the
+	// scheduler performs when a declared tier reads the project side.
+	projects := platform.NewProjectQueries(proxyCfg.ServerURL, proxyCfg.WorkspaceID, serverToken)
+	jbCfg.NameResolver = projects
+	schedCfg.Project = projects
 
 	// Terminal reports that exhausted the retry budget are queued on the
 	// node-local state root and re-sent through the scheduler's single

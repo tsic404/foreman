@@ -113,11 +113,16 @@ func TestTechObservability01DesignedFamiliesAtBoot(t *testing.T) {
 // per key kind, unavailable for anything unlisted.
 type observability01Resolver map[string]jobbuilder.NameConclusion
 
-func (r observability01Resolver) ResolveName(_ context.Context, kind, _ string) (jobbuilder.NameConclusion, error) {
-	if conclusion, ok := r[kind]; ok {
-		return conclusion, nil
+func (r observability01Resolver) ResolveName(_ context.Context, kind, name string) (jobbuilder.NameResolution, error) {
+	conclusion, ok := r[kind]
+	if !ok {
+		conclusion = jobbuilder.NameUnavailable
 	}
-	return jobbuilder.NameUnavailable, nil
+	resolution := jobbuilder.NameResolution{Conclusion: conclusion}
+	if conclusion == jobbuilder.NameResolved && kind == jobbuilder.PolicyKeyProject {
+		resolution.Identifier = projectIDFor(name)
+	}
+	return resolution, nil
 }
 
 // TestTechObservability01PolicyFaces drives one completed and one failed task

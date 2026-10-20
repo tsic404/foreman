@@ -20,22 +20,23 @@ import (
 
 // projectStub is the platform-side project seam: it answers both sources from
 // fixed tables and counts the reverse lookups, so "the lookup did not happen"
-// is an assertion and not an absence of evidence.
+// is an assertion and not an absence of evidence. Both answers are platform
+// project identifiers, never names (ADR-048).
 type projectStub struct {
-	mu          sync.Mutex
-	payloadName string
-	byIssue     map[string]string
-	err         error
-	block       bool
-	calls       []string
+	mu        sync.Mutex
+	payloadID string
+	byIssue   map[string]string
+	err       error
+	block     bool
+	calls     []string
 }
 
-func (s *projectStub) FromPayload(json.RawMessage) string { return s.payloadName }
+func (s *projectStub) FromPayload(json.RawMessage) string { return s.payloadID }
 
 func (s *projectStub) ByIssue(ctx context.Context, issueID string) (string, error) {
 	s.mu.Lock()
 	s.calls = append(s.calls, issueID)
-	block, err, name := s.block, s.err, s.byIssue[issueID]
+	block, err, projectID := s.block, s.err, s.byIssue[issueID]
 	s.mu.Unlock()
 	if block {
 		<-ctx.Done()
@@ -44,7 +45,7 @@ func (s *projectStub) ByIssue(ctx context.Context, issueID string) (string, erro
 	if err != nil {
 		return "", err
 	}
-	return name, nil
+	return projectID, nil
 }
 
 func (s *projectStub) callCount() int {
@@ -106,11 +107,11 @@ func projectClaim(id, issueID string) json.RawMessage {
 	}`)
 }
 
-// TestProjectIdentityPayloadSource: a payload carrying the structured project
-// key is the first source — the platform is never asked, so the reverse lookup
-// cannot fail a claim that already has the answer.
+// TestProjectIdentityPayloadSource: a payload carrying the top-level project
+// identifier is the first source — the platform is never asked, so the reverse
+// lookup cannot fail a claim that already has the answer.
 func TestProjectIdentityPayloadSource(t *testing.T) {
-	stub := &projectStub{payloadName: "foreman-payload", byIssue: map[string]string{"issue-1": "foreman-api"}}
+	stub := &projectStub{payloadID: "foreman-payload", byIssue: map[string]string{"issue-1": "foreman-api"}}
 	f, logs := projectFixture(t, stub, time.Second)
 
 	if err := f.sched.OnClaim(context.Background(), projectClaim("task-1", "issue-1")); err != nil {
@@ -120,8 +121,8 @@ func TestProjectIdentityPayloadSource(t *testing.T) {
 	if !ok {
 		t.Fatal("entry missing after the claim")
 	}
-	if entry.ProjectName != "foreman-payload" || entry.ProjectSource != jobbuilder.ProjectSourcePayload {
-		t.Errorf("project = %q/%q, want foreman-payload/payload", entry.ProjectName, entry.ProjectSource)
+	if entry.ProjectID != "foreman-payload" || entry.ProjectSource != jobbuilder.ProjectSourcePayload {
+		t.Errorf("project = %q/%q, want foreman-payload/payload", entry.ProjectID, entry.ProjectSource)
 	}
 	if stub.callCount() != 0 {
 		t.Errorf("reverse lookups = %d, want none for a payload-sourced task", stub.callCount())
@@ -131,8 +132,9 @@ func TestProjectIdentityPayloadSource(t *testing.T) {
 	}
 }
 
-// TestProjectIdentityAPISourceAndCache: without the structured key the claim
-// falls back to the read-only lookup — once per issue id, cached afterwards.
+// TestProjectIdentityAPISourceAndCache: without the payload identifier the
+// claim falls back to the read-only lookup — once per issue id, cached
+// afterwards.
 func TestProjectIdentityAPISourceAndCache(t *testing.T) {
 	stub := &projectStub{byIssue: map[string]string{"issue-1": "foreman-api"}}
 	f, _ := projectFixture(t, stub, time.Second)
@@ -145,8 +147,8 @@ func TestProjectIdentityAPISourceAndCache(t *testing.T) {
 		if !ok {
 			t.Fatalf("entry %s missing", taskID)
 		}
-		if entry.ProjectName != "foreman-api" || entry.ProjectSource != jobbuilder.ProjectSourceAPI {
-			t.Errorf("entry %s project = %q/%q, want foreman-api/api", taskID, entry.ProjectName, entry.ProjectSource)
+		if entry.ProjectID != "foreman-api" || entry.ProjectSource != jobbuilder.ProjectSourceAPI {
+			t.Errorf("entry %s project = %q/%q, want foreman-api/api", taskID, entry.ProjectID, entry.ProjectSource)
 		}
 	}
 	if stub.callCount() != 1 {
@@ -171,8 +173,8 @@ func TestProjectIdentityLookupFailureContinues(t *testing.T) {
 			if !ok {
 				t.Fatal("entry missing: the claim must not fail on a lookup problem")
 			}
-			if entry.ProjectName != "" || entry.ProjectSource != jobbuilder.ProjectSourceNone {
-				t.Errorf("project = %q/%q, want empty/none", entry.ProjectName, entry.ProjectSource)
+			if entry.ProjectID != "" || entry.ProjectSource != jobbuilder.ProjectSourceNone {
+				t.Errorf("project = %q/%q, want empty/none", entry.ProjectID, entry.ProjectSource)
 			}
 			if name == "no result" {
 				// "No project" is a legal answer, not a failure event.

@@ -117,7 +117,7 @@ projects:
 	h := newHarness(t, false)
 	h.useRealBuilderWithPolicy(t, deployedTemplatePath(t), policyPath, nil)
 	job := tcPolicyAxisBuildJob(t, h, jobbuilder.TaskEntry{
-		TaskID: "task-1", AgentName: "omp", ProjectName: "proj-1", ProjectSource: jobbuilder.ProjectSourcePayload,
+		TaskID: "task-1", AgentName: "omp", ProjectID: projectIDFor("proj-1"), ProjectSource: jobbuilder.ProjectSourcePayload,
 	})
 
 	// The shared keys take the agent's side (cpu 1, not 500m; limits cpu 8,
@@ -157,7 +157,7 @@ func TestJob11EmptyOrMissingDefinitionKeepsTemplate(t *testing.T) {
 		h := newHarness(t, false)
 		h.useRealBuilderWithPolicy(t, deployedTemplatePath(t), policyPath, nil)
 		job := tcPolicyAxisBuildJob(t, h, jobbuilder.TaskEntry{
-			TaskID: "task-1", AgentName: "omp", ProjectName: "proj-1", ProjectSource: jobbuilder.ProjectSourcePayload,
+			TaskID: "task-1", AgentName: "omp", ProjectID: projectIDFor("proj-1"), ProjectSource: jobbuilder.ProjectSourcePayload,
 		})
 
 		tcPolicyAxisWantResources(t, job.Spec.Template.Spec.Containers[0].Resources,
@@ -181,7 +181,7 @@ projects:
 		h := newHarness(t, false)
 		h.useRealBuilderWithPolicy(t, deployedTemplatePath(t), policyPath, nil)
 		job := tcPolicyAxisBuildJob(t, h, jobbuilder.TaskEntry{
-			TaskID: "task-1", AgentName: "omp", ProjectName: "proj-1", ProjectSource: jobbuilder.ProjectSourcePayload,
+			TaskID: "task-1", AgentName: "omp", ProjectID: projectIDFor("proj-1"), ProjectSource: jobbuilder.ProjectSourcePayload,
 		})
 
 		tcPolicyAxisWantResources(t, job.Spec.Template.Spec.Containers[0].Resources,
@@ -210,7 +210,7 @@ projects:
 		h := newHarness(t, false)
 		h.useRealBuilderWithPolicy(t, deployedTemplatePath(t), policyPath, nil)
 		job := tcPolicyAxisBuildJob(t, h, jobbuilder.TaskEntry{
-			TaskID: "task-1", AgentName: "omp", ProjectName: "proj-1", ProjectSource: jobbuilder.ProjectSourcePayload,
+			TaskID: "task-1", AgentName: "omp", ProjectID: projectIDFor("proj-1"), ProjectSource: jobbuilder.ProjectSourcePayload,
 		})
 
 		tcPolicyAxisWantResources(t, job.Spec.Template.Spec.Containers[0].Resources,
@@ -236,7 +236,7 @@ projects:
 		h := newHarness(t, false)
 		h.useRealBuilderWithPolicy(t, deployedTemplatePath(t), policyPath, nil)
 		job := tcPolicyAxisBuildJob(t, h, jobbuilder.TaskEntry{
-			TaskID: "task-1", AgentName: "omp", ProjectName: "proj-1", ProjectSource: jobbuilder.ProjectSourcePayload,
+			TaskID: "task-1", AgentName: "omp", ProjectID: projectIDFor("proj-1"), ProjectSource: jobbuilder.ProjectSourcePayload,
 		})
 
 		tcPolicyAxisWantResources(t, job.Spec.Template.Spec.Containers[0].Resources,

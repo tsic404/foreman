@@ -32,7 +32,7 @@ const (
 	EnvModelCatalogTimeout = "FOREMAN_MODEL_CATALOG_TIMEOUT"
 	EnvReconcileInterval   = "FOREMAN_RECONCILE_INTERVAL"
 	// EnvProjectLookupTimeout bounds one read-only project reverse lookup by
-	// issue id (ADR-035 decision 3: the timeout value belongs to the
+	// issue id (ADR-048 decision 4: the timeout value belongs to the
 	// implementation, and the claim → Job 5s P95 must hold).
 	EnvProjectLookupTimeout = "FOREMAN_PROJECT_LOOKUP_TIMEOUT"
 )
@@ -64,7 +64,7 @@ const (
 	DefaultReconcileInterval = 30 * time.Second
 
 	// DefaultProjectLookupTimeout keeps one project reverse lookup well inside
-	// the claim → Job 5s P95 (ADR-035 decision 3): a lookup that outlives it
+	// the claim → Job 5s P95 (ADR-048 decision 4): a lookup that outlives it
 	// converges on project.lookup_failed, never on a slow Job create.
 	DefaultProjectLookupTimeout = 2 * time.Second
 
@@ -113,9 +113,9 @@ type Config struct {
 	// ReconcileInterval is the convergence cadence; the probe sweep grace
 	// covers one round on each side (FOREMAN_RECONCILE_INTERVAL).
 	ReconcileInterval time.Duration
-	// Project is the platform-side project-identity seam (ADR-035 decision 3):
-	// the payload's structured project key and the read-only lookup by issue
-	// id. Nil means the platform offers neither, so every task reads
+	// Project is the platform-side project-identity seam (ADR-048 decision 1):
+	// the payload's top-level project identifier and the read-only lookup by
+	// issue id. Nil means the platform offers neither, so every task reads
 	// project_source=none and the project tiers stay no_identity.
 	Project ProjectIdentity
 	// ProjectLookupTimeout bounds one reverse lookup so the claim → Job budget
