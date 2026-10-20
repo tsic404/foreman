@@ -45,6 +45,23 @@ func indexPods(pods []corev1.Pod) map[string][]corev1.Pod {
 	return byJob
 }
 
+// instancePods keeps the pods of the current Job instance. The Job controller
+// creates an instance's pods after the Job object, so a pod created before
+// job_created_at belongs to a predecessor that held the same name — the name
+// fm-<task_id> is reused on a re-run, and GC lag leaves the predecessor's
+// corpse on the list face. Such a pod must not decide this instance's facts;
+// the scheduler's jobPods family applies the same filter (ADR-017).
+func instancePods(pods []corev1.Pod, since time.Time) []corev1.Pod {
+	current := make([]corev1.Pod, 0, len(pods))
+	for i := range pods {
+		if pods[i].CreationTimestamp.Time.Before(since) {
+			continue
+		}
+		current = append(current, pods[i])
+	}
+	return current
+}
+
 // podNodeName returns the node a Job's pod was scheduled on ("" while the pod
 // is Pending or does not exist yet). A Job has at most one pod
 // (parallelism: 1), so the first placement found is the placement.

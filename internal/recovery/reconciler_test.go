@@ -790,6 +790,52 @@ func TestReconcileUnknownPodIsEvicted(t *testing.T) {
 	}
 }
 
+// A re-run reuses the Job name (fm-<task_id>), so the list face can still
+// carry the predecessor's corpse pod. Its eviction and its node belong to the
+// predecessor: neither may name this instance's end reason nor its placement
+// (ADR-017 instance filter).
+func TestReconcilePredecessorPodDoesNotDecideTheInstance(t *testing.T) {
+	e := testEntry("t1")
+	e.JobCreatedAt = time.Now()
+	reg := newRegistry(t, e)
+	set := &fakeSettler{}
+	objs := &fakeObjects{
+		job: runningJob("fm-t1"),
+		pods: []corev1.Pod{
+			podFor("fm-t1", func(p *corev1.Pod) {
+				p.CreationTimestamp = metav1.NewTime(e.JobCreatedAt.Add(-time.Minute))
+				p.Spec.NodeName = "company-02"
+				p.Status.Phase = corev1.PodUnknown
+			}),
+			podFor("fm-t1", func(p *corev1.Pod) {
+				p.CreationTimestamp = metav1.NewTime(e.JobCreatedAt)
+				p.Spec.NodeName = "company-01"
+				p.Status.Phase = corev1.PodRunning
+			}),
+		},
+	}
+	r := newTestReconciler(t, reg, objs, &fakeStatus{status: "running"}, set)
+	r.recheckWindow = 0
+
+	// Two rounds: the first only records an end sighting, the second is where
+	// the eviction would be compensated.
+	for round := 1; round <= 2; round++ {
+		if err := r.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile round %d: %v", round, err)
+		}
+	}
+	if _, fails, _, _, _ := set.calls(); fails != 0 {
+		t.Fatalf("failJobs = %d, want 0 (the predecessor's pod is not this instance)", fails)
+	}
+	got, ok := reg.Get("t1")
+	if !ok {
+		t.Fatal("entry t1 vanished")
+	}
+	if got.NodeName != "company-01" {
+		t.Fatalf("node_name = %q, want company-01 from the current instance's pod", got.NodeName)
+	}
+}
+
 // ---- §4.6: server-side cancel -------------------------------------------
 
 func TestReconcileCancelledWaitsForAckThenReleases(t *testing.T) {

@@ -371,17 +371,21 @@ func (r *Reconciler) round(ctx context.Context) error {
 		if listErr != nil && !e.IsTerminal() && !r.releasing[e.TaskID] {
 			continue
 		}
+		// A re-run reuses the Job name (fm-<task_id>), so the list face can
+		// still carry a predecessor's corpse pod; both consumers of the
+		// round's pod facts read only the current instance (ADR-017).
+		current := instancePods(byJob[e.JobName], e.JobCreatedAt)
 		// Node placement is the fact the per-node soft cap counts
 		// (FOREMAN_MAX_JOBS_PER_NODE, contract §3: Pod 读 spec.nodeName),
 		// and the node_name the terminal report's learning face reads
 		// (ADR-015). The pods are already listed for this round; record the
 		// node once it is known.
 		if e.NodeName == "" {
-			if node := podNodeName(byJob[e.JobName]); node != "" {
+			if node := podNodeName(current); node != "" {
 				r.reg.SetNode(e.TaskID, node)
 			}
 		}
-		if err := r.reconcileOne(ctx, e, byJob[e.JobName]); err != nil {
+		if err := r.reconcileOne(ctx, e, current); err != nil {
 			r.log.WarnContext(ctx, "reconcile entry failed",
 				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID, "err", err)
 			if firstErr == nil {
