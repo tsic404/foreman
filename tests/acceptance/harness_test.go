@@ -1236,6 +1236,9 @@ type jobClient struct {
 	getJobs         []string
 	createJobErr    error
 	createSecretErr error
+	// createCarrierErr refuses only the pending-report carrier writes, leaving
+	// the credential Secret face working.
+	createCarrierErr error
 	// deleteSecretErr makes the next Secret deletion fail (the reclaim's
 	// retry face): the entry must survive as the retry handle.
 	deleteSecretErr error
@@ -1318,6 +1321,12 @@ func (c *jobClient) CreateSecret(_ context.Context, secret *corev1.Secret) error
 	if c.createSecretErr != nil && secret.Labels[registry.LabelRole] != registry.RolePendingReport {
 		return c.createSecretErr
 	}
+	// The carrier is the queue's durability face (§4.6): its write can fail on
+	// its own while the credential Secrets stay writable, which is the window
+	// the unbacked-entry scenario judges.
+	if c.createCarrierErr != nil && secret.Labels[registry.LabelRole] == registry.RolePendingReport {
+		return c.createCarrierErr
+	}
 	c.createdSecrets = append(c.createdSecrets, secret)
 	// The list face sees the object too, exactly as the apiserver's does: a
 	// carrier written before a restart is what the rebuilt queue lists.
@@ -1364,6 +1373,15 @@ func (c *jobClient) setListSecretsErr(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.listSecretsErr = err
+}
+
+// setCreateCarrierErr programs the pending-report carrier write (nil restores
+// it): the queue's durability face fails while the credential Secrets stay
+// writable.
+func (c *jobClient) setCreateCarrierErr(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.createCarrierErr = err
 }
 
 // carrierSecrets lists the pending-report carriers on the cluster face.
