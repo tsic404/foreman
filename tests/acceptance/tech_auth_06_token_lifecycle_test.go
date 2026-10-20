@@ -1,12 +1,11 @@
 // TC-tech-auth-06 (AC-30, ADR-017): the Job Token's lifetime follows the Job,
-// not the task verdict. After the terminal report the entry stays in drain —
-// the daemon's closing claim, deregister and status poll are still accepted and
-// delivery is always empty. The reclaim (revoke → delete Secret → drop the
-// entry) runs only when the Job's pods terminated (or the drain bound expires),
-// and it is the reclaim that makes the token unusable: non-terminal endpoints
-// answer 401, the terminal replay stays idempotently 200. A failed Secret
-// deletion keeps the entry as the retry handle. The orphan-Secret sweep is the
-// last face, with the three negative shapes left untouched.
+// not the task verdict: after the terminal report the entry stays in drain and
+// its closing claim, deregister and status poll are accepted (delivery empty).
+// The reclaim (revoke → delete Secret → drop the entry) runs only when the pods
+// terminated (or the drain bound expires), and it makes the token unusable:
+// non-terminal endpoints answer 401 for own and cross-task requests alike; a
+// terminal replay is the idempotent 200 only for the token's own task (§2.1
+// rule 1 403 otherwise) and never writes twice; retry-handle and sweep follow.
 package acceptance
 
 import (
@@ -119,7 +118,8 @@ func TestAuth06TokenLifetimeFollowsJobTermination(t *testing.T) {
 	}
 
 	// After the reclaim: non-terminal endpoints 401, the terminal replay is
-	// the idempotent 200 (the done index answers it).
+	// the idempotent 200 answered by the done index — and it re-forwards
+	// nothing, so the server sees no second terminal write.
 	if code, body := h.call("POST", "/api/daemon/tasks/claim", token,
 		[]byte(`{"daemon_id":"fm-task-1","runtime_ids":["`+entry.JobRuntimeID+`"],"max_tasks":1}`)); code != http.StatusUnauthorized {
 		t.Errorf("claim after reclaim = %d (%s), want 401", code, body)
@@ -127,9 +127,22 @@ func TestAuth06TokenLifetimeFollowsJobTermination(t *testing.T) {
 	if code, body := h.call("POST", "/api/daemon/deregister", token, []byte(`{}`)); code != http.StatusUnauthorized {
 		t.Errorf("deregister after reclaim = %d (%s), want 401", code, body)
 	}
+	forwardsBefore := len(h.server.forwarded(scheduler.EPComplete))
+	acceptedBefore := h.server.acceptedFor(scheduler.EPComplete)
 	if code, body := h.call("POST", "/api/daemon/tasks/task-1/complete", token,
 		[]byte(`{"exit_code":0}`)); code != http.StatusOK {
 		t.Errorf("terminal replay after reclaim = %d (%s), want the idempotent 200", code, body)
+	}
+	if got := len(h.server.forwarded(scheduler.EPComplete)); got != forwardsBefore {
+		t.Errorf("terminal replay forwarded C9 again: %d → %d forwards, want no second write",
+			forwardsBefore, got)
+	}
+	if got := h.server.acceptedFor(scheduler.EPComplete); got != acceptedBefore {
+		t.Errorf("terminal replay applied a second terminal write: %d → %d accepted, want no second write",
+			acceptedBefore, got)
+	}
+	if _, ok := h.reg.Get("task-1"); ok {
+		t.Error("the replay resurrected the reclaimed entry")
 	}
 
 	// Evidence: the reclaim names the Job-termination reason, the kubelet
@@ -157,6 +170,80 @@ func TestAuth06TokenLifetimeFollowsJobTermination(t *testing.T) {
 	}
 	if got := h.metrics.credReclaimCount(scheduler.JobTerminationReasonDrainTimeout); got != 0 {
 		t.Errorf("reclaim metric{drain_timeout} = %d, want 0", got)
+	}
+}
+
+// TestAuth06ReclaimedTokenAdjudicatesCrossTaskRequests pins §6.4's two
+// post-reclaim verdicts. Non-terminal endpoints answer 401 for own and
+// cross-task requests alike (the entry's absence, not the resource, is the
+// verdict), while a terminal replay is the idempotent 200 only for the token's
+// own task: every other task's terminal path is §2.1 rule 1's 403 — never a
+// replay, and never a forward or a settlement of the other task.
+func TestAuth06ReclaimedTokenAdjudicatesCrossTaskRequests(t *testing.T) {
+	h := newDeliveryHarness(t)
+	h.revoker = h.issuer
+	h.rebuildScheduler(t, func(*scheduler.Config) {})
+
+	tokenA, entryA := tcAuth06Settle(t, h, "task-a")
+	// A second live task is the cross-task target: it must stay non-terminal
+	// through every refused request.
+	if err := h.sched.OnClaim(t.Context(), deliveryPayload("task-b")); err != nil {
+		t.Fatalf("OnClaim(task-b): %v", err)
+	}
+	entryB, ok := h.reg.Get("task-b")
+	if !ok || entryB.IsTerminal() {
+		t.Fatalf("task-b entry = %+v/%v, want a live non-terminal entry", entryB, ok)
+	}
+
+	if err := h.sched.OnJobTerminated(t.Context(), entryA.JobName,
+		scheduler.JobTerminationReasonJobTerminated, time.Now(), 0); err != nil {
+		t.Fatalf("OnJobTerminated(%s): %v", entryA.JobName, err)
+	}
+	if _, ok := h.reg.Get("task-a"); ok {
+		t.Fatal("the entry survived the reclaim")
+	}
+
+	// Non-terminal endpoints: the reclaimed token is an unknown Job whether
+	// the request names its own task, another task, or another Job's runtime.
+	for _, call := range []struct {
+		name, method, path string
+		body               []byte
+	}{
+		{"own status", http.MethodGet, "/api/daemon/tasks/task-a/status", nil},
+		{"cross-task status", http.MethodGet, "/api/daemon/tasks/task-b/status", nil},
+		{"own prepare-lease", http.MethodPost,
+			"/api/daemon/runtimes/" + entryA.JobRuntimeID + "/tasks/task-a/prepare-lease", []byte(`{}`)},
+		{"cross-runtime prepare-lease", http.MethodPost,
+			"/api/daemon/runtimes/" + entryB.JobRuntimeID + "/tasks/task-a/prepare-lease", []byte(`{}`)},
+		{"own deregister", http.MethodPost, "/api/daemon/deregister", []byte(`{}`)},
+		{"cross-runtime claim", http.MethodPost, "/api/daemon/tasks/claim",
+			[]byte(`{"daemon_id":"fm-task-a","runtime_ids":["` + entryB.JobRuntimeID + `"],"max_tasks":1}`)},
+	} {
+		if code, body := h.call(call.method, call.path, tokenA, call.body); code != http.StatusUnauthorized {
+			t.Errorf("%s after reclaim = %d (%s), want 401", call.name, code, body)
+		}
+	}
+
+	// Terminal replay: only the token's own task path reaches the done index;
+	// each cross-task terminal endpoint is the scope mismatch, counted once.
+	scopeBefore := h.metrics.authFailureCount("scope")
+	for _, ep := range []scheduler.Endpoint{scheduler.EPComplete, scheduler.EPFail, scheduler.EPCancelAck} {
+		forwardsBefore := len(h.server.forwarded(ep))
+		code, body := h.call(http.MethodPost, "/api/daemon/tasks/task-b/"+string(ep), tokenA,
+			[]byte(`{"exit_code":0}`))
+		if code != http.StatusForbidden {
+			t.Errorf("cross-task %s replay = %d (%s), want 403", ep, code, body)
+		}
+		if got := len(h.server.forwarded(ep)); got != forwardsBefore {
+			t.Errorf("cross-task %s was forwarded (%d → %d), want the refused request never to reach the server",
+				ep, forwardsBefore, got)
+		}
+	}
+	if got := h.metrics.authFailureCount("scope") - scopeBefore; got != 3 {
+		t.Errorf("scope auth failures for the cross-task replays = %d, want 3", got)
+	}
+	if entry, ok := h.reg.Get("task-b"); !ok || entry.IsTerminal() {
+		t.Errorf("task-b entry = %+v/%v, want it untouched by the refused replays", entry, ok)
 	}
 }
 
