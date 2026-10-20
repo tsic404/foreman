@@ -1221,10 +1221,14 @@ var upstreamUnavailableBody = []byte(`{"error":"upstream unavailable"}`)
 // decided body. A write that fails is the queue's own error row: it keeps the
 // report staged and retries it every drain (§1.5 退避后重试), and Queued
 // reports it as undelivered so the entry's objects stay put. The error is
-// logged, never acted on — dropping the report here is exactly what §10
-// forbids.
+// logged, never acted on. The one report the queue itself discards is the one
+// its retention bound refuses (§4.6): the queue emitted that drop's error row
+// already, so it is not repeated here.
 func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep Endpoint, failureReason string, body []byte) {
 	if err := s.pendingReports.Enqueue(ctx, e.TaskID, e.JobName, e.DaemonID, ep, body, failureReason); err != nil {
+		if errors.Is(err, ErrPendingQueueFull) {
+			return
+		}
 		s.log.ErrorContext(ctx, "task.forward_undelivered",
 			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 			"endpoint", string(ep),

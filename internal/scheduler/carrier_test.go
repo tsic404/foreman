@@ -70,12 +70,24 @@ func (s *memCarrierStore) count() int {
 	return len(s.carriers)
 }
 
+// restoreForServe lands the startup rebuild production performs before any
+// report arrives (scheduler.Rebuild → RestorePendingReports). Without it the
+// carrier backlog is unknown, and the retention bound refuses new entries
+// (§4.6): unknown capacity is not room.
+func restoreForServe(t *testing.T, p *PendingReports) {
+	t.Helper()
+	if err := p.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+}
+
 func TestPendingCarrierHoldsTheForwardedBodyVerbatim(t *testing.T) {
 	store := newMemCarrierStore()
 	p, err := NewPendingReports(t.TempDir(), WithPendingReportsCarrier(store))
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
+	restoreForServe(t, p)
 	body := []byte(`{"result":"ok","summary":"done"}`)
 	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPComplete, body, ""); err != nil {
 		t.Fatalf("Enqueue: %v", err)
@@ -104,6 +116,7 @@ func TestPendingRestoreRebuildsTheQueueFromCarriers(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
+	restoreForServe(t, p)
 	body := []byte(`{"result":"ok"}`)
 	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPComplete, body, ""); err != nil {
 		t.Fatalf("Enqueue: %v", err)
@@ -157,6 +170,7 @@ func TestPendingCarrierCarriesTheFailureAttribution(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
+	restoreForServe(t, p)
 	body := []byte(`{"error":"job vanished"}`)
 	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, body, FailureReasonJobMissing); err != nil {
 		t.Fatalf("Enqueue: %v", err)
@@ -239,6 +253,7 @@ func TestPendingCarrierWriteFailureIsRetriedByDrain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
+	restoreForServe(t, p)
 	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPComplete, []byte(`{"result":"ok"}`), ""); err == nil {
 		t.Fatal("Enqueue: want the carrier write error surfaced")
 	}
@@ -265,6 +280,7 @@ func TestPendingCarrierBoundKeepsOversizeReportsInProcess(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
+	restoreForServe(t, p)
 	body := []byte(`{"v":"` + strings.Repeat("x", MaxCarrierBytes) + `"}`)
 	err = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPComplete, body, "")
 	if !errors.Is(err, ErrCarrierPayloadTooLarge) {

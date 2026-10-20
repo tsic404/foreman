@@ -268,6 +268,22 @@ func (s *blockingSender) DeliverQueued(context.Context, Endpoint, string, []byte
 	return 503, nil, nil
 }
 
+// makeQueueUnwritable leaves the queue directory listable but refuses writes:
+// the shape the 错误处理表's staging row covers (a known depth, a failed
+// write). A directory that cannot be listed is the other face — unknown
+// capacity — which the retention bound refuses instead of admitting.
+func makeQueueUnwritable(t *testing.T, dir string) {
+	t.Helper()
+	if err := os.Chmod(dir, 0o500); err != nil {
+		t.Fatalf("chmod %s: %v", dir, err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if err := os.WriteFile(filepath.Join(dir, "probe"), []byte("x"), 0o600); err == nil {
+		_ = os.Remove(filepath.Join(dir, "probe"))
+		t.Skip("the queue directory is still writable (privileged test user)")
+	}
+}
+
 // A failed write must not drop the report: it stays staged, counts as
 // undelivered for Queued, never grows the gauge, and the next drain that can
 // write lands it (错误处理表「待发队列目录不可写 → 记 error + gauge 不增长；
@@ -281,13 +297,8 @@ func TestEnqueueFailureStagesReportUntilWritable(t *testing.T) {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
 
-	// Break the queue directory: the write cannot land.
-	if err := os.RemoveAll(dir); err != nil {
-		t.Fatalf("remove dir: %v", err)
-	}
-	if err := os.WriteFile(dir, []byte("not a directory"), 0o600); err != nil {
-		t.Fatalf("break dir: %v", err)
-	}
+	// The directory stays listable (the depth is known) but refuses writes.
+	makeQueueUnwritable(t, dir)
 	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"failure_reason":"job_failed"}`), ""); err == nil {
 		t.Fatal("Enqueue against an unwritable queue: want the write error")
 	}
@@ -305,10 +316,7 @@ func TestEnqueueFailureStagesReportUntilWritable(t *testing.T) {
 
 	// The directory is writable again: the retry lands the report and one
 	// delivery takes it off the queue.
-	if err := os.Remove(dir); err != nil {
-		t.Fatalf("remove blocker: %v", err)
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatalf("restore dir: %v", err)
 	}
 	sender := &fakeSender{code: 200}
@@ -379,19 +387,11 @@ func TestReportEventsCarryTaskIdentity(t *testing.T) {
 	}
 	// A failed write stages the report; the retry's queue line is the second
 	// forward_queued emission (the first is the direct write below).
-	if err := os.RemoveAll(dir); err != nil {
-		t.Fatalf("remove dir: %v", err)
-	}
-	if err := os.WriteFile(dir, []byte("not a directory"), 0o600); err != nil {
-		t.Fatalf("break dir: %v", err)
-	}
+	makeQueueUnwritable(t, dir)
 	if err := p.Enqueue(context.Background(), "task-staged", "fm-task-staged", "fm-daemon-staged", EPFail, []byte(`{}`), ""); err == nil {
 		t.Fatal("Enqueue against an unwritable queue: want the write error")
 	}
-	if err := os.Remove(dir); err != nil {
-		t.Fatalf("remove blocker: %v", err)
-	}
-	if err := os.MkdirAll(dir, 0o700); err != nil {
+	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatalf("restore dir: %v", err)
 	}
 	if _, err := p.Drain(context.Background(), &fakeSender{code: 200}); err != nil {
@@ -549,5 +549,292 @@ func TestMalformedFileQuarantineFailureIsLoggedOnce(t *testing.T) {
 	}
 	if got := strings.Count(logs.String(), "quarantine failed"); got != 1 {
 		t.Fatalf("quarantine-failure log lines = %d, want one", got)
+	}
+}
+
+// TestEnqueueRefusesNewEntriesAtTheRetentionBound pins §4.6 / ADR-046 decision
+// 6: once the queue holds its bound, a report for a task it does not already
+// hold is refused — dropped with an error row, the alarm face — while a task's
+// own replacement is still admitted and no queued entry is removed.
+func TestEnqueueRefusesNewEntriesAtTheRetentionBound(t *testing.T) {
+	store := newMemCarrierStore()
+	logs := &strings.Builder{}
+	p, err := NewPendingReports(t.TempDir(),
+		WithPendingReportsMaxEntries(2),
+		WithPendingReportsCarrier(store),
+		WithPendingReportsLogger(slog.New(slog.NewJSONHandler(logs, nil))))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	// The startup rebuild completes before reports arrive (§4.3); an
+	// unrestored list reads every task as possibly queued.
+	if err := p.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	for _, taskID := range []string{"task-1", "task-2"} {
+		if err := p.Enqueue(context.Background(), taskID, "fm-"+taskID, "fm-"+taskID, EPFail, []byte(`{}`), ""); err != nil {
+			t.Fatalf("Enqueue %s: %v", taskID, err)
+		}
+	}
+	if got := p.Len(); got != 2 {
+		t.Fatalf("Len = %d, want the bound", got)
+	}
+	if got := store.count(); got != 2 {
+		t.Fatalf("carriers = %d, want 2", got)
+	}
+
+	// A new entry is refused: nothing written, nothing staged, nothing
+	// carried, and the drop is the alarm face's error row.
+	err = p.Enqueue(context.Background(), "task-3", "fm-task-3", "fm-task-3", EPComplete, []byte(`{"result":"ok"}`), "")
+	if !errors.Is(err, ErrPendingQueueFull) {
+		t.Fatalf("Enqueue at the bound = %v, want ErrPendingQueueFull", err)
+	}
+	if got := p.Len(); got != 2 {
+		t.Fatalf("Len after the refusal = %d, want the bound untouched", got)
+	}
+	if p.Queued("task-3") {
+		t.Fatal("the refused report must not be held: a queued entry holds its Job back")
+	}
+	if got := store.count(); got != 2 {
+		t.Fatalf("carriers after the refusal = %d, want the queued two only", got)
+	}
+	if _, ok := p.readLocked("task-3"); ok {
+		t.Fatal("the refused report must not name a queue file")
+	}
+	record := pendingLogRecord(t, logs.String(), "task.forward_dropped", "task-3")
+	assertPendingLogIdentity(t, record, "fm-task-3", "fm-task-3")
+	if got := record["reason"]; got != "pending report queue bound reached" {
+		t.Errorf("reason = %v, want the bound's drop reason", got)
+	}
+
+	// A task the queue already holds is a replacement, not a new entry: it is
+	// admitted at the bound and never grows the queue.
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"v":2}`), ""); err != nil {
+		t.Fatalf("re-enqueue at the bound: %v", err)
+	}
+	if got := p.Len(); got != 2 {
+		t.Fatalf("Len after the replacement = %d, want the bound", got)
+	}
+	if rep, ok := p.readLocked("task-1"); !ok || string(rep.Body) != `{"v":2}` {
+		t.Fatalf("replaced report = %+v (ok=%v), want the newer body", rep, ok)
+	}
+
+	// Settlement frees capacity: the same task is admitted once the queue is
+	// below the bound again.
+	p.Drop(context.Background(), "task-2")
+	if got := p.Len(); got != 1 {
+		t.Fatalf("Len after settlement = %d, want 1", got)
+	}
+	if err := p.Enqueue(context.Background(), "task-3", "fm-task-3", "fm-task-3", EPComplete, []byte(`{"result":"ok"}`), ""); err != nil {
+		t.Fatalf("Enqueue below the bound: %v", err)
+	}
+}
+
+// TestRetentionBoundCountsCarrierBackedEntries: a carrier-restored backlog
+// occupies the bound (nothing is deleted to make room, and none of it is
+// trimmed), so the queue refuses new entries until the backlog drains.
+func TestRetentionBoundCountsCarrierBackedEntries(t *testing.T) {
+	store := newMemCarrierStore()
+	for _, taskID := range []string{"task-1", "task-2"} {
+		if err := store.PutCarrier(context.Background(), Carrier{
+			TaskID: taskID, Endpoint: string(EPFail), Body: []byte(`{}`), EnqueuedAt: time.Now(),
+		}); err != nil {
+			t.Fatalf("PutCarrier: %v", err)
+		}
+	}
+	p, err := NewPendingReports(t.TempDir(),
+		WithPendingReportsMaxEntries(2),
+		WithPendingReportsCarrier(store))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	if err := p.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if got := p.Len(); got != 2 {
+		t.Fatalf("rebuilt depth = %d, want the carrier count", got)
+	}
+	// The backlog is already enqueued: the bound never trims it.
+	if err := p.Enqueue(context.Background(), "task-3", "", "", EPFail, []byte(`{}`), ""); !errors.Is(err, ErrPendingQueueFull) {
+		t.Fatalf("Enqueue over a restored backlog = %v, want ErrPendingQueueFull", err)
+	}
+	if got := store.count(); got != 2 {
+		t.Fatalf("carriers after the refusal = %d, want the restored two kept", got)
+	}
+	// Both restored reports are still delivered — dropping them for the bound
+	// would pass a mere depth-zero check but lose two terminal callbacks.
+	sender := &fakeSender{code: 200}
+	remaining, err := p.Drain(context.Background(), sender)
+	if err != nil || remaining != 0 {
+		t.Fatalf("Drain = %d, %v", remaining, err)
+	}
+	delivered := make(map[string]bool, len(sender.sent))
+	for _, sent := range sender.sent {
+		taskID, _, _ := strings.Cut(sent, ":")
+		delivered[taskID] = true
+	}
+	if len(sender.sent) != 2 || !delivered["task-1"] || !delivered["task-2"] {
+		t.Fatalf("replayed = %v, want both restored reports delivered", sender.sent)
+	}
+	if got := store.count(); got != 0 {
+		t.Fatalf("carriers after settlement = %d, want 0", got)
+	}
+}
+
+// TestRetentionBoundCountsStagedReports: a report a failed write left staged
+// is held by the queue too, so it occupies the bound — the memory face cannot
+// grow past it while the disk is unwritable.
+func TestRetentionBoundCountsStagedReports(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "pending-reports")
+	p, err := NewPendingReports(dir, WithPendingReportsMaxEntries(1))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	makeQueueUnwritable(t, dir)
+	if err := p.Enqueue(context.Background(), "task-1", "", "", EPFail, []byte(`{}`), ""); err == nil {
+		t.Fatal("Enqueue against an unwritable queue: want the write error")
+	}
+	if !p.Queued("task-1") {
+		t.Fatal("the staged report must be held")
+	}
+	if err := p.Enqueue(context.Background(), "task-2", "", "", EPFail, []byte(`{}`), ""); !errors.Is(err, ErrPendingQueueFull) {
+		t.Fatalf("Enqueue over a staged report = %v, want ErrPendingQueueFull", err)
+	}
+
+	// The queue below the bound admits again once the staged report left.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("restore dir: %v", err)
+	}
+	if remaining, err := p.Drain(context.Background(), &fakeSender{code: 200}); err != nil || remaining != 0 {
+		t.Fatalf("Drain = %d, %v", remaining, err)
+	}
+	if err := p.Enqueue(context.Background(), "task-2", "", "", EPFail, []byte(`{}`), ""); err != nil {
+		t.Fatalf("Enqueue after the queue drained: %v", err)
+	}
+}
+
+// TestUnlistableQueueRefusesNewEntries: a queue directory that can be written
+// but not listed hides the entries it already holds. The admission gate reads
+// that unknown capacity as reached — the same discipline Queued follows
+// (§4.3) — and refuses the new entry through the same drop row, instead of
+// reading the depth as zero and letting the queue grow.
+func TestUnlistableQueueRefusesNewEntries(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "pending-reports")
+	logs := &strings.Builder{}
+	p, err := NewPendingReports(dir,
+		WithPendingReportsMaxEntries(8),
+		WithPendingReportsLogger(slog.New(slog.NewJSONHandler(logs, nil))))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{}`), ""); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// Writable but not listable: creating and renaming files still works, the
+	// directory read does not.
+	if err := os.Chmod(dir, 0o300); err != nil {
+		t.Fatalf("chmod: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(dir, 0o700) })
+	if _, err := os.ReadDir(dir); err == nil {
+		t.Skip("the queue directory is still listable (privileged test user)")
+	}
+
+	// A task already queued stays a replacement even with the listing gone:
+	// its own file is still probeable by name, so the re-enqueue is admitted
+	// and draws no depth-unknown drop.
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"v":2}`), ""); err != nil {
+		t.Fatalf("re-enqueue of a held task with an unlistable queue: %v", err)
+	}
+	if got := strings.Count(logs.String(), `"msg":"task.forward_dropped"`); got != 0 {
+		t.Fatalf("drop rows after a held replacement = %d, want none", got)
+	}
+	if rep, ok := p.readLocked("task-1"); !ok || string(rep.Body) != `{"v":2}` {
+		t.Fatalf("replaced report = %+v (ok=%v), want the newer body", rep, ok)
+	}
+
+	err = p.Enqueue(context.Background(), "task-2", "fm-task-2", "fm-task-2", EPComplete, []byte(`{"result":"ok"}`), "")
+	if !errors.Is(err, ErrPendingQueueFull) {
+		t.Fatalf("Enqueue with an unlistable queue = %v, want ErrPendingQueueFull", err)
+	}
+	record := pendingLogRecord(t, logs.String(), "task.forward_dropped", "task-2")
+	assertPendingLogIdentity(t, record, "fm-task-2", "fm-task-2")
+	if got := record["reason"]; got != "pending report queue depth unknown: queue directory cannot be listed" {
+		t.Errorf("reason = %v, want the unknown-depth drop", got)
+	}
+	if _, ok := record["err"]; !ok {
+		t.Error("the unknown-depth drop must carry the listing error")
+	}
+	if _, err := os.Stat(filepath.Join(dir, "task-2.json")); !os.IsNotExist(err) {
+		t.Fatalf("the refused report left a queue file: %v", err)
+	}
+	if !p.Queued("task-1") {
+		t.Fatal("the held entry must survive the refused admission")
+	}
+
+	// The listing is back: the same report is admitted.
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("restore mode: %v", err)
+	}
+	if err := p.Enqueue(context.Background(), "task-2", "fm-task-2", "fm-task-2", EPComplete, []byte(`{"result":"ok"}`), ""); err != nil {
+		t.Fatalf("Enqueue after the listing recovered: %v", err)
+	}
+	if got := p.Len(); got != 2 {
+		t.Fatalf("depth = %d, want both entries", got)
+	}
+}
+
+// TestUnrebuiltCarrierBacklogRefusesNewEntries: before the carrier list lands,
+// the previous process's backlog is invisible, so capacity is unknown and new
+// entries are refused. A task the queue already holds (visible on disk) stays a
+// replacement; the rebuild restores admission without dropping anything.
+func TestUnrebuiltCarrierBacklogRefusesNewEntries(t *testing.T) {
+	dir := t.TempDir()
+	held, err := json.Marshal(pendingReport{
+		TaskID: "held", Endpoint: string(EPFail), Body: json.RawMessage(`{}`), EnqueuedAt: time.Now(),
+	})
+	if err != nil {
+		t.Fatalf("marshal held report: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "held.json"), held, 0o600); err != nil {
+		t.Fatalf("write held report: %v", err)
+	}
+	store := newMemCarrierStore()
+	logs := &strings.Builder{}
+	p, err := NewPendingReports(dir,
+		WithPendingReportsMaxEntries(8),
+		WithPendingReportsCarrier(store),
+		WithPendingReportsLogger(slog.New(slog.NewJSONHandler(logs, nil))))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+
+	// A held task is a replacement: capacity is not judged for it.
+	if err := p.Enqueue(context.Background(), "held", "fm-held", "fm-held", EPFail, []byte(`{"v":2}`), ""); err != nil {
+		t.Fatalf("re-enqueue while the backlog is unknown: %v", err)
+	}
+	// A new task is refused: the backlog could already fill the bound.
+	err = p.Enqueue(context.Background(), "task-new", "fm-task-new", "fm-task-new", EPComplete, []byte(`{}`), "")
+	if !errors.Is(err, ErrPendingQueueFull) {
+		t.Fatalf("Enqueue while the backlog is unknown = %v, want ErrPendingQueueFull", err)
+	}
+	record := pendingLogRecord(t, logs.String(), "task.forward_dropped", "task-new")
+	if got := record["reason"]; got != "pending report queue depth unknown: carrier backlog not rebuilt" {
+		t.Errorf("reason = %v, want the unrebuilt-backlog drop", got)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "task-new.json")); !os.IsNotExist(err) {
+		t.Fatalf("the refused report left a queue file: %v", err)
+	}
+
+	// The rebuild lands: admission resumes and nothing was trimmed.
+	if err := p.Restore(context.Background()); err != nil {
+		t.Fatalf("Restore: %v", err)
+	}
+	if got := p.Len(); got != 1 {
+		t.Fatalf("depth after the rebuild = %d, want the held entry only", got)
+	}
+	if err := p.Enqueue(context.Background(), "task-new", "fm-task-new", "fm-task-new", EPComplete, []byte(`{}`), ""); err != nil {
+		t.Fatalf("Enqueue after the rebuild: %v", err)
 	}
 }

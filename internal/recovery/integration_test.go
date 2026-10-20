@@ -324,13 +324,16 @@ func TestIntegrationStagedReportSurvivesWriteFailure(t *testing.T) {
 		scheduler.WithPendingReportsGauge(metrics.PendingReports))
 	ctx := context.Background()
 
-	// Break the queue directory: every write now fails (ENOTDIR), exactly
-	// like an unwritable state root.
-	if err := os.RemoveAll(queuePath); err != nil {
-		t.Fatalf("remove queue dir: %v", err)
+	// The queue directory stays listable (the depth is known) but refuses
+	// writes — the staging row's shape. A directory that cannot be listed is
+	// the capacity-unknown face instead, which the retention bound refuses.
+	if err := os.Chmod(queuePath, 0o500); err != nil {
+		t.Fatalf("chmod queue dir: %v", err)
 	}
-	if err := os.WriteFile(queuePath, []byte("not a directory"), 0o600); err != nil {
-		t.Fatalf("break queue dir: %v", err)
+	t.Cleanup(func() { _ = os.Chmod(queuePath, 0o700) })
+	if err := os.WriteFile(filepath.Join(queuePath, "probe"), []byte("x"), 0o600); err == nil {
+		_ = os.Remove(filepath.Join(queuePath, "probe"))
+		t.Skip("the queue directory is still writable (privileged test user)")
 	}
 
 	claim := json.RawMessage(`{"id":"t1","agent_id":"a1","issue_id":"i1","issue_identifier":"TSI-1","workspace_id":"w1"}`)
@@ -387,10 +390,7 @@ func TestIntegrationStagedReportSurvivesWriteFailure(t *testing.T) {
 
 	// The directory is writable again and the upstream recovers: one round
 	// lands the staged write, delivers it, and cleans up.
-	if err := os.Remove(queuePath); err != nil {
-		t.Fatalf("remove queue blocker: %v", err)
-	}
-	if err := os.MkdirAll(queuePath, 0o700); err != nil {
+	if err := os.Chmod(queuePath, 0o700); err != nil {
 		t.Fatalf("restore queue dir: %v", err)
 	}
 	server.setForwardCode(0)

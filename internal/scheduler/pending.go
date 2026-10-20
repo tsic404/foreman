@@ -20,6 +20,19 @@ import (
 // it is dropped with an error log (§10: 上限 24h).
 const PendingReportTTL = 24 * time.Hour
 
+// MaxPendingReports is the queue's retention bound on held entries (§4.6,
+// ADR-046 decision 6). It acts at enqueue: once the queue holds this many
+// entries, a report for a task it does not already hold is refused and
+// dropped with an error (the alarm face). Entries already queued — the ones
+// carried on the cluster carrier included — are never removed for the bound;
+// the bound is one order above the design's ≤10² working scale (ADR-046), so
+// a routine outage never reaches it.
+const MaxPendingReports = 1024
+
+// ErrPendingQueueFull reports a report the retention bound refused: it was
+// not enqueued, and the error is the alarm face (§4.6, ADR-046 decision 6).
+var ErrPendingQueueFull = errors.New("pending-report queue at its retention bound")
+
 // EnvStateRoot is FOREMAN_STATE_ROOT: the node-local state root the queue
 // lives under (the same root the GC module reclaims).
 const EnvStateRoot = "FOREMAN_STATE_ROOT"
@@ -85,6 +98,10 @@ type PendingReports struct {
 	mu       sync.Mutex
 	onChange func(int) // foreman_pending_reports gauge hook
 
+	// maxEntries is the retention bound on held entries (§4.6, ADR-046
+	// decision 6); Enqueue refuses a new entry once the queue holds this many.
+	maxEntries int
+
 	// staged holds the reports that are not durable yet: a write that failed
 	// (待发队列目录不可写：记 error + gauge 不
 	// 增长；退避后重试」) or a task id that can never name a queue file. It is
@@ -136,6 +153,17 @@ func WithPendingReportsCarrier(c CarrierStore) PendingReportsOption {
 	return func(p *PendingReports) { p.carriers = c }
 }
 
+// WithPendingReportsMaxEntries overrides the retention bound on held entries
+// (§4.6, ADR-046 decision 6). A non-positive value keeps the default: the
+// contract's bound is what makes the queue finite, so there is no "off".
+func WithPendingReportsMaxEntries(n int) PendingReportsOption {
+	return func(p *PendingReports) {
+		if n > 0 {
+			p.maxEntries = n
+		}
+	}
+}
+
 // NewPendingReports opens (creating if needed) the queue directory.
 func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReports, error) {
 	if dir == "" {
@@ -151,6 +179,7 @@ func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReport
 		staged:          make(map[string]pendingReport),
 		quarantineTried: make(map[string]bool),
 		carrierBacked:   make(map[string]bool),
+		maxEntries:      MaxPendingReports,
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -173,8 +202,48 @@ func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReport
 // reports it as undelivered, so the task's objects stay until it landed. The
 // returned error is that error row's "记 error" half — never a reason to
 // discard the report.
+//
+// The retention bound (§4.6, ADR-046 decision 6) acts here, on new entries
+// only: once the queue holds maxEntries reports, one for a task it does not
+// already hold is refused with ErrPendingQueueFull and dropped with an error
+// row (the alarm face). A re-enqueue replaces a body and never grows the
+// queue, so it is not a new entry; entries already queued — carrier-backed
+// ones included — are never removed to make room. Capacity the process cannot
+// see — an unlistable queue directory, a carrier backlog the rebuild has not
+// landed — reads as reached, never as room (unknown is not empty, §4.3).
 func (p *PendingReports) Enqueue(ctx context.Context, taskID, jobName, daemonID string, ep Endpoint, body []byte, failureReason string) error {
 	p.mu.Lock()
+	// A report the queue already holds — staged, carrier-backed, or on disk —
+	// is a replacement (§4.6): it never grows the queue, so it is admitted
+	// without judging capacity. The disk face is the directory listing when
+	// that can be read; when it cannot, the task's own file is still
+	// probeable by name, so an already-queued report stays a replacement
+	// instead of drawing a depth-unknown drop.
+	_, staged := p.staged[taskID]
+	if held := p.carrierBacked[taskID] || staged; !held {
+		diskIDs, diskErr := p.diskIDsLocked()
+		if diskErr == nil {
+			_, held = diskIDs[taskID]
+		} else if validTaskID(taskID) {
+			if _, statErr := os.Stat(p.path(taskID)); statErr == nil {
+				held = true
+			}
+		}
+		if !held {
+			if reason, cause := p.refusalLocked(diskIDs, diskErr); reason != "" {
+				p.mu.Unlock()
+				fields := []any{
+					"task_id", taskID, "job_name", jobName, "daemon_id", daemonID,
+					"endpoint", string(ep), "bound", p.maxEntries, "reason", reason,
+				}
+				if cause != nil {
+					fields = append(fields, "err", cause)
+				}
+				p.log.Error("task.forward_dropped", fields...)
+				return fmt.Errorf("%w: %s", ErrPendingQueueFull, reason)
+			}
+		}
+	}
 	rep := pendingReport{
 		TaskID:        taskID,
 		JobName:       jobName,
@@ -525,6 +594,74 @@ func (p *PendingReports) entryPresentLocked(taskID string) bool {
 	}
 	_, ok := p.staged[taskID]
 	return ok
+}
+
+// diskIDsLocked is the queue's disk face as task ids, read from the directory's
+// file names only: the capacity bound is an entry count, and a report body can
+// be MiB-sized, so the admission gate never opens or decodes one. A directory
+// that cannot be listed is an error — unknown, never an empty queue (§4.3).
+func (p *PendingReports) diskIDsLocked() (map[string]struct{}, error) {
+	entries, err := os.ReadDir(p.dir)
+	if err != nil {
+		return nil, fmt.Errorf("list pending-reports dir: %w", err)
+	}
+	ids := make(map[string]struct{}, len(entries))
+	for _, ent := range entries {
+		if ent.IsDir() {
+			continue
+		}
+		taskID, ok := strings.CutSuffix(ent.Name(), ".json")
+		if !ok || !validTaskID(taskID) {
+			continue
+		}
+		ids[taskID] = struct{}{}
+	}
+	return ids, nil
+}
+
+// heldCountLocked counts the entries the queue holds, deduplicated by task id
+// across its faces: the disk files (by name), the staged reports and the
+// carrier-backed ones.
+func (p *PendingReports) heldCountLocked(diskIDs map[string]struct{}) int {
+	n := len(diskIDs)
+	for taskID := range p.staged {
+		if _, ok := diskIDs[taskID]; !ok {
+			n++
+		}
+	}
+	for taskID := range p.carrierBacked {
+		if _, ok := diskIDs[taskID]; ok {
+			continue
+		}
+		if _, ok := p.staged[taskID]; ok {
+			continue
+		}
+		n++
+	}
+	return n
+}
+
+// refusalLocked answers the admission gate for a new entry: the reason it may
+// not join the queue, and the cause when the reason is a face it could not
+// read. An empty reason means admitted.
+//
+// The unknown faces read as reached (unknown is not empty, §4.3): a directory
+// that cannot be listed hides entries the process already holds, and a carrier
+// backlog the rebuild has not landed hides the previous process's entries.
+// Admitting against either is exactly what would let the queue grow past its
+// bound. Refusing does not weaken §10's write-ahead: the direct forward still
+// runs, the write-ahead ordering is unchanged, and the refusal itself is
+// §4.6's registered alarm-face drop.
+func (p *PendingReports) refusalLocked(diskIDs map[string]struct{}, diskErr error) (string, error) {
+	switch {
+	case diskErr != nil:
+		return "pending report queue depth unknown: queue directory cannot be listed", diskErr
+	case p.carriers != nil && !p.restored:
+		return "pending report queue depth unknown: carrier backlog not rebuilt", nil
+	case p.heldCountLocked(diskIDs) >= p.maxEntries:
+		return "pending report queue bound reached", nil
+	}
+	return "", nil
 }
 
 // dropLocked removes a report from the queue, wherever it sits: the durable

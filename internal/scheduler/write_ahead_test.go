@@ -2,12 +2,14 @@ package scheduler
 
 import (
 	"context"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/tsic404/foreman/internal/observability"
 	"github.com/tsic404/foreman/internal/registry"
 )
 
@@ -143,5 +145,83 @@ func TestCompensatedFailReportIsDurableBeforeTheForward(t *testing.T) {
 	}
 	if len(f.server.forwards) != 1 || f.server.forwards[0].ep != EPFail {
 		t.Fatalf("forwards = %+v, want exactly one fail report", f.server.forwards)
+	}
+}
+
+// TestTerminalReportDroppedAtTheRetentionBound: with the queue at its bound, an
+// inbound terminal report has no write-ahead landing. The queue refuses it with
+// its own error row — the alarm face (§4.6, ADR-046 decision 6) — and the
+// scheduler does not log the refusal a second time. The verdict is still
+// written and the forward still goes out: the queue is a fallback, not the
+// delivery path.
+func TestTerminalReportDroppedAtTheRetentionBound(t *testing.T) {
+	f := newFixture(t)
+	queueLogs := &strings.Builder{}
+	p, err := NewPendingReports(t.TempDir(),
+		WithPendingReportsMaxEntries(1),
+		WithPendingReportsLogger(slog.New(slog.NewJSONHandler(queueLogs, nil))))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	// The scheduler's own face is captured too: the refusal must not grow a
+	// second, differently-worded line in enqueuePending.
+	schedLogs := &strings.Builder{}
+	cfg, err := LoadConfig(testEnv(nil))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	sched, err := New(cfg, f.reg, f.jobs, f.builder, f.server, f.metrics,
+		WithClock(func() time.Time { return f.now }),
+		WithPendingReports(p),
+		WithRevoker(f.revoker),
+		WithProbeRegistry(registry.NewProbeRegistry()),
+		WithLogger(observability.NewLogger(schedLogs, slog.LevelInfo, "")))
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	f.sched = sched
+	f.server.forwardCode = 503
+
+	first := f.claim(t, "task-1")
+	if code, _, err := f.sched.OnReport(context.Background(), EPComplete, first, []byte(`{"result":"ok"}`), ""); err != nil || code != 502 {
+		t.Fatalf("OnReport task-1 = %d, %v; want 502 with the upstream down", code, err)
+	}
+	if got := p.Len(); got != 1 {
+		t.Fatalf("pending reports = %d, want the first report queued", got)
+	}
+
+	second := f.claim(t, "task-2")
+	if code, _, err := f.sched.OnReport(context.Background(), EPComplete, second, []byte(`{"result":"ok"}`), ""); err != nil || code != 502 {
+		t.Fatalf("OnReport task-2 = %d, %v; want the same forward", code, err)
+	}
+	if got := p.Len(); got != 1 {
+		t.Fatalf("pending reports = %d, want the bound held", got)
+	}
+	if p.Queued("task-2") {
+		t.Fatal("the refused report must not gate task-2's objects")
+	}
+	if entry, ok := f.reg.Get("task-2"); !ok || !entry.IsTerminal() {
+		t.Fatalf("entry = %+v, %v; want the verdict written despite the refusal", entry, ok)
+	}
+	// The refused report was still forwarded: the queue is a fallback, not the
+	// delivery path.
+	forwarded := false
+	for _, call := range f.server.forwards {
+		if call.ep == EPComplete && call.taskID == "task-2" {
+			forwarded = true
+		}
+	}
+	if !forwarded {
+		t.Fatalf("forwards = %+v, want task-2's complete report attempted", f.server.forwards)
+	}
+	// One drop row for the one refused report, with the task-face identity.
+	record := pendingLogRecord(t, queueLogs.String(), "task.forward_dropped", "task-2")
+	assertPendingLogIdentity(t, record, "fm-task-2", "fm-task-2")
+	if got := strings.Count(queueLogs.String(), `"msg":"task.forward_dropped"`); got != 1 {
+		t.Fatalf("drop rows = %d, want exactly the queue's alarm row", got)
+	}
+	// The scheduler must not repeat the queue's drop as an undelivered line.
+	if got := strings.Count(schedLogs.String(), `"msg":"task.forward_undelivered"`); got != 0 {
+		t.Fatalf("scheduler undelivered rows = %d, want none for the bound's drop", got)
 	}
 }
