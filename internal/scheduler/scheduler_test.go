@@ -3045,6 +3045,7 @@ func TestTaskEventsCarryIdentity(t *testing.T) {
 		f := newFixture(t)
 		buf := newLogScheduler(t, f, slog.LevelInfo)
 		f.claim(t, "task-1")
+		f.server.statusErr = ErrTaskNotFound
 		if err := f.sched.OnTaskVanished(context.Background(), "task-1"); err != nil {
 			t.Fatalf("OnTaskVanished: %v", err)
 		}

@@ -11,12 +11,29 @@ import (
 	"github.com/tsic404/foreman/internal/registry"
 )
 
+// rebuiltEntry puts the entry a restart rebuilds: identity and Job name, no
+// payload and no token digest. It is the only shape the discard row is for
+// (§4.3: 判别式 = 载荷可得性).
+func (f *fixture) rebuiltEntry(t *testing.T, taskID string) registry.TaskEntry {
+	t.Helper()
+	e := registry.TaskEntry{
+		TaskID: taskID, JobName: "fm-" + taskID, DaemonID: "fm-" + taskID,
+		JobNamespace: "multica-agents", State: registry.StateJobCreated,
+		ClaimedAt: f.now,
+	}
+	if err := f.reg.Put(e); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	return e
+}
+
 // A failed discard must keep the entry live: it is the only retry handle for
 // the Job and its credential Secret, and dropping it would leave a zombie Job
 // or leak the Secret (§6.4: the entry is the only retry handle).
 func TestDiscardTaskKeepsEntryUntilObjectsAreGone(t *testing.T) {
 	f := newFixture(t)
-	f.claim(t, "task-1")
+	f.rebuiltEntry(t, "task-1")
+	f.server.status = "queued"
 
 	secretsBefore := len(f.jobs.deletedSecrets)
 	f.jobs.deleteJobErr = errors.New("apiserver unavailable")
@@ -48,30 +65,27 @@ func TestDiscardTaskKeepsEntryUntilObjectsAreGone(t *testing.T) {
 	}
 }
 
-// The discard path is the "task will be re-run" one: the successor Job
-// reuses the name, so the predecessor's digest must be revoked (ADR-017).
-// A rebuilt entry has no digest and says so.
-func TestDiscardTaskRevokesTheCredential(t *testing.T) {
+// The pre-start replacement row is the one whose predecessor carries a
+// digest: the successor Job reuses the name, so the old pod must never be
+// able to claim the re-run task (ADR-017 replace_pre_start). A rebuilt entry
+// has no digest in memory (TaskEntryFromJob restores none) and degrades
+// visibly instead.
+func TestPreStartReplacementRevokesThePredecessorDigest(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
-	f.jobs.deletedSecrets = nil
+	f.server.status = "dispatched"
 
-	if err := f.sched.DiscardTask(context.Background(), "task-1"); err != nil {
-		t.Fatalf("DiscardTask: %v", err)
+	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
 	}
 	if len(f.revoker.revoked) != 1 || f.revoker.revoked[0] != "hash-of-task-1" {
-		t.Fatalf("revoked = %v, want the entry's digest", f.revoker.revoked)
+		t.Fatalf("revoked = %v, want the predecessor's digest", f.revoker.revoked)
 	}
 
 	// A rebuilt entry (no digest in memory) degrades visibly instead of
 	// silently leaving the old token valid.
-	rebuilt := registry.TaskEntry{
-		TaskID: "task-2", JobName: "fm-task-2", DaemonID: "fm-task-2",
-		State: registry.StateJobCreated,
-	}
-	if err := f.reg.Put(rebuilt); err != nil {
-		t.Fatalf("Put: %v", err)
-	}
+	f.rebuiltEntry(t, "task-2")
+	f.server.status = "queued"
 	if err := f.sched.DiscardTask(context.Background(), "task-2"); err != nil {
 		t.Fatalf("DiscardTask(rebuilt): %v", err)
 	}
@@ -102,6 +116,133 @@ func TestDiscardTaskKeepsStartedEntry(t *testing.T) {
 	}
 	if len(f.revoker.revoked) != 0 {
 		t.Fatalf("revoked = %v, want no revocation for an adopted entry", f.revoker.revoked)
+	}
+}
+
+// The replacement race the discard row must lose: a claim the server
+// re-dispatched replaced the rebuilt entry (payload present, Secret and Job
+// of the successor live under the same names). The round snapshot still says
+// "rebuilt", but the live entry is a claim's — deleting it would revoke the
+// successor's token and remove its Secret and Job.
+func TestDiscardTaskKeepsAReplacementEntry(t *testing.T) {
+	f := newFixture(t)
+	f.claim(t, "task-1")
+	f.server.status = "queued"
+	f.jobs.deletedJobs = nil
+	f.jobs.deletedSecrets = nil
+
+	if err := f.sched.DiscardTask(context.Background(), "task-1"); err != nil {
+		t.Fatalf("DiscardTask: %v", err)
+	}
+	if _, ok := f.reg.Get("task-1"); !ok {
+		t.Fatal("the replacement entry was discarded")
+	}
+	if len(f.jobs.deletedJobs) != 0 || len(f.jobs.deletedSecrets) != 0 {
+		t.Fatalf("deleted jobs/secrets = %v/%v, want the successor's objects kept",
+			f.jobs.deletedJobs, f.jobs.deletedSecrets)
+	}
+	if len(f.revoker.revoked) != 0 {
+		t.Fatalf("revoked = %v, want the successor's token kept", f.revoker.revoked)
+	}
+}
+
+// A terminal verdict is irreversible: the discard row must not delete the
+// objects of a settled entry (its drain owns them, ADR-017).
+func TestDiscardTaskKeepsTerminalEntry(t *testing.T) {
+	f := newFixture(t)
+	f.rebuiltEntry(t, "task-1")
+	f.server.status = "queued"
+	if _, _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, "", f.now); err != nil {
+		t.Fatalf("MarkTerminal: %v", err)
+	}
+
+	if err := f.sched.DiscardTask(context.Background(), "task-1"); err != nil {
+		t.Fatalf("DiscardTask: %v", err)
+	}
+	if e, ok := f.reg.Get("task-1"); !ok || !e.IsTerminal() {
+		t.Fatalf("entry = %+v, %v; want the settled entry kept", e, ok)
+	}
+	if len(f.jobs.deletedJobs) != 0 {
+		t.Fatalf("deletedJobs = %v, want the drain's Job lifecycle untouched", f.jobs.deletedJobs)
+	}
+}
+
+// The deletion re-reads C13 under the task lock: a stale "pre-delivery"
+// round snapshot must not delete a Job whose task the server now holds.
+func TestDiscardTaskAdoptsWhenC13IsPostDelivery(t *testing.T) {
+	f := newFixture(t)
+	f.rebuiltEntry(t, "task-1")
+	f.server.status = "running"
+
+	if err := f.sched.DiscardTask(context.Background(), "task-1"); err != nil {
+		t.Fatalf("DiscardTask: %v", err)
+	}
+	e, ok := f.reg.Get("task-1")
+	if !ok || e.StartedAt.IsZero() {
+		t.Fatalf("entry = %+v, %v; want the adopted entry with a start fact", e, ok)
+	}
+	if len(f.jobs.deletedJobs) != 0 || len(f.revoker.revoked) != 0 {
+		t.Fatalf("deletedJobs = %v, revoked = %v; want the Job and credential kept",
+			f.jobs.deletedJobs, f.revoker.revoked)
+	}
+}
+
+// C13 terminal at the deletion surface settles the entry instead of
+// discarding it: the verdict is the server's, and the drain owns the objects.
+func TestDiscardTaskSettlesWhenC13IsTerminal(t *testing.T) {
+	f := newFixture(t)
+	f.rebuiltEntry(t, "task-1")
+	f.server.status = "completed"
+
+	if err := f.sched.DiscardTask(context.Background(), "task-1"); err != nil {
+		t.Fatalf("DiscardTask: %v", err)
+	}
+	e, ok := f.reg.Get("task-1")
+	if !ok || !e.IsTerminal() || e.Result != registry.ResultCompleted {
+		t.Fatalf("entry = %+v, %v; want the server's verdict", e, ok)
+	}
+	if f.hasJob("fm-task-1") {
+		t.Fatal("the Job must be deleted at the verdict")
+	}
+	if len(f.jobs.deletedSecrets) != 0 {
+		t.Fatalf("secret deletes = %v, want the credential kept for the drain", f.jobs.deletedSecrets)
+	}
+}
+
+// C13 gone at the deletion surface: the task will not be re-run, so it
+// settles with an empty result instead of being discarded.
+func TestDiscardTaskSettlesWhenC13SaysGone(t *testing.T) {
+	f := newFixture(t)
+	f.rebuiltEntry(t, "task-1")
+	f.server.statusErr = ErrTaskNotFound
+
+	if err := f.sched.DiscardTask(context.Background(), "task-1"); err != nil {
+		t.Fatalf("DiscardTask: %v", err)
+	}
+	e, ok := f.reg.Get("task-1")
+	if !ok || !e.IsTerminal() || e.Result != "" {
+		t.Fatalf("entry = %+v, %v; want terminal with an empty result", e, ok)
+	}
+	if f.hasJob("fm-task-1") {
+		t.Fatal("the Job must be deleted at the verdict")
+	}
+}
+
+// A failed C13 re-read is not a verdict: the entry stays as the retry handle.
+func TestDiscardTaskKeepsEntryWhenC13Fails(t *testing.T) {
+	f := newFixture(t)
+	f.rebuiltEntry(t, "task-1")
+	f.server.statusErr = errors.New("status lookup unavailable")
+
+	if err := f.sched.DiscardTask(context.Background(), "task-1"); err == nil {
+		t.Fatal("DiscardTask: want the status error surfaced for the next round")
+	}
+	if _, ok := f.reg.Get("task-1"); !ok {
+		t.Fatal("the entry must stay as the retry handle")
+	}
+	if len(f.jobs.deletedJobs) != 0 || len(f.jobs.deletedSecrets) != 0 {
+		t.Fatalf("deleted jobs/secrets = %v/%v, want nothing deleted on an unknown status",
+			f.jobs.deletedJobs, f.jobs.deletedSecrets)
 	}
 }
 
@@ -243,6 +384,7 @@ func TestOnTaskVanishedEntersDrain(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
 	f.jobs.deletedSecrets = nil
+	f.server.statusErr = ErrTaskNotFound
 
 	if err := f.sched.OnTaskVanished(context.Background(), "task-1"); err != nil {
 		t.Fatalf("OnTaskVanished: %v", err)
@@ -262,6 +404,42 @@ func TestOnTaskVanishedEntersDrain(t *testing.T) {
 	}
 	if len(f.metrics.terminal) != 0 {
 		t.Fatalf("terminal metric = %v, want none for the empty-result path", f.metrics.terminal)
+	}
+}
+
+// The 404 is confirmed under the task lock before anything is deleted: a
+// stale vanish observation must not settle a task the server still holds.
+func TestOnTaskVanishedKeepsTheEntryWhenTheTaskStillExists(t *testing.T) {
+	f := newFixture(t)
+	f.claim(t, "task-1")
+	f.server.status = "running"
+
+	if err := f.sched.OnTaskVanished(context.Background(), "task-1"); err != nil {
+		t.Fatalf("OnTaskVanished: %v", err)
+	}
+	if e, ok := f.reg.Get("task-1"); !ok || e.IsTerminal() {
+		t.Fatalf("entry = %+v, %v; want the live entry kept", e, ok)
+	}
+	if !f.hasJob("fm-task-1") {
+		t.Fatal("the Job must survive a stale vanish observation")
+	}
+}
+
+// A failed confirmation is not a verdict: the entry stays and the next round
+// retries (错误处理表: truth unknown changes nothing).
+func TestOnTaskVanishedKeepsTheEntryWhenTheStatusReadFails(t *testing.T) {
+	f := newFixture(t)
+	f.claim(t, "task-1")
+	f.server.statusErr = errors.New("status lookup unavailable")
+
+	if err := f.sched.OnTaskVanished(context.Background(), "task-1"); err == nil {
+		t.Fatal("OnTaskVanished: want the status error surfaced")
+	}
+	if e, ok := f.reg.Get("task-1"); !ok || e.IsTerminal() {
+		t.Fatalf("entry = %+v, %v; want the live entry kept", e, ok)
+	}
+	if !f.hasJob("fm-task-1") {
+		t.Fatal("the Job must survive an unknown status")
 	}
 }
 
@@ -347,5 +525,55 @@ func TestOnJobTerminatedIgnoresLiveEntries(t *testing.T) {
 	if len(f.jobs.deletedSecrets) != 0 || len(f.revoker.revoked) != 0 {
 		t.Fatalf("secrets=%v revoked=%v, want no action for a live entry",
 			f.jobs.deletedSecrets, f.revoker.revoked)
+	}
+}
+
+// The drain entry is resolved by Job name, and a re-dispatched task may have
+// replaced it under the same name between that read and the lock. The
+// re-read under the lock is what keeps the successor's Secret, entry and
+// token: acting on the predecessor's termination evidence would reclaim
+// objects the successor now owns. The seam lands the successor exactly in
+// that window.
+func TestOnJobTerminatedKeepsTheSuccessorReplacingTheEntry(t *testing.T) {
+	f := newFixture(t)
+	f.claim(t, "task-1")
+	if _, _, err := f.reg.MarkTerminal("task-1", registry.ResultCompleted, "", f.now); err != nil {
+		t.Fatalf("MarkTerminal: %v", err)
+	}
+	f.jobs.deletedSecrets = nil
+
+	// The successor is a live claim: same task and Job name, a payload and a
+	// digest of its own.
+	successor := registry.TaskEntry{
+		TaskID: "task-1", JobName: "fm-task-1", DaemonID: "fm-task-1",
+		JobNamespace: "multica-agents", State: registry.StateJobCreated,
+		ClaimedAt: f.now, Payload: []byte(`{"id":"task-1"}`),
+		TokenHash: "hash-of-the-successor",
+	}
+	f.sched.beforeJobLock = func() {
+		if err := f.reg.Delete("task-1"); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+		if err := f.reg.Put(successor); err != nil {
+			t.Fatalf("Put: %v", err)
+		}
+	}
+
+	if err := f.sched.OnJobTerminated(context.Background(), "fm-task-1",
+		JobTerminationReasonJobTerminated, f.now, 0); err != nil {
+		t.Fatalf("OnJobTerminated: %v", err)
+	}
+	e, ok := f.reg.Get("task-1")
+	if !ok || e.IsDraining() || e.TokenHash != "hash-of-the-successor" {
+		t.Fatalf("entry = %+v, %v; want the successor kept", e, ok)
+	}
+	if len(f.jobs.deletedSecrets) != 0 {
+		t.Fatalf("secret deletes = %v, want the successor's Secret kept", f.jobs.deletedSecrets)
+	}
+	if len(f.revoker.revoked) != 0 {
+		t.Fatalf("revoked = %v, want the successor's token kept", f.revoker.revoked)
+	}
+	if len(f.metrics.reclaim) != 0 {
+		t.Fatalf("cred reclaim metric = %v, want none", f.metrics.reclaim)
 	}
 }

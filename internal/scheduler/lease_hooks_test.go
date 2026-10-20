@@ -199,6 +199,7 @@ func TestOnBootTimeoutIgnoresStartedOrTerminal(t *testing.T) {
 func TestOnTaskVanished(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "t-vanish")
+	f.server.statusErr = ErrTaskNotFound
 
 	if err := f.sched.OnTaskVanished(context.Background(), "t-vanish"); err != nil {
 		t.Fatalf("OnTaskVanished: %v", err)
@@ -428,6 +429,7 @@ func TestOnReportNonTerminal404Vanishes(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "t-prog404")
 	f.server.forwardCode = 404
+	f.server.statusErr = ErrTaskNotFound
 
 	code, _, err := f.sched.OnReport(context.Background(), EPProgress, e, []byte(`{}`), "")
 	if err != nil || code != 404 {

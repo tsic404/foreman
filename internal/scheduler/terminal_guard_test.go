@@ -1,11 +1,10 @@
 // The `first` gates only matter when a losing writer's MarkTerminal returns
 // first=false: OnReport's terminal branch loses to a settlement landed at the
 // queue landing, settleFailure to a verdict already written before failEntry
-// (it does not pre-check IsTerminal), settleReplayed to a vanished-task
-// settlement, which does not take taskMu, and OnTaskVanished to a verdict
-// written before the vanished callback arrives (no IsTerminal pre-check
-// either). Each case must leave the single observation to the path that
-// actually transitioned the entry.
+// (it does not pre-check IsTerminal), settleReplayed to a verdict written
+// between its fresh read and its write, and OnTaskVanished to a verdict
+// written after its pre-check. Each case must leave the single observation to
+// the path that actually transitioned the entry.
 package scheduler
 
 import (
@@ -116,11 +115,10 @@ func TestFailEntryOnADecidedTaskDoesNotCountTheVerdict(t *testing.T) {
 }
 
 // TestSettleReplayedLosingTheVanishedRaceDoesNotCountTheVerdict guards
-// settleReplayed's `first` check. The fresh read runs under taskMu, but
-// OnTaskVanished settles without it (proxy handlers, the lease keeper and the
-// reconciler call it from their own goroutines), so a vanished verdict can win
-// between the read and the write. The replay must then leave the count to the
-// path that actually transitioned the entry.
+// settleReplayed's `first` check. The verdict is written between the fresh
+// read and the write — the window a vanished verdict can land in — so the
+// replay's MarkTerminal returns first=false and it must leave the count to
+// the path that actually transitioned the entry.
 func TestSettleReplayedLosingTheVanishedRaceDoesNotCountTheVerdict(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
@@ -128,13 +126,12 @@ func TestSettleReplayedLosingTheVanishedRaceDoesNotCountTheVerdict(t *testing.T)
 	fired := false
 	f.sched.now = func() time.Time {
 		// MarkTerminal's timestamp argument is evaluated after the fresh read
-		// and before the write — the window OnTaskVanished can land in. The
-		// guard keeps the nested clock read inside OnTaskVanished from
-		// re-entering this hook.
+		// and before the write. The guard keeps the nested clock read inside
+		// MarkTerminal from re-entering this hook.
 		if !fired {
 			fired = true
-			if err := f.sched.OnTaskVanished(context.Background(), "task-1"); err != nil {
-				t.Errorf("OnTaskVanished: %v", err)
+			if _, _, err := f.reg.MarkTerminal("task-1", "", "", f.now); err != nil {
+				t.Errorf("winning MarkTerminal: %v", err)
 			}
 		}
 		return f.now
@@ -151,11 +148,10 @@ func TestSettleReplayedLosingTheVanishedRaceDoesNotCountTheVerdict(t *testing.T)
 	}
 }
 
-// TestOnTaskVanishedOnADecidedTaskDoesNotLogTheVanishedEvent guards
-// OnTaskVanished's `first` check: it reads the entry without an IsTerminal
-// pre-check, so a vanished callback that arrives after another path decided
-// the task still reaches MarkTerminal, which returns first=false. That path
-// must not emit a second task.vanished event.
+// TestOnTaskVanishedOnADecidedTaskDoesNotLogTheVanishedEvent guards the
+// decided-entry branch: a vanished callback that arrives after another path
+// decided the task only retries the Job deletion, and must not emit a second
+// task.vanished event nor rewrite the verdict.
 func TestOnTaskVanishedOnADecidedTaskDoesNotLogTheVanishedEvent(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
