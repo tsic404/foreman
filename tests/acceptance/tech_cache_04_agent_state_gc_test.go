@@ -4,8 +4,8 @@
 // FOREMAN_AGENT_MEMORY_TTL, judged per entry by its own newest mtime; fresh
 // entries and a 35-day memory entry (inside the 90-day memory window) survive,
 // and a zero TTL turns each rule off. The design case's sample tree runs in a
-// temp root here; the DaemonSet wiring (kubectl set env on foreman-gc) is the
-// environment face.
+// temp root here; the node filesystem, the published image and the deployed
+// DaemonSet wiring are tests/acceptance/tech-cache-04-cluster.sh.
 package acceptance
 
 import (
