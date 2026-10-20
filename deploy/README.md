@@ -11,6 +11,7 @@ Everything is plain YAML — `kubectl apply -f deploy/` installs it in one pass.
 | `25-job-template.yaml` | `ConfigMap foreman-job-template` (ns foreman) — the required Job template, mounted by the Deployment |
 | `26-job-policy.yaml` | `ConfigMap foreman-job-policy` (ns foreman) — the **optional** three-axis job policy, mounted by the Deployment |
 | `30-foreman.yaml` | `Deployment foreman` (1 replica) + `Service foreman` (ClusterIP :8080) |
+| `35-shared-state.yaml` | `StatefulSet foreman-redis` + `Service foreman-redis` — the shared state store (ADR-046 阶段一); **baseline only** — a deployment swaps in its own persistent Redis (or a managed service) and points `FOREMAN_STATE_URL` at it |
 | `40-foreman-gc.yaml` | `DaemonSet foreman-gc` (ns multica-agents) |
 | `optional/servicemonitor.yaml` | `ServiceMonitor foreman` — needs the Prometheus Operator CRDs |
 
@@ -42,6 +43,7 @@ rather than serve with a key anyone can read from the repository.
 kubectl -n foreman create secret generic foreman-secret \
   --from-literal=MULTICA_TOKEN='mdt_...' \
   --from-literal=FOREMAN_JOB_TOKEN_KEY="$(head -c 32 /dev/urandom | xxd -p -c 64)" \
+  --from-literal=FOREMAN_STATE_PASSWORD='<redis password, or empty for none>' \
   --dry-run=client -o yaml | kubectl apply -f -
 
 # GHCR pull secret (ns multica-agents and ns foreman): a GitHub token with
@@ -209,6 +211,65 @@ image contains is checked by the design's acceptance cases against the image
 provenance assertions live. The release record reflects the push command's exit
 code only — a non-zero exit does not prove that nothing landed, so check the
 registry before re-running.
+
+## Shared state store (stage one)
+
+Foreman persists the **Job Token entries, the settled terminal records and
+the token revocation set** in a shared state store (Redis), so a restart
+restores them instead of rebuilding from K8s (ADR-046 阶段一,
+`02-contracts.md` §4.3/§6.1, AC-73):
+
+- `FOREMAN_STATE_URL` — the store's connection string. Two forms are
+  accepted (§7 部署面):
+  - **single endpoint** — `redis://host:port`, or `rediss://` for TLS;
+  - **sentinel** — the same URL with `master_name=<name>` and one
+    `addr=<sentinel:26379>` per additional sentinel, e.g.
+    `redis://sentinel-a:26379?master_name=foreman&addr=sentinel-b:26379`.
+    This form is served by a failover client: it resolves `<name>` through
+    the sentinels and follows a failover to the new master.
+
+  A deployment points this at its own Redis and replaces
+  `35-shared-state.yaml`; the shipped manifest is a **single-pod
+  baseline**. A topology that exposes neither form (e.g. a cluster that
+  requires the cluster protocol) is fronted by one stable endpoint — a
+  managed service endpoint or a proxy — because the connection face is a
+  single URL.
+- `FOREMAN_STATE_PASSWORD` — the store credential (from `foreman-secret`;
+  the shipped `REPLACE_ME` placeholder must be replaced). An empty value is
+  allowed only for a store that is otherwise protected. Foreman treats an
+  empty value **and the literal `REPLACE_ME`** as unauthenticated (the latter
+  is a usable string published in the repository, so leaving it unreplaced
+  must alarm rather than serve), logs `state.unauthenticated`, because the
+  store carries token digests, mapping rows and delivery bodies (§10 安全).
+  A data-node credential embedded in `FOREMAN_STATE_URL` counts as
+  authenticated, exactly as it is applied: the URL's userinfo for a single
+  endpoint, the `password` query parameter for a sentinel URL (a sentinel
+  URL's userinfo authenticates to the sentinels, not to the store).
+- `FOREMAN_STATE_ENTRY_TTL` (default `48h`) — one entry's retention in the
+  store. It must cover the Job Token TTL (`24h7m`: claim → boot → task →
+  drain) plus the settled-record window (24h), which is why the default is
+  48h.
+
+Requirements (§7 部署面):
+
+- **Persistence is mandatory.** Run the store with persistence on (AOF/RDB)
+  and a failover-capable topology (the sentinel form above, or a managed
+  service) when availability matters; the contract pins the *connection
+  face*, not the topology — a single instance is the baseline.
+- The store holds token digests, the mapping rows (including each row's
+  delivery body and terminal verdict body, §4.3), and their terminal records:
+  treat it as a **credential store** (isolation, authentication, transport
+  protection). Those bodies never reach a K8s object, a log or `/foreman/tasks`
+  (F3); the shared state face is where the design puts them, and they are
+  deleted with the row at the credential reclaim.
+- Requirements on the store's credential and reachability are fail-fast: an
+  unparsable `FOREMAN_STATE_URL` refuses startup. A *reachable-but-empty*
+  store is not an error — the K8s rebuild then owns recovery (§4.3's disposal
+  table), which is also the behaviour when the store is lost.
+- If `FOREMAN_STATE_URL` is unset, Foreman falls back to the pre-stage-one
+  behaviour (in-memory index + full K8s rebuild on restart); AC-73's restart
+  persistence then does not hold. Set the URL in every deployment that
+  expects tokens and mapping to survive a restart.
 
 ## Node-local state
 

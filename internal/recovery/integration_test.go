@@ -540,7 +540,7 @@ type fakeRevoker struct {
 	revoked []string
 }
 
-func (f *fakeRevoker) Revoke(tokenHash string) {
+func (f *fakeRevoker) Revoke(tokenHash, workspaceID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.revoked = append(f.revoked, tokenHash)

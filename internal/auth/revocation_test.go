@@ -90,7 +90,7 @@ func TestIssuerRevokeUsesTokenValidityWindow(t *testing.T) {
 		t.Fatalf("Issue: %v", err)
 	}
 
-	iss.Revoke(iss.Hash(token))
+	iss.Revoke(iss.Hash(token), "ws-1")
 	if !iss.revocations.IsRevoked(iss.Hash(token)) {
 		t.Fatal("token should be revoked")
 	}

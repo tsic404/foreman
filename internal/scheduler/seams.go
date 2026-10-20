@@ -69,9 +69,11 @@ type JobBuilder interface {
 // (satisfied by *auth.Issuer). The reclaim path calls it before the Secret
 // and the entry go; a missing revoker is a wiring error, not a mode, because
 // a silent no-op would leave the predecessor's token valid on the
-// same-name-reuse face (ADR-017).
+// same-name-reuse face (ADR-017). The workspace partitions the revocation
+// set (ADR-046 阶段一, §6.1): one workspace's revocations must never
+// adjudicate another's.
 type Revoker interface {
-	Revoke(tokenHash string)
+	Revoke(tokenHash, workspaceID string)
 }
 
 // Metrics is the observability seam. The observability module provides the

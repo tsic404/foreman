@@ -186,6 +186,27 @@ spec:
               value: "info"
             - name: FOREMAN_WS_ENABLED
               value: "true"
+            # --- shared state (ADR-046 阶段一) ---
+            # The Job Token entries, the settled terminal records and the
+            # revocation set persist in the shared state store, so a Foreman
+            # restart restores them instead of rebuilding from K8s
+            # (02-contracts.md §4.3/§6.1). Required: the store MUST be
+            # persistent (AOF or RDB with an appropriate policy) — the
+            # contract's deployment interface list carries the connection
+            # information and the credential (§7 部署面). Unset keeps the
+            # pre-stage-one behaviour (in-memory index + K8s rebuild).
+            - name: FOREMAN_STATE_URL
+              value: "redis://foreman-redis.foreman.svc.cluster.local:6379"
+            - name: FOREMAN_STATE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: foreman-secret
+                  key: FOREMAN_STATE_PASSWORD
+            # One entry's retention in the store; must cover the Job Token
+            # TTL (claim → boot → task → drain, §6.1) plus the settled-record
+            # window. Default 48h.
+            - name: FOREMAN_STATE_ENTRY_TTL
+              value: "48h"
           livenessProbe:
             httpGet:
               path: /foreman/healthz

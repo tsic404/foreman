@@ -438,7 +438,7 @@ type fakeRevoker struct {
 	revoked []string
 }
 
-func (f *fakeRevoker) Revoke(tokenHash string) { f.revoked = append(f.revoked, tokenHash) }
+func (f *fakeRevoker) Revoke(tokenHash, workspaceID string) { f.revoked = append(f.revoked, tokenHash) }
 
 // ---- helpers ----
 

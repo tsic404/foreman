@@ -119,7 +119,7 @@ type fakeRevoker struct {
 	revoked []string
 }
 
-func (f *fakeRevoker) Revoke(tokenHash string) {
+func (f *fakeRevoker) Revoke(tokenHash, workspaceID string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.revoked = append(f.revoked, tokenHash)
@@ -216,7 +216,7 @@ func newTestRigWith(t *testing.T, register func(*stubUpstream), discovery regist
 	}
 	rig.sched = sched
 
-	issuer, err := JobTokenIssuer(testTokenKey, rig.reg, rig.probes, auth.DefaultJobTokenTTL)
+	issuer, err := JobTokenIssuer(testTokenKey, rig.reg, rig.probes, auth.DefaultJobTokenTTL, nil)
 	if err != nil {
 		t.Fatalf("JobTokenIssuer: %v", err)
 	}

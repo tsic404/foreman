@@ -237,7 +237,7 @@ func newMultiWSWithURLs(t *testing.T, ids []string, urls map[string]string) *mul
 	if err != nil {
 		t.Fatalf("NewClientSet: %v", err)
 	}
-	issuer, err := proxy.JobTokenIssuer(testKey, reg, probes, auth.DefaultJobTokenTTL)
+	issuer, err := proxy.JobTokenIssuer(testKey, reg, probes, auth.DefaultJobTokenTTL, nil)
 	if err != nil {
 		t.Fatalf("JobTokenIssuer: %v", err)
 	}

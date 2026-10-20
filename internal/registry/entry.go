@@ -113,10 +113,11 @@ type TaskEntry struct {
 	LeaseKeepUntil time.Time `json:"lease_keep_until"`
 	LastStatusSeen string    `json:"last_status_seen"`
 
-	// Job lifecycle fields (§4.3): memory-only — never projected
-	// into /foreman/tasks, never written to annotations, never persisted.
-	// The credential stays valid while the entry exists, so an entry in
-	// draining is still the authorization row for its Job (ADR-017).
+	// Job lifecycle fields (§4.3): never projected into /foreman/tasks and
+	// never written to a K8s object; they persist only in the shared state
+	// snapshot the restart restores (ADR-046 阶段一). The credential stays
+	// valid while the entry exists, so an entry in draining is still the
+	// authorization row for its Job (ADR-017).
 	JobPhase      JobPhase  `json:"-"`
 	DrainDeadline time.Time `json:"-"`
 	TokenHash     string    `json:"-"`
@@ -127,32 +128,35 @@ type TaskEntry struct {
 	// releases the delivery for another attempt (the re-arm), so the window
 	// bounds the re-delivery rather than the entry. Zero means no window is
 	// armed: either nothing was delivered yet, or the re-delivery exit is
-	// configured off and the boot bound alone owns the entry.
+	// configured off and the boot bound alone owns the entry. Not projected;
+	// persisted only in the shared state snapshot (ADR-046 阶段一).
 	DeliveryDeadline time.Time `json:"-"`
 
 	// CompletedAt is the verdict instant, the stamp the settled index keeps
-	// (registry.DoneAt). Memory-only, like the rest of the drain bookkeeping:
-	// the projection's timestamp keys keep their existing set.
+	// (registry.DoneAt). Not projected — the projection's timestamp keys keep
+	// their existing set — and persisted only in the shared state snapshot
+	// (ADR-046 阶段一).
 	CompletedAt time.Time `json:"-"`
 
 	// PriorSessionID is the claim payload's prior_session_id: where the
 	// resuming session's file lives, hence the soft-affinity key source
-	// (ADR-015). Payload-derived and memory-only like the body itself — not
-	// annotated, not projected, and not rebuilt after a restart, because a
-	// rebuilt entry's Job already exists and never goes through Build.
+	// (ADR-015). Payload-derived and build-only: not annotated, not projected
+	// and not persisted, because it is consumed once at Build and a rebuilt or
+	// restored entry's Job already exists and never goes through Build.
 	PriorSessionID string `json:"-"`
 
 	// AgentName is the claim payload's agent.name — the policy keyspace's
 	// agent side (ADR-035) and the <agent-name> / <agent-segment> source.
-	// Memory-only like PriorSessionID; empty means the identity is
-	// unavailable, which degrades the axes rather than failing the task.
+	// Build-only like PriorSessionID (not persisted); empty means the identity
+	// is unavailable, which degrades the axes rather than failing the task.
 	AgentName string `json:"-"`
 
 	// ProjectID is the task's project identity (§4.1 项目身份): the
 	// platform's opaque project identifier, read at claim time from the
 	// payload's top-level project_id, or from the read-only reverse lookup by
 	// issue id. It is matched against the startup name → identifier index.
-	// Memory-only: never annotated, never projected, never rebuilt.
+	// Never annotated, never projected, never persisted: it is read once at
+	// claim time for the policy axes.
 	ProjectID string `json:"-"`
 	// ProjectSource records where ProjectID came from (payload / api /
 	// none); policy.applied projects it, nothing else reads it.
@@ -160,9 +164,10 @@ type TaskEntry struct {
 
 	// RealRuntimeID is the real runtime the claim was dispatched under: the
 	// C4 lease, the C19 resolve and the S8 body translation are all addressed
-	// by it when Foreman declares N runtimes. Like the payload it is
-	// memory-only and absent on rebuilt entries, whose Job is already past
-	// its start.
+	// by it when Foreman declares N runtimes. Persisted only in the shared
+	// state snapshot (ADR-046 阶段一), so a restored entry keeps addressing
+	// those calls; absent on a K8s-rebuilt entry, whose Job is already past its
+	// start.
 	RealRuntimeID string `json:"-"`
 
 	// RuntimeIdentity is the declared identity the claim was dispatched under
@@ -171,12 +176,14 @@ type TaskEntry struct {
 	// server-side row id, never the identity. S-4 matches the Job's reported
 	// runtimes against it (§2.3), so an empty value means the identity is
 	// unknown — a rebuilt entry, whose Job carries no dispatch record — and no
-	// entry of the declaration may answer for it. Memory-only, like
-	// RealRuntimeID.
+	// entry of the declaration may answer for it. Persisted only in the shared
+	// state snapshot, like RealRuntimeID; absent on a K8s-rebuilt entry.
 	RuntimeIdentity string `json:"-"`
 
 	// Payload: raw claim payload until MarkDelivering replaces it with the
-	// delivered body — the form the ops preview must serve (S6 / AC-07).
+	// delivered body — the form the ops preview must serve (S6 / AC-07). It
+	// never reaches a K8s object, a log or the projection; the shared state
+	// snapshot carries it (§4.3: 任务载荷存在共享状态的条目里, ADR-046 阶段一).
 	Payload json.RawMessage `json:"-"`
 
 	// DecidedReport is the terminal report body that stands for this instance
@@ -185,8 +192,9 @@ type TaskEntry struct {
 	// of the instance — the enqueued copy, a queue replay, a late replay in
 	// the drain window and the convergence compensation. A platform-forced
 	// termination registers the compensation body; any other decision
-	// registers the body of that first terminal forward. Memory-only, like
-	// the rest of the drain bookkeeping (ADR-002), and never projected.
+	// registers the body of that first terminal forward. Never projected;
+	// persisted only in the shared state snapshot (ADR-046 阶段一), so a late
+	// replay after a restart sends the same body.
 	DecidedReport []byte `json:"-"`
 }
 

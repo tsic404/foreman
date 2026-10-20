@@ -1827,7 +1827,7 @@ func (s *Scheduler) revokeCredential(ctx context.Context, e registry.TaskEntry) 
 			"task_id", e.TaskID, "job_name", e.JobName)
 		return
 	}
-	s.revoker.Revoke(e.TokenHash)
+	s.revoker.Revoke(e.TokenHash, e.WorkspaceID)
 }
 
 // discardQuietly runs the non-drain discard of a duplicate-claim replacement
@@ -2236,10 +2236,46 @@ func (s *Scheduler) Reconcile(ctx context.Context) error {
 	return firstErr
 }
 
-// Rebuild reconstructs the in-memory index from the foreman Jobs still
-// present in K8s (ADR-002): labels/annotations restore the identity fields;
-// the state starts at job_created and the following Reconcile advances it.
+// Rebuild reconstructs the in-memory index: from the shared state face when
+// it is configured and reachable (ADR-046 阶段一: 实例重启只重新接入共享
+// 状态，已存在的条目不再从 K8s 全量重建), and from the foreman Jobs still
+// present in K8s otherwise (ADR-002, §4.3 重建处置表). A store that answers
+// with entries restores them verbatim (the projection and the terminal
+// records are the shared face's), while a store miss or outage falls back to
+// the K8s rebuild exactly as before.
 func (s *Scheduler) Rebuild(ctx context.Context) error {
+	// Shared state restore first: its entries carry the live facts the K8s
+	// rebuild cannot restore (the boot/lease deadlines, the delivery facts,
+	// the start fact), so a configured store must be the source when it can
+	// answer. The K8s rebuild below only fills the gaps — every Job whose
+	// task the store did not restore (§4.3: 从共享状态取不到的 Job 才进入
+	// 重建); a restored entry is never replaced by its payload-less K8s
+	// projection (PutIfAbsent checks and inserts in one locked step).
+	restored, answered, err := s.reg.Restore(ctx)
+	if err != nil {
+		s.log.WarnContext(ctx, "registry.restore_failed",
+			"err", err.Error(), "fallback", "k8s_rebuild")
+	}
+	if answered && len(restored) > 0 {
+		s.log.InfoContext(ctx, "registry.restored",
+			"entries", len(restored))
+	}
+	if err := s.rebuildFromK8s(ctx); err != nil {
+		return err
+	}
+	// The same recovery rebuilds the pending queue from its carriers
+	// (§4.3). A list failure is not fatal here: the queue stays unrestored
+	// and the recovery round retries it, settling nothing until it succeeds.
+	if err := s.pendingReports.Restore(ctx); err != nil {
+		s.log.ErrorContext(ctx, "pending.restore_failed", "err", err)
+	}
+	return nil
+}
+
+// rebuildFromK8s is the §4.3 K8s rebuild: labels/annotations restore the
+// identity fields; the state starts at job_created and the following
+// Reconcile advances it.
+func (s *Scheduler) rebuildFromK8s(ctx context.Context) error {
 	jobs, err := s.jobs.ListJobs(ctx)
 	if err != nil {
 		return err
@@ -2290,12 +2326,6 @@ func (s *Scheduler) Rebuild(ctx context.Context) error {
 	// Payloads never leave process memory (F3), so every rebuilt entry lacks
 	// one; the C13 convergence releases pre-start entries for redispatch.
 	s.log.InfoContext(ctx, "registry.rebuilt", "jobs", rebuilt)
-	// The same recovery rebuilds the pending queue from its carriers
-	// (§4.3). A list failure is not fatal here: the queue stays unrestored
-	// and the recovery round retries it, settling nothing until it succeeds.
-	if err := s.pendingReports.Restore(ctx); err != nil {
-		s.log.ErrorContext(ctx, "pending.restore_failed", "err", err)
-	}
 	return nil
 }
 

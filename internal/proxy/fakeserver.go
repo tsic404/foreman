@@ -420,13 +420,19 @@ func (a jobLookup) ByDaemon(daemonID string) (auth.JobEntry, bool) {
 // (the auth ↔ registry wiring the Job-facing surfaces share). tokenTTL is the
 // issued lifetime; it also bounds the revocation window (ADR-017). probes is
 // the catalog-probe session table a probe token is adjudicated against; a nil
-// one leaves probe tokens unverifiable.
-func JobTokenIssuer(key []byte, reg *registry.Registry, probes *registry.ProbeRegistry, tokenTTL time.Duration) (*auth.Issuer, error) {
-	opts := []auth.Option{}
+// one leaves probe tokens unverifiable. state is the shared revocation face
+// (ADR-046 阶段一): nil keeps the in-process revocation set, so a deployment
+// without the shared store behaves exactly as before.
+func JobTokenIssuer(key []byte, reg *registry.Registry, probes *registry.ProbeRegistry, tokenTTL time.Duration, state registry.StateStore, opts ...auth.Option) (*auth.Issuer, error) {
+	all := []auth.Option{}
 	if probes != nil {
-		opts = append(opts, auth.WithProbeLookup(probeLookup{probes}))
+		all = append(all, auth.WithProbeLookup(probeLookup{probes}))
 	}
-	return auth.NewIssuer(key, jobLookup{reg}, reg, tokenTTL, opts...)
+	if state != nil {
+		all = append(all, auth.WithRevocationStore(state))
+	}
+	all = append(all, opts...)
+	return auth.NewIssuer(key, jobLookup{reg}, reg, tokenTTL, all...)
 }
 
 // probeLookup adapts the probe session table to auth's read view.

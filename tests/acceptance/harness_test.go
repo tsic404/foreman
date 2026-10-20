@@ -2619,13 +2619,25 @@ func newHarnessWithOptions(t *testing.T, catalogEnabled bool, window time.Durati
 	return buildHarness(t, catalogEnabled, window, skill, realServer, false)
 }
 
+// newHarnessWithSharedState is newHarness with the stage-one shared state
+// face wired into the registry and the issuer (ADR-046): the harness mirrors
+// cmd/foreman's wiring, so a scenario can drive the restart-persistence
+// semantics against a real store (miniredis) instead of stubs.
+func newHarnessWithSharedState(t *testing.T, catalogEnabled bool, store registry.StateStore) *harness {
+	t.Helper()
+	return buildHarnessWith(t, catalogEnabled, deliveryConfirmWindow, nil, false, false, harnessOptions{store: store})
+}
+
 // harnessOptions are the fixture knobs a scenario needs beyond the shared
 // shape: extra production seams on the proxy client (the §10 terminal retry
-// budget) and on the pending queue (the retention bound). Zero values keep
-// the deployment defaults.
+// budget), on the pending queue (the retention bound), and the stage-one
+// shared state face (ADR-046). Zero values keep the deployment defaults.
 type harnessOptions struct {
 	clientOpts  []proxy.Option
 	pendingOpts []scheduler.PendingReportsOption
+	// store is the shared state face the registry and the issuer persist
+	// through; nil keeps the pre-stage-one in-memory shape.
+	store registry.StateStore
 }
 
 func buildHarness(t *testing.T, catalogEnabled bool, window time.Duration, skill func(*proxy.Config), realServer, wsEnabled bool) *harness {
@@ -2635,7 +2647,7 @@ func buildHarness(t *testing.T, catalogEnabled bool, window time.Duration, skill
 
 func buildHarnessWith(t *testing.T, catalogEnabled bool, window time.Duration, skill func(*proxy.Config), realServer, wsEnabled bool, opts harnessOptions) *harness {
 	upstream := newUpstreamStub(t)
-	reg := registry.New(time.Now, registry.WithDeliveryConfirmTimeout(window))
+	reg := registry.New(time.Now, registry.WithDeliveryConfirmTimeout(window), registry.WithStateStore(opts.store))
 	probes := registry.NewProbeRegistry()
 	startup := registry.NewStartupCatalog()
 	slots := proxy.NewCatalogSlots()
@@ -2685,7 +2697,7 @@ func buildHarnessWith(t *testing.T, catalogEnabled bool, window time.Duration, s
 			}),
 		}, opts.clientOpts...)...,
 	)
-	issuer, err := proxy.JobTokenIssuer(testKey, reg, probes, auth.DefaultJobTokenTTL)
+	issuer, err := proxy.JobTokenIssuer(testKey, reg, probes, auth.DefaultJobTokenTTL, opts.store)
 	if err != nil {
 		t.Fatalf("JobTokenIssuer: %v", err)
 	}
@@ -3014,7 +3026,7 @@ func (h *harness) handlerEvents(msg string) []map[string]any {
 
 type noRevoker struct{}
 
-func (noRevoker) Revoke(string) {}
+func (noRevoker) Revoke(string, string) {}
 
 // credentialRevoker is the scheduler's revoker: the scenario's when it wired
 // one, the inert one otherwise.

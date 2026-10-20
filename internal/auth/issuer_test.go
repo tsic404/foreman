@@ -208,7 +208,7 @@ func TestVerifyRevoked(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
 	}
-	iss.Revoke(iss.Hash(token))
+	iss.Revoke(iss.Hash(token), "ws-1")
 	if _, err := iss.Verify(token, RequestScope{}); !errors.Is(err, ErrRevoked) {
 		t.Fatalf("err = %v, want ErrRevoked", err)
 	}
@@ -216,7 +216,7 @@ func TestVerifyRevoked(t *testing.T) {
 	// Entry adjudication precedes the revocation check: a revoked token whose
 	// entry is gone is rejected as an unknown Job, never as revoked.
 	gone := newTestIssuer(now, fakeRegistry{}, fakeDone{})
-	gone.Revoke(gone.Hash(token))
+	gone.Revoke(gone.Hash(token), "ws-1")
 	if _, err := gone.Verify(token, RequestScope{}); !errors.Is(err, ErrUnknownJob) {
 		t.Fatalf("err = %v, want ErrUnknownJob (adjudication precedes revocation)", err)
 	}
@@ -230,7 +230,7 @@ func TestVerifyExpiredBeatsRevoked(t *testing.T) {
 		t.Fatalf("Issue: %v", err)
 	}
 	later := newTestIssuer(issued.Add(2*time.Hour), jobs, fakeDone{})
-	later.Revoke(later.Hash(token))
+	later.Revoke(later.Hash(token), "ws-1")
 	if _, err := later.Verify(token, RequestScope{}); !errors.Is(err, ErrExpired) {
 		t.Fatalf("err = %v, want ErrExpired (checked before revocation)", err)
 	}
@@ -439,7 +439,7 @@ func TestReasonVocabularyIsClosed(t *testing.T) {
 
 func TestRevokeIgnoresEmptyDigest(t *testing.T) {
 	iss := newTestIssuer(time.Now(), fakeRegistry{}, fakeDone{})
-	iss.Revoke("")
+	iss.Revoke("", "ws-1")
 	if len(iss.revocations.entries) != 0 {
 		t.Fatalf("entries = %d, want 0 (empty digest ignored)", len(iss.revocations.entries))
 	}
