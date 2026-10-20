@@ -1,4 +1,4 @@
-// TC-tech-cache-07 implements AC-65: every node-cleanup round's event carries
+// TC-tech-cache-07 implements AC-79: every node-cleanup round's event carries
 // the bare-cache bytes left behind together with a measurement state, so the
 // cache cap's occupancy is observable in production and a quiesce-skipped
 // round is never read as an empty cache. The collector writes the event; the
