@@ -79,8 +79,8 @@ func tokenDigest(token string) string {
 // it, with nothing saturated.
 type fakeNodes map[string]string
 
-func (n fakeNodes) LastNodeForSession(key string) string { return n[key] }
-func (n fakeNodes) Saturated(string) bool                { return false }
+func (n fakeNodes) LastNodeForSession(_ string, key string) string { return n[key] }
+func (n fakeNodes) Saturated(string) bool                          { return false }
 
 // sessionNodeIndex is the index the affinity tests hand to the builder: the
 // test entry's session, learned on node.
@@ -247,10 +247,10 @@ func TestBuildPreferredNodeAffinity(t *testing.T) {
 // same file — a different root directory, as a changed HOME gives it — still
 // resolves it. The real registry is the witness that both sides match.
 func TestBuildPreferredNodeFromLearnedRegistry(t *testing.T) {
-	reg := registry.New(time.Now)
-	reg.LearnSession(registry.SessionKey("/state/home/.multica/pi-sessions/sess-1.jsonl"), "company-02")
-
 	entry := testEntry()
+	reg := registry.New(time.Now)
+	reg.LearnSession(entry.WorkspaceID, registry.SessionKey("/state/home/.multica/pi-sessions/sess-1.jsonl"), "company-02")
+
 	entry.PriorSessionID = "/root/.multica/pi-sessions/sess-1.jsonl"
 
 	cfg := testConfig()

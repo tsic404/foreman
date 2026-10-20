@@ -5,7 +5,9 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"slices"
 	"strconv"
+	"strings"
 	"time"
 
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
@@ -44,9 +46,14 @@ type OpsConfig struct {
 	// Health is the liveness view of the process's critical loops; nil keeps
 	// the endpoint's always-ok shape (a handler mounted without loops, as in
 	// the ops tests).
-	Health    *Health
-	StartedAt time.Time
-	Logger    *slog.Logger
+	Health *Health
+	// WorkspaceIDs is the deployment's configured workspace set (§0,
+	// ADR-047). A multi-workspace deployment must be asked with the
+	// workspace dimension; a single workspace is its default. Empty keeps
+	// the pre-ADR-047 single-workspace shape.
+	WorkspaceIDs []string
+	StartedAt    time.Time
+	Logger       *slog.Logger
 }
 
 // NewOpsHandler mounts the cluster-internal ops surface (§2.2 S-25): /metrics
@@ -89,15 +96,37 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 		}
 		writeJSON(w, status, body)
 	})
-	mux.HandleFunc("GET /foreman/tasks", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("GET /foreman/tasks", func(w http.ResponseWriter, r *http.Request) {
 		// TaskEntry.Payload is json:"-" — the list never leaks payloads (F3).
+		workspaceID, ok := workspaceScope(r, cfg.WorkspaceIDs)
+		if !ok {
+			// §4.1: the list is partitioned by workspace; a deployment with
+			// more than one workspace has no default dimension, and answering
+			// every workspace's entries would cross the partition.
+			writeError(w, http.StatusBadRequest, "workspace is required")
+			return
+		}
 		entries := index.List()
+		if workspaceID != "" {
+			filtered := entries[:0]
+			for _, entry := range entries {
+				if entry.WorkspaceID == workspaceID {
+					filtered = append(filtered, entry)
+				}
+			}
+			entries = filtered
+		}
 		if entries == nil {
 			entries = []registry.TaskEntry{}
 		}
 		writeJSON(w, http.StatusOK, entries)
 	})
 	mux.HandleFunc("GET /foreman/tasks/{taskID}", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID, scoped := workspaceScope(r, cfg.WorkspaceIDs)
+		if !scoped {
+			writeError(w, http.StatusBadRequest, "workspace is required")
+			return
+		}
 		taskID := r.PathValue("taskID")
 		e, ok := index.Get(taskID)
 		if !ok {
@@ -112,13 +141,36 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 			writeError(w, http.StatusNotFound, "task not found")
 			return
 		}
+		if workspaceID != "" && e.WorkspaceID != workspaceID {
+			// A cross-workspace task id is indistinguishable from one that
+			// never existed (§4.1: 跨 workspace 一律 404).
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
 		writeJSON(w, http.StatusOK, e)
 	})
 	mux.HandleFunc("GET /foreman/tasks/{taskID}/logs", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID, scoped := workspaceScope(r, cfg.WorkspaceIDs)
+		if !scoped {
+			writeError(w, http.StatusBadRequest, "workspace is required")
+			return
+		}
+		if !workspaceVisible(index, r.PathValue("taskID"), workspaceID) {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
 		serveJobLogs(w, r, index, logs, log)
 	})
 	mux.HandleFunc("GET /foreman/tasks/{taskID}/payload-preview", func(w http.ResponseWriter, r *http.Request) {
+		workspaceID, scoped := workspaceScope(r, cfg.WorkspaceIDs)
+		if !scoped {
+			writeError(w, http.StatusBadRequest, "workspace is required")
+			return
+		}
 		e, ok := index.Get(r.PathValue("taskID"))
+		if ok && !workspaceVisible(index, e.TaskID, workspaceID) {
+			ok = false
+		}
 		if !ok {
 			// A reclaimed entry's terminal record is still answerable, but the
 			// payload is not part of it: the record drops the body at the
@@ -208,6 +260,43 @@ func parseTail(raw string) (int64, error) {
 		n = maxLogTail
 	}
 	return n, nil
+}
+
+// workspaceScope resolves the workspace dimension of an ops request (§4.1).
+// An explicit workspace must be one the deployment serves. Without one, a
+// single configured workspace is the dimension; a multi-workspace deployment
+// has none (the caller must say which), and an empty set keeps the
+// pre-ADR-047 single-workspace shape.
+func workspaceScope(r *http.Request, configured []string) (string, bool) {
+	workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace"))
+	if workspaceID != "" {
+		if len(configured) > 0 && !slices.Contains(configured, workspaceID) {
+			return "", false
+		}
+		return workspaceID, true
+	}
+	switch len(configured) {
+	case 0:
+		return "", true
+	case 1:
+		return configured[0], true
+	default:
+		return "", false
+	}
+}
+
+// workspaceVisible applies the projection's workspace partition to the
+// task-addressed ops routes: an entry of another workspace is invisible (404),
+// exactly like a task that never existed.
+func workspaceVisible(index TaskIndex, taskID, workspaceID string) bool {
+	if workspaceID == "" {
+		return true
+	}
+	e, ok := index.Get(taskID)
+	if !ok {
+		e, ok = index.Settled(taskID)
+	}
+	return ok && e.WorkspaceID == workspaceID
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

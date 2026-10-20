@@ -478,12 +478,12 @@ func TestTemplatePerTaskWrites(t *testing.T) {
 	}
 
 	podLabels := job.Spec.Template.Labels
-	if len(podLabels) != 4 {
-		t.Fatalf("pod labels = %v, want the three §8.2 A1.2 labels plus the template's own", podLabels)
+	if len(podLabels) != 5 {
+		t.Fatalf("pod labels = %v, want the four §8.2 A1.2 labels plus the template's own", podLabels)
 	}
 	if podLabels["app.kubernetes.io/name"] != "foreman-job" || podLabels["foreman.tsic.top/task-id"] != testTaskID ||
-		podLabels[labelDaemonID] != testJobName {
-		t.Errorf("pod labels = %v, want the three §8.2 A1.2 labels", podLabels)
+		podLabels[labelDaemonID] != testJobName || podLabels[labelWorkspaceID] != entry.WorkspaceID {
+		t.Errorf("pod labels = %v, want the four §8.2 A1.2 labels", podLabels)
 	}
 	if podLabels["cost-center"] != "platform" {
 		t.Errorf("pod labels = %v, the template's free label must survive", podLabels)
@@ -873,9 +873,10 @@ func TestTemplateAuthoritativeMetadataWins(t *testing.T) {
 	}
 
 	podLabels := job.Spec.Template.Labels
-	if len(podLabels) != 3 || podLabels["app.kubernetes.io/name"] != jobAppName ||
-		podLabels[labelTaskID] != entry.TaskID || podLabels[labelDaemonID] != DaemonIDFor(entry.TaskID) {
-		t.Errorf("pod labels = %v, want exactly the three §8.2 A1.2 labels", podLabels)
+	if len(podLabels) != 4 || podLabels["app.kubernetes.io/name"] != jobAppName ||
+		podLabels[labelTaskID] != entry.TaskID || podLabels[labelDaemonID] != DaemonIDFor(entry.TaskID) ||
+		podLabels[labelWorkspaceID] != entry.WorkspaceID {
+		t.Errorf("pod labels = %v, want exactly the four §8.2 A1.2 labels", podLabels)
 	}
 	// app.kubernetes.io/managed-by is a Job-side key (§8.2 A1.2): Foreman owns
 	// both app.kubernetes.io keys, and the pod side's key set does not carry

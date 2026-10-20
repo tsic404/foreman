@@ -56,7 +56,7 @@ func TestCatalog10ProbeBudgetBoundaries(t *testing.T) {
 		{"req-no-budget", 0, 86400},
 	}
 	for _, tc := range cases {
-		if _, err := h.sched.StartProbe(t.Context(), tc.requestID, "", registry.ProbeRegisterOnly, tc.budget); err != nil {
+		if _, err := h.sched.StartProbe(t.Context(), tc.requestID, "", "", registry.ProbeRegisterOnly, tc.budget); err != nil {
 			t.Fatalf("StartProbe(%s): %v", tc.requestID, err)
 		}
 		job := h.createdJob(t, "fm-catalog-"+tc.requestID)

@@ -41,13 +41,14 @@ const (
 // Carrier data keys. The body is stored as the exact bytes that were
 // forwarded, so a replay is byte-identical to the enqueue (§4.4 定论体).
 const (
-	carrierKeyTaskID     = "task_id"
-	carrierKeyJobName    = "job_name"
-	carrierKeyDaemonID   = "daemon_id"
-	carrierKeyEndpoint   = "endpoint"
-	carrierKeyBody       = "body"
-	carrierKeyEnqueuedAt = "enqueued_at"
-	carrierKeyAttempts   = "attempts"
+	carrierKeyTaskID      = "task_id"
+	carrierKeyJobName     = "job_name"
+	carrierKeyDaemonID    = "daemon_id"
+	carrierKeyWorkspaceID = "workspace_id"
+	carrierKeyEndpoint    = "endpoint"
+	carrierKeyBody        = "body"
+	carrierKeyEnqueuedAt  = "enqueued_at"
+	carrierKeyAttempts    = "attempts"
 	// carrierKeyFailureReason carries the attribution a synthesized failure
 	// verdict was decided with (§4.1). It is queue identity, not body data:
 	// an inbound failure body also carries the key, and reading it from there
@@ -62,14 +63,18 @@ var ErrCarrierPayloadTooLarge = errors.New("pending report exceeds the carrier o
 
 // Carrier is one pending report's durable form (ADR-046 decision 1).
 type Carrier struct {
-	Name       string
-	TaskID     string
-	JobName    string
-	DaemonID   string
-	Endpoint   string
-	Body       []byte
-	EnqueuedAt time.Time
-	Attempts   int
+	Name     string
+	TaskID   string
+	JobName  string
+	DaemonID string
+	// WorkspaceID is the credential the replay uses when the entry is gone
+	// (§10, ADR-047). It rides both the object's data and its label so the
+	// queue rebuild and the per-workspace sweep read the same dimension.
+	WorkspaceID string
+	Endpoint    string
+	Body        []byte
+	EnqueuedAt  time.Time
+	Attempts    int
 	// FailureReason is the verdict's attribution when the queued report was
 	// a failure Foreman judged itself (§4.1). Empty for a report the server
 	// decided.
@@ -108,6 +113,7 @@ func (c Carrier) data() map[string][]byte {
 		carrierKeyTaskID:        []byte(c.TaskID),
 		carrierKeyJobName:       []byte(c.JobName),
 		carrierKeyDaemonID:      []byte(c.DaemonID),
+		carrierKeyWorkspaceID:   []byte(c.WorkspaceID),
 		carrierKeyEndpoint:      []byte(c.Endpoint),
 		carrierKeyBody:          c.Body,
 		carrierKeyEnqueuedAt:    []byte(c.EnqueuedAt.UTC().Format(time.RFC3339Nano)),
@@ -132,14 +138,18 @@ func (s *secretCarrierStore) PutCarrier(ctx context.Context, c Carrier) error {
 		return fmt.Errorf("%w: %d bytes > %d", ErrCarrierPayloadTooLarge, c.sizeBytes(), MaxCarrierBytes)
 	}
 	name := carrierSecretName(c.TaskID)
+	labels := map[string]string{
+		registry.LabelManagedBy: registry.ManagedByForeman,
+		registry.LabelRole:      registry.RolePendingReport,
+		registry.LabelTaskID:    c.TaskID,
+	}
+	if c.WorkspaceID != "" {
+		labels[registry.LabelWorkspaceID] = c.WorkspaceID
+	}
 	secret := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
-			Name: name,
-			Labels: map[string]string{
-				registry.LabelManagedBy: registry.ManagedByForeman,
-				registry.LabelRole:      registry.RolePendingReport,
-				registry.LabelTaskID:    c.TaskID,
-			},
+			Name:   name,
+			Labels: labels,
 		},
 		Type: corev1.SecretTypeOpaque,
 		Data: c.data(),
@@ -183,11 +193,17 @@ func (s *secretCarrierStore) ListCarriers(ctx context.Context) ([]Carrier, error
 			continue
 		}
 		data := secrets[i].Data
+		workspaceID := string(data[carrierKeyWorkspaceID])
+		if workspaceID == "" {
+			// Older carriers carry the workspace only on the label.
+			workspaceID = labels[registry.LabelWorkspaceID]
+		}
 		c := Carrier{
 			Name:          secrets[i].Name,
 			TaskID:        taskID,
 			JobName:       string(data[carrierKeyJobName]),
 			DaemonID:      string(data[carrierKeyDaemonID]),
+			WorkspaceID:   workspaceID,
 			Endpoint:      string(data[carrierKeyEndpoint]),
 			Body:          data[carrierKeyBody],
 			FailureReason: string(data[carrierKeyFailureReason]),

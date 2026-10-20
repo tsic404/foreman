@@ -151,6 +151,16 @@ func (c *Client) WorkspaceState() WorkspaceState {
 	return c.state.clone()
 }
 
+// WorkspaceID returns the workspace this client serves. One client serves one
+// (credential, daemon identity) pair (§0).
+func (c *Client) WorkspaceID() string { return c.cfg.WorkspaceID }
+
+// DaemonID returns the daemon identity this client registers under.
+func (c *Client) DaemonID() string { return c.cfg.DaemonID }
+
+// CatalogSlots returns the per-real-runtime catalog cache this client owns.
+func (c *Client) CatalogSlots() *CatalogSlots { return c.slots }
+
 // Workspace returns the workspace id and the display name cached by C17
 // (falling back to the id until the preflight runs).
 func (c *Client) Workspace() (id, name string) {
@@ -273,6 +283,16 @@ func endpointPath(ep scheduler.Endpoint, taskID string) string {
 // (4s/8s/16s/32s/64s; 5xx/408/429/network only); exhaustion returns
 // ErrTerminalUndelivered for the PendingReports queue.
 func (c *Client) Forward(ctx context.Context, ep scheduler.Endpoint, taskID string, body []byte) (int, []byte, error) {
+	return c.ForwardInWorkspace(ctx, ep, taskID, c.cfg.WorkspaceID, body)
+}
+
+// ForwardInWorkspace forwards a task-addressed callback for workspaceID. A
+// Client owns exactly one (credential, daemon identity) pair (§1.1), so a
+// different workspace is a routing error, never a borrowed credential.
+func (c *Client) ForwardInWorkspace(ctx context.Context, ep scheduler.Endpoint, taskID, workspaceID string, body []byte) (int, []byte, error) {
+	if workspaceID != "" && workspaceID != c.cfg.WorkspaceID {
+		return 0, nil, fmt.Errorf("workspace %s is not served by the %s client", workspaceID, c.cfg.WorkspaceID)
+	}
 	path := endpointPath(ep, taskID)
 	if path == "" {
 		return 0, nil, fmt.Errorf("unknown endpoint %q", ep)
@@ -616,6 +636,7 @@ func (c *Client) Workspaces(ctx context.Context) error {
 	if err := json.Unmarshal(raw, &list); err != nil {
 		return fmt.Errorf("list workspaces: decode: %w", err)
 	}
+	visible := make([]string, 0, len(list))
 	for _, w := range list {
 		if w.ID == c.cfg.WorkspaceID {
 			c.mu.Lock()
@@ -623,8 +644,12 @@ func (c *Client) Workspaces(ctx context.Context) error {
 			c.mu.Unlock()
 			return nil
 		}
+		visible = append(visible, w.ID)
 	}
-	return fmt.Errorf("workspace %s not visible to the server token", c.cfg.WorkspaceID)
+	return fmt.Errorf("list workspaces: %w", &WorkspaceMismatchError{
+		Configured: c.cfg.WorkspaceID,
+		Visible:    visible,
+	})
 }
 
 // ---- transport ----

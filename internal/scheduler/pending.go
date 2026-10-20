@@ -58,19 +58,23 @@ func PendingReportsDir(getenv func(string) string) string {
 // not an inbound report: it never enters the attribution gate, and it sends
 // the instance's decided body when one is registered (ADR-031).
 type ReportSender interface {
-	DeliverQueued(ctx context.Context, ep Endpoint, taskID string, body []byte, failureReason string) (int, []byte, error)
+	DeliverQueued(ctx context.Context, ep Endpoint, taskID, workspaceID string, body []byte, failureReason string) (int, []byte, error)
 }
 
 // pendingReport is one queued terminal report (contract §10). The file is
 // the queue: a report is durable iff its file exists (staged until it lands).
 type pendingReport struct {
-	TaskID     string          `json:"task_id"`
-	JobName    string          `json:"job_name"`
-	DaemonID   string          `json:"daemon_id"`
-	Endpoint   string          `json:"endpoint"`
-	Body       json.RawMessage `json:"body"`
-	EnqueuedAt time.Time       `json:"enqueued_at"`
-	Attempts   int             `json:"attempts"`
+	TaskID   string `json:"task_id"`
+	JobName  string `json:"job_name"`
+	DaemonID string `json:"daemon_id"`
+	// WorkspaceID is the credential the replay must use when the entry is
+	// gone: a queued report can outlive its credential, and a multi-workspace
+	// deployment has no single client to fall back to (§10, ADR-047).
+	WorkspaceID string          `json:"workspace_id,omitempty"`
+	Endpoint    string          `json:"endpoint"`
+	Body        json.RawMessage `json:"body"`
+	EnqueuedAt  time.Time       `json:"enqueued_at"`
+	Attempts    int             `json:"attempts"`
 	// FailureReason is the verdict's attribution when the queued report is a
 	// failure Foreman judged itself (§4.1). It rides the queue entry because
 	// the projection is rebuilt from it after a restart; the body is never
@@ -211,7 +215,7 @@ func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReport
 // ones included — are never removed to make room. Capacity the process cannot
 // see — an unlistable queue directory, a carrier backlog the rebuild has not
 // landed — reads as reached, never as room (unknown is not empty, §4.3).
-func (p *PendingReports) Enqueue(ctx context.Context, taskID, jobName, daemonID string, ep Endpoint, body []byte, failureReason string) error {
+func (p *PendingReports) Enqueue(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string) error {
 	p.mu.Lock()
 	// A report the queue already holds — staged, carrier-backed, or on disk —
 	// is a replacement (§4.6): it never grows the queue, so it is admitted
@@ -248,6 +252,7 @@ func (p *PendingReports) Enqueue(ctx context.Context, taskID, jobName, daemonID 
 		TaskID:        taskID,
 		JobName:       jobName,
 		DaemonID:      daemonID,
+		WorkspaceID:   workspaceID,
 		Endpoint:      string(ep),
 		Body:          body,
 		EnqueuedAt:    p.now(),
@@ -295,6 +300,7 @@ func (p *PendingReports) persistCarrier(ctx context.Context, rep pendingReport) 
 		TaskID:        rep.TaskID,
 		JobName:       rep.JobName,
 		DaemonID:      rep.DaemonID,
+		WorkspaceID:   rep.WorkspaceID,
 		Endpoint:      rep.Endpoint,
 		Body:          rep.Body,
 		EnqueuedAt:    rep.EnqueuedAt,
@@ -407,7 +413,7 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 			}
 			continue
 		}
-		code, _, err := sender.DeliverQueued(ctx, Endpoint(rep.Endpoint), rep.TaskID, rep.Body, rep.FailureReason)
+		code, _, err := sender.DeliverQueued(ctx, Endpoint(rep.Endpoint), rep.TaskID, rep.WorkspaceID, rep.Body, rep.FailureReason)
 		delivered := err == nil && terminalReportDelivered(code)
 		p.mu.Lock()
 		var deleteCarrier bool
@@ -839,6 +845,7 @@ func (p *PendingReports) Restore(ctx context.Context) error {
 			TaskID:        c.TaskID,
 			JobName:       c.JobName,
 			DaemonID:      c.DaemonID,
+			WorkspaceID:   c.WorkspaceID,
 			Endpoint:      c.Endpoint,
 			Body:          c.Body,
 			EnqueuedAt:    c.EnqueuedAt,

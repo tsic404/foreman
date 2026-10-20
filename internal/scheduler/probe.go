@@ -55,6 +55,14 @@ func (e *StartupProbeFailure) Unwrap() error { return ErrStartupProbeUnregistere
 // session and the probe's pod state.
 const probePollInterval = 500 * time.Millisecond
 
+// probeRegistrationSettle is how long the orchestration keeps collecting
+// registrations after the last one arrived. One probe daemon registers once per
+// workspace it serves (§1.2); those registrations are separate HTTP calls, so
+// tearing the probe down on the first one would cut the scope short. The
+// settle is an implementation constant, not a deployment knob, and stays far
+// below the probe window.
+const probeRegistrationSettle = time.Second
+
 // relayPollInterval is how often AwaitProbeRelayed re-reads the session's
 // result face; the wait is a shared-state poll, not a new channel.
 const relayPollInterval = 100 * time.Millisecond
@@ -79,7 +87,7 @@ func WithProbeRegistry(probes *registry.ProbeRegistry) Option {
 // verbatim (realRuntimeID names the runtime it belongs to), and a
 // registration-discovery probe owns no command at all. An id that does not
 // belong to the mode is rejected rather than silently ignored.
-func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID string, mode registry.ProbeMode, budget time.Duration) (ProbeHandle, error) {
+func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID, workspaceID string, mode registry.ProbeMode, budget time.Duration) (ProbeHandle, error) {
 	if s.probes == nil {
 		return ProbeHandle{}, errors.New("probe session table is not wired")
 	}
@@ -104,8 +112,14 @@ func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID str
 		if realRuntimeID == "" {
 			return ProbeHandle{}, errors.New("command-driven probe requires a real runtime id")
 		}
+		if workspaceID == "" {
+			return ProbeHandle{}, errors.New("command-driven probe requires a workspace id")
+		}
 		session.RequestID = requestID
 		session.RealRuntimeID = realRuntimeID
+		// A catalog probe serves one workspace (the request's); the startup
+		// and discovery probes carry no pin and span the configured set.
+		session.WorkspaceID = workspaceID
 	case registry.ProbeRegisterOnly:
 		if realRuntimeID != "" {
 			return ProbeHandle{}, errors.New("registration-only probe carries no real runtime id")
@@ -113,7 +127,14 @@ func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID str
 	default:
 		return ProbeHandle{}, fmt.Errorf("unknown probe mode %d", mode)
 	}
-	job, cred, tokenHash, err := s.builder.BuildCatalogProbe(requestID, jobRuntime, s.cfg.WorkspaceID, budget)
+	tokenWorkspace := workspaceID
+	if tokenWorkspace == "" {
+		tokenWorkspace = s.probeTokenWorkspace()
+	}
+	if tokenWorkspace == "" {
+		return ProbeHandle{}, errors.New("no workspace configured for the probe credential")
+	}
+	job, cred, tokenHash, err := s.builder.BuildCatalogProbe(requestID, jobRuntime, tokenWorkspace, budget)
 	if err != nil {
 		return ProbeHandle{}, fmt.Errorf("build catalog probe %s: %w", jobName, err)
 	}
@@ -130,7 +151,7 @@ func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID str
 		s.rollbackProbe(ctx, handle)
 		return ProbeHandle{}, fmt.Errorf("create probe job %s: %w", jobName, err)
 	}
-	s.log.InfoContext(ctx, "probe.started", "job_name", jobName, "job_runtime_id", jobRuntime, "budget", budget)
+	s.log.InfoContext(ctx, "probe.started", "job_name", jobName, "job_runtime_id", jobRuntime, "workspace_id", tokenWorkspace, "budget", budget)
 	trackCtx, stopTracking := context.WithDeadline(s.trackerContext(ctx), session.Deadline)
 	go func() {
 		defer stopTracking()
@@ -258,6 +279,11 @@ func (s *Scheduler) SweepStaleProbes(ctx context.Context) error {
 		if !isProbeObject(job.GetLabels()) {
 			continue
 		}
+		if workspaceID := job.GetLabels()[registry.LabelWorkspaceID]; workspaceID != "" && !s.workspaceConfigured(workspaceID) {
+			// A probe of a workspace this deployment does not serve is
+			// outside its sweep domain (§6.5 按 workspace 分区).
+			continue
+		}
 		if job.CreationTimestamp.Time.After(cutoff) {
 			continue
 		}
@@ -277,6 +303,9 @@ func (s *Scheduler) SweepStaleProbes(ctx context.Context) error {
 	for i := range secrets {
 		secret := secrets[i]
 		if !isProbeObject(secret.Labels) || !strings.HasSuffix(secret.Name, "-cred") {
+			continue
+		}
+		if workspaceID := secret.Labels[registry.LabelWorkspaceID]; workspaceID != "" && !s.workspaceConfigured(workspaceID) {
 			continue
 		}
 		jobName := strings.TrimSuffix(secret.Name, "-cred")
@@ -320,62 +349,83 @@ func isProbeObject(labels map[string]string) bool {
 
 // RunStartupProbe is the startup orchestration of ADR-025: build one probe,
 // wait for its registration (the truth source C1 declares), wait for the
-// discovery to land when the catalog route is on, clean up, and hand the
-// discovery back for C1.
+// discovery to land when the catalog route is on, clean up, and hand each
+// workspace's declaration back for C1. One probe serves the whole deployment:
+// the template's daemon decides which workspaces it registers to (§1.2).
 //
 // Only "no runtime registered inside the window" is fatal — the discovery not
 // landing is a visible failure event that does not stop startup (C-1, §10).
-func (s *Scheduler) RunStartupProbe(ctx context.Context) (registry.Discovery, error) {
+func (s *Scheduler) RunStartupProbe(ctx context.Context) (map[string]registry.Discovery, error) {
 	return s.runProbe(ctx, true, "startup")
 }
 
-// RunDiscoveryProbe runs one registration-discovery probe (§1.6): the same
-// shape, the same window upper bound and the same cleanup as the startup
-// probe, but registration alone is the completion signal — no model catalog
-// discovery is performed (the profile list is what the probe's C1 body
-// declares). A failure is returned to the caller; it never exits the process.
-func (s *Scheduler) RunDiscoveryProbe(ctx context.Context) (registry.Discovery, error) {
-	return s.runProbe(ctx, false, "discovery")
+// RunDiscoveryProbe runs one registration-discovery probe for one workspace
+// (§1.6): the same shape, the same window upper bound and the same cleanup as
+// the startup probe, but registration alone is the completion signal — no
+// model catalog discovery is performed (the profile list is what the probe's
+// C1 body declares). A failure is returned to the caller; it never exits the
+// process.
+func (s *Scheduler) RunDiscoveryProbe(ctx context.Context, workspaceID string) (registry.Discovery, error) {
+	discoveries, err := s.runProbe(ctx, false, "discovery")
+	if err != nil {
+		return registry.Discovery{}, err
+	}
+	discovery, ok := discoveries[workspaceID]
+	if !ok {
+		return registry.Discovery{}, fmt.Errorf("discovery probe did not register workspace %s", workspaceID)
+	}
+	return discovery, nil
+}
+
+// probeTokenWorkspace is the workspace the probe Job Token is bound to when
+// the probe itself is not pinned: the first configured workspace. The token is
+// only an admission credential for the probe Job; its S-1 answer is the
+// configured set and its registrations tell which workspaces it actually
+// serves.
+func (s *Scheduler) probeTokenWorkspace() string {
+	if ids := s.WorkspaceIDs(); len(ids) > 0 {
+		return ids[0]
+	}
+	return s.cfg.WorkspaceID
 }
 
 // runProbe is the shared orchestration of the startup probe and the
 // registration-discovery probe. waitCatalog selects the startup path's extra
 // wait for the model catalog result (§1.3); the discovery probe stops at
-// registration and never owns a catalog command (§1.6).
-func (s *Scheduler) runProbe(ctx context.Context, waitCatalog bool, kind string) (registry.Discovery, error) {
+// registration and never owns a catalog command (§1.6). The result is keyed
+// by workspace: each declaration covers exactly the workspaces the probe
+// registered to, and a configured workspace with no registration is reported
+// (never silently served).
+func (s *Scheduler) runProbe(ctx context.Context, waitCatalog bool, kind string) (map[string]registry.Discovery, error) {
 	window := s.cfg.StartupProbeTimeout
 	minted, err := mintedProbeID()
 	if err != nil {
-		return registry.Discovery{}, fmt.Errorf("mint %s probe id: %w", kind, err)
+		return nil, fmt.Errorf("mint %s probe id: %w", kind, err)
 	}
 	mode := registry.ProbeRegisterOnly
 	if waitCatalog {
 		mode = registry.ProbeStartupDiscovery
 	}
-	handle, err := s.StartProbe(ctx, minted, "", mode, window)
+	handle, err := s.StartProbe(ctx, minted, "", "", mode, window)
 	if err != nil {
 		s.reportProbeFailure(ctx, kind, jobbuilder.ProbeJobName(minted), ProbeFailureJobCreateFailed, "", "", false)
-		return registry.Discovery{}, fmt.Errorf("%s probe: %w", kind, err)
+		return nil, fmt.Errorf("%s probe: %w", kind, err)
 	}
 	deadline := s.now().Add(window)
-	readRegistration := func() (registry.Discovery, bool) {
+	readRegistration := func() (registry.ProbeSession, bool) {
 		session, ok := s.probes.ProbeByJob(handle.JobName)
 		if !ok || session.RegisteredAt.IsZero() {
-			return registry.Discovery{}, false
+			return registry.ProbeSession{}, false
 		}
-		return registry.Discovery{
-			CLIVersion:     session.CLIVersion,
-			Runtimes:       session.Runtimes,
-			FailedProfiles: session.FailedProfiles,
-		}, true
+		return session, true
 	}
-	discovery := registry.Discovery{}
+	session := registry.ProbeSession{}
 	podStatus, jobEvent := "", ""
 	podStarted := false
 	registered := false
 	for s.now().Before(deadline) {
 		if found, ok := readRegistration(); ok {
-			registered, discovery = true, found
+			registered, session = true, found
 			break
 		}
 		status, started, event := s.probeObservation(ctx, handle.JobName)
@@ -384,7 +434,7 @@ func (s *Scheduler) runProbe(ctx context.Context, waitCatalog bool, kind string)
 		select {
 		case <-ctx.Done():
 			s.teardownStartupProbe(ctx, handle)
-			return registry.Discovery{}, ctx.Err()
+			return nil, ctx.Err()
 		case <-time.After(probePollInterval):
 		}
 	}
@@ -392,7 +442,7 @@ func (s *Scheduler) runProbe(ctx context.Context, waitCatalog bool, kind string)
 		// The window's last poll interval still counts: a registration landing
 		// in it is "a runtime registered within the window" (§10).
 		if found, ok := readRegistration(); ok {
-			registered, discovery = true, found
+			registered, session = true, found
 		}
 	}
 	if !registered {
@@ -409,12 +459,40 @@ func (s *Scheduler) runProbe(ctx context.Context, waitCatalog bool, kind string)
 		}
 		s.reportProbeFailure(ctx, kind, handle.JobName, reason, podStatus, jobEvent, sessionExists)
 		s.teardownStartupProbe(ctx, handle)
-		return registry.Discovery{}, &StartupProbeFailure{JobName: handle.JobName, Reason: reason}
+		return nil, &StartupProbeFailure{JobName: handle.JobName, Reason: reason}
 	}
 	// The startup path's extra completion signal: when the catalog route is
 	// on, the startup discovery still has to land in its slot before the probe
 	// is torn down. With the route off — and for every discovery probe —
 	// registration alone completes the orchestration.
+	// One probe may register to several workspaces (§1.2). The first
+	// registration is the completion signal, but the daemon's remaining
+	// registrations arrive as separate calls: collect them until the session
+	// has been quiet for the settle window (or the probe window ends), then
+	// read the final registration set.
+	settleUntil := s.now().Add(probeRegistrationSettle)
+	lastRegistrations := len(session.Registrations)
+settle:
+	for s.now().Before(deadline) {
+		select {
+		case <-ctx.Done():
+			break settle
+		case <-time.After(probePollInterval):
+		}
+		current, ok := s.probes.ProbeByJob(handle.JobName)
+		if !ok {
+			break
+		}
+		if len(current.Registrations) > lastRegistrations {
+			lastRegistrations = len(current.Registrations)
+			settleUntil = s.now().Add(probeRegistrationSettle)
+		}
+		session = current
+		if !s.now().Before(settleUntil) {
+			break
+		}
+	}
+
 	if waitCatalog && s.cfg.ModelCatalogEnabled {
 	waitLanding:
 		for s.now().Before(deadline) {
@@ -433,7 +511,37 @@ func (s *Scheduler) runProbe(ctx context.Context, waitCatalog bool, kind string)
 		}
 	}
 	s.teardownStartupProbe(ctx, handle)
-	return discovery, nil
+	discoveries := make(map[string]registry.Discovery, len(session.Registrations))
+	for _, workspaceID := range s.WorkspaceIDs() {
+		registration, ok := session.Registration(workspaceID)
+		if !ok {
+			s.log.WarnContext(ctx, "probe.workspace_not_registered", "job_name", handle.JobName,
+				"workspace_id", workspaceID, "kind", kind,
+				"detail", "configured workspace was not registered by the probe; it is not served")
+			continue
+		}
+		discoveries[workspaceID] = registration.Discovery()
+	}
+	if len(discoveries) == 0 && len(session.Registrations) == 0 && !session.RegisteredAt.IsZero() {
+		// Legacy session shape (no per-workspace map): the single captured
+		// registration belongs to the probe's own credential workspace.
+		discoveries[s.probeTokenWorkspace()] = registry.Discovery{
+			CLIVersion:     session.CLIVersion,
+			Runtimes:       session.Runtimes,
+			FailedProfiles: session.FailedProfiles,
+		}
+	}
+	if len(discoveries) == 0 && len(session.Registrations) > 0 {
+		// The probe registered to workspaces the deployment does not
+		// configure: no declaration is servable.
+		for workspaceID, registration := range session.Registrations {
+			s.log.WarnContext(ctx, "probe.workspace_not_configured", "job_name", handle.JobName,
+				"workspace_id", workspaceID, "kind", kind,
+				"detail", "probe registered a workspace this deployment does not configure")
+			discoveries[workspaceID] = registration.Discovery()
+		}
+	}
+	return discoveries, nil
 }
 
 func (s *Scheduler) teardownStartupProbe(ctx context.Context, h ProbeHandle) {

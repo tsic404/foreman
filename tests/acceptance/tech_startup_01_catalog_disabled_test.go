@@ -44,10 +44,14 @@ func TestStartupCatalogDisabledCompletesAtRegistration(t *testing.T) {
 	}
 
 	begin := time.Now()
-	discovery, err := h.sched.RunStartupProbe(t.Context())
+	discoveries, err := h.sched.RunStartupProbe(t.Context())
 	elapsed := time.Since(begin)
 	if err != nil {
 		t.Fatalf("RunStartupProbe: %v", err)
+	}
+	discovery, ok := discoveries[h.schedCfg.WorkspaceID]
+	if !ok {
+		t.Fatalf("discoveries = %+v, want an entry for workspace %q", discoveries, h.schedCfg.WorkspaceID)
 	}
 	if len(discovery.Runtimes) != 1 || discovery.Runtimes[0].Type != "omp" || discovery.CLIVersion != "0.6.1" {
 		t.Fatalf("discovery = %+v, want the probe's registration body", discovery)
@@ -126,9 +130,13 @@ func TestStartupCatalogEnabledStillWaitsForDiscovery(t *testing.T) {
 		}
 	}
 
-	discovery, err := h.sched.RunStartupProbe(t.Context())
+	discoveries, err := h.sched.RunStartupProbe(t.Context())
 	if err != nil {
 		t.Fatalf("the fourth class must not stop startup: %v", err)
+	}
+	discovery, ok := discoveries[h.schedCfg.WorkspaceID]
+	if !ok {
+		t.Fatalf("discoveries = %+v, want an entry for workspace %q", discoveries, h.schedCfg.WorkspaceID)
 	}
 	if len(discovery.Runtimes) != 1 {
 		t.Fatalf("discovery = %+v", discovery)

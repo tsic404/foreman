@@ -40,7 +40,12 @@ type ProbeSession struct {
 	TokenHash     string // sha256 hex of the probe Job Token
 	JobRuntime    string // uuid5(NS_JOB_RUNTIME, JobName)
 	RealRuntimeID string // real runtime id results are relayed to; ProbeCommandDriven only
-	Deadline      time.Time
+	// WorkspaceID pins the probe to one workspace (catalog probes). Empty on
+	// startup / registration-discovery probes: their registration scope spans
+	// every configured workspace and their S-2 / S-3 answers serve any of them
+	// (§1.2, §6.3).
+	WorkspaceID string
+	Deadline    time.Time
 
 	// Result face (written by the fake server's S27 path / scheduler).
 	RelayedAt   time.Time
@@ -49,10 +54,45 @@ type ProbeSession struct {
 
 	// Registration face: written by the fake server's S4 probe branch for the
 	// modes whose registration body is a declaration (CapturesRegistration).
+	// Registrations is the per-workspace truth; the four fields below mirror
+	// the first registration for the single-workspace readers.
 	RegisteredAt   time.Time
 	CLIVersion     string
 	Runtimes       []DiscoveredRuntime
 	FailedProfiles []json.RawMessage
+	Registrations  map[string]ProbeRegistration
+}
+
+// ProbeRegistration is one workspace's S4 declaration captured by a
+// registration probe. The daemon config decides which workspaces a probe
+// registers to, so one probe may carry several of these (§1.2).
+type ProbeRegistration struct {
+	RegisteredAt   time.Time
+	CLIVersion     string
+	Runtimes       []DiscoveredRuntime
+	FailedProfiles []json.RawMessage
+}
+
+// Registration returns one workspace's captured declaration, or false when
+// the probe never registered to that workspace (the configured-but-unserved
+// case of AC-87).
+func (s ProbeSession) Registration(workspaceID string) (ProbeRegistration, bool) {
+	registration, ok := s.Registrations[workspaceID]
+	if !ok {
+		return ProbeRegistration{}, false
+	}
+	registration.Runtimes = slices.Clone(registration.Runtimes)
+	registration.FailedProfiles = cloneRawMessages(registration.FailedProfiles)
+	return registration, true
+}
+
+// Discovery renders one workspace's captured registration as C1's input.
+func (r ProbeRegistration) Discovery() Discovery {
+	return Discovery{
+		CLIVersion:     r.CLIVersion,
+		Runtimes:       slices.Clone(r.Runtimes),
+		FailedProfiles: cloneRawMessages(r.FailedProfiles),
+	}
 }
 
 // CapturesRegistration reports whether the session's S4 body is the C1 truth
@@ -89,6 +129,14 @@ func (s ProbeSession) clone() ProbeSession {
 	out := s
 	out.Runtimes = slices.Clone(s.Runtimes)
 	out.FailedProfiles = cloneRawMessages(s.FailedProfiles)
+	if s.Registrations != nil {
+		out.Registrations = make(map[string]ProbeRegistration, len(s.Registrations))
+		for workspaceID, registration := range s.Registrations {
+			registration.Runtimes = slices.Clone(registration.Runtimes)
+			registration.FailedProfiles = cloneRawMessages(registration.FailedProfiles)
+			out.Registrations[workspaceID] = registration
+		}
+	}
 	return out
 }
 

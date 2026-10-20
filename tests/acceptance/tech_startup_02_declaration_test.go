@@ -79,9 +79,13 @@ func TestStartupDeclarationComesFromProbeRegistration(t *testing.T) {
 		}
 	}
 
-	discovery, err := h.sched.RunStartupProbe(t.Context())
+	discoveries, err := h.sched.RunStartupProbe(t.Context())
 	if err != nil {
 		t.Fatalf("RunStartupProbe: %v", err)
+	}
+	discovery, ok := discoveries[h.schedCfg.WorkspaceID]
+	if !ok {
+		t.Fatalf("discoveries = %+v, want an entry for workspace %q", discoveries, h.schedCfg.WorkspaceID)
 	}
 	if !emptyReposSeen {
 		t.Fatal("the pre-C1 S2 window was never exercised")

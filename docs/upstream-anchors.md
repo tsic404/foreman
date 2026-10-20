@@ -71,3 +71,17 @@ and Foreman can call them with its existing server credential.
 through the platform's project list. Title uniqueness is not promised, which is
 why more than one exact match refuses startup as ambiguous (ADR-048 decision 2)
 rather than picking one.
+
+## Unverified: multi-workspace probe registration (contracts §1.2 / ADR-047)
+
+The design's probe scope (one startup / registration-discovery probe whose
+daemon decides, from the template config, which workspaces it registers to)
+needs each registration to name its workspace. The pinned anchor set above does
+not record a registration-body workspace field. The implementation is the
+defensive form: S-4 accepts `workspace_id` when the body carries it and falls
+back to the Job Token's workspace when it does not; a probe that never names a
+second workspace is treated as unregistered for it (one visible
+`probe.workspace_not_registered` event, no silent service). Re-verify the field
+against the pinned artifact before relying on the multi-workspace probe scope;
+a confirmed absence narrows the scope to the token's workspace and is a design
+question, not an implementation fix.

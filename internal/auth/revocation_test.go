@@ -80,7 +80,7 @@ func TestRevocationSetSweepOnInsert(t *testing.T) {
 func TestIssuerRevokeUsesTokenValidityWindow(t *testing.T) {
 	issued := time.Unix(1_700_000_000, 0)
 	now := issued
-	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1"}}
+	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1", WorkspaceID: "ws-1"}}
 	iss, err := NewIssuer(testKey, jobs, fakeDone{}, testTokenTTL, WithClock(func() time.Time { return now }))
 	if err != nil {
 		t.Fatalf("NewIssuer: %v", err)

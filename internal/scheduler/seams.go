@@ -34,6 +34,11 @@ type ServerClient interface {
 	// Forward posts a lifecycle callback body to the server and returns its
 	// status code and response body.
 	Forward(ctx context.Context, ep Endpoint, taskID string, body []byte) (int, []byte, error)
+	// ForwardInWorkspace posts a callback for a task the index no longer
+	// holds, using workspaceID's credential: a replayed report can outlive
+	// the entry that carried the workspace, and in a multi-workspace
+	// deployment there is no single client to fall back to (§10, ADR-047).
+	ForwardInWorkspace(ctx context.Context, ep Endpoint, taskID, workspaceID string, body []byte) (int, []byte, error)
 }
 
 // JobBuilder renders the Job and credential Secret for an entry; satisfied
@@ -114,7 +119,7 @@ type Reconciler interface {
 // cleanup of its task: a deleted Job must never stand in for a delivered
 // report.
 type PendingReportQueue interface {
-	Enqueue(ctx context.Context, taskID, jobName, daemonID string, ep Endpoint, body []byte, failureReason string) error
+	Enqueue(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string) error
 	// Queued reports whether taskID's terminal report is still undelivered.
 	// It is conservative: while the carrier list has not completed every task
 	// reads as queued (§4.3 — an uncompleted rebuild is not an empty queue).

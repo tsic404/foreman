@@ -38,11 +38,15 @@ type TaskScheduler interface {
 // Job Tokens to the local daemon face, any other credential verbatim to
 // the real server (S29), none to 401.
 type FakeServer struct {
-	issuer  *auth.Issuer
-	reg     *registry.Registry
-	probes  *registry.ProbeRegistry // catalog-probe sessions; nil disables the probe face
-	sched   TaskScheduler
+	issuer *auth.Issuer
+	reg    *registry.Registry
+	probes *registry.ProbeRegistry // catalog-probe sessions; nil disables the probe face
+	sched  TaskScheduler
+	// client is the legacy single-workspace client; clients is the
+	// multi-workspace set. Handlers resolve by the token's workspace, falling
+	// back to client when no set is wired (every single-workspace test).
 	client  *Client
+	clients *ClientSet
 	ws      *WSHandler // nil when FOREMAN_WS_ENABLED=false
 	metrics Metrics
 	log     *slog.Logger
@@ -57,6 +61,10 @@ type FakeServer struct {
 	// bundles answers S26: the §1.8 resolve cache (fresh hit, upstream refresh,
 	// bounded downgrade). Never nil once the server is built.
 	bundles *SkillCache
+	// bundlesInjected marks a scenario-supplied cache: it owns the whole
+	// resolve face (clock, logging), so the workspace-partitioned factory is
+	// not consulted.
+	bundlesInjected bool
 
 	// legacyClaimMu guards legacyClaimed: the per-entry dedup of the legacy
 	// claim fallback event. The set lives for the process lifetime — the
@@ -74,6 +82,12 @@ func WithProbeRegistry(probes *registry.ProbeRegistry) FakeServerOption {
 	return func(s *FakeServer) { s.probes = probes }
 }
 
+// WithClientSet wires the per-workspace client set: S-1's configured set,
+// S-2/S-3/S-4 routing by workspace and the S-26 cache partition all read it.
+func WithClientSet(clients *ClientSet) FakeServerOption {
+	return func(s *FakeServer) { s.clients = clients }
+}
+
 // WithServerLogger overrides the fake server's logger (tests).
 func WithServerLogger(l *slog.Logger) FakeServerOption {
 	return func(s *FakeServer) { s.log = l }
@@ -83,7 +97,7 @@ func WithServerLogger(l *slog.Logger) FakeServerOption {
 // default one is built from the client's configuration, which is what a
 // deployment wants; a scenario injects its own to drive the clock.
 func WithSkillBundles(cache *SkillCache) FakeServerOption {
-	return func(s *FakeServer) { s.bundles = cache }
+	return func(s *FakeServer) { s.bundles, s.bundlesInjected = cache, true }
 }
 
 // NewFakeServer builds the handler with the full §2.2 endpoint table.
@@ -104,6 +118,11 @@ func NewFakeServer(issuer *auth.Issuer, reg *registry.Registry, sched TaskSchedu
 	}
 	for _, opt := range opts {
 		opt(s)
+	}
+	if s.clients == nil && client != nil {
+		if set, err := NewClientSet(client); err == nil {
+			s.clients = set
+		}
 	}
 	if s.bundles == nil && client != nil {
 		s.bundles = NewSkillCache(client.cfg, client, s.metrics)
@@ -213,6 +232,52 @@ func (s *FakeServer) authenticate(w http.ResponseWriter, r *http.Request, scope 
 		return auth.Claims{}, false
 	}
 	return claims, true
+}
+
+// clientFor resolves the client of one workspace. A single-workspace server
+// built without a set answers with its one client for any id (the legacy
+// path); once a set is wired an unknown workspace resolves to nil.
+func (s *FakeServer) clientFor(workspaceID string) *Client {
+	if client, ok := s.clients.For(workspaceID); ok {
+		return client
+	}
+	return nil
+}
+
+// workspaceConfigured reports whether the deployment serves workspaceID.
+func (s *FakeServer) workspaceConfigured(workspaceID string) bool {
+	return s.clients.Has(workspaceID)
+}
+
+// configuredWorkspaces returns the configured workspace ids in order.
+func (s *FakeServer) configuredWorkspaces() []string {
+	return s.clients.IDs()
+}
+
+// allowsWorkspace decides whether a token may address a workspace on the
+// res/{ws} routes. Task and catalog-probe tokens are pinned to their own
+// workspace; a startup / registration-discovery probe carries no pin and
+// spans the configured set (§1.2).
+func (s *FakeServer) allowsWorkspace(claims auth.Claims, workspaceID string) bool {
+	if claims.WorkspaceID == workspaceID {
+		return true
+	}
+	if claims.Role != catalogProbeRole {
+		return false
+	}
+	session, ok := s.probeSession(claims)
+	return ok && session.WorkspaceID == "" && s.workspaceConfigured(workspaceID)
+}
+
+// bundlesFor is the workspace-partitioned S-26 cache.
+func (s *FakeServer) bundlesFor(workspaceID string) *SkillCache {
+	if s.bundlesInjected || s.clients == nil {
+		return s.bundles
+	}
+	if cache := s.clients.SkillBundles(workspaceID, s.metrics); cache != nil {
+		return cache
+	}
+	return s.bundles
 }
 
 // ---- shared helpers ----
@@ -348,7 +413,7 @@ func (a jobLookup) ByDaemon(daemonID string) (auth.JobEntry, bool) {
 	if !ok {
 		return auth.JobEntry{}, false
 	}
-	return auth.JobEntry{JobRuntimeID: e.JobRuntimeID}, true
+	return auth.JobEntry{JobRuntimeID: e.JobRuntimeID, WorkspaceID: e.WorkspaceID}, true
 }
 
 // JobTokenIssuer builds the Job Token issuer over the registry's read view
@@ -377,5 +442,6 @@ func (p probeLookup) ProbeByJob(jobName string) (auth.ProbeEntry, bool) {
 		RequestID:    session.RequestID,
 		SelfMintedID: session.SelfMintedID,
 		TokenHash:    session.TokenHash,
+		WorkspaceID:  session.WorkspaceID,
 	}, true
 }

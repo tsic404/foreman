@@ -20,10 +20,14 @@ import (
 )
 
 const (
-	tcAuth04ProfileDir  = "/home/agent/.multica/profiles/foreman-job"
-	tcAuth04CredFile    = tcAuth04ProfileDir + "/config.json"
-	tcAuth04HomePath    = "/home/agent"
-	tcAuth04HomeVolume  = "/var/lib/foreman/home"
+	tcAuth04ProfileDir = "/home/agent/.multica/profiles/foreman-job"
+	tcAuth04CredFile   = tcAuth04ProfileDir + "/config.json"
+	tcAuth04HomePath   = "/home/agent"
+	tcAuth04HomeRoot   = "/var/lib/foreman/home"
+	tcAuth04Workspace  = "ws-1"
+	// Node-side state is partitioned per workspace (ADR-047): the rendered
+	// home volume is the claimed task's workspace tree under the shared root.
+	tcAuth04HomeVolume  = tcAuth04HomeRoot + "/" + tcAuth04Workspace
 	tcAuth04StateVolume = "/var/lib/foreman/workspaces"
 )
 

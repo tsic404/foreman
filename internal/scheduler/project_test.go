@@ -33,7 +33,7 @@ type projectStub struct {
 
 func (s *projectStub) FromPayload(json.RawMessage) string { return s.payloadID }
 
-func (s *projectStub) ByIssue(ctx context.Context, issueID string) (string, error) {
+func (s *projectStub) ByIssue(ctx context.Context, workspaceID, issueID string) (string, error) {
 	s.mu.Lock()
 	s.calls = append(s.calls, issueID)
 	block, err, projectID := s.block, s.err, s.byIssue[issueID]

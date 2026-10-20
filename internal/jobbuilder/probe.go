@@ -51,7 +51,7 @@ func (b *Builder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string,
 	if b.cfg.Issuer == nil {
 		return nil, nil, "", fmt.Errorf("Config.Issuer is required")
 	}
-	job, err := b.renderProbe(name, jobRuntimeID, budget)
+	job, err := b.renderProbe(name, jobRuntimeID, workspaceID, budget)
 	if err != nil {
 		return nil, nil, "", err
 	}
@@ -59,7 +59,7 @@ func (b *Builder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string,
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("issue probe Job Token: %w", err)
 	}
-	return job, b.probeCredentialSecret(name, token), b.cfg.Issuer.Hash(token), nil
+	return job, b.probeCredentialSecret(name, workspaceID, token), b.cfg.Issuer.Hash(token), nil
 }
 
 // ProbeJobName is the probe naming convention: the Job, its credential Secret
@@ -87,18 +87,19 @@ func probeLabels(name string) map[string]string {
 
 // renderProbe is the probe pipeline (§8.4): the template copy through the
 // probe write face, then the budget deadline.
-func (b *Builder) renderProbe(name, jobRuntimeID string, budget time.Duration) (*batchv1.Job, error) {
+func (b *Builder) renderProbe(name, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, error) {
 	job, err := renderProbeTemplate(b.template, probeValues{
 		jobImage:     b.cfg.JobImage,
 		jobRuntimeID: jobRuntimeID,
 		jobName:      name,
 		daemonID:     name,
 		credSecret:   CredentialSecretName(name),
+		workspaceID:  workspaceID,
 	})
 	if err != nil {
 		return nil, err
 	}
-	b.applyProbeWrites(job, name)
+	b.applyProbeWrites(job, name, workspaceID)
 	writeProbeDeadline(job, budget)
 	return job, nil
 }
@@ -128,7 +129,7 @@ func writeProbeDeadline(job *batchv1.Job, budget time.Duration) {
 // generic substitution). Annotations stay as the template wrote them, minus
 // that domain: a probe maps no task, so it carries none of the task
 // annotations (§4.3).
-func (b *Builder) applyProbeWrites(job *batchv1.Job, name string) {
+func (b *Builder) applyProbeWrites(job *batchv1.Job, name, workspaceID string) {
 	injectContainerEnv(job, b.cfg.serverURL())
 
 	job.Name = name
@@ -138,6 +139,15 @@ func (b *Builder) applyProbeWrites(job *batchv1.Job, name string) {
 	clearForemanDomain(job.Annotations)
 	clearForemanDomain(job.Spec.Template.Labels)
 	clearForemanDomain(job.Spec.Template.Annotations)
+	if workspaceID != "" {
+		// The probe's workspace identity is the credential's, and it is what
+		// partitions the probe domain's sweep and its labels (§3).
+		job.Labels[labelWorkspaceID] = workspaceID
+		if job.Spec.Template.Labels == nil {
+			job.Spec.Template.Labels = map[string]string{}
+		}
+		job.Spec.Template.Labels[labelWorkspaceID] = workspaceID
+	}
 	clearOwnedKeys(job.Labels)
 	clearOwnedKeys(job.Annotations)
 	clearOwnedKeys(job.Spec.Template.Labels)
@@ -178,13 +188,22 @@ func writeProbeHeartbeat(job *batchv1.Job, interval time.Duration) {
 // a task's (one config.json, mounted 0400 through cred-src), labelled with the
 // probe role and without a task id, so the task-side orphan sweep leaves it to
 // the probe sweep (§6.5).
-func (b *Builder) probeCredentialSecret(name, token string) *corev1.Secret {
+func (b *Builder) probeCredentialSecret(name, workspaceID, token string) *corev1.Secret {
 	configJSON := `{"token":` + strconv.Quote(token) + `}`
+	labels := map[string]string{
+		labelAppName:   jobAppName,
+		labelManagedBy: managedByForeman,
+		labelRole:      probeRole,
+		labelDaemonID:  name,
+	}
+	if workspaceID != "" {
+		labels[labelWorkspaceID] = workspaceID
+	}
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      CredentialSecretName(name),
+			Labels:    labels,
 			Namespace: b.cfg.JobNamespace,
-			Labels:    probeLabels(name),
 		},
 		Type:       corev1.SecretTypeOpaque,
 		StringData: map[string]string{configFileKey: configJSON},
@@ -206,6 +225,11 @@ type probeValues struct {
 	// so the two placeholders agree on this path.
 	daemonID   string
 	credSecret string
+	// workspaceID is the probe's credential workspace: the startup and
+	// registration-discovery probes take the workspace of the credential they
+	// hold (§8.3), so a workspace-partitioned template location lands under
+	// the workspace the probe actually acts for.
+	workspaceID string
 }
 
 // replacement is the probe's consumption face: exactly the four placeholders
@@ -224,6 +248,8 @@ func (v probeValues) replacement(placeholder string) string {
 		return v.jobName
 	case placeholderDaemonID:
 		return v.daemonID
+	case placeholderWorkspaceID:
+		return v.workspaceID
 	default:
 		return placeholder
 	}

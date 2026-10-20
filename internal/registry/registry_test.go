@@ -130,7 +130,7 @@ func TestMarkTerminalWritesDoneIndexAndIsImmutable(t *testing.T) {
 	if e.State != StateTerminal || e.Result != ResultFailed {
 		t.Fatalf("entry = %v/%v", e.State, e.Result)
 	}
-	if !r.IsDone("t1") {
+	if !r.IsDone("", "t1") {
 		t.Fatal("IsDone false after MarkTerminal")
 	}
 	// A repeated terminal write is an idempotent cleanup: the first verdict
@@ -195,7 +195,7 @@ func TestDeleteKeepsDoneRecord(t *testing.T) {
 	if _, ok := r.ByJob("fm-t1"); ok {
 		t.Fatal("job index survived Delete")
 	}
-	if !r.IsDone("t1") {
+	if !r.IsDone("", "t1") {
 		t.Fatal("done record lost with Delete")
 	}
 	// A non-terminal Put for the same ID is possible again after Delete;
@@ -211,7 +211,7 @@ func TestDoneIndexExpires(t *testing.T) {
 	_ = r.Put(entryFor("t1"))
 	_, _, _ = r.MarkTerminal("t1", ResultCompleted, "", now)
 	now = now.Add(DoneIndexTTL + time.Minute)
-	if r.IsDone("t1") {
+	if r.IsDone("", "t1") {
 		t.Fatal("done record past TTL still reported")
 	}
 }
@@ -254,7 +254,7 @@ func TestNodePlacement(t *testing.T) {
 	}
 	// Placement is not a learning point: the soft-affinity index only ever
 	// learns from a terminal report (ADR-015), and it has no issue key.
-	if got := r.LastNodeForSession("issue-t1"); got != "" {
+	if got := r.LastNodeForSession("", "issue-t1"); got != "" {
 		t.Fatalf("LastNodeForSession(issue key) = %q, want empty", got)
 	}
 	r.SetNode("ghost", "node-b") // no panic on unknown task

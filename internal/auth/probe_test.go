@@ -192,7 +192,7 @@ func TestVerifyProbeUnknownSession(t *testing.T) {
 	}{
 		"lookup not injected":         {fakeRegistry{}, nil, RequestScope{RuntimeID: probeRuntime, RequestID: probeRequest}},
 		"lookup miss":                 {fakeRegistry{}, fakeProbes{"fm-catalog-other": session}, RequestScope{RuntimeID: probeRuntime}},
-		"task entry cannot rescue it": {fakeRegistry{probeJobName: {JobRuntimeID: probeRuntime}}, fakeProbes{}, RequestScope{RuntimeID: probeRuntime}},
+		"task entry cannot rescue it": {fakeRegistry{probeJobName: {JobRuntimeID: probeRuntime, WorkspaceID: "ws-1"}}, fakeProbes{}, RequestScope{RuntimeID: probeRuntime}},
 		"terminal endpoint":           {fakeRegistry{}, nil, RequestScope{RuntimeID: probeRuntime, IsTerminalEndpoint: true}},
 	}
 	for name, tc := range cases {
@@ -252,7 +252,7 @@ func TestVerifyProbeExpired(t *testing.T) {
 func TestProbeAndTaskFacesAreDisjoint(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
 	probeToken, session := probeFixture(t, now)
-	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1"}}
+	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1", WorkspaceID: "ws-1"}}
 	iss := newProbeIssuer(now, jobs, fakeDone{}, fakeProbes{probeJobName: session})
 
 	// A revoked digest on the task face does not touch the probe branch.

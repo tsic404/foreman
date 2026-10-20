@@ -162,7 +162,7 @@ func TestIntegrationInflightGaugeConvergesWhileARoundIsBusy(t *testing.T) {
 	const interval = 20 * time.Millisecond
 
 	claimFor(t, sched, "t1")
-	if err := pending.Enqueue(context.Background(), "t1", "fm-t1", "fm-t1", scheduler.EPFail, []byte(`{"error":"boom"}`), ""); err != nil {
+	if err := pending.Enqueue(context.Background(), "t1", "fm-t1", "fm-t1", "", scheduler.EPFail, []byte(`{"error":"boom"}`), ""); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	busy := &stallingSettler{Settler: sched, entered: make(chan struct{}, 1), release: make(chan struct{})}

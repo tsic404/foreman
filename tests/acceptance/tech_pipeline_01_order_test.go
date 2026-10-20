@@ -335,7 +335,7 @@ spec:
 		// A learned session with a usable node: without the policy injection the
 		// item would have been filled with node-a, so the deletion proves the
 		// injection ran before the conditional block.
-		h.reg.LearnSession(registry.SessionKey("sessions/sess-1"), "node-a")
+		h.reg.LearnSession("ws-1", registry.SessionKey("sessions/sess-1"), "node-a")
 
 		body := tcBaseClaim("task-1")
 		body.PriorSessionID = "sessions/sess-1"

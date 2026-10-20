@@ -16,15 +16,17 @@ import (
 
 // fakeSender programs Drain outcomes per task.
 type fakeSender struct {
-	code    int
-	err     error
-	sent    []string
-	reasons []string
+	code       int
+	err        error
+	sent       []string
+	reasons    []string
+	workspaces []string
 }
 
-func (f *fakeSender) DeliverQueued(_ context.Context, ep Endpoint, taskID string, body []byte, failureReason string) (int, []byte, error) {
+func (f *fakeSender) DeliverQueued(_ context.Context, ep Endpoint, taskID, workspaceID string, body []byte, failureReason string) (int, []byte, error) {
 	f.sent = append(f.sent, taskID+":"+string(ep)+":"+string(body))
 	f.reasons = append(f.reasons, failureReason)
+	f.workspaces = append(f.workspaces, workspaceID)
 	if f.err != nil {
 		return 0, nil, f.err
 	}
@@ -37,7 +39,7 @@ func TestEnqueueWritesDurableFile(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPComplete, []byte(`{"result":"ok"}`), ""); err != nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "ws-a", EPComplete, []byte(`{"result":"ok"}`), ""); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if p.Len() != 1 {
@@ -53,6 +55,9 @@ func TestEnqueueWritesDurableFile(t *testing.T) {
 	}
 	if rep.TaskID != "task-1" || rep.Endpoint != "complete" || string(rep.Body) != `{"result":"ok"}` {
 		t.Errorf("report = %+v", rep)
+	}
+	if rep.WorkspaceID != "ws-a" {
+		t.Errorf("workspace = %q, want ws-a persisted with the report", rep.WorkspaceID)
 	}
 	if rep.JobName != "fm-task-1" || rep.DaemonID != "fm-task-1" {
 		t.Errorf("identity = job %q daemon %q, want the task's Job identity", rep.JobName, rep.DaemonID)
@@ -73,7 +78,7 @@ func TestEnqueueRejectsUnsafeNames(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	if err := p.Enqueue(context.Background(), "../evil", "", "", EPFail, []byte(`{}`), ""); err == nil {
+	if err := p.Enqueue(context.Background(), "../evil", "", "", "", EPFail, []byte(`{}`), ""); err == nil {
 		t.Error("path-unsafe task ids must be rejected")
 	}
 }
@@ -83,7 +88,7 @@ func TestDrainDeliversAndRemoves(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPComplete, []byte(`{"a":1}`), "")
+	_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPComplete, []byte(`{"a":1}`), "")
 	sender := &fakeSender{code: 200}
 
 	remaining, err := p.Drain(context.Background(), sender)
@@ -101,7 +106,7 @@ func TestDrainDeliversAndRemoves(t *testing.T) {
 func TestDrainTreats404And409AsDelivered(t *testing.T) {
 	for _, code := range []int{404, 409} {
 		p, _ := NewPendingReports(t.TempDir())
-		_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPCancelAck, []byte(`{}`), "")
+		_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPCancelAck, []byte(`{}`), "")
 		remaining, err := p.Drain(context.Background(), &fakeSender{code: code})
 		if err != nil || remaining != 0 {
 			t.Errorf("code %d: Drain = %d, %v (a settled/gone task makes the report moot)", code, remaining, err)
@@ -114,7 +119,7 @@ func TestDrainKeepsFailuresAndCountsAttempts(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{}`), "")
+	_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPFail, []byte(`{}`), "")
 	sender := &fakeSender{code: 503}
 
 	remaining, err := p.Drain(context.Background(), sender)
@@ -138,7 +143,7 @@ func TestDrainDropsExpiredReports(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	_ = p.Enqueue(context.Background(), "task-old", "fm-task-old", "fm-task-old", EPFail, []byte(`{}`), "")
+	_ = p.Enqueue(context.Background(), "task-old", "fm-task-old", "fm-task-old", "", EPFail, []byte(`{}`), "")
 
 	// 25h later the report exceeds the TTL and is dropped with an error log
 	// (§10).
@@ -160,11 +165,11 @@ func TestEnqueuePreservesOriginalEnqueueTime(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"v":1}`), "")
+	_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPFail, []byte(`{"v":1}`), "")
 
 	later := now.Add(time.Hour)
 	p2, _ := NewPendingReports(p.dir, WithPendingReportsClock(func() time.Time { return later }))
-	if err := p2.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"v":2}`), ""); err != nil {
+	if err := p2.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPFail, []byte(`{"v":2}`), ""); err != nil {
 		t.Fatalf("re-Enqueue: %v", err)
 	}
 	raw, _ := os.ReadFile(filepath.Join(p.dir, "task-1.json"))
@@ -180,7 +185,7 @@ func TestEnqueuePreservesOriginalEnqueueTime(t *testing.T) {
 
 func TestDrainSurfacesTransportErrors(t *testing.T) {
 	p, _ := NewPendingReports(t.TempDir())
-	_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPComplete, []byte(`{}`), "")
+	_ = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPComplete, []byte(`{}`), "")
 	remaining, err := p.Drain(context.Background(), &fakeSender{err: errors.New("dial refused")})
 	if err == nil || remaining != 1 {
 		t.Fatalf("Drain = %d, %v", remaining, err)
@@ -219,7 +224,7 @@ func TestDrainDoesNotBlockEnqueue(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	_ = p.Enqueue(context.Background(), "task-slow", "fm-task-slow", "fm-task-slow", EPComplete, []byte(`{}`), "")
+	_ = p.Enqueue(context.Background(), "task-slow", "fm-task-slow", "fm-task-slow", "", EPComplete, []byte(`{}`), "")
 
 	release := make(chan struct{})
 	blocking := newBlockingSender(release)
@@ -233,7 +238,7 @@ func TestDrainDoesNotBlockEnqueue(t *testing.T) {
 	<-blocking.entered
 	enqueued := make(chan error, 1)
 	go func() {
-		enqueued <- p.Enqueue(context.Background(), "task-fast", "fm-task-fast", "fm-task-fast", EPFail, []byte(`{}`), "")
+		enqueued <- p.Enqueue(context.Background(), "task-fast", "fm-task-fast", "fm-task-fast", "", EPFail, []byte(`{}`), "")
 	}()
 	select {
 	case err := <-enqueued:
@@ -262,7 +267,7 @@ func newBlockingSender(release chan struct{}) *blockingSender {
 	return &blockingSender{release: release, entered: make(chan struct{})}
 }
 
-func (s *blockingSender) DeliverQueued(context.Context, Endpoint, string, []byte, string) (int, []byte, error) {
+func (s *blockingSender) DeliverQueued(context.Context, Endpoint, string, string, []byte, string) (int, []byte, error) {
 	s.once.Do(func() { close(s.entered) })
 	<-s.release
 	return 503, nil, nil
@@ -299,7 +304,7 @@ func TestEnqueueFailureStagesReportUntilWritable(t *testing.T) {
 
 	// The directory stays listable (the depth is known) but refuses writes.
 	makeQueueUnwritable(t, dir)
-	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"failure_reason":"job_failed"}`), ""); err == nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPFail, []byte(`{"failure_reason":"job_failed"}`), ""); err == nil {
 		t.Fatal("Enqueue against an unwritable queue: want the write error")
 	}
 	if p.Len() != 0 {
@@ -345,7 +350,7 @@ func TestDrainDeliversUnstorableTaskIDFromStaging(t *testing.T) {
 	if p.Queued("../escape") {
 		t.Fatal("Queued must not claim an unsafe task id is a queue entry")
 	}
-	if err := p.Enqueue(context.Background(), "../escape", "", "", EPFail, []byte(`{"failure_reason":"invalid_task_id"}`), ""); err == nil {
+	if err := p.Enqueue(context.Background(), "../escape", "", "", "", EPFail, []byte(`{"failure_reason":"invalid_task_id"}`), ""); err == nil {
 		t.Fatal("Enqueue with an unsafe task id: want an error")
 	}
 	if p.Len() != 0 {
@@ -388,7 +393,7 @@ func TestReportEventsCarryTaskIdentity(t *testing.T) {
 	// A failed write stages the report; the retry's queue line is the second
 	// forward_queued emission (the first is the direct write below).
 	makeQueueUnwritable(t, dir)
-	if err := p.Enqueue(context.Background(), "task-staged", "fm-task-staged", "fm-daemon-staged", EPFail, []byte(`{}`), ""); err == nil {
+	if err := p.Enqueue(context.Background(), "task-staged", "fm-task-staged", "fm-daemon-staged", "", EPFail, []byte(`{}`), ""); err == nil {
 		t.Fatal("Enqueue against an unwritable queue: want the write error")
 	}
 	if err := os.Chmod(dir, 0o700); err != nil {
@@ -399,7 +404,7 @@ func TestReportEventsCarryTaskIdentity(t *testing.T) {
 	}
 
 	// The durable file carries the identity across a reopened queue.
-	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-daemon-1", EPComplete, []byte(`{}`), ""); err != nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-daemon-1", "", EPComplete, []byte(`{}`), ""); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	p2, err := NewPendingReports(dir, WithPendingReportsLogger(logger), WithPendingReportsClock(clock))
@@ -412,7 +417,7 @@ func TestReportEventsCarryTaskIdentity(t *testing.T) {
 
 	// An unknown identity keeps both keys with empty values, on the queue and
 	// on the TTL drop.
-	if err := p2.Enqueue(context.Background(), "task-2", "", "", EPFail, []byte(`{}`), ""); err != nil {
+	if err := p2.Enqueue(context.Background(), "task-2", "", "", "", EPFail, []byte(`{}`), ""); err != nil {
 		t.Fatalf("Enqueue without identity: %v", err)
 	}
 	now = now.Add(PendingReportTTL + time.Hour)
@@ -487,14 +492,14 @@ func TestDrainKeepsAReportReplacedMidFlight(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"old":1}`), ""); err != nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPFail, []byte(`{"old":1}`), ""); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	replaced := false
 	sender := &senderFunc{send: func(_ string, _ []byte) (int, []byte, error) {
 		if !replaced {
 			replaced = true
-			if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"new":2}`), ""); err != nil {
+			if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPFail, []byte(`{"new":2}`), ""); err != nil {
 				t.Errorf("mid-flight Enqueue: %v", err)
 			}
 		}
@@ -519,7 +524,7 @@ type senderFunc struct {
 	send func(taskID string, body []byte) (int, []byte, error)
 }
 
-func (f *senderFunc) DeliverQueued(_ context.Context, _ Endpoint, taskID string, body []byte, _ string) (int, []byte, error) {
+func (f *senderFunc) DeliverQueued(_ context.Context, _ Endpoint, taskID, _ string, body []byte, _ string) (int, []byte, error) {
 	return f.send(taskID, body)
 }
 
@@ -572,7 +577,7 @@ func TestEnqueueRefusesNewEntriesAtTheRetentionBound(t *testing.T) {
 		t.Fatalf("Restore: %v", err)
 	}
 	for _, taskID := range []string{"task-1", "task-2"} {
-		if err := p.Enqueue(context.Background(), taskID, "fm-"+taskID, "fm-"+taskID, EPFail, []byte(`{}`), ""); err != nil {
+		if err := p.Enqueue(context.Background(), taskID, "fm-"+taskID, "fm-"+taskID, "", EPFail, []byte(`{}`), ""); err != nil {
 			t.Fatalf("Enqueue %s: %v", taskID, err)
 		}
 	}
@@ -585,7 +590,7 @@ func TestEnqueueRefusesNewEntriesAtTheRetentionBound(t *testing.T) {
 
 	// A new entry is refused: nothing written, nothing staged, nothing
 	// carried, and the drop is the alarm face's error row.
-	err = p.Enqueue(context.Background(), "task-3", "fm-task-3", "fm-task-3", EPComplete, []byte(`{"result":"ok"}`), "")
+	err = p.Enqueue(context.Background(), "task-3", "fm-task-3", "fm-task-3", "", EPComplete, []byte(`{"result":"ok"}`), "")
 	if !errors.Is(err, ErrPendingQueueFull) {
 		t.Fatalf("Enqueue at the bound = %v, want ErrPendingQueueFull", err)
 	}
@@ -609,7 +614,7 @@ func TestEnqueueRefusesNewEntriesAtTheRetentionBound(t *testing.T) {
 
 	// A task the queue already holds is a replacement, not a new entry: it is
 	// admitted at the bound and never grows the queue.
-	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"v":2}`), ""); err != nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPFail, []byte(`{"v":2}`), ""); err != nil {
 		t.Fatalf("re-enqueue at the bound: %v", err)
 	}
 	if got := p.Len(); got != 2 {
@@ -625,7 +630,7 @@ func TestEnqueueRefusesNewEntriesAtTheRetentionBound(t *testing.T) {
 	if got := p.Len(); got != 1 {
 		t.Fatalf("Len after settlement = %d, want 1", got)
 	}
-	if err := p.Enqueue(context.Background(), "task-3", "fm-task-3", "fm-task-3", EPComplete, []byte(`{"result":"ok"}`), ""); err != nil {
+	if err := p.Enqueue(context.Background(), "task-3", "fm-task-3", "fm-task-3", "", EPComplete, []byte(`{"result":"ok"}`), ""); err != nil {
 		t.Fatalf("Enqueue below the bound: %v", err)
 	}
 }
@@ -655,7 +660,7 @@ func TestRetentionBoundCountsCarrierBackedEntries(t *testing.T) {
 		t.Fatalf("rebuilt depth = %d, want the carrier count", got)
 	}
 	// The backlog is already enqueued: the bound never trims it.
-	if err := p.Enqueue(context.Background(), "task-3", "", "", EPFail, []byte(`{}`), ""); !errors.Is(err, ErrPendingQueueFull) {
+	if err := p.Enqueue(context.Background(), "task-3", "", "", "", EPFail, []byte(`{}`), ""); !errors.Is(err, ErrPendingQueueFull) {
 		t.Fatalf("Enqueue over a restored backlog = %v, want ErrPendingQueueFull", err)
 	}
 	if got := store.count(); got != 2 {
@@ -691,13 +696,13 @@ func TestRetentionBoundCountsStagedReports(t *testing.T) {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
 	makeQueueUnwritable(t, dir)
-	if err := p.Enqueue(context.Background(), "task-1", "", "", EPFail, []byte(`{}`), ""); err == nil {
+	if err := p.Enqueue(context.Background(), "task-1", "", "", "", EPFail, []byte(`{}`), ""); err == nil {
 		t.Fatal("Enqueue against an unwritable queue: want the write error")
 	}
 	if !p.Queued("task-1") {
 		t.Fatal("the staged report must be held")
 	}
-	if err := p.Enqueue(context.Background(), "task-2", "", "", EPFail, []byte(`{}`), ""); !errors.Is(err, ErrPendingQueueFull) {
+	if err := p.Enqueue(context.Background(), "task-2", "", "", "", EPFail, []byte(`{}`), ""); !errors.Is(err, ErrPendingQueueFull) {
 		t.Fatalf("Enqueue over a staged report = %v, want ErrPendingQueueFull", err)
 	}
 
@@ -708,7 +713,7 @@ func TestRetentionBoundCountsStagedReports(t *testing.T) {
 	if remaining, err := p.Drain(context.Background(), &fakeSender{code: 200}); err != nil || remaining != 0 {
 		t.Fatalf("Drain = %d, %v", remaining, err)
 	}
-	if err := p.Enqueue(context.Background(), "task-2", "", "", EPFail, []byte(`{}`), ""); err != nil {
+	if err := p.Enqueue(context.Background(), "task-2", "", "", "", EPFail, []byte(`{}`), ""); err != nil {
 		t.Fatalf("Enqueue after the queue drained: %v", err)
 	}
 }
@@ -727,7 +732,7 @@ func TestUnlistableQueueRefusesNewEntries(t *testing.T) {
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{}`), ""); err != nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPFail, []byte(`{}`), ""); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
@@ -744,7 +749,7 @@ func TestUnlistableQueueRefusesNewEntries(t *testing.T) {
 	// A task already queued stays a replacement even with the listing gone:
 	// its own file is still probeable by name, so the re-enqueue is admitted
 	// and draws no depth-unknown drop.
-	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, []byte(`{"v":2}`), ""); err != nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPFail, []byte(`{"v":2}`), ""); err != nil {
 		t.Fatalf("re-enqueue of a held task with an unlistable queue: %v", err)
 	}
 	if got := strings.Count(logs.String(), `"msg":"task.forward_dropped"`); got != 0 {
@@ -754,7 +759,7 @@ func TestUnlistableQueueRefusesNewEntries(t *testing.T) {
 		t.Fatalf("replaced report = %+v (ok=%v), want the newer body", rep, ok)
 	}
 
-	err = p.Enqueue(context.Background(), "task-2", "fm-task-2", "fm-task-2", EPComplete, []byte(`{"result":"ok"}`), "")
+	err = p.Enqueue(context.Background(), "task-2", "fm-task-2", "fm-task-2", "", EPComplete, []byte(`{"result":"ok"}`), "")
 	if !errors.Is(err, ErrPendingQueueFull) {
 		t.Fatalf("Enqueue with an unlistable queue = %v, want ErrPendingQueueFull", err)
 	}
@@ -777,7 +782,7 @@ func TestUnlistableQueueRefusesNewEntries(t *testing.T) {
 	if err := os.Chmod(dir, 0o700); err != nil {
 		t.Fatalf("restore mode: %v", err)
 	}
-	if err := p.Enqueue(context.Background(), "task-2", "fm-task-2", "fm-task-2", EPComplete, []byte(`{"result":"ok"}`), ""); err != nil {
+	if err := p.Enqueue(context.Background(), "task-2", "fm-task-2", "fm-task-2", "", EPComplete, []byte(`{"result":"ok"}`), ""); err != nil {
 		t.Fatalf("Enqueue after the listing recovered: %v", err)
 	}
 	if got := p.Len(); got != 2 {
@@ -811,11 +816,11 @@ func TestUnrebuiltCarrierBacklogRefusesNewEntries(t *testing.T) {
 	}
 
 	// A held task is a replacement: capacity is not judged for it.
-	if err := p.Enqueue(context.Background(), "held", "fm-held", "fm-held", EPFail, []byte(`{"v":2}`), ""); err != nil {
+	if err := p.Enqueue(context.Background(), "held", "fm-held", "fm-held", "", EPFail, []byte(`{"v":2}`), ""); err != nil {
 		t.Fatalf("re-enqueue while the backlog is unknown: %v", err)
 	}
 	// A new task is refused: the backlog could already fill the bound.
-	err = p.Enqueue(context.Background(), "task-new", "fm-task-new", "fm-task-new", EPComplete, []byte(`{}`), "")
+	err = p.Enqueue(context.Background(), "task-new", "fm-task-new", "fm-task-new", "", EPComplete, []byte(`{}`), "")
 	if !errors.Is(err, ErrPendingQueueFull) {
 		t.Fatalf("Enqueue while the backlog is unknown = %v, want ErrPendingQueueFull", err)
 	}
@@ -834,7 +839,7 @@ func TestUnrebuiltCarrierBacklogRefusesNewEntries(t *testing.T) {
 	if got := p.Len(); got != 1 {
 		t.Fatalf("depth after the rebuild = %d, want the held entry only", got)
 	}
-	if err := p.Enqueue(context.Background(), "task-new", "fm-task-new", "fm-task-new", EPComplete, []byte(`{}`), ""); err != nil {
+	if err := p.Enqueue(context.Background(), "task-new", "fm-task-new", "fm-task-new", "", EPComplete, []byte(`{}`), ""); err != nil {
 		t.Fatalf("Enqueue after the rebuild: %v", err)
 	}
 }

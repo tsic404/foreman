@@ -60,17 +60,48 @@ func (s *FakeServer) registerProbe(w http.ResponseWriter, r *http.Request, claim
 		return
 	}
 	first := probeServedRuntime(req.Runtimes)
+	workspaceID := req.WorkspaceID
+	if workspaceID == "" {
+		workspaceID = claims.WorkspaceID
+	}
+	client := s.clientFor(workspaceID)
+	if client == nil {
+		writeError(w, http.StatusForbidden, "workspace is not configured")
+		return
+	}
+	if session.WorkspaceID != "" && session.WorkspaceID != workspaceID {
+		// A workspace-pinned probe (catalog) registers only for its own
+		// workspace; a startup / discovery probe may register for any
+		// configured one (§1.2).
+		writeError(w, http.StatusForbidden, "probe does not serve this workspace")
+		return
+	}
 	now := time.Now()
 	updated, _ := s.probes.UpdateProbe(claims.JobName, func(session *registry.ProbeSession) {
 		if !session.CapturesRegistration() {
 			return
 		}
 		// Startup and registration-discovery probes only: this registration
-		// body is C1's truth.
-		session.RegisteredAt = now
-		session.CLIVersion = req.CLIVersion
-		session.Runtimes = discoveredRuntimes(req.Runtimes)
-		session.FailedProfiles = req.FailedProfiles
+		// body is C1's truth, captured per workspace because one probe may
+		// register to several (§1.2).
+		registration := registry.ProbeRegistration{
+			RegisteredAt:   now,
+			CLIVersion:     req.CLIVersion,
+			Runtimes:       discoveredRuntimes(req.Runtimes),
+			FailedProfiles: req.FailedProfiles,
+		}
+		if session.Registrations == nil {
+			session.Registrations = map[string]registry.ProbeRegistration{}
+		}
+		session.Registrations[workspaceID] = registration
+		if session.RegisteredAt.IsZero() {
+			// The first registration is the completion signal; the mirrored
+			// fields keep the single-workspace readers working.
+			session.RegisteredAt = now
+			session.CLIVersion = registration.CLIVersion
+			session.Runtimes = registration.Runtimes
+			session.FailedProfiles = registration.FailedProfiles
+		}
 	})
 	if updated.RegisteredAt.IsZero() && session.CapturesRegistration() {
 		writeError(w, http.StatusUnauthorized, "unknown probe session")
@@ -78,10 +109,10 @@ func (s *FakeServer) registerProbe(w http.ResponseWriter, r *http.Request, claim
 	}
 	s.log.Info("daemon.registered",
 		"job_name", claims.JobName, "daemon_id", claims.JobName,
-		"job_runtime_id", session.JobRuntime, "probe", true,
+		"workspace_id", workspaceID, "job_runtime_id", session.JobRuntime, "probe", true,
 		"remote_addr", r.RemoteAddr)
 
-	repos := s.client.WorkspaceState()
+	repos := client.WorkspaceState()
 	respBody := workspaceStateResponse(repos)
 	answer := map[string]any{
 		"id":         session.JobRuntime,
@@ -200,7 +231,13 @@ func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusConflict, "no runtime declared")
 			return
 		}
-		s.client.stageStartupCatalog(provider, profileID, body)
+		workspaceID := session.WorkspaceID
+		if workspaceID == "" {
+			workspaceID = claims.WorkspaceID
+		}
+		if client := s.clientFor(workspaceID); client != nil {
+			client.stageStartupCatalog(provider, profileID, body)
+		}
 		s.probes.UpdateProbe(claims.JobName, func(probe *registry.ProbeSession) {
 			probe.RelayedAt = now
 			probe.RelayedCode = http.StatusOK
@@ -211,7 +248,12 @@ func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 		// The relay retries transport errors and 5xx with C-21's backoff,
 		// bounded by the probe's own budget (the consumption-to-answer window);
 		// a 4xx is the upstream's verdict and goes back as it is.
-		status, resp, err := relayCatalog(r.Context(), s.client, session.RealRuntimeID, req, body, session.Deadline, s.log)
+		client := s.clientFor(session.WorkspaceID)
+		if client == nil {
+			writeError(w, http.StatusForbidden, "workspace is not configured")
+			return
+		}
+		status, resp, err := relayCatalog(r.Context(), client, session.RealRuntimeID, req, body, session.Deadline, s.log)
 		code := status
 		if err != nil {
 			s.log.Error("model catalog relay exhausted", "job_name", claims.JobName, "err", err)

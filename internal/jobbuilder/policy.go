@@ -95,9 +95,10 @@ type NameResolution struct {
 // startup continues (the documented degradation).
 type PolicyNameResolver interface {
 	// ResolveName reports what the platform's authority says about a policy
-	// key. An error means unreachable or no such query — the caller maps it to
-	// unavailable; it never becomes a startup refusal.
-	ResolveName(ctx context.Context, kind, name string) (NameResolution, error)
+	// key of one workspace. An error means unreachable or no such query — the
+	// caller maps it to unavailable; it never becomes a startup refusal. An
+	// empty workspaceID is the legacy flat-form lookup.
+	ResolveName(ctx context.Context, workspaceID, kind, name string) (NameResolution, error)
 }
 
 // Axis sources: the evaluation outcome of one axis
@@ -132,6 +133,23 @@ type Policy struct {
 	agents       map[string]agentEntry
 	projects     map[string]projectEntry
 	projectsByID map[string]projectEntry
+	// byWorkspace is the partitioned form. When it is non-nil, a task reads
+	// only its own workspace's subset; a workspace with no entry reads as an
+	// empty table (no definition on any axis), never another workspace's.
+	byWorkspace map[string]*Policy
+}
+
+// forWorkspace selects the table a task's workspace reads (§8.5: definitions
+// are keyed by workspace × name and never cross the partition). A legacy flat
+// table has no partition and answers every caller.
+func (p *Policy) forWorkspace(workspaceID string) *Policy {
+	if p.byWorkspace == nil {
+		return p
+	}
+	if sub, ok := p.byWorkspace[workspaceID]; ok {
+		return sub
+	}
+	return &Policy{agents: map[string]agentEntry{}, projects: map[string]projectEntry{}}
 }
 
 // agentEntry is one agent's row: the three tiers plus that agent's own
@@ -221,6 +239,16 @@ func (ev Evaluation) writtenFaces() []string {
 // a misspelled axis or definition field — are refused, so a policy that does not
 // mean what it says never loads.
 type filePolicy struct {
+	// Workspaces is the partitioned form (§8.5 键空间 = workspace × 名字):
+	// each workspace carries its own two sections. The flat sections below
+	// stay the legal single-workspace form.
+	Workspaces map[string]filePolicySections `json:"workspaces"`
+	Agents     map[string]fileAgent          `json:"agents"`
+	Projects   map[string]fileProject        `json:"projects"`
+}
+
+// filePolicySections is one workspace's partition of the policy table.
+type filePolicySections struct {
 	Agents   map[string]fileAgent   `json:"agents"`
 	Projects map[string]fileProject `json:"projects"`
 }
@@ -289,7 +317,7 @@ func LoadPolicy(cfg Config) (Policy, error) {
 			"policy", path, "err", err.Error(), "declaration", policyEffectStatement)
 		return Policy{}, fmt.Errorf("%w: %v", ErrInvalidPolicy, err)
 	}
-	policy, err := buildPolicy(file)
+	policy, err := buildPolicy(cfg, file)
 	if err != nil {
 		log.Error("job policy rejected: refusing to start",
 			"policy", path, "err", err.Error(), "declaration", policyEffectStatement)
@@ -333,12 +361,40 @@ func parsePolicyFile(path string, data []byte) (filePolicy, error) {
 // buildPolicy validates the decoded file and freezes it into the read-only
 // Policy: tiers spell the four documented literals, resource quantities parse,
 // capability names are non-empty, and no definition rewrites drop.
-func buildPolicy(file filePolicy) (Policy, error) {
-	policy := Policy{
-		agents:   make(map[string]agentEntry, len(file.Agents)),
-		projects: make(map[string]projectEntry, len(file.Projects)),
+func buildPolicy(cfg Config, file filePolicy) (Policy, error) {
+	flat := len(file.Agents) > 0 || len(file.Projects) > 0
+	if len(file.Workspaces) > 0 {
+		if flat {
+			return Policy{}, fmt.Errorf("%w: flat agents/projects and workspaces sections are mutually exclusive", ErrInvalidPolicy)
+		}
+		policy := Policy{byWorkspace: make(map[string]*Policy, len(file.Workspaces))}
+		for workspaceID, sections := range file.Workspaces {
+			if strings.TrimSpace(workspaceID) == "" {
+				return Policy{}, fmt.Errorf("%w: a workspaces key is empty", ErrInvalidPolicy)
+			}
+			sub, err := buildPolicySections(sections)
+			if err != nil {
+				return Policy{}, fmt.Errorf("workspace %s: %w", workspaceID, err)
+			}
+			policy.byWorkspace[workspaceID] = &sub
+		}
+		return policy, nil
 	}
-	for name, row := range file.Projects {
+	if len(cfg.WorkspaceIDs) > 1 && flat {
+		return Policy{}, fmt.Errorf("%w: flat agents/projects sections are the single-workspace form; partition them under workspaces (configured: %s)",
+			ErrInvalidPolicy, strings.Join(cfg.WorkspaceIDs, ","))
+	}
+	return buildPolicySections(filePolicySections{Agents: file.Agents, Projects: file.Projects})
+}
+
+// buildPolicySections freezes one table (one workspace's, or the legacy flat
+// form's).
+func buildPolicySections(sections filePolicySections) (Policy, error) {
+	policy := Policy{
+		agents:   make(map[string]agentEntry, len(sections.Agents)),
+		projects: make(map[string]projectEntry, len(sections.Projects)),
+	}
+	for name, row := range sections.Projects {
 		if name == "" {
 			return Policy{}, fmt.Errorf("%w: a projects key is empty", ErrInvalidPolicy)
 		}
@@ -348,7 +404,7 @@ func buildPolicy(file filePolicy) (Policy, error) {
 		}
 		policy.projects[name] = entry
 	}
-	for name, row := range file.Agents {
+	for name, row := range sections.Agents {
 		if name == "" {
 			return Policy{}, fmt.Errorf("%w: an agents key is empty", ErrInvalidPolicy)
 		}
@@ -493,6 +549,21 @@ func parseCapabilities(field string, raw *fileCapabilities) (*capabilityDefiniti
 // definition, with no fallback to name matching. Nothing is cached or
 // refreshed.
 func resolvePolicyNames(cfg Config, policy *Policy, log logger) error {
+	if policy.byWorkspace != nil {
+		for workspaceID, sub := range policy.byWorkspace {
+			if err := resolvePolicyNamesFor(cfg, workspaceID, sub, log); err != nil {
+				return fmt.Errorf("workspace %s: %w", workspaceID, err)
+			}
+			policy.byWorkspace[workspaceID] = sub
+		}
+		return nil
+	}
+	return resolvePolicyNamesFor(cfg, "", policy, log)
+}
+
+// resolvePolicyNamesFor resolves one table's keys with that table's workspace
+// credential scope (§8.5: 解析按 workspace 逐套执行).
+func resolvePolicyNamesFor(cfg Config, workspaceID string, policy *Policy, log logger) error {
 	keys := sortedPolicyKeys(*policy)
 	if len(keys) == 0 {
 		return nil
@@ -503,7 +574,7 @@ func resolvePolicyNames(cfg Config, policy *Policy, log logger) error {
 	resolvedProjects := make(map[string]projectEntry, len(policy.projects))
 	owners := make(map[string]string, len(policy.projects))
 	for _, key := range keys {
-		resolution, err := resolveOneName(cfg, resolver, deadline, key)
+		resolution, err := resolveOneName(cfg, workspaceID, resolver, deadline, key)
 		conclusion := resolution.Conclusion
 		// A resolved project key without an identifier cannot be matched at
 		// runtime; it is a malformed platform answer, which reads as the
@@ -512,7 +583,7 @@ func resolvePolicyNames(cfg Config, policy *Policy, log logger) error {
 			conclusion = NameUnavailable
 		}
 		cfg.metrics().PolicyNameResolution(string(conclusion))
-		fields := []any{"kind", key.kind, "name", key.name, "conclusion", string(conclusion)}
+		fields := []any{"workspace_id", workspaceID, "kind", key.kind, "name", key.name, "conclusion", string(conclusion)}
 		if conclusion == NameResolved {
 			log.Info("policy.name_resolution", fields...)
 		} else {
@@ -576,7 +647,7 @@ func sortedPolicyKeys(policy Policy) []policyKey {
 // resolveOneName resolves one key inside the batch window; a nil resolver (no
 // platform query, or a window already exhausted) concludes unavailable without
 // an error.
-func resolveOneName(cfg Config, resolver PolicyNameResolver, deadline time.Time, key policyKey) (NameResolution, error) {
+func resolveOneName(cfg Config, workspaceID string, resolver PolicyNameResolver, deadline time.Time, key policyKey) (NameResolution, error) {
 	if resolver == nil {
 		return NameResolution{Conclusion: NameUnavailable}, nil
 	}
@@ -586,7 +657,7 @@ func resolveOneName(cfg Config, resolver PolicyNameResolver, deadline time.Time,
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), remaining)
 	defer cancel()
-	resolution, err := resolver.ResolveName(ctx, key.kind, key.name)
+	resolution, err := resolver.ResolveName(ctx, workspaceID, key.kind, key.name)
 	if err != nil {
 		cfg.logger().Warn("policy name resolution unavailable",
 			"kind", key.kind, "name", key.name, "err", err.Error())
@@ -603,6 +674,23 @@ func resolveOneName(cfg Config, resolver PolicyNameResolver, deadline time.Time,
 // logDeadDefinitions warns about definitions no policy references (ADR-035
 // decision 8/3): visible, never blocking.
 func logDeadDefinitions(policy Policy, log logger) {
+	if policy.byWorkspace != nil {
+		for workspaceID, sub := range policy.byWorkspace {
+			if sub == nil {
+				continue
+			}
+			before := len(sub.agents) + len(sub.projects)
+			if before == 0 {
+				continue
+			}
+			logDeadDefinitionsFor(workspaceID, *sub, log)
+		}
+		return
+	}
+	logDeadDefinitionsFor("", policy, log)
+}
+
+func logDeadDefinitionsFor(workspaceID string, policy Policy, log logger) {
 	var dead []string
 	for name, entry := range policy.agents {
 		if !reachesAgentDefinition(entry.resourcePolicy) && !entry.resources.empty() {
@@ -632,7 +720,7 @@ func logDeadDefinitions(policy Policy, log logger) {
 	}
 	sort.Strings(dead)
 	log.Warn("job policy carries definitions no axis references",
-		"dead_definitions", strings.Join(dead, ","))
+		"workspace_id", workspaceID, "dead_definitions", strings.Join(dead, ","))
 }
 
 // reachesAgentDefinition reports whether a tier can read the agent's own
@@ -663,8 +751,9 @@ func reachesProjectDefinition(policy Policy) bool {
 // process whose platform resolution was unavailable) reads as no definition
 // for the project side; the name is never compared at runtime.
 func (p Policy) Evaluate(e TaskEntry) Evaluation {
-	agent, agentListed := p.agents[e.AgentName]
-	project := p.projectsByID[e.ProjectID]
+	table := p.forWorkspace(e.WorkspaceID)
+	agent, agentListed := table.agents[e.AgentName]
+	project := table.projectsByID[e.ProjectID]
 
 	ev := Evaluation{
 		projectSource: e.ProjectSource,
@@ -1054,7 +1143,8 @@ func injectCapabilities(container *corev1.Container, add []string) {
 // table declares nothing, so the reverse lookup stays out of the claim path
 // entirely (ADR-048 decision 4: 反查只在需要时发生).
 func (b *Builder) RequiresProjectIdentity(e TaskEntry) bool {
-	agent, listed := b.policy.agents[e.AgentName]
+	table := b.policy.forWorkspace(e.WorkspaceID)
+	agent, listed := table.agents[e.AgentName]
 	if !listed {
 		return false
 	}

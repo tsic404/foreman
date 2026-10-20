@@ -71,9 +71,10 @@ type TokenIssuer interface {
 // NodeIndex exposes the registry's session index and per-node load markers;
 // it backs the soft node-reuse affinity (FOREMAN_PREFER_NODE_REUSE).
 type NodeIndex interface {
-	// LastNodeForSession reports the node a session key was learned on
-	// ("" when unknown); the key is a normalized session key (§4.5).
-	LastNodeForSession(key string) string
+	// LastNodeForSession reports the node a (workspace, session key) pair was
+	// learned on ("" when unknown); the key is a normalized session key (§4.5)
+	// and the index is workspace-partitioned.
+	LastNodeForSession(workspaceID, key string) string
 	// Saturated reports whether the node currently sits at or over the
 	// per-node soft cap (FOREMAN_MAX_JOBS_PER_NODE, ADR-006 节流). A
 	// saturated node drops out of the candidate set of the next Job, so the
@@ -279,14 +280,16 @@ func (b *Builder) applyWrites(job *batchv1.Job, name, daemonID string, e TaskEnt
 
 	job.Labels = setKeys(job.Labels, b.identityLabels(e))
 	job.Annotations = setKeys(job.Annotations, b.identityAnnotations(daemonID, e))
-	// Pod side: the three A1.2 labels (app name, task id, daemon id) — no
+	// Pod side: app name, task id, daemon id and the workspace identity — no
 	// annotations, no managed-by (§4.3 lists Jobs, never pods). The
 	// daemon-id label is what MULTICA_DAEMON_ID's fieldRef reads, so it is
-	// Foreman's own write and never the template's (ADR-034 decision 8).
+	// Foreman's own write and never the template's (ADR-034 decision 8); the
+	// workspace label is the pod's own identity (AC-88).
 	job.Spec.Template.Labels = setKeys(job.Spec.Template.Labels, map[string]string{
-		labelAppName:  jobAppName,
-		labelTaskID:   e.TaskID,
-		labelDaemonID: daemonID,
+		labelAppName:     jobAppName,
+		labelTaskID:      e.TaskID,
+		labelDaemonID:    daemonID,
+		labelWorkspaceID: e.WorkspaceID,
 	})
 }
 
@@ -386,7 +389,7 @@ func (b *Builder) preferredNode(e TaskEntry, policyInjected bool) (string, strin
 	if key == "" {
 		return "", SuppressionNone
 	}
-	node := b.cfg.Nodes.LastNodeForSession(key)
+	node := b.cfg.Nodes.LastNodeForSession(e.WorkspaceID, key)
 	if node == "" {
 		return "", SuppressionNone
 	}

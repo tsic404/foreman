@@ -54,7 +54,7 @@ func TestTechAuth02CrossTaskAndExpiredTokens(t *testing.T) {
 	if _, ok := h.reg.Get(taskA); ok {
 		t.Fatalf("entry %s survived the credential reclaim", taskA)
 	}
-	if !h.reg.IsDone(taskA) {
+	if !h.reg.IsDone("ws-1", taskA) {
 		t.Fatalf("done index lost %s", taskA)
 	}
 

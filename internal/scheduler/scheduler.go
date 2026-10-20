@@ -416,13 +416,76 @@ func (s *Scheduler) ClaimBudget() int {
 	return min(free, s.cfg.ClaimBatchMax)
 }
 
+// ClaimBudgetFor is one workspace identity's claim budget (§10 两级预算):
+// the smaller of the global free slots and that workspace's own free slots.
+// A cap of zero leaves the workspace term out (the global cap alone applies).
+// The budget never subtracts another workspace's load from this one: a
+// workspace's flood cannot stop another's claims.
+func (s *Scheduler) ClaimBudgetFor(workspaceID string) int {
+	free := s.cfg.MaxInflightJobs - s.reg.Inflight()
+	if s.cfg.MaxInflightJobsPerWorkspace > 0 {
+		if workspaceFree := s.cfg.MaxInflightJobsPerWorkspace - s.reg.InflightFor(workspaceID); workspaceFree < free {
+			free = workspaceFree
+		}
+	}
+	if free < 0 {
+		free = 0
+	}
+	return min(free, s.cfg.ClaimBatchMax)
+}
+
+// workspaceConfigured reports whether workspaceID is part of this
+// deployment's served set. An empty label reads as the legacy single
+// workspace when exactly one is configured; otherwise it is foreign.
+func (s *Scheduler) workspaceConfigured(workspaceID string) bool {
+	ids := s.WorkspaceIDs()
+	if workspaceID == "" {
+		return len(ids) <= 1
+	}
+	for _, id := range ids {
+		if id == workspaceID {
+			return true
+		}
+	}
+	return false
+}
+
+// workspaceTaskKey is the (workspace, task) composite used by the
+// cross-object presence checks.
+func workspaceTaskKey(workspaceID, taskID string) string {
+	return workspaceID + "\x00" + taskID
+}
+
+// WorkspaceIDs returns the configured workspace set in configuration order.
+func (s *Scheduler) WorkspaceIDs() []string {
+	if len(s.cfg.Workspaces) > 0 {
+		return append([]string(nil), s.cfg.Workspaces...)
+	}
+	if s.cfg.WorkspaceID != "" {
+		return []string{s.cfg.WorkspaceID}
+	}
+	return nil
+}
+
 // SyncInflight re-derives foreman_inflight_jobs from the live index. The
 // gauge is defined as Registry.Inflight() (§9.2), so it is
 // a derived value, never an independently updated one: every settlement path
 // re-derives it on exit, and recovery's ticker repeats it every interval.
 // That bound is the ticker's, not the round's — a round can sit in its own
 // I/O (terminal-report retry budgets, object deletes) for minutes.
-func (s *Scheduler) SyncInflight() { s.metrics.InflightJobs(s.reg.Inflight()) }
+func (s *Scheduler) SyncInflight() {
+	s.metrics.InflightJobs(s.reg.Inflight())
+	// The per-workspace series is the two-level budget's observable face
+	// (§10); the optional interface keeps older metrics implementations
+	// (tests) compiling.
+	if workspaceMetrics, ok := s.metrics.(interface {
+		InflightJobsWorkspace(workspaceID string, n int)
+	}); ok {
+		for _, workspaceID := range s.WorkspaceIDs() {
+			workspaceMetrics.InflightJobsWorkspace(workspaceID, s.reg.InflightFor(workspaceID))
+		}
+	}
+}
 
 // RefreshNodeSaturation recomputes the per-node soft cap
 // (FOREMAN_MAX_JOBS_PER_NODE, ADR-006 §决策结果 3) from the live index and
@@ -497,13 +560,21 @@ func (s *Scheduler) createSteps(ctx context.Context, e registry.TaskEntry) func(
 // never a payload or a credential.
 func (s *Scheduler) logJobCreateFailed(ctx context.Context, e registry.TaskEntry, phase string, cause error) {
 	s.log.ErrorContext(ctx, "job.create_failed",
-		"task_id", e.TaskID, "job_name", e.JobName, "phase", phase, "err", cause.Error())
+		"task_id", e.TaskID, "job_name", e.JobName, "workspace_id", e.WorkspaceID,
+		"phase", phase, "err", cause.Error())
 }
 
-// OnClaim registers a freshly claimed task and creates its Secret + Job
-// (pending → job_created). A task the registry already knows goes through
-// the duplicate-claim rule; no second Job is ever created concurrently.
+// OnClaim registers a freshly claimed task (single-workspace form: the
+// workspace comes from the payload).
 func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
+	return s.OnClaimFor(ctx, "", task)
+}
+
+// OnClaimFor registers a task claimed under one workspace identity. The claim
+// identity is authoritative: a payload naming another workspace is refused
+// (a cross-workspace claim must never produce an entry, AC-81). An empty
+// workspaceID keeps the legacy payload-derived form.
+func (s *Scheduler) OnClaimFor(ctx context.Context, workspaceID string, task json.RawMessage) error {
 	defer s.SyncInflight()
 	var head claimHead
 	if err := json.Unmarshal(task, &head); err != nil {
@@ -521,6 +592,16 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 		s.noteUnnameableClaim(ctx, err, len(task))
 		return fmt.Errorf("%w: %v", ErrUnnameableClaim, err)
 	}
+	workspace := workspaceID
+	if workspace == "" {
+		workspace = head.WorkspaceID
+	} else if head.WorkspaceID != "" && head.WorkspaceID != workspace {
+		s.metrics.ClaimError("workspace_mismatch")
+		s.log.ErrorContext(ctx, "claim rejected: payload workspace does not match the claiming identity",
+			"task_id", head.ID, "claim_workspace", workspace, "payload_workspace", head.WorkspaceID)
+		return fmt.Errorf("claim workspace %q does not match payload workspace %q", workspace, head.WorkspaceID)
+	}
+	head.WorkspaceID = workspace
 	unlock := s.taskMu.Lock(head.ID)
 	defer unlock()
 
@@ -531,7 +612,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 			return err
 		}
 		attempt = priorAttempt + 1
-	} else if s.reg.IsDone(head.ID) {
+	} else if s.reg.IsDone(workspace, head.ID) {
 		// The task settled within the done window yet the server re-dispatched
 		// it: re-executing would double-run it (invariant 4). The terminal
 		// report retry belongs to the pending-report queue.
@@ -612,6 +693,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	}
 	s.log.InfoContext(ctx, "task.claimed",
 		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+		"workspace_id", e.WorkspaceID,
 		"issue_identifier", e.IssueIdentifier,
 		"autopilot_run_id", e.AutopilotRunID, "chat_session_id", e.ChatSessionID,
 		"agent_id", e.AgentID)
@@ -706,6 +788,7 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 	s.metrics.JobCreateSeconds(placedAt.Sub(e.ClaimedAt).Seconds())
 	s.log.InfoContext(ctx, "job.created",
 		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+		"workspace_id", e.WorkspaceID,
 		"node_name", e.NodeName, "image", jobImage(job))
 	return nil
 }
@@ -913,6 +996,7 @@ func (s *Scheduler) Deliver(daemonID string, runtimeID string, maxTasks int) ([]
 	s.reg.SetRuntimeDeliveredTask(e.JobRuntimeID, e.TaskID)
 	s.log.Info("task.delivered",
 		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+		"workspace_id", e.WorkspaceID,
 		"deliver_latency_ms", now.Sub(e.ClaimedAt).Milliseconds())
 	if e.Deliveries > 1 {
 		// The window's exit (ADR-032): the delivery committed at
@@ -1087,6 +1171,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 				s.metrics.TaskTerminal(string(result))
 				s.log.InfoContext(ctx, "task.terminal",
 					"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+					"workspace_id", e.WorkspaceID,
 					"result", string(result),
 					"duration_seconds", now.Sub(e.ClaimedAt).Seconds())
 				// The instance's first terminal forward decides its body:
@@ -1225,7 +1310,7 @@ var upstreamUnavailableBody = []byte(`{"error":"upstream unavailable"}`)
 // its retention bound refuses (§4.6): the queue emitted that drop's error row
 // already, so it is not repeated here.
 func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep Endpoint, failureReason string, body []byte) {
-	if err := s.pendingReports.Enqueue(ctx, e.TaskID, e.JobName, e.DaemonID, ep, body, failureReason); err != nil {
+	if err := s.pendingReports.Enqueue(ctx, e.TaskID, e.JobName, e.DaemonID, e.WorkspaceID, ep, body, failureReason); err != nil {
 		if errors.Is(err, ErrPendingQueueFull) {
 			return
 		}
@@ -1584,7 +1669,7 @@ func (s *Scheduler) settleTerminalLocked(ctx context.Context, taskID, result str
 		s.metrics.TaskTerminal(result)
 		s.log.InfoContext(ctx, "task.terminal",
 			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
-			"result", result)
+			"workspace_id", e.WorkspaceID, "result", result)
 	}
 	return s.deleteJob(ctx, e)
 }
@@ -1786,7 +1871,8 @@ func (s *Scheduler) reclaimObjectless(ctx context.Context, e registry.TaskEntry)
 	}
 	s.metrics.CredReclaimed(JobTerminationReasonNoObjects, drainSeconds)
 	s.log.InfoContext(ctx, "cred.reclaimed",
-		"task_id", e.TaskID, "job_name", e.JobName, "reason", JobTerminationReasonNoObjects,
+		"task_id", e.TaskID, "job_name", e.JobName, "workspace_id", e.WorkspaceID,
+		"reason", JobTerminationReasonNoObjects,
 		"drain_seconds", drainSeconds,
 		"pod_terminated_at", "", "pod_terminated_at_source", PodTerminatedAtSourceObserved,
 		"orphan_pods", 0)
@@ -1870,7 +1956,7 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 		podTerminatedAtField = podTerminatedAt.UTC().Format(time.RFC3339)
 	}
 	s.log.InfoContext(ctx, "cred.reclaimed",
-		"task_id", e.TaskID, "job_name", jobName, "reason", reason,
+		"task_id", e.TaskID, "job_name", jobName, "workspace_id", e.WorkspaceID, "reason", reason,
 		"drain_seconds", drainSeconds,
 		"pod_terminated_at", podTerminatedAtField,
 		"pod_terminated_at_source", source,
@@ -2031,9 +2117,14 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 	}
 	withJob := make(map[string]struct{}, len(jobs))
 	for i := range jobs {
-		if taskID := jobs[i].Labels[registry.LabelTaskID]; taskID != "" {
-			withJob[taskID] = struct{}{}
+		taskID := jobs[i].Labels[registry.LabelTaskID]
+		if taskID == "" {
+			continue
 		}
+		// The presence key carries the workspace: the same task id in two
+		// workspaces is two instances, and one must not protect the other's
+		// orphaned credential (§6.5 按 workspace 分区).
+		withJob[workspaceTaskKey(jobs[i].Labels[registry.LabelWorkspaceID], taskID)] = struct{}{}
 	}
 	var firstErr error
 	for _, secret := range secrets {
@@ -2047,13 +2138,19 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		if taskID == "" {
 			continue
 		}
+		workspaceID := secret.Labels[registry.LabelWorkspaceID]
+		if !s.workspaceConfigured(workspaceID) {
+			// An object of a workspace this deployment does not serve is
+			// outside its sweep domain (§6.5: 跨 workspace 的对象不清扫).
+			continue
+		}
 		if secret.Name != jobbuilder.CredentialSecretName(jobbuilder.DaemonIDFor(taskID)) {
 			continue
 		}
 		if _, ok := s.reg.Get(taskID); ok {
 			continue
 		}
-		if _, ok := withJob[taskID]; ok {
+		if _, ok := withJob[workspaceTaskKey(workspaceID, taskID)]; ok {
 			continue
 		}
 		if err := s.jobs.DeleteSecret(ctx, secret.Name); err != nil {
@@ -2066,7 +2163,8 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		// is no object to read a name from and the identity name is the one
 		// value the sweep can name (§9.1: cred.orphan_secret_removed).
 		s.log.InfoContext(ctx, "cred.orphan_secret_removed",
-			"task_id", taskID, "job_name", jobbuilder.DaemonIDFor(taskID), "secret", secret.Name)
+			"task_id", taskID, "workspace_id", workspaceID,
+			"job_name", jobbuilder.DaemonIDFor(taskID), "secret", secret.Name)
 	}
 	for _, secret := range secrets {
 		// Carrier domain: selected by the carrier role label ∧ managed-by.
@@ -2080,6 +2178,9 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		taskID := secret.Labels[registry.LabelTaskID]
 		if taskID == "" {
 			// No task identity: no settlement judgement, so no deletion.
+			continue
+		}
+		if !s.workspaceConfigured(secret.Labels[registry.LabelWorkspaceID]) {
 			continue
 		}
 		if s.pendingReports.Queued(taskID) {
@@ -2333,7 +2434,7 @@ func (s *Scheduler) settleMalformedClaim(ctx context.Context, id string, task js
 		}
 		return nil
 	}
-	if s.reg.IsDone(id) {
+	if s.reg.IsDoneAny(id) {
 		s.metrics.DuplicateDispatch()
 		s.log.WarnContext(ctx, "duplicate_dispatch",
 			"task_id", id, "old_job_name", "", "action", "drop_terminal_done")
@@ -2432,13 +2533,21 @@ func (s *Scheduler) RestorePendingReports(ctx context.Context) error {
 // 2xx deletes the Job. It is the sender the queue's Drain calls, so a replay
 // is never an inbound report — it does not enter the attribution gate and
 // cannot emit a second attribution decision.
-func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID string, body []byte, failureReason string) (int, []byte, error) {
+func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, workspaceID string, body []byte, failureReason string) (int, []byte, error) {
 	e, ok := s.reg.Get(taskID)
 	if !ok {
 		// The credential was reclaimed before the report landed: the entry is
 		// gone, but the report still goes — a terminal callback is never
-		// dropped (§10). No objects are left to clean up.
-		code, resp, err := s.server.Forward(ctx, ep, taskID, body)
+		// dropped (§10). No objects are left to clean up. The queue entry's
+		// workspace is the only routing key left; an empty one is the
+		// single-workspace shape the pre-ADR-047 callers pass.
+		forward := s.server.Forward
+		if workspaceID != "" {
+			forward = func(ctx context.Context, ep Endpoint, taskID string, body []byte) (int, []byte, error) {
+				return s.server.ForwardInWorkspace(ctx, ep, taskID, workspaceID, body)
+			}
+		}
+		code, resp, err := forward(ctx, ep, taskID, body)
 		if err == nil && ep.IsTerminal() && permanentTerminalRejection(code) {
 			// A replay of a permanently refused report would only be refused
 			// again: the queue entry goes now instead of at the TTL.

@@ -63,6 +63,7 @@ data:
             app.kubernetes.io/name: foreman-job
             foreman.tsic.top/task-id: "<task_id>"
             foreman.tsic.top/daemon-id: "fm-<task_id>"
+            foreman.tsic.top/workspace-id: "<workspace_id>"
         spec:
           restartPolicy: Never
           terminationGracePeriodSeconds: 30
@@ -192,8 +193,12 @@ data:
                 - { name: tmp,        mountPath: /tmp }
                 - { name: agent-bin,  mountPath: /usr/local/bin/omp, subPath: omp, readOnly: true }
           volumes:
+            # Node-side agent state is partitioned per workspace (§8.8): the
+            # placeholder is the Job's workspace, so two workspaces on one
+            # node never share profiles, sessions or memory — and the gc
+            # rounds judge each workspace's tree independently.
             - name: home
-              hostPath: { path: /var/lib/foreman/home, type: DirectoryOrCreate }
+              hostPath: { path: /var/lib/foreman/home/<workspace_id>, type: DirectoryOrCreate }
             - name: workspaces
               hostPath: { path: /var/lib/foreman/workspaces, type: DirectoryOrCreate }
             - name: tmp

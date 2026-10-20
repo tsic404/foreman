@@ -59,23 +59,31 @@ type JobLookup interface {
 	ByDaemon(daemonID string) (JobEntry, bool)
 }
 
-// JobEntry is the subset of a registry entry that Verify needs.
+// JobEntry is the subset of a registry entry that Verify needs. WorkspaceID
+// is part of the resource adjudication: a token only ever addresses entries of
+// its own workspace (§2.1).
 type JobEntry struct {
 	JobRuntimeID string
+	WorkspaceID  string
 }
 
 // DoneIndex reports tasks that reached terminal state within the retention
-// window (24h); it backs the late-replay idempotent path.
+// window (24h); it backs the late-replay idempotent path. The workspace is
+// part of the key: the same task id in another workspace is a different task
+// (§4.1).
 type DoneIndex interface {
-	IsDone(taskID string) bool
+	IsDone(workspaceID, taskID string) bool
 }
 
-// ProbeEntry is the subset of a probe session that Verify needs.
+// ProbeEntry is the subset of a probe session that Verify needs. WorkspaceID
+// is empty for startup / registration-discovery probes, whose registration
+// scope spans every configured workspace (§1.2).
 type ProbeEntry struct {
 	JobRuntime   string
 	RequestID    string
 	SelfMintedID string
 	TokenHash    string
+	WorkspaceID  string
 }
 
 // ProbeLookup is the auth module's read view of the probe session table, the
@@ -236,6 +244,12 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 		if session.TokenHash != "" && i.Hash(token) != session.TokenHash {
 			return Claims{}, ErrRevoked
 		}
+		// A workspace-pinned probe (a catalog probe) only answers for its own
+		// workspace; startup / discovery probes carry no pin and span the
+		// configured set (§6.3).
+		if session.WorkspaceID != "" && session.WorkspaceID != payload.WorkspaceID {
+			return Claims{}, fmt.Errorf("%w: workspace %s", ErrScopeMismatch, payload.WorkspaceID)
+		}
 		claims.Role = RoleCatalogProbe
 		// The probe has no task face at all: any {tid} on the path is out of
 		// scope, never a resource to adjudicate (§6.3 作用域行). Without
@@ -255,7 +269,7 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 	}
 	entry, ok := i.jobs.ByDaemon(payload.JobName)
 	if !ok {
-		if i.done.IsDone(payload.TaskID) && req.IsTerminalEndpoint {
+		if i.done.IsDone(payload.WorkspaceID, payload.TaskID) && req.IsTerminalEndpoint {
 			// The replay is idempotent only for the token's own task: the
 			// done index proves that task settled, never that the request
 			// addresses it (§2.1 rule 1). Without this check any settled
@@ -268,6 +282,12 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 			return claims, nil
 		}
 		return Claims{}, fmt.Errorf("%w: %s", ErrUnknownJob, payload.JobName)
+	}
+	// 4b. The token's workspace must equal the entry's: a Job Token of one
+	// workspace addressing another workspace's task is the cross-workspace
+	// impersonation case (§2.1, AC-82).
+	if entry.WorkspaceID != payload.WorkspaceID {
+		return Claims{}, fmt.Errorf("%w: workspace %s", ErrScopeMismatch, payload.WorkspaceID)
 	}
 	// 5. Revocation set — reachable only while the entry exists, which is
 	// exactly the same-name reuse face (a re-dispatched task or a rebuilt Job

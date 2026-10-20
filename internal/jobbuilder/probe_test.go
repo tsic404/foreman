@@ -138,11 +138,12 @@ func TestBuildCatalogProbeTemplateRender(t *testing.T) {
 		t.Error("probe Job kept the template's task-id label")
 	}
 	wantLabels := map[string]string{
-		"app.kubernetes.io/name":       "foreman-job",
-		"app.kubernetes.io/managed-by": "foreman",
-		"foreman.tsic.top/role":        "catalog-probe",
-		"foreman.tsic.top/daemon-id":   testProbeName,
-		"cost-center":                  "platform",
+		"app.kubernetes.io/name":        "foreman-job",
+		"app.kubernetes.io/managed-by":  "foreman",
+		"foreman.tsic.top/role":         "catalog-probe",
+		"foreman.tsic.top/daemon-id":    testProbeName,
+		"foreman.tsic.top/workspace-id": testWorkspaceID,
+		"cost-center":                   "platform",
 	}
 	if len(job.Labels) != len(wantLabels) {
 		t.Fatalf("job labels = %v, want exactly %v", job.Labels, wantLabels)

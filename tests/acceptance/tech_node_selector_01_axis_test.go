@@ -190,7 +190,7 @@ func TestNodeSelector01Axis(t *testing.T) {
 		h := newHarness(t, false)
 		h.useRealBuilderWithTemplate(t, plainTemplate)
 		tcPrepareRuntimes(t, h)
-		h.reg.LearnSession(registry.SessionKey("sessions/sess-1"), "node-a")
+		h.reg.LearnSession("ws-1", registry.SessionKey("sessions/sess-1"), "node-a")
 		body := tcBaseClaim("task-1")
 		body.PriorSessionID = "sessions/sess-1"
 		tcClaimOnClaim(t, h, body)
@@ -215,7 +215,7 @@ func TestNodeSelector01Axis(t *testing.T) {
 		hit := newHarness(t, false)
 		hit.useRealBuilderWithPolicy(t, hitTemplate, policyPath, nil)
 		tcPrepareRuntimes(t, hit)
-		hit.reg.LearnSession(registry.SessionKey("sessions/sess-1"), "node-a")
+		hit.reg.LearnSession("ws-1", registry.SessionKey("sessions/sess-1"), "node-a")
 		hitBody := tcBaseClaim("task-1")
 		hitBody.PriorSessionID = "sessions/sess-1"
 		tcClaimOnClaim(t, hit, hitBody)

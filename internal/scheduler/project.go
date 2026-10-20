@@ -24,11 +24,11 @@ type ProjectIdentity interface {
 	// project_* prompt-context fields — title and description are not the
 	// identity.
 	FromPayload(task json.RawMessage) string
-	// ByIssue performs the read-only identity query for one issue id. One
-	// attempt, no retry: an error (unreachable, timeout, no such query) is the
-	// caller's signal to record project.lookup_failed and continue with no
-	// identity.
-	ByIssue(ctx context.Context, issueID string) (string, error)
+	// ByIssue performs the read-only identity query for one issue id, with
+	// the Job's workspace credential (§4.1 多 workspace 口径). One attempt, no
+	// retry: an error (unreachable, timeout, no such query) is the caller's
+	// signal to record project.lookup_failed and continue with no identity.
+	ByIssue(ctx context.Context, workspaceID, issueID string) (string, error)
 }
 
 // projectCacheTTL is the short TTL of the issue-id lookup cache (ADR-048
@@ -50,24 +50,31 @@ type projectCacheEntry struct {
 }
 
 // get returns the cached identifier and whether the entry is still fresh. A
-// cached empty identifier is a fresh negative answer, not a miss.
-func (c *projectCache) get(issueID string, now time.Time) (string, bool) {
+// cached empty identifier is a fresh negative answer, not a miss. The key
+// carries the workspace: the same issue id resolves independently per
+// workspace (§4.1).
+func (c *projectCache) get(workspaceID, issueID string, now time.Time) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entry, ok := c.entries[issueID]
+	entry, ok := c.entries[projectCacheKey(workspaceID, issueID)]
 	if !ok || now.Sub(entry.cachedAt) > projectCacheTTL {
 		return "", false
 	}
 	return entry.projectID, true
 }
 
-func (c *projectCache) put(issueID, projectID string, now time.Time) {
+func (c *projectCache) put(workspaceID, issueID, projectID string, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.entries == nil {
 		c.entries = map[string]projectCacheEntry{}
 	}
-	c.entries[issueID] = projectCacheEntry{projectID: projectID, cachedAt: now}
+	c.entries[projectCacheKey(workspaceID, issueID)] = projectCacheEntry{projectID: projectID, cachedAt: now}
+}
+
+// projectCacheKey partitions the reverse-lookup cache by workspace.
+func projectCacheKey(workspaceID, issueID string) string {
+	return workspaceID + "\x00" + issueID
 }
 
 // projectIdentity resolves the project identity of one claim: the payload's
@@ -76,6 +83,7 @@ func (c *projectCache) put(issueID, projectID string, now time.Time) {
 // the task continues with the project tiers degraded (ADR-048 decision 4,
 // AC-54).
 func (s *Scheduler) projectIdentity(ctx context.Context, task json.RawMessage, head claimHead) (string, string) {
+	workspaceID := head.WorkspaceID
 	if s.cfg.Project == nil {
 		return "", jobbuilder.ProjectSourceNone
 	}
@@ -86,7 +94,7 @@ func (s *Scheduler) projectIdentity(ctx context.Context, task json.RawMessage, h
 		return "", jobbuilder.ProjectSourceNone
 	}
 	now := s.now()
-	if projectID, ok := s.project.get(head.IssueID, now); ok {
+	if projectID, ok := s.project.get(workspaceID, head.IssueID, now); ok {
 		if projectID == "" {
 			return "", jobbuilder.ProjectSourceNone
 		}
@@ -94,15 +102,15 @@ func (s *Scheduler) projectIdentity(ctx context.Context, task json.RawMessage, h
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, s.projectLookupTimeout())
 	defer cancel()
-	projectID, err := s.cfg.Project.ByIssue(lookupCtx, head.IssueID)
+	projectID, err := s.cfg.Project.ByIssue(lookupCtx, workspaceID, head.IssueID)
 	if err != nil {
 		s.log.WarnContext(ctx, "project.lookup_failed",
-			"task_id", head.ID, "issue_id", head.IssueID, "err", err.Error())
-		s.project.put(head.IssueID, "", now)
+			"task_id", head.ID, "workspace_id", workspaceID, "issue_id", head.IssueID, "err", err.Error())
+		s.project.put(workspaceID, head.IssueID, "", now)
 		return "", jobbuilder.ProjectSourceNone
 	}
 	projectID = strings.TrimSpace(projectID)
-	s.project.put(head.IssueID, projectID, now)
+	s.project.put(workspaceID, head.IssueID, projectID, now)
 	if projectID == "" {
 		return "", jobbuilder.ProjectSourceNone
 	}

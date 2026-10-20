@@ -36,7 +36,7 @@ type probeResult struct {
 	code    int
 }
 
-func (f *fakeProbe) StartProbe(_ context.Context, requestID, realRuntimeID string, _ registry.ProbeMode, budget time.Duration) (scheduler.ProbeHandle, error) {
+func (f *fakeProbe) StartProbe(_ context.Context, requestID, realRuntimeID, _ string, _ registry.ProbeMode, budget time.Duration) (scheduler.ProbeHandle, error) {
 	if f.gate != nil {
 		<-f.gate
 	}

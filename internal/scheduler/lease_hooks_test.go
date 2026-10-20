@@ -25,13 +25,14 @@ type pendingCall struct {
 	taskID        string
 	jobName       string
 	daemonID      string
+	workspaceID   string
 	ep            Endpoint
 	body          string
 	failureReason string
 }
 
-func (f *fakePendingReports) Enqueue(_ context.Context, taskID, jobName, daemonID string, ep Endpoint, body []byte, failureReason string) error {
-	f.reports = append(f.reports, pendingCall{taskID, jobName, daemonID, ep, string(body), failureReason})
+func (f *fakePendingReports) Enqueue(_ context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string) error {
+	f.reports = append(f.reports, pendingCall{taskID, jobName, daemonID, workspaceID, ep, string(body), failureReason})
 	if f.err != nil {
 		return f.err
 	}
@@ -68,7 +69,7 @@ func (f *fakePendingReports) Restore(context.Context) error { return nil }
 // once through sender and the queue is reported empty.
 func (f *fakePendingReports) Drain(ctx context.Context, sender ReportSender) (int, error) {
 	for taskID := range f.queued {
-		if _, _, err := sender.DeliverQueued(ctx, EPFail, taskID, nil, ""); err != nil {
+		if _, _, err := sender.DeliverQueued(ctx, EPFail, taskID, "", nil, ""); err != nil {
 			return len(f.queued), err
 		}
 		delete(f.queued, taskID)
@@ -126,7 +127,7 @@ func TestOnBootTimeoutFailsAndCleansUp(t *testing.T) {
 	if f.hasJob("fm-t-boot") {
 		t.Error("Job must be deleted after the boot-timeout settlement")
 	}
-	if !f.reg.IsDone("t-boot") {
+	if !f.reg.IsDone("ws-1", "t-boot") {
 		t.Error("done index must record the terminal task")
 	}
 	// The synthetic C10 carries failure_reason=job_boot_timeout.
@@ -489,7 +490,7 @@ func TestReportFailDropsPermanent4xxAndKeepsTransient(t *testing.T) {
 			e := f.claim(t, "t-rf")
 			// The verdict path queued the report ahead of the forward; this
 			// test models that state directly.
-			if err := p.Enqueue(context.Background(), e.TaskID, e.JobName, e.DaemonID, EPFail, []byte(`{}`), ""); err != nil {
+			if err := p.Enqueue(context.Background(), e.TaskID, e.JobName, e.DaemonID, "", EPFail, []byte(`{}`), ""); err != nil {
 				t.Fatalf("Enqueue: %v", err)
 			}
 			f.server.forwardCode = tc.code
@@ -524,12 +525,12 @@ func TestDeliverQueuedSettlesPermanent4xx(t *testing.T) {
 			f := newFixture(t)
 			p := f.withDurableReports(t)
 			e := f.claim(t, "t-dq")
-			if err := p.Enqueue(context.Background(), e.TaskID, e.JobName, e.DaemonID, EPFail, []byte(`{}`), ""); err != nil {
+			if err := p.Enqueue(context.Background(), e.TaskID, e.JobName, e.DaemonID, "", EPFail, []byte(`{}`), ""); err != nil {
 				t.Fatalf("Enqueue: %v", err)
 			}
 			f.server.forwardCode = tc.code
 
-			code, _, err := f.sched.DeliverQueued(t.Context(), EPFail, e.TaskID, []byte(`{}`), "")
+			code, _, err := f.sched.DeliverQueued(t.Context(), EPFail, e.TaskID, "", []byte(`{}`), "")
 			if err != nil || code != tc.code {
 				t.Fatalf("DeliverQueued = %d, %v; want the upstream code %d", code, err, tc.code)
 			}
@@ -571,7 +572,7 @@ func TestDeliverQueuedWithoutEntrySettlesPermanent4xx(t *testing.T) {
 			f := newFixture(t)
 			p := f.withDurableReports(t)
 			e := f.claim(t, "t-dq-gone")
-			if err := p.Enqueue(context.Background(), e.TaskID, e.JobName, e.DaemonID, EPFail, []byte(`{}`), ""); err != nil {
+			if err := p.Enqueue(context.Background(), e.TaskID, e.JobName, e.DaemonID, "", EPFail, []byte(`{}`), ""); err != nil {
 				t.Fatalf("Enqueue: %v", err)
 			}
 			// The credential was reclaimed before the replay landed: the
@@ -583,7 +584,7 @@ func TestDeliverQueuedWithoutEntrySettlesPermanent4xx(t *testing.T) {
 			f.sched.log = slog.New(slog.NewJSONHandler(logs, nil))
 			f.server.forwardCode = tc.code
 
-			code, _, err := f.sched.DeliverQueued(t.Context(), EPFail, e.TaskID, []byte(`{}`), "")
+			code, _, err := f.sched.DeliverQueued(t.Context(), EPFail, e.TaskID, "", []byte(`{}`), "")
 			if err != nil || code != tc.code {
 				t.Fatalf("DeliverQueued = %d, %v; want the upstream code %d", code, err, tc.code)
 			}

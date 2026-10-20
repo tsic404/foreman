@@ -57,6 +57,47 @@ kubectl -n foreman create secret docker-registry registry-tsic \
 `FOREMAN_JOB_TOKEN_KEY` must decode to at least 32 bytes of hex (64 hex
 characters); `MULTICA_TOKEN` must start with `mdt_` or `mul_`.
 
+## Multi-workspace (optional)
+
+One deployment can serve several workspaces (ADR-047): each workspace has its
+own `(credential, daemon identity)` pair, and every control-plane action runs
+once per pair.
+
+- **Credentials**: either keep the single-workspace `MULTICA_WORKSPACE_ID` /
+  `FOREMAN_DAEMON_ID` / `MULTICA_TOKEN` form (a legal one-workspace set), or set
+  `FOREMAN_WORKSPACES_FILE` to a mounted file holding:
+  ```json
+  [
+    {"workspace_id": "ws-a", "daemon_id": "foreman-a", "token": "mdt_..."},
+    {"workspace_id": "ws-b", "daemon_id": "foreman-b", "token_env": "MULTICA_TOKEN_B"}
+  ]
+  ```
+  `token_env` names the Secret key's env variable; `token` may be inlined. Both
+  ids are unique, and no daemon identity may be shared across workspaces (F2).
+  `FOREMAN_WORKSPACES` accepts the same JSON inline (mutually exclusive with the
+  file form).
+- **Serving scope**: the startup probe is still one Job; the template's daemon
+  decides which workspaces it registers to (S-1 answers the configured set).
+  Foreman serves exactly the workspaces it observed registering — a configured
+  workspace the probe never registered is not served and logs
+  `workspace.probe_registration_absent`.
+- **Budget**: `FOREMAN_MAX_INFLIGHT_JOBS` is the global cap;
+  `FOREMAN_MAX_INFLIGHT_JOBS_PER_WORKSPACE` adds the per-workspace cap (0 = none).
+- **Policy**: partition the table under `workspaces.<workspace_id>`:
+  ```yaml
+  workspaces:
+    ws-a: {agents: {...}, projects: {...}}
+    ws-b: {agents: {...}, projects: {...}}
+  ```
+  The flat `agents` / `projects` form is the single-workspace form and refuses
+  startup when more than one workspace is configured.
+- **Node state**: every workspace-partitioned location in the template must be
+  expressed through `<workspace_id>` (the shipped template does this for the
+  home volume). A fixed literal makes the template correct for one workspace
+  only — a deployment error Foreman does not correct.
+- **Isolation**: cross-workspace Job Tokens, projections, delivery and probes are
+  rejected (403 / 404); a credential failure retries only its workspace.
+
 ## Images
 
 Two images come from this repo: the scheduler image for the Deployment, and the
