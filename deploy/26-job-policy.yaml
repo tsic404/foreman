@@ -13,7 +13,21 @@
 #
 # The skeleton below is comment-only on purpose: it decodes to an empty policy,
 # which is the same "no axis configured" default as an absent file. Replace it
-# with real entries — see deploy/README.md §Job policy — for example:
+# with real entries — see deploy/README.md §Job policy.
+#
+# Multi-workspace deployments MUST partition the table under
+# `workspaces.<workspace_id>:`; the flat `agents` / `projects` form below is
+# the single-workspace form and refuses startup when more than one workspace is
+# configured (02-contracts.md §8.5 键空间 = workspace × 名字). Example:
+#
+#   workspaces:
+#     <workspace-id-a>:
+#       agents: { ... }
+#       projects: { ... }
+#     <workspace-id-b>:
+#       agents: { ... }
+#
+# The single-workspace example:
 #
 #   agents:
 #     omp-default:

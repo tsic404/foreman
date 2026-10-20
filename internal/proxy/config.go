@@ -163,8 +163,8 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		return Config{}, fmt.Errorf("%s must name a host", EnvServerURL)
 	}
 	cfg.WorkspaceID = strings.TrimSpace(getenv(EnvWorkspaceID))
-	if cfg.WorkspaceID == "" {
-		return Config{}, fmt.Errorf("%s is required", EnvWorkspaceID)
+	if cfg.WorkspaceID == "" && strings.TrimSpace(getenv("FOREMAN_WORKSPACES")) == "" && strings.TrimSpace(getenv("FOREMAN_WORKSPACES_FILE")) == "" {
+		return Config{}, fmt.Errorf("%s is required (or configure FOREMAN_WORKSPACES)", EnvWorkspaceID)
 	}
 	if v := strings.TrimSpace(getenv(EnvDaemonID)); v != "" {
 		cfg.DaemonID = v

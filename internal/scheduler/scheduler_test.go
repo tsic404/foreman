@@ -212,9 +212,10 @@ func (f *fakeJobs) ListPods(_ context.Context, labelSelector string) ([]corev1.P
 }
 
 type forwardCall struct {
-	ep     Endpoint
-	taskID string
-	body   string
+	ep          Endpoint
+	taskID      string
+	workspaceID string
+	body        string
 }
 
 type fakeServer struct {
@@ -236,10 +237,21 @@ func (f *fakeServer) TaskStatus(context.Context, string) (string, error) {
 }
 
 func (f *fakeServer) Forward(_ context.Context, ep Endpoint, taskID string, body []byte) (int, []byte, error) {
+	return f.forward(ep, taskID, "", body)
+}
+
+// ForwardInWorkspace records the persisted workspace the replay routed by;
+// the fake routes by task id either way, as the single-workspace production
+// client does.
+func (f *fakeServer) ForwardInWorkspace(_ context.Context, ep Endpoint, taskID, workspaceID string, body []byte) (int, []byte, error) {
+	return f.forward(ep, taskID, workspaceID, body)
+}
+
+func (f *fakeServer) forward(ep Endpoint, taskID, workspaceID string, body []byte) (int, []byte, error) {
 	if f.onForward != nil {
 		f.onForward()
 	}
-	f.forwards = append(f.forwards, forwardCall{ep, taskID, string(body)})
+	f.forwards = append(f.forwards, forwardCall{ep, taskID, workspaceID, string(body)})
 	if f.forwardErr != nil {
 		return 0, nil, f.forwardErr
 	}
@@ -776,7 +788,7 @@ func TestOnClaimNameResolutionFailureLeavesReclaimableEntry(t *testing.T) {
 	if _, ok := f.reg.Get("TASK-1"); ok {
 		t.Fatal("entry survived the reclaim")
 	}
-	if !f.reg.IsDone("TASK-1") {
+	if !f.reg.IsDone("ws-1", "TASK-1") {
 		t.Fatal("terminal record lost by the reclaim")
 	}
 }
@@ -796,7 +808,7 @@ func TestOnClaimJobFailureRollsBackSecret(t *testing.T) {
 	if len(f.jobs.deletedSecrets) != 2 {
 		t.Fatalf("secret deletes = %+v", f.jobs.deletedSecrets)
 	}
-	if !f.reg.IsDone("task-1") {
+	if !f.reg.IsDone("ws-1", "task-1") {
 		t.Fatal("done index not written")
 	}
 }
@@ -1595,7 +1607,7 @@ func TestOnReportStart409SettlesStaleClaim(t *testing.T) {
 	if e, ok := f.reg.Get("t-409"); !ok || !e.IsTerminal() || !e.IsDraining() {
 		t.Fatalf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
-	if !f.reg.IsDone("t-409") {
+	if !f.reg.IsDone("ws-1", "t-409") {
 		t.Fatal("the terminal write must land in the done index")
 	}
 	if f.hasJob("fm-t-409") {
@@ -1729,7 +1741,7 @@ func TestOnReportStart409TerminalSettlesToServer(t *testing.T) {
 	if e, ok := f.reg.Get("t-done"); !ok || !e.IsTerminal() || !e.IsDraining() {
 		t.Fatalf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
-	if !f.reg.IsDone("t-done") {
+	if !f.reg.IsDone("ws-1", "t-done") {
 		t.Fatal("the terminal write must land in the done index")
 	}
 	if f.hasJob("fm-t-done") {
@@ -1901,7 +1913,7 @@ func TestOnReportTerminalCleansUpAfterSuccess(t *testing.T) {
 	if e, ok := f.reg.Get("task-1"); !ok || !e.IsTerminal() || !e.IsDraining() {
 		t.Fatalf("entry = %+v, %v; want a retained draining entry", e, ok)
 	}
-	if !f.reg.IsDone("task-1") {
+	if !f.reg.IsDone("ws-1", "task-1") {
 		t.Fatal("done index not written")
 	}
 	if len(f.jobs.deletedJobs) != 1 || f.jobs.deletedJobs[0] != "fm-task-1" {
@@ -1985,7 +1997,7 @@ func TestOnJobGoneCompensatesRunningTask(t *testing.T) {
 	if body["failure_reason"] != "job_missing" {
 		t.Fatalf("failure_reason = %q", body["failure_reason"])
 	}
-	if !f.reg.IsDone("task-1") {
+	if !f.reg.IsDone("ws-1", "task-1") {
 		t.Fatal("done index not written")
 	}
 }
@@ -2249,7 +2261,7 @@ func TestConvergeTerminalAndGoneCleanup(t *testing.T) {
 			if len(f.jobs.deletedJobs) != 1 {
 				t.Fatalf("job deletes = %+v", f.jobs.deletedJobs)
 			}
-			if got := f.reg.IsDone("task-1"); got != tc.wantDone {
+			if got := f.reg.IsDone("ws-1", "task-1"); got != tc.wantDone {
 				t.Fatalf("IsDone = %v, want %v", got, tc.wantDone)
 			}
 		})
@@ -2672,7 +2684,7 @@ func TestJobCreateFailedLogsPhaseForSecretStep(t *testing.T) {
 	record := findLogRecord(t, buf.Bytes(), "job.create_failed")
 	wantFields := map[string]bool{
 		"ts": true, "level": true, "msg": true, "component": true,
-		"task_id": true, "job_name": true, "phase": true, "err": true,
+		"task_id": true, "job_name": true, "workspace_id": true, "phase": true, "err": true,
 	}
 	for field := range wantFields {
 		if _, ok := record[field]; !ok {
@@ -2979,7 +2991,7 @@ func TestOnClaimDropsAffinityForSaturatedNode(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFixture(t)
-			f.reg.LearnSession(registry.SessionKey(priorSession), "node-a")
+			f.reg.LearnSession("ws-1", registry.SessionKey(priorSession), "node-a")
 			// node-a already holds two live Jobs.
 			place(t, f, "t1", "issue-a", "node-a")
 			place(t, f, "t2", "issue-b", "node-a")
@@ -3245,7 +3257,7 @@ func TestOnClaimMalformedHeadDeadLetters(t *testing.T) {
 	if _, ok := f.reg.Get("t-bad"); ok {
 		t.Fatal("entry survived the reclaim")
 	}
-	if !f.reg.IsDone("t-bad") {
+	if !f.reg.IsDone(e.WorkspaceID, "t-bad") {
 		t.Fatal("terminal record lost by the reclaim")
 	}
 	if len(f.jobs.deletedSecrets) != 0 || len(f.jobs.deletedJobs) != 0 {

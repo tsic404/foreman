@@ -69,15 +69,15 @@ type RuntimeProfileView struct {
 // Job that registers and is then cleaned up, with no model catalog discovery
 // (§1.6).
 type DiscoveryProbeRunner interface {
-	RunDiscoveryProbe(ctx context.Context) (registry.Discovery, error)
+	RunDiscoveryProbe(ctx context.Context, workspaceID string) (registry.Discovery, error)
 }
 
 // DiscoveryProbeFunc adapts a function to DiscoveryProbeRunner.
-type DiscoveryProbeFunc func(context.Context) (registry.Discovery, error)
+type DiscoveryProbeFunc func(context.Context, string) (registry.Discovery, error)
 
 // RunDiscoveryProbe implements DiscoveryProbeRunner.
-func (f DiscoveryProbeFunc) RunDiscoveryProbe(ctx context.Context) (registry.Discovery, error) {
-	return f(ctx)
+func (f DiscoveryProbeFunc) RunDiscoveryProbe(ctx context.Context, workspaceID string) (registry.Discovery, error) {
+	return f(ctx, workspaceID)
 }
 
 // WithDiscoveryProbe wires the registration-discovery probe the §1.6 refresh
@@ -168,7 +168,7 @@ func (c *Client) refreshLocked(ctx context.Context, candidate []byte, trigger st
 		return errors.New("refresh profiles: no registration-discovery probe runner wired")
 	}
 	prevRefs := c.RuntimeRefs()
-	disc, err := c.discoveryProbe.RunDiscoveryProbe(ctx)
+	disc, err := c.discoveryProbe.RunDiscoveryProbe(ctx, c.cfg.WorkspaceID)
 	if err != nil {
 		c.restoreProfiles(prev)
 		c.metrics.RuntimeProfileRefresh(ProfileRefreshFailed)

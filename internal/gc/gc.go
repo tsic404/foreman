@@ -415,35 +415,59 @@ func (c *Collector) expireAgentState(ctx context.Context, root string) (int, int
 		freed   int64
 		errs    []error
 	)
-	profiles, err := readDirs(filepath.Join(root, homeDir, multicaDir, profilesDir))
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		errs = append(errs, fmt.Errorf("scan profiles under %q: %w", root, err))
-	}
-	for _, profile := range profiles {
-		for _, store := range []string{hermesSessionsDir, dshSessionsDir, reasonixStateDir} {
-			dir := filepath.Join(root, homeDir, multicaDir, profilesDir, profile.Name(), store)
-			n, f, err := c.expireStores(ctx, root, dir, ttl)
-			removed, freed = removed+n, freed+f
-			if err != nil {
-				errs = append(errs, err)
+	for _, home := range homeRoots(root) {
+		profiles, err := readDirs(filepath.Join(home, multicaDir, profilesDir))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("scan profiles under %q: %w", home, err))
+		}
+		for _, profile := range profiles {
+			for _, store := range []string{hermesSessionsDir, dshSessionsDir, reasonixStateDir} {
+				dir := filepath.Join(home, multicaDir, profilesDir, profile.Name(), store)
+				n, f, err := c.expireStores(ctx, root, dir, ttl)
+				removed, freed = removed+n, freed+f
+				if err != nil {
+					errs = append(errs, err)
+				}
 			}
 		}
-	}
-	// pi-sessions is a flat *.jsonl directory; the codex session stores hold
-	// their files at any depth beneath the store namespace.
-	pi := filepath.Join(root, homeDir, multicaDir, piSessionsDir)
-	n, f, err := c.expireFiles(ctx, root, pi, ".jsonl", ttl, false)
-	removed, freed = removed+n, freed+f
-	if err != nil {
-		errs = append(errs, err)
-	}
-	codex := filepath.Join(root, homeDir, codexDir, codexSessionsDir)
-	n, f, err = c.expireFiles(ctx, root, codex, "", ttl, true)
-	removed, freed = removed+n, freed+f
-	if err != nil {
-		errs = append(errs, err)
+		// pi-sessions is a flat *.jsonl directory; the codex session stores hold
+		// their files at any depth beneath the store namespace.
+		pi := filepath.Join(home, multicaDir, piSessionsDir)
+		n, f, err := c.expireFiles(ctx, root, pi, ".jsonl", ttl, false)
+		removed, freed = removed+n, freed+f
+		if err != nil {
+			errs = append(errs, err)
+		}
+		codex := filepath.Join(home, codexDir, codexSessionsDir)
+		n, f, err = c.expireFiles(ctx, root, codex, "", ttl, true)
+		removed, freed = removed+n, freed+f
+		if err != nil {
+			errs = append(errs, err)
+		}
 	}
 	return removed, freed, errors.Join(errs...)
+}
+
+// homeRoots lists the home roots to walk for agent state: the legacy shared
+// root (<root>/home) and every workspace-partitioned root the template wrote
+// (<root>/home/<workspace_id>, expressed through the workspace placeholder,
+// §8.8). Each root is judged independently, so a round never reaches across
+// workspaces.
+func homeRoots(root string) []string {
+	home := filepath.Join(root, homeDir)
+	roots := []string{home}
+	entries, err := readDirs(home)
+	if err != nil {
+		return roots
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		if strings.HasPrefix(name, ".") {
+			continue
+		}
+		roots = append(roots, filepath.Join(home, name))
+	}
+	return roots
 }
 
 // expireAgentMemory reclaims node-local agent memory (hermes-state) with
@@ -457,16 +481,18 @@ func (c *Collector) expireAgentMemory(ctx context.Context, root string) (int, in
 		freed   int64
 		errs    []error
 	)
-	profiles, err := readDirs(filepath.Join(root, homeDir, multicaDir, profilesDir))
-	if err != nil && !errors.Is(err, fs.ErrNotExist) {
-		errs = append(errs, fmt.Errorf("scan profiles under %q: %w", root, err))
-	}
-	for _, profile := range profiles {
-		dir := filepath.Join(root, homeDir, multicaDir, profilesDir, profile.Name(), hermesStateDir)
-		n, f, err := c.expireStores(ctx, root, dir, c.cfg.AgentMemoryTTL)
-		removed, freed = removed+n, freed+f
-		if err != nil {
-			errs = append(errs, err)
+	for _, home := range homeRoots(root) {
+		profiles, err := readDirs(filepath.Join(home, multicaDir, profilesDir))
+		if err != nil && !errors.Is(err, fs.ErrNotExist) {
+			errs = append(errs, fmt.Errorf("scan profiles under %q: %w", home, err))
+		}
+		for _, profile := range profiles {
+			dir := filepath.Join(home, multicaDir, profilesDir, profile.Name(), hermesStateDir)
+			n, f, err := c.expireStores(ctx, root, dir, c.cfg.AgentMemoryTTL)
+			removed, freed = removed+n, freed+f
+			if err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return removed, freed, errors.Join(errs...)

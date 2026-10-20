@@ -89,7 +89,7 @@ func TestPendingCarrierHoldsTheForwardedBodyVerbatim(t *testing.T) {
 	}
 	restoreForServe(t, p)
 	body := []byte(`{"result":"ok","summary":"done"}`)
-	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPComplete, body, ""); err != nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPComplete, body, ""); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if store.count() != 1 {
@@ -118,7 +118,7 @@ func TestPendingRestoreRebuildsTheQueueFromCarriers(t *testing.T) {
 	}
 	restoreForServe(t, p)
 	body := []byte(`{"result":"ok"}`)
-	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPComplete, body, ""); err != nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "ws-a", EPComplete, body, ""); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 
@@ -155,6 +155,9 @@ func TestPendingRestoreRebuildsTheQueueFromCarriers(t *testing.T) {
 	if len(sender.sent) != 1 || sender.sent[0] != "task-1:complete:"+string(body) {
 		t.Errorf("sent = %v, want the carrier's body replayed", sender.sent)
 	}
+	if len(sender.workspaces) != 1 || sender.workspaces[0] != "ws-a" {
+		t.Errorf("replayed workspace = %v, want the carrier's ws-a", sender.workspaces)
+	}
 	if store.count() != 0 {
 		t.Errorf("carriers after the replay = %d, want 0", store.count())
 	}
@@ -172,7 +175,7 @@ func TestPendingCarrierCarriesTheFailureAttribution(t *testing.T) {
 	}
 	restoreForServe(t, p)
 	body := []byte(`{"error":"job vanished"}`)
-	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPFail, body, FailureReasonJobMissing); err != nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPFail, body, FailureReasonJobMissing); err != nil {
 		t.Fatalf("Enqueue: %v", err)
 	}
 	if got := store.carriers["task-1"].FailureReason; got != FailureReasonJobMissing {
@@ -254,7 +257,7 @@ func TestPendingCarrierWriteFailureIsRetriedByDrain(t *testing.T) {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
 	restoreForServe(t, p)
-	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPComplete, []byte(`{"result":"ok"}`), ""); err == nil {
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPComplete, []byte(`{"result":"ok"}`), ""); err == nil {
 		t.Fatal("Enqueue: want the carrier write error surfaced")
 	}
 	if !p.Queued("task-1") {
@@ -282,7 +285,7 @@ func TestPendingCarrierBoundKeepsOversizeReportsInProcess(t *testing.T) {
 	}
 	restoreForServe(t, p)
 	body := []byte(`{"v":"` + strings.Repeat("x", MaxCarrierBytes) + `"}`)
-	err = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", EPComplete, body, "")
+	err = p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPComplete, body, "")
 	if !errors.Is(err, ErrCarrierPayloadTooLarge) {
 		t.Fatalf("Enqueue = %v, want ErrCarrierPayloadTooLarge", err)
 	}
@@ -299,7 +302,7 @@ func TestSecretCarrierStoreShapeAndDomains(t *testing.T) {
 	store := NewSecretCarrierStore(jobs)
 	body := []byte(`{"result":"ok"}`)
 	if err := store.PutCarrier(context.Background(), Carrier{
-		TaskID: "task-1", JobName: "fm-task-1", DaemonID: "fm-task-1",
+		TaskID: "task-1", JobName: "fm-task-1", DaemonID: "fm-task-1", WorkspaceID: "ws-a",
 		Endpoint: string(EPComplete), Body: body, EnqueuedAt: time.Now(), Attempts: 2,
 	}); err != nil {
 		t.Fatalf("PutCarrier: %v", err)
@@ -317,6 +320,12 @@ func TestSecretCarrierStoreShapeAndDomains(t *testing.T) {
 	if secret.Labels[registry.LabelTaskID] != "task-1" {
 		t.Errorf("task-id label = %q", secret.Labels[registry.LabelTaskID])
 	}
+	if secret.Labels[registry.LabelWorkspaceID] != "ws-a" {
+		t.Errorf("workspace label = %q, want ws-a", secret.Labels[registry.LabelWorkspaceID])
+	}
+	if got := string(secret.Data[carrierKeyWorkspaceID]); got != "ws-a" {
+		t.Errorf("workspace data = %q, want ws-a", got)
+	}
 	if !bytes.Equal(secret.Data[carrierKeyBody], body) {
 		t.Errorf("carrier body = %s, want the enqueued bytes", secret.Data[carrierKeyBody])
 	}
@@ -332,7 +341,8 @@ func TestSecretCarrierStoreShapeAndDomains(t *testing.T) {
 	}
 	got := carriers[0]
 	if got.TaskID != "task-1" || got.Endpoint != string(EPComplete) ||
-		got.JobName != "fm-task-1" || got.DaemonID != "fm-task-1" || !bytes.Equal(got.Body, body) {
-		t.Errorf("listed carrier = %+v, want the stored identity and body", got)
+		got.JobName != "fm-task-1" || got.DaemonID != "fm-task-1" ||
+		got.WorkspaceID != "ws-a" || !bytes.Equal(got.Body, body) {
+		t.Errorf("listed carrier = %+v, want the stored identity, workspace and body", got)
 	}
 }

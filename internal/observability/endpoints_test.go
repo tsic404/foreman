@@ -434,3 +434,87 @@ func TestRegisterSourceUnavailableWithoutSeam(t *testing.T) {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
 }
+
+// TestOpsWorkspaceDimensionIsRequiredAcrossWorkspaces pins §4.1/§9.3 on a
+// multi-workspace deployment: the projection, single-task, log and preview
+// routes have no "all workspaces" default. A missing dimension is a bad
+// request, and an explicit other-workspace id answers 404, never a cross-
+// workspace entry.
+func TestOpsWorkspaceDimensionIsRequiredAcrossWorkspaces(t *testing.T) {
+	reg := registry.New(time.Now)
+	for _, e := range []registry.TaskEntry{
+		{TaskID: "task-a", JobName: "fm-task-a", WorkspaceID: "ws-a", State: registry.StateRunning},
+		{TaskID: "task-b", JobName: "fm-task-b", WorkspaceID: "ws-b", State: registry.StateRunning},
+	} {
+		if err := reg.Put(e); err != nil {
+			t.Fatalf("Put %s: %v", e.TaskID, err)
+		}
+	}
+	h := NewOpsHandler(NewMetrics(), reg, nil, OpsConfig{
+		WorkspaceIDs: []string{"ws-a", "ws-b"},
+	})
+	get := func(path string) *httptest.ResponseRecorder {
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		return rec
+	}
+
+	for _, path := range []string{
+		"/foreman/tasks",
+		"/foreman/tasks/task-a",
+		"/foreman/tasks/task-a/logs",
+		"/foreman/tasks/task-a/payload-preview",
+	} {
+		if rec := get(path); rec.Code != http.StatusBadRequest {
+			t.Errorf("%s without workspace = %d, want 400", path, rec.Code)
+		}
+	}
+
+	rec := get("/foreman/tasks?workspace=ws-a")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list ws-a = %d: %s", rec.Code, rec.Body)
+	}
+	var entries []struct {
+		TaskID      string `json:"task_id"`
+		WorkspaceID string `json:"workspace_id"`
+	}
+	decodeBody(t, rec, &entries)
+	if len(entries) != 1 || entries[0].TaskID != "task-a" || entries[0].WorkspaceID != "ws-a" {
+		t.Fatalf("list ws-a = %+v, want exactly task-a", entries)
+	}
+
+	if rec := get("/foreman/tasks/task-b?workspace=ws-a"); rec.Code != http.StatusNotFound {
+		t.Errorf("cross-workspace single task = %d, want 404", rec.Code)
+	}
+	if rec := get("/foreman/tasks/task-b?workspace=ws-z"); rec.Code != http.StatusBadRequest {
+		t.Errorf("unknown workspace = %d, want 400", rec.Code)
+	}
+}
+
+// TestOpsSingleWorkspaceIsTheDefaultDimension keeps single-workspace
+// deployments unchanged: the only workspace is the dimension when the caller
+// omits it.
+func TestOpsSingleWorkspaceIsTheDefaultDimension(t *testing.T) {
+	reg := registry.New(time.Now)
+	if err := reg.Put(registry.TaskEntry{
+		TaskID: "task-a", JobName: "fm-task-a", WorkspaceID: "ws-a", State: registry.StateRunning,
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	h := NewOpsHandler(NewMetrics(), reg, nil, OpsConfig{WorkspaceIDs: []string{"ws-a"}})
+
+	rec := do(t, h, "/foreman/tasks")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("list = %d: %s", rec.Code, rec.Body)
+	}
+	var entries []struct {
+		TaskID string `json:"task_id"`
+	}
+	decodeBody(t, rec, &entries)
+	if len(entries) != 1 || entries[0].TaskID != "task-a" {
+		t.Fatalf("list = %+v, want task-a", entries)
+	}
+	if rec := do(t, h, "/foreman/tasks/task-a"); rec.Code != http.StatusOK {
+		t.Fatalf("single task = %d, want 200", rec.Code)
+	}
+}

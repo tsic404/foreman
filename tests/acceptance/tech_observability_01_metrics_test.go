@@ -113,7 +113,7 @@ func TestTechObservability01DesignedFamiliesAtBoot(t *testing.T) {
 // per key kind, unavailable for anything unlisted.
 type observability01Resolver map[string]jobbuilder.NameConclusion
 
-func (r observability01Resolver) ResolveName(_ context.Context, kind, name string) (jobbuilder.NameResolution, error) {
+func (r observability01Resolver) ResolveName(_ context.Context, _, kind, name string) (jobbuilder.NameResolution, error) {
 	conclusion, ok := r[kind]
 	if !ok {
 		conclusion = jobbuilder.NameUnavailable

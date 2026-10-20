@@ -26,6 +26,7 @@ const (
 	metricJobBootSeconds           = "foreman_job_boot_seconds"
 	metricJobCreateSeconds         = "foreman_job_create_seconds"
 	metricInflightJobs             = "foreman_inflight_jobs"
+	metricInflightJobsWorkspace    = "foreman_inflight_jobs_workspace"
 	metricForwardTotal             = "foreman_forward_total"
 	metricForwardLatency           = "foreman_forward_latency_seconds"
 	metricAuthFailuresTotal        = "foreman_auth_failures_total"
@@ -167,6 +168,7 @@ type Metrics struct {
 	jobBootSeconds     prometheus.Histogram
 	jobCreateSeconds   prometheus.Histogram
 	inflightJobs       prometheus.Gauge
+	inflightWorkspace  *prometheus.GaugeVec
 	forwardTotal       *prometheus.CounterVec
 	forwardLatency     *prometheus.HistogramVec
 	authFailures       *prometheus.CounterVec
@@ -239,6 +241,10 @@ func NewMetrics() *Metrics {
 		Help:    "claim -> Job created latency.",
 		Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
 	})
+	m.inflightWorkspace = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: metricInflightJobsWorkspace,
+		Help: "Current non-terminal Job count per workspace (§10 两级预算).",
+	}, []string{"workspace"})
 	m.inflightJobs = prometheus.NewGauge(prometheus.GaugeOpts{
 		Name: metricInflightJobs,
 		Help: "Non-terminal registry entries.",
@@ -340,7 +346,7 @@ func NewMetrics() *Metrics {
 	collectors := []prometheus.Collector{
 		m.tasksTotal, m.taskClaims, m.claimErrors, m.jobBootSeconds,
 		m.deliveryClaims, m.deliveryLatency, m.deliveryUnconfirm,
-		m.jobCreateSeconds, m.inflightJobs, m.forwardTotal, m.forwardLatency,
+		m.jobCreateSeconds, m.inflightJobs, m.inflightWorkspace, m.forwardTotal, m.forwardLatency,
 		m.authFailures, m.tokenUsage, m.duplicateDispatch, m.pendingReports,
 		m.wsConnected, m.wsReconnects, m.heartbeatSuspect,
 		m.credReclaims, m.jobDrainSeconds, m.jobDeleteFailures, m.catalogRelays, m.catalogSeconds,
@@ -422,6 +428,12 @@ func (m *Metrics) JobBootSeconds(seconds float64) { m.jobBootSeconds.Observe(sec
 
 // InflightJobs sets the current non-terminal entry count (§9.2).
 func (m *Metrics) InflightJobs(n int) { m.inflightJobs.Set(float64(n)) }
+
+// InflightJobsWorkspace sets one workspace's non-terminal entry count: the
+// two-level budget's observable face (§10).
+func (m *Metrics) InflightJobsWorkspace(workspaceID string, n int) {
+	m.inflightWorkspace.WithLabelValues(workspaceID).Set(float64(n))
+}
 
 // TokenUsage accumulates a forwarded usage report (§9.2). The upstream S-12
 // entry carries input/output and the two prompt-cache directions; the

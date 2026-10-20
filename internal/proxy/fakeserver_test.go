@@ -460,7 +460,7 @@ func TestFullLifecycle(t *testing.T) {
 	if !ok || !e.IsTerminal() || !e.IsDraining() {
 		t.Fatalf("entry after terminal report = %+v, want it terminal and draining", e)
 	}
-	if !rig.reg.IsDone("t-life") {
+	if !rig.reg.IsDone("ws-1", "t-life") {
 		t.Error("done index not updated")
 	}
 
@@ -957,11 +957,11 @@ func TestTerminalReportLearnsSessionNode(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("S13 = %d: %s", code, body)
 	}
-	if got := rig.reg.LastNodeForSession("sess-7"); got != "company-02" {
+	if got := rig.reg.LastNodeForSession("ws-1", "sess-7"); got != "company-02" {
 		t.Fatalf("learned node = %q, want company-02", got)
 	}
 	// The key is the session, never the issue the task was dispatched from.
-	if got := rig.reg.LastNodeForSession("issue-1"); got != "" {
+	if got := rig.reg.LastNodeForSession("ws-1", "issue-1"); got != "" {
 		t.Fatalf("issue key learned: %q", got)
 	}
 
@@ -975,7 +975,7 @@ func TestTerminalReportLearnsSessionNode(t *testing.T) {
 		[]byte(`{"session_id":"/state/home/.multica/pi-sessions/sess-8.jsonl"}`)); code != 204 {
 		t.Fatalf("S16 = %d, want 204", code)
 	}
-	if got := rig.reg.LastNodeForSession("sess-8"); got != "" {
+	if got := rig.reg.LastNodeForSession("ws-1", "sess-8"); got != "" {
 		t.Fatalf("S16 learned a session node: %q", got)
 	}
 
@@ -988,7 +988,7 @@ func TestTerminalReportLearnsSessionNode(t *testing.T) {
 		[]byte(`{"session_id":"/state/home/.multica/pi-sessions/sess-9.jsonl"}`)); code != 200 {
 		t.Fatalf("S13 = %d, want 200", code)
 	}
-	if got := rig.reg.LastNodeForSession("sess-9"); got != "" {
+	if got := rig.reg.LastNodeForSession("ws-1", "sess-9"); got != "" {
 		t.Fatalf("node-less task learned a session: %q", got)
 	}
 
@@ -1003,7 +1003,7 @@ func TestTerminalReportLearnsSessionNode(t *testing.T) {
 		[]byte(`{"error":"agent died","session_id":"/state/home/.multica/pi-sessions/sess-10.jsonl"}`)); code != 502 {
 		t.Fatalf("S14 with a failing upstream = %d, want 502", code)
 	}
-	if got := rig.reg.LastNodeForSession("sess-10"); got != "company-04" {
+	if got := rig.reg.LastNodeForSession("ws-1", "sess-10"); got != "company-04" {
 		t.Fatalf("learned node after a failed forward = %q, want company-04", got)
 	}
 }
@@ -1423,6 +1423,7 @@ func TestRegisterRefusesAnEntryWithoutADispatchRecord(t *testing.T) {
 	}
 	rig.reg.Put(registry.TaskEntry{
 		TaskID: e.TaskID, DaemonID: e.DaemonID, JobName: e.JobName,
+		WorkspaceID:  e.WorkspaceID,
 		JobRuntimeID: e.JobRuntimeID, State: registry.StateJobCreated,
 	})
 	rig.stub.on("GET", "/api/daemon/tasks/t-rebuilt/status", func(w http.ResponseWriter, _ *http.Request, _ []byte) {

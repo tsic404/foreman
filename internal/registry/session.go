@@ -34,28 +34,36 @@ type sessionNodeEntry struct {
 	learnedAt time.Time
 }
 
-// LearnSession records the node a session's file lives on, keyed by its
-// normalized session key (the soft-affinity unique key, ADR-015). The only
-// learning face is the terminal report body (S13/S14), so an empty key or an
-// unknown node leaves the index untouched rather than storing a key that can
-// never hit. Learning the same key again overwrites node and timestamp: the
-// later report describes where the session is now.
-func (r *Registry) LearnSession(key, nodeName string) {
+// LearnSession records the node a session's file lives on, keyed by
+// (workspace, normalized session key) — the session index is partitioned by
+// workspace (§4.5). The only learning face is the terminal report body
+// (S13/S14), so an empty key or an unknown node leaves the index untouched
+// rather than storing a key that can never hit. Learning the same key again
+// overwrites node and timestamp: the later report describes where the session
+// is now.
+func (r *Registry) LearnSession(workspaceID, key, nodeName string) {
 	if key == "" || nodeName == "" {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.sessionNode[key] = sessionNodeEntry{node: nodeName, learnedAt: r.now()}
+	r.sessionNode[sessionIndexKey(workspaceID, key)] = sessionNodeEntry{node: nodeName, learnedAt: r.now()}
 }
 
 // LastNodeForSession implements jobbuilder.NodeIndex: the node a session's
-// file was last seen on, "" when the key is unknown — which, like an expired
-// or saturated entry, means "no soft affinity for this task".
-func (r *Registry) LastNodeForSession(key string) string {
+// file was last seen on, "" when the (workspace, key) pair is unknown — which,
+// like an expired or saturated entry, means "no soft affinity for this task".
+func (r *Registry) LastNodeForSession(workspaceID, key string) string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	return r.sessionNode[key].node
+	return r.sessionNode[sessionIndexKey(workspaceID, key)].node
+}
+
+// sessionIndexKey is the workspace-partitioned session index key. The
+// separator is not valid in either component, so no pair collides with
+// another.
+func sessionIndexKey(workspaceID, key string) string {
+	return workspaceID + "\x00" + key
 }
 
 // PruneExpiredSessions evicts the entries whose learned_at is older than ttl

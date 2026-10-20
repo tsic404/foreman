@@ -255,9 +255,33 @@ func (r *Registry) Inflight() int {
 	return n
 }
 
-// IsDone reports whether taskID reached terminal state within the retention
-// window; it backs the late-replay idempotent path and claim dedup.
-func (r *Registry) IsDone(taskID string) bool {
+// InflightFor counts the non-terminal entries of one workspace (§10 两级预算).
+func (r *Registry) InflightFor(workspaceID string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n := 0
+	for _, e := range r.live {
+		if e.State != StateTerminal && e.WorkspaceID == workspaceID {
+			n++
+		}
+	}
+	return n
+}
+
+// IsDone reports whether (workspaceID, taskID) reached terminal state within
+// the retention window; it backs the late-replay idempotent path and claim
+// dedup. The workspace is part of the key, so a terminal task of one
+// workspace never suppresses the same task id in another.
+func (r *Registry) IsDone(workspaceID, taskID string) bool {
+	e, _, ok := r.done.get(taskID)
+	return ok && e.WorkspaceID == workspaceID
+}
+
+// IsDoneAny reports whether taskID reached terminal state in any workspace.
+// It is the malformed-claim path's conservative check: when the claim body
+// cannot carry a workspace, a settled task under that id must still not be
+// re-executed.
+func (r *Registry) IsDoneAny(taskID string) bool {
 	return r.done.has(taskID)
 }
 

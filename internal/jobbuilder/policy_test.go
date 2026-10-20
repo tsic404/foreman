@@ -207,7 +207,7 @@ type resolutionStub struct {
 	calls       []string
 }
 
-func (s *resolutionStub) ResolveName(_ context.Context, kind, name string) (NameResolution, error) {
+func (s *resolutionStub) ResolveName(_ context.Context, _, kind, name string) (NameResolution, error) {
 	s.calls = append(s.calls, kind+":"+name)
 	if s.err != nil {
 		return NameResolution{}, s.err
@@ -403,8 +403,8 @@ projects:
 // platform answer that says resolved but carries no identity.
 type noIdentifierProjectResolver struct{ inner *resolutionStub }
 
-func (r noIdentifierProjectResolver) ResolveName(ctx context.Context, kind, name string) (NameResolution, error) {
-	resolution, err := r.inner.ResolveName(ctx, kind, name)
+func (r noIdentifierProjectResolver) ResolveName(ctx context.Context, workspaceID, kind, name string) (NameResolution, error) {
+	resolution, err := r.inner.ResolveName(ctx, workspaceID, kind, name)
 	resolution.Identifier = ""
 	return resolution, err
 }

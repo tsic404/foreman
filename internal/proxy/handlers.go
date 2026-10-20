@@ -23,11 +23,29 @@ const tokenRenewResponseTTL = 24 * time.Hour
 // legacy /api/workspaces fallback S28). It must succeed, else the daemon
 // finds no runtime.
 func (s *FakeServer) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticate(w, r, auth.RequestScope{}); !ok {
+	claims, ok := s.authenticate(w, r, auth.RequestScope{})
+	if !ok {
 		return
 	}
-	id, name := s.client.Workspace()
-	writeJSON(w, http.StatusOK, []map[string]string{{"id": id, "name": name}})
+	// A task Job and a catalog probe see their own workspace; a startup /
+	// registration-discovery probe sees the configured set, from which the
+	// template's daemon decides where to register (§2.2 S-1).
+	ids := []string{claims.WorkspaceID}
+	if claims.Role == catalogProbeRole {
+		if session, found := s.probeSession(claims); found && session.WorkspaceID == "" {
+			ids = s.configuredWorkspaces()
+		}
+	}
+	answer := make([]map[string]string, 0, len(ids))
+	for _, id := range ids {
+		client := s.clientFor(id)
+		if client == nil {
+			continue
+		}
+		_, name := client.Workspace()
+		answer = append(answer, map[string]string{"id": id, "name": name})
+	}
+	writeJSON(w, http.StatusOK, answer)
 }
 
 // ---- S2 repos ----
@@ -41,16 +59,22 @@ func (s *FakeServer) handleRepos(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if ws := r.PathValue("ws"); ws != claims.WorkspaceID {
+	ws := r.PathValue("ws")
+	if !s.allowsWorkspace(claims, ws) {
 		writeError(w, http.StatusForbidden, "workspace does not belong to this job")
+		return
+	}
+	client := s.clientFor(ws)
+	if client == nil {
+		writeError(w, http.StatusForbidden, "workspace is not configured")
 		return
 	}
 	// A failed refresh is non-fatal: the answer replays the last successful
 	// snapshot and never blocks the checkout (§1.7). The failure event and
 	// metric are recorded by the client seam itself.
-	_ = s.client.RefreshWorkspaceState(r.Context())
-	body := workspaceStateResponse(s.client.WorkspaceState())
-	body["workspace_id"] = claims.WorkspaceID
+	_ = client.RefreshWorkspaceState(r.Context())
+	body := workspaceStateResponse(client.WorkspaceState())
+	body["workspace_id"] = ws
 	writeRaw(w, http.StatusOK, mustMarshal(body))
 }
 
@@ -65,11 +89,17 @@ func (s *FakeServer) handleRuntimeProfiles(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	if ws := r.PathValue("ws"); ws != claims.WorkspaceID {
+	ws := r.PathValue("ws")
+	if !s.allowsWorkspace(claims, ws) {
 		writeError(w, http.StatusForbidden, "workspace does not belong to this job")
 		return
 	}
-	code, body := s.client.S3Response()
+	client := s.clientFor(ws)
+	if client == nil {
+		writeError(w, http.StatusForbidden, "workspace is not configured")
+		return
+	}
+	code, body := client.S3Response()
 	if code == http.StatusOK {
 		writeRaw(w, code, body)
 		return
@@ -81,6 +111,10 @@ func (s *FakeServer) handleRuntimeProfiles(w http.ResponseWriter, r *http.Reques
 
 type daemonRegisterRequest struct {
 	DaemonID string `json:"daemon_id"`
+	// WorkspaceID is the workspace this registration belongs to. The official
+	// daemon sends it per registration; an older body omits it and the Job
+	// Token's workspace stands in (§1.2 控制面逐套).
+	WorkspaceID string `json:"workspace_id"`
 	// CLIVersion is the template CLI's version: the startup probe's value
 	// becomes C1's cli_version (C-1 的取值来源与声明域).
 	CLIVersion string            `json:"cli_version"`
@@ -118,6 +152,12 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "daemon_id does not belong to this job")
 		return
 	}
+	if claims.Role != catalogProbeRole && req.WorkspaceID != "" && req.WorkspaceID != claims.WorkspaceID {
+		// A task Job registers only under its own workspace; a workspace
+		// mismatch is the cross-workspace impersonation case (§2.1).
+		writeError(w, http.StatusForbidden, "workspace does not belong to this job")
+		return
+	}
 	if claims.Role == catalogProbeRole {
 		s.registerProbe(w, r, claims, req)
 		return
@@ -134,9 +174,14 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// only ever confirm an id it currently holds; when neither resolves, the
 	// registration is refused instead of answered for another profile or for
 	// the same type's builtin.
+	client := s.clientFor(e.WorkspaceID)
+	if client == nil {
+		writeError(w, http.StatusForbidden, "workspace is not configured")
+		return
+	}
 	identity := e.RuntimeIdentity
 	if identity == "" {
-		identity, _ = s.client.RuntimeIdentity(e.RealRuntimeID)
+		identity, _ = client.RuntimeIdentity(e.RealRuntimeID)
 	}
 	declared, matched := selectDeclaredRuntime(req.Runtimes, identity)
 	if !matched {
@@ -166,7 +211,7 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	})
 	registered, stillLive := s.reg.MarkDaemonRegistered(claims.JobName, time.Now())
 	s.log.Info("daemon.registered",
-		"task_id", e.TaskID, "job_name", e.JobName,
+		"task_id", e.TaskID, "job_name", e.JobName, "workspace_id", e.WorkspaceID,
 		"daemon_id", claims.JobName, "job_runtime_id", e.JobRuntimeID,
 		"profile_id", declared.ProfileID,
 		"remote_addr", r.RemoteAddr)
@@ -181,7 +226,7 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	if declared.ProfileID != "" {
 		answer["profile_id"] = declared.ProfileID
 	}
-	respBody := workspaceStateResponse(s.client.WorkspaceState())
+	respBody := workspaceStateResponse(client.WorkspaceState())
 	respBody["runtimes"] = []map[string]any{answer}
 	writeRaw(w, http.StatusOK, mustMarshal(respBody))
 	// The task is deliverable from this moment (S30 push; idempotent —
@@ -296,6 +341,12 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 	// is the re-delivery the expired window released — while the window test
 	// itself stays in the registry's gate (one clock, one decision).
 	pending, pendingOK := s.reg.ByDaemon(req.DaemonID)
+	if pendingOK && pending.WorkspaceID != claims.WorkspaceID {
+		// The token addresses another workspace's task: the cross-workspace
+		// impersonation case, judged like a cross-Job one (§2.1).
+		writeError(w, http.StatusForbidden, "task does not belong to this workspace")
+		return
+	}
 	if pendingOK {
 		// Every listed runtime must be this Job's own (S6 归属判据): one
 		// foreign value refuses the batch even beside the Job's own id.
@@ -367,7 +418,12 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
-	ready, err := s.client.PrepareLease(r.Context(), entry.RealRuntimeID, tid)
+	client := s.clientFor(entry.WorkspaceID)
+	if client == nil {
+		writeError(w, http.StatusForbidden, "workspace is not configured")
+		return
+	}
+	ready, err := client.PrepareLease(r.Context(), entry.RealRuntimeID, tid)
 	switch {
 	case errors.Is(err, scheduler.ErrTaskNotFound):
 		if verr := s.sched.OnTaskVanished(r.Context(), tid); verr != nil {
@@ -396,10 +452,16 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 // forward switch: non-terminal 404 → OnTaskVanished; §4.6).
 func (s *FakeServer) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 	tid := r.PathValue("tid")
-	if _, ok := s.authenticate(w, r, auth.RequestScope{TaskID: tid}); !ok {
+	claims, ok := s.authenticate(w, r, auth.RequestScope{TaskID: tid})
+	if !ok {
 		return
 	}
-	code, resp, err := s.client.TaskStatusRaw(r.Context(), tid)
+	client := s.clientFor(claims.WorkspaceID)
+	if client == nil {
+		writeError(w, http.StatusForbidden, "workspace is not configured")
+		return
+	}
+	code, resp, err := client.TaskStatusRaw(r.Context(), tid)
 	if errors.Is(err, scheduler.ErrTaskNotFound) {
 		if verr := s.sched.OnTaskVanished(r.Context(), tid); verr != nil {
 			s.log.Error("task vanish settlement failed", "task_id", tid, "err", verr)
@@ -420,10 +482,16 @@ func (s *FakeServer) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 // (GC is disabled Job-side; the endpoint stays truthful if enabled, S20).
 func (s *FakeServer) handleTaskGCCheck(w http.ResponseWriter, r *http.Request) {
 	tid := r.PathValue("tid")
-	if _, ok := s.authenticate(w, r, auth.RequestScope{TaskID: tid}); !ok {
+	claims, ok := s.authenticate(w, r, auth.RequestScope{TaskID: tid})
+	if !ok {
 		return
 	}
-	code, resp, err := s.client.GCCheck(r.Context(), tid)
+	client := s.clientFor(claims.WorkspaceID)
+	if client == nil {
+		writeError(w, http.StatusForbidden, "workspace is not configured")
+		return
+	}
+	code, resp, err := client.GCCheck(r.Context(), tid)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream unavailable")
 		return
@@ -506,7 +574,7 @@ func (s *FakeServer) learnSession(e registry.TaskEntry, body []byte) string {
 		return ""
 	}
 	if e.NodeName != "" {
-		s.reg.LearnSession(registry.SessionKey(report.SessionID), e.NodeName)
+		s.reg.LearnSession(e.WorkspaceID, registry.SessionKey(report.SessionID), e.NodeName)
 	}
 	return report.SessionID
 }
@@ -556,14 +624,15 @@ func (s *FakeServer) handleTokenRenew(w http.ResponseWriter, r *http.Request) {
 // input; the task and runtime ids never reach it.
 func (s *FakeServer) handleSkillBundles(w http.ResponseWriter, r *http.Request) {
 	tid, rid := r.PathValue("tid"), r.PathValue("rid")
-	if _, ok := s.authenticate(w, r, auth.RequestScope{TaskID: tid, RuntimeID: rid}); !ok {
+	claims, ok := s.authenticate(w, r, auth.RequestScope{TaskID: tid, RuntimeID: rid})
+	if !ok {
 		return
 	}
 	body, ok := s.readBody(w, r)
 	if !ok {
 		return
 	}
-	code, resp, err := s.bundles.Resolve(r.Context(), tid, rid, body)
+	code, resp, err := s.bundlesFor(claims.WorkspaceID).Resolve(r.Context(), tid, rid, body)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream unavailable")
 		return

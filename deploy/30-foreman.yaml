@@ -60,6 +60,11 @@ spec:
             # --- server identity / credentials ---
             - name: MULTICA_SERVER_URL
               value: "http://multica.tsic.top"
+            # Single-workspace form. For one deployment serving several
+            # workspaces, drop the three identity keys and mount the identity
+            # list instead (deploy/README.md §Multi-workspace):
+            #   - name: FOREMAN_WORKSPACES_FILE
+            #     value: /etc/foreman/workspaces.json
             - name: MULTICA_WORKSPACE_ID
               value: "f311e8ff-e026-4c6e-b267-dcc004f08782"
             - name: MULTICA_TOKEN

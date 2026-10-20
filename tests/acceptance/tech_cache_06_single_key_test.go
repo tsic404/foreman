@@ -67,7 +67,7 @@ func TestCache06SingleKeySemantics(t *testing.T) {
 			Agent: tcAgentObject{Name: "agent-1"},
 		})
 		h.reg.SetNode("task-1", "node-a")
-		h.reg.LearnSession(registry.SessionKey("sess-sat"), "node-a")
+		h.reg.LearnSession("ws-1", registry.SessionKey("sess-sat"), "node-a")
 
 		tcClaimOnClaim(t, h, tcClaimPayloadBody{
 			ID: "task-2", AgentID: "agent-1", WorkspaceID: "ws-1", RuntimeID: "rid-zz",
@@ -75,7 +75,7 @@ func TestCache06SingleKeySemantics(t *testing.T) {
 			Agent: tcAgentObject{Name: "agent-1"},
 		})
 		// The key is resolvable; only the cap explains the drop.
-		if got := h.reg.LastNodeForSession(registry.SessionKey("sess-sat")); got != "node-a" {
+		if got := h.reg.LastNodeForSession("ws-1", registry.SessionKey("sess-sat")); got != "node-a" {
 			t.Fatalf("session index = %q, want node-a (the positive control)", got)
 		}
 		if affinity := h.createdJob(t, "fm-task-2").Spec.Template.Spec.Affinity; affinity != nil {
@@ -101,8 +101,8 @@ func TestCache06SingleKeySemantics(t *testing.T) {
 		tcPrepareRuntimes(t, h)
 		h.rebuildScheduler(t, func(c *scheduler.Config) { c.MaxJobsPerNode = 4 })
 
-		h.reg.LearnSession(registry.SessionKey("sess-off"), "node-a")
-		if got := h.reg.LastNodeForSession(registry.SessionKey("sess-off")); got != "node-a" {
+		h.reg.LearnSession("ws-1", registry.SessionKey("sess-off"), "node-a")
+		if got := h.reg.LastNodeForSession("ws-1", registry.SessionKey("sess-off")); got != "node-a" {
 			t.Fatalf("session index = %q, want node-a (the key is resolvable; the switch is the only suppressant)", got)
 		}
 		tcClaimOnClaim(t, h, tcClaimPayloadBody{
@@ -121,12 +121,12 @@ func TestCache06SingleKeySemantics(t *testing.T) {
 		tcPrepareRuntimes(t, h)
 		h.rebuildScheduler(t, func(c *scheduler.Config) { c.MaxJobsPerNode = 4 })
 
-		h.reg.LearnSession(registry.SessionKey("sess-ttl"), "node-a")
+		h.reg.LearnSession("ws-1", registry.SessionKey("sess-ttl"), "node-a")
 		time.Sleep(5 * time.Millisecond)
 		if dropped := h.reg.PruneExpiredSessions(time.Millisecond); dropped != 1 {
 			t.Fatalf("pruned entries = %d, want the one expired entry", dropped)
 		}
-		if got := h.reg.LastNodeForSession(registry.SessionKey("sess-ttl")); got != "" {
+		if got := h.reg.LastNodeForSession("ws-1", registry.SessionKey("sess-ttl")); got != "" {
 			t.Fatalf("session index = %q after expiry, want the entry gone", got)
 		}
 		tcClaimOnClaim(t, h, tcClaimPayloadBody{

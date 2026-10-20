@@ -107,6 +107,11 @@ type Config struct {
 	// PolicyNameResolutionTimeout is FOREMAN_POLICY_NAME_RESOLUTION_TIMEOUT:
 	// the bounded window the startup resolution of all policy keys shares.
 	PolicyNameResolutionTimeout time.Duration
+	// WorkspaceIDs is the configured workspace set. A policy file's flat
+	// sections are the legacy single-workspace form: with more than one
+	// workspace configured they are ambiguous and refuse startup (§8.5 键空间
+	// = workspace × 名字).
+	WorkspaceIDs []string
 
 	Issuer TokenIssuer
 	Nodes  NodeIndex

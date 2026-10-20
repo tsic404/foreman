@@ -156,7 +156,7 @@ func TestIntegrationFailedJobIsCompensated(t *testing.T) {
 	if len(fails) != 1 || fails[0].reason != scheduler.FailureReasonJobFailed {
 		t.Fatalf("fail forwards = %+v, want one job_failed report", fails)
 	}
-	if !reg.IsDone("t1") {
+	if !reg.IsDone(entry.WorkspaceID, "t1") {
 		t.Fatal("the task must be settled terminal after the compensation")
 	}
 	// The verdict deletes the Job but starts the drain: the entry and the
@@ -726,6 +726,12 @@ func (s *fakeServerClient) Forward(_ context.Context, ep scheduler.Endpoint, tas
 	call.code = code
 	s.calls = append(s.calls, call)
 	return code, []byte(`{}`), nil
+}
+
+// ForwardInWorkspace is the single-workspace fixture's routing face: one
+// credential serves every task, so the persisted workspace only names it.
+func (s *fakeServerClient) ForwardInWorkspace(ctx context.Context, ep scheduler.Endpoint, taskID, _ string, body []byte) (int, []byte, error) {
+	return s.Forward(ctx, ep, taskID, body)
 }
 
 // setForwardCode programs the answer of every following forward (0 → 200).

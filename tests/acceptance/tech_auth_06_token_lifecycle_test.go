@@ -109,7 +109,7 @@ func TestAuth06TokenLifetimeFollowsJobTermination(t *testing.T) {
 	if _, ok := h.reg.Get("task-1"); ok {
 		t.Error("the entry survived the reclaim")
 	}
-	if !h.reg.IsDone("task-1") {
+	if !h.reg.IsDone("ws-1", "task-1") {
 		t.Error("the done index lost the terminal record")
 	}
 	if got := len(h.jobs.deletedSecretNames()); got != secretDeletesAtVerdict+1 {

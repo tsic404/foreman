@@ -28,7 +28,7 @@ func (f fakeRegistry) ByDaemon(daemonID string) (JobEntry, bool) {
 
 type fakeDone map[string]bool
 
-func (f fakeDone) IsDone(taskID string) bool { return f[taskID] }
+func (f fakeDone) IsDone(workspaceID, taskID string) bool { return f[taskID] }
 
 func fixedClock(t time.Time) func() time.Time { return func() time.Time { return t } }
 
@@ -100,7 +100,7 @@ func TestNewIssuerRejectsNonPositiveTTL(t *testing.T) {
 
 func TestVerifyOK(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1"}}
+	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1", WorkspaceID: "ws-1"}}
 	iss := newTestIssuer(now, jobs, fakeDone{})
 	token, err := iss.Issue("fm-task-1", "task-1", "ws-1", time.Hour)
 	if err != nil {
@@ -151,7 +151,7 @@ func TestVerifyMalformed(t *testing.T) {
 
 func TestVerifyBadSignature(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1"}}
+	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1", WorkspaceID: "ws-1"}}
 	iss := newTestIssuer(now, jobs, fakeDone{})
 	token, err := iss.Issue("fm-task-1", "task-1", "ws-1", time.Hour)
 	if err != nil {
@@ -181,7 +181,7 @@ func TestVerifyBadSignature(t *testing.T) {
 
 func TestVerifyExpired(t *testing.T) {
 	issued := time.Unix(1_700_000_000, 0)
-	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1"}}
+	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1", WorkspaceID: "ws-1"}}
 	token, err := newTestIssuer(issued, jobs, fakeDone{}).Issue("fm-task-1", "task-1", "ws-1", time.Hour)
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
@@ -202,7 +202,7 @@ func TestVerifyExpired(t *testing.T) {
 
 func TestVerifyRevoked(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1"}}
+	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1", WorkspaceID: "ws-1"}}
 	iss := newTestIssuer(now, jobs, fakeDone{})
 	token, err := iss.Issue("fm-task-1", "task-1", "ws-1", time.Hour)
 	if err != nil {
@@ -224,7 +224,7 @@ func TestVerifyRevoked(t *testing.T) {
 
 func TestVerifyExpiredBeatsRevoked(t *testing.T) {
 	issued := time.Unix(1_700_000_000, 0)
-	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1"}}
+	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1", WorkspaceID: "ws-1"}}
 	token, err := newTestIssuer(issued, jobs, fakeDone{}).Issue("fm-task-1", "task-1", "ws-1", time.Hour)
 	if err != nil {
 		t.Fatalf("Issue: %v", err)
@@ -281,7 +281,7 @@ func TestVerifyLateReplay(t *testing.T) {
 
 	// Entry still present (task terminal, Job draining): a live entry is
 	// adjudicated normally, so the retry is not a late replay.
-	iss = newTestIssuer(now, fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1"}}, fakeDone{"task-1": true})
+	iss = newTestIssuer(now, fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1", WorkspaceID: "ws-1"}}, fakeDone{"task-1": true})
 	claims, err = iss.Verify(token, req)
 	if err != nil {
 		t.Fatalf("Verify: %v", err)
@@ -325,7 +325,7 @@ func TestVerifyLateReplayScopeMismatch(t *testing.T) {
 // token, including on non-terminal endpoints.
 func TestVerifyDrainWindowEntryStillValid(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1"}}
+	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1", WorkspaceID: "ws-1"}}
 	iss := newTestIssuer(now, jobs, fakeDone{"task-1": true})
 	token, err := iss.Issue("fm-task-1", "task-1", "ws-1", time.Hour)
 	if err != nil {
@@ -349,7 +349,7 @@ func TestVerifyDrainWindowEntryStillValid(t *testing.T) {
 
 func TestVerifyScopeMismatch(t *testing.T) {
 	now := time.Unix(1_700_000_000, 0)
-	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1"}}
+	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1", WorkspaceID: "ws-1"}}
 	iss := newTestIssuer(now, jobs, fakeDone{})
 	token, err := iss.Issue("fm-task-1", "task-1", "ws-1", time.Hour)
 	if err != nil {

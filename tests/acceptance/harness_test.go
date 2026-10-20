@@ -220,6 +220,9 @@ const forwardProbeBulkBytes = 33<<20 + 7
 // upstreamStub is the server side of C1–C21 as the scenarios need it.
 type upstreamStub struct {
 	mu sync.Mutex
+	// workspaceID is the workspace the C-17 answer names (a multi-workspace
+	// fixture gives each stub its own).
+	workspaceID string
 	// registerIDs maps a declared provider type to the runtime id the server
 	// answers with; a missing entry means the provider is not registered.
 	// profileIDs holds the profile identities, keyed by RuntimeIdentityKey.
@@ -474,7 +477,13 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 	// production loop needs these to answer as the server does before C3 runs.
 	mux.HandleFunc("GET /api/daemon/workspaces", func(w http.ResponseWriter, r *http.Request) {
 		stub.record(r, "/api/daemon/workspaces", nil)
-		writeJSON(w, http.StatusOK, []map[string]string{{"id": "ws-1", "name": "foreman"}})
+		stub.mu.Lock()
+		id := stub.workspaceID
+		stub.mu.Unlock()
+		if id == "" {
+			id = "ws-1"
+		}
+		writeJSON(w, http.StatusOK, []map[string]string{{"id": id, "name": "foreman"}})
 	})
 	mux.HandleFunc("GET /api/daemon/workspaces/{wid}/runtime-profiles", func(w http.ResponseWriter, r *http.Request) {
 		stub.record(r, r.URL.Path, nil)
@@ -800,6 +809,13 @@ func (s *upstreamStub) idFor(provider, profileID string) (string, bool) {
 }
 
 // setRuntimeID maps one identity to the runtime id the C1 answer carries.
+// setWorkspaceID makes the C-17 answer name this workspace.
+func (s *upstreamStub) setWorkspaceID(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.workspaceID = id
+}
+
 func (s *upstreamStub) setRuntimeID(provider, profileID, id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1669,7 +1685,7 @@ func projectIDFor(name string) string { return "pid-" + name }
 // boot with this resolver proceeds for both sections.
 type projectNameResolver struct{}
 
-func (projectNameResolver) ResolveName(_ context.Context, kind, name string) (jobbuilder.NameResolution, error) {
+func (projectNameResolver) ResolveName(_ context.Context, _, kind, name string) (jobbuilder.NameResolution, error) {
 	if kind != jobbuilder.PolicyKeyProject {
 		return jobbuilder.NameResolution{Conclusion: jobbuilder.NameUnavailable}, nil
 	}
@@ -1692,7 +1708,9 @@ func (payloadProjectIdentity) FromPayload(task json.RawMessage) string {
 	return strings.TrimSpace(head.ProjectID)
 }
 
-func (payloadProjectIdentity) ByIssue(context.Context, string) (string, error) { return "", nil }
+func (payloadProjectIdentity) ByIssue(context.Context, string, string) (string, error) {
+	return "", nil
+}
 
 // countingProjectIdentity is payloadProjectIdentity with a reverse-lookup
 // counter, so "the lookup did not happen" is an assertion.
@@ -1711,7 +1729,7 @@ func (c *countingProjectIdentity) FromPayload(task json.RawMessage) string {
 	return strings.TrimSpace(head.ProjectID)
 }
 
-func (c *countingProjectIdentity) ByIssue(_ context.Context, issueID string) (string, error) {
+func (c *countingProjectIdentity) ByIssue(_ context.Context, _, issueID string) (string, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.calls = append(c.calls, issueID)
@@ -1780,11 +1798,11 @@ type lateProbeRunner struct {
 	sched *scheduler.Scheduler
 }
 
-func (l *lateProbeRunner) RunDiscoveryProbe(ctx context.Context) (registry.Discovery, error) {
+func (l *lateProbeRunner) RunDiscoveryProbe(ctx context.Context, workspaceID string) (registry.Discovery, error) {
 	if l.sched == nil {
 		return registry.Discovery{}, errors.New("scheduler not wired")
 	}
-	return l.sched.RunDiscoveryProbe(ctx)
+	return l.sched.RunDiscoveryProbe(ctx, workspaceID)
 }
 
 // schedulerServerClient is the scheduler's server seam.
@@ -1875,6 +1893,12 @@ func (c *schedulerServerClient) Forward(_ context.Context, ep scheduler.Endpoint
 		}
 	}
 	return code, []byte(`{"status":"ok"}`), nil
+}
+
+// ForwardInWorkspace is the single-workspace fixture's routing face: one
+// credential serves every task, so the persisted workspace only names it.
+func (c *schedulerServerClient) ForwardInWorkspace(ctx context.Context, ep scheduler.Endpoint, taskID, _ string, body []byte) (int, []byte, error) {
+	return c.Forward(ctx, ep, taskID, body)
 }
 
 // appliedTerminalWrites returns the terminal write the stub applied for the

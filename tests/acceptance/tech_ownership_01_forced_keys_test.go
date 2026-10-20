@@ -129,15 +129,16 @@ func TestOwnership01DomainClearedAndRewritten(t *testing.T) {
 		t.Errorf("job annotations = %v, want the set plus claimed-at/attempt", job.Annotations)
 	}
 
-	// Pod side: exactly three Foreman labels (no managed-by — that key is
+	// Pod side: the four Foreman labels (no managed-by — that key is
 	// Job-side only, so the template's pod-side value is discarded, not kept)
 	// plus the deployer's own key.
 	podLabels := job.Spec.Template.Labels
 	wantPodLabels := map[string]string{
-		labelAppNameOwnership:  "foreman-job",
-		registry.LabelTaskID:   "task-1",
-		labelDaemonIDOwnership: "fm-task-1",
-		"cost-center":          "platform",
+		labelAppNameOwnership:     "foreman-job",
+		registry.LabelTaskID:      "task-1",
+		labelDaemonIDOwnership:    "fm-task-1",
+		registry.LabelWorkspaceID: "ws-1",
+		"cost-center":             "platform",
 	}
 	if len(podLabels) != len(wantPodLabels) {
 		t.Fatalf("pod labels = %v, want exactly %v", podLabels, wantPodLabels)

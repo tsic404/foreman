@@ -3,6 +3,8 @@ package proxy
 import (
 	"errors"
 	"fmt"
+	"net/http"
+	"strings"
 	"time"
 )
 
@@ -16,6 +18,39 @@ type StatusError struct {
 
 func (e *StatusError) Error() string {
 	return fmt.Sprintf("server returned %d: %s", e.Code, truncate(e.Body, 200))
+}
+
+// WorkspaceMismatchError reports C17 answering a workspace set that does not
+// include the configured workspace: the credential is bound to another
+// workspace, which is a configuration error, not a transient upstream
+// failure (§1.1, §1.5, AC-86). Visible carries the answer's workspace ids so
+// the startup log can name both sides without a second request.
+type WorkspaceMismatchError struct {
+	Configured string
+	Visible    []string
+}
+
+func (e *WorkspaceMismatchError) Error() string {
+	visible := strings.Join(e.Visible, ",")
+	if visible == "" {
+		visible = "none"
+	}
+	return fmt.Sprintf("workspace %s not visible to the server token (visible: %s)", e.Configured, visible)
+}
+
+// IsCredentialConfigError reports the credential defects the startup
+// self-check refuses to start on: the daemon credential is not bound to the
+// configured workspace (C17 mismatch) or the server rejects it outright
+// (§1.1, §1.5). Only the startup path treats this as fatal — a failure seen
+// by a running workspace loop is confined to that workspace and retried
+// (AC-86).
+func IsCredentialConfigError(err error) bool {
+	var mismatch *WorkspaceMismatchError
+	if errors.As(err, &mismatch) {
+		return true
+	}
+	var status *StatusError
+	return errors.As(err, &status) && (status.Code == http.StatusUnauthorized || status.Code == http.StatusForbidden)
 }
 
 // ErrTerminalUndelivered reports a terminal forward (C9–C11) whose retry

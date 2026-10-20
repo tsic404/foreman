@@ -22,7 +22,7 @@ import (
 // credential, no runtime detail.
 var observability03FailureFields = map[string]bool{
 	"time": true, "level": true, "msg": true, "component": true,
-	"task_id": true, "job_name": true, "phase": true, "err": true,
+	"task_id": true, "job_name": true, "workspace_id": true, "phase": true, "err": true,
 }
 
 // assertCreateFailure judges one create-failure path end to end. secretCreated

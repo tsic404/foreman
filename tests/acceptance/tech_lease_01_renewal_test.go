@@ -340,7 +340,7 @@ func TestTechLease01InterruptedRenewalIsRecognizedAndRunsOnce(t *testing.T) {
 	if n := len(h.reg.List()); n != 1 {
 		t.Errorf("registry entries = %d, want 1 (the discarded attempt left nothing behind)", n)
 	}
-	if h.reg.IsDone(lease01Task) {
+	if h.reg.IsDone("ws-1", lease01Task) {
 		t.Error("the discarded attempt must not settle the task in the done index")
 	}
 	// Discarded, not accumulated: the old attempt's Job went (the claim path

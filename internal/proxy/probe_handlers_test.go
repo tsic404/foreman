@@ -35,7 +35,11 @@ func startProbeTokenBudget(t *testing.T, r *testRig, requestID, realRuntimeID st
 // caller's control: the registration-discovery probe owns no command.
 func startProbeTokenMode(t *testing.T, r *testRig, requestID, realRuntimeID string, mode registry.ProbeMode, budget time.Duration) (string, registry.ProbeSession) {
 	t.Helper()
-	handle, err := r.sched.StartProbe(t.Context(), requestID, realRuntimeID, mode, budget)
+	workspaceID := ""
+	if mode == registry.ProbeCommandDriven {
+		workspaceID = "ws-1"
+	}
+	handle, err := r.sched.StartProbe(t.Context(), requestID, realRuntimeID, workspaceID, mode, budget)
 	if err != nil {
 		t.Fatalf("StartProbe: %v", err)
 	}

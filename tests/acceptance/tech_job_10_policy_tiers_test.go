@@ -359,7 +359,7 @@ func (tcPolicyAxisProjectIdentity) FromPayload(task json.RawMessage) string {
 	return strings.TrimSpace(head.ProjectID)
 }
 
-func (tcPolicyAxisProjectIdentity) ByIssue(context.Context, string) (string, error) {
+func (tcPolicyAxisProjectIdentity) ByIssue(context.Context, string, string) (string, error) {
 	return "", nil
 }
 
@@ -367,7 +367,7 @@ func (tcPolicyAxisProjectIdentity) ByIssue(context.Context, string) (string, err
 // name" for every key.
 type tcPolicyAxisAbsentResolver struct{}
 
-func (tcPolicyAxisAbsentResolver) ResolveName(context.Context, string, string) (jobbuilder.NameResolution, error) {
+func (tcPolicyAxisAbsentResolver) ResolveName(context.Context, string, string, string) (jobbuilder.NameResolution, error) {
 	return jobbuilder.NameResolution{Conclusion: jobbuilder.NameAbsent}, nil
 }
 
@@ -378,7 +378,7 @@ type tcPolicyAxisResolvedResolver struct{}
 // ResolveName resolves every key; a project key answers the name itself as its
 // platform identifier, which keeps the runtime index addressable from a claim
 // carrying the same identifier.
-func (tcPolicyAxisResolvedResolver) ResolveName(_ context.Context, kind, name string) (jobbuilder.NameResolution, error) {
+func (tcPolicyAxisResolvedResolver) ResolveName(_ context.Context, _, kind, name string) (jobbuilder.NameResolution, error) {
 	identifier := ""
 	if kind == jobbuilder.PolicyKeyProject {
 		identifier = projectIDFor(name)

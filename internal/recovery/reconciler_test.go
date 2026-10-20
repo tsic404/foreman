@@ -1224,7 +1224,7 @@ func TestReconcileRecordsPodNodePlacement(t *testing.T) {
 	}
 	// Placement feeds the per-node cap and the terminal report, never the
 	// session index: only S13/S14 teach it (ADR-015).
-	if last := reg.LastNodeForSession(registry.SessionKey(e.PriorSessionID)); last != "" {
+	if last := reg.LastNodeForSession(e.WorkspaceID, registry.SessionKey(e.PriorSessionID)); last != "" {
 		t.Fatalf("LastNodeForSession = %q, want empty before a terminal report", last)
 	}
 }
@@ -1253,9 +1253,9 @@ func TestReconcileLeavesNodeEmptyWhilePodIsPending(t *testing.T) {
 func TestReconcileExpiresSessionIndexEntries(t *testing.T) {
 	now := time.Now()
 	reg := registry.New(func() time.Time { return now })
-	reg.LearnSession("sess-stale", "company-02")
+	reg.LearnSession("ws-1", "sess-stale", "company-02")
 	now = now.Add(2 * time.Hour)
-	reg.LearnSession("sess-fresh", "company-03")
+	reg.LearnSession("ws-1", "sess-fresh", "company-03")
 
 	r, err := New(Config{ReconcileInterval: time.Minute, AgentStateTTL: time.Hour},
 		reg, &fakeObjects{}, &fakeStatus{}, &fakeSettler{})
@@ -1265,10 +1265,10 @@ func TestReconcileExpiresSessionIndexEntries(t *testing.T) {
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if got := reg.LastNodeForSession("sess-stale"); got != "" {
+	if got := reg.LastNodeForSession("ws-1", "sess-stale"); got != "" {
 		t.Fatalf("expired entry still points at %q", got)
 	}
-	if got := reg.LastNodeForSession("sess-fresh"); got != "company-03" {
+	if got := reg.LastNodeForSession("ws-1", "sess-fresh"); got != "company-03" {
 		t.Fatalf("fresh entry = %q, want company-03", got)
 	}
 }

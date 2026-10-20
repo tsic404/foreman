@@ -19,7 +19,7 @@ type fakeDiscoveryRunner struct {
 	err   error
 }
 
-func (f *fakeDiscoveryRunner) RunDiscoveryProbe(context.Context) (registry.Discovery, error) {
+func (f *fakeDiscoveryRunner) RunDiscoveryProbe(_ context.Context, _ string) (registry.Discovery, error) {
 	f.calls++
 	return f.disc, f.err
 }

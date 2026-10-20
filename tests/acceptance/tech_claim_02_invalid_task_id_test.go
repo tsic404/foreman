@@ -118,7 +118,7 @@ func TestClaimInvalidTaskIDLeavesReclaimableEntry(t *testing.T) {
 	if _, ok := h.reg.Get("TASK-1"); ok {
 		t.Fatal("entry survived the reclaim")
 	}
-	if !h.reg.IsDone("TASK-1") {
+	if !h.reg.IsDone("ws-1", "TASK-1") {
 		t.Fatal("terminal record lost by the reclaim")
 	}
 }

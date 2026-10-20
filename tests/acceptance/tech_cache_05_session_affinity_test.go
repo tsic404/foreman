@@ -99,14 +99,14 @@ func TestCache05SessionResumeAffinity(t *testing.T) {
 		[]byte(`{"session_id":"/state/home/.multica/pi-sessions/s16-only.jsonl"}`)); code != 200 {
 		t.Fatalf("S16 = %d (%s), want 200", code, body)
 	}
-	if got := h.reg.LastNodeForSession(registry.SessionKey("s16-only")); got != "" {
+	if got := h.reg.LastNodeForSession("ws-1", registry.SessionKey("s16-only")); got != "" {
 		t.Errorf("S16 taught the index node %q, want no learning outside S13/S14", got)
 	}
 	if code, body := h.call("POST", "/api/daemon/tasks/task-1/complete", token,
 		[]byte(`{"result":"ok","session_id":"/state/home/.multica/pi-sessions/chat-sess.jsonl"}`)); code != 200 {
 		t.Fatalf("S13 = %d (%s), want 200", code, body)
 	}
-	if got := h.reg.LastNodeForSession(registry.SessionKey("chat-sess")); got != "node-b" {
+	if got := h.reg.LastNodeForSession("ws-1", registry.SessionKey("chat-sess")); got != "node-b" {
 		t.Fatalf("learning face recorded node %q, want node-b (path and bare spellings share one key)", got)
 	}
 

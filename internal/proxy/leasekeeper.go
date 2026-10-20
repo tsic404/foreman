@@ -47,13 +47,25 @@ type LeaseKeeper struct {
 	reg      *registry.Registry
 	hooks    LeaseHooks
 	interval time.Duration
-	now      func() time.Time
-	log      *slog.Logger
+	// workspace filters the round to one workspace's entries: each
+	// (credential, daemon identity) pair renews only its own tasks (§1.4
+	// 失败粒度含 workspace). Empty keeps the legacy global round.
+	workspace string
+	now       func() time.Time
+	log       *slog.Logger
+}
+
+// LeaseKeeperOption customizes a LeaseKeeper.
+type LeaseKeeperOption func(*LeaseKeeper)
+
+// WithLeaseWorkspace binds the keeper to one workspace's entries.
+func WithLeaseWorkspace(workspaceID string) LeaseKeeperOption {
+	return func(k *LeaseKeeper) { k.workspace = workspaceID }
 }
 
 // NewLeaseKeeper builds the keeper; interval is cfg.LeaseRefreshInterval.
-func NewLeaseKeeper(client LeaseClient, reg *registry.Registry, hooks LeaseHooks, interval time.Duration) *LeaseKeeper {
-	return &LeaseKeeper{
+func NewLeaseKeeper(client LeaseClient, reg *registry.Registry, hooks LeaseHooks, interval time.Duration, opts ...LeaseKeeperOption) *LeaseKeeper {
+	k := &LeaseKeeper{
 		client:   client,
 		reg:      reg,
 		hooks:    hooks,
@@ -61,6 +73,10 @@ func NewLeaseKeeper(client LeaseClient, reg *registry.Registry, hooks LeaseHooks
 		now:      time.Now,
 		log:      slog.Default().With("component", "lease-keeper"),
 	}
+	for _, opt := range opts {
+		opt(k)
+	}
+	return k
 }
 
 // Run renews leases until ctx ends.
@@ -77,6 +93,9 @@ func (k *LeaseKeeper) Run(ctx context.Context) error {
 func (k *LeaseKeeper) round(ctx context.Context) {
 	for _, e := range k.reg.List() {
 		if !leaseable(e) {
+			continue
+		}
+		if k.workspace != "" && e.WorkspaceID != k.workspace {
 			continue
 		}
 		if e.RealRuntimeID == "" {

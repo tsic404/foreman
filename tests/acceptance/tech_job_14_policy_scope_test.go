@@ -40,8 +40,8 @@ agents:
 // never saturated, so the template's <preferred node> item resolves.
 type tcJob14NodeIndex struct{}
 
-func (tcJob14NodeIndex) LastNodeForSession(string) string { return "node-a" }
-func (tcJob14NodeIndex) Saturated(string) bool            { return false }
+func (tcJob14NodeIndex) LastNodeForSession(string, string) string { return "node-a" }
+func (tcJob14NodeIndex) Saturated(string) bool                    { return false }
 
 // tcJob14Entry is the task both renders of one case share: the same entry is
 // what makes their diff attributable to the policy alone.

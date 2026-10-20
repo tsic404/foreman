@@ -28,23 +28,23 @@ func TestSessionKey(t *testing.T) {
 
 func TestLearnSessionAndLookup(t *testing.T) {
 	r := New(fixedClock())
-	if got := r.LastNodeForSession("sess-1"); got != "" {
+	if got := r.LastNodeForSession("ws-1", "sess-1"); got != "" {
 		t.Fatalf("unknown key = %q, want empty", got)
 	}
-	r.LearnSession("", "node-a") // no key
-	r.LearnSession("sess-1", "") // no node
-	if got := r.LastNodeForSession(""); got != "" {
+	r.LearnSession("ws-1", "", "node-a") // no key
+	r.LearnSession("ws-1", "sess-1", "") // no node
+	if got := r.LastNodeForSession("ws-1", ""); got != "" {
 		t.Fatalf("empty key learned: %q", got)
 	}
 
-	r.LearnSession("sess-1", "node-a")
-	if got := r.LastNodeForSession("sess-1"); got != "node-a" {
+	r.LearnSession("ws-1", "sess-1", "node-a")
+	if got := r.LastNodeForSession("ws-1", "sess-1"); got != "node-a" {
 		t.Fatalf("LastNodeForSession = %q, want node-a", got)
 	}
 	// Re-learning the same key refreshes node and timestamp: the later report
 	// says where the session is now.
-	r.LearnSession("sess-1", "node-b")
-	if got := r.LastNodeForSession("sess-1"); got != "node-b" {
+	r.LearnSession("ws-1", "sess-1", "node-b")
+	if got := r.LastNodeForSession("ws-1", "sess-1"); got != "node-b" {
 		t.Fatalf("re-learned key = %q, want node-b", got)
 	}
 }
@@ -52,18 +52,18 @@ func TestLearnSessionAndLookup(t *testing.T) {
 func TestPruneExpiredSessions(t *testing.T) {
 	now := testNow
 	r := New(func() time.Time { return now })
-	r.LearnSession("stale", "node-a")
+	r.LearnSession("ws-1", "stale", "node-a")
 	now = now.Add(2 * time.Hour)
 	learnedFresh := now
-	r.LearnSession("fresh", "node-b")
+	r.LearnSession("ws-1", "fresh", "node-b")
 
 	if dropped := r.PruneExpiredSessions(time.Hour); dropped != 1 {
 		t.Fatalf("dropped = %d, want 1", dropped)
 	}
-	if got := r.LastNodeForSession("stale"); got != "" {
+	if got := r.LastNodeForSession("ws-1", "stale"); got != "" {
 		t.Fatalf("expired key survived: %q", got)
 	}
-	if got := r.LastNodeForSession("fresh"); got != "node-b" {
+	if got := r.LastNodeForSession("ws-1", "fresh"); got != "node-b" {
 		t.Fatalf("fresh key dropped: %q", got)
 	}
 	// An entry exactly at the window's edge is still inside it: the rule is
@@ -78,7 +78,7 @@ func TestPruneExpiredSessions(t *testing.T) {
 	if dropped := r.PruneExpiredSessions(0); dropped != 0 {
 		t.Fatalf("ttl=0 dropped %d entries", dropped)
 	}
-	if got := r.LastNodeForSession("fresh"); got != "node-b" {
+	if got := r.LastNodeForSession("ws-1", "fresh"); got != "node-b" {
 		t.Fatalf("ttl=0 evicted a live key: %q", got)
 	}
 }

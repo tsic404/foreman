@@ -42,7 +42,7 @@ func TestCatalog05ProbeCredentialAndIsolationFaces(t *testing.T) {
 		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
 	t.Cleanup(ops.Close)
 
-	if _, err := h.sched.StartProbe(t.Context(), requestID, "rid-omp", registry.ProbeCommandDriven, h.schedCfg.ModelCatalogTimeout); err != nil {
+	if _, err := h.sched.StartProbe(t.Context(), requestID, "rid-omp", h.schedCfg.WorkspaceID, registry.ProbeCommandDriven, h.schedCfg.ModelCatalogTimeout); err != nil {
 		t.Fatalf("StartProbe: %v", err)
 	}
 	job := h.createdJob(t, probeName)
@@ -55,10 +55,15 @@ func TestCatalog05ProbeCredentialAndIsolationFaces(t *testing.T) {
 	if cred.Labels[registry.LabelRole] != registry.RoleCatalogProbe {
 		t.Errorf("probe Secret labels = %v, want the catalog-probe role", cred.Labels)
 	}
-	for _, key := range []string{registry.LabelTaskID, registry.LabelAgentID, registry.LabelWorkspaceID} {
+	for _, key := range []string{registry.LabelTaskID, registry.LabelAgentID} {
 		if _, has := cred.Labels[key]; has {
 			t.Errorf("probe Secret labels = %v, want no %s", cred.Labels, key)
 		}
+	}
+	// The workspace label is the credential's own: a pinned probe carries the
+	// workspace it acts for (ADR-047), never a task's or an agent's.
+	if got := cred.Labels[registry.LabelWorkspaceID]; got != h.schedCfg.WorkspaceID {
+		t.Errorf("probe Secret workspace label = %q, want %q", got, h.schedCfg.WorkspaceID)
 	}
 	token, keys := probeCredentialToken(t, cred)
 	if len(keys) != 1 || keys[0] != "config.json" {
@@ -92,10 +97,13 @@ func TestCatalog05ProbeCredentialAndIsolationFaces(t *testing.T) {
 	// The pod carries the probe label block only: no task labels and no task
 	// annotations.
 	for _, labels := range []map[string]string{job.Labels, podMeta.Labels} {
-		for _, key := range []string{registry.LabelTaskID, registry.LabelAgentID, registry.LabelWorkspaceID} {
+		for _, key := range []string{registry.LabelTaskID, registry.LabelAgentID} {
 			if _, has := labels[key]; has {
 				t.Errorf("probe labels = %v, want no %s", labels, key)
 			}
+		}
+		if got := labels[registry.LabelWorkspaceID]; got != h.schedCfg.WorkspaceID {
+			t.Errorf("probe labels = %v, want workspace %q", labels, h.schedCfg.WorkspaceID)
 		}
 	}
 	if got := podMeta.Labels[registry.LabelRole]; got != registry.RoleCatalogProbe {

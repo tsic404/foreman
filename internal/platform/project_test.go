@@ -105,7 +105,7 @@ func TestResolveNameProjectByExactTitle(t *testing.T) {
 	}}
 	queries := newProjectQueries(t, server)
 
-	resolution, err := queries.ResolveName(context.Background(), jobbuilder.PolicyKeyProject, "rffmpeg")
+	resolution, err := queries.ResolveName(context.Background(), "ws-1", jobbuilder.PolicyKeyProject, "rffmpeg")
 	if err != nil {
 		t.Fatalf("ResolveName: %v", err)
 	}
@@ -113,7 +113,7 @@ func TestResolveNameProjectByExactTitle(t *testing.T) {
 		t.Errorf("resolution = %q/%q, want resolved/proj-rffmpeg", resolution.Conclusion, resolution.Identifier)
 	}
 
-	absent, err := queries.ResolveName(context.Background(), jobbuilder.PolicyKeyProject, "rffmpe")
+	absent, err := queries.ResolveName(context.Background(), "ws-1", jobbuilder.PolicyKeyProject, "rffmpe")
 	if err != nil {
 		t.Fatalf("ResolveName(absent): %v", err)
 	}
@@ -141,7 +141,7 @@ func TestResolveNameAmbiguousTitle(t *testing.T) {
 		{ID: "proj-2", Title: "same"},
 	}}
 	queries := newProjectQueries(t, server)
-	resolution, err := queries.ResolveName(context.Background(), jobbuilder.PolicyKeyProject, "same")
+	resolution, err := queries.ResolveName(context.Background(), "ws-1", jobbuilder.PolicyKeyProject, "same")
 	if err != nil {
 		t.Fatalf("ResolveName: %v", err)
 	}
@@ -153,7 +153,7 @@ func TestResolveNameAmbiguousTitle(t *testing.T) {
 func TestResolveNameAgentSectionIsUnavailableWithoutQuery(t *testing.T) {
 	server := &projectServer{}
 	queries := newProjectQueries(t, server)
-	resolution, err := queries.ResolveName(context.Background(), jobbuilder.PolicyKeyAgent, "Vulcan")
+	resolution, err := queries.ResolveName(context.Background(), "ws-1", jobbuilder.PolicyKeyAgent, "Vulcan")
 	if err != nil {
 		t.Fatalf("ResolveName: %v", err)
 	}
@@ -168,7 +168,7 @@ func TestResolveNameAgentSectionIsUnavailableWithoutQuery(t *testing.T) {
 func TestResolveNameListFailureIsAnError(t *testing.T) {
 	server := &projectServer{projectsErr: http.StatusUnauthorized}
 	queries := newProjectQueries(t, server)
-	if _, err := queries.ResolveName(context.Background(), jobbuilder.PolicyKeyProject, "rffmpeg"); err == nil {
+	if _, err := queries.ResolveName(context.Background(), "ws-1", jobbuilder.PolicyKeyProject, "rffmpeg"); err == nil {
 		t.Fatal("ResolveName accepted a non-200 answer")
 	}
 }
@@ -190,7 +190,7 @@ func TestByIssueReadsProjectID(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			server := &projectServer{issueStatus: tc.status, issueBody: tc.body}
 			queries := newProjectQueries(t, server)
-			got, err := queries.ByIssue(context.Background(), "issue-1")
+			got, err := queries.ByIssue(context.Background(), "ws-1", "issue-1")
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("ByIssue error = %v, wantErr %v", err, tc.wantErr)
 			}

@@ -27,10 +27,11 @@ const (
 	// EnvStartupProbeTimeout names the startup probe window; the design fixes
 	// its semantics (one Job-boot magnitude, §10) but leaves the key to the
 	// implementation.
-	EnvStartupProbeTimeout = "FOREMAN_STARTUP_PROBE_TIMEOUT"
-	EnvModelCatalogEnabled = "FOREMAN_MODEL_CATALOG_ENABLED"
-	EnvModelCatalogTimeout = "FOREMAN_MODEL_CATALOG_TIMEOUT"
-	EnvReconcileInterval   = "FOREMAN_RECONCILE_INTERVAL"
+	EnvStartupProbeTimeout     = "FOREMAN_STARTUP_PROBE_TIMEOUT"
+	EnvMaxInflightPerWorkspace = "FOREMAN_MAX_INFLIGHT_JOBS_PER_WORKSPACE"
+	EnvModelCatalogEnabled     = "FOREMAN_MODEL_CATALOG_ENABLED"
+	EnvModelCatalogTimeout     = "FOREMAN_MODEL_CATALOG_TIMEOUT"
+	EnvReconcileInterval       = "FOREMAN_RECONCILE_INTERVAL"
 	// EnvProjectLookupTimeout bounds one read-only project reverse lookup by
 	// issue id (ADR-048 decision 4: the timeout value belongs to the
 	// implementation, and the claim → Job 5s P95 must hold).
@@ -40,9 +41,14 @@ const (
 // Defaults applied when the environment leaves a scheduler key unset.
 const (
 	DefaultMaxInflightJobs = 100
-	DefaultMaxJobsPerNode  = 4
-	DefaultClaimBatchMax   = 32
-	DefaultJobBootTimeout  = 300 * time.Second
+	// DefaultMaxInflightPerWorkspace is the per-workspace cap of the two-level
+	// in-flight budget (§10). Zero means "no separate per-workspace bound":
+	// the global cap alone applies; a positive value must not exceed the
+	// global cap.
+	DefaultMaxInflightPerWorkspace = 0
+	DefaultMaxJobsPerNode          = 4
+	DefaultClaimBatchMax           = 32
+	DefaultJobBootTimeout          = 300 * time.Second
 	// DefaultDeliveryConfirmTimeout is the S6 delivery confirmation window
 	// (§5, ADR-032): comfortably above the upstream daemon's own claim
 	// budget (seconds, plus its retry margin), so a released delivery can
@@ -84,8 +90,12 @@ type Config struct {
 	// control — no Job is queued, refused, or deleted on account of it.
 	MaxJobsPerNode  int
 	MaxInflightJobs int
-	ClaimBatchMax   int
-	JobBootTimeout  time.Duration
+	// MaxInflightJobsPerWorkspace is the per-workspace in-flight cap
+	// (FOREMAN_MAX_INFLIGHT_JOBS_PER_WORKSPACE, §10 两级预算); 0 disables the
+	// workspace term and leaves the global cap alone.
+	MaxInflightJobsPerWorkspace int
+	ClaimBatchMax               int
+	JobBootTimeout              time.Duration
 	// DeliveryConfirmTimeout is the S6 delivery confirmation window
 	// (FOREMAN_DELIVERY_CONFIRM_TIMEOUT, ADR-032): a committed delivery still
 	// without a start fact once it elapses releases the payload for one more
@@ -97,9 +107,14 @@ type Config struct {
 	// credential reclaim (ADR-017). Zero means "do not wait": the reclaim
 	// still lands on the next observation point.
 	JobDrainTimeout time.Duration
-	// WorkspaceID is the workspace the probe Job Token is bound to
-	// (MULTICA_WORKSPACE_ID); the catalog probe has no task to carry it.
+	// WorkspaceID is the legacy single-workspace identity (MULTICA_WORKSPACE_ID);
+	// multi-workspace deployments carry the set in Workspaces and every probe
+	// names its own workspace explicitly.
 	WorkspaceID string
+	// Workspaces is the configured workspace set (configuration order). The
+	// scheduler reads it for the probe orchestration's registration scope and
+	// for the credential-reclaim/sweep partition.
+	Workspaces []string
 	// StartupProbeTimeout is the startup probe's wait window: the first probe
 	// must register within it or Foreman exits non-zero (§10 启动探针窗口,
 	// default = JobBootTimeout — one "schedule + pull + register" magnitude).
@@ -164,6 +179,17 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		}
 		cfg.MaxInflightJobs = n
 	}
+	if raw := strings.TrimSpace(getenv(EnvMaxInflightPerWorkspace)); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n < 1 {
+			return Config{}, fmt.Errorf("%s must be a positive integer, got %q", EnvMaxInflightPerWorkspace, raw)
+		}
+		cfg.MaxInflightJobsPerWorkspace = n
+	}
+	if cfg.MaxInflightJobsPerWorkspace > cfg.MaxInflightJobs {
+		return Config{}, fmt.Errorf("%s (%d) must not exceed %s (%d): the per-workspace cap is one level of the global budget",
+			EnvMaxInflightPerWorkspace, cfg.MaxInflightJobsPerWorkspace, EnvMaxInflightJobs, cfg.MaxInflightJobs)
+	}
 	if raw := strings.TrimSpace(getenv(EnvClaimBatchMax)); raw != "" {
 		n, err := strconv.Atoi(raw)
 		if err != nil || n < 1 {
@@ -220,8 +246,9 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		}
 		cfg.JobDrainTimeout = d
 	}
-	if cfg.WorkspaceID = strings.TrimSpace(getenv(EnvWorkspaceID)); cfg.WorkspaceID == "" {
-		return Config{}, fmt.Errorf("%s is required", EnvWorkspaceID)
+	cfg.WorkspaceID = strings.TrimSpace(getenv(EnvWorkspaceID))
+	if cfg.WorkspaceID == "" && strings.TrimSpace(getenv("FOREMAN_WORKSPACES")) == "" && strings.TrimSpace(getenv("FOREMAN_WORKSPACES_FILE")) == "" {
+		return Config{}, fmt.Errorf("%s is required (or configure FOREMAN_WORKSPACES)", EnvWorkspaceID)
 	}
 	// The startup window defaults to the task Job's boot bound: the same
 	// "schedule + pull + register" magnitude, with no second magic number
