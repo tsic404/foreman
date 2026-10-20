@@ -306,6 +306,11 @@ type Scheduler struct {
 	// item and no env carries it.
 	attributionWait time.Duration
 
+	// beforeJobLock is a test seam in OnJobTerminated between the Job-name
+	// resolution and the task lock: it lets a test land a successor entry in
+	// that window. Nil in production; the nil check is its only cost.
+	beforeJobLock func()
+
 	// taskMu serializes the per-task transitions (OnClaim and every
 	// settlement path): a settlement that ran concurrently with an in-flight
 	// S-8 round would decide on a registry snapshot the start is about to
@@ -809,7 +814,7 @@ func (s *Scheduler) resolveDuplicateClaim(ctx context.Context, existing registry
 		// claim is dropped: nothing is built for a deleted task.
 		s.log.WarnContext(ctx, "duplicate_dispatch",
 			"task_id", existing.TaskID, "old_job_name", existing.JobName, "action", "drop_task_gone")
-		return false, 0, s.OnTaskVanished(ctx, existing.TaskID)
+		return false, 0, s.onTaskVanishedLocked(ctx, existing.TaskID)
 	case err != nil:
 		// Truth unknown: keep the existing entry, drop the new claim; the
 		// reconcile loop converges later.
@@ -1021,8 +1026,9 @@ func boundUsageLabel(v string) string {
 // body: an S14 the attribution gate suppresses reports it back in the
 // compensation body (ADR-031).
 func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEntry, body []byte, sessionID string) (int, []byte, error) {
+	locked := ep == EPStart
 	unlock := func() {}
-	if ep == EPStart {
+	if locked {
 		unlock = s.taskMu.Lock(e.TaskID)
 	}
 	defer unlock()
@@ -1185,8 +1191,13 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 	}
 	if code == 404 {
 		// A non-terminal forward answered 404: the server deleted the task
-		// (§4.6).
-		if err := s.OnTaskVanished(ctx, e.TaskID); err != nil {
+		// (§4.6). The S-8 round already holds the task lock; every other
+		// endpoint takes it inside OnTaskVanished.
+		vanish := s.OnTaskVanished
+		if locked {
+			vanish = s.onTaskVanishedLocked
+		}
+		if err := vanish(ctx, e.TaskID); err != nil {
 			s.log.ErrorContext(ctx, "task vanish cleanup failed",
 				"task_id", e.TaskID, "job_name", e.JobName, "err", err)
 		}
@@ -1240,7 +1251,7 @@ func (s *Scheduler) OnStartRejected(ctx context.Context, taskID string) error {
 	st, err := s.server.TaskStatus(ctx, taskID)
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
-		return s.OnTaskVanished(ctx, taskID)
+		return s.onTaskVanishedLocked(ctx, taskID)
 	case err != nil:
 		return fmt.Errorf("check status of task %s: %w", taskID, err)
 	}
@@ -1249,7 +1260,7 @@ func (s *Scheduler) OnStartRejected(ctx context.Context, taskID string) error {
 	case st == "running" || st == "waiting_local_directory":
 		// Post-delivery (ADR-026 决策结果 1 证据面②): the daemon holds the
 		// task, so record the start fact, stop renewals and keep the Job.
-		return s.AdoptRunning(ctx, taskID, st)
+		return s.adoptRunningLocked(ctx, taskID, st)
 	case registry.IsTerminalResult(st):
 		return s.settleTerminalLocked(ctx, taskID, st)
 	case st == "queued" || st == "dispatched":
@@ -1334,7 +1345,7 @@ func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) err
 	st, err := s.server.TaskStatus(ctx, taskID)
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
-		return s.OnTaskVanished(ctx, taskID)
+		return s.onTaskVanishedLocked(ctx, taskID)
 	case err != nil:
 		return err
 	}
@@ -1446,7 +1457,7 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 	case errors.Is(err, ErrTaskNotFound):
 		// Task deleted server-side (scenario #9): settle it without a
 		// report and start the drain.
-		return s.OnTaskVanished(ctx, e.TaskID)
+		return s.onTaskVanishedLocked(ctx, e.TaskID)
 	case err != nil:
 		return fmt.Errorf("check status of task %s: %w", e.TaskID, err)
 	}
@@ -1581,7 +1592,19 @@ func (s *Scheduler) settleTerminalLocked(ctx context.Context, taskID, result str
 // adoption is never read back as "running". Adoption is an observation, not
 // a report: only started_at moves, so the projection keeps the rebuild's
 // initial phase (ADR-026 决策结果 1 / 后果).
+//
+// The write takes the task lock: started_at is the fact the discard row is
+// decided on, so it must be ordered against DiscardTask's re-read and
+// deletion (§4.2: one decisive fact per transition).
 func (s *Scheduler) AdoptRunning(ctx context.Context, taskID, status string) error {
+	unlock := s.taskMu.Lock(taskID)
+	defer unlock()
+	return s.adoptRunningLocked(ctx, taskID, status)
+}
+
+// adoptRunningLocked is AdoptRunning for callers that already hold the task
+// lock. A terminal entry is never reopened (MarkStartFact refuses it).
+func (s *Scheduler) adoptRunningLocked(ctx context.Context, taskID, status string) error {
 	e, ok := s.reg.MarkStartFact(taskID, s.now())
 	if !ok {
 		return nil
@@ -1592,20 +1615,13 @@ func (s *Scheduler) AdoptRunning(ctx context.Context, taskID, status string) err
 }
 
 // DiscardTask removes the objects and the mapping of a task that will be
-// re-run, without any terminal report and without entering drain
-// (§4.3: discard and redispatch). A successor Job may be rendered under the
-// same display name (the template's format is deterministic per task), so the
-// predecessor's credential is revoked first: its pod must never be able to
-// claim the re-run task (ADR-017 — "宁可噪音、不可重跑"). A rebuilt entry
-// has no digest to revoke; that degradation is logged as
-// cred.revoke_unavailable. A failed deletion keeps the entry: it is the only
-// retry handle, and dropping it would leave a zombie Job or leak the
-// credential Secret (§6.4: the entry is the only retry handle).
-//
-// The discard row's 成立面 is read from the live entry under the task lock
-// (ADR-026 决策 5): a start fact S8 established while the caller's C13 round
-// trip was in flight makes the entry adopted and keeps it. The duplicate-claim
-// replacement (discardQuietly) applies the same gate to the entry it discards.
+// re-run, without a terminal report and without entering drain (§4.3). The
+// row's 成立面 is re-read from the live entry under the task lock (ADR-026
+// 决策 5): terminal, started, or payload-bearing entries are kept. C13 is
+// re-read before the deletion, so a stale pre-delivery snapshot never deletes
+// a Job the server now holds. The predecessor's digest is revoked first
+// (ADR-017); a rebuilt entry has none and logs cred.revoke_unavailable. A
+// failed deletion keeps the entry as the only retry handle (§6.4).
 func (s *Scheduler) DiscardTask(ctx context.Context, taskID string) error {
 	unlock := s.taskMu.Lock(taskID)
 	defer unlock()
@@ -1613,10 +1629,30 @@ func (s *Scheduler) DiscardTask(ctx context.Context, taskID string) error {
 	if !ok {
 		return nil
 	}
-	if !e.StartedAt.IsZero() {
+	if e.IsTerminal() || !e.StartedAt.IsZero() || len(e.Payload) != 0 {
 		return nil
 	}
-	return s.discardTaskLocked(ctx, e)
+	st, err := s.server.TaskStatus(ctx, taskID)
+	switch {
+	case errors.Is(err, ErrTaskNotFound):
+		return s.settleVanishedLocked(ctx, taskID)
+	case err != nil:
+		// Truth unknown: keep the entry as the retry handle.
+		return fmt.Errorf("check status of task %s: %w", taskID, err)
+	}
+	s.reg.SetLastStatusSeen(taskID, st)
+	switch {
+	case st == "running" || st == "waiting_local_directory":
+		// The daemon holds the task: adopt, never discard.
+		return s.adoptRunningLocked(ctx, taskID, st)
+	case registry.IsTerminalResult(st):
+		return s.settleTerminalLocked(ctx, taskID, st)
+	case st == "queued" || st == "dispatched":
+		return s.discardTaskLocked(ctx, e)
+	default:
+		s.logUnclassifiedStatus(ctx, e, st)
+		return nil
+	}
 }
 
 // discardTaskLocked removes the objects and the mapping. The caller holds the
@@ -1631,13 +1667,49 @@ func (s *Scheduler) discardTaskLocked(ctx context.Context, e registry.TaskEntry)
 	return s.reg.Delete(e.TaskID)
 }
 
-// OnTaskVanished settles a task the server deleted (§4.6, C13/C4 404). No
-// terminal report is sent for a task the server no longer knows, but the
-// verdict still starts the drain: the entry is marked terminal with an empty
-// result — the only source of result="" — and the Job
-// goes, while the credential and the entry stay until the Job terminates or
-// the drain upper bound expires (ADR-017).
+// OnTaskVanished settles a task the server deleted (§4.6, C13/C4 404): the
+// entry is marked terminal with an empty result — the only source of result=""
+// — and the Job goes; the credential and the entry stay until the Job
+// terminates or the drain upper bound expires (ADR-017). No report is sent.
+//
+// It runs under the task lock on a live re-read, and the 404 is confirmed
+// once more before the deletion: a stale observation never settles a live
+// task. A decided entry keeps its verdict and only retries the Job deletion.
 func (s *Scheduler) OnTaskVanished(ctx context.Context, taskID string) error {
+	unlock := s.taskMu.Lock(taskID)
+	defer unlock()
+	return s.onTaskVanishedLocked(ctx, taskID)
+}
+
+// onTaskVanishedLocked is OnTaskVanished for callers that already hold the
+// task lock. The 404 is confirmed once more before the deletion: a vanished
+// verdict deletes the Job and drops the credential's use, so a stale 404 must
+// not be acted on (§4.2). A failed confirmation is not a verdict — the entry
+// is kept and the next round retries.
+func (s *Scheduler) onTaskVanishedLocked(ctx context.Context, taskID string) error {
+	e, ok := s.reg.Get(taskID)
+	if !ok {
+		return nil
+	}
+	if e.IsTerminal() {
+		return s.deleteJob(ctx, e)
+	}
+	st, err := s.server.TaskStatus(ctx, taskID)
+	switch {
+	case errors.Is(err, ErrTaskNotFound):
+		return s.settleVanishedLocked(ctx, taskID)
+	case err != nil:
+		return fmt.Errorf("check status of task %s: %w", taskID, err)
+	default:
+		// The task still exists: the vanish verdict was not a fact.
+		s.reg.SetLastStatusSeen(taskID, st)
+		return nil
+	}
+}
+
+// settleVanishedLocked writes the empty-result verdict of a confirmed
+// vanished task and deletes its Job. The caller holds the task lock.
+func (s *Scheduler) settleVanishedLocked(ctx context.Context, taskID string) error {
 	defer s.SyncInflight()
 	e, ok := s.reg.Get(taskID)
 	if !ok {
@@ -1736,7 +1808,20 @@ func (s *Scheduler) reclaimObjectless(ctx context.Context, e registry.TaskEntry)
 // exists only as the observation moment is Foreman's clock (observed domain).
 func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string, podTerminatedAt time.Time, orphanPods int) error {
 	defer s.SyncInflight()
+	// The caller holds only the Job name, so the key is resolved outside the
+	// lock and the entry re-read under it: a replacement claim may have taken
+	// the same display name, and the successor's credential Secret and entry
+	// must never be reclaimed on the predecessor's termination evidence.
 	e, ok := s.reg.ByJob(jobName)
+	if !ok {
+		return nil
+	}
+	if s.beforeJobLock != nil {
+		s.beforeJobLock()
+	}
+	unlock := s.taskMu.Lock(e.TaskID)
+	defer unlock()
+	e, ok = s.reg.ByJob(jobName)
 	if !ok || !e.IsDraining() {
 		return nil
 	}

@@ -249,6 +249,15 @@ func TestRestart01DeletedJobLeavesNoGhostEntry(t *testing.T) {
 	if err := h.sched.OnClaim(t.Context(), claimPayload("task-1")); err != nil {
 		t.Fatalf("OnClaim: %v", err)
 	}
+	// The process restart that precedes the discard: the index is gone, so the
+	// entry is rebuilt from the cluster without a payload — the shape the
+	// discard row is for (§4.3: 判别式 = 载荷可得性).
+	if err := h.reg.Delete("task-1"); err != nil {
+		t.Fatalf("registry delete: %v", err)
+	}
+	if err := h.sched.Rebuild(t.Context()); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
 	// The pre-start discard (failure-handling 场景 #2) removes the objects and
 	// the entry; the restart that follows must find nothing to rebuild.
 	if err := h.sched.DiscardTask(t.Context(), "task-1"); err != nil {
@@ -259,6 +268,73 @@ func TestRestart01DeletedJobLeavesNoGhostEntry(t *testing.T) {
 	}
 	if entries := projectedList(t, ops.URL); len(entries) != 0 {
 		t.Fatalf("a discarded Job came back as a ghost entry: %v", entries)
+	}
+}
+
+// restart01JobLive reports whether the Job object still exists on the list
+// face (the deletion log is historical, so it cannot answer this).
+func restart01JobLive(t *testing.T, h *harness, name string) bool {
+	t.Helper()
+	jobs, err := h.jobs.ListJobs(t.Context())
+	if err != nil {
+		t.Fatalf("ListJobs: %v", err)
+	}
+	for i := range jobs {
+		if jobs[i].Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+// TestRestart01RedispatchSurvivesAStaleRelease covers TC-tech-restart-01
+// 步骤 2/5 from the other side: the rebuilt entry is re-dispatched (the claim
+// replaces it under the same display name), and the release round that
+// decided "discard and redispatch" from its pre-claim snapshot must lose to
+// the live entry — its Job, credential Secret and mapping stay (§4.3: the
+// discard row is the payload-less rebuilt entry, never a claim's).
+func TestRestart01RedispatchSurvivesAStaleRelease(t *testing.T) {
+	h := newHarness(t, false)
+	h.useRealBuilder(t)
+
+	if err := h.sched.OnClaim(t.Context(), claimPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	// Restart: the index is rebuilt from the cluster, so the entry loses its
+	// payload — the discard row's shape.
+	if err := h.reg.Delete("task-1"); err != nil {
+		t.Fatalf("drop entry: %v", err)
+	}
+	if err := h.sched.Rebuild(t.Context()); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	// The server re-dispatches the task: the claim replaces the rebuilt entry.
+	if err := h.sched.OnClaim(t.Context(), claimPayload("task-1")); err != nil {
+		t.Fatalf("re-claim: %v", err)
+	}
+	if e, ok := h.reg.Get("task-1"); !ok || len(e.Payload) == 0 || e.Attempt != 2 {
+		t.Fatalf("entry = %+v, %v; want the replacement claim", e, ok)
+	}
+
+	jobsBefore := len(h.jobs.deletedJobNames())
+	secretsBefore := len(h.jobs.deletedSecretNames())
+	if err := h.sched.DiscardTask(t.Context(), "task-1"); err != nil {
+		t.Fatalf("DiscardTask: %v", err)
+	}
+	if e, ok := h.reg.Get("task-1"); !ok || len(e.Payload) == 0 {
+		t.Fatalf("entry = %+v, %v; want the successor entry kept", e, ok)
+	}
+	if got := len(h.jobs.deletedJobNames()); got != jobsBefore {
+		t.Fatalf("job deletions = %v, want none for the live successor", h.jobs.deletedJobNames()[jobsBefore:])
+	}
+	if got := len(h.jobs.deletedSecretNames()); got != secretsBefore {
+		t.Fatalf("secret deletions = %v, want none for the live successor", h.jobs.deletedSecretNames()[secretsBefore:])
+	}
+	if !restart01JobLive(t, h, "fm-task-1") {
+		t.Fatal("the successor's Job was deleted")
+	}
+	if !h.jobs.hasSecret("fm-task-1-cred") {
+		t.Fatal("the successor's credential Secret was deleted")
 	}
 }
 
