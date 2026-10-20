@@ -271,6 +271,13 @@ type upstreamStub struct {
 	// taskStatuses is the C13 answer per task (an absent key is a 404, the
 	// shape a task the server no longer holds produces).
 	taskStatuses map[string]string
+	// lifecycleCodes programs the C5–C12 answer per endpoint (absent = 200):
+	// the permanent-rejection face a terminal report can meet.
+	lifecycleCodes map[string]int
+	// lifecycleGates parks the next C5–C12 forward for an endpoint after it
+	// is recorded, so a scenario can read the write-ahead window (queue depth
+	// and carrier) while the report is still in flight.
+	lifecycleGates map[string]chan struct{}
 	// gcStatus/gcBody are the S-20 answer (default 404).
 	gcStatus int
 	gcBody   []byte
@@ -304,6 +311,8 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		skillStatus:          200,
 		skillBody:            []byte(`{"bundles":[]}`),
 		taskStatuses:         map[string]string{},
+		lifecycleCodes:       map[string]int{},
+		lifecycleGates:       map[string]chan struct{}{},
 		gcStatus:             http.StatusNotFound,
 		gcBody:               []byte(`{"error":"not found"}`),
 		registerStatus:       http.StatusOK,
@@ -398,7 +407,9 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 	})
 	// C5–C12: the lifecycle forwards the scheduler sends through the
 	// production client. The stub answers 200 and records the call; a
-	// scenario wiring the real client reads the forward metric off these.
+	// scenario wiring the real client reads the forward metric off these,
+	// and one judging a permanent rejection programs the answer and can hold
+	// the call in flight.
 	for _, ep := range []string{
 		"start", "progress", "messages", "usage", "complete", "fail",
 		"cancel-ack", "session", "wait-local-directory",
@@ -406,7 +417,14 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		mux.HandleFunc("POST /api/daemon/tasks/{tid}/"+ep, func(w http.ResponseWriter, r *http.Request) {
 			body, _ := io.ReadAll(r.Body)
 			stub.record(r, r.URL.Path, body)
-			writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+			gate, status := stub.lifecycleAnswer(ep)
+			if gate != nil {
+				<-gate
+			}
+			if status == 0 {
+				status = http.StatusOK
+			}
+			writeJSON(w, status, map[string]string{"status": "ok"})
 		})
 	}
 	// C4: the lease keeper's renewal. Without this route the stub's 404 would
@@ -651,6 +669,35 @@ func (s *upstreamStub) setTaskStatus(taskID, status string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.taskStatuses[taskID] = status
+}
+
+// setLifecycleStatus programs the C5–C12 answer for one endpoint (0 restores
+// 200). The permanent-rejection scenario answers a terminal report here.
+func (s *upstreamStub) setLifecycleStatus(ep string, code int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lifecycleCodes[ep] = code
+}
+
+// holdLifecycle parks the next C5–C12 forward for ep once it is recorded; the
+// scenario releases the returned channel. It is how the write-ahead window is
+// read from outside the scheduler.
+func (s *upstreamStub) holdLifecycle(ep string) chan struct{} {
+	gate := make(chan struct{})
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lifecycleGates[ep] = gate
+	return gate
+}
+
+// lifecycleAnswer takes the pending gate and the programmed status for ep in
+// one locked step.
+func (s *upstreamStub) lifecycleAnswer(ep string) (chan struct{}, int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	gate := s.lifecycleGates[ep]
+	delete(s.lifecycleGates, ep)
+	return gate, s.lifecycleCodes[ep]
 }
 
 // setGCCheck programs the S-20 answer.

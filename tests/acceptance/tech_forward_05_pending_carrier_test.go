@@ -28,7 +28,11 @@ import (
 // restartOverCluster rebuilds the process-local components over the same
 // cluster fake: a fresh registry and a fresh pending queue (its node-local
 // directory is gone with the process), exactly what a rescheduled Foreman
-// starts from. The carriers and Jobs are the cluster's.
+// starts from. The carriers and Jobs are the cluster's. The forward seam is
+// the one the harness itself runs on (h.serverClient), so a replay from the
+// rebuilt process reaches the same wire and the same counter a live process
+// would — wiring the recorder stub instead would leave every replay
+// assertion blind.
 func restartOverCluster(t *testing.T, h *harness) (*registry.Registry, *scheduler.PendingReports, *scheduler.Scheduler) {
 	t.Helper()
 	reg := registry.New(time.Now, registry.WithDeliveryConfirmTimeout(deliveryConfirmWindow))
@@ -38,7 +42,7 @@ func restartOverCluster(t *testing.T, h *harness) (*registry.Registry, *schedule
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
-	sched, err := scheduler.New(h.schedCfg, reg, h.jobs, h.builder, h.server, h.metrics,
+	sched, err := scheduler.New(h.schedCfg, reg, h.jobs, h.builder, h.serverClient, h.metrics,
 		scheduler.WithPendingReports(pending),
 		scheduler.WithRevoker(noRevoker{}),
 		scheduler.WithProbeRegistry(h.probes),
