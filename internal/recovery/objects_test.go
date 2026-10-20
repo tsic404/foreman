@@ -30,6 +30,26 @@ func TestIndexPodsGroupsByOwningJob(t *testing.T) {
 	}
 }
 
+func TestInstancePodsDropsPredecessorPods(t *testing.T) {
+	since := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	pods := []corev1.Pod{
+		podFor("fm-a", func(p *corev1.Pod) {
+			p.CreationTimestamp = metav1.NewTime(since.Add(-time.Second))
+		}),
+		podFor("fm-a", func(p *corev1.Pod) { p.CreationTimestamp = metav1.NewTime(since) }),
+		podFor("fm-a", func(p *corev1.Pod) {
+			p.CreationTimestamp = metav1.NewTime(since.Add(time.Second))
+		}),
+	}
+	got := instancePods(pods, since)
+	if len(got) != 2 {
+		t.Fatalf("instancePods = %d pods, want the 2 created at or after the Job", len(got))
+	}
+	if got[0].CreationTimestamp.Time.Before(since) {
+		t.Fatalf("instancePods kept a pod created before the Job: %v", got[0].CreationTimestamp)
+	}
+}
+
 func TestJobEndReason(t *testing.T) {
 	tests := []struct {
 		name   string
