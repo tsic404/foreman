@@ -95,9 +95,13 @@ func TestWS01SubscriptionAndPushDrivenClaim(t *testing.T) {
 	go func() { _ = claimLoop.Run(ctx) }()
 	go func() { _ = subscriber.Run(ctx) }()
 
-	// 步骤 1: the subscription is up. One runtime ⇒ one dial ⇒ gauge 1.
+	// 步骤 1: the subscription is up. One runtime ⇒ one dial ⇒ gauge 1. The
+	// gauge and the §9.1 line are written in that order, so the wait must cover
+	// the line itself — reading the buffer right after the gauge races the log
+	// write. The assertions below still pin the line's fields.
 	waitFor(t, "server-side WS connection", 10*time.Second, func() bool {
-		return h.metrics.wsConnectedCount("server") == 1 && h.upstream.wsDialCount() == 1
+		return len(ws01Events(wsLogs, "ws.connected")) >= 1 &&
+			h.metrics.wsConnectedCount("server") == 1 && h.upstream.wsDialCount() == 1
 	})
 	connected := ws01Events(wsLogs, "ws.connected")
 	if len(connected) != 1 {
@@ -177,9 +181,17 @@ func TestWS01JobSideHandshakeAccepted(t *testing.T) {
 		t.Fatalf("S-30 handshake status = %d, want 101", resp.StatusCode)
 	}
 
-	waitFor(t, "job-side gauge", 5*time.Second, func() bool {
-		return h.metrics.wsConnectedCount("job") == 1
+	// The two faces the S-30 acceptance names are independent observables: the
+	// gauge counts the connection, and §9.1's ws.connected line records it.
+	// The handler writes the gauge before the log line, so waiting on the gauge
+	// and then reading the buffer races that write — the wait covers the line
+	// itself, and the assertions below still pin its fields.
+	waitFor(t, "job-side ws.connected line", 5*time.Second, func() bool {
+		return len(ws01Events(wsLogs, "ws.connected")) >= 1
 	})
+	if got := h.metrics.wsConnectedCount("job"); got != 1 {
+		t.Errorf("foreman_ws_connected{side=job} = %d, want 1", got)
+	}
 	connected := ws01Events(wsLogs, "ws.connected")
 	jobSide := false
 	for _, event := range connected {
