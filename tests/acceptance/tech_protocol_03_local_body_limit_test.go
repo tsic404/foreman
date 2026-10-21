@@ -1,4 +1,4 @@
-// TC-tech-protocol-03 (AC-65): the local daemon face's request-body bound is
+// TC-tech-protocol-03 (AC-89): the local daemon face's request-body bound is
 // announced, not disguised. A body past it is refused with 413 carrying the
 // bound and how much was read, the same facts land in the event log, the
 // handler never runs on the truncated bytes, and S-29 — which carries agent
