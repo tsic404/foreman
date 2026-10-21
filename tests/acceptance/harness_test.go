@@ -2619,7 +2619,21 @@ func newHarnessWithOptions(t *testing.T, catalogEnabled bool, window time.Durati
 	return buildHarness(t, catalogEnabled, window, skill, realServer, false)
 }
 
+// harnessOptions are the fixture knobs a scenario needs beyond the shared
+// shape: extra production seams on the proxy client (the §10 terminal retry
+// budget) and on the pending queue (the retention bound). Zero values keep
+// the deployment defaults.
+type harnessOptions struct {
+	clientOpts  []proxy.Option
+	pendingOpts []scheduler.PendingReportsOption
+}
+
 func buildHarness(t *testing.T, catalogEnabled bool, window time.Duration, skill func(*proxy.Config), realServer, wsEnabled bool) *harness {
+	t.Helper()
+	return buildHarnessWith(t, catalogEnabled, window, skill, realServer, wsEnabled, harnessOptions{})
+}
+
+func buildHarnessWith(t *testing.T, catalogEnabled bool, window time.Duration, skill func(*proxy.Config), realServer, wsEnabled bool, opts harnessOptions) *harness {
 	upstream := newUpstreamStub(t)
 	reg := registry.New(time.Now, registry.WithDeliveryConfirmTimeout(window))
 	probes := registry.NewProbeRegistry()
@@ -2656,18 +2670,20 @@ func buildHarness(t *testing.T, catalogEnabled bool, window time.Duration, skill
 	probeRunner := &lateProbeRunner{}
 	metrics := &recordingMetrics{}
 	client := proxy.NewClient(cfg, "mdt_test",
-		proxy.WithStartupCatalog(startup),
-		proxy.WithCatalogSlots(slots),
-		proxy.WithDiscoveryProbe(probeRunner),
-		proxy.WithMetrics(metrics),
-		proxy.WithLogger(slog.New(slog.NewJSONHandler(io.Discard, nil))),
-		proxy.WithTaskRuntime(func(taskID string) string {
-			entry, ok := reg.Get(taskID)
-			if !ok {
-				return ""
-			}
-			return entry.RealRuntimeID
-		}),
+		append([]proxy.Option{
+			proxy.WithStartupCatalog(startup),
+			proxy.WithCatalogSlots(slots),
+			proxy.WithDiscoveryProbe(probeRunner),
+			proxy.WithMetrics(metrics),
+			proxy.WithLogger(slog.New(slog.NewJSONHandler(io.Discard, nil))),
+			proxy.WithTaskRuntime(func(taskID string) string {
+				entry, ok := reg.Get(taskID)
+				if !ok {
+					return ""
+				}
+				return entry.RealRuntimeID
+			}),
+		}, opts.clientOpts...)...,
 	)
 	issuer, err := proxy.JobTokenIssuer(testKey, reg, probes, auth.DefaultJobTokenTTL)
 	if err != nil {
@@ -2683,8 +2699,10 @@ func buildHarness(t *testing.T, catalogEnabled bool, window time.Duration, skill
 	// The terminal-report queue is the production one: the write-ahead
 	// discipline and the gauge are part of the face the scenarios judge.
 	pending, err := scheduler.NewPendingReports(t.TempDir(),
-		scheduler.WithPendingReportsGauge(metrics.PendingReports),
-		scheduler.WithPendingReportsCarrier(scheduler.NewSecretCarrierStore(jobs)))
+		append([]scheduler.PendingReportsOption{
+			scheduler.WithPendingReportsGauge(metrics.PendingReports),
+			scheduler.WithPendingReportsCarrier(scheduler.NewSecretCarrierStore(jobs)),
+		}, opts.pendingOpts...)...)
 	if err != nil {
 		t.Fatalf("NewPendingReports: %v", err)
 	}
