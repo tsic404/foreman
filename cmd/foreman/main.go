@@ -75,10 +75,13 @@ func run() error {
 	if err := authCfg.Validate(); err != nil {
 		return err
 	}
-	// The deployment's workspace identities: one (credential, daemon
-	// identity) pair per served workspace (ADR-047). A single-workspace
-	// deployment is the legacy form of the same set.
-	workspaces, err := workspace.Load(getenv)
+	// The deployment's workspace shape (ADR-049): either per-workspace
+	// (credential, daemon identity) pairs — the legacy single-workspace form
+	// is a set of one — or a single user-scoped credential whose workspace set
+	// is discovered at startup. The legacy single-workspace deployment keeps
+	// its behaviour except for the workspace-set source and the exact-set
+	// self-check (§1.1).
+	deployment, err := workspace.LoadDeployment(getenv)
 	if err != nil {
 		return err
 	}
@@ -95,11 +98,18 @@ func run() error {
 	if err != nil {
 		return err
 	}
-	schedCfg.Workspaces = workspaces.IDs()
-	if schedCfg.WorkspaceID == "" {
-		schedCfg.WorkspaceID = workspaces.IDs()[0]
+	// The user-scoped discovery form has no workspace identity in the
+	// interface; the scheduler's single-workspace seams read this field, so it
+	// is filled from the discovery result below.
+	workspaces := workspace.Set{}
+	if deployment.Scope == workspace.ScopeWorkspace {
+		workspaces = deployment.Set
+		schedCfg.Workspaces = workspaces.IDs()
+		if schedCfg.WorkspaceID == "" {
+			schedCfg.WorkspaceID = workspaces.IDs()[0]
+		}
+		jbCfg.WorkspaceIDs = workspaces.IDs()
 	}
-	jbCfg.WorkspaceIDs = workspaces.IDs()
 	recCfg, err := recovery.LoadConfig(getenv)
 	if err != nil {
 		return err
@@ -181,8 +191,29 @@ func run() error {
 	// it is what the Job Token probe branch, the probe handlers and the probe
 	// lifecycle all read.
 	probes := registry.NewProbeRegistry()
-	slotsByWorkspace := make(map[string]*proxy.CatalogSlots, workspaces.Len())
 	metrics := observability.NewMetrics()
+
+	// The user-scoped discovery form resolves its workspace set before any
+	// client exists: C-17 with the single credential, the manifest rule
+	// applied, then one (credential, daemon identity) pair per discovered
+	// workspace derived from the deployment base identity (ADR-049 decision
+	// 3). Discovery failure refuses startup — never a half-configured service
+	// (§1.1, AC-96).
+	var discoveryEvent *proxy.Discovery
+	if deployment.Scope == workspace.ScopeUser {
+		// Discovery runs before any client exists: it defines the set.
+		workspaces, discoveryEvent, err = discoverUserScope(context.Background(), deployment, proxyCfg, metrics, baseLog)
+		if err != nil {
+			return err
+		}
+		schedCfg.Workspaces = workspaces.IDs()
+		if schedCfg.WorkspaceID == "" {
+			schedCfg.WorkspaceID = workspaces.IDs()[0]
+		}
+		jbCfg.WorkspaceIDs = workspaces.IDs()
+	}
+
+	slotsByWorkspace := make(map[string]*proxy.CatalogSlots, workspaces.Len())
 
 	// One fake client per workspace identity: every F→S call carries that
 	// workspace's credential and daemon identity (§1.1). The
@@ -198,7 +229,7 @@ func run() error {
 		slots := proxy.NewCatalogSlots()
 		slotsByWorkspace[identity.WorkspaceID] = slots
 		tokenByWorkspace[identity.WorkspaceID] = identity.Token
-		clients = append(clients, proxy.NewClient(cfg, identity.Token,
+		client := proxy.NewClient(cfg, identity.Token,
 			proxy.WithMetrics(metrics),
 			proxy.WithLogger(baseLog),
 			proxy.WithCatalogSlots(slots),
@@ -217,7 +248,16 @@ func run() error {
 				}
 				return e.RealRuntimeID
 			}),
-		))
+		)
+		if discoveryEvent != nil {
+			for _, ref := range discoveryEvent.Set {
+				if ref.ID == identity.WorkspaceID {
+					client.SetWorkspaceName(ref.Name)
+					break
+				}
+			}
+		}
+		clients = append(clients, client)
 	}
 	clientSet, err := proxy.NewClientSet(clients...)
 	if err != nil {
@@ -389,31 +429,13 @@ func run() error {
 	// probe, so the probe's daemon reads S-3 as the truth for the profiles it
 	// declares. 404 (old server) and failure are not fatal: S-3 answers 404 or
 	// 503, and the probe continues with the builtin runtime.
-	for _, c := range clientSet.All() {
-		if err := c.RuntimeProfiles(ctx); err != nil {
-			log.Warn("runtime.profiles_snapshot_failed", "workspace_id", c.WorkspaceID(), "err", err.Error())
-		}
-		// C-17 is the per-workspace credential check (§1.1: 启动自检按
-		// workspace 逐条校验). A 401/403 is a configuration error — the
-		// credential is not bound to this workspace — and refuses startup,
-		// naming the workspace; an unreachable upstream only warns and lets
-		// the loops retry.
-		if err := c.Workspaces(ctx); err != nil {
-			// §1.5/AC-86: a credential that does not name this workspace is
-			// a configuration error — no retry can fix it, and in a
-			// multi-workspace deployment the affected loop must not sit in a
-			// retry that hides the half-dead process.
-			if proxy.IsCredentialConfigError(err) {
-				fields := []any{"stage", "workspace_credential", "workspace_id", c.WorkspaceID(), "err", err.Error()}
-				var mismatch *proxy.WorkspaceMismatchError
-				if errors.As(err, &mismatch) {
-					fields = append(fields, "visible_workspaces", mismatch.Visible)
-				}
-				log.Error("foreman.startup_aborted", fields...)
-				return fmt.Errorf("workspace %s credential rejected: %w", c.WorkspaceID(), err)
-			}
-			log.Warn("workspace.credential_check_failed", "workspace_id", c.WorkspaceID(), "err", err.Error())
-		}
+	//
+	// Startup credential checks: C-18 snapshots, and the workspace-scoped
+	// form's C-17 exact-set self-check. Only configuration errors refuse
+	// startup; a transient upstream failure warns and the loops converge
+	// (§1.1, §1.5, AC-86).
+	if err := runStartupSelfCheck(ctx, deployment.Scope, clientSet.All(), log); err != nil {
+		return err
 	}
 
 	discoveries, err := sched.RunStartupProbe(ctx)
@@ -434,19 +456,27 @@ func run() error {
 	// preflight sends that workspace's C1 of this startup (with the §1.5
 	// backoff, C-1), so a transient failure retries instead of exiting.
 	served := make([]*proxy.Client, 0, len(discoveries))
+	servedRefs := make([]workspace.Ref, 0, len(discoveries))
+	unregisteredRefs := make([]workspace.Ref, 0, len(discoveries))
 	for _, c := range clientSet.All() {
 		discovery, ok := discoveries[c.WorkspaceID()]
 		if !ok {
-			// Configured but not registered by the probe: no declaration, no
+			// Discovered but not registered by the probe: no declaration, no
 			// control plane, no service — and never a silent drop (§10 多
-			// workspace 前置; AC-87).
+			// workspace 前置; AC-87). Each unregistered member also gets its
+			// own warn line (§9.1 服务事件按条 warn).
+			id, name := c.Workspace()
 			log.Warn("workspace.probe_registration_absent",
 				"workspace_id", c.WorkspaceID(),
-				"detail", "configured workspace was not registered by the probe; it is not served")
+				"workspace_name", name,
+				"detail", "discovered workspace was not registered by the probe; it is not served")
+			unregisteredRefs = append(unregisteredRefs, workspace.Ref{ID: id, Name: name})
 			continue
 		}
 		c.Declare(discovery)
 		served = append(served, c)
+		id, name := c.Workspace()
+		servedRefs = append(servedRefs, workspace.Ref{ID: id, Name: name})
 		log.Info("runtime.declared",
 			"workspace_id", c.WorkspaceID(),
 			"runtimes", len(discovery.Runtimes),
@@ -456,6 +486,12 @@ func run() error {
 	if len(served) == 0 {
 		return errors.New("no configured workspace was declared by the startup probe")
 	}
+	// §9.1 服务事件: one line after the probe, with the effective service
+	// scope and the discovered-but-unregistered members. The set is fixed for
+	// the process lifetime, so this is emitted once. Manifest-excluded
+	// workspaces never entered the discovery set, so they are reported at
+	// discovery time, not here.
+	proxy.LogServingEvent(log, servedRefs, unregisteredRefs)
 
 	// §4.3: rebuild the index before any loop that can create a Job or
 	// converge an entry. The claim loop creates Jobs; a rebuild running

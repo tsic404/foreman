@@ -82,7 +82,7 @@ func WithProbeRegistry(probes *registry.ProbeRegistry) FakeServerOption {
 	return func(s *FakeServer) { s.probes = probes }
 }
 
-// WithClientSet wires the per-workspace client set: S-1's configured set,
+// WithClientSet wires the per-workspace client set: S-1's discovery set,
 // S-2/S-3/S-4 routing by workspace and the S-26 cache partition all read it.
 func WithClientSet(clients *ClientSet) FakeServerOption {
 	return func(s *FakeServer) { s.clients = clients }
@@ -249,15 +249,18 @@ func (s *FakeServer) workspaceConfigured(workspaceID string) bool {
 	return s.clients.Has(workspaceID)
 }
 
-// configuredWorkspaces returns the configured workspace ids in order.
-func (s *FakeServer) configuredWorkspaces() []string {
+// discoverySet returns the discovery set in configuration order (§2.2 S-1):
+// the set the deployment's credentials scope to — for the user-scoped form the
+// C-17 answer (∩ manifest), for the workspace-scoped form the configured
+// pairs. The clients are built from exactly that set, so their ids are it.
+func (s *FakeServer) discoverySet() []string {
 	return s.clients.IDs()
 }
 
 // allowsWorkspace decides whether a token may address a workspace on the
 // res/{ws} routes. Task and catalog-probe tokens are pinned to their own
 // workspace; a startup / registration-discovery probe carries no pin and
-// spans the configured set (§1.2).
+// spans the discovery set (§1.2).
 func (s *FakeServer) allowsWorkspace(claims auth.Claims, workspaceID string) bool {
 	if claims.WorkspaceID == workspaceID {
 		return true

@@ -21,19 +21,19 @@ const tokenRenewResponseTTL = 24 * time.Hour
 
 // handleWorkspaces answers with the Job's single workspace (S1; also the
 // legacy /api/workspaces fallback S28). It must succeed, else the daemon
-// finds no runtime.
+// finds no runtime. A task Job and a catalog probe see their own workspace;
+// a startup / registration-discovery probe sees the discovery set (§2.2
+// S-1) — the set the deployment's credentials scope to, from which the
+// template's daemon registers without narrowing (ADR-049).
 func (s *FakeServer) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 	claims, ok := s.authenticate(w, r, auth.RequestScope{})
 	if !ok {
 		return
 	}
-	// A task Job and a catalog probe see their own workspace; a startup /
-	// registration-discovery probe sees the configured set, from which the
-	// template's daemon decides where to register (§2.2 S-1).
 	ids := []string{claims.WorkspaceID}
 	if claims.Role == catalogProbeRole {
 		if session, found := s.probeSession(claims); found && session.WorkspaceID == "" {
-			ids = s.configuredWorkspaces()
+			ids = s.discoverySet()
 		}
 	}
 	answer := make([]map[string]string, 0, len(ids))

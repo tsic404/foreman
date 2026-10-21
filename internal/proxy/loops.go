@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
-	"net/http"
 	"sync"
 	"time"
 
@@ -17,14 +16,6 @@ const heartbeatInterval = 15 * time.Second
 
 // tokenRenewInterval is the C16 cadence (§1.2: every 72h, non-fatal).
 const tokenRenewInterval = 72 * time.Hour
-
-// isConfigError reports whether err is a 403 (§1.5: token ↔
-// daemon_id/workspace_id mismatch). 403 is a configuration error: log it
-// and stop instead of blindly retrying — a CrashLoopBackOff is the alarm.
-func isConfigError(err error) bool {
-	var se *StatusError
-	return errors.As(err, &se) && se.Code == http.StatusForbidden
-}
 
 // ClaimScheduler is the scheduler's claim surface.
 type ClaimScheduler interface {
@@ -39,8 +30,9 @@ type ClaimScheduler interface {
 // ClaimLoop is the polling claim loop (S-6 + §10): it claims up
 // to the scheduler's budget every FOREMAN_CLAIM_INTERVAL, idles at
 // FOREMAN_CLAIM_INTERVAL_IDLE when no slot is free, and runs one immediate
-// iteration on a WS wakeup (ADR-010). Errors back off per §1.5 (1s→30s,
-// never exit) — except 403, which is a config error and stops the loop.
+// iteration on a WS wakeup (ADR-010). Every error backs off per §1.5
+// (1s→30s) and the loop never exits: at runtime a 401/403/404 is the §1.4
+// credential failure face, not a configuration verdict (AC-86).
 type ClaimLoop struct {
 	cfg     Config
 	client  *Client
@@ -72,18 +64,15 @@ func (l *ClaimLoop) Wake() {
 	}
 }
 
-// Run preflights (C1/C17/C18/C16) with §1.5 backoff, then serves the claim
-// loop until ctx ends. A 403 ends the loop with an error: the credential
-// is misbound (§1.5) and retrying cannot fix it.
+// Run preflights (C1/C16) with §1.5 backoff, then serves the claim loop until
+// ctx ends. No response code stops the loop: the startup self-check owns the
+// configuration verdict, and runtime failures back off and retry (§1.4,
+// §1.5, AC-86).
 func (l *ClaimLoop) Run(ctx context.Context) error {
 	for {
 		err := l.client.Preflight(ctx)
 		if err == nil {
 			break
-		}
-		if isConfigError(err) {
-			l.log.Error("preflight rejected: token does not match daemon_id/workspace_id (config error, not retrying)", "err", err)
-			return err
 		}
 		wait := l.backoff.next()
 		l.log.Error("preflight failed", "err", err, "retry_in", wait)
@@ -94,10 +83,6 @@ func (l *ClaimLoop) Run(ctx context.Context) error {
 	l.backoff.reset()
 	for {
 		if err := l.iterate(ctx); err != nil {
-			if isConfigError(err) {
-				l.log.Error("claim rejected: 403 config error, not retrying", "err", err)
-				return err
-			}
 			wait := l.backoff.next()
 			l.log.Error("claim failed", "err", err, "backoff", wait)
 			if !sleepOrDone(ctx, wait) {
@@ -151,8 +136,9 @@ func (l *ClaimLoop) interval() time.Duration {
 // HeartbeatLoop keeps every declared real runtime alive: one independent C2
 // stream per runtime, each with its own backoff — a failing runtime never
 // touches the others (§1.4 多 runtime 的失败面按 runtime 粒度). C16 renews the
-// server token every 72h and is non-fatal. A 403 stops the loop (config error).
-// The heartbeat ack is consumed in the same round it arrives (§1.3).
+// server token every 72h and is non-fatal. A 401/403/404 backs off and retries
+// (§1.5, AC-86); no response code stops the loop. The heartbeat ack is
+// consumed in the same round it arrives (§1.3).
 type HeartbeatLoop struct {
 	client   *Client
 	reporter *ModelCatalogReporter
@@ -166,6 +152,11 @@ type HeartbeatLoop struct {
 	// renewMu guards lastRenewAttempt: the per-runtime streams share one
 	// token-renew clock.
 	renewMu sync.Mutex
+
+	// newBackoff builds one stream's retry progression (§1.5). Tests replace
+	// it with a near-zero progression so a retry-count assertion does not
+	// spend the real 1s→30s waits.
+	newBackoff func() *backoff
 }
 
 // NewHeartbeatLoop builds the heartbeat loop.
@@ -176,12 +167,14 @@ func NewHeartbeatLoop(client *Client, reporter *ModelCatalogReporter) *Heartbeat
 		log:              slog.Default().With("component", "heartbeat-loop"),
 		now:              time.Now,
 		lastRenewAttempt: time.Now(),
+		newBackoff:       newBackoff,
 	}
 }
 
 // Run supervises one heartbeat goroutine per declared real runtime until ctx
-// ends or a 403 marks the credential misbound. A runtime whose id moved is
-// restarted on its own; the other streams keep running (§1.4).
+// ends. A runtime whose id moved is restarted on its own; the other streams
+// keep running (§1.4), and every failure inside a stream backs off and retries
+// (§1.5) — no response code stops the loop.
 func (l *HeartbeatLoop) Run(ctx context.Context) error {
 	changes, unsubscribe := l.client.SubscribeChanges()
 	defer unsubscribe()
@@ -252,10 +245,10 @@ type heartbeatStream struct {
 const heartbeatSupervisorInterval = 5 * time.Second
 
 // stream heartbeats one runtime until ctx ends. A nil return means the stream
-// was retired (runtime replaced); a non-nil one is a 403 config error and stops
-// the loop.
+// was retired (runtime replaced) or the context ended; every error backs off
+// and retries (§1.5).
 func (l *HeartbeatLoop) stream(ctx context.Context, runtimeID string) error {
-	backoff := newBackoff()
+	backoff := l.newBackoff()
 	// The ack body's runtime_id is advisory: the real server's ack does not
 	// reliably echo it, so a mismatch is worth one event per stream — never a
 	// re-key (§1.3).
@@ -270,9 +263,6 @@ func (l *HeartbeatLoop) stream(ctx context.Context, runtimeID string) error {
 				// The pending request is unrecoverable (delivered once); the
 				// server converges it by timeout. Keep the cadence.
 				l.log.Error("heartbeat ack unreadable; continuing without pending work", "runtime_id", runtimeID, "err", err)
-			} else if isConfigError(err) {
-				l.log.Error("heartbeat rejected: 403 config error, not retrying", "runtime_id", runtimeID, "err", err)
-				return err
 			} else {
 				wait := backoff.next()
 				l.log.Error("heartbeat failed", "runtime_id", runtimeID, "err", err, "retry_in", wait)

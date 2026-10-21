@@ -246,10 +246,10 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		}
 		cfg.JobDrainTimeout = d
 	}
+	// Optional: the user-scoped credential form fills Workspaces (and this
+	// single-workspace fallback) from the startup discovery (ADR-049). The
+	// deployment shape is validated by workspace.LoadDeployment.
 	cfg.WorkspaceID = strings.TrimSpace(getenv(EnvWorkspaceID))
-	if cfg.WorkspaceID == "" && strings.TrimSpace(getenv("FOREMAN_WORKSPACES")) == "" && strings.TrimSpace(getenv("FOREMAN_WORKSPACES_FILE")) == "" {
-		return Config{}, fmt.Errorf("%s is required (or configure FOREMAN_WORKSPACES)", EnvWorkspaceID)
-	}
 	// The startup window defaults to the task Job's boot bound: the same
 	// "schedule + pull + register" magnitude, with no second magic number
 	// (§10 启动探针窗口). A boot bound switched off (0 = no upper bound)

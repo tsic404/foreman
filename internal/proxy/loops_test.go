@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log/slog"
 	"net/http"
@@ -198,39 +197,44 @@ func TestClaimLoopIntervalSelection(t *testing.T) {
 	}
 }
 
-func TestClaimLoopStopsOn403(t *testing.T) {
+func TestClaimLoopRetriesOn403(t *testing.T) {
 	srv, stub := newStubUpstream(t)
 	stub.on("POST", "/api/daemon/register", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
 		w.WriteHeader(403)
-		_, _ = w.Write([]byte(`{"error":"token does not match daemon_id"}`))
+		_, _ = w.Write([]byte(`{"error":"forbidden"}`))
 	})
 	sched := &fakeClaimScheduler{budget: 1}
 	client := NewClient(testConfig(srv.URL), "mdt_test")
-	// The startup probe declared the runtime set before the loops start; the
-	// loop's preflight therefore re-declares it (and meets the 403).
 	client.disc = testDiscovery()
 	client.refs = declaredRefs(testDiscovery())
 	loop := NewClaimLoop(testConfig(srv.URL), client, sched)
+	loop.backoff = &backoff{min: time.Millisecond, max: time.Millisecond, cur: time.Millisecond}
 
-	// §1.5: 403 is a config error — no blind retry; the loop
-	// exits (CrashLoopBackOff is the alarm surface).
+	// §1.5: a runtime 401/403 is a credential failure — backoff and retry,
+	// never judged config (AC-86). The loop keeps trying until the context
+	// ends; the assertion is the retry count crossing one.
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- loop.Run(t.Context()) }()
+	go func() { done <- loop.Run(ctx) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(stub.calls("POST", "/api/daemon/register")) < 3 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if got := len(stub.calls("POST", "/api/daemon/register")); got < 3 {
+		t.Errorf("register calls = %d, want >= 3 (the loop must keep retrying a 403)", got)
+	}
 	select {
 	case err := <-done:
-		var se *StatusError
-		if !errors.As(err, &se) || se.Code != 403 {
-			t.Fatalf("Run error = %v, want 403 StatusError", err)
+		if err != nil {
+			t.Fatalf("Run returned %v after cancel, want nil", err)
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("Run must stop on 403 instead of retrying")
-	}
-	if got := len(stub.calls("POST", "/api/daemon/register")); got != 1 {
-		t.Errorf("register calls = %d, want exactly 1 (no blind retry)", got)
+	case <-time.After(time.Second):
+		t.Fatal("Run did not stop after cancel")
 	}
 }
 
-func TestHeartbeatLoopStopsOn403(t *testing.T) {
+func TestHeartbeatLoopRetriesOn403(t *testing.T) {
 	srv, stub := newStubUpstream(t)
 	stubRegister(stub, "rid-1")
 	stub.on("POST", "/api/daemon/heartbeat", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
@@ -240,17 +244,34 @@ func TestHeartbeatLoopStopsOn403(t *testing.T) {
 	client := NewClient(testConfig(srv.URL), "mdt_test")
 	registerDeclared(t, client)
 	loop := NewHeartbeatLoop(client, nil)
+	loop.now = time.Now
+	// §1.5's real progression is 1s→30s; the assertion is the retry count, so
+	// the stream uses a near-zero progression (same seam shape as the claim
+	// loop's backoff).
+	loop.newBackoff = func() *backoff {
+		return &backoff{min: time.Millisecond, max: time.Millisecond, cur: time.Millisecond}
+	}
 
+	// §1.5: the heartbeat stream backs off and retries a 403 (AC-86); the
+	// loop does not stop.
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- loop.Run(t.Context()) }()
+	go func() { done <- loop.Run(ctx) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for len(stub.calls("POST", "/api/daemon/heartbeat")) < 3 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if got := len(stub.calls("POST", "/api/daemon/heartbeat")); got < 3 {
+		t.Errorf("heartbeat calls = %d, want >= 3 (the loop must keep retrying a 403)", got)
+	}
 	select {
 	case err := <-done:
-		var se *StatusError
-		if !errors.As(err, &se) || se.Code != 403 {
-			t.Fatalf("Run error = %v, want 403 StatusError", err)
+		if err != nil {
+			t.Fatalf("Run returned %v after cancel, want nil", err)
 		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("heartbeat loop must stop on 403")
+	case <-time.After(time.Second):
+		t.Fatal("Run did not stop after cancel")
 	}
 }
 

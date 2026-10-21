@@ -162,10 +162,11 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	if parsed.Host == "" {
 		return Config{}, fmt.Errorf("%s must name a host", EnvServerURL)
 	}
+	// The workspace identity is optional here: the user-scoped credential
+	// form discovers its workspaces at startup and fills one Config per
+	// discovered workspace (ADR-049). The deployment shape is validated by
+	// workspace.LoadDeployment, which is the single authority.
 	cfg.WorkspaceID = strings.TrimSpace(getenv(EnvWorkspaceID))
-	if cfg.WorkspaceID == "" && strings.TrimSpace(getenv("FOREMAN_WORKSPACES")) == "" && strings.TrimSpace(getenv("FOREMAN_WORKSPACES_FILE")) == "" {
-		return Config{}, fmt.Errorf("%s is required (or configure FOREMAN_WORKSPACES)", EnvWorkspaceID)
-	}
 	if v := strings.TrimSpace(getenv(EnvDaemonID)); v != "" {
 		cfg.DaemonID = v
 	}

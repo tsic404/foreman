@@ -42,7 +42,7 @@ type ProbeSession struct {
 	RealRuntimeID string // real runtime id results are relayed to; ProbeCommandDriven only
 	// WorkspaceID pins the probe to one workspace (catalog probes). Empty on
 	// startup / registration-discovery probes: their registration scope spans
-	// every configured workspace and their S-2 / S-3 answers serve any of them
+	// every discovery-set workspace and their S-2 / S-3 answers serve any of them
 	// (§1.2, §6.3).
 	WorkspaceID string
 	Deadline    time.Time
@@ -74,7 +74,7 @@ type ProbeRegistration struct {
 }
 
 // Registration returns one workspace's captured declaration, or false when
-// the probe never registered to that workspace (the configured-but-unserved
+// the probe never registered to that workspace (the discovered-but-unserved
 // case of AC-87).
 func (s ProbeSession) Registration(workspaceID string) (ProbeRegistration, bool) {
 	registration, ok := s.Registrations[workspaceID]

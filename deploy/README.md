@@ -39,7 +39,9 @@ an un-replaced copy makes Foreman fail its startup self-check and CrashLoop,
 rather than serve with a key anyone can read from the repository.
 
 ```bash
-# Server credential: mdt_/mul_ token bound to FOREMAN_DAEMON_ID + workspace.
+# Server credential: mdt_/mul_ token. Workspace-scoped form: bound to
+# FOREMAN_DAEMON_ID + workspace. Discovery form: the account's membership
+# defines the served set (§Multi-workspace).
 kubectl -n foreman create secret generic foreman-secret \
   --from-literal=MULTICA_TOKEN='mdt_...' \
   --from-literal=FOREMAN_JOB_TOKEN_KEY="$(head -c 32 /dev/urandom | xxd -p -c 64)" \
@@ -61,28 +63,99 @@ characters); `MULTICA_TOKEN` must start with `mdt_` or `mul_`.
 
 ## Multi-workspace (optional)
 
-One deployment can serve several workspaces (ADR-047): each workspace has its
-own `(credential, daemon identity)` pair, and every control-plane action runs
-once per pair.
+One deployment can serve several workspaces (ADR-047, ADR-049). The server
+credential's scope selects the deployment form; every control-plane action runs
+once per `(credential, daemon identity, workspace)`.
 
-- **Credentials**: either keep the single-workspace `MULTICA_WORKSPACE_ID` /
-  `FOREMAN_DAEMON_ID` / `MULTICA_TOKEN` form (a legal one-workspace set), or set
-  `FOREMAN_WORKSPACES_FILE` to a mounted file holding:
-  ```json
-  [
-    {"workspace_id": "ws-a", "daemon_id": "foreman-a", "token": "mdt_..."},
-    {"workspace_id": "ws-b", "daemon_id": "foreman-b", "token_env": "MULTICA_TOKEN_B"}
-  ]
-  ```
-  `token_env` names the Secret key's env variable; `token` may be inlined. Both
-  ids are unique, and no daemon identity may be shared across workspaces (F2).
-  `FOREMAN_WORKSPACES` accepts the same JSON inline (mutually exclusive with the
-  file form).
-- **Serving scope**: the startup probe is still one Job; the template's daemon
-  decides which workspaces it registers to (S-1 answers the configured set).
-  Foreman serves exactly the workspaces it observed registering — a configured
-  workspace the probe never registered is not served and logs
-  `workspace.probe_registration_absent`.
+### Discovery form (default): one user-scoped credential
+
+Give the deployment one user-scoped credential and **no workspace id**:
+
+```yaml
+env:
+  - name: MULTICA_TOKEN          # the account's credential (mul_/mdt_)
+    valueFrom: {secretKeyRef: {name: foreman-secret, key: MULTICA_TOKEN}}
+  - name: FOREMAN_DAEMON_ID
+    value: "foreman"             # deployment-level base identity
+```
+
+At startup Foreman lists every workspace the credential can see (C-17) and
+serves all of them; each workspace gets a deployment identity derived from the
+base identity (`foreman-<workspace>`, stable across restarts, distinct across
+workspaces). Zero workspace ids to hand-write.
+
+Narrow the scope with an optional manifest — a JSON array of workspace ids:
+
+```yaml
+  - name: FOREMAN_WORKSPACES_MANIFEST_FILE
+    value: /etc/foreman/workspaces.json
+# /etc/foreman/workspaces.json: ["<workspace-uuid>", ...]
+```
+
+`FOREMAN_WORKSPACES_MANIFEST` accepts the same list inline (mutually exclusive
+with the file form). Rules (ADR-049 decision 1): the discovery set is
+`manifest ∩ visible`; a manifest entry the credential cannot see, an empty
+manifest (`[]`), or an unreachable/rejected/empty C-17 answer refuses startup —
+never a half-configured service. Workspaces visible but outside the manifest
+are not registered or served, and the startup discovery event names them.
+
+### Workspace-scoped form: one credential per workspace
+
+Set `FOREMAN_WORKSPACES_FILE` (or `FOREMAN_WORKSPACES` inline) to a mounted
+file holding one `(credential, workspace)` pair per workspace:
+
+```json
+[
+  {"workspace_id": "ws-a", "daemon_id": "foreman-a", "token": "mdt_..."},
+  {"workspace_id": "ws-b", "daemon_id": "foreman-b", "token_env": "MULTICA_TOKEN_B"}
+]
+```
+
+`token_env` names the Secret key's env variable; `token` may be inlined. Both
+ids are unique, and no daemon identity may be shared across workspaces (F2).
+This form accepts **no manifest** — the configured pairs are the discovery set.
+Each credential's C-17 answer must be exactly its configured workspace, else
+startup is refused (a workspace-scoped credential that sees more is mis-scoped).
+
+The legacy `MULTICA_WORKSPACE_ID` / `FOREMAN_DAEMON_ID` / `MULTICA_TOKEN` triple
+is the workspace-scoped form with one pair.
+
+> **Migrating a single-workspace deployment.** If its credential is a user
+> token that sees more than one workspace, the exact-set check above refuses
+> startup (it always did see more, but the check used to accept a superset).
+> Either switch to the discovery form (drop `MULTICA_WORKSPACE_ID`; add a
+> manifest to keep serving one workspace) or move to a workspace-scoped
+> credential.
+
+### Serving scope and events
+
+- The startup probe is one Job. It registers to every workspace of S-1's answer
+  (the discovery set) — the upstream daemon has no workspace whitelist, and the
+  template cannot narrow the scope. Foreman neither filters nor pads that
+  answer. The **effective service scope** is what the probe actually registered:
+  a discovery-set member the probe never registered is not served, logs one
+  `workspace.probe_registration_absent` warn and appears in the
+  `workspace.serving` event.
+- `workspace.discovery` (once) names the source (visible set / manifest /
+  workspace-scoped pairs), the discovery set and the manifest-excluded
+  workspaces. `workspace.discovery_failed` names the reason and the credential
+  scope when startup is refused.
+- The set is fixed for the process lifetime: `daemon:workspaces_changed` is
+  received and ignored — membership changes take effect on the next restart.
+
+### Failure surface
+
+- Workspace-scoped credential: a failing credential or identity backs off only
+  its own workspace; the others keep heartbeating, claiming and subscribing.
+- User-scoped credential: a rejected credential (401/403) is a deployment-level
+  failure — every workspace's control-plane loop backs off on the same
+  credential; no request keeps using it.
+- Runtime 401/403/404 are never judged configuration errors (§1.5): they back
+  off and retry. Only the startup self-check (discovery, C-17 scope, TTL
+  arithmetic) refuses startup.
+
+### Budget, policy and node state
+
 - **Budget**: `FOREMAN_MAX_INFLIGHT_JOBS` is the global cap;
   `FOREMAN_MAX_INFLIGHT_JOBS_PER_WORKSPACE` adds the per-workspace cap (0 = none).
 - **Policy**: partition the table under `workspaces.<workspace_id>`:
@@ -98,7 +171,8 @@ once per pair.
   home volume). A fixed literal makes the template correct for one workspace
   only — a deployment error Foreman does not correct.
 - **Isolation**: cross-workspace Job Tokens, projections, delivery and probes are
-  rejected (403 / 404); a credential failure retries only its workspace.
+  rejected (403 / 404); a credential failure retries only its workspace (or the
+  whole deployment for the user-scoped form).
 
 ## Images
 
