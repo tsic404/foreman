@@ -629,7 +629,7 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		}
 		_, _ = w.Write([]byte("-last"))
 	})
-	// The S29 failure probes (TC-tech-forward-05): a head that never arrives, an
+	// The S29 failure probes (TC-tech-forward-08): a head that never arrives, an
 	// upstream 5xx, and a head whose body is cut short. Each records the request
 	// so a scenario can count what one caller request produced upstream.
 	mux.HandleFunc("GET /api/forward-probe-refused", func(w http.ResponseWriter, r *http.Request) {

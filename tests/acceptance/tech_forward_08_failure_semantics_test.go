@@ -1,4 +1,4 @@
-// TC-tech-forward-05 (AC-66): S-29's failure semantics have two segments. A
+// TC-tech-forward-08 (AC-90): S-29's failure semantics have two segments. A
 // failure before the upstream's head (connect or transport) and an upstream 5xx
 // answer 502 with the fixed error body; a break after the head has gone out
 // reaches the caller as a truncated answer — upstream status, the bytes already
@@ -35,11 +35,11 @@ func forwardGet(t *testing.T, client *http.Client, url string, header http.Heade
 	return resp.StatusCode, raw, readErr
 }
 
-func TestTechForward05FailureSemantics(t *testing.T) {
+func TestTechForward08FailureSemantics(t *testing.T) {
 	h := newHarness(t, false)
 	header := http.Header{
 		"Authorization": {"Bearer mat_tasktoken"},
-		"User-Agent":    {"tc-forward-05/1.0"},
+		"User-Agent":    {"tc-forward-08/1.0"},
 	}
 	client := newForwardCaller(t)
 
