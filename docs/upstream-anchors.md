@@ -72,16 +72,29 @@ through the platform's project list. Title uniqueness is not promised, which is
 why more than one exact match refuses startup as ambiguous (ADR-048 decision 2)
 rather than picking one.
 
-## Unverified: multi-workspace probe registration (contracts §1.2 / ADR-047)
+## Multi-workspace credential scope and probe registration (contracts §0 / §1.1 / §1.2 / §7, ADR-049)
 
-The design's probe scope (one startup / registration-discovery probe whose
-daemon decides, from the template config, which workspaces it registers to)
-needs each registration to name its workspace. The pinned anchor set above does
-not record a registration-body workspace field. The implementation is the
-defensive form: S-4 accepts `workspace_id` when the body carries it and falls
-back to the Job Token's workspace when it does not; a probe that never names a
-second workspace is treated as unregistered for it (one visible
-`probe.workspace_not_registered` event, no silent service). Re-verify the field
-against the pinned artifact before relying on the multi-workspace probe scope;
-a confirmed absence narrows the scope to the token's workspace and is a design
-question, not an implementation fix.
+Premise: the workspace set a credential can act for is answered by C-17, the
+daemon has no configuration that narrows its registration scope, and the
+cross-workspace answer shapes are the ones ADR-049 decision 4 names. Verified
+against the pinned artifact (`multica-ai/multica@2ea01ae4`).
+
+| Fact | Anchor |
+|---|---|
+| `GET /api/daemon/workspaces` answers `[{id, name}]` by credential scope: a user-scoped PAT/JWT caller gets every workspace the user belongs to; a workspace-scoped daemon token (`mdt_`) gets only its bound workspace. The answer is an eventual-consistency read and is not an admission decision — downstream daemon APIs authorize each request themselves. | `server/internal/handler/daemon_workspace.go` → `(*Handler).ListDaemonWorkspaces`, `DaemonWorkspaceResponse` |
+| The daemon has **no** workspace parameter and **no** workspace whitelist: its workspace set comes only from C-17, and the sync loop registers every workspace in the answer. | `server/internal/daemon/daemon.go` → `(*Daemon).syncWorkspacesFromAPI`, `(*Daemon).workspaceSyncLoop`; `server/internal/daemon/client.go` → `(*Client).ListWorkspaces`; `server/internal/daemon/config.go` (`WorkspacesRoot` is a path, not a scope) |
+| Cross-workspace authorization answers `404 not found` (not 403): a daemon token whose workspace differs from the target, and a user who is not a member, both fall through `requireDaemonWorkspaceAccess` to a 404. | `server/internal/handler/daemon.go` → `(*Handler).requireDaemonWorkspaceAccess` |
+| Registration (`POST /api/daemon/register`) requires `workspace_id` + `daemon_id` and at least one runtime or failed profile; a daemon-token workspace mismatch answers 404, a user-token non-member answers 404, and the register body names its workspace per registration. | `server/internal/handler/daemon.go` → `(*Handler).DaemonRegister`, `DaemonRegisterRequest` |
+| Heartbeat (`POST /api/daemon/heartbeat`): an unknown runtime id answers 404 ("runtime not found"); a workspace the credential does not cover answers 404 through the workspace check. | `server/internal/handler/daemon.go` → `(*Handler).DaemonHeartbeat`, `(*Handler).requireDaemonRuntimeAccess` |
+| Batch claim (`POST /api/daemon/tasks/claim`): `daemon_id` is required and a daemon-token identity mismatch answers 403; unknown or unauthorized runtime ids are **skipped** (not failed), so a claim naming another workspace's runtime answers 200 with an empty task set. | `server/internal/handler/daemon.go` → `(*Handler).ClaimTasksByRuntime` |
+| Deregister (`POST /api/daemon/deregister`): runtimes the credential does not cover are skipped and the request still answers 200. | `server/internal/handler/daemon.go` → `(*Handler).DaemonDeregister`, `(*Handler).verifyDaemonWorkspaceAccess` |
+| The register response carries one row per declared runtime; the row is keyed by `(workspace, daemon_id, provider, profile_id)` and the daemon identity is the request's `daemon_id`. | `server/internal/handler/daemon.go` → `(*Handler).DaemonRegister`; `server/pkg/db/generated/*` → the agent-runtime upsert queries |
+
+**Scope of the premise.** These anchors settle the *client* side: which
+workspace set a credential may act for, and what a cross-workspace request
+answers. The probe-side registration remains Foreman-local by contract (S-4
+captures it into the probe session; it is never forwarded upstream), so the
+probe's own daemon identity never reaches the server — the server-side runtime
+rows come only from Foreman's per-workspace C-1 with the deployment identity.
+Re-verify when upstream changes the daemon route group or the C-17 answer shape
+(protocol change ⇒ 提案, per 01-scope 变更触发条件).

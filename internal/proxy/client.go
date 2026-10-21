@@ -225,20 +225,19 @@ func (c *Client) recoverOrphans(ctx context.Context, runtimeID string) {
 	}
 }
 
-// Preflight runs the post-registration startup checks: C17 workspace
-// validation (caches the workspace name for S1) and C16 token renew
+// Preflight runs the post-registration startup checks: C16 token renew
 // (non-fatal). C1 is carried by the cached declaration unless a live runtime
 // set already exists. C18 is not part of the preflight: the profile snapshot is
-// taken before the startup probe (§1.6 startup order). Callers retry with the
-// §1.5 backoff.
+// taken before the startup probe (§1.6 startup order). C17 is not part of the
+// preflight either: discovery/scope validation happens once at startup
+// (ADR-049), and §1.5 keeps runtime credential failures inside the per-§1.4
+// backoff — a runtime 401/403 is retried, never judged config (AC-86). Callers
+// retry with the §1.5 backoff.
 func (c *Client) Preflight(ctx context.Context) error {
 	if len(c.RuntimeIDs()) == 0 {
 		if err := c.Register(ctx); err != nil {
 			return err
 		}
-	}
-	if err := c.Workspaces(ctx); err != nil {
-		return fmt.Errorf("workspace check: %w", err)
 	}
 	if err := c.RenewToken(ctx); err != nil {
 		c.log.Warn("token renew failed (non-fatal)", "err", err)
@@ -619,37 +618,13 @@ func (c *Client) RenewToken(ctx context.Context) error {
 	return nil
 }
 
-// Workspaces is C17: validates the configured workspace is reachable and
-// caches its display name for S1.
-func (c *Client) Workspaces(ctx context.Context) error {
-	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodGet, "/api/daemon/workspaces", nil)
-	if err != nil {
-		return fmt.Errorf("list workspaces: %w", err)
-	}
-	if code < 200 || code >= 300 {
-		return fmt.Errorf("list workspaces: %w", &StatusError{Code: code, Body: raw})
-	}
-	var list []struct {
-		ID   string `json:"id"`
-		Name string `json:"name"`
-	}
-	if err := json.Unmarshal(raw, &list); err != nil {
-		return fmt.Errorf("list workspaces: decode: %w", err)
-	}
-	visible := make([]string, 0, len(list))
-	for _, w := range list {
-		if w.ID == c.cfg.WorkspaceID {
-			c.mu.Lock()
-			c.workspace = w.Name
-			c.mu.Unlock()
-			return nil
-		}
-		visible = append(visible, w.ID)
-	}
-	return fmt.Errorf("list workspaces: %w", &WorkspaceMismatchError{
-		Configured: c.cfg.WorkspaceID,
-		Visible:    visible,
-	})
+// SetWorkspaceName caches the workspace display name discovered from C-17
+// (ADR-049): the discovery answer names each workspace, and S-1 serves the
+// name verbatim. The id itself never changes for one client.
+func (c *Client) SetWorkspaceName(name string) {
+	c.mu.Lock()
+	c.workspace = name
+	c.mu.Unlock()
 }
 
 // ---- transport ----

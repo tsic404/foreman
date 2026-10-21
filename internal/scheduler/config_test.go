@@ -70,9 +70,16 @@ func TestLoadConfigDefaults(t *testing.T) {
 
 // MULTICA_WORKSPACE_ID binds the probe Job Token (the catalog probe carries no
 // task), so a configuration without one is refused at startup.
-func TestLoadConfigRequiresWorkspaceID(t *testing.T) {
-	if _, err := LoadConfig(envFrom(map[string]string{})); err == nil {
-		t.Fatal("LoadConfig without a workspace id: want an error")
+// The workspace identity is not a scheduler-config requirement: the
+// user-scoped credential form discovers its set at startup and fills it in
+// (ADR-049). workspace.LoadDeployment is the deployment-shape authority.
+func TestLoadConfigAcceptsDiscoveryForm(t *testing.T) {
+	cfg, err := LoadConfig(envFrom(map[string]string{}))
+	if err != nil {
+		t.Fatalf("LoadConfig without a workspace id: %v", err)
+	}
+	if cfg.WorkspaceID != "" || len(cfg.Workspaces) != 0 {
+		t.Errorf("config = %+v, want the discovery form to stay unset until startup", cfg)
 	}
 }
 

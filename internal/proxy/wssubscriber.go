@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -120,12 +119,6 @@ const (
 	// hammering the handshake; the supervisor un-parks on the next runtime-set
 	// change, which is exactly when dialing can work again (§1.5 退避面).
 	streamParked
-	// streamConfigError means the handshake was rejected with 403: the
-	// credential does not match the daemon identity/workspace (§1.5
-	// configuration error). Neither a backoff nor a park makes it
-	// connectable, so the subscriber reports it and the process fails
-	// visibly instead of serving a subscription that can never come up.
-	streamConfigError
 	// streamDone means the context ended.
 	streamDone
 )
@@ -142,6 +135,11 @@ type wsSubscription struct {
 	runtimeID string
 	epoch     uint64
 	cancel    context.CancelFunc
+	// closed fires once this stream's live connection has been closed after a
+	// cancel. A replacement waits for it: the old connection must be gone
+	// before the new dial starts, or two connections for one real runtime
+	// overlap (§1.2 C-20).
+	closed chan struct{}
 }
 
 // runtimeStreamState survives stream replacement: the reconnect progression
@@ -211,6 +209,15 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 	// epochs numbers the stream instances: an id may be reused, a stream
 	// instance never is (it is what the outcome is matched against).
 	var epochs uint64
+	// retiring holds the identities whose live stream is being torn down for a
+	// runtime-id move. The entry stays until that stream reports its
+	// connection closed (or ends), so the replacement never dials over a
+	// closing connection (§1.2 C-20 — one live connection per real runtime).
+	retiring := map[string]bool{}
+	// closedEvents wakes the supervisor when a retiring stream's connection has
+	// closed, so the replacement starts without waiting for the stream's
+	// bookkeeping (metrics, outcome) to finish.
+	closedEvents := make(chan struct{}, 8)
 	stopAll := func() {
 		for key, sub := range connections {
 			sub.cancel()
@@ -245,13 +252,29 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 		for key, sub := range connections {
 			ref, ok := declared[key]
 			if !ok || ref.ID != sub.runtimeID {
-				sub.cancel()
-				delete(connections, key)
+				if !retiring[key] {
+					sub.cancel()
+					retiring[key] = true
+				}
+				// The entry stays until the stream reports its connection
+				// closed: the start loop below replaces it then, never before.
 			}
 		}
 		for key, ref := range declared {
-			if _, ok := connections[key]; ok {
-				continue
+			if sub, ok := connections[key]; ok {
+				if !retiring[key] {
+					continue
+				}
+				// Retiring: start the replacement only once the old
+				// connection is closed. Its outcome may still be in flight
+				// (bookkeeping); the epoch guard drops that late outcome.
+				select {
+				case <-sub.closed:
+					delete(connections, key)
+					delete(retiring, key)
+				default:
+					continue
+				}
 			}
 			if _, parking := parked[key]; parking {
 				continue
@@ -264,14 +287,22 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 			subCtx, cancel := context.WithCancel(ctx)
 			epochs++
 			epoch := epochs
-			connections[key] = wsSubscription{runtimeID: ref.ID, epoch: epoch, cancel: cancel}
-			go func(ref RuntimeRef, state *runtimeStreamState, epoch uint64) {
-				result := s.listen(subCtx, ref, state, epoch)
+			closed := make(chan struct{})
+			onClosed := sync.OnceFunc(func() {
+				close(closed)
+				select {
+				case closedEvents <- struct{}{}:
+				default:
+				}
+			})
+			connections[key] = wsSubscription{runtimeID: ref.ID, epoch: epoch, cancel: cancel, closed: closed}
+			go func(ref RuntimeRef, state *runtimeStreamState, epoch uint64, onClosed func()) {
+				result := s.listen(subCtx, ref, state, epoch, onClosed)
 				select {
 				case outcomes <- result:
 				case <-ctx.Done():
 				}
-			}(ref, state, epoch)
+			}(ref, state, epoch, onClosed)
 		}
 	}
 	for {
@@ -280,12 +311,6 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case result := <-outcomes:
-			if result.outcome == streamConfigError {
-				// §1.5: the credential cannot be retried into working. The
-				// error travels to the process supervisor, which exits
-				// non-zero — the Deployment's restart is the alarm.
-				return fmt.Errorf("ws subscription: 403 config error on runtime %s", result.runtimeID)
-			}
 			if result.outcome == streamParked {
 				// Parking is a statement about the identity, not about one id:
 				// the rebuild budget is shared across replacements, so even a
@@ -306,6 +331,10 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 				continue
 			}
 			delete(connections, result.identity)
+			delete(retiring, result.identity)
+		case <-closedEvents:
+			// A retiring stream's connection has closed: the next reconcile
+			// starts its replacement.
 		case <-changes:
 			// Just wake up: parking is left to its own window, so a provider
 			// whose id moves on every register cannot re-arm by moving.
@@ -319,9 +348,9 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 // state, which outlives a stream replacement — an id that keeps moving must not
 // reset the rate limit by starting a fresh stream. epoch is this instance's own
 // identity and travels back with the outcome.
-func (s *WSSubscriber) listen(ctx context.Context, ref RuntimeRef, state *runtimeStreamState, epoch uint64) streamResult {
+func (s *WSSubscriber) listen(ctx context.Context, ref RuntimeRef, state *runtimeStreamState, epoch uint64, onClosed func()) streamResult {
 	for {
-		outcome := s.iterate(ctx, ref, state)
+		outcome := s.iterate(ctx, ref, state, onClosed)
 		if outcome != streamRetry {
 			return streamResult{identity: ref.Key(), runtimeID: ref.ID, epoch: epoch, outcome: outcome}
 		}
@@ -330,7 +359,7 @@ func (s *WSSubscriber) listen(ctx context.Context, ref RuntimeRef, state *runtim
 
 // iterate runs one connect → read → reconnect cycle for a runtime, returning
 // the reason the loop must stop (or streamRetry to go around again).
-func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *runtimeStreamState) streamOutcome {
+func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *runtimeStreamState, onClosed func()) streamOutcome {
 	runtimeID := ref.ID
 	u := wsURL(s.client.cfg.ServerURL) + "/api/daemon/ws?runtime_ids=" + url.QueryEscape(runtimeID)
 	hdr := http.Header{}
@@ -358,12 +387,12 @@ func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *runti
 			s.log.Error("ws handshake rejected (bad request); staying on polling", "status", code, "runtime_id", runtimeID)
 			return streamParked
 		case code == http.StatusForbidden:
-			// §1.5: 403 is the credential/identity mismatch — a
-			// configuration error, not a transient failure. Retrying or
-			// parking only hides it; report it so the process fails (the same
-			// face the claim and heartbeat loops take).
-			s.log.Error("ws handshake rejected: 403 config error (credential does not match daemon_id/workspace_id)", "status", code, "runtime_id", runtimeID)
-			return streamConfigError
+			// §1.5: a 403 at runtime is the credential failure face of
+			// §1.4 — back off and retry. Only the startup self-check judges
+			// configuration; the running loop must not stop (AC-86).
+			s.log.Error("ws handshake rejected (403); backing off", "status", code, "runtime_id", runtimeID)
+			s.waitReconnect(ctx, err, state)
+			return streamRetry
 		case code == http.StatusNotFound && handshakeSaysRuntimeGone(resp):
 			// The runtime row is gone: rebuild it (C1) and reconnect under the
 			// fresh id. A row that cannot be moved parks this stream instead of
@@ -400,6 +429,12 @@ func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *runti
 	s.log.Info("ws.connected", "side", WSSideServer, "runtime_id", runtimeID)
 	s.readLoop(ctx, conn)
 	_ = conn.Close(websocket.StatusNormalClosure, "closing")
+	if ctx.Err() != nil {
+		// A cancelled stream's connection is closed: its replacement may dial
+		// now (the supervisor waits for this signal, never for the bookkeeping
+		// below). A reconnect's own close is not a retirement.
+		onClosed()
+	}
 	s.metrics.WSDisconnect(WSSideServer)
 	// A shutdown closes every connection; it is not a reconnect. Counting it
 	// would inflate the reconnect metric on every process stop.
@@ -452,6 +487,12 @@ func (s *WSSubscriber) readLoop(ctx context.Context, conn *websocket.Conn) {
 			}
 			s.log.Info("runtime.profiles_changed", "workspace_id", ws)
 			s.profilesChanged()
+		case FrameDaemonWorkspacesChanged:
+			// §1.7 / ADR-049 decision 5: the discovery set is fixed at
+			// startup. The user-scoped connection receives membership
+			// changes, but the set never moves mid-process — the change
+			// takes effect on the next restart.
+			s.log.Debug("ws workspaces change ignored (set fixed at startup)", "workspace_id", frame.workspaceID())
 		}
 	}
 }

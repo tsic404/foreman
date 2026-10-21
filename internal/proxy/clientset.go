@@ -16,7 +16,7 @@ type ClientSet struct {
 	bundles   map[string]*SkillCache
 }
 
-// NewClientSet groups clients by their configured workspace.
+// NewClientSet groups clients by the workspace each one serves.
 func NewClientSet(clients ...*Client) (*ClientSet, error) {
 	set := &ClientSet{
 		clients: make([]*Client, 0, len(clients)),
@@ -60,7 +60,7 @@ func (s *ClientSet) All() []*Client {
 	return append([]*Client(nil), s.clients...)
 }
 
-// IDs returns the configured workspace ids in configuration order.
+// IDs returns the served workspace ids in configuration order.
 func (s *ClientSet) IDs() []string {
 	if s == nil {
 		return nil
@@ -72,7 +72,7 @@ func (s *ClientSet) IDs() []string {
 	return ids
 }
 
-// Has reports whether workspaceID is configured.
+// Has reports whether workspaceID is served.
 func (s *ClientSet) Has(workspaceID string) bool {
 	_, ok := s.For(workspaceID)
 	return ok

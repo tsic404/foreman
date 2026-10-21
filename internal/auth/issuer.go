@@ -77,7 +77,7 @@ type DoneIndex interface {
 
 // ProbeEntry is the subset of a probe session that Verify needs. WorkspaceID
 // is empty for startup / registration-discovery probes, whose registration
-// scope spans every configured workspace (§1.2).
+// scope spans every discovery-set workspace (§1.2).
 type ProbeEntry struct {
 	JobRuntime   string
 	RequestID    string
@@ -246,7 +246,7 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 		}
 		// A workspace-pinned probe (a catalog probe) only answers for its own
 		// workspace; startup / discovery probes carry no pin and span the
-		// configured set (§6.3).
+		// discovery set (§6.3).
 		if session.WorkspaceID != "" && session.WorkspaceID != payload.WorkspaceID {
 			return Claims{}, fmt.Errorf("%w: workspace %s", ErrScopeMismatch, payload.WorkspaceID)
 		}

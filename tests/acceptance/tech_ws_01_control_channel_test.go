@@ -2,7 +2,7 @@
 // one connection per declared runtime (gauge 1 for a one-runtime declaration),
 // the "claim is push-driven" discriminator, the Job-side S-30 handshake with
 // no fallback noise, the FOREMAN_WS_ENABLED=false polling fallback, and the
-// §1.5 handshake-403 face (one error line, no backoff, no park).
+// §1.5 handshake-403 face (error line + backoff retry, never a stop).
 package acceptance
 
 import (
@@ -285,42 +285,39 @@ func TestWS01DisabledFallsBackToPolling(t *testing.T) {
 	}
 }
 
-// TestWS01Handshake403ReportsConfigError pins the §1.5 face PR #100 added: a
-// 403 handshake is the credential/identity mismatch, so the subscriber reports
-// it once and stops. No backoff retry (one dial total, still one after the 1s
-// first step) and no park (Run returns instead of holding the stream for 30s).
-func TestWS01Handshake403ReportsConfigError(t *testing.T) {
+// TestWS01Handshake403BacksOff pins the §1.5 face ADR-049 settled: a 403 at
+// runtime is the credential failure of §1.4 — the subscriber logs it and backs
+// off, retrying the handshake instead of stopping. Only the startup self-check
+// refuses to run on a rejected credential.
+func TestWS01Handshake403BacksOff(t *testing.T) {
 	wsLogs := ws01CaptureDefaultLogs(t)
 	h := newHarnessWithWS(t, false)
 	ws01Declare(t, h)
 	h.upstream.setWSStatus(http.StatusForbidden)
 
 	subscriber := proxy.NewWSSubscriber(h.client, func() {}, h.metrics)
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- subscriber.Run(t.Context()) }()
+	go func() { done <- subscriber.Run(ctx) }()
 
-	var runErr error
+	// The first §1.5 backoff step is 1s; past it a second dial must have
+	// happened, and the subscriber must still be running.
+	deadline := time.Now().Add(3 * time.Second)
+	for h.upstream.wsDialCount() < 2 && time.Now().Before(deadline) {
+		time.Sleep(20 * time.Millisecond)
+	}
+	if got := h.upstream.wsDialCount(); got < 2 {
+		t.Fatalf("handshake dials = %d, want >= 2 (a 403 must be retried with backoff)", got)
+	}
 	select {
-	case runErr = <-done:
-	case <-time.After(2 * time.Second):
-		t.Fatal("a 403 handshake must stop the subscriber; a retry loop or a park would keep it running")
-	}
-	if runErr == nil || !strings.Contains(runErr.Error(), "403") {
-		t.Fatalf("Run error = %v, want the 403 config error the supervisor escalates", runErr)
-	}
-	if got := h.upstream.wsDialCount(); got != 1 {
-		t.Fatalf("handshake dials = %d, want exactly 1 (no blind retry)", got)
-	}
-	// The first §1.5 backoff step is 1s: surviving it with the dial count
-	// unchanged proves the stop is a stop, not a scheduled retry.
-	time.Sleep(1100 * time.Millisecond)
-	if got := h.upstream.wsDialCount(); got != 1 {
-		t.Fatalf("handshake dials after the first backoff window = %d, want 1", got)
+	case err := <-done:
+		t.Fatalf("Run stopped on a 403 handshake: %v", err)
+	default:
 	}
 
-	events := ws01Events(wsLogs, "ws handshake rejected: 403 config error (credential does not match daemon_id/workspace_id)")
-	if len(events) != 1 {
-		t.Fatalf("403 config-error lines = %d, want exactly 1: %v", len(events), events)
+	events := ws01Events(wsLogs, "ws handshake rejected (403); backing off")
+	if len(events) == 0 {
+		t.Fatalf("no 403 backoff line: %v", wsLogs.String())
 	}
 	event := events[0]
 	if event["level"] != "ERROR" {
@@ -331,5 +328,14 @@ func TestWS01Handshake403ReportsConfigError(t *testing.T) {
 	}
 	if event["runtime_id"] != "rid-omp" {
 		t.Errorf("403 line runtime_id = %v, want rid-omp", event["runtime_id"])
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v after cancel, want nil", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not stop after cancel")
 	}
 }

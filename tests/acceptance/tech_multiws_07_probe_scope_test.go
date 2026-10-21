@@ -1,7 +1,7 @@
-// TC-tech-multiws-07 implements AC-87: one startup probe serves the whole
-// deployment; the template's daemon decides which workspaces it registers to,
-// and Foreman serves exactly the observed set — never injecting, overriding or
-// stripping that configuration.
+// TC-tech-multiws-07 implements AC-87: the startup probe's registration scope
+// is S-1's answer (the discovery set) — one probe Job, no template-side
+// narrowing, no filtering or padding by Foreman — and the effective service
+// scope is exactly what the probe actually registered.
 package acceptance
 
 import (
@@ -11,11 +11,14 @@ import (
 	"time"
 
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/workspace"
 )
 
-// probeDaemon plays the startup probe pod: it reads S-1 and registers to the
-// workspaces the "template" chose (all when limitedTo is empty).
-func probeDaemon(t *testing.T, m *multiWS, limitedTo string, versions map[string]string) func(job *batchv1Job) {
+// probeDaemon plays the startup probe pod: it reads S-1, asserts it equals
+// want, and registers to every workspace in it — the official daemon's
+// behaviour (it has no workspace whitelist). skip names workspaces the
+// simulated daemon fails to register (the unregistered-member face).
+func probeDaemon(t *testing.T, m *multiWS, want []string, skip string, versions map[string]string) func(job *batchv1Job) {
 	t.Helper()
 	return func(job *batchv1Job) {
 		if job.Labels[registry.LabelRole] != registry.RoleCatalogProbe {
@@ -42,11 +45,18 @@ func probeDaemon(t *testing.T, m *multiWS, limitedTo string, versions map[string
 		for _, row := range answer {
 			ids = append(ids, row.ID)
 		}
-		if len(ids) != 2 || ids[0] != "ws-a" || ids[1] != "ws-b" {
-			t.Errorf("probe S-1 = %v, want the configured set [ws-a ws-b]", ids)
+		if len(ids) != len(want) {
+			t.Errorf("probe S-1 = %v, want the discovery set %v", ids, want)
+			return
+		}
+		for i := range want {
+			if ids[i] != want[i] {
+				t.Errorf("probe S-1 = %v, want the discovery set %v", ids, want)
+				return
+			}
 		}
 		for _, workspaceID := range ids {
-			if limitedTo != "" && workspaceID != limitedTo {
+			if workspaceID == skip {
 				continue
 			}
 			version := versions[workspaceID]
@@ -70,17 +80,21 @@ func probeDaemon(t *testing.T, m *multiWS, limitedTo string, versions map[string
 }
 
 func TestTechMultiWS07ProbeRegistrationScope(t *testing.T) {
-	t.Run("template does not limit the scope", func(t *testing.T) {
-		m := newMultiWS(t, "ws-a", "ws-b")
+	t.Run("the discovery set is the whole registration scope", func(t *testing.T) {
+		stub := newDiscoveryStub(t, []workspace.Ref{
+			{ID: "ws-a", Name: "A"},
+			{ID: "ws-b", Name: "B"},
+		})
+		m, _ := newUserScopedWS(t, stub, nil)
 		m.rebuildScheduler(func(cfg *schedulerConfig) { cfg.StartupProbeTimeout = 5 * time.Second })
-		m.jobs.onCreateJob = probeDaemon(t, m, "", map[string]string{"ws-a": "0.6.1", "ws-b": "0.6.2"})
+		m.jobs.onCreateJob = probeDaemon(t, m, []string{"ws-a", "ws-b"}, "", map[string]string{"ws-a": "0.6.1", "ws-b": "0.6.2"})
 
 		discoveries, err := m.sched.RunStartupProbe(t.Context())
 		if err != nil {
 			t.Fatalf("RunStartupProbe: %v", err)
 		}
 		if len(discoveries) != 2 {
-			t.Fatalf("discoveries = %v, want both configured workspaces", discoveries)
+			t.Fatalf("discoveries = %v, want both discovered workspaces", discoveries)
 		}
 		if got := discoveries["ws-a"].CLIVersion; got != "0.6.1" {
 			t.Errorf("A cli_version = %q, want 0.6.1", got)
@@ -97,10 +111,20 @@ func TestTechMultiWS07ProbeRegistrationScope(t *testing.T) {
 		assertProbeScopeConfigUntouched(t, m)
 	})
 
-	t.Run("template limits the scope to A", func(t *testing.T) {
-		m := newMultiWS(t, "ws-a", "ws-b")
+	t.Run("the manifest narrows the discovery set", func(t *testing.T) {
+		stub := newDiscoveryStub(t, []workspace.Ref{
+			{ID: "ws-a", Name: "A"},
+			{ID: "ws-b", Name: "B"},
+		})
+		m, discovered := newUserScopedWS(t, stub, []string{"ws-a"})
+		if len(m.clients) != 1 || m.clients["ws-a"] == nil {
+			t.Fatalf("clients = %v, want only the manifested workspace", m.set.IDs())
+		}
+		if len(discovered.Excluded) != 1 || discovered.Excluded[0].ID != "ws-b" {
+			t.Fatalf("excluded = %v, want the visible ws-b", discovered.Excluded)
+		}
 		m.rebuildScheduler(func(cfg *schedulerConfig) { cfg.StartupProbeTimeout = 5 * time.Second })
-		m.jobs.onCreateJob = probeDaemon(t, m, "ws-a", nil)
+		m.jobs.onCreateJob = probeDaemon(t, m, []string{"ws-a"}, "", nil)
 
 		discoveries, err := m.sched.RunStartupProbe(t.Context())
 		if err != nil {
@@ -113,10 +137,31 @@ func TestTechMultiWS07ProbeRegistrationScope(t *testing.T) {
 			t.Fatalf("discoveries = %v, want ws-a", discoveries)
 		}
 		if _, ok := discoveries["ws-b"]; ok {
+			t.Fatalf("ws-b was not in the discovery set but has a declaration: %v", discoveries)
+		}
+		if got := countProbeJobs(m); got != 1 {
+			t.Errorf("probe Jobs created = %d, want 1", got)
+		}
+	})
+
+	t.Run("a discovered workspace the probe never registers is not served", func(t *testing.T) {
+		stub := newDiscoveryStub(t, []workspace.Ref{
+			{ID: "ws-a", Name: "A"},
+			{ID: "ws-b", Name: "B"},
+		})
+		m, _ := newUserScopedWS(t, stub, nil)
+		m.rebuildScheduler(func(cfg *schedulerConfig) { cfg.StartupProbeTimeout = 5 * time.Second })
+		m.jobs.onCreateJob = probeDaemon(t, m, []string{"ws-a", "ws-b"}, "ws-b", nil)
+
+		discoveries, err := m.sched.RunStartupProbe(t.Context())
+		if err != nil {
+			t.Fatalf("RunStartupProbe: %v", err)
+		}
+		if _, ok := discoveries["ws-b"]; ok {
 			t.Fatalf("B was not registered by the probe but has a declaration: %v", discoveries)
 		}
 		if !strings.Contains(m.logs.String(), "probe.workspace_not_registered") {
-			t.Errorf("the unserved workspace is silent; want the probe.workspace_not_registered event")
+			t.Errorf("the unregistered workspace is silent; want the probe.workspace_not_registered event")
 		}
 	})
 }

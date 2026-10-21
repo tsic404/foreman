@@ -118,7 +118,7 @@ func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID, wo
 		session.RequestID = requestID
 		session.RealRuntimeID = realRuntimeID
 		// A catalog probe serves one workspace (the request's); the startup
-		// and discovery probes carry no pin and span the configured set.
+		// and discovery probes carry no pin and span the discovery set.
 		session.WorkspaceID = workspaceID
 	case registry.ProbeRegisterOnly:
 		if realRuntimeID != "" {
@@ -378,9 +378,9 @@ func (s *Scheduler) RunDiscoveryProbe(ctx context.Context, workspaceID string) (
 }
 
 // probeTokenWorkspace is the workspace the probe Job Token is bound to when
-// the probe itself is not pinned: the first configured workspace. The token is
+// the probe itself is not pinned: the first served workspace. The token is
 // only an admission credential for the probe Job; its S-1 answer is the
-// configured set and its registrations tell which workspaces it actually
+// discovery set and its registrations tell which workspaces it actually
 // serves.
 func (s *Scheduler) probeTokenWorkspace() string {
 	if ids := s.WorkspaceIDs(); len(ids) > 0 {
@@ -394,7 +394,7 @@ func (s *Scheduler) probeTokenWorkspace() string {
 // wait for the model catalog result (§1.3); the discovery probe stops at
 // registration and never owns a catalog command (§1.6). The result is keyed
 // by workspace: each declaration covers exactly the workspaces the probe
-// registered to, and a configured workspace with no registration is reported
+// registered to, and a discovery-set workspace with no registration is reported
 // (never silently served).
 func (s *Scheduler) runProbe(ctx context.Context, waitCatalog bool, kind string) (map[string]registry.Discovery, error) {
 	window := s.cfg.StartupProbeTimeout
@@ -517,7 +517,7 @@ settle:
 		if !ok {
 			s.log.WarnContext(ctx, "probe.workspace_not_registered", "job_name", handle.JobName,
 				"workspace_id", workspaceID, "kind", kind,
-				"detail", "configured workspace was not registered by the probe; it is not served")
+				"detail", "discovery-set workspace was not registered by the probe; it is not served")
 			continue
 		}
 		discoveries[workspaceID] = registration.Discovery()

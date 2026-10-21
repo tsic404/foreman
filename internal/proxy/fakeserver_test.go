@@ -187,6 +187,11 @@ func newTestRigWith(t *testing.T, register func(*stubUpstream), discovery regist
 	if err := rig.client.Preflight(t.Context()); err != nil {
 		t.Fatalf("Preflight: %v", err)
 	}
+	// The production startup order runs the workspace-scope self-check beside
+	// the preflight (ADR-049): it seeds the display name S-1 serves.
+	if err := rig.client.ValidateWorkspaceScope(t.Context()); err != nil {
+		t.Fatalf("ValidateWorkspaceScope: %v", err)
+	}
 
 	rig.reg = registry.New(time.Now)
 	rig.jobs = &fakeJobs{created: time.Now()}

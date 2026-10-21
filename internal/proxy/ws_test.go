@@ -406,6 +406,44 @@ func TestWSSubscriberProfileChangeTriggersRefresh(t *testing.T) {
 	}
 }
 
+// TestWSSubscriberIgnoresWorkspacesChanged pins ADR-049 decision 5: the
+// discovery set is fixed for the process lifetime, so a
+// daemon:workspaces_changed frame on the user-scoped connection is received
+// and ignored — it must not refresh profiles, wake a claim, or drop the
+// connection.
+func TestWSSubscriberIgnoresWorkspacesChanged(t *testing.T) {
+	srv, stub := newCombinedStub(t)
+	client := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, client)
+	profilesChanged := make(chan struct{}, 4)
+	wake := make(chan struct{}, 4)
+	sub := NewWSSubscriber(client, func() {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	}, nil, WithProfileChangeNotify(func() { profilesChanged <- struct{}{} }))
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() { _ = sub.Run(ctx) }()
+	waitFor(t, "ws dial", func() bool { return stub.dialCount() == 1 })
+
+	payload, _ := json.Marshal(map[string]string{"workspace_id": "ws-1"})
+	stub.push(t, wsFrame{Type: FrameDaemonWorkspacesChanged, Payload: payload})
+	select {
+	case <-profilesChanged:
+		t.Fatal("workspaces_changed must not trigger a profile refresh")
+	case <-wake:
+		t.Fatal("workspaces_changed must not wake a claim")
+	case <-time.After(200 * time.Millisecond):
+	}
+	// The connection stays up: no reconnect follows the ignored frame.
+	if got := stub.dialCount(); got != 1 {
+		t.Fatalf("dials = %d after an ignored workspaces_changed frame, want 1", got)
+	}
+}
+
 // TestWSFrameWorkspaceIDReadsBothShapes keeps the invalidation hint tolerant:
 // upstream may put workspace_id in the payload or at the envelope level.
 func TestWSFrameWorkspaceIDReadsBothShapes(t *testing.T) {
@@ -454,11 +492,11 @@ func TestWSSubscriberHandshake404BacksOff(t *testing.T) {
 	cancel()
 }
 
-// TestWSSubscriberStopsOnHandshake403: a 403 handshake is the
-// credential/identity mismatch of §1.5 — a configuration error, not a
-// transient one. The subscriber must report it instead of backing off
-// forever: the process fails visibly (its restart is the alarm).
-func TestWSSubscriberStopsOnHandshake403(t *testing.T) {
+// TestWSSubscriberRetriesOnHandshake403: a 403 handshake at runtime is the
+// credential failure face of §1.4 — the subscriber backs off and retries,
+// never judging it a configuration error (§1.5). Only the startup self-check
+// fails fast; the running loop keeps dialing.
+func TestWSSubscriberRetriesOnHandshake403(t *testing.T) {
 	var dials atomic.Int32
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/daemon/ws", func(w http.ResponseWriter, _ *http.Request) {
@@ -476,18 +514,29 @@ func TestWSSubscriberStopsOnHandshake403(t *testing.T) {
 	sub := NewWSSubscriber(client, func() {}, nil)
 	sub.waitSteps = []time.Duration{time.Millisecond}
 
+	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan error, 1)
-	go func() { done <- sub.Run(t.Context()) }()
+	go func() { done <- sub.Run(ctx) }()
+	deadline := time.Now().Add(2 * time.Second)
+	for dials.Load() < 3 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := dials.Load(); got < 3 {
+		t.Errorf("dials = %d, want >= 3 (a 403 handshake must be retried, not fatal)", got)
+	}
 	select {
 	case err := <-done:
-		if err == nil || !strings.Contains(err.Error(), "403") {
-			t.Fatalf("Run error = %v, want the 403 config error", err)
-		}
-	case <-time.After(3 * time.Second):
-		t.Fatal("Run must stop on a 403 handshake instead of retrying")
+		t.Fatalf("Run stopped on a 403 handshake: %v", err)
+	default:
 	}
-	if got := dials.Load(); got != 1 {
-		t.Errorf("dials = %d, want exactly 1 (no blind retry)", got)
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v after cancel, want nil", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Run did not stop after cancel")
 	}
 }
 
@@ -1008,7 +1057,10 @@ func TestCancelledStreamDoesNotSpendTheRuntimeProgression(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan streamOutcome, 1)
-	go func() { done <- sub.iterate(ctx, ref, state) }()
+	closed := make(chan struct{})
+	var closedOnce sync.Once
+	onClosed := func() { closedOnce.Do(func() { close(closed) }) }
+	go func() { done <- sub.iterate(ctx, ref, state, onClosed) }()
 
 	waitFor(t, "the connection", func() bool { return stub.liveConnections() == 1 })
 	cancel() // what reconcile does when it replaces a stream
@@ -1022,6 +1074,12 @@ func TestCancelledStreamDoesNotSpendTheRuntimeProgression(t *testing.T) {
 	}
 	if wait := state.nextBackoff(); wait != 7*time.Millisecond {
 		t.Fatalf("the next reconnect wait = %s, want the progression's first step: the cancelled stream must not spend it", wait)
+	}
+	// A cancelled stream's closed connection is what arms its replacement.
+	select {
+	case <-closed:
+	default:
+		t.Fatal("a cancelled stream must report its connection closed")
 	}
 	if got := len(metrics.wsReconnect); got != 0 {
 		t.Fatalf("WSReconnect counted %d shutdown, want none", got)

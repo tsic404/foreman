@@ -1268,7 +1268,7 @@ func TestSkillBundlesUsesRealRuntimeAndForemanCredential(t *testing.T) {
 	}
 }
 
-func TestPreflightCoversC1C16C17(t *testing.T) {
+func TestPreflightCoversC1C16(t *testing.T) {
 	srv, stub := newStubUpstream(t)
 	stubRegister(stub, "rid-1")
 	stub.on("GET", "/api/daemon/workspaces", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
@@ -1284,6 +1284,15 @@ func TestPreflightCoversC1C16C17(t *testing.T) {
 
 	if err := c.Preflight(t.Context()); err != nil {
 		t.Fatalf("Preflight: %v", err)
+	}
+	// C-17 is not a preflight face any more: discovery / scope validation
+	// runs once at startup (ADR-049), and the runtime loops never judge a
+	// credential by its response code (§1.5).
+	if got := len(stub.calls("GET", "/api/daemon/workspaces")); got != 0 {
+		t.Errorf("C17 calls in preflight = %d, want 0", got)
+	}
+	if err := c.ValidateWorkspaceScope(t.Context()); err != nil {
+		t.Fatalf("ValidateWorkspaceScope: %v", err)
 	}
 	_, name := c.Workspace()
 	if name != "foreman-ws" {
@@ -1306,7 +1315,7 @@ func TestPreflightCoversC1C16C17(t *testing.T) {
 	}
 }
 
-func TestPreflightFailsWhenWorkspaceInvisible(t *testing.T) {
+func TestValidateWorkspaceScopeRejectsInvisible(t *testing.T) {
 	srv, stub := newStubUpstream(t)
 	stubRegister(stub, "rid-1")
 	stub.on("GET", "/api/daemon/workspaces", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
@@ -1316,8 +1325,15 @@ func TestPreflightFailsWhenWorkspaceInvisible(t *testing.T) {
 	if err := c.RegisterWithDiscovery(t.Context(), testDiscovery()); err != nil {
 		t.Fatalf("RegisterWithDiscovery: %v", err)
 	}
-	if err := c.Preflight(t.Context()); err == nil {
-		t.Fatal("Preflight must fail when the configured workspace is not visible")
+	// The workspace-scoped credential form's startup self-check: the answer
+	// must equal the configured workspace (ADR-049, AC-97).
+	err := c.ValidateWorkspaceScope(t.Context())
+	var mismatch *WorkspaceMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("ValidateWorkspaceScope = %v, want a WorkspaceMismatchError", err)
+	}
+	if !IsCredentialConfigError(err) {
+		t.Error("the scope mismatch must classify as a startup configuration error")
 	}
 }
 

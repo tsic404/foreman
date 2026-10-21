@@ -1,9 +1,10 @@
-// Multi-workspace acceptance harness (ADR-047): two or more workspace
-// identities, one fake client per identity, one shared scheduler and one
-// Job-facing fake server. It is the fixture the TC-tech-multiws-* scenarios
+// Multi-workspace acceptance harness (ADR-047 / ADR-049): two or more
+// workspace identities, one fake client per identity, one shared scheduler and
+// one Job-facing fake server. It is the fixture the TC-tech-multiws-* scenarios
 // drive; it deliberately mirrors cmd/foreman's wiring (one client per
 // (credential, daemon identity) pair, one claim budget per workspace, a
-// workspace-routed server seam).
+// workspace-routed server seam). newUserScopedWS builds the discovery form on
+// top of it (C-17 → manifest → derived identities).
 package acceptance
 
 import (
@@ -29,6 +30,7 @@ import (
 	"github.com/tsic404/foreman/internal/proxy"
 	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
+	"github.com/tsic404/foreman/internal/workspace"
 )
 
 // multiWS is the multi-workspace fixture.
@@ -176,23 +178,54 @@ func newMultiWS(t *testing.T, ids ...string) *multiWS {
 	return newMultiWSWithURLs(t, ids, nil)
 }
 
+// wsIdentity is one deployment identity the fixture wires: the workspace, its
+// daemon identity, and the credential its requests carry.
+type wsIdentity struct {
+	workspaceID string
+	daemonID    string
+	token       string
+	name        string
+}
+
 // newMultiWSWithURLs builds the fixture while letting a scenario replace one
 // workspace's upstream address (credential-failure scenarios). A workspace
-// without an override gets a fresh stub.
+// without an override gets a fresh stub. This is the workspace-scoped
+// credential form: one credential per workspace.
 func newMultiWSWithURLs(t *testing.T, ids []string, urls map[string]string) *multiWS {
 	t.Helper()
-	if len(ids) < 1 {
+	identities := make([]wsIdentity, 0, len(ids))
+	for _, id := range ids {
+		identities = append(identities, wsIdentity{
+			workspaceID: id,
+			daemonID:    "foreman-" + id,
+			token:       "mdt_" + id,
+			name:        id,
+		})
+	}
+	return newMultiWSFromIdentities(t, identities, urls)
+}
+
+// newMultiWSFromIdentities builds the fixture around a given identity set.
+// Every workspace gets its own upstream stub and its own proxy client; the
+// scheduler, registry, probe table and Job client are shared, exactly as one
+// deployment shares them.
+func newMultiWSFromIdentities(t *testing.T, identities []wsIdentity, urls map[string]string) *multiWS {
+	t.Helper()
+	if len(identities) < 1 {
 		t.Fatalf("newMultiWS needs at least one workspace")
 	}
-	upstream := make(map[string]*upstreamStub, len(ids))
-	clients := make(map[string]*proxy.Client, len(ids))
-	clientList := make([]*proxy.Client, 0, len(ids))
+	upstream := make(map[string]*upstreamStub, len(identities))
+	clients := make(map[string]*proxy.Client, len(identities))
+	clientList := make([]*proxy.Client, 0, len(identities))
 	logs := &syncBuffer{}
 	metrics := &recordingMetrics{}
 	reg := registry.New(time.Now, registry.WithDeliveryConfirmTimeout(300*time.Millisecond))
 	probes := registry.NewProbeRegistry()
 
-	for _, id := range ids {
+	ids := make([]string, 0, len(identities))
+	for _, identity := range identities {
+		id := identity.workspaceID
+		ids = append(ids, id)
 		serverURL := urls[id]
 		if serverURL == "" {
 			stub := newUpstreamStub(t)
@@ -203,7 +236,7 @@ func newMultiWSWithURLs(t *testing.T, ids []string, urls map[string]string) *mul
 		cfg := proxy.Config{
 			ServerURL:             serverURL,
 			WorkspaceID:           id,
-			DaemonID:              "foreman-" + id,
+			DaemonID:              identity.daemonID,
 			Version:               "0.1.0",
 			ClaimInterval:         time.Second,
 			ClaimIntervalIdle:     time.Second,
@@ -217,7 +250,7 @@ func newMultiWSWithURLs(t *testing.T, ids []string, urls map[string]string) *mul
 			SkillCacheMaxEntries:  16,
 			SkillCacheMaxBytes:    1 << 20,
 		}
-		client := proxy.NewClient(cfg, "mdt_"+id,
+		client := proxy.NewClient(cfg, identity.token,
 			proxy.WithMetrics(metrics),
 			proxy.WithDiscoveryProbe(proxy.DiscoveryProbeFunc(func(context.Context, string) (registry.Discovery, error) {
 				return registry.Discovery{}, nil
@@ -230,6 +263,7 @@ func newMultiWSWithURLs(t *testing.T, ids []string, urls map[string]string) *mul
 				return e.RealRuntimeID
 			}),
 		)
+		client.SetWorkspaceName(identity.name)
 		clients[id] = client
 		clientList = append(clientList, client)
 	}
@@ -451,4 +485,88 @@ func taskEntryFor(taskID, workspaceID, agentName string) jobbuilder.TaskEntry {
 		Attempt:      1,
 		AgentName:    agentName,
 	}
+}
+
+// discoveryStub answers C-17 for the user-scoped credential form and records
+// every call. The answer and its status are programmable, so the discovery
+// scenarios can drive the visible set, an auth rejection and an unreachable
+// upstream.
+type discoveryStub struct {
+	mu      sync.Mutex
+	visible []workspace.Ref
+	status  int
+	calls   int
+	server  *httptest.Server
+}
+
+func newDiscoveryStub(t *testing.T, visible []workspace.Ref) *discoveryStub {
+	t.Helper()
+	stub := &discoveryStub{visible: append([]workspace.Ref(nil), visible...), status: http.StatusOK}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /api/daemon/workspaces", func(w http.ResponseWriter, _ *http.Request) {
+		stub.mu.Lock()
+		visible, status := append([]workspace.Ref(nil), stub.visible...), stub.status
+		stub.calls++
+		stub.mu.Unlock()
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"error":"rejected"}`))
+			return
+		}
+		answer := make([]map[string]string, 0, len(visible))
+		for _, ref := range visible {
+			answer = append(answer, map[string]string{"id": ref.ID, "name": ref.Name})
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(answer)
+	})
+	stub.server = httptest.NewServer(mux)
+	t.Cleanup(stub.server.Close)
+	return stub
+}
+
+func (s *discoveryStub) setStatus(status int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.status = status
+}
+
+func (s *discoveryStub) callCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.calls
+}
+
+// newUserScopedWS builds the user-scoped credential form fixture: one C-17
+// discovery against stub, the manifest applied, then one derived identity per
+// discovered workspace sharing the single credential — the same wiring
+// cmd/foreman performs at startup (ADR-049).
+func newUserScopedWS(t *testing.T, stub *discoveryStub, manifest []string) (*multiWS, proxy.Discovery) {
+	t.Helper()
+	deployment := workspace.Deployment{
+		Scope:        workspace.ScopeUser,
+		UserToken:    "mul_user",
+		BaseDaemonID: "foreman",
+		Manifest:     manifest,
+	}
+	discoveryClient := proxy.NewClient(proxy.Config{ServerURL: stub.server.URL, Version: "0.1.0"}, deployment.UserToken)
+	discovered, err := discoveryClient.DiscoverWorkspaces(t.Context(), manifest)
+	if err != nil {
+		t.Fatalf("DiscoverWorkspaces: %v", err)
+	}
+	identities := deployment.Identities(discovered.Set)
+	names := make(map[string]string, len(discovered.Set))
+	for _, ref := range discovered.Set {
+		names[ref.ID] = ref.Name
+	}
+	wsIdentities := make([]wsIdentity, 0, len(identities))
+	for _, identity := range identities {
+		wsIdentities = append(wsIdentities, wsIdentity{
+			workspaceID: identity.WorkspaceID,
+			daemonID:    identity.DaemonID,
+			token:       identity.Token,
+			name:        names[identity.WorkspaceID],
+		})
+	}
+	return newMultiWSFromIdentities(t, wsIdentities, nil), discovered
 }

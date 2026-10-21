@@ -8,9 +8,11 @@ import (
 	"time"
 )
 
-// StatusError is a non-2xx server response. Callers branch on Code per the
-// §1.5: 401 backs off, 403 is a config error (no blind retry),
-// 404 with a "runtime not found" body triggers re-registration.
+// StatusError is a non-2xx server response. Callers branch on Code per §1.4 /
+// §1.5: at runtime 401/403 back off like any other credential failure, and a
+// 404 with a "runtime not found" body triggers re-registration. Only the
+// startup self-check judges a credential error configuration (see
+// IsCredentialConfigError).
 type StatusError struct {
 	Code int
 	Body []byte
@@ -21,7 +23,7 @@ func (e *StatusError) Error() string {
 }
 
 // WorkspaceMismatchError reports C17 answering a workspace set that does not
-// include the configured workspace: the credential is bound to another
+// equal the configured workspace: the credential is bound to another
 // workspace, which is a configuration error, not a transient upstream
 // failure (§1.1, §1.5, AC-86). Visible carries the answer's workspace ids so
 // the startup log can name both sides without a second request.
@@ -35,15 +37,14 @@ func (e *WorkspaceMismatchError) Error() string {
 	if visible == "" {
 		visible = "none"
 	}
-	return fmt.Sprintf("workspace %s not visible to the server token (visible: %s)", e.Configured, visible)
+	return fmt.Sprintf("the server token's workspace set is not exactly %s (visible: %s)", e.Configured, visible)
 }
 
 // IsCredentialConfigError reports the credential defects the startup
-// self-check refuses to start on: the daemon credential is not bound to the
-// configured workspace (C17 mismatch) or the server rejects it outright
-// (§1.1, §1.5). Only the startup path treats this as fatal — a failure seen
-// by a running workspace loop is confined to that workspace and retried
-// (AC-86).
+// self-check refuses to start on: the C-17 answer is not exactly the
+// configured workspace, or the server rejects the credential outright (§1.1).
+// Only the startup path treats this as fatal — at runtime §1.5 keeps 401/403
+// and 404 inside the §1.4 backoff, never judged configuration (AC-86).
 func IsCredentialConfigError(err error) bool {
 	var mismatch *WorkspaceMismatchError
 	if errors.As(err, &mismatch) {

@@ -20,6 +20,11 @@ const (
 	// FrameDaemonRuntimeProfilesChanged is the C-20 invalidation hint: the
 	// workspace's runtime profile list changed and must be re-fetched (§1.6).
 	FrameDaemonRuntimeProfilesChanged = "daemon:runtime_profiles_changed"
+	// FrameDaemonWorkspacesChanged is the user-scoped connection's membership
+	// hint. ADR-049 decision 5: the discovery set is fixed for the process
+	// lifetime, so the event is received and ignored — membership changes
+	// take effect on the next restart.
+	FrameDaemonWorkspacesChanged = "daemon:workspaces_changed"
 )
 
 // wsFrame is the {type,payload} envelope of the daemon WS channel. The
