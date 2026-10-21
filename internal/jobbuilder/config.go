@@ -112,6 +112,13 @@ type Config struct {
 	// workspace configured they are ambiguous and refuse startup (§8.5 键空间
 	// = workspace × 名字).
 	WorkspaceIDs []string
+	// Workspaces is the startup discovery result (§8.5 分区键的启动期解析):
+	// every discovered workspace's identifier and the display name C-17
+	// reported for it. The policy file's partition keys resolve against this
+	// set — identifier exact match first, then display name exact match. Empty
+	// falls back to WorkspaceIDs without display names, so a hand-built Config
+	// keeps the identifier form working (name keys then have no match).
+	Workspaces []WorkspaceRef
 
 	Issuer TokenIssuer
 	Nodes  NodeIndex
@@ -122,6 +129,15 @@ type Config struct {
 	Logger  *slog.Logger
 }
 
+// WorkspaceRef is one workspace of the startup discovery result (§8.5 分区键的
+// 启动期解析): the identifier the platform uses and the display name it
+// reported. The policy file's partition keys resolve against this set; nothing
+// else in the builder needs the name.
+type WorkspaceRef struct {
+	ID   string
+	Name string
+}
+
 // Metrics is the policy-face observability seam (§9.2). The observability
 // module provides the Prometheus implementation; nil degrades to no-ops.
 type Metrics interface {
@@ -130,7 +146,8 @@ type Metrics interface {
 	// no_identity).
 	PolicyHit(axis, source string)
 	// PolicyNameResolution records one startup key's conclusion (resolved /
-	// absent / ambiguous / unavailable).
+	// absent / ambiguous / unavailable, plus conflict for a partition key
+	// another key already claimed).
 	PolicyNameResolution(conclusion string)
 }
 
@@ -182,6 +199,20 @@ func (c Config) policyPath() string {
 		return c.PolicyPath
 	}
 	return PolicyPath
+}
+
+// workspaceRefs is the partition-key resolution set: the discovery result when
+// given, else the configured ids (name keys then have no match — the
+// identifier form keeps working for hand-built Configs).
+func (c Config) workspaceRefs() []WorkspaceRef {
+	if len(c.Workspaces) > 0 {
+		return c.Workspaces
+	}
+	refs := make([]WorkspaceRef, 0, len(c.WorkspaceIDs))
+	for _, id := range c.WorkspaceIDs {
+		refs = append(refs, WorkspaceRef{ID: id})
+	}
+	return refs
 }
 
 // policyNameResolutionWindow is the bounded window the startup name resolution

@@ -89,6 +89,8 @@ func TestTechObservability01DesignedFamiliesAtBoot(t *testing.T) {
 		`foreman_policy_name_resolutions_total{conclusion="absent"} 0`,
 		`foreman_policy_name_resolutions_total{conclusion="ambiguous"} 0`,
 		`foreman_policy_name_resolutions_total{conclusion="unavailable"} 0`,
+		`foreman_policy_name_resolutions_total{conclusion="conflict"} 0`,
+		`foreman_policy_name_resolutions_total{conclusion="unseeded"} 0`,
 		`foreman_runtime_profile_refreshes_total{result="success"} 0`,
 		`foreman_runtime_profile_refreshes_total{result="unchanged"} 0`,
 		`foreman_runtime_profile_refreshes_total{result="failed"} 0`,

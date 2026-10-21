@@ -149,8 +149,9 @@ var policyAxes = []string{"resources", "capabilities_add", "node_selector"}
 var policySources = []string{"direct", "no_definition", "no_identity"}
 
 // policyNameConclusions is the foreman_policy_name_resolutions_total label
-// vocabulary (ADR-035 decision 4).
-var policyNameConclusions = []string{"resolved", "absent", "ambiguous", "unavailable"}
+// vocabulary (ADR-035 decision 4, plus the §9.1 partition-key conclusions
+// conflict and unseeded).
+var policyNameConclusions = []string{"resolved", "absent", "ambiguous", "unavailable", "conflict", "unseeded"}
 
 // Metrics is the Prometheus implementation of the designed metric surface
 // (§9.2) plus the recorders for the remaining designed metrics. It owns

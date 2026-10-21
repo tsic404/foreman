@@ -27,6 +27,11 @@
 #     <workspace-id-b>:
 #       agents: { ... }
 #
+# The partition key may also be the workspace's display name — the identifier
+# form always works; the display-name form is resolved once at startup and
+# refuses the boot when it matches more than one workspace. A rename
+# invalidates the old name: the next start refuses until the key is updated.
+#
 # The single-workspace example:
 #
 #   agents:
@@ -51,8 +56,9 @@
 #         disktype: ssd
 #
 # Keys are names (agent.name / the project name), compared by exact equality —
-# a UUID-shaped key never matches, and the startup name resolution reports it.
-# The capability axis only appends to the container's `add` list and keeps the
+# the startup name resolution's authority answers each key, whatever its
+# literal shape; a key the authority reports absent refuses the boot. The
+# capability axis only appends to the container's `add` list and keeps the
 # template's `drop` list: the policy file is not a security boundary and the
 # capability names are not whitelisted (see README.md §Risk disclosure).
 apiVersion: v1

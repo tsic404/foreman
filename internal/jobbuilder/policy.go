@@ -71,12 +71,24 @@ const (
 	NameAbsent      NameConclusion = "absent"
 	NameAmbiguous   NameConclusion = "ambiguous"
 	NameUnavailable NameConclusion = "unavailable"
+	// NameConflict is the partition-key conclusion §9.1: two partition keys
+	// resolved to the same workspace, so that workspace's definitions have
+	// two possible rows. It refuses startup and is recorded as one warn per
+	// key (each carrying the shared workspace identifier).
+	NameConflict NameConclusion = "conflict"
+	// NameUnseeded is the §9.1 conclusion of a partition key whose display
+	// name could not be checked because the authority has not answered yet
+	// (workspace-scoped form, transient C-17 failure). The key is not judge
+	// absent — it warns and never refuses startup (§1.1, AC-86).
+	NameUnseeded NameConclusion = "unseeded"
 )
 
-// Policy sections: the two keyspaces a policy table carries (§8.5).
+// Policy sections: the two keyspaces a policy table carries (§8.5), plus the
+// partition segment whose keys are workspace identifiers or display names.
 const (
-	PolicyKeyAgent   = "agent"
-	PolicyKeyProject = "project"
+	PolicyKeyAgent     = "agent"
+	PolicyKeyProject   = "project"
+	PolicyKeyWorkspace = "workspace"
 )
 
 // NameResolution is one key's startup answer. Identifier is the platform's
@@ -150,6 +162,43 @@ func (p *Policy) forWorkspace(workspaceID string) *Policy {
 		return sub
 	}
 	return &Policy{agents: map[string]agentEntry{}, projects: map[string]projectEntry{}}
+}
+
+// PolicyWorkspaceIDs lists the workspaces the policy table carries a partition
+// for after startup resolution (§8.5 分区键的启动期解析). The ids are the
+// resolved workspace identifiers, never the file's key literals.
+func (b *Builder) PolicyWorkspaceIDs() []string {
+	if b == nil || b.policy.byWorkspace == nil {
+		return nil
+	}
+	ids := make([]string, 0, len(b.policy.byWorkspace))
+	for id := range b.policy.byWorkspace {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	return ids
+}
+
+// WarnDeadPartitions warns about policy partitions the effective service scope
+// does not cover (§8.5 dead configuration, AC-44): the probe never registered
+// that workspace, so no Job ever reads those definitions. It warns once per
+// partition and never refuses startup — the startup refusal classes are the
+// resolution conclusions themselves, which this call runs after.
+func (b *Builder) WarnDeadPartitions(served []string) {
+	if b == nil || b.policy.byWorkspace == nil {
+		return
+	}
+	servedSet := make(map[string]struct{}, len(served))
+	for _, id := range served {
+		servedSet[id] = struct{}{}
+	}
+	for _, id := range b.PolicyWorkspaceIDs() {
+		if _, ok := servedSet[id]; ok {
+			continue
+		}
+		b.cfg.logger().Warn("job policy partition is outside the effective service scope: no Job reads its definitions",
+			"workspace_id", id)
+	}
 }
 
 // agentEntry is one agent's row: the three tiers plus that agent's own
@@ -367,24 +416,162 @@ func buildPolicy(cfg Config, file filePolicy) (Policy, error) {
 		if flat {
 			return Policy{}, fmt.Errorf("%w: flat agents/projects and workspaces sections are mutually exclusive", ErrInvalidPolicy)
 		}
-		policy := Policy{byWorkspace: make(map[string]*Policy, len(file.Workspaces))}
-		for workspaceID, sections := range file.Workspaces {
-			if strings.TrimSpace(workspaceID) == "" {
-				return Policy{}, fmt.Errorf("%w: a workspaces key is empty", ErrInvalidPolicy)
-			}
-			sub, err := buildPolicySections(sections)
-			if err != nil {
-				return Policy{}, fmt.Errorf("workspace %s: %w", workspaceID, err)
-			}
-			policy.byWorkspace[workspaceID] = &sub
-		}
-		return policy, nil
+		return buildPartitionedPolicy(cfg, file.Workspaces)
 	}
 	if len(cfg.WorkspaceIDs) > 1 && flat {
 		return Policy{}, fmt.Errorf("%w: flat agents/projects sections are the single-workspace form; partition them under workspaces (configured: %s)",
 			ErrInvalidPolicy, strings.Join(cfg.WorkspaceIDs, ","))
 	}
 	return buildPolicySections(filePolicySections{Agents: file.Agents, Projects: file.Projects})
+}
+
+// buildPartitionedPolicy freezes the workspaces segment (§8.5 分区键的启动期
+// 解析): each partition key resolves once, at startup, to the workspace
+// identifier the rest of the process uses. Keys are processed in sorted order
+// so the per-key events and the refusal message are reproducible.
+func buildPartitionedPolicy(cfg Config, sections map[string]filePolicySections) (Policy, error) {
+	keys := sortedKeys(sections)
+	tables := make(map[string]*Policy, len(keys))
+	for _, key := range keys {
+		if strings.TrimSpace(key) == "" {
+			return Policy{}, fmt.Errorf("%w: a workspaces key is empty", ErrInvalidPolicy)
+		}
+		sub, err := buildPolicySections(sections[key])
+		if err != nil {
+			return Policy{}, fmt.Errorf("workspace %s: %w", key, err)
+		}
+		tables[key] = &sub
+	}
+	byWorkspace, err := resolvePartitionKeys(cfg, keys, tables, cfg.logger())
+	if err != nil {
+		return Policy{}, err
+	}
+	return Policy{byWorkspace: byWorkspace}, nil
+}
+
+// sortedKeys lists a partition segment's keys in lexical order.
+func sortedKeys(sections map[string]filePolicySections) []string {
+	keys := make([]string, 0, len(sections))
+	for key := range sections {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// resolvePartitionKeys maps the file's partition keys onto workspace ids
+// (§8.5 分区键的启动期解析): identifier exact match first, then display name.
+// The mapping freezes here — no upstream call, no runtime re-resolution.
+//
+// Failures are per key and refuse startup, naming the key: a key that names
+// nothing, one whose display name matches several discovered workspaces, and
+// two keys landing on one workspace. One policy.name_resolution event per key;
+// a conflict is one warn per key, no third event. Display-name authority
+// unavailable (workspace-scoped form, transient C-17 failure): an unmatched
+// key warns as unseeded and the boot continues — never judge absent, or a
+// server blip turns into CrashLoopBackOff (§1.1, AC-86). Unseeded partitions
+// simply stay unreadable for this process.
+func resolvePartitionKeys(cfg Config, keys []string, tables map[string]*Policy, log logger) (map[string]*Policy, error) {
+	refs := cfg.workspaceRefs()
+	ids := make(map[string]struct{}, len(refs))
+	byName := make(map[string][]string, len(refs))
+	allSeeded := true
+	for _, ref := range refs {
+		if ref.ID == "" {
+			continue
+		}
+		ids[ref.ID] = struct{}{}
+		if ref.Name == "" {
+			allSeeded = false
+			continue
+		}
+		byName[ref.Name] = append(byName[ref.Name], ref.ID)
+	}
+
+	type resolution struct {
+		key     string
+		id      string
+		verdict NameConclusion
+	}
+	resolutions := make([]resolution, 0, len(keys))
+	for _, key := range keys {
+		res := resolution{key: key, verdict: NameAbsent}
+		switch {
+		case hasID(ids, key):
+			res.id, res.verdict = key, NameResolved
+		case len(byName[key]) == 1:
+			res.id, res.verdict = byName[key][0], NameResolved
+		case len(byName[key]) > 1:
+			res.verdict = NameAmbiguous
+		case !allSeeded:
+			// The display-name authority has not answered for every
+			// discovered workspace: an unmatched name key may simply be
+			// the unseeded one. Warn and continue — never absent.
+			res.verdict = NameUnseeded
+		}
+		resolutions = append(resolutions, res)
+	}
+
+	// Two keys on one workspace leave its definitions with two possible rows:
+	// both keys turn conflict, and both keep their own event.
+	claims := make(map[string][]int, len(resolutions))
+	for i, res := range resolutions {
+		if res.verdict == NameResolved {
+			claims[res.id] = append(claims[res.id], i)
+		}
+	}
+	for _, idxs := range claims {
+		if len(idxs) < 2 {
+			continue
+		}
+		for _, i := range idxs {
+			resolutions[i].verdict = NameConflict
+		}
+	}
+
+	var refusals []string
+	for _, res := range resolutions {
+		conclusion := string(res.verdict)
+		cfg.metrics().PolicyNameResolution(conclusion)
+		fields := []any{"kind", PolicyKeyWorkspace, "key", res.key, "conclusion", conclusion}
+		if res.id != "" {
+			fields = append(fields, "resolved_workspace_id", res.id)
+		}
+		if res.verdict == NameResolved {
+			log.Info("policy.name_resolution", fields...)
+			continue
+		}
+		log.Warn("policy.name_resolution", fields...)
+		switch res.verdict {
+		case NameAbsent:
+			refusals = append(refusals, fmt.Sprintf("workspace key %q: absent", res.key))
+		case NameAmbiguous:
+			refusals = append(refusals, fmt.Sprintf("workspace key %q: ambiguous (its display name matches more than one discovered workspace)", res.key))
+		case NameConflict:
+			refusals = append(refusals, fmt.Sprintf("workspace key %q: conflict (another key resolves to workspace %q)", res.key, res.id))
+		}
+	}
+	if len(refusals) > 0 {
+		return nil, fmt.Errorf("%w: workspace partition key resolution refused startup: %s",
+			ErrInvalidPolicy, strings.Join(refusals, "; "))
+	}
+
+	byWorkspace := make(map[string]*Policy, len(resolutions))
+	for _, res := range resolutions {
+		// Unseeded keys never resolved: their partitions stay unreadable for
+		// this process, exactly like a partition whose key is absent — but
+		// the boot continues (§1.1, AC-86).
+		if res.verdict != NameResolved {
+			continue
+		}
+		byWorkspace[res.id] = tables[res.key]
+	}
+	return byWorkspace, nil
+}
+
+func hasID(ids map[string]struct{}, id string) bool {
+	_, ok := ids[id]
+	return ok
 }
 
 // buildPolicySections freezes one table (one workspace's, or the legacy flat

@@ -165,7 +165,16 @@ is the workspace-scoped form with one pair.
     ws-b: {agents: {...}, projects: {...}}
   ```
   The flat `agents` / `projects` form is the single-workspace form and refuses
-  startup when more than one workspace is configured.
+  startup when more than one workspace is configured. The partition key can be
+  either the workspace id (unchanged, always works) or the workspace display
+  name as reported by the server at startup — the two are resolved once at
+  boot and never re-resolved. Two workspaces with the same display name make
+  the name unusable as a key: writing it refuses startup, and the identifier
+  form still works. Renaming a workspace after this restart invalidates the
+  old name — the next start refuses until the key is updated. A display-name
+  key over a workspace-scoped credential whose C-17 check failed transiently
+  warns (`显示名权威暂不可用`) and boots without that partition; it resolves
+  on the next restart.
 - **Node state**: every workspace-partitioned location in the template must be
   expressed through `<workspace_id>` (the shipped template does this for the
   home volume). A fixed literal makes the template correct for one workspace
