@@ -1,4 +1,4 @@
-// TC-tech-claim-02 (AC-65): a claim whose task id cannot compose a legal Job
+// TC-tech-claim-02 (AC-93): a claim whose task id cannot compose a legal Job
 // name must still leave a reclaimable mapping entry. The name face is
 // template-expressed (ADR-034), so the render-time final check can fail for a
 // legal but unusable task id (the invalid_task_id path). The entry is settled
