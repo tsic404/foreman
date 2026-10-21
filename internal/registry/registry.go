@@ -1,11 +1,13 @@
 package registry
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -17,11 +19,71 @@ const DoneIndexTTL = 24 * time.Hour
 // to a non-terminal state (§4.2 invariant: terminal is irreversible).
 var ErrTerminalImmutable = errors.New("terminal entry cannot become non-terminal")
 
+// StateStore is the shared state face stage one persists through
+// (ADR-046 决策 0, 02-contracts.md §4.3/§6.1): the live mapping rows, the
+// settled terminal records and the token revocation set live in a shared,
+// persistent store instead of process memory alone (F11). The interface is
+// satisfied by internal/state; a no-op implementation keeps the pre-stage-one
+// behaviour (in-memory index + K8s rebuild) for deployments without the
+// shared state face.
+type StateStore interface {
+	// PutEntry stores the live row's snapshot. The registry writes it after
+	// every transition; the snapshot never carries the memory-only secrets
+	// (Payload, DecidedReport, TokenHash — the store's FromEntry drops them).
+	PutEntry(ctx context.Context, ws, taskID string, e TaskEntry) error
+	// GetEntry reads the live row of one task. Reserved for stage two's
+	// partitioned lookups; stage one restores through ListEntries and then
+	// reads its in-memory index.
+	GetEntry(ctx context.Context, ws, taskID string) (TaskEntry, bool, error)
+	// ListEntries lists every live snapshot (the startup-restore scan).
+	ListEntries(ctx context.Context) ([]TaskEntry, error)
+	// DeleteEntry removes one live row.
+	DeleteEntry(ctx context.Context, ws, taskID string) error
+
+	// PutSettled stores the settled terminal record of one task.
+	PutSettled(ctx context.Context, ws, taskID string, e TaskEntry) error
+	// GetSettled reads the settled terminal record of one task. Reserved for
+	// stage two's partitioned lookups; stage one restores the whole settled
+	// set through ListSettled.
+	GetSettled(ctx context.Context, ws, taskID string) (TaskEntry, bool, error)
+	// ListSettled lists every settled terminal record (the startup-restore
+	// scan of the post-reclaim answer face).
+	ListSettled(ctx context.Context) ([]TaskEntry, error)
+
+	// Revoke records a revoked token digest until validUntil (§6.1).
+	Revoke(ctx context.Context, ws, hash string, validUntil time.Time) error
+	// IsRevoked answers the revocation check for one digest. Reserved for
+	// stage two's cross-instance read; stage one's in-process set is seeded at
+	// startup and written through, so the hot path needs no store read.
+	IsRevoked(ctx context.Context, ws, hash string) (bool, error)
+	// ListRevoked lists the live revocations (digest → valid-until) so a
+	// restart can seed the in-process positive cache.
+	ListRevoked(ctx context.Context) (map[string]time.Time, error)
+
+	// Ping verifies the store is reachable.
+	Ping(ctx context.Context) error
+}
+
+// WithStateStore wires the shared state face. Without it the registry is the
+// pre-stage-one in-memory index (the K8s rebuild owns restart recovery).
+func WithStateStore(s StateStore) Option {
+	return func(r *Registry) { r.state = s }
+}
+
+// WithStateErrorHook observes shared-state failures (§9.1: the shared state
+// face's unavailability is an event, never silent). The hook is optional:
+// tests and the no-op store run without one.
+func WithStateErrorHook(h func(op, taskID string, err error)) Option {
+	return func(r *Registry) { r.stateErr = h }
+}
+
 // Registry is the in-memory mapping index. The K8s Job objects are the
-// durable truth (ADR-002); nothing here is persisted. Entries stay in the
-// live index until Delete — including terminal entries in their drain window,
-// whose credential is still valid — so Inflight counts only non-terminal
-// rows.
+// durable truth (ADR-002). A configured shared state face persists every
+// transition (ADR-046 阶段一) so a restart restores the rows instead of
+// rebuilding them from K8s; without one, nothing is persisted and the K8s
+// rebuild owns restart recovery. Entries stay in the live index until
+// Delete — including terminal entries in their drain window, whose credential
+// is still valid — so Inflight counts only non-terminal rows.
 type Registry struct {
 	mu   sync.RWMutex
 	now  func() time.Time
@@ -58,6 +120,16 @@ type Registry struct {
 
 	runtimes        map[string]JobRuntime // job_runtime_id → runtime
 	runtimeByDaemon map[string]string     // daemon_id → job_runtime_id
+
+	// state is the shared state face (ADR-046 阶段一). Nil keeps the
+	// pre-stage-one behaviour: the registry is the in-memory index and the
+	// K8s rebuild owns restart recovery.
+	state    StateStore
+	stateErr func(op, taskID string, err error)
+	// stateCh is the ordered write queue; nil when no shared state face is
+	// wired. statePending counts the writes queued but not yet applied.
+	stateCh      chan stateOp
+	statePending atomic.Int64
 }
 
 // Option customizes a Registry.
@@ -109,6 +181,10 @@ func New(now func() time.Time, opts ...Option) *Registry {
 	for _, opt := range opts {
 		opt(r)
 	}
+	if r.state != nil {
+		r.stateCh = make(chan stateOp, stateQueueSize)
+		go r.runStateWriter()
+	}
 	return r
 }
 
@@ -128,6 +204,7 @@ func (r *Registry) Put(e TaskEntry) error {
 	}
 	r.live[e.TaskID] = e
 	r.indexLocked(e)
+	r.persist(e.TaskID, e)
 	return nil
 }
 
@@ -146,7 +223,217 @@ func (r *Registry) PutIfAbsent(e TaskEntry) (bool, error) {
 	}
 	r.live[e.TaskID] = e
 	r.indexLocked(e)
+	// No write-through: PutIfAbsent's callers are the shared-state restore
+	// (the row is already in the store) and the K8s gap-fill. The gap-fill's
+	// projection carries no payload and no claim-time deadlines, so writing
+	// it would overwrite a healthier store row after a transient restore
+	// failure — the row's next transition (or the terminal write) persists
+	// the complete snapshot instead.
 	return true, nil
+}
+
+// stateWriteTimeout bounds one shared-state write, so a slow or unreachable
+// store can never stall the writer for its dial timeout.
+const stateWriteTimeout = 2 * time.Second
+
+// stateQueueSize bounds the write queue. A burst past it is dropped with an
+// event: the K8s Job remains the durable truth, so a dropped write only means
+// the next restart rebuilds that row from K8s (§4.3).
+const stateQueueSize = 4096
+
+// stateOpKind discriminates one queued shared-state write.
+type stateOpKind int
+
+const (
+	stateOpPut stateOpKind = iota
+	stateOpDelete
+	stateOpPutSettled
+)
+
+// stateOp is one queued write. The snapshot is taken under the registry lock
+// (so it matches the row it belongs to) and applied by the writer in queue
+// order, outside the lock: the daemon face never waits on store I/O (C13
+// every 5s per entry, C4 per renewal would otherwise serialize it).
+type stateOp struct {
+	kind   stateOpKind
+	ws     string
+	taskID string
+	e      TaskEntry
+}
+
+// persist enqueues the live row's snapshot. The memory index is the runtime
+// authority (stage one keeps the single-instance form); the shared store is
+// the persistence face a restart restores from, so a failed write must never
+// disturb the in-memory transition — the miss only means the restart rebuilds
+// that row from K8s (§4.3). Called with r.mu held.
+func (r *Registry) persist(taskID string, e TaskEntry) {
+	r.enqueueState(stateOp{kind: stateOpPut, ws: e.WorkspaceID, taskID: taskID, e: e})
+}
+
+// persistDelete enqueues the removal of the live row's snapshot.
+func (r *Registry) persistDelete(taskID string, e TaskEntry) {
+	r.enqueueState(stateOp{kind: stateOpDelete, ws: e.WorkspaceID, taskID: taskID})
+}
+
+// persistSettled enqueues the settled terminal record (the row a restart
+// needs to keep answering the post-reclaim single-task endpoint; §4.3,
+// ADR-032).
+func (r *Registry) persistSettled(taskID string, e TaskEntry) {
+	r.enqueueState(stateOp{kind: stateOpPutSettled, ws: e.WorkspaceID, taskID: taskID, e: e})
+}
+
+// enqueueState hands one write to the ordered writer. It is a non-blocking
+// channel send plus a counter bump — no store I/O ever runs under r.mu.
+func (r *Registry) enqueueState(op stateOp) {
+	if r.stateCh == nil {
+		return
+	}
+	r.statePending.Add(1)
+	select {
+	case r.stateCh <- op:
+	default:
+		r.statePending.Add(-1)
+		r.stateFailure("queue_full", op.taskID, errStateQueueFull)
+	}
+}
+
+// errStateQueueFull reports a write the bounded queue refused.
+var errStateQueueFull = errors.New("shared state write queue is full")
+
+// runStateWriter applies the queued writes in order. A failed write is
+// reported through the hook; the next write of the same row repairs it (every
+// op carries a full snapshot or a delete).
+func (r *Registry) runStateWriter() {
+	for op := range r.stateCh {
+		r.applyStateOp(op)
+		r.statePending.Add(-1)
+	}
+}
+
+func (r *Registry) applyStateOp(op stateOp) {
+	ctx, cancel := context.WithTimeout(context.Background(), stateWriteTimeout)
+	defer cancel()
+	var err error
+	switch op.kind {
+	case stateOpPut:
+		err = r.state.PutEntry(ctx, op.ws, op.taskID, op.e)
+	case stateOpDelete:
+		err = r.state.DeleteEntry(ctx, op.ws, op.taskID)
+	case stateOpPutSettled:
+		err = r.state.PutSettled(ctx, op.ws, op.taskID, op.e)
+	}
+	if err != nil {
+		opName := "put_entry"
+		switch op.kind {
+		case stateOpDelete:
+			opName = "delete_entry"
+		case stateOpPutSettled:
+			opName = "put_settled"
+		}
+		r.stateFailure(opName, op.taskID, err)
+	}
+}
+
+// FlushState blocks until every queued write has been applied (or ctx ends).
+// It is the test seam and the graceful-shutdown drain: callers must not rely
+// on a total order with writes enqueued after the call.
+func (r *Registry) FlushState(ctx context.Context) error {
+	if r.stateCh == nil {
+		return nil
+	}
+	ticker := time.NewTicker(2 * time.Millisecond)
+	defer ticker.Stop()
+	for {
+		if r.statePending.Load() == 0 {
+			return nil
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+		}
+	}
+}
+
+// stateFailure reports one shared-state failure through the hook; a store
+// failure never rolls back the in-memory transition (the K8s rebuild is the
+// backstop, §4.3).
+func (r *Registry) stateFailure(op, taskID string, err error) {
+	if r.stateErr != nil {
+		r.stateErr(op, taskID, err)
+	}
+}
+
+// Restore rebuilds the in-memory index from the shared state face instead of
+// from K8s (§4.3: 实例重启只重新接入共享状态，已存在的条目不再从 K8s 全量重建).
+// It returns the entries restored and whether the store answered at all: a
+// store outage (or an unconfigured one) answers false and the caller falls
+// back to the K8s rebuild.
+func (r *Registry) Restore(ctx context.Context) ([]TaskEntry, bool, error) {
+	if r.state == nil {
+		return nil, false, nil
+	}
+	if err := r.state.Ping(ctx); err != nil {
+		return nil, false, err
+	}
+	// The restore scan is per workspace; the workspace id is not known to the
+	// registry, so the store lists its whole entry namespace. The stage-one
+	// single workspace keeps this a single scan.
+	entries, err := r.state.ListEntries(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	restored := 0
+	for _, e := range entries {
+		if e.TaskID == "" {
+			continue
+		}
+		inserted, err := r.PutIfAbsent(e)
+		if err != nil {
+			return entries, true, err
+		}
+		if !inserted {
+			continue
+		}
+		// Restore the secondary indexes the snapshot cannot carry: the
+		// job runtime row is what the daemon's heartbeat and the fake
+		// server's claim lookup need.
+		if e.JobRuntimeID != "" {
+			r.PutRuntime(JobRuntime{
+				JobRuntimeID:    e.JobRuntimeID,
+				DaemonID:        e.DaemonID,
+				TaskID:          e.TaskID,
+				Provider:        "omp",
+				Name:            "foreman-job",
+				Online:          true,
+				LastHeartbeatAt: r.now(),
+			})
+		}
+		restored++
+	}
+	// Restore the settled records into the done index: the terminal row
+	// deleted from the live set at reclaim still answers the post-reclaim
+	// single-task endpoint (§4.3, ADR-032). These rows are independent of
+	// the live set — a task can be fully reclaimed (live row gone) while
+	// its retained record is still answerable. A listing failure is an
+	// error, never a silent empty set (§9.1): the caller logs it and the
+	// K8s fill-gaps continue, but the terminal face must not read as
+	// "nothing settled".
+	settled, err := r.state.ListSettled(ctx)
+	if err != nil {
+		return entries, true, err
+	}
+	for _, rec := range settled {
+		if rec.TaskID == "" {
+			continue
+		}
+		at := rec.CompletedAt
+		if at.IsZero() {
+			at = rec.DrainDeadline
+		}
+		r.done.put(rec.TaskID, at, settledRecord(rec))
+	}
+	return entries, true, nil
 }
 
 // indexLocked writes e's secondary indexes. The caller holds r.mu.
@@ -196,6 +483,7 @@ func (r *Registry) Delete(taskID string) error {
 		r.dropIndexesLocked(e)
 		delete(r.live, taskID)
 		r.dropRuntimeLocked(e.JobRuntimeID, e.DaemonID)
+		r.persistDelete(taskID, e)
 	}
 	return nil
 }
@@ -210,6 +498,7 @@ func (r *Registry) SetLastStatusSeen(taskID, status string) {
 	if e, ok := r.live[taskID]; ok {
 		e.LastStatusSeen = status
 		r.live[taskID] = e
+		r.persist(taskID, e)
 	}
 }
 
@@ -227,6 +516,7 @@ func (r *Registry) SetLeaseKeepUntil(taskID string, until time.Time) {
 	if e, ok := r.live[taskID]; ok {
 		e.LeaseKeepUntil = until
 		r.live[taskID] = e
+		r.persist(taskID, e)
 	}
 }
 
@@ -342,9 +632,13 @@ func (r *Registry) MarkTerminal(taskID string, result Result, reason string, com
 	}
 	// The settled record is the projection at the verdict instant: it is
 	// what the ops endpoint keeps answering with once the credential
-	// reclaim deletes the live row (ADR-032).
+	// reclaim deletes the live row (ADR-032). Both faces persist: the live
+	// row (drain keeps the credential valid) and the settled record (the
+	// post-reclaim single-task answer, §4.3).
 	r.done.put(taskID, e.CompletedAt, settledRecord(e))
 	r.live[taskID] = e
+	r.persist(taskID, e)
+	r.persistSettled(taskID, settledRecord(e))
 	return e, true, nil
 }
 
@@ -363,8 +657,10 @@ func (r *Registry) SettleNoResult(taskID string, expected Result) (TaskEntry, bo
 	e.Result = ""
 	e.FailureReason = ""
 	r.live[taskID] = e
+	r.persist(taskID, e)
 	if _, at, ok := r.done.get(taskID); ok {
 		r.done.put(taskID, at, settledRecord(e))
+		r.persistSettled(taskID, settledRecord(e))
 	}
 	return e, true
 }
@@ -408,6 +704,10 @@ func (r *Registry) RegisterDecidedReport(taskID string, body []byte) (TaskEntry,
 	if len(e.DecidedReport) == 0 && len(body) > 0 {
 		e.DecidedReport = body
 		r.live[taskID] = e
+		// The decided body is part of the mapping record (ADR-046 决策 0).
+		// Both call paths register it right after MarkTerminal, whose write
+		// predates this field, so this write-through is what persists it.
+		r.persist(taskID, e)
 	}
 	return e, true
 }
@@ -447,6 +747,7 @@ func (r *Registry) MarkJobCreated(taskID string, at time.Time) (TaskEntry, bool)
 	}
 	e.JobCreatedAt = at
 	r.live[taskID] = e
+	r.persist(taskID, e)
 	return e, true
 }
 
@@ -466,6 +767,7 @@ func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntr
 	}
 	e.DaemonRegisteredAt = at
 	r.live[e.TaskID] = e
+	r.persist(e.TaskID, e)
 	return e, true
 }
 
@@ -492,6 +794,7 @@ func (r *Registry) MarkDelivering(daemonID string, at time.Time, delivered json.
 		e.DeliveryDeadline = at.Add(r.deliveryConfirm)
 	}
 	r.live[e.TaskID] = e
+	r.persist(e.TaskID, e)
 	return e, true
 }
 
@@ -517,6 +820,7 @@ func (r *Registry) NoteClaimAfterDelivery(taskID string) {
 	if e, ok := r.live[taskID]; ok {
 		e.ClaimsAfterDelivery++
 		r.live[taskID] = e
+		r.persist(taskID, e)
 	}
 }
 
@@ -535,6 +839,7 @@ func (r *Registry) MarkStarted(taskID string, at time.Time) (TaskEntry, bool) {
 	}
 	e.State = StateRunning
 	r.live[taskID] = e
+	r.persist(taskID, e)
 	return e, true
 }
 
@@ -545,7 +850,11 @@ func (r *Registry) MarkStarted(taskID string, at time.Time) (TaskEntry, bool) {
 func (r *Registry) MarkStartFact(taskID string, at time.Time) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	return r.startFactLocked(taskID, at)
+	e, ok := r.startFactLocked(taskID, at)
+	if ok {
+		r.persist(taskID, e)
+	}
+	return e, ok
 }
 
 // startFactLocked applies the once-only started_at write; the caller holds

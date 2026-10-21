@@ -351,7 +351,7 @@ func TestForward05RegistrationRefusedDuringCarrierListFailureSettlesNothing(t *t
 	// The daemon registers against the restarted scheduler with a runtime set
 	// its rebuilt identity cannot match; the handler refuses and compensates
 	// through FailJob.
-	issuer, err := proxy.JobTokenIssuer(testKey, reg, h.probes, auth.DefaultJobTokenTTL)
+	issuer, err := proxy.JobTokenIssuer(testKey, reg, h.probes, auth.DefaultJobTokenTTL, nil)
 	if err != nil {
 		t.Fatalf("JobTokenIssuer: %v", err)
 	}

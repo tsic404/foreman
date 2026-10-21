@@ -256,7 +256,7 @@ func TestProbeAndTaskFacesAreDisjoint(t *testing.T) {
 	iss := newProbeIssuer(now, jobs, fakeDone{}, fakeProbes{probeJobName: session})
 
 	// A revoked digest on the task face does not touch the probe branch.
-	iss.Revoke(iss.Hash(probeToken))
+	iss.Revoke(iss.Hash(probeToken), "ws-1")
 	if _, err := iss.Verify(probeToken, RequestScope{RuntimeID: probeRuntime, RequestID: probeRequest}); err != nil {
 		t.Fatalf("probe token consulted the revocation set: %v", err)
 	}

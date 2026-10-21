@@ -15,6 +15,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/signal"
 	"syscall"
@@ -32,6 +33,7 @@ import (
 	"github.com/tsic404/foreman/internal/recovery"
 	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
+	"github.com/tsic404/foreman/internal/state"
 	"github.com/tsic404/foreman/internal/workspace"
 )
 
@@ -129,9 +131,52 @@ func run() error {
 	// once at the alive → draining transition (ADR-017); the delivery
 	// confirmation window is too, because markDelivering arms it once at the
 	// delivery commit (ADR-032).
+	//
+	// The shared state face (ADR-046 阶段一) is wired when FOREMAN_STATE_URL
+	// is set: the Job Token entries, the settled records and the revocation
+	// set then persist in the shared store, so a restart restores them
+	// instead of rebuilding from K8s. Without the URL the no-op store keeps
+	// the pre-stage-one behaviour (in-memory index + K8s rebuild) — the
+	// shared state is an optional persistence face at stage one, never a
+	// startup requirement (02-contracts.md §7 部署面).
+	stateCfg, err := state.LoadConfig(getenv)
+	if err != nil {
+		return err
+	}
+	var shared state.Store
+	if stateCfg.URL != "" {
+		shared, err = state.New(stateCfg)
+		if err != nil {
+			return err
+		}
+		// Log the endpoint without its userinfo: a redis:// URL may embed the
+		// credential, and the redactor only knows the token prefixes (§9.1:
+		// never leak a credential into the log). authenticated reads the same
+		// credential state.New applies (the dedicated password wins, else the
+		// URL's own data-node credential), and the shipped REPLACE_ME
+		// placeholder counts as absent: an unreplaced manifest must alarm,
+		// not pass as protected.
+		authenticated := stateAuthenticated(stateCfg)
+		log.Info("state.configured", "endpoint", stateEndpoint(stateCfg.URL),
+			"authenticated", authenticated)
+		if !authenticated {
+			// §10 安全: the store carries token digests, the mapping rows and
+			// the delivery bodies, so it must be protected like a credential
+			// store. An unauthenticated store is allowed (cluster-internal
+			// topologies exist) but never silent.
+			log.Warn("state.unauthenticated",
+				"detail", "FOREMAN_STATE_PASSWORD is empty or still the REPLACE_ME placeholder, and the URL carries no data-node credential: the shared state store is unauthenticated")
+		}
+	}
 	reg := registry.New(time.Now,
 		registry.WithDrainTimeout(schedCfg.JobDrainTimeout),
-		registry.WithDeliveryConfirmTimeout(schedCfg.DeliveryConfirmTimeout))
+		registry.WithDeliveryConfirmTimeout(schedCfg.DeliveryConfirmTimeout),
+		registry.WithStateStore(shared),
+		// §9.1: a shared-state failure is an event, never silent. The
+		// in-memory transition stands (the K8s rebuild is the backstop).
+		registry.WithStateErrorHook(func(op, taskID string, err error) {
+			log.Warn("state.entry_failed", "op", op, "task_id", taskID, "err", err.Error())
+		}))
 	// The catalog probe's identity lives beside the task registry (ADR-019):
 	// it is what the Job Token probe branch, the probe handlers and the probe
 	// lifecycle all read.
@@ -209,9 +254,18 @@ func run() error {
 		return err
 	}
 
-	issuer, err := proxy.JobTokenIssuer(authCfg.Key, reg, probes, authCfg.TokenTTL)
+	issuer, err := proxy.JobTokenIssuer(authCfg.Key, reg, probes, authCfg.TokenTTL, shared,
+		auth.WithRevocationErrorHook(func(op string, err error) {
+			log.Warn("state.revocation_failed", "op", op, "err", err.Error())
+		}))
 	if err != nil {
 		return err
+	}
+	// ADR-046 阶段一: seed the in-process revocation cache from the shared
+	// store, so a digest revoked before the restart is rejected after it. A
+	// store miss leaves the per-request lookup as the fallback.
+	if err := issuer.RestoreRevocations(context.Background()); err != nil {
+		log.Warn("state.revocations_restore_failed", "err", err.Error())
 	}
 	jbCfg.Issuer = issuer
 	jbCfg.Nodes = reg
@@ -493,6 +547,13 @@ func run() error {
 	if !sup.wait(shutdownCtx) {
 		log.Warn("loops.shutdown_timeout", "err", shutdownCtx.Err().Error())
 	}
+	// The shared-state writes run on an ordered writer outside the registry
+	// lock; drain what is queued so the last transitions land before exit.
+	if shared != nil {
+		if err := reg.FlushState(shutdownCtx); err != nil {
+			log.Warn("state.flush_incomplete", "err", err.Error())
+		}
+	}
 	log.Info("foreman.stopped")
 	if fatalErr != nil {
 		return fatalErr
@@ -524,6 +585,53 @@ func isolateWorkspaceLoop(ctx context.Context, component string, log *slog.Logge
 		case <-time.After(retryDelay):
 		}
 	}
+}
+
+// stateEndpoint renders the shared-state URL without its userinfo, so a
+// credential embedded in the URL never reaches the log (§9.1).
+func stateEndpoint(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Scheme + "://" + u.Host
+}
+
+// statePlaceholderCredential is the shipped manifest's credential
+// placeholder. It is a usable string, so an unreplaced deployment would
+// authenticate with a value published in the repository; it counts as
+// unauthenticated and raises state.unauthenticated instead.
+const statePlaceholderCredential = "REPLACE_ME"
+
+// stateAuthenticated reports whether the store's credential comes from a real
+// value. The dedicated password wins over the URL's own data-node credential
+// exactly as state.New applies them; an empty value or the shipped
+// placeholder reads as unauthenticated (§10 安全: the store holds token
+// digests, mapping rows and delivery bodies).
+func stateAuthenticated(cfg state.Config) bool {
+	if cfg.Password != "" {
+		return cfg.Password != statePlaceholderCredential
+	}
+	u, err := url.Parse(cfg.URL)
+	if err != nil {
+		return false
+	}
+	if u.Query().Get("master_name") != "" {
+		// A sentinel URL's userinfo authenticates to the sentinels, not to
+		// the data node: the data node's credential is the password query
+		// parameter, which is what state.New applies here.
+		pw := u.Query().Get("password")
+		return pw != "" && pw != statePlaceholderCredential
+	}
+	if u.User == nil {
+		return false
+	}
+	pw, hasPassword := u.User.Password()
+	if !hasPassword || pw == "" {
+		// A username-only ACL entry is still an identity the store checks.
+		return u.User.Username() != ""
+	}
+	return pw != statePlaceholderCredential
 }
 
 // lateReconciler breaks the scheduler<->recovery construction cycle:

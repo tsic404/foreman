@@ -1,0 +1,128 @@
+# Shared state store (ADR-046 阶段一): the Job Token entries, the settled
+# terminal records and the revocation set persist here, so a Foreman restart
+# restores them instead of rebuilding from K8s (02-contracts.md §4.3/§6.1).
+#
+# The contract's deployment interface list (§7) requires the store to be
+# PERSISTENT — this manifest is a minimal single-pod baseline (the contract's
+# baseline topology). Foreman accepts two connection forms for it, and the
+# deployment picks either by what it points FOREMAN_STATE_URL at, keeping the
+# credential in foreman-secret:
+#   - a single endpoint:  redis://host:6379        (rediss:// for TLS)
+#   - a sentinel topology: redis://sentinel-a:26379?master_name=<name>
+#                          &addr=sentinel-b:26379&addr=sentinel-c:26379
+# The sentinel form is served by a failover client: it resolves <name> through
+# the sentinels and follows a failover to the new master. A topology that
+# exposes neither form is fronted by one stable endpoint (a managed service
+# endpoint or a proxy), because a single URL is all the connection face
+# carries — the contract pins that face, not the topology (§7 部署面).
+# The store carries Job Token digests, the mapping rows (delivery bodies and
+# verdict bodies included, §4.3) and the revoked digests, so it must be treated
+# as a credential store (isolation, auth, transport protection).
+#
+# The Redis image below is the reference baseline; its persistence is AOF
+# (appendonly yes) on a PersistentVolumeClaim, so both a pod restart and a
+# pod reschedule keep acknowledged writes. A deployment swaps in its own
+# persistent Redis (in either form above) by pointing FOREMAN_STATE_URL at it.
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: foreman-redis
+  namespace: foreman
+  labels:
+    app.kubernetes.io/name: foreman
+    app.kubernetes.io/component: shared-state
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: foreman
+    app.kubernetes.io/component: shared-state
+  ports:
+    - name: redis
+      port: 6379
+      targetPort: redis
+      protocol: TCP
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: foreman-redis
+  namespace: foreman
+  labels:
+    app.kubernetes.io/name: foreman
+    app.kubernetes.io/component: shared-state
+spec:
+  serviceName: foreman-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: foreman
+      app.kubernetes.io/component: shared-state
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: foreman
+        app.kubernetes.io/component: shared-state
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: redis
+          image: redis:7-alpine
+          imagePullPolicy: IfNotPresent
+          args: ["redis-server", "--appendonly", "yes", "--requirepass", "$(FOREMAN_STATE_PASSWORD)"]
+          env:
+            - name: FOREMAN_STATE_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: foreman-secret
+                  key: FOREMAN_STATE_PASSWORD
+          ports:
+            - name: redis
+              containerPort: 6379
+              protocol: TCP
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              cpu: "1"
+              memory: 256Mi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          livenessProbe:
+            exec:
+              command: ["redis-cli", "-a", "$(FOREMAN_STATE_PASSWORD)", "ping"]
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 3
+          readinessProbe:
+            exec:
+              command: ["redis-cli", "-a", "$(FOREMAN_STATE_PASSWORD)", "ping"]
+            initialDelaySeconds: 5
+            periodSeconds: 10
+            timeoutSeconds: 3
+  # Persistence is a contract requirement (§7): the store holds the Job Token
+  # entries, the mapping rows and the revocation set, so acknowledged writes
+  # must survive a restart. The claim uses the cluster's default
+  # StorageClass; a deployment with its own storage policy sets one here.
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 1Gi

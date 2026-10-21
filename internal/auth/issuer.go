@@ -4,6 +4,7 @@
 package auth
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -105,6 +106,30 @@ type Issuer struct {
 	done        DoneIndex
 	probes      ProbeLookup
 	revocations *RevocationSet
+	// revokeStore is the shared revocation face (ADR-046 阶段一): when
+	// wired, Revoke writes the digest there and IsRevoked consults it,
+	// making the revocation set cross-restart persistent and (stage two)
+	// cross-instance consistent. Nil keeps the in-process set.
+	revokeStore RevocationStore
+	// revokeErr observes shared-state failures (§9.1: the shared face's
+	// unavailability is an event, never silent).
+	revokeErr func(op string, err error)
+}
+
+// RevocationStore is the shared revocation set face; satisfied by
+// internal/state.Store.
+type RevocationStore interface {
+	Revoke(ctx context.Context, ws, hash string, validUntil time.Time) error
+	// IsRevoked is the cross-instance read. Stage one does not call it: the
+	// in-process set is the complete view (seeded at startup, written
+	// through on every revoke), so a per-request store read would only add
+	// latency. It is the seam stage two's bounded positive cache runs
+	// against (§6.1 跨实例一致).
+	IsRevoked(ctx context.Context, ws, hash string) (bool, error)
+	// ListRevoked lists the live revocations so a restart can seed the
+	// in-process positive cache (the safe direction: a cached digest can
+	// only reject a token early, never accept one).
+	ListRevoked(ctx context.Context) (map[string]time.Time, error)
 }
 
 // Option customizes an Issuer.
@@ -120,6 +145,52 @@ func WithClock(now func() time.Time) Option {
 // consulted for task tokens.
 func WithProbeLookup(p ProbeLookup) Option {
 	return func(i *Issuer) { i.probes = p }
+}
+
+// WithRevocationStore wires the shared revocation face (ADR-046 阶段一). The
+// in-process RevocationSet stays as the local positive cache: it is seeded
+// from the store at startup (RestoreRevocations), every revoke writes through,
+// and it is what the same-instance fast path reads.
+func WithRevocationStore(s RevocationStore) Option {
+	return func(i *Issuer) { i.revokeStore = s }
+}
+
+// WithRevocationErrorHook observes shared-state failures of the revocation
+// face (§9.1). Optional: tests and deployments without the face run without
+// one.
+func WithRevocationErrorHook(h func(op string, err error)) Option {
+	return func(i *Issuer) { i.revokeErr = h }
+}
+
+// revocationCheckTimeout bounds one shared-store revocation lookup, so a slow
+// store never stalls the daemon face.
+const revocationCheckTimeout = 2 * time.Second
+
+// RestoreRevocations seeds the in-process revocation cache from the shared
+// store. It is the startup face of ADR-046 阶段一's revocation persistence: a
+// digest revoked before the restart must still be rejected after it. A store
+// failure leaves the cache as it was (empty) — the per-request store lookup
+// remains the fallback.
+func (i *Issuer) RestoreRevocations(ctx context.Context) error {
+	if i.revokeStore == nil {
+		return nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, revocationCheckTimeout)
+	defer cancel()
+	revoked, err := i.revokeStore.ListRevoked(ctx)
+	if err != nil {
+		if i.revokeErr != nil {
+			i.revokeErr("list_revoked", err)
+		}
+		return err
+	}
+	now := i.now()
+	for hash, until := range revoked {
+		if until.After(now) {
+			i.revocations.Revoke(hash, until)
+		}
+	}
+	return nil
 }
 
 // NewIssuer builds an Issuer from the decoded HMAC key (>= MinKeyBytes) and
@@ -292,7 +363,13 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 	// 5. Revocation set — reachable only while the entry exists, which is
 	// exactly the same-name reuse face (a re-dispatched task or a rebuilt Job
 	// brought the entry back): the predecessor's token must never be
-	// accepted again (ADR-017).
+	// accepted again (ADR-017). The in-process set is the complete stage-one
+	// view: it is seeded from the shared store at startup
+	// (RestoreRevocations) and every Revoke writes through, so the hot path
+	// needs no store round trip. The cross-instance read (bounded positive
+	// cache with the revocation window) is stage two's contract (§6.1
+	// 跨实例一致); doing it here would put a store call on every daemon
+	// request for no stage-one gain.
 	if i.revocations.IsRevoked(i.Hash(token)) {
 		return Claims{}, ErrRevoked
 	}
@@ -315,16 +392,30 @@ func (i *Issuer) Hash(token string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-// Revoke adds a token digest to the in-process revocation set for the rest of
+// Revoke adds a token digest to the revocation set for the rest of
 // the token's validity window. The credential reclaim calls it before deleting
 // the Secret and the entry (ADR-017); see RevocationSet for the face it
-// protects.
+// protects. workspace partitions the revocation set (§6.1): the shared face
+// records the digest under that workspace, so a revocation never leaks into
+// another workspace's adjudication.
 //
 // The window is the *upper bound approximation* of §6.1's "TTL = the
 // token's remaining validity": the reclaim runs after the issue, so the
 // remaining time is ≤ the issued TTL, and `now + TTL + ClockSkew` therefore
 // never expires an entry early (conservative direction — the digest may
 // outlive the token, never the reverse).
-func (i *Issuer) Revoke(tokenHash string) {
+func (i *Issuer) Revoke(tokenHash, workspaceID string) {
 	i.revocations.Revoke(tokenHash, i.now().Add(i.tokenTTL+ClockSkew))
+	if i.revokeStore != nil {
+		// The shared face is the cross-restart authority. A failure leaves
+		// the in-process set holding the digest, so the same-instance face
+		// is safe; the shared miss is the outage the bounded-window
+		// consistency tolerates, and the reclaim must not fail on it.
+		ctx, cancel := context.WithTimeout(context.Background(), revocationCheckTimeout)
+		defer cancel()
+		if err := i.revokeStore.Revoke(ctx, workspaceID, tokenHash,
+			i.now().Add(i.tokenTTL+ClockSkew)); err != nil && i.revokeErr != nil {
+			i.revokeErr("revoke", err)
+		}
+	}
 }

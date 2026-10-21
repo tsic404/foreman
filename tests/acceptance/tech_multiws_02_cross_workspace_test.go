@@ -34,7 +34,7 @@ func TestTechMultiWS02CrossWorkspaceRejected(t *testing.T) {
 	}
 
 	// Revoking A does not touch B's in-flight credential.
-	m.issuer.Revoke(m.issuer.Hash(tokenA))
+	m.issuer.Revoke(m.issuer.Hash(tokenA), "ws-a")
 	if code, _ := m.call("GET", "/api/daemon/workspaces/ws-a/repos", tokenA, nil); code != 401 {
 		t.Errorf("revoked A token = %d, want 401", code)
 	}
