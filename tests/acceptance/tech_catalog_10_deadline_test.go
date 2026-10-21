@@ -1,4 +1,4 @@
-// TC-tech-catalog-10 / AC-65: the probe budget's two boundaries. The catalog
+// TC-tech-catalog-10 / AC-80: the probe budget's two boundaries. The catalog
 // budget's startup self-check refuses a value below three probe heartbeat
 // intervals, and the rendered activeDeadlineSeconds rounds a positive budget
 // up to whole seconds — a sub-second budget renders one second, never the zero
@@ -28,7 +28,7 @@ func TestCatalog10ProbeBudgetBoundaries(t *testing.T) {
 	if _, err := proxy.LoadConfig(env("30s")); err == nil {
 		t.Fatal("a catalog budget below three heartbeat intervals was accepted")
 	} else {
-		// AC-65's refusal criterion: the error states the inequality and the
+		// AC-80's refusal criterion: the error states the inequality and the
 		// actual value, not just the key name.
 		for _, want := range []string{proxy.EnvModelCatalogTimeout, ">= 3x", "30s"} {
 			if !strings.Contains(err.Error(), want) {
