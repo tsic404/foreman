@@ -18,6 +18,8 @@ import (
 type fakeClaimScheduler struct {
 	mu         sync.Mutex
 	budget     int
+	reserved   int
+	released   int
 	claimed    []json.RawMessage
 	onClaimErr error
 }
@@ -28,7 +30,36 @@ func (f *fakeClaimScheduler) ClaimBudget() int {
 	return f.budget
 }
 
-func (f *fakeClaimScheduler) OnClaim(_ context.Context, task json.RawMessage) error {
+func (f *fakeClaimScheduler) ReserveSlots(_ context.Context, want int) (int, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	granted := want
+	if f.budget < want {
+		granted = f.budget
+	}
+	f.reserved += granted
+	return granted, nil
+}
+
+func (f *fakeClaimScheduler) ReleaseSlots(_ context.Context, n int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.released += n
+}
+
+func (f *fakeClaimScheduler) reservedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reserved
+}
+
+func (f *fakeClaimScheduler) releasedCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.released
+}
+
+func (f *fakeClaimScheduler) OnClaimReserved(_ context.Context, task json.RawMessage) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.claimed = append(f.claimed, task)
@@ -418,5 +449,42 @@ func TestHeartbeatAckConsumesUnderTheStreamsRuntime(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// TestClaimLoopReservesBeforeClaim pins §10's ordering: the slots are taken
+// before the C3 claim request, so a full cap never produces an unfunded claim
+// (and the claim batch never exceeds the reservation).
+func TestClaimLoopReservesBeforeClaim(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stubRegister(stub, "rid-1")
+	sched := &fakeClaimScheduler{budget: 1}
+	var reservedAtClaim int
+	stub.on("POST", "/api/daemon/tasks/claim", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		reservedAtClaim = sched.reservedCount()
+		writeJSONStub(w, 200, map[string]any{"tasks": []json.RawMessage{json.RawMessage(`{"id":"t1"}`)}})
+	})
+	cfg := testConfig(srv.URL)
+	client := NewClient(cfg, "mdt_test")
+	registerDeclared(t, client)
+	loop := NewClaimLoop(cfg, client, sched)
+
+	if err := loop.iterate(t.Context()); err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if reservedAtClaim != 1 {
+		t.Fatalf("reservations at the C3 request = %d, want 1 (reserve before claim)", reservedAtClaim)
+	}
+	calls := stub.calls("POST", "/api/daemon/tasks/claim")
+	var body map[string]any
+	_ = json.Unmarshal(calls[0].Body, &body)
+	if body["max_tasks"] != float64(1) {
+		t.Errorf("max_tasks = %v, want the reserved batch", body["max_tasks"])
+	}
+	if sched.claimedCount() != 1 {
+		t.Fatalf("claimed = %d, want 1", sched.claimedCount())
+	}
+	if sched.releasedCount() != 0 {
+		t.Fatalf("released = %d, want 0 (the one reservation was filled)", sched.releasedCount())
 	}
 }

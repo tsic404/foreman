@@ -114,6 +114,9 @@ type Reconciler struct {
 	// an entry themselves.
 	mu     sync.Mutex
 	wakeCh chan struct{}
+	// leader gates the rounds: convergence and sweep run only on the
+	// control-plane holder (§1.1 发出者口径). Nil keeps the gate open.
+	leader func() bool
 
 	// ended records when a Job was first observed ended, so the daemon's
 	// report gets recheckWindow to arrive before the synthesized fail
@@ -206,6 +209,16 @@ func (r *Reconciler) Run(ctx context.Context) error {
 	}
 	go r.refreshInflight(ctx)
 	for {
+		if r.leader != nil && !r.leader() {
+			// Only the control-plane holder converges and sweeps (§1.1
+			// 发出者口径, AC-77); a parked instance keeps its watcher running.
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(500 * time.Millisecond):
+			}
+			continue
+		}
 		if err := r.Reconcile(ctx); err != nil {
 			r.log.WarnContext(ctx, "reconcile round finished with failures", "err", err)
 		}
@@ -396,6 +409,12 @@ func (r *Reconciler) round(ctx context.Context) error {
 	if firstErr == nil {
 		firstErr = listErr
 	}
+	// §10 两级在途上限: the leader round repairs a leaked counter (a dead
+	// reserver's unexplained increment) within one round. Downward-only on the
+	// live path; the absolute write happens on takeover.
+	if serr := r.settler.ReconcileSlots(ctx); serr != nil {
+		r.log.WarnContext(ctx, "coordination.slots_reconcile_failed", "err", serr)
+	}
 	return firstErr
 }
 
@@ -438,6 +457,16 @@ func (r *Reconciler) reconcileOne(ctx context.Context, e registry.TaskEntry, pod
 		return fmt.Errorf("get job %s: %w", e.JobName, err)
 	}
 	if job == nil {
+		// §4.3 未完成创建的接续: a pre-delivery entry whose payload is in the
+		// shared row and whose Job was never created is continued, not
+		// failed — the task never ran and the claim is still ours.
+		if !e.IsTerminal() && !e.IsDraining() && e.State == registry.StatePending &&
+			e.StartedAt.IsZero() && e.DeliveredAt.IsZero() && len(e.Payload) != 0 {
+			if err := r.settler.ContinueClaim(ctx, e.TaskID); err == nil {
+				delete(r.missing, e.JobName)
+				return nil
+			}
+		}
 		// §4.3/§4.6: the Job vanished (deleted, TTL-collected, or never
 		// created). The compensation waits out jobGoneWindow measured from
 		// this first missing observation — a briefly invisible long-lived
@@ -770,3 +799,6 @@ func (r *Reconciler) prune() {
 		}
 	}
 }
+
+// SetLeaderGate wires the control-plane ownership check.
+func (r *Reconciler) SetLeaderGate(g func() bool) { r.leader = g }

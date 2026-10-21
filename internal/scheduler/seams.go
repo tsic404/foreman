@@ -104,6 +104,22 @@ type Metrics interface {
 	// the report, without a new persistence face). The four counters are the
 	// S-12 entry's input/output and its two prompt-cache directions.
 	TokenUsage(provider, model string, input, output, cacheRead, cacheWrite int64)
+	// QueueOp counts one shared-queue operation by result
+	// (enqueued|idempotent|taken|redelivered) (§9.2 共享队列).
+	QueueOp(result string)
+	// QueueDepth sets the live queue-row gauge (§9.2 条目数).
+	QueueDepth(n int)
+	// SharedSlots sets the two-level in-flight counter gauge; an empty
+	// workspaceID is the cluster level (§9.2 两级在途).
+	SharedSlots(workspaceID string, n int)
+	// TaskLockWait observes one shared task-lock acquisition's wait.
+	TaskLockWait(seconds float64)
+	// ReconcileResult counts one takeover reconciliation by result and
+	// observes its duration (§9.2 重建与对账结果).
+	ReconcileResult(result string, seconds float64)
+	// StateError counts one shared-state operation failure by operation
+	// (§9.2 共享状态错误).
+	StateError(op string)
 }
 
 // Reconciler is the recovery module's convergence driver. When wired,
@@ -157,6 +173,12 @@ func (noopMetrics) DeliveryUnconfirmed()                                  {}
 func (noopMetrics) ClaimError(string)                                     {}
 func (noopMetrics) JobDeleteFailed(string)                                {}
 func (noopMetrics) TokenUsage(string, string, int64, int64, int64, int64) {}
+func (noopMetrics) QueueOp(string)                                        {}
+func (noopMetrics) QueueDepth(int)                                        {}
+func (noopMetrics) SharedSlots(string, int)                               {}
+func (noopMetrics) TaskLockWait(float64)                                  {}
+func (noopMetrics) ReconcileResult(string, float64)                       {}
+func (noopMetrics) StateError(string)                                     {}
 
 func orNoopMetrics(m Metrics) Metrics {
 	if m == nil {

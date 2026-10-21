@@ -86,6 +86,7 @@ type fakeSettler struct {
 	settles   []settleCall
 	adopts    []adoptCall
 	discards  []string
+	continued []string
 	vanished  []string
 	sweeps    int
 	reclaims  []reclaimCall
@@ -116,6 +117,15 @@ type fakeSettler struct {
 	// RestorePendingReports' programmed answer.
 	restoreCalls int
 	restoreErr   error
+}
+
+func (f *fakeSettler) ReconcileSlots(context.Context) error { return nil }
+
+func (f *fakeSettler) ContinueClaim(_ context.Context, taskID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.continued = append(f.continued, taskID)
+	return f.err
 }
 
 func (f *fakeSettler) OnJobGone(_ context.Context, jobName string) error {

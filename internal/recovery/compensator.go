@@ -14,6 +14,13 @@ import (
 // callback is never dropped (contract §10), and C13 is consulted before any
 // compensation (§4.6).
 type Settler interface {
+	// ContinueClaim continues a persisted pre-delivery claim whose Job was
+	// never created (§4.3 未完成创建的接续). It is idempotent and reports an
+	// error only when the continuation must be retried.
+	ContinueClaim(ctx context.Context, taskID string) error
+	// ReconcileSlots runs the leader round's two-level counter repair
+	// (§10 计数按条目周期对账); it only lowers a counter.
+	ReconcileSlots(ctx context.Context) error
 	// OnJobGone compensates a Job object that disappeared (§4.6); the
 	// freshly-created grace period is included.
 	OnJobGone(ctx context.Context, jobName string) error

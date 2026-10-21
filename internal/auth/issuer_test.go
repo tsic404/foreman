@@ -21,7 +21,7 @@ const testTokenTTL = time.Hour
 
 type fakeRegistry map[string]JobEntry
 
-func (f fakeRegistry) ByDaemon(daemonID string) (JobEntry, bool) {
+func (f fakeRegistry) ByDaemonInWorkspace(workspaceID, daemonID string) (JobEntry, bool) {
 	e, ok := f[daemonID]
 	return e, ok
 }
@@ -219,6 +219,43 @@ func TestVerifyRevoked(t *testing.T) {
 	gone.Revoke(gone.Hash(token), "ws-1")
 	if _, err := gone.Verify(token, RequestScope{}); !errors.Is(err, ErrUnknownJob) {
 		t.Fatalf("err = %v, want ErrUnknownJob (adjudication precedes revocation)", err)
+	}
+}
+
+// TestVerifyRevokedTerminalReplayScope pins §6.4/§2.1 on the revoked-token
+// face: a terminal replay of the token's own settled task and runtime is
+// idempotent, a foreign task or runtime on that endpoint is the §2.1 rule-1
+// scope mismatch (403), and every other endpoint stays 401.
+func TestVerifyRevokedTerminalReplayScope(t *testing.T) {
+	now := time.Unix(1_700_000_000, 0)
+	jobs := fakeRegistry{"fm-task-1": {JobRuntimeID: "rid-1", WorkspaceID: "ws-1", Terminal: true}}
+	iss := newTestIssuer(now, jobs, fakeDone{})
+	token, err := iss.Issue("fm-task-1", "task-1", "ws-1", time.Hour)
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	iss.Revoke(iss.Hash(token), "ws-1")
+
+	claims, err := iss.Verify(token, RequestScope{TaskID: "task-1", RuntimeID: "rid-1", IsTerminalEndpoint: true})
+	if err != nil {
+		t.Fatalf("own terminal replay: %v", err)
+	}
+	if !claims.IsLateReplay {
+		t.Fatalf("claims = %+v, want IsLateReplay", claims)
+	}
+
+	if _, err := iss.Verify(token, RequestScope{TaskID: "task-2", RuntimeID: "rid-1", IsTerminalEndpoint: true}); !errors.Is(err, ErrScopeMismatch) {
+		t.Fatalf("foreign task: err = %v, want ErrScopeMismatch", err)
+	} else if got := HTTPStatus(err); got != http.StatusForbidden {
+		t.Fatalf("foreign task status = %d, want 403", got)
+	}
+	if _, err := iss.Verify(token, RequestScope{TaskID: "task-1", RuntimeID: "rid-other", IsTerminalEndpoint: true}); !errors.Is(err, ErrScopeMismatch) {
+		t.Fatalf("foreign runtime: err = %v, want ErrScopeMismatch", err)
+	} else if got := HTTPStatus(err); got != http.StatusForbidden {
+		t.Fatalf("foreign runtime status = %d, want 403", got)
+	}
+	if _, err := iss.Verify(token, RequestScope{TaskID: "task-1", RuntimeID: "rid-1"}); !errors.Is(err, ErrRevoked) {
+		t.Fatalf("non-terminal endpoint: err = %v, want ErrRevoked", err)
 	}
 }
 

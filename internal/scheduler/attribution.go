@@ -264,7 +264,13 @@ func (s *Scheduler) attributionGate(ctx context.Context, e registry.TaskEntry, b
 	// the task's lock, so no settlement path can decide this instance while
 	// the gate is deciding on its behalf, and an instance another path decided
 	// during the wait is never rewritten (§4.4).
-	unlock := s.taskMu.Lock(e.TaskID)
+	unlock, lockErr := s.lockTaskFor(ctx, e.TaskID)
+	if lockErr != nil {
+		// The shared task lock is unreachable: never decide on a snapshot
+		// another instance may be changing; the report is forwarded as-is and
+		// the shared CAS keeps the terminal write single.
+		return e, body, gateDecidedElsewhere
+	}
 	defer unlock()
 	if fresh, ok := s.reg.Get(e.TaskID); ok {
 		e = fresh

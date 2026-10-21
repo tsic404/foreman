@@ -40,6 +40,9 @@ type WSSubscriber struct {
 	// daemon:runtime_profiles_changed frame (nil keeps the subscriber inert on
 	// that event — the WS-disabled degradation).
 	profilesChanged func()
+	// leader gates the subscription: only the lease holder holds C-20
+	// connections (§1.1 发出者口径). Nil keeps the gate open (stage one).
+	leader func() bool
 	// now is the clock (overridable in tests).
 	now func() time.Time
 }
@@ -306,6 +309,13 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 		}
 	}
 	for {
+		if s.leader != nil && !s.leader() {
+			stopAll()
+			if !sleepOrDone(ctx, leaderPollInterval) {
+				return nil
+			}
+			continue
+		}
 		reconcile()
 		select {
 		case <-ctx.Done():
@@ -521,3 +531,7 @@ func (s *WSSubscriber) waitReconnect(ctx context.Context, err error, state *runt
 	case <-time.After(wait):
 	}
 }
+
+// SetLeaderGate wires the control-plane ownership check: a non-holder closes
+// its C-20 connections and opens none until it acquires the lease.
+func (s *WSSubscriber) SetLeaderGate(g func() bool) { s.leader = g }

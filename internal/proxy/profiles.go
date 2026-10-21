@@ -409,7 +409,13 @@ type ProfileRefresher struct {
 	log     *slog.Logger
 	trigger chan struct{}
 	now     func() time.Time
+	// leader gates the refresh sequence: it runs a probe Job and re-registers,
+	// both control-plane actions (§1.1 发出者口径). Nil keeps the gate open.
+	leader func() bool
 }
+
+// SetLeaderGate wires the control-plane ownership check.
+func (r *ProfileRefresher) SetLeaderGate(g func() bool) { r.leader = g }
 
 // ProfileRefresherOption customizes a ProfileRefresher.
 type ProfileRefresherOption func(*ProfileRefresher)
@@ -455,6 +461,13 @@ func (r *ProfileRefresher) Run(ctx context.Context) error {
 		case <-ctx.Done():
 			return nil
 		case <-r.trigger:
+		}
+		if r.leader != nil && !r.leader() {
+			// The invalidation hint arrived on a non-holder: the event is
+			// dropped here, and the next restart converges (§1.6 降级面), so a
+			// non-holder never runs a probe Job or re-registers.
+			r.log.Debug("runtime.profiles_refresh_skipped", "reason", "not control-plane holder")
+			continue
 		}
 		if err := r.client.RefreshRuntimeProfiles(ctx); err != nil {
 			r.log.Warn("runtime.profiles_refresh_failed", "err", err)

@@ -23,6 +23,7 @@ import (
 
 	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/state"
 )
 
 // jobGoneGracePeriod tolerates the first-visibility delay of a freshly
@@ -280,6 +281,23 @@ func WithRuntimeIdentity(r RuntimeIdentityResolver) Option {
 	return func(s *Scheduler) { s.runtimeIdentity = r }
 }
 
+// WithSharedStore wires the stage-two coordination face: the shared delivery
+// queue, per-task write locks, the two-level in-flight counters and the
+// shared-row transitions. instanceID names this process as the lock owner.
+func WithSharedStore(store state.CoordStore, instanceID string, taskLockTTL time.Duration) Option {
+	return func(s *Scheduler) {
+		s.shared = store
+		s.instanceID = instanceID
+		s.taskLockTTL = taskLockTTL
+	}
+}
+
+// WithLeaderGate wires the control-plane ownership check the claim budget
+// consults; without it every instance of a shared deployment would claim.
+func WithLeaderGate(fn func() bool) Option {
+	return func(s *Scheduler) { s.leaderHeld = fn }
+}
+
 // Scheduler owns the task mapping state machine and the Job/Secret
 // lifecycle. The claim loop lives in proxy; the scheduling actions are here.
 type Scheduler struct {
@@ -342,6 +360,18 @@ type Scheduler struct {
 	// so the space is bounded rather than trusted.
 	usageMu    sync.Mutex
 	usagePairs map[usageLabelPair]struct{}
+
+	// Stage-two coordination face (ADR-046 决策 1-9). shared is nil without a
+	// shared store (the stage-one process-local form); when set, decisive
+	// transitions run against the shared row, the delivery take is the shared
+	// queue's atomic pickup, and the in-flight counters are the shared ones.
+	shared      state.CoordStore
+	instanceID  string
+	taskLockTTL time.Duration
+	// leaderHeld gates the claim budget: only the control-plane holder claims
+	// (02-contracts.md §1.1 发出者口径). Nil leaves the gate open (stage one
+	// and direct scheduler tests).
+	leaderHeld func() bool
 }
 
 // New builds a Scheduler. reg, jobs, builder and server are required.
@@ -399,6 +429,9 @@ func (s *Scheduler) Start(ctx context.Context) error {
 	if err := s.Rebuild(ctx); err != nil {
 		return fmt.Errorf("rebuild registry from k8s jobs: %w", err)
 	}
+	if err := s.reconcileSlots(ctx, true); err != nil {
+		s.log.WarnContext(ctx, "coordination.slot_reset_failed", "err", err)
+	}
 	if err := s.Reconcile(ctx); err != nil {
 		s.log.WarnContext(ctx, "initial reconcile failed", "err", err)
 	}
@@ -409,6 +442,23 @@ func (s *Scheduler) Start(ctx context.Context) error {
 // min(max-inflight − inflight, claim-batch-max). Queueing stays on the
 // server; Foreman never pre-fetches (AC-02).
 func (s *Scheduler) ClaimBudget() int {
+	if s.shared != nil {
+		if s.leaderHeld != nil && !s.leaderHeld() {
+			return 0
+		}
+		ctx, cancel := sharedDetachedCtx()
+		defer cancel()
+		used, err := s.shared.Slots(ctx, "")
+		if err != nil {
+			// A store that cannot answer stops new claims (§10 共享状态不可用).
+			return 0
+		}
+		free := int64(s.cfg.MaxInflightJobs) - used
+		if free < 0 {
+			free = 0
+		}
+		return min(int(free), s.cfg.ClaimBatchMax)
+	}
 	free := s.cfg.MaxInflightJobs - s.reg.Inflight()
 	if free < 0 {
 		free = 0
@@ -422,6 +472,31 @@ func (s *Scheduler) ClaimBudget() int {
 // The budget never subtracts another workspace's load from this one: a
 // workspace's flood cannot stop another's claims.
 func (s *Scheduler) ClaimBudgetFor(workspaceID string) int {
+	if s.shared != nil {
+		if s.leaderHeld != nil && !s.leaderHeld() {
+			return 0
+		}
+		ctx, cancel := sharedDetachedCtx()
+		defer cancel()
+		used, err := s.shared.Slots(ctx, "")
+		if err != nil {
+			return 0
+		}
+		free := int64(s.cfg.MaxInflightJobs) - used
+		if s.cfg.MaxInflightJobsPerWorkspace > 0 {
+			wsUsed, err := s.shared.Slots(ctx, workspaceID)
+			if err != nil {
+				return 0
+			}
+			if wsFree := int64(s.cfg.MaxInflightJobsPerWorkspace) - wsUsed; wsFree < free {
+				free = wsFree
+			}
+		}
+		if free < 0 {
+			free = 0
+		}
+		return min(int(free), s.cfg.ClaimBatchMax)
+	}
 	free := s.cfg.MaxInflightJobs - s.reg.Inflight()
 	if s.cfg.MaxInflightJobsPerWorkspace > 0 {
 		if workspaceFree := s.cfg.MaxInflightJobsPerWorkspace - s.reg.InflightFor(workspaceID); workspaceFree < free {
@@ -474,6 +549,27 @@ func (s *Scheduler) WorkspaceIDs() []string {
 // That bound is the ticker's, not the round's — a round can sit in its own
 // I/O (terminal-report retry budgets, object deletes) for minutes.
 func (s *Scheduler) SyncInflight() {
+	if s.shared != nil {
+		// The shared counters are the cluster-level truth (§10 两级在途上限);
+		// the local index understates another instance's load.
+		ctx, cancel := sharedDetachedCtx()
+		global, err := s.shared.Slots(ctx, "")
+		if err == nil {
+			s.metrics.InflightJobs(int(global))
+			if workspaceMetrics, ok := s.metrics.(interface {
+				InflightJobsWorkspace(workspaceID string, n int)
+			}); ok {
+				for _, workspaceID := range s.WorkspaceIDs() {
+					if n, err := s.shared.Slots(ctx, workspaceID); err == nil {
+						workspaceMetrics.InflightJobsWorkspace(workspaceID, int(n))
+					}
+				}
+			}
+			cancel()
+			return
+		}
+		cancel()
+	}
 	s.metrics.InflightJobs(s.reg.Inflight())
 	// The per-workspace series is the two-level budget's observable face
 	// (§10); the optional interface keeps older metrics implementations
@@ -575,7 +671,28 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 // (a cross-workspace claim must never produce an entry, AC-81). An empty
 // workspaceID keeps the legacy payload-derived form.
 func (s *Scheduler) OnClaimFor(ctx context.Context, workspaceID string, task json.RawMessage) error {
+	return s.onClaimFor(ctx, workspaceID, task, false)
+}
+
+// OnClaimReservedFor registers a task against a reservation the claim loop
+// already holds (§10: claim 前必须持有槽位预留). It never reserves again; a
+// task that produces no entry returns its slot to the caller's budget.
+func (s *Scheduler) OnClaimReservedFor(ctx context.Context, workspaceID string, task json.RawMessage) error {
+	return s.onClaimFor(ctx, workspaceID, task, true)
+}
+
+func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task json.RawMessage, reserved bool) error {
 	defer s.SyncInflight()
+	workspace := workspaceID
+	held := reserved
+	owned := false
+	// The caller's reservation (or the one this call takes below) is consumed
+	// by the entry only when reg.Put lands; every other exit returns it.
+	defer func() {
+		if held && !owned {
+			s.releaseSlots(ctx, workspace)
+		}
+	}()
 	var head claimHead
 	if err := json.Unmarshal(task, &head); err != nil {
 		// The full head parse failed. A tolerant id read is the difference
@@ -592,7 +709,6 @@ func (s *Scheduler) OnClaimFor(ctx context.Context, workspaceID string, task jso
 		s.noteUnnameableClaim(ctx, err, len(task))
 		return fmt.Errorf("%w: %v", ErrUnnameableClaim, err)
 	}
-	workspace := workspaceID
 	if workspace == "" {
 		workspace = head.WorkspaceID
 	} else if head.WorkspaceID != "" && head.WorkspaceID != workspace {
@@ -602,7 +718,10 @@ func (s *Scheduler) OnClaimFor(ctx context.Context, workspaceID string, task jso
 		return fmt.Errorf("claim workspace %q does not match payload workspace %q", workspace, head.WorkspaceID)
 	}
 	head.WorkspaceID = workspace
-	unlock := s.taskMu.Lock(head.ID)
+	unlock, err := s.lockTaskIn(ctx, workspace, head.ID)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 
 	attempt := 1
@@ -688,8 +807,30 @@ func (s *Scheduler) OnClaimFor(ctx context.Context, workspaceID string, task jso
 		name = daemonID
 	}
 	e.JobName = name
+	if s.shared != nil && !held {
+		// Direct callers (not the claim loop) reserve here; the loop's
+		// reservation is already held and checked before C3.
+		if err := s.reserveSlots(ctx, e.WorkspaceID); err != nil {
+			return err
+		}
+		held = true
+	}
 	if err := s.reg.Put(e); err != nil {
 		return fmt.Errorf("register task %s: %w", e.TaskID, err)
+	}
+	owned = true
+	if held {
+		// The reservation becomes the entry's in-flight slot (counter
+		// unchanged, pending marker gone).
+		s.consumeSlots(ctx, e.WorkspaceID)
+	}
+	// The claim is enqueued once, before any object exists: the queue row and
+	// the mapping row are the delivery face any instance reads (§5 单次入队).
+	if err := s.enqueueShared(ctx, e); err != nil {
+		// No object was created yet; dropping the entry lets the server
+		// re-dispatch after the prepare lease lapses, the deferral path.
+		_ = s.reg.Delete(e.TaskID)
+		return err
 	}
 	s.log.InfoContext(ctx, "task.claimed",
 		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
@@ -944,76 +1085,6 @@ func (s *Scheduler) resolveDuplicateClaim(ctx context.Context, existing registry
 	}
 }
 
-// Deliver hands the Job's task to its daemon (S6): at most once per task,
-// and only the runtime_id field of the original claim payload is rewritten.
-func (s *Scheduler) Deliver(daemonID string, runtimeID string, maxTasks int) ([]json.RawMessage, error) {
-	if maxTasks < 1 {
-		return nil, nil
-	}
-	e, ok := s.reg.ByDaemon(daemonID)
-	if !ok {
-		return nil, fmt.Errorf("%w: %s", ErrUnknownDaemon, daemonID)
-	}
-	if runtimeID != e.JobRuntimeID {
-		return nil, fmt.Errorf("%w: %s", ErrRuntimeMismatch, runtimeID)
-	}
-	if len(e.Payload) == 0 {
-		// The full payload never leaves process memory (F3); a rebuilt entry
-		// has nothing to deliver and is converged away instead.
-		s.log.Warn("task.payload_missing",
-			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID)
-		return nil, nil
-	}
-
-	// The only rewritten field (S-6); every other field keeps
-	// its value (the map round-trip may reorder keys). Rewritten before the
-	// state transition so a marshal failure does not burn the single delivery.
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(e.Payload, &fields); err != nil {
-		return nil, fmt.Errorf("parse stored payload for task %s: %w", e.TaskID, err)
-	}
-	runtimeRaw, err := json.Marshal(e.JobRuntimeID)
-	if err != nil {
-		return nil, err
-	}
-	fields["runtime_id"] = runtimeRaw
-	out, err := json.Marshal(fields)
-	if err != nil {
-		return nil, err
-	}
-
-	// The delivered body is handed to the registry so the entry keeps the
-	// delivered form, not the claim-time one (registry.MarkDelivering).
-	// The entry's pre-commit face is the one that says whether this claim is
-	// the first hand-over or a re-delivery the expired window released.
-	prevDelivered := e.DeliveredAt
-	prevClaims := e.ClaimsAfterDelivery
-	now := s.now()
-	e, ok = s.reg.MarkDelivering(daemonID, now, out)
-	if !ok {
-		return nil, nil
-	}
-	s.reg.SetRuntimeDeliveredTask(e.JobRuntimeID, e.TaskID)
-	s.log.Info("task.delivered",
-		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
-		"workspace_id", e.WorkspaceID,
-		"deliver_latency_ms", now.Sub(e.ClaimedAt).Milliseconds())
-	if e.Deliveries > 1 {
-		// The window's exit (ADR-032): the delivery committed at
-		// delivered_at was never confirmed, and this claim released it. The
-		// claim itself is the evidence that the daemon is not holding that
-		// copy — a Job daemon claims only with a free task slot, and it holds
-		// one for the whole task.
-		s.log.Warn("task.delivery_rearmed",
-			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
-			"delivered_at", registry.ProjectedTime(prevDelivered),
-			"window_seconds", e.DeliveryDeadline.Sub(e.DeliveredAt).Seconds(),
-			"claims_after_delivery", prevClaims,
-			"deliveries", e.Deliveries)
-	}
-	return []json.RawMessage{out}, nil
-}
-
 // usageReport is the token-usage shape the upstream daemon sends on S-12.
 // Only the metric's label values and the four token counters are read; the
 // optional cost figure stays with the upstream.
@@ -1113,7 +1184,11 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 	locked := ep == EPStart
 	unlock := func() {}
 	if locked {
-		unlock = s.taskMu.Lock(e.TaskID)
+		var lockErr error
+		unlock, lockErr = s.lockTaskFor(ctx, e.TaskID)
+		if lockErr != nil {
+			return http.StatusServiceUnavailable, nil, lockErr
+		}
 	}
 	defer unlock()
 	if ep == EPUsage {
@@ -1150,7 +1225,10 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		// can settle this instance, and §4.4 forbids rewriting a decided one.
 		// The gate's verdict distinguishes its own settlement from such a
 		// decision; both skip this report's write.
-		unlockTerminal := s.taskMu.Lock(e.TaskID)
+		unlockTerminal, lockErr := s.lockTaskFor(ctx, e.TaskID)
+		if lockErr != nil {
+			return http.StatusServiceUnavailable, nil, lockErr
+		}
 		if fresh, ok := s.reg.Get(e.TaskID); ok {
 			e = fresh
 		}
@@ -1371,7 +1449,10 @@ func (s *Scheduler) OnStartRejected(ctx context.Context, taskID string) error {
 // no-op) or the start really never happened.
 func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
 	defer s.SyncInflight()
-	unlock := s.taskMu.Lock(taskID)
+	unlock, err := s.lockTaskFor(ctx, taskID)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	e, ok := s.reg.Get(taskID)
 	if !ok || e.IsTerminal() || !e.StartedAt.IsZero() {
@@ -1398,7 +1479,10 @@ func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
 // form, and it is claim-relative, so the number of attempts is bounded by it.
 func (s *Scheduler) OnDeliveryUnconfirmed(ctx context.Context, taskID string) error {
 	defer s.SyncInflight()
-	unlock := s.taskMu.Lock(taskID)
+	unlock, err := s.lockTaskFor(ctx, taskID)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	e, ok := s.reg.Get(taskID)
 	if !ok || e.IsTerminal() || !e.StartedAt.IsZero() || e.DeliveredAt.IsZero() {
@@ -1425,7 +1509,10 @@ func (s *Scheduler) OnDeliveryUnconfirmed(ctx context.Context, taskID string) er
 // reported and never guessed (S-7 + §10: 租约不超时, ADR-026 决策结果 1/3).
 func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) error {
 	defer s.SyncInflight()
-	unlock := s.taskMu.Lock(taskID)
+	unlock, err := s.lockTaskFor(ctx, taskID)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	e, ok := s.reg.Get(taskID)
 	if !ok || e.IsTerminal() {
@@ -1522,7 +1609,10 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 	// The key is the task id, so it is resolved before the lock and the
 	// entry re-read under it: a concurrent path must not be settled on a
 	// snapshot it already replaced.
-	unlock := s.taskMu.Lock(e.TaskID)
+	unlock, lockErr := s.lockTaskFor(ctx, e.TaskID)
+	if lockErr != nil {
+		return lockErr
+	}
 	defer unlock()
 	e, ok = s.reg.ByJob(jobName)
 	if !ok {
@@ -1636,7 +1726,10 @@ func (s *Scheduler) settleFailure(ctx context.Context, e registry.TaskEntry, rep
 // a C13 answer can never reclassify an entry a concurrent report decided
 // (§4.2: terminal is irreversible).
 func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) error {
-	unlock := s.taskMu.Lock(taskID)
+	unlock, err := s.lockTaskFor(ctx, taskID)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	return s.settleTerminalLocked(ctx, taskID, result)
 }
@@ -1686,7 +1779,10 @@ func (s *Scheduler) settleTerminalLocked(ctx context.Context, taskID, result str
 // decided on, so it must be ordered against DiscardTask's re-read and
 // deletion (§4.2: one decisive fact per transition).
 func (s *Scheduler) AdoptRunning(ctx context.Context, taskID, status string) error {
-	unlock := s.taskMu.Lock(taskID)
+	unlock, err := s.lockTaskFor(ctx, taskID)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	return s.adoptRunningLocked(ctx, taskID, status)
 }
@@ -1712,7 +1808,10 @@ func (s *Scheduler) adoptRunningLocked(ctx context.Context, taskID, status strin
 // (ADR-017); a rebuilt entry has none and logs cred.revoke_unavailable. A
 // failed deletion keeps the entry as the only retry handle (§6.4).
 func (s *Scheduler) DiscardTask(ctx context.Context, taskID string) error {
-	unlock := s.taskMu.Lock(taskID)
+	unlock, err := s.lockTaskFor(ctx, taskID)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	e, ok := s.reg.Get(taskID)
 	if !ok {
@@ -1765,7 +1864,10 @@ func (s *Scheduler) discardTaskLocked(ctx context.Context, e registry.TaskEntry)
 // once more before the deletion: a stale observation never settles a live
 // task. A decided entry keeps its verdict and only retries the Job deletion.
 func (s *Scheduler) OnTaskVanished(ctx context.Context, taskID string) error {
-	unlock := s.taskMu.Lock(taskID)
+	unlock, err := s.lockTaskFor(ctx, taskID)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	return s.onTaskVanishedLocked(ctx, taskID)
 }
@@ -1909,7 +2011,10 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 	if s.beforeJobLock != nil {
 		s.beforeJobLock()
 	}
-	unlock := s.taskMu.Lock(e.TaskID)
+	unlock, lockErr := s.lockTaskFor(ctx, e.TaskID)
+	if lockErr != nil {
+		return lockErr
+	}
 	defer unlock()
 	e, ok = s.reg.ByJob(jobName)
 	if !ok || !e.IsDraining() {
@@ -2309,6 +2414,12 @@ func (s *Scheduler) rebuildFromK8s(ctx context.Context) error {
 			s.log.DebugContext(ctx, "keep live entry", "task_id", e.TaskID, "job_name", e.JobName)
 			continue
 		}
+		// Stage two: the shared store is the adjudication face, so a rebuilt
+		// row must land there too (the data-loss path's K8s rebuild, §4.3).
+		if err := s.reg.PersistShared(ctx, e); err != nil {
+			s.log.ErrorContext(ctx, "restore entry to shared state failed",
+				"task_id", e.TaskID, "job_name", e.JobName, "err", err)
+		}
 		s.reg.PutRuntime(registry.JobRuntime{
 			JobRuntimeID: e.JobRuntimeID,
 			DaemonID:     e.DaemonID,
@@ -2363,7 +2474,10 @@ func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) err
 		// deliberately does not enter drain — the task will be re-run
 		// (ADR-017).
 		if len(e.Payload) != 0 {
-			return nil
+			// §4.3 未完成创建的接续: the claim was persisted but the process
+			// died before the Job existed. Continuing is idempotent and keeps
+			// the task off the redispatch path.
+			return s.ContinueClaim(ctx, e.TaskID)
 		}
 		return s.DiscardTask(ctx, e.TaskID)
 	case registry.IsTerminalResult(st):
@@ -2455,7 +2569,10 @@ func claimID(task json.RawMessage) string {
 // it. Without this the same claim would be re-delivered on every lease expiry
 // forever, since no entry exists for any other path to converge it.
 func (s *Scheduler) settleMalformedClaim(ctx context.Context, id string, task json.RawMessage, parseErr error) error {
-	unlock := s.taskMu.Lock(id)
+	unlock, err := s.lockTaskFor(ctx, id)
+	if err != nil {
+		return err
+	}
 	defer unlock()
 	cause := fmt.Errorf("%w: malformed claim payload: %v", jobbuilder.ErrInvalidTaskID, parseErr)
 	if existing, ok := s.reg.Get(id); ok {
@@ -2484,7 +2601,18 @@ func (s *Scheduler) settleMalformedClaim(ctx context.Context, id string, task js
 		ClaimedAt:    s.now(),
 		Payload:      append(json.RawMessage(nil), task...),
 	}
+	// The malformed claim still occupies an in-flight slot until its terminal
+	// write releases it, so the accounting stays balanced (the workspace is
+	// unknown here: the global level alone applies).
+	if s.shared != nil {
+		if err := s.reserveSlots(ctx, ""); err != nil {
+			return err
+		}
+	}
 	if err := s.reg.Put(e); err != nil {
+		if s.shared != nil {
+			s.releaseSlots(ctx, "")
+		}
 		return err
 	}
 	s.failClaim(ctx, e, cause)
@@ -2608,7 +2736,10 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, work
 			// keeps its result (§4.2, §4.4). Only an instance that never
 			// reached a verdict settles with no result, and the Job deletion
 			// uses the fresh entry.
-			unlock := s.taskMu.Lock(taskID)
+			unlock, lockErr := s.lockTaskFor(ctx, taskID)
+			if lockErr != nil {
+				return http.StatusServiceUnavailable, nil, lockErr
+			}
 			fresh, ok := s.reg.Get(taskID)
 			if !ok {
 				// Reclaimed while the replay was in flight: the pre-forward
@@ -2659,7 +2790,10 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, work
 // synthesized failure replayed across a restart must project the same
 // failure_reason, never an empty one (§4.1).
 func (s *Scheduler) settleReplayed(ctx context.Context, taskID string, ep Endpoint, failureReason string) {
-	unlock := s.taskMu.Lock(taskID)
+	unlock, err := s.lockTaskFor(ctx, taskID)
+	if err != nil {
+		return
+	}
 	defer unlock()
 	fresh, ok := s.reg.Get(taskID)
 	if !ok || fresh.IsTerminal() || len(fresh.DecidedReport) > 0 {

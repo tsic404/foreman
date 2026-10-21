@@ -26,6 +26,14 @@ const (
 	metricJobBootSeconds           = "foreman_job_boot_seconds"
 	metricJobCreateSeconds         = "foreman_job_create_seconds"
 	metricInflightJobs             = "foreman_inflight_jobs"
+	metricQueueOps                 = "foreman_queue_operations_total"
+	metricQueueDepth               = "foreman_queue_depth"
+	metricSharedSlots              = "foreman_shared_slots"
+	metricTaskLockWait             = "foreman_task_lock_wait_seconds"
+	metricReconcileTotal           = "foreman_coordination_reconcile_total"
+	metricReconcileSeconds         = "foreman_coordination_reconcile_seconds"
+	metricStateErrors              = "foreman_state_errors_total"
+	metricLeaderChanges            = "foreman_leader_changes_total"
 	metricInflightJobsWorkspace    = "foreman_inflight_jobs_workspace"
 	metricForwardTotal             = "foreman_forward_total"
 	metricForwardLatency           = "foreman_forward_latency_seconds"
@@ -192,6 +200,14 @@ type Metrics struct {
 	profileRefreshes   *prometheus.CounterVec
 	policyHits         *prometheus.CounterVec
 	policyResolutions  *prometheus.CounterVec
+	queueOps           *prometheus.CounterVec
+	queueDepth         prometheus.Gauge
+	sharedSlots        *prometheus.GaugeVec
+	taskLockWait       prometheus.Histogram
+	reconcileTotal     *prometheus.CounterVec
+	reconcileSeconds   prometheus.Histogram
+	stateErrors        *prometheus.CounterVec
+	leaderChanges      *prometheus.CounterVec
 
 	// wsMu guards wsJobs, the authoritative side=job connection count; the
 	// gauge is Set from it so a disconnect without a matching connect (e.g.
@@ -242,6 +258,41 @@ func NewMetrics() *Metrics {
 		Help:    "claim -> Job created latency.",
 		Buckets: []float64{0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30},
 	})
+	m.queueOps = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricQueueOps,
+		Help: "Shared-queue operations by result (enqueued|idempotent|taken|redelivered).",
+	}, []string{"result"})
+	m.queueDepth = prometheus.NewGauge(prometheus.GaugeOpts{
+		Name: metricQueueDepth,
+		Help: "Live shared-queue rows (tasks waiting for a delivery take).",
+	})
+	m.sharedSlots = prometheus.NewGaugeVec(prometheus.GaugeOpts{
+		Name: metricSharedSlots,
+		Help: "In-flight slots held on the shared counter (workspace=empty is the cluster level).",
+	}, []string{"workspace"})
+	m.taskLockWait = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    metricTaskLockWait,
+		Help:    "Time spent waiting for the per-task write lock.",
+		Buckets: []float64{0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1, 5},
+	})
+	m.reconcileTotal = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricReconcileTotal,
+		Help: "Takeover reconciliation rounds by result.",
+	}, []string{"result"})
+	m.reconcileSeconds = prometheus.NewHistogram(prometheus.HistogramOpts{
+		Name:    metricReconcileSeconds,
+		Help:    "Takeover reconciliation duration.",
+		Buckets: []float64{0.01, 0.05, 0.1, 0.5, 1, 5, 10},
+	})
+	m.stateErrors = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricStateErrors,
+		Help: "Shared-state operation failures by operation.",
+	}, []string{"op"})
+	m.leaderChanges = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricLeaderChanges,
+		Help: "Control-plane lease changes by result (acquired|lost).",
+	}, []string{"result"})
+
 	m.inflightWorkspace = prometheus.NewGaugeVec(prometheus.GaugeOpts{
 		Name: metricInflightJobsWorkspace,
 		Help: "Current non-terminal Job count per workspace (§10 两级预算).",
@@ -354,6 +405,14 @@ func NewMetrics() *Metrics {
 		m.skillResolves, m.skillEntries, m.skillBytes, m.skillEvictions,
 		m.workspaceRefreshes, m.profileRefreshes, m.policyHits,
 		m.policyResolutions,
+		m.queueOps,
+		m.queueDepth,
+		m.sharedSlots,
+		m.taskLockWait,
+		m.reconcileTotal,
+		m.reconcileSeconds,
+		m.stateErrors,
+		m.leaderChanges,
 	}
 	for _, c := range collectors {
 		m.reg.MustRegister(c)
@@ -583,3 +642,29 @@ func (m *Metrics) PolicyHit(axis, source string) {
 func (m *Metrics) PolicyNameResolution(conclusion string) {
 	m.policyResolutions.WithLabelValues(conclusion).Inc()
 }
+
+// QueueOp counts one shared-queue operation by result (§9.2 共享队列).
+func (m *Metrics) QueueOp(result string) { m.queueOps.WithLabelValues(result).Inc() }
+
+// QueueDepth sets the live queue-row gauge.
+func (m *Metrics) QueueDepth(n int) { m.queueDepth.Set(float64(n)) }
+
+// SharedSlots sets one in-flight counter gauge ("" = cluster level).
+func (m *Metrics) SharedSlots(workspaceID string, n int) {
+	m.sharedSlots.WithLabelValues(workspaceID).Set(float64(n))
+}
+
+// TaskLockWait observes one per-task write-lock wait.
+func (m *Metrics) TaskLockWait(seconds float64) { m.taskLockWait.Observe(seconds) }
+
+// ReconcileResult counts one takeover reconciliation by result.
+func (m *Metrics) ReconcileResult(result string, seconds float64) {
+	m.reconcileTotal.WithLabelValues(result).Inc()
+	m.reconcileSeconds.Observe(seconds)
+}
+
+// StateError counts one shared-state operation failure.
+func (m *Metrics) StateError(op string) { m.stateErrors.WithLabelValues(op).Inc() }
+
+// LeaderChange counts one control-plane lease change (acquired|lost).
+func (m *Metrics) LeaderChange(result string) { m.leaderChanges.WithLabelValues(result).Inc() }

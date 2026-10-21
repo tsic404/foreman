@@ -1,8 +1,15 @@
 # Foreman Deployment + Service (02-contracts.md §9.3, §8.1).
 #
-# Single replica (01-scope.md NG7): two Foreman instances would claim the same
-# runtime and double-dispatch tasks, so the strategy is Recreate and replicas
-# is pinned.
+# One or more replicas form one logical instance set (ADR-046 阶段二): every
+# replica serves the Job daemon face, while the control plane (registration,
+# heartbeat, subscription, claim, convergence) is held by the replica that owns
+# the shared lease. Multi-replica operation requires FOREMAN_STATE_URL: the
+# delivery queue, the in-flight counters and the per-task write locks live in
+# the shared store. The baseline ships one replica; scale up freely — the
+# strategy is RollingUpdate because a second instance no longer double-claims.
+#
+# Job pods reach Foreman through this Service (the deployment never points a
+# Job at a specific replica).
 # Environment: every key with its deployment default spelled out, except
 # MULTICA_SERVER_URL / MULTICA_WORKSPACE_ID (deployment values) and the two
 # secret keys. FOREMAN_JOB_IMAGE is a full movable image reference (ADR-012);
@@ -20,7 +27,10 @@ metadata:
 spec:
   replicas: 1
   strategy:
-    type: Recreate
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: foreman
@@ -215,6 +225,26 @@ spec:
             # window. Default 48h.
             - name: FOREMAN_STATE_ENTRY_TTL
               value: "48h"
+            # Shared-state outage grace: in-flight requests keep adjudicating
+            # from the local positive cache for this long; past it every
+            # non-terminal request fails closed (401/503, §10 共享状态不可用).
+            - name: FOREMAN_STATE_GRACE
+              value: "30s"
+            # Control-plane lease: the holder owns registration, heartbeat,
+            # subscription, claim and convergence; a dead holder is replaced
+            # after this lease plus the takeover window (§10 控制面接管有界).
+            - name: FOREMAN_LEADER_LEASE_TTL
+              value: "10s"
+            - name: FOREMAN_LEADER_TAKEOVER_WINDOW
+              value: "2s"
+            # Liveness row of one replica; the shutdown path deregisters only
+            # when this replica is the last live one (§4.6 优雅关闭).
+            - name: FOREMAN_INSTANCE_TTL
+              value: "30s"
+            # Per-task write lock lease: bounds a dead holder's lock. Must
+            # cover the claim chain (including the Job-name wait).
+            - name: FOREMAN_TASK_LOCK_TTL
+              value: "120s"
           livenessProbe:
             httpGet:
               path: /foreman/healthz
