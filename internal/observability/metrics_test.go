@@ -145,7 +145,7 @@ func TestMetricsIsolatedRegistries(t *testing.T) {
 
 // TestPolicyAndRefreshSeries records the four §9.2 families this change and
 // the profile/workspace work expose: the policy hit counter keeps axis and
-// source apart, the resolution counter keeps the four conclusions apart, and
+// source apart, the resolution counter keeps the six conclusions apart, and
 // the two refresh counters keep their result vocabularies.
 func TestPolicyAndRefreshSeries(t *testing.T) {
 	m := NewMetrics()
@@ -154,6 +154,8 @@ func TestPolicyAndRefreshSeries(t *testing.T) {
 	m.PolicyHit("node_selector", "no_identity")
 	m.PolicyNameResolution("resolved")
 	m.PolicyNameResolution("unavailable")
+	m.PolicyNameResolution("conflict")
+	m.PolicyNameResolution("unseeded")
 	m.RuntimeProfileRefresh("unchanged")
 	m.RuntimeProfileRefresh("failed")
 	m.WorkspaceStateRefresh("stale_replay")
@@ -167,6 +169,9 @@ func TestPolicyAndRefreshSeries(t *testing.T) {
 		`foreman_policy_name_resolutions_total{conclusion="resolved"} 1`,
 		`foreman_policy_name_resolutions_total{conclusion="unavailable"} 1`,
 		`foreman_policy_name_resolutions_total{conclusion="absent"} 0`,
+		`foreman_policy_name_resolutions_total{conclusion="ambiguous"} 0`,
+		`foreman_policy_name_resolutions_total{conclusion="conflict"} 1`,
+		`foreman_policy_name_resolutions_total{conclusion="unseeded"} 1`,
 		`foreman_runtime_profile_refreshes_total{result="unchanged"} 1`,
 		`foreman_runtime_profile_refreshes_total{result="failed"} 1`,
 		`foreman_runtime_profile_refreshes_total{result="success"} 0`,

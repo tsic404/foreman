@@ -6,9 +6,33 @@ import (
 	"fmt"
 	"log/slog"
 
+	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/proxy"
 	"github.com/tsic404/foreman/internal/workspace"
 )
+
+// policyWorkspaceRefs is the partition-key resolution set for the policy
+// gate: one ref per workspace with the display name the startup already knows
+// (user-scoped form = the discovery answer; workspace-scoped form = the C-17
+// self-check answer). A workspace-scoped client whose C-17 never seeded the
+// name (transient failure, already warned) contributes id only — its name
+// keys must not read as absent and refuse startup (§1.1, AC-86). No upstream
+// call: the set is whatever the startup already knows.
+func policyWorkspaceRefs(set *proxy.ClientSet, workspaces workspace.Set) []jobbuilder.WorkspaceRef {
+	refs := make([]jobbuilder.WorkspaceRef, 0, workspaces.Len())
+	for _, identity := range workspaces.All() {
+		c, ok := set.For(identity.WorkspaceID)
+		if !ok {
+			continue
+		}
+		ref := jobbuilder.WorkspaceRef{ID: c.WorkspaceID()}
+		if name, seeded := c.WorkspaceName(); seeded {
+			ref.Name = name
+		}
+		refs = append(refs, ref)
+	}
+	return refs
+}
 
 // discoverUserScope resolves the user-scoped credential form into its
 // workspace set (ADR-049 decision 1): C-17 once, the manifest rule applied,

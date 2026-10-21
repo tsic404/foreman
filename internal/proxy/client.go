@@ -172,6 +172,16 @@ func (c *Client) Workspace() (id, name string) {
 	return c.cfg.WorkspaceID, c.workspace
 }
 
+// WorkspaceName returns the display name cached by C17 and whether it was
+// actually seeded. An unseeded name means the authority has not answered yet
+// (a transient C-17 failure in the workspace-scoped form) — never a fact about
+// the workspace, so callers must not treat "" as the name.
+func (c *Client) WorkspaceName() (name string, seeded bool) {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.workspace, c.workspace != ""
+}
+
 // ---- C1 register (runtime.go) ----
 
 // registerRequest is the C1 body (§1.2; field names strict, type not

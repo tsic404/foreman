@@ -263,6 +263,21 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// Startup credential checks run before the policy gate: C-18 snapshots,
+	// and the workspace-scoped form's C-17 exact-set self-check, which also
+	// seeds each workspace's display name. The policy's partition keys
+	// resolve against that startup result, so the checks must land first
+	// (§8.5 分区键的启动期解析). Only a configuration error refuses startup;
+	// a transient upstream failure warns and the loops converge (§1.1, §1.5,
+	// AC-86). The signal context is created later, so the checks run on a
+	// background context — the default signal handling still terminates a
+	// start-up process.
+	if err := runStartupSelfCheck(context.Background(), deployment.Scope, clientSet.All(), log); err != nil {
+		return err
+	}
+
+	jbCfg.Workspaces = policyWorkspaceRefs(clientSet, workspaces)
+
 	// The legacy single client handle stays for the router seams that only
 	// need the shared server URL (passthrough, ops); every workspace-scoped
 	// call goes through clientSet.
@@ -430,13 +445,9 @@ func run() error {
 	// declares. 404 (old server) and failure are not fatal: S-3 answers 404 or
 	// 503, and the probe continues with the builtin runtime.
 	//
-	// Startup credential checks: C-18 snapshots, and the workspace-scoped
-	// form's C-17 exact-set self-check. Only configuration errors refuse
-	// startup; a transient upstream failure warns and the loops converge
-	// (§1.1, §1.5, AC-86).
-	if err := runStartupSelfCheck(ctx, deployment.Scope, clientSet.All(), log); err != nil {
-		return err
-	}
+	// Startup credential checks already ran before the policy gate (they seed
+	// the display names the partition-key resolution reads), so the probe is
+	// the next startup step.
 
 	discoveries, err := sched.RunStartupProbe(ctx)
 	if err != nil {
@@ -492,6 +503,14 @@ func run() error {
 	// workspaces never entered the discovery set, so they are reported at
 	// discovery time, not here.
 	proxy.LogServingEvent(log, servedRefs, unregisteredRefs)
+	// Policy partitions outside the effective service scope are dead
+	// configuration: no Job reads them, and they warn without refusing
+	// startup (§8.5, AC-44/AC-98).
+	servedIDs := make([]string, 0, len(servedRefs))
+	for _, ref := range servedRefs {
+		servedIDs = append(servedIDs, ref.ID)
+	}
+	builder.WarnDeadPartitions(servedIDs)
 
 	// §4.3: rebuild the index before any loop that can create a Job or
 	// converge an entry. The claim loop creates Jobs; a rebuild running
