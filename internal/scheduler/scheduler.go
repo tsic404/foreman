@@ -468,9 +468,12 @@ func (s *Scheduler) ClaimBudget() int {
 
 // ClaimBudgetFor is one workspace identity's claim budget (§10 两级预算):
 // the smaller of the global free slots and that workspace's own free slots.
-// A cap of zero leaves the workspace term out (the global cap alone applies).
-// The budget never subtracts another workspace's load from this one: a
-// workspace's flood cannot stop another's claims.
+// The global term counts every workspace's in-flight jobs, so flood isolation
+// holds only when the per-workspace term is active (cap > 0) and its cap is
+// below the global cap. A cap of zero drops the workspace term: the global
+// cap is then the only constraint and one flood can exhaust every other
+// budget. Sizing the caps to sum below the global cap is deployment advice,
+// not a precondition: it keeps a third workspace from starving.
 func (s *Scheduler) ClaimBudgetFor(workspaceID string) int {
 	if s.shared != nil {
 		if s.leaderHeld != nil && !s.leaderHeld() {

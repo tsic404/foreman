@@ -1,6 +1,7 @@
 // TC-tech-multiws-05 implements AC-85: the in-flight budget has two levels —
-// the global cap and each workspace's own cap — and one workspace's flood
-// never stops another workspace's claim.
+// the global cap and each workspace's own cap. With the per-workspace cap
+// active and below the global cap, one workspace's flood never stops another
+// workspace's claim.
 package acceptance
 
 import (
