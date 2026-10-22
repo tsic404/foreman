@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"log/slog"
 	"strings"
 	"sync"
 	"testing"
@@ -208,6 +209,168 @@ func TestPendingCarrierCarriesTheFailureAttribution(t *testing.T) {
 	}
 	if len(sender.sent) != 1 || sender.sent[0] != "task-1:fail:"+string(body) {
 		t.Fatalf("replayed = %v, want the carrier's body", sender.sent)
+	}
+}
+
+// TestPendingCarrierHoldsTaskIDsTheFileGrammarRejects: the node-local queue
+// names its files after the task id, the carrier names its object after a hash
+// and rides the id on a label. A "." or "_" id is a legal label value, so its
+// report must keep the cross-process face instead of losing it silently
+// (§3, §6.5, §10).
+func TestPendingCarrierHoldsTaskIDsTheFileGrammarRejects(t *testing.T) {
+	store := newMemCarrierStore()
+	p, err := NewPendingReports(t.TempDir(), WithPendingReportsCarrier(store))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	restoreForServe(t, p)
+	body := []byte(`{"failure_reason":"invalid_task_id"}`)
+	ids := []string{"task.a", "task_a"}
+	for _, taskID := range ids {
+		if err := p.Enqueue(context.Background(), taskID, "", "", "", EPFail, body, FailureReasonInvalidTaskID); err != nil {
+			t.Fatalf("Enqueue(%q): %v", taskID, err)
+		}
+		if got := store.carriers[taskID].TaskID; got != taskID {
+			t.Fatalf("carrier(%q) task id = %q, want the raw id on the label face", taskID, got)
+		}
+	}
+	if p.Len() != len(ids) {
+		t.Fatalf("Len = %d, want one carrier-backed entry per report", p.Len())
+	}
+
+	// A restart keeps only the cluster: the rebuilt queue holds both reports
+	// and replays the bodies they were enqueued with.
+	restarted, err := NewPendingReports(t.TempDir(), WithPendingReportsCarrier(store))
+	if err != nil {
+		t.Fatalf("NewPendingReports(restarted): %v", err)
+	}
+	restoreForServe(t, restarted)
+	if got := restarted.Len(); got != len(ids) {
+		t.Fatalf("rebuilt depth = %d, want %d (the carrier entries)", got, len(ids))
+	}
+	sender := &fakeSender{code: 200}
+	if remaining, err := restarted.Drain(context.Background(), sender); err != nil || remaining != 0 {
+		t.Fatalf("Drain = %d, %v, want the replayed reports settled", remaining, err)
+	}
+	if len(sender.sent) != len(ids) {
+		t.Fatalf("replayed = %v, want one replay per report", sender.sent)
+	}
+	for _, taskID := range ids {
+		want := taskID + ":fail:" + string(body)
+		found := false
+		for _, sent := range sender.sent {
+			if sent == want {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("replayed = %v, want %q", sender.sent, want)
+		}
+	}
+	if store.count() != 0 {
+		t.Fatalf("carriers after the replays = %d, want 0", store.count())
+	}
+}
+
+// TestPendingCarrierRetriesTaskIDsTheFileGrammarRejects: such a report has no
+// node-local file, so its carrier write is the only durability face it can get
+// — a failed write must be retried by the drain, not abandoned.
+func TestPendingCarrierRetriesTaskIDsTheFileGrammarRejects(t *testing.T) {
+	store := newMemCarrierStore()
+	store.putErr = errors.New("apiserver unavailable")
+	p, err := NewPendingReports(t.TempDir(), WithPendingReportsCarrier(store))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	restoreForServe(t, p)
+	if err := p.Enqueue(context.Background(), "task.a", "", "", "", EPFail, []byte(`{}`), ""); err == nil {
+		t.Fatal("Enqueue: want the carrier write error surfaced")
+	}
+
+	store.putErr = nil
+	sender := &fakeSender{code: 503}
+	if _, err := p.Drain(context.Background(), sender); err == nil {
+		t.Fatal("Drain: want the undelivered report surfaced")
+	}
+	if store.count() != 1 {
+		t.Fatalf("carriers after the retry = %d, want 1", store.count())
+	}
+	if !p.Queued("task.a") {
+		t.Fatal("the retried report must read as queued")
+	}
+}
+
+// TestPendingCarrierTaskIDOutsideLabelGrammarIsVisible: an id the carrier's
+// task-id label cannot hold has no cross-process face at all. That is an error
+// event and a returned error — the alarm face (§10, ADR-046 decision 2) — and
+// the report stays in process memory for its delivery; it is never dropped
+// silently.
+func TestPendingCarrierTaskIDOutsideLabelGrammarIsVisible(t *testing.T) {
+	cases := []struct{ name, taskID string }{
+		{name: "path separator", taskID: "../escape"},
+		{name: "beyond the label length", taskID: strings.Repeat("a", 64)},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			store := newMemCarrierStore()
+			var logs bytes.Buffer
+			p, err := NewPendingReports(t.TempDir(),
+				WithPendingReportsCarrier(store),
+				WithPendingReportsLogger(slog.New(slog.NewJSONHandler(&logs, nil))))
+			if err != nil {
+				t.Fatalf("NewPendingReports: %v", err)
+			}
+			restoreForServe(t, p)
+			err = p.Enqueue(context.Background(), tc.taskID, "", "", "ws-1", EPFail, []byte(`{}`), "")
+			if !errors.Is(err, ErrCarrierTaskIDInvalid) {
+				t.Fatalf("Enqueue = %v, want ErrCarrierTaskIDInvalid", err)
+			}
+			if store.count() != 0 {
+				t.Fatalf("carriers = %d, want none: the label cannot hold the id", store.count())
+			}
+			if !bytes.Contains(logs.Bytes(), []byte(`"reason":"pending-report carrier cannot carry the task id"`)) {
+				t.Fatalf("no undelivered event for the unpersistable task id:\n%s", logs.String())
+			}
+			if !bytes.Contains(logs.Bytes(), []byte(`"workspace_id":"ws-1"`)) {
+				t.Fatalf("the undelivered event misses the workspace (contract §9.1):\n%s", logs.String())
+			}
+
+			// The report is still delivered from process memory.
+			sender := &fakeSender{code: 200}
+			if remaining, err := p.Drain(context.Background(), sender); err != nil || remaining != 0 {
+				t.Fatalf("Drain = %d, %v, want the staged report delivered", remaining, err)
+			}
+			if len(sender.sent) != 1 || sender.sent[0] != tc.taskID+":fail:{}" {
+				t.Fatalf("sent = %v, want the report delivered from memory", sender.sent)
+			}
+		})
+	}
+}
+
+// TestSecretCarrierStoreCarriesTaskIDsTheFileGrammarRejects pins the label
+// face the rebuild and the sweep read: the raw task id rides the task-id label,
+// never the hashed object name.
+func TestSecretCarrierStoreCarriesTaskIDsTheFileGrammarRejects(t *testing.T) {
+	jobs := &fakeJobs{existingJobs: map[string]*batchv1.Job{}}
+	store := NewSecretCarrierStore(jobs)
+	if err := store.PutCarrier(context.Background(), Carrier{
+		TaskID: "task.1_a", Endpoint: string(EPFail), Body: []byte(`{}`),
+	}); err != nil {
+		t.Fatalf("PutCarrier: %v", err)
+	}
+	if len(jobs.createdSecrets) != 1 {
+		t.Fatalf("created secrets = %d, want 1", len(jobs.createdSecrets))
+	}
+	if got := jobs.createdSecrets[0].Labels[registry.LabelTaskID]; got != "task.1_a" {
+		t.Fatalf("task-id label = %q, want the raw id", got)
+	}
+
+	err := store.PutCarrier(context.Background(), Carrier{TaskID: "../escape", Endpoint: string(EPFail)})
+	if !errors.Is(err, ErrCarrierTaskIDInvalid) {
+		t.Fatalf("PutCarrier = %v, want ErrCarrierTaskIDInvalid", err)
+	}
+	if len(jobs.createdSecrets) != 1 {
+		t.Fatalf("created secrets = %d, want the invalid id refused before the write", len(jobs.createdSecrets))
 	}
 }
 

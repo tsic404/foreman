@@ -29,7 +29,8 @@ func capturePendingLogs(t *testing.T) *syncBuffer {
 }
 
 // assertUndeliveredEvent fails unless the queue reported one undelivered
-// report for the task under the given reason.
+// report for the task under the given reason, with the workspace the task
+// belongs to (contract §9.1: task-face rows carry the workspace).
 func assertUndeliveredEvent(t *testing.T, logs *syncBuffer, taskID, reason string) {
 	t.Helper()
 	for _, line := range bytes.Split(logs.Bytes(), []byte("\n")) {
@@ -39,6 +40,9 @@ func assertUndeliveredEvent(t *testing.T, logs *syncBuffer, taskID, reason strin
 		}
 		if fields["msg"] == "task.forward_undelivered" &&
 			fields["task_id"] == taskID && fields["reason"] == reason {
+			if fields["workspace_id"] != "ws-1" {
+				t.Fatalf("task.forward_undelivered workspace_id = %v, want ws-1: %v", fields["workspace_id"], fields)
+			}
 			return
 		}
 	}

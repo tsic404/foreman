@@ -106,13 +106,14 @@ type PendingReports struct {
 	// decision 6); Enqueue refuses a new entry once the queue holds this many.
 	maxEntries int
 
-	// staged holds the reports that are not durable yet: a write that failed
-	// (待发队列目录不可写：记 error + gauge 不
-	// 增长；退避后重试」) or a task id that can never name a queue file. It is
-	// the retry handle of that error row: every Drain retries the write,
-	// Queued counts the report as undelivered, and the gauge stays at the
-	// durable depth. A crash inside the window loses the report — the disk
-	// cannot take it either way.
+	// staged holds the reports the disk has not taken yet. A failed disk write
+	// (待发队列目录不可写：记 error + gauge 不增长；退避后重试) is retried as a
+	// disk write on every Drain; a crash loses it only if neither face landed.
+	// A task id that cannot name a queue file has its carrier as the only
+	// durability face: Drain retries that carrier write, and a landed carrier
+	// keeps the report across processes. Queued answers a failed disk write as
+	// undelivered while it stays staged; an id that cannot name a queue file
+	// only once its carrier landed. The gauge stays at the durable depth.
 	staged map[string]pendingReport
 
 	// quarantineTried remembers malformed file names whose isolation was
@@ -205,7 +206,8 @@ func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReport
 // dropping it: Drain retries the write (错误处理表「退避后重试」) and Queued
 // reports it as undelivered, so the task's objects stay until it landed. The
 // returned error is that error row's "记 error" half — never a reason to
-// discard the report.
+// discard the report. It names a lost durability face, so a task id the disk
+// cannot name is only an error when no carrier can hold it either.
 //
 // The retention bound (§4.6, ADR-046 decision 6) acts here, on new entries
 // only: once the queue holds maxEntries reports, one for a task it does not
@@ -265,9 +267,13 @@ func (p *PendingReports) Enqueue(ctx context.Context, taskID, jobName, daemonID,
 	var diskErr error
 	if !validTaskID(taskID) {
 		// The id can never name a queue file: keep the report staged so the
-		// drain delivers it straight from memory instead of losing it.
+		// drain delivers it straight from memory instead of losing it. Its
+		// carrier is the only durability face left; without one, the file
+		// name is the loss face and the caller sees it.
 		p.staged[taskID] = rep
-		diskErr = fmt.Errorf("task id %q is not a safe file name", taskID)
+		if p.carriers == nil {
+			diskErr = fmt.Errorf("task id %q is not a safe file name", taskID)
+		}
 	} else if err := p.writeLocked(rep); err != nil {
 		diskErr = err
 		p.staged[taskID] = rep
@@ -295,9 +301,24 @@ func (p *PendingReports) Enqueue(ctx context.Context, taskID, jobName, daemonID,
 // persistCarrier lands one report on its cluster carrier. A report that
 // settles while the write is in flight leaves an orphan carrier behind — the
 // post-write check deletes it instead of resurrecting a settled entry.
+//
+// The gate is the carrier's own identity, not the queue file's: a task id the
+// file-name grammar rejects ("." or "_" in it) is a legal label value and keeps
+// its cross-process face. An id the label grammar cannot carry has no carrier
+// — that is an error face and the entry stays in process memory for retry
+// (§10, ADR-046 decision 2), never a silent skip.
 func (p *PendingReports) persistCarrier(ctx context.Context, rep pendingReport) error {
-	if p.carriers == nil || !validTaskID(rep.TaskID) {
+	if p.carriers == nil {
 		return nil
+	}
+	if !carrierTaskIDValid(rep.TaskID) {
+		err := fmt.Errorf("%w: %q", ErrCarrierTaskIDInvalid, rep.TaskID)
+		p.log.Error("task.forward_undelivered",
+			"task_id", rep.TaskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
+			"workspace_id", rep.WorkspaceID,
+			"endpoint", rep.Endpoint,
+			"reason", "pending-report carrier cannot carry the task id", "err", err)
+		return err
 	}
 	carrier := Carrier{
 		TaskID:        rep.TaskID,
@@ -321,6 +342,7 @@ func (p *PendingReports) persistCarrier(ctx context.Context, rep pendingReport) 
 		// error face reports the loss on process exit (ADR-046 decision 6).
 		p.log.Error("task.forward_undelivered",
 			"task_id", rep.TaskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
+			"workspace_id", rep.WorkspaceID,
 			"endpoint", rep.Endpoint,
 			"reason", "pending report exceeds the carrier object bound", "err", err)
 		return err
@@ -328,13 +350,14 @@ func (p *PendingReports) persistCarrier(ctx context.Context, rep pendingReport) 
 	if err != nil {
 		p.log.Error("task.forward_undelivered",
 			"task_id", rep.TaskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
+			"workspace_id", rep.WorkspaceID,
 			"endpoint", rep.Endpoint,
 			"reason", "pending-report carrier write failed", "err", err)
 		return err
 	}
 
 	p.mu.Lock()
-	if !p.queuedKnownLocked(rep.TaskID) {
+	if !p.entryPresentLocked(rep.TaskID) {
 		// The direct forward settled the report while the carrier write was
 		// in flight: the carrier must not outlive the queue entry.
 		p.mu.Unlock()
@@ -376,9 +399,10 @@ func (p *PendingReports) inheritClockLocked(rep *pendingReport) {
 // undelivered: the disk entries, the carrier-backed ones, and the ones a
 // failed write left staged.
 //
-// A report whose task id cannot name a queue file is delivered straight from
-// staging: it can never become durable, and dropping it would lose a
-// terminal callback (contract §10).
+// A report whose task id cannot name a queue file has the carrier as its only
+// durability face: a landed carrier keeps it across processes, and only one
+// that cannot land is delivered straight from staging — dropping it would
+// lose a terminal callback (contract §10).
 //
 // The lock is never held across the network: the queue is snapshotted,
 // forwarded, and settled entry-by-entry, so a slow upstream cannot block
@@ -492,7 +516,9 @@ func (p *PendingReports) unbackedLocked() []pendingReport {
 		if _, ok := seen[taskID]; ok {
 			continue
 		}
-		if validTaskID(taskID) && !p.carrierBacked[taskID] {
+		if !p.carrierBacked[taskID] {
+			// A staged report whose id cannot name a queue file still has
+			// the carrier face — that is the only durability it can get.
 			out = append(out, rep)
 		}
 	}
@@ -685,7 +711,10 @@ func (p *PendingReports) dropLocked(taskID string) {
 }
 
 // queuedKnownLocked answers Queued from the entries the process actually
-// holds: the carrier-backed ids, the disk files and the staging area.
+// holds: the carrier-backed ids, the disk files, and the staged reports the
+// disk can still take. A staged report whose id can never name a queue file is
+// not a durable entry — only its carrier can make it one, and that face is
+// answered first.
 func (p *PendingReports) queuedKnownLocked(taskID string) bool {
 	if p.carrierBacked[taskID] {
 		return true
@@ -765,8 +794,8 @@ func (p *PendingReports) Len() int {
 // deciding whether to write, not whether to settle.
 //
 // A task id that cannot name a queue file is answered without touching the
-// filesystem: such a report is never a durable queue entry (Drain delivers
-// it straight from staging), so it gates no objects either.
+// filesystem: the node-local copy cannot hold it, so only its carrier makes it
+// a durable entry — and a carrier-backed report answers true above.
 func (p *PendingReports) Queued(taskID string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
