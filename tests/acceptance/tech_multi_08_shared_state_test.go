@@ -193,6 +193,10 @@ func TestMulti08SettledRecordSurvivesRestart(t *testing.T) {
 	if !ok {
 		t.Fatal("the first process writes no settled record")
 	}
+	// §4.3: the retention window holds the terminal projection only. The
+	// projection comparison below cannot see these faces (json:"-"), so
+	// assert them on the record itself.
+	multi08AssertProjectionOnly(t, "before restart", beforeSettled)
 
 	// Reclaim the credential on the first process (revoke → delete Secret →
 	// drop the entry): the live row is gone, the settled record stays in the
@@ -206,6 +210,18 @@ func TestMulti08SettledRecordSurvivesRestart(t *testing.T) {
 	}
 	multi08Flush(t, h)
 
+	// The retention window's own row, read straight from the shared store
+	// (GetSettled strips nothing): the restart path strips on read, so only
+	// this read judges what the done key actually holds (§4.3).
+	row, ok, err := store.GetSettled(t.Context(), beforeSettled.WorkspaceID, "task-1")
+	if err != nil {
+		t.Fatalf("GetSettled: %v", err)
+	}
+	if !ok {
+		t.Fatal("the retention window holds no settled row after the reclaim")
+	}
+	multi08AssertProjectionOnly(t, "shared settled row", row)
+
 	// Restart: the settled record must restore the post-reclaim answer, and
 	// its projection must match field by field (AC-73's 终态记录逐字段一致).
 	h2 := newHarnessWithSharedState(t, false, store)
@@ -216,6 +232,7 @@ func TestMulti08SettledRecordSurvivesRestart(t *testing.T) {
 	if !ok {
 		t.Fatal("settled record lost across restart")
 	}
+	multi08AssertProjectionOnly(t, "after restart", settled)
 	wantJSON := multi08ProjectionJSON(t, beforeSettled)
 	gotJSON := multi08ProjectionJSON(t, settled)
 	for key, want := range wantJSON {
@@ -400,6 +417,23 @@ func TestMulti08StoreLossFallsBackToK8sRebuild(t *testing.T) {
 	}
 	if got := len(h.jobs.createdJobs); got != jobsBefore {
 		t.Errorf("the rebuild created %d extra Jobs, want none", got-jobsBefore)
+	}
+}
+
+// multi08AssertProjectionOnly asserts a settled record retains none of the
+// non-projected faces: the retention window must never hold a delivery body,
+// a token digest or a decided terminal body (§4.3). The projection (json:"-"
+// on these fields) cannot express the boundary, so it is asserted directly.
+func multi08AssertProjectionOnly(t *testing.T, label string, e registry.TaskEntry) {
+	t.Helper()
+	if e.Payload != nil {
+		t.Errorf("%s: settled record retains a delivery body (%d bytes)", label, len(e.Payload))
+	}
+	if e.TokenHash != "" {
+		t.Errorf("%s: settled record retains a token digest %q", label, e.TokenHash)
+	}
+	if e.DecidedReport != nil {
+		t.Errorf("%s: settled record retains a decided terminal body (%d bytes)", label, len(e.DecidedReport))
 	}
 }
 
