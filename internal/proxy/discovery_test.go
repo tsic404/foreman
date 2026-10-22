@@ -33,6 +33,26 @@ func newC17Stub(t *testing.T, status int, body string) *httptest.Server {
 	return srv
 }
 
+// An entry without an id is skipped and the drop is logged: silently
+// shrinking the discovery set would hide an upstream defect.
+func TestListWorkspacesLogsSkippedEntries(t *testing.T) {
+	srv := newC17Stub(t, http.StatusOK, `[{"id":"","name":"broken"},{"id":"ws-a","name":"A"}]`)
+	var logs bytes.Buffer
+	c := NewClient(Config{ServerURL: srv.URL, Version: "0.1.0"}, "mul_user",
+		WithLogger(slog.New(slog.NewJSONHandler(&logs, &slog.HandlerOptions{Level: slog.LevelDebug}))))
+
+	list, err := c.ListWorkspaces(t.Context())
+	if err != nil {
+		t.Fatalf("ListWorkspaces: %v", err)
+	}
+	if len(list) != 1 || list[0].ID != "ws-a" {
+		t.Fatalf("list = %v, want only the well-formed entry", list)
+	}
+	if !strings.Contains(logs.String(), "workspace.discovery_entry_skipped") {
+		t.Fatalf("logs = %s, want the skipped entry recorded", logs.String())
+	}
+}
+
 func TestListWorkspaces(t *testing.T) {
 	srv := newC17Stub(t, http.StatusOK, `[{"id":"ws-a","name":"A"},{"id":"ws-b","name":"B"}]`)
 	c := NewClient(Config{ServerURL: srv.URL, Version: "0.1.0"}, "mul_user")

@@ -258,8 +258,8 @@ func TestReclaimGatesTheJobDeletionOnTheQueuedReport(t *testing.T) {
 	if _, ok := f.reg.Get("task-1"); ok {
 		t.Fatal("the credential reclaim must not wait for the report")
 	}
-	if len(f.revoker.revoked) != 1 || len(f.jobs.deletedSecrets) != 1 {
-		t.Fatalf("revoked=%v secrets=%v, want the credential reclaimed", f.revoker.revoked, f.jobs.deletedSecrets)
+	if len(f.revoker.digests()) != 1 || len(f.jobs.deletedSecrets) != 1 {
+		t.Fatalf("revoked=%v secrets=%v, want the credential reclaimed", f.revoker.digests(), f.jobs.deletedSecrets)
 	}
 
 	// The report landed: the next reclaim catch-up deletes the Job (idempotent
@@ -298,8 +298,8 @@ func TestReclaimWithoutDigestIsVisible(t *testing.T) {
 		t.Fatalf("OnJobTerminated: %v", err)
 	}
 	decodeLogEvent(t, &logs, "cred.revoke_unavailable")
-	if len(f.revoker.revoked) != 0 {
-		t.Fatalf("revoked = %v, want none without a digest", f.revoker.revoked)
+	if len(f.revoker.digests()) != 0 {
+		t.Fatalf("revoked = %v, want none without a digest", f.revoker.digests())
 	}
 }
 
@@ -395,6 +395,24 @@ func TestSweepSecretDomainsKeepCarriersOutOfTheCredentialCriterion(t *testing.T)
 		if f.jobs.deletedSecrets[i] != name {
 			t.Fatalf("deleted secrets = %v, want %v", f.jobs.deletedSecrets, want)
 		}
+	}
+}
+
+// A failed orphan delete is retried next round and logged per object: the
+// round's aggregate error alone does not say which Secret survived.
+func TestSweepOrphanSecretsLogsAFailedDelete(t *testing.T) {
+	f := newFixture(t)
+	var logs bytes.Buffer
+	f.sched.log = slog.New(slog.NewJSONHandler(&logs, nil))
+	f.jobs.secrets = []corev1.Secret{secretObject("fm-task-orphan-cred", "task-orphan")}
+	f.jobs.deleteSecretErr = errors.New("apiserver unavailable")
+
+	if err := f.sched.SweepOrphanSecrets(context.Background()); err == nil {
+		t.Fatal("SweepOrphanSecrets: want the delete error surfaced")
+	}
+	event := decodeLogEvent(t, &logs, "cred.orphan_secret_delete_failed")
+	if event["task_id"] != "task-orphan" || event["secret"] != "fm-task-orphan-cred" {
+		t.Fatalf("event = %v, want the surviving Secret's identity", event)
 	}
 }
 

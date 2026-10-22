@@ -122,7 +122,14 @@ func LoadDeployment(getenv func(string) string) (Deployment, error) {
 		return Deployment{}, err
 	}
 	raw := strings.TrimSpace(getenv(EnvWorkspaces))
+	// listVar names the key the identity list actually came from: a message
+	// that always says FOREMAN_WORKSPACES sends the operator to the wrong
+	// place when the list is file-borne.
+	listVar := EnvWorkspaces
 	path := strings.TrimSpace(getenv(EnvWorkspacesFile))
+	if path != "" {
+		listVar = EnvWorkspacesFile
+	}
 	switch {
 	case raw != "" && path != "":
 		return Deployment{}, fmt.Errorf("%s and %s are mutually exclusive", EnvWorkspaces, EnvWorkspacesFile)
@@ -130,7 +137,7 @@ func LoadDeployment(getenv func(string) string) (Deployment, error) {
 		// ADR-049 decision 1: the workspace-scoped credential form accepts no
 		// manifest — the configured pairs are the discovery set.
 		return Deployment{}, fmt.Errorf("%s is not accepted with %s: the workspace-scoped credential form derives its set from its own pairs",
-			EnvWorkspacesManifest, EnvWorkspaces)
+			EnvWorkspacesManifest, listVar)
 	case path != "":
 		file, err := os.ReadFile(path)
 		if err != nil {
@@ -142,7 +149,7 @@ func LoadDeployment(getenv func(string) string) (Deployment, error) {
 	}
 	var identities []Identity
 	if err := json.Unmarshal([]byte(raw), &identities); err != nil {
-		return Deployment{}, fmt.Errorf("%s is not a JSON identity list: %w", EnvWorkspaces, err)
+		return Deployment{}, fmt.Errorf("%s is not a JSON identity list: %w", listVar, err)
 	}
 	set, err := newSet(identities, getenv)
 	if err != nil {

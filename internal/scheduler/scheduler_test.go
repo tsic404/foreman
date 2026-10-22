@@ -442,10 +442,23 @@ func (f *fakeMetrics) CredReclaimed(reason string, drainSeconds float64) {
 
 // fakeRevoker records the digests the credential reclaim revokes.
 type fakeRevoker struct {
+	mu      sync.Mutex
 	revoked []string
 }
 
-func (f *fakeRevoker) Revoke(tokenHash, workspaceID string) { f.revoked = append(f.revoked, tokenHash) }
+func (f *fakeRevoker) Revoke(tokenHash, workspaceID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.revoked = append(f.revoked, tokenHash)
+}
+
+// digests returns the recorded digests: the reclaim may run on a loop
+// goroutine, so tests read through the lock like every other fixture face.
+func (f *fakeRevoker) digests() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.revoked...)
+}
 
 // ---- helpers ----
 
@@ -890,8 +903,8 @@ func TestDuplicateClaimKeepsStartedEntry(t *testing.T) {
 	if len(f.jobs.deletedJobs) != 0 {
 		t.Fatalf("deletedJobs = %v, want none for a started entry", f.jobs.deletedJobs)
 	}
-	if len(f.revoker.revoked) != 0 {
-		t.Fatalf("revoked = %v, want no revocation for a started entry", f.revoker.revoked)
+	if len(f.revoker.digests()) != 0 {
+		t.Fatalf("revoked = %v, want no revocation for a started entry", f.revoker.digests())
 	}
 	e, ok := f.reg.Get("task-1")
 	if !ok || e.StartedAt.IsZero() || e.State != registry.StateRunning ||
@@ -949,8 +962,8 @@ func TestDuplicateClaimTaskGoneSettlesVanished(t *testing.T) {
 			if len(f.server.forwards) != 0 {
 				t.Fatalf("forwards = %v, want none for a vanished task", f.server.forwards)
 			}
-			if len(f.revoker.revoked) != 0 {
-				t.Fatalf("revoked = %v, want the credential kept until the Job terminates", f.revoker.revoked)
+			if len(f.revoker.digests()) != 0 {
+				t.Fatalf("revoked = %v, want the credential kept until the Job terminates", f.revoker.digests())
 			}
 		})
 	}

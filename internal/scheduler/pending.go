@@ -249,12 +249,15 @@ func (p *PendingReports) Enqueue(ctx context.Context, taskID, jobName, daemonID,
 		}
 	}
 	rep := pendingReport{
-		TaskID:        taskID,
-		JobName:       jobName,
-		DaemonID:      daemonID,
-		WorkspaceID:   workspaceID,
-		Endpoint:      string(ep),
-		Body:          body,
+		TaskID:      taskID,
+		JobName:     jobName,
+		DaemonID:    daemonID,
+		WorkspaceID: workspaceID,
+		Endpoint:    string(ep),
+		// The caller's buffer is not retained: a queued report outlives the
+		// request that carried it (staged, then replayed), so a buffer the
+		// caller reuses must not rewrite a queued body.
+		Body:          json.RawMessage(bytes.Clone(body)),
 		EnqueuedAt:    p.now(),
 		FailureReason: failureReason,
 	}

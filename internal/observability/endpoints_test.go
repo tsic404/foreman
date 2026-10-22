@@ -33,6 +33,16 @@ func (f *fakeLogReader) ReadLogs(_ context.Context, namespace, jobName string, t
 	return f.data, f.err
 }
 
+// A handler mounted without a metrics registry answers the readiness face
+// with 503 instead of dereferencing nil at construction time.
+func TestOpsHandlerWithoutMetricsAnswersNotReady(t *testing.T) {
+	h := NewOpsHandler(nil, registry.New(time.Now), nil, OpsConfig{})
+	rec := do(t, h, "/metrics")
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("/metrics = %d, want 503", rec.Code)
+	}
+}
+
 func newTestHandler(reg *registry.Registry, logs PodLogReader) http.Handler {
 	return NewOpsHandler(NewMetrics(), reg, logs, OpsConfig{
 		Version:    "v0.1.0",

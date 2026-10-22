@@ -83,7 +83,9 @@ $pull_secret
   containers:
     - name: cli
       image: $JOB_IMAGE
-      imagePullPolicy: IfNotPresent
+      # Always: the judgement is about the tag's current content. A node
+      # cache would let an older image answer for a movable tag.
+      imagePullPolicy: Always
       command: ["/bin/sh", "-ec"]
       args:
         - |

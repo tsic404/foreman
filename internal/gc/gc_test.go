@@ -480,6 +480,40 @@ func TestRunOnceAgentStateTTL(t *testing.T) {
 	}
 }
 
+// A session shell this rule emptied is reaped on a later round: files are
+// judged by their own mtime, and the directory that held them must not stay
+// behind forever. The shell waits out the TTL after its last file left, so a
+// directory another process is about to write is never raced.
+func TestRunOnceReapsEmptiedSessionShell(t *testing.T) {
+	root := t.TempDir()
+	const shell = "home/.codex/multica-sessions/p_ns/agent-1/issue"
+	makeTree(t, root, map[string]string{shell + "/rollout-old.jsonl": "old"})
+	ageTree(t, root, 100*24*time.Hour)
+
+	c := newTestCollector(t, testConfig(root))
+	if _, err := c.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	// The round that reclaimed the file leaves the shell: removing the file
+	// stamped the directory with that round's clock, so it is not yet stale.
+	if !exists(filepath.Join(root, shell)) {
+		t.Fatalf("%s disappeared in the round that reclaimed its file", shell)
+	}
+
+	// Once the shell's own mtime is past the TTL, a later round reaps it. The
+	// store roots above it stay (prepare's self-heal owns them).
+	c.now = func() time.Time { return time.Now().Add(400 * time.Hour) }
+	if _, err := c.RunOnce(context.Background()); err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if exists(filepath.Join(root, shell)) {
+		t.Errorf("%s survived a round after its last file left, want the empty shell reaped", shell)
+	}
+	if !exists(filepath.Join(root, "home/.codex/multica-sessions")) {
+		t.Error("the store root was reaped, want only the emptied shell removed")
+	}
+}
+
 // A zero agent-state or agent-memory TTL turns that rule off entirely.
 func TestRunOnceAgentTTLDisabled(t *testing.T) {
 	root := t.TempDir()

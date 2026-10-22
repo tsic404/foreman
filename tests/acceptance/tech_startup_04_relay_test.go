@@ -12,6 +12,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
@@ -336,16 +337,31 @@ func TestStartup04CachedSlotAnswersTwoCommandsVerbatim(t *testing.T) {
 	}
 }
 
-// writeBuffer is a tiny io.Writer for the reporter's logger.
-type writeBuffer struct{ data []byte }
+// writeBuffer is a tiny io.Writer for the reporter's logger. The reporter and
+// the command loop can log from different goroutines, so the buffer carries
+// its own lock instead of relying on the producers' ordering.
+type writeBuffer struct {
+	mu   sync.Mutex
+	data []byte
+}
 
 func (b *writeBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.data = append(b.data, p...)
 	return len(p), nil
 }
 
-func (b *writeBuffer) Bytes() []byte { return b.data }
+func (b *writeBuffer) Bytes() []byte {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return append([]byte(nil), b.data...)
+}
 
-func (b *writeBuffer) String() string { return string(b.data) }
+func (b *writeBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return string(b.data)
+}
 
 var _ io.Writer = (*writeBuffer)(nil)

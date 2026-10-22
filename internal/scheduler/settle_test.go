@@ -78,8 +78,8 @@ func TestPreStartReplacementRevokesThePredecessorDigest(t *testing.T) {
 	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
 		t.Fatalf("OnClaim: %v", err)
 	}
-	if len(f.revoker.revoked) != 1 || f.revoker.revoked[0] != "hash-of-task-1" {
-		t.Fatalf("revoked = %v, want the predecessor's digest", f.revoker.revoked)
+	if len(f.revoker.digests()) != 1 || f.revoker.digests()[0] != "hash-of-task-1" {
+		t.Fatalf("revoked = %v, want the predecessor's digest", f.revoker.digests())
 	}
 
 	// A rebuilt entry (no digest in memory) degrades visibly instead of
@@ -89,8 +89,8 @@ func TestPreStartReplacementRevokesThePredecessorDigest(t *testing.T) {
 	if err := f.sched.DiscardTask(context.Background(), "task-2"); err != nil {
 		t.Fatalf("DiscardTask(rebuilt): %v", err)
 	}
-	if len(f.revoker.revoked) != 1 {
-		t.Fatalf("revoked = %v, want no digest for a rebuilt entry", f.revoker.revoked)
+	if len(f.revoker.digests()) != 1 {
+		t.Fatalf("revoked = %v, want no digest for a rebuilt entry", f.revoker.digests())
 	}
 }
 
@@ -114,8 +114,8 @@ func TestDiscardTaskKeepsStartedEntry(t *testing.T) {
 	if len(f.jobs.deletedJobs) != 0 {
 		t.Fatalf("deletedJobs = %v, want none for an adopted entry", f.jobs.deletedJobs)
 	}
-	if len(f.revoker.revoked) != 0 {
-		t.Fatalf("revoked = %v, want no revocation for an adopted entry", f.revoker.revoked)
+	if len(f.revoker.digests()) != 0 {
+		t.Fatalf("revoked = %v, want no revocation for an adopted entry", f.revoker.digests())
 	}
 }
 
@@ -141,8 +141,8 @@ func TestDiscardTaskKeepsAReplacementEntry(t *testing.T) {
 		t.Fatalf("deleted jobs/secrets = %v/%v, want the successor's objects kept",
 			f.jobs.deletedJobs, f.jobs.deletedSecrets)
 	}
-	if len(f.revoker.revoked) != 0 {
-		t.Fatalf("revoked = %v, want the successor's token kept", f.revoker.revoked)
+	if len(f.revoker.digests()) != 0 {
+		t.Fatalf("revoked = %v, want the successor's token kept", f.revoker.digests())
 	}
 }
 
@@ -181,9 +181,9 @@ func TestDiscardTaskAdoptsWhenC13IsPostDelivery(t *testing.T) {
 	if !ok || e.StartedAt.IsZero() {
 		t.Fatalf("entry = %+v, %v; want the adopted entry with a start fact", e, ok)
 	}
-	if len(f.jobs.deletedJobs) != 0 || len(f.revoker.revoked) != 0 {
+	if len(f.jobs.deletedJobs) != 0 || len(f.revoker.digests()) != 0 {
 		t.Fatalf("deletedJobs = %v, revoked = %v; want the Job and credential kept",
-			f.jobs.deletedJobs, f.revoker.revoked)
+			f.jobs.deletedJobs, f.revoker.digests())
 	}
 }
 
@@ -465,8 +465,8 @@ func TestOnJobTerminatedByDrainTimeoutReportsOrphans(t *testing.T) {
 	if len(f.jobs.deletedSecrets) != 1 || f.jobs.deletedSecrets[0] != "fm-task-1-cred" {
 		t.Fatalf("secret deletes = %v, want the credential Secret", f.jobs.deletedSecrets)
 	}
-	if len(f.revoker.revoked) != 1 || f.revoker.revoked[0] != "hash-of-task-1" {
-		t.Fatalf("revoked = %v, want the entry's digest", f.revoker.revoked)
+	if len(f.revoker.digests()) != 1 || f.revoker.digests()[0] != "hash-of-task-1" {
+		t.Fatalf("revoked = %v, want the entry's digest", f.revoker.digests())
 	}
 	if len(f.metrics.reclaim) != 1 || f.metrics.reclaim[0] != JobTerminationReasonDrainTimeout {
 		t.Fatalf("cred reclaim metric = %v, want [drain_timeout]", f.metrics.reclaim)
@@ -522,9 +522,9 @@ func TestOnJobTerminatedIgnoresLiveEntries(t *testing.T) {
 	if _, ok := f.reg.Get("task-1"); !ok {
 		t.Fatal("a live entry must survive a stray termination report")
 	}
-	if len(f.jobs.deletedSecrets) != 0 || len(f.revoker.revoked) != 0 {
+	if len(f.jobs.deletedSecrets) != 0 || len(f.revoker.digests()) != 0 {
 		t.Fatalf("secrets=%v revoked=%v, want no action for a live entry",
-			f.jobs.deletedSecrets, f.revoker.revoked)
+			f.jobs.deletedSecrets, f.revoker.digests())
 	}
 }
 
@@ -570,8 +570,8 @@ func TestOnJobTerminatedKeepsTheSuccessorReplacingTheEntry(t *testing.T) {
 	if len(f.jobs.deletedSecrets) != 0 {
 		t.Fatalf("secret deletes = %v, want the successor's Secret kept", f.jobs.deletedSecrets)
 	}
-	if len(f.revoker.revoked) != 0 {
-		t.Fatalf("revoked = %v, want the successor's token kept", f.revoker.revoked)
+	if len(f.revoker.digests()) != 0 {
+		t.Fatalf("revoked = %v, want the successor's token kept", f.revoker.digests())
 	}
 	if len(f.metrics.reclaim) != 0 {
 		t.Fatalf("cred reclaim metric = %v, want none", f.metrics.reclaim)

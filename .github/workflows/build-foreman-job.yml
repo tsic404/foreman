@@ -126,7 +126,11 @@ jobs:
           # (F1/AC-13 provenance).
           digest_of() { # <checksum-manifest-url> <asset-name>
             local sha
-            sha=$(curl -fsSL "$1" | grep -E "[[:space:]]$2$" | cut -d' ' -f1 | head -n1)
+            # Exact file-name match: the manifest line is "<sha>  <asset>"
+            # (an optional "*" marks binary mode), and the asset name is not a
+            # regular expression.
+            sha=$(curl -fsSL "$1" |
+              awk -v asset="$2" '{ name = $2; sub(/^\*/, "", name) } name == asset { print $1; exit }')
             [[ $sha =~ ^[0-9a-f]{64}$ ]] || {
               echo "::error title=Upstream artifact missing::no SHA-256 for $2 in $1 (got '$sha')"
               exit 1

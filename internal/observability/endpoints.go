@@ -78,7 +78,15 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 	}
 	log = log.With("component", "observability")
 	mux := http.NewServeMux()
-	mux.Handle("GET /metrics", metrics.Handler())
+	if metrics == nil {
+		// No metrics registry was wired: the endpoint is a readiness input
+		// (§9.3), so it answers "not ready" instead of dereferencing nil.
+		mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+			writeError(w, http.StatusServiceUnavailable, "metrics are not wired")
+		})
+	} else {
+		mux.Handle("GET /metrics", metrics.Handler())
+	}
 	mux.HandleFunc("GET /foreman/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		runtimeIDs := []string{}
 		if cfg.RuntimeIDs != nil {

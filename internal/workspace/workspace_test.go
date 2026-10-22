@@ -98,6 +98,19 @@ func TestLoadDeploymentRefusesBadShapes(t *testing.T) {
 			t.Errorf("%s: LoadDeployment accepted the shape", name)
 		}
 	}
+
+	// The refusal names the key the identity list actually came from.
+	path := filepath.Join(t.TempDir(), "workspaces.json")
+	if err := os.WriteFile(path, []byte(`[{"workspace_id":"ws-a","daemon_id":"a","token":"mdt_a"}]`), 0o644); err != nil {
+		t.Fatalf("write identity list: %v", err)
+	}
+	_, err := LoadDeployment(envMap(map[string]string{
+		"FOREMAN_WORKSPACES_FILE":     path,
+		"FOREMAN_WORKSPACES_MANIFEST": `["ws-a"]`,
+	}))
+	if err == nil || !strings.Contains(err.Error(), EnvWorkspacesFile) {
+		t.Fatalf("error = %v, want it to name %s", err, EnvWorkspacesFile)
+	}
 }
 
 func TestLoadDeploymentWorkspaceScope(t *testing.T) {

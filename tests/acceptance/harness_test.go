@@ -922,6 +922,10 @@ func (s *upstreamStub) enqueueTask(taskID string) {
 func (s *upstreamStub) claim(maxTasks int) []json.RawMessage {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if maxTasks < 0 {
+		// A negative batch asks for nothing; make() would panic on it.
+		maxTasks = 0
+	}
 	served := make([]json.RawMessage, 0, maxTasks)
 	for _, task := range s.queued {
 		if len(served) >= maxTasks {
@@ -2834,6 +2838,7 @@ func buildHarness(t *testing.T, catalogEnabled bool, window time.Duration, skill
 func buildHarnessWith(t *testing.T, catalogEnabled bool, window time.Duration, skill func(*proxy.Config), realServer, wsEnabled bool, opts harnessOptions) *harness {
 	upstream := newUpstreamStub(t)
 	reg := registry.New(time.Now, registry.WithDeliveryConfirmTimeout(window), registry.WithStateStore(opts.store))
+	t.Cleanup(func() { reg.Close(context.Background()) })
 	probes := registry.NewProbeRegistry()
 	startup := registry.NewStartupCatalog()
 	slots := proxy.NewCatalogSlots()

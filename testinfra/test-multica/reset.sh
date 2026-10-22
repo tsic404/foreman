@@ -158,7 +158,7 @@ wipe_rows() {
 	# agent.runtime_id is a RESTRICT foreign key: unbind before deleting the
 	# runtime rows. Task rows are deleted by agent (their workspace is only
 	# reachable through the agent).
-	psql_ro "UPDATE agent SET runtime_id = NULL WHERE workspace_id = '$ws';
+	psql_exec "UPDATE agent SET runtime_id = NULL WHERE workspace_id = '$ws';
 		DELETE FROM agent_task_queue
 			WHERE agent_id IN (SELECT id FROM agent WHERE workspace_id = '$ws');
 		DELETE FROM agent_runtime WHERE workspace_id = '$ws';" >/dev/null

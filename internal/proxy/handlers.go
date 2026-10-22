@@ -40,7 +40,12 @@ func (s *FakeServer) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 	for _, id := range ids {
 		client := s.clientFor(id)
 		if client == nil {
-			continue
+			// S-1 promises the Job's own workspace (single element). A
+			// workspace this deployment does not serve is a routing mismatch,
+			// answered like the res/{ws} routes — a short list would read as
+			// "this workspace exists and has no name".
+			writeError(w, http.StatusForbidden, "workspace is not configured")
+			return
 		}
 		_, name := client.Workspace()
 		answer = append(answer, map[string]string{"id": id, "name": name})

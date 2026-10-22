@@ -123,33 +123,53 @@ jobs:
           echo "published $ref" >>"$GITHUB_STEP_SUMMARY"
 
       - name: Record what this run published
+        if: always()
         env:
           VERSION: ${{ steps.version.outputs.version }}
           REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
           FOREMAN_IMAGE: ${{ steps.publish.outputs.foreman_image }}
         run: |
           set -euo pipefail
           sha7=$(git rev-parse --short=7 HEAD)
           mkdir -p dist
+          # The record runs even when the run died (to leave the scene), so it
+          # has to say which state this is: the push completed, or it did not
+          # and may have partially landed.
+          if [ "${PUBLISH_OUTCOME:-}" = success ]; then
+            status=PUBLISHED
+          else
+            status=FAILED
+          fi
           cat >dist/release-foreman.env <<EOF
           # The release record for this run. deploy/ is never backfilled from it
           # (ADR-012): the image is referenced by movable tag.
           GIT_SHA=$sha7
-          VERSION=$VERSION
-          REGISTRY=$REGISTRY
-          PLATFORMS=$PLATFORMS
-          FOREMAN_IMAGE=$FOREMAN_IMAGE
+          VERSION=${VERSION:-}
+          REGISTRY=${REGISTRY:-}
+          PLATFORMS=${PLATFORMS:-}
+          STATUS=$status
+          FOREMAN_IMAGE=${FOREMAN_IMAGE:-}
           EOF
-          {
-            printf '## Foreman image %s (%s)\n\n' "$VERSION" "$sha7"
-            printf '| Image | Reference |\n|---|---|\n'
-            printf '| foreman | `%s` |\n' "$FOREMAN_IMAGE"
-            printf '\n`%s` manifest list; the Deployment references it by movable tag (`deploy/30-foreman.yaml`).\n' "$PLATFORMS"
-          } >>"$GITHUB_STEP_SUMMARY"
+          case "$status" in
+            PUBLISHED)
+              {
+                printf '## Foreman image %s (%s)\n\n' "$VERSION" "$sha7"
+                printf '| Image | Reference |\n|---|---|\n'
+                printf '| foreman | `%s` |\n' "$FOREMAN_IMAGE"
+                printf '\n`%s` manifest list; the Deployment references it by movable tag (`deploy/30-foreman.yaml`).\n' "$PLATFORMS"
+              } >>"$GITHUB_STEP_SUMMARY"
+              ;;
+            FAILED)
+              printf '## Foreman image %s (%s)\n\nnot recorded as published (publish: %s) — a partial push may have landed; check the registry before re-running.\n' \
+                "${VERSION:-<unresolved>}" "$sha7" "${PUBLISH_OUTCOME:-none}" >>"$GITHUB_STEP_SUMMARY"
+              ;;
+          esac
 
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
-          name: release-foreman-${{ steps.version.outputs.version }}
+          name: release-foreman-${{ steps.version.outputs.version || github.run_id }}
           path: dist/release-foreman.env
           retention-days: 90
 

@@ -9,7 +9,6 @@ package acceptance
 import (
 	"bytes"
 	"encoding/json"
-	"reflect"
 	"testing"
 	"time"
 )
@@ -94,15 +93,5 @@ func TestCatalog04TaskJobCannotFeedTheCatalog(t *testing.T) {
 	}
 	if !bytes.Equal(after.Body, before.Body) || !after.LandedAt.Equal(before.LandedAt) {
 		t.Errorf("slot = %q @ %v, want %q @ %v unchanged", after.Body, after.LandedAt, before.Body, before.LandedAt)
-	}
-	var beforeFields, afterFields any
-	if err := json.Unmarshal(before.Body, &beforeFields); err != nil {
-		t.Fatalf("decode the slot before: %v", err)
-	}
-	if err := json.Unmarshal(after.Body, &afterFields); err != nil {
-		t.Fatalf("decode the slot after: %v", err)
-	}
-	if !reflect.DeepEqual(beforeFields, afterFields) {
-		t.Errorf("catalog fields changed: %v -> %v", beforeFields, afterFields)
 	}
 }

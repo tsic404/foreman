@@ -20,9 +20,13 @@
 # as a credential store (isolation, auth, transport protection).
 #
 # The Redis image below is the reference baseline; its persistence is AOF
-# (appendonly yes) on a PersistentVolumeClaim, so both a pod restart and a
-# pod reschedule keep acknowledged writes. A deployment swaps in its own
-# persistent Redis (in either form above) by pointing FOREMAN_STATE_URL at it.
+# (appendonly yes) on a PersistentVolumeClaim, so a pod restart and a pod
+# reschedule keep the acknowledged writes that reached the AOF file. The
+# default appendfsync everysec is not a zero-loss guarantee: a crash of the
+# Redis process can drop up to one second of acknowledged writes, and a
+# deployment that needs the write to survive it must set appendfsync always
+# (or its own persistent store). A deployment swaps in its own persistent
+# Redis (in either form above) by pointing FOREMAN_STATE_URL at it.
 ---
 apiVersion: v1
 kind: Service

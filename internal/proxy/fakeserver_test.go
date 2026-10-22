@@ -305,6 +305,28 @@ func (r *testRig) registerDaemon(t *testing.T, taskID, token string) string {
 	return resp.Runtimes[0].ID
 }
 
+// A Job whose workspace this deployment does not serve is a routing
+// mismatch: S-1 answers 403 like the res/{ws} routes instead of a short list.
+func TestWorkspacesAnswersForbiddenWhenTheWorkspaceIsNotServed(t *testing.T) {
+	r := newTestRig(t)
+	token, err := r.issuer.IssueProbe("fm-catalog-other", "req-other", "ws-other", time.Hour)
+	if err != nil {
+		t.Fatalf("IssueProbe: %v", err)
+	}
+	if err := r.probes.PutProbe(registry.ProbeSession{
+		JobName:     "fm-catalog-other",
+		WorkspaceID: "ws-other",
+		TokenHash:   r.issuer.Hash(token),
+	}); err != nil {
+		t.Fatalf("PutProbe: %v", err)
+	}
+
+	code, body := r.call(t, "GET", "/api/daemon/workspaces", token, nil)
+	if code != http.StatusForbidden {
+		t.Fatalf("S-1 = %d: %s, want 403 for an unserved workspace", code, body)
+	}
+}
+
 func TestRoutingRules(t *testing.T) {
 	rig := newTestRig(t)
 	rig.claimTask(t, "t-1")

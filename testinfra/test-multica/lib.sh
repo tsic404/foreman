@@ -155,9 +155,10 @@ workspace_id() {
 	jq -er .workspace_id "$PROFILE_CONFIG" || die "profile $PROFILE_CONFIG carries no workspace_id"
 }
 
-# psql against the test server's own database, for the reset entry's row wipe.
-# Runs inside the persistence pod; no credential leaves the cluster.
-psql_ro() {
+# psql against the test server's own database. It carries the reset entry's
+# writes as well as its reads (UPDATE / DELETE), so it is named for what it
+# does. Runs inside the persistence pod; no credential leaves the cluster.
+psql_exec() {
 	k exec deploy/postgres -n "$NS" -- \
 		psql -v ON_ERROR_STOP=1 -U multica -d multica -qtAX -c "$1"
 }
@@ -179,8 +180,10 @@ instance_object_present() {
 	case $_out in
 	*NotFound*) return 1 ;;
 	esac
-	k -n "$INSTANCE_NS" get "$_kind" "$_name" -o name >/dev/null 2>&1 ||
-		die "cannot read $_kind/$_name in $INSTANCE_NS — $_out"
+	# The retry's own error is the one to report: the first read's message may
+	# be a transient failure the retry already got past.
+	_retry_out=$(k -n "$INSTANCE_NS" get "$_kind" "$_name" -o name 2>&1 >/dev/null) ||
+		die "cannot read $_kind/$_name in $INSTANCE_NS — ${_retry_out:-$_out}"
 	return 0
 }
 

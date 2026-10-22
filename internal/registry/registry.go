@@ -137,8 +137,21 @@ type Registry struct {
 	shared SharedStore
 	// stateCh is the ordered write queue; nil when no shared state face is
 	// wired. statePending counts the writes queued but not yet applied.
+	// stateStop ends the writer goroutine (Close); stateDone closes once it
+	// has returned, so Close can wait for it. stateMu makes "refuse or
+	// enqueue" atomic against Close: without it a write that read
+	// stateClosed=false before Close could still be sent after the writer
+	// returned, and would never be applied. The writer never takes it.
 	stateCh      chan stateOp
 	statePending atomic.Int64
+	stateStop    chan struct{}
+	stateDone    chan struct{}
+	stateMu      sync.Mutex
+	stateClosed  bool
+	stateClose   sync.Once
+	// stateCloseErr is Close's first outcome: a budget that expired before
+	// the writer drained.
+	stateCloseErr error
 }
 
 // Option customizes a Registry.
@@ -206,6 +219,8 @@ func New(now func() time.Time, opts ...Option) *Registry {
 			r.shared = shared
 		}
 		r.stateCh = make(chan stateOp, stateQueueSize)
+		r.stateStop = make(chan struct{})
+		r.stateDone = make(chan struct{})
 		go r.runStateWriter()
 	}
 	return r
@@ -329,11 +344,23 @@ func (r *Registry) enqueueState(op stateOp) {
 	if r.stateCh == nil {
 		return
 	}
+	// The closed check and the send are one critical section: Close cannot
+	// slip between them, so an accepted write always reaches a live writer.
+	r.stateMu.Lock()
+	if r.stateClosed {
+		r.stateMu.Unlock()
+		// No writer is left to apply it; a silent drop would hide the lost
+		// transition, so it goes through the same failure hook.
+		r.stateFailure("closed", op.taskID, errRegistryClosed)
+		return
+	}
 	r.statePending.Add(1)
 	select {
 	case r.stateCh <- op:
+		r.stateMu.Unlock()
 	default:
 		r.statePending.Add(-1)
+		r.stateMu.Unlock()
 		r.stateFailure("queue_full", op.taskID, errStateQueueFull)
 	}
 }
@@ -341,14 +368,79 @@ func (r *Registry) enqueueState(op stateOp) {
 // errStateQueueFull reports a write the bounded queue refused.
 var errStateQueueFull = errors.New("shared state write queue is full")
 
+// errRegistryClosed reports a write attempted after Close stopped the writer.
+var errRegistryClosed = errors.New("registry is closed")
+
+// errStateDrainTimeout reports a close budget that ran out with writes still
+// queued: those writes are refused through the failure hook rather than
+// waited out, so shutdown stays inside the pod's grace period.
+var errStateDrainTimeout = errors.New("shared state writer did not drain within the close budget")
+
 // runStateWriter applies the queued writes in order. A failed write is
 // reported through the hook; the next write of the same row repairs it (every
 // op carries a full snapshot or a delete).
 func (r *Registry) runStateWriter() {
-	for op := range r.stateCh {
-		r.applyStateOp(op)
-		r.statePending.Add(-1)
+	defer close(r.stateDone)
+	for {
+		select {
+		case op := <-r.stateCh:
+			r.applyStateOp(op)
+			r.statePending.Add(-1)
+		case <-r.stateStop:
+			// Close stops new writes landing under stateMu before it signals
+			// here, so this drain sees a finite set: apply what was already
+			// accepted and leave nothing counted but unapplied.
+			for {
+				select {
+				case op := <-r.stateCh:
+					r.applyStateOp(op)
+					r.statePending.Add(-1)
+				default:
+					return
+				}
+			}
+		}
 	}
+}
+
+// Close stops the shared-state writer and waits up to ctx for it to drain.
+// Writes already accepted are applied while the budget lasts; when it runs
+// out, the rest are counted off and refused through the failure hook (op
+// "closed"), and Close returns errStateDrainTimeout instead of waiting out a
+// store that stopped answering. A write attempted after Close is refused the
+// same way. Safe to call more than once and without a state store; every call
+// reports the first call's outcome.
+func (r *Registry) Close(ctx context.Context) error {
+	r.stateClose.Do(func() {
+		if r.stateStop == nil {
+			return
+		}
+		// Under stateMu no send is in flight and none can start once the flag
+		// is set; the writer does not take the lock, so this cannot deadlock.
+		r.stateMu.Lock()
+		r.stateClosed = true
+		close(r.stateStop)
+		r.stateMu.Unlock()
+		select {
+		case <-r.stateDone:
+			return
+		case <-ctx.Done():
+			r.stateCloseErr = fmt.Errorf("%w: %w", errStateDrainTimeout, ctx.Err())
+		}
+		// The writer is still inside a store call. Take what is queued so
+		// every accepted write is either applied or reported, and nothing is
+		// left counted but unapplied.
+		for {
+			select {
+			case op := <-r.stateCh:
+				r.statePending.Add(-1)
+				r.stateFailure("closed", op.taskID, errStateDrainTimeout)
+			default:
+				return
+			}
+		}
+	})
+	return r.stateCloseErr
 }
 
 func (r *Registry) applyStateOp(op stateOp) {
@@ -372,6 +464,8 @@ func (r *Registry) applyStateOp(op stateOp) {
 			opName = "delete_entry"
 		case stateOpPutSettled:
 			opName = "put_settled"
+		case stateOpMerge:
+			opName = "merge_entry"
 		}
 		r.stateFailure(opName, op.taskID, err)
 	}
