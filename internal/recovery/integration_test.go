@@ -429,8 +429,9 @@ func TestIntegrationStagedReportSurvivesWriteFailure(t *testing.T) {
 	}
 }
 
-// Scenario #2: a rebuilt pre-start entry (payload lost with the restart) is
-// released so the server re-dispatches the task — no report, no zombie.
+// Scenario #2: a rebuilt pre-start entry (no payload — the Job object face
+// carries identity and trigger context only) is released so the server
+// re-dispatches the task — no report, no zombie.
 func TestIntegrationRebuiltPreStartEntryIsReleased(t *testing.T) {
 	server := newFakeServerClient(map[string]string{"t1": "dispatched"})
 	reg, jobs, _, _, _, newReconciler := setupIntegration(t, server, "")

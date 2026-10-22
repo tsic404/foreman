@@ -497,7 +497,7 @@ func TestReconcileReleaseSurvivesAPartialDeletion(t *testing.T) {
 
 func TestReconcileRebuiltPreStartEntryIsReleased(t *testing.T) {
 	e := testEntry("t1")
-	e.Payload = nil // rebuilt from K8s: the payload never left process memory
+	e.Payload = nil // rebuilt from the Job object face, which carries no payload
 	reg := newRegistry(t, e)
 	set := &fakeSettler{}
 
@@ -569,12 +569,12 @@ func TestReconcileRunningTaskIsAdopted(t *testing.T) {
 	}
 }
 
-// A rebuilt entry has lost its payload with the restart, so a daemon-held
-// status is the post-delivery evidence the adoption face needs (§4.3,
-// ADR-026 决策结果 1/3).
+// A rebuilt entry has no payload — the Job object face carries identity and
+// trigger context only (F3) — so a daemon-held status is the post-delivery
+// evidence the adoption face needs (§4.3, ADR-026 决策结果 1/3).
 func TestReconcileRebuiltWaitingEntryIsAdopted(t *testing.T) {
 	e := testEntry("t1")
-	e.Payload = nil // rebuilt: the payload never left process memory
+	e.Payload = nil // rebuilt: the Job object face carries no payload
 	e.State = registry.StateJobCreated
 	reg := newRegistry(t, e)
 	set := &fakeSettler{}
