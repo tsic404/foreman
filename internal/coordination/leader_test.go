@@ -2,6 +2,7 @@ package coordination
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -120,4 +121,27 @@ func TestLeaderAbortsReconcileOnLeaseLoss(t *testing.T) {
 		t.Fatal("A was granted after its lease lapsed during the reconcile")
 	}
 	mr.SetError("")
+}
+
+// TestLastInstanceAfterShutdownCancellation pins the deregistration gate: the
+// shutdown path cancels the loop contexts, and an in-flight store call then
+// returns context.Canceled. That is not a store outage, so the last-instance
+// verdict (and with it the deregistration) still holds (§4.6 优雅关闭).
+func TestLastInstanceAfterShutdownCancellation(t *testing.T) {
+	store, _ := leaderTestStore(t)
+	ctx := context.Background()
+	if err := store.HeartbeatInstance(ctx, "instance-a", time.Minute); err != nil {
+		t.Fatalf("HeartbeatInstance: %v", err)
+	}
+
+	shutdown, cancel := context.WithCancel(ctx)
+	cancel()
+	if err := store.HeartbeatInstance(shutdown, "instance-a", time.Minute); !errors.Is(err, context.Canceled) {
+		t.Fatalf("heartbeat on the cancelled shutdown context = %v, want context.Canceled", err)
+	}
+
+	last, err := New(store, "instance-a", leaseTestConfig()).LastInstance(ctx)
+	if err != nil || !last {
+		t.Fatalf("LastInstance after a cancelled op = %v, %v; want true, nil", last, err)
+	}
 }
