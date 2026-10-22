@@ -862,7 +862,17 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 	// that Put writes the whole entry back. It never reaches an annotation: a
 	// rebuilt entry cannot restore it and degrades visibly instead
 	// (cred.revoke_unavailable).
-	s.reg.SetTokenHash(e.TaskID, tokenHash)
+	if err := s.reg.SetTokenHash(e.TaskID, tokenHash); err != nil {
+		// The shared row does not carry the digest, so no other instance can
+		// adjudicate the credential: this claim issues nothing (ADR-046 决策 7).
+		// No object exists yet — dropping the entry is the deferral path the
+		// server re-dispatches from once the prepare lease lapses.
+		if delErr := s.reg.Delete(e.TaskID); delErr != nil {
+			s.log.WarnContext(ctx, "task.claim_drop_failed",
+				"task_id", e.TaskID, "job_name", e.JobName, "err", delErr)
+		}
+		return fmt.Errorf("%w: record token digest: %v", ErrStoreUnavailable, err)
+	}
 	e.TokenHash = tokenHash
 	// An idempotent retry may have left the Secret behind: delete-then-create
 	// (NotFound counts as success inside the JobClient). The clear is

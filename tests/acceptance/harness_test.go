@@ -3495,6 +3495,9 @@ type twoInstanceOptions struct {
 	// workspaces overrides the scheduler's configured workspace set (the
 	// zero-row counter reconciliation needs a workspace with no live row).
 	workspaces []string
+	// wrap decorates the shared store both instances share: a scenario fails
+	// one command while the rest of the store stays healthy.
+	wrap func(store state.Store, coord state.CoordStore) (state.Store, state.CoordStore)
 }
 
 func newTwoInstances(t *testing.T, opts twoInstanceOptions) *twoInstances {
@@ -3537,6 +3540,9 @@ func newTwoInstances(t *testing.T, opts twoInstanceOptions) *twoInstances {
 		t.Fatalf("state.New: %v", err)
 	}
 	coord := st.(state.CoordStore)
+	if opts.wrap != nil {
+		st, coord = opts.wrap(st, coord)
+	}
 	mutate := func(c *scheduler.Config) {
 		c.JobBootTimeout = opts.bootTimeout
 		c.DeliveryConfirmTimeout = opts.deliveryWindow

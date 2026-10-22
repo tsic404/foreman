@@ -465,6 +465,14 @@ func (r *Reconciler) reconcileOne(ctx context.Context, e registry.TaskEntry, pod
 			if err := r.settler.ContinueClaim(ctx, e.TaskID); err == nil {
 				delete(r.missing, e.JobName)
 				return nil
+			} else if errors.Is(err, scheduler.ErrStoreUnavailable) {
+				// The row cannot carry the token digest, so the continuation
+				// created nothing (ADR-046 决策 7). That is not a Job-missing
+				// observation: the compensation below would settle a task that
+				// never ran as job_missing. Keep the entry; the next round
+				// retries once the shared state answers.
+				delete(r.missing, e.JobName)
+				return err
 			}
 		}
 		// §4.3/§4.6: the Job vanished (deleted, TTL-collected, or never

@@ -57,16 +57,20 @@ func (r *Registry) mergeShared(taskID string, e TaskEntry, p EntryPatch) {
 }
 
 // mergeNow is the synchronous merge used by the adoption paths that must be
-// visible before the response leaves (the token digest).
-func (r *Registry) mergeNow(taskID string, e TaskEntry, p EntryPatch) {
+// visible before the response leaves (the token digest). The write's failure
+// is returned as well as reported: a fact the shared row does not carry is
+// not adjudicable on another instance, so the caller must not hand it out.
+func (r *Registry) mergeNow(taskID string, e TaskEntry, p EntryPatch) error {
 	if r.shared == nil {
-		return
+		return nil
 	}
 	ctx, cancel := r.sharedCtx()
 	defer cancel()
 	if err := r.shared.MergeEntry(ctx, e.WorkspaceID, taskID, p); err != nil {
 		r.stateFailure("merge_entry", taskID, err)
+		return err
 	}
+	return nil
 }
 
 // Cache inserts one row read from the shared state into the local index

@@ -6,12 +6,16 @@
 package acceptance
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/state"
 )
 
 func TestTechMulti05SharedStateOutage(t *testing.T) {
@@ -161,5 +165,145 @@ func TestTechMulti05SharedStateOutageStopsIssuance(t *testing.T) {
 	code, _ := tw.claimCode(t, tw.b, "task-issue", token)
 	if code != http.StatusServiceUnavailable && code != http.StatusUnauthorized {
 		t.Fatalf("issuance during outage = %d, want 503/401", code)
+	}
+}
+
+// mergeGateStore fails the token-digest merge of one armed task and passes
+// every other command through: the store stays reachable, so a scenario
+// isolates the digest write from a full outage.
+type mergeGateStore struct {
+	state.CoordStore
+	phaseOne state.Store
+
+	mu      sync.Mutex
+	failFor string
+	failed  int
+}
+
+// arm fails the next digest merge of taskID (once: the recovery half must
+// land on the shared row).
+func (s *mergeGateStore) arm(taskID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.failFor = taskID
+}
+
+// mergeFailures reports how many digest merges the gate refused.
+func (s *mergeGateStore) mergeFailures() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.failed
+}
+
+func (s *mergeGateStore) MergeEntry(ctx context.Context, ws, taskID string, p registry.EntryPatch) error {
+	s.mu.Lock()
+	fail := p.TokenHash != nil && s.failFor != "" && s.failFor == taskID
+	if fail {
+		s.failFor = ""
+		s.failed++
+	}
+	s.mu.Unlock()
+	if fail {
+		return errors.New("shared state: merge unavailable")
+	}
+	return s.CoordStore.MergeEntry(ctx, ws, taskID, p)
+}
+
+// The stage-one face of the same store.
+
+func (s *mergeGateStore) PutEntry(ctx context.Context, ws, taskID string, e registry.TaskEntry) error {
+	return s.phaseOne.PutEntry(ctx, ws, taskID, e)
+}
+
+func (s *mergeGateStore) PutSettled(ctx context.Context, ws, taskID string, e registry.TaskEntry) error {
+	return s.phaseOne.PutSettled(ctx, ws, taskID, e)
+}
+
+func (s *mergeGateStore) GetSettled(ctx context.Context, ws, taskID string) (registry.TaskEntry, bool, error) {
+	return s.phaseOne.GetSettled(ctx, ws, taskID)
+}
+
+func (s *mergeGateStore) DeleteSettled(ctx context.Context, ws, taskID string) error {
+	return s.phaseOne.DeleteSettled(ctx, ws, taskID)
+}
+
+func (s *mergeGateStore) Revoke(ctx context.Context, ws, hash string, until time.Time) error {
+	return s.phaseOne.Revoke(ctx, ws, hash, until)
+}
+
+func (s *mergeGateStore) IsRevoked(ctx context.Context, ws, hash string) (bool, error) {
+	return s.phaseOne.IsRevoked(ctx, ws, hash)
+}
+
+func (s *mergeGateStore) Ping(ctx context.Context) error { return s.phaseOne.Ping(ctx) }
+
+// TestTechMulti05DigestWriteFailureStopsIssuance is AC-78's token-issuance
+// face at its narrowest point: every store command answers except the
+// token-digest merge. The claim issues no credential and no Job, and its slot
+// returns with the dropped entry; once the merge lands the claim succeeds and
+// the other instance reads the digest off the shared row.
+func TestTechMulti05DigestWriteFailureStopsIssuance(t *testing.T) {
+	var gate *mergeGateStore
+	tw := newTwoInstances(t, twoInstanceOptions{
+		leaderCfg: smallLeaderCfg(2 * time.Second),
+		wrap: func(store state.Store, coord state.CoordStore) (state.Store, state.CoordStore) {
+			gate = &mergeGateStore{CoordStore: coord, phaseOne: store}
+			return gate, gate
+		},
+	})
+	tw.declareAll(t)
+	tw.a.startLeader(t)
+	stopClaim := startConcurrency01ClaimLoop(t, tw.a)
+	defer stopClaim()
+
+	gate.arm("task-digest")
+	tw.a.upstream.enqueueTask("task-digest")
+	waitFor(t, "the claim whose digest merge failed", 10*time.Second, func() bool {
+		return gate.mergeFailures() > 0
+	})
+	waitFor(t, "the failed claim's entry to be dropped", 10*time.Second, func() bool {
+		_, ok := tw.entry(t, "task-digest")
+		return !ok
+	})
+
+	if tw.a.jobs.jobCreated("fm-task-digest") {
+		t.Fatal("a Job was created although the token digest never reached the shared row")
+	}
+	tw.a.jobs.mu.Lock()
+	secrets := len(tw.a.jobs.createdSecrets)
+	tw.a.jobs.mu.Unlock()
+	if secrets != 0 {
+		t.Fatalf("credential Secrets created = %d, want 0: no token may be issued", secrets)
+	}
+	if calls := tw.a.upstream.calls("POST", "/api/daemon/tasks/task-digest/fail"); len(calls) != 0 {
+		t.Fatalf("failure reports to the server = %d, want 0: an outage is not a task failure", len(calls))
+	}
+	if got := tw.a.upstream.taskStatus("task-digest"); got != taskStatusDispatched {
+		t.Fatalf("server task status = %q, want dispatched (the task stays with the server)", got)
+	}
+	// The dropped entry releases the slot the claim took: the outage leaks no
+	// in-flight capacity (AC-78's 计数均不增).
+	waitFor(t, "the in-flight slot to return", 5*time.Second, func() bool {
+		n, err := tw.coord.Slots(context.Background(), "")
+		return err == nil && n == 0
+	})
+
+	// Recovery: the server's lease lapses and re-dispatches; the digest lands
+	// on the shared row and the other instance adjudicates with it.
+	if !tw.a.upstream.requeueTask("task-digest") {
+		t.Fatal("task-digest was not dispatched when the requeue was requested")
+	}
+	tw.waitForTaskJob(t, "task-digest", 10*time.Second)
+	e, ok := tw.entry(t, "task-digest")
+	if !ok || e.TokenHash == "" {
+		t.Fatalf("shared row = %+v (ok=%v), want the token digest", e, ok)
+	}
+	token := tw.a.builder.probeToken("fm-task-digest")
+	if e.TokenHash != tw.a.issuer.Hash(token) {
+		t.Fatalf("token_hash = %q, want the digest of the issued credential", e.TokenHash)
+	}
+	other, ok := tw.b.reg.GetInWorkspace("ws-1", "task-digest")
+	if !ok || other.TokenHash != e.TokenHash {
+		t.Fatalf("instance B row = %+v (ok=%v), want the same digest", other, ok)
 	}
 }
