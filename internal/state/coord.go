@@ -278,7 +278,9 @@ return 1`)
 	// ARGV[2]=index value, ARGV[3]=ttl ms.
 	scriptSetIndexed = redis.NewScript(`
 redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[3])
-redis.call('SET', KEYS[2], ARGV[2])
+if ARGV[4] == '1' then
+  redis.call('SET', KEYS[2], ARGV[2])
+end
 return 1`)
 
 	// enqueue: KEYS[1]=marker, KEYS[2]=row; ARGV[1]=row raw, ARGV[2]=marker raw,
@@ -513,9 +515,16 @@ func (s *redisStore) SetEntry(ctx context.Context, ws, taskID string, e registry
 		_ = s.rdb.Del(ctx, s.jobIndexKey(old.JobName)).Err()
 	}
 	index := ws + "\x00" + taskID
-	err = scriptSetIndexed.Run(ctx, s.rdb,
-		[]string{s.entryKey(ws, taskID), s.jobIndexKey(e.JobName)},
-		raw, index, s.entryTTL().Milliseconds()).Err()
+	// A row without a Job name has no name to index. Writing it anyway would
+	// put every such row on one shared, meaningless key.
+	keys := []string{s.entryKey(ws, taskID)}
+	indexed := "0"
+	if e.JobName != "" {
+		keys = append(keys, s.jobIndexKey(e.JobName))
+		indexed = "1"
+	}
+	err = scriptSetIndexed.Run(ctx, s.rdb, keys,
+		raw, index, s.entryTTL().Milliseconds(), indexed).Err()
 	s.mark(err)
 	return err
 }

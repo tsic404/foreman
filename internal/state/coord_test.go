@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -314,5 +315,34 @@ func TestCoordSlotSnapshotCAS(t *testing.T) {
 	count, reservations, err = store.SlotSnapshot(ctx, "")
 	if err != nil || count != 0 || reservations != 0 {
 		t.Fatalf("snapshot after expiry = (%d,%d) err=%v, want (0,0)", count, reservations, err)
+	}
+}
+
+// A row without a Job name owns no name index: writing it anyway would put
+// every such row on one shared, meaningless key.
+func TestCoordEntryWithoutJobNameWritesNoIndex(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	s, err := New(Config{
+		URL:         "redis://" + mr.Addr(),
+		DialTimeout: time.Second,
+		EntryTTL:    48 * time.Hour,
+	}, WithClock(time.Now))
+	if err != nil {
+		t.Fatalf("state.New: %v", err)
+	}
+	store := s.(CoordStore)
+	entry := coordTestEntry("task-1", `{"body":"x"}`)
+	entry.JobName = ""
+	if err := store.SetEntry(ctx, "ws-1", "task-1", entry); err != nil {
+		t.Fatalf("SetEntry: %v", err)
+	}
+	for _, key := range mr.Keys() {
+		if strings.HasPrefix(key, keyJobIndex) {
+			t.Fatalf("wrote job index %q for a row without a Job name", key)
+		}
+	}
+	if got, ok, err := s.GetEntry(ctx, "ws-1", "task-1"); err != nil || !ok || got.TaskID != "task-1" {
+		t.Fatalf("GetEntry: ok=%v err=%v", ok, err)
 	}
 }
