@@ -153,8 +153,25 @@ check)
 	nodes=$(node_count) || blocked "cannot count the cluster's schedulable Linux nodes"
 	[ "$nodes" = "$recorded_nodes" ] ||
 		fail "the machine count changed from $recorded_nodes to $nodes — G1 keeps it constant"
-	# Put the deployment's original cap back whatever the judgement says.
-	trap 'kubectl -n "$FOREMAN_NS" set env deploy/foreman "FOREMAN_MAX_INFLIGHT_JOBS=$orig" >/dev/null 2>&1 || true' EXIT INT TERM
+	# Put the deployment's original cap back whatever the judgement says, and
+	# close the window: a state file left behind makes the next lower refuse
+	# with "a window is already open". A failed restore keeps it so
+	# '$0 restore' can retry.
+	check_done=0
+	cleanup_check() {
+		if [ "$check_done" -eq 1 ]; then return 0; fi
+		check_done=1
+		if kubectl -n "$FOREMAN_NS" set env deploy/foreman "FOREMAN_MAX_INFLIGHT_JOBS=$orig" >/dev/null 2>&1; then
+			rm -f "$STATE"
+		else
+			printf 'warning: could not restore FOREMAN_MAX_INFLIGHT_JOBS=%s; state kept at %s — run %s restore\n' \
+				"$orig" "$STATE" "$0" >&2
+		fi
+		return 0
+	}
+	trap cleanup_check EXIT
+	trap 'cleanup_check; exit 130' INT
+	trap 'cleanup_check; exit 143' TERM
 
 	max=0
 	deadline=$(( $(date +%s) + WINDOW ))

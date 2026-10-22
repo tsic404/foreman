@@ -103,7 +103,7 @@ verify-unwritable)
 	echo "PASS: TC-tech-cache-03 step 2 (task $tid failed explicitly; workspaces restored)"
 	;;
 rebuild-prepare)
-	out=$(node_sh "repos=\$(find \"\$R/workspaces/.repos\" -mindepth 1 -maxdepth 2 -name '*.git' -type d 2>/dev/null)
+	out=$(node_sh "repos=\$(find \"\$R/workspaces/.repos\" -mindepth 2 -maxdepth 2 -name '*.git' -type d 2>/dev/null)
 		[ -n \"\$repos\" ] || { echo 'QA_BLOCKED: no bare repo to delete' >&2; exit 2; }
 		for repo in \$repos; do rm -rf \"\$repo\" && echo \"deleted=\$repo\"; done") ||
 		blocked "cannot delete the bare caches on $NODE"
