@@ -124,7 +124,9 @@ func TestDelivery02LostResponseLeavesMetricsEventsAndRetainedRecord(t *testing.T
 	if !ok {
 		t.Fatal("the reclaim must leave the terminal record")
 	}
-	if record.FailureReason != scheduler.FailureReasonDeliveryUnconfirmed || record.ClaimsAfterDelivery != 2 || record.Deliveries != 2 {
+	// The rearm replaced the first commit, so the current commit's count is
+	// zero (the replaced commit's two empty batches are in the rearm event).
+	if record.FailureReason != scheduler.FailureReasonDeliveryUnconfirmed || record.ClaimsAfterDelivery != 0 || record.Deliveries != 2 {
 		t.Errorf("retained record = %+v, want the verdict with its delivery diagnostic", record)
 	}
 	if !record.StartedAt.IsZero() {
@@ -148,8 +150,8 @@ func TestDelivery02LostResponseLeavesMetricsEventsAndRetainedRecord(t *testing.T
 	if projected["state"] != "terminal" || projected["failure_reason"] != scheduler.FailureReasonDeliveryUnconfirmed {
 		t.Errorf("projection = %v, want a terminal record with the delivery attribution", projected)
 	}
-	if claims, _ := projected["claims_after_delivery"].(float64); claims != 2 {
-		t.Errorf("projected claims_after_delivery = %v, want 2", projected["claims_after_delivery"])
+	if claims, _ := projected["claims_after_delivery"].(float64); claims != 0 {
+		t.Errorf("projected claims_after_delivery = %v, want 0 (the rearm reset the count)", projected["claims_after_delivery"])
 	}
 	if deliveries, _ := projected["deliveries"].(float64); deliveries != 2 {
 		t.Errorf("projected deliveries = %v, want 2", projected["deliveries"])
@@ -172,13 +174,11 @@ func TestDelivery02LostResponseLeavesMetricsEventsAndRetainedRecord(t *testing.T
 	}
 }
 
-// TestDelivery02ClaimsAfterDeliveryAccumulateAcrossRearms drives the form the
-// cumulative reading of the counter is the only distinguishing one for: three
-// commits with an empty-batch window between them. A per-window reading would
-// report the second rearm with the claims of its own window alone, so after a
-// later commit the entry would read as a daemon that stopped asking — the
-// other branch of the diagnostic (02-contracts.md §4.1, AC-47 ②).
-func TestDelivery02ClaimsAfterDeliveryAccumulateAcrossRearms(t *testing.T) {
+// TestDelivery02ClaimsAfterDeliveryResetAcrossRearms drives the per-commit
+// reading of the counter (02-contracts.md §4.1): each commit starts the count
+// from zero, and the rearm event carries the replaced commit's count — three
+// commits with an empty-batch window between them.
+func TestDelivery02ClaimsAfterDeliveryResetAcrossRearms(t *testing.T) {
 	// Two full windows have to fit under the boot bound, the form's only
 	// terminal bound; the window keeps its scenario cadence.
 	h := newDeliveryHarnessWith(t, 6*deliveryConfirmWindow, deliveryConfirmWindow)
@@ -230,8 +230,8 @@ func TestDelivery02ClaimsAfterDeliveryAccumulateAcrossRearms(t *testing.T) {
 	if n, _ := rearmed[0]["claims_after_delivery"].(float64); n != 2 {
 		t.Errorf("first rearm claims_after_delivery = %v, want 2", rearmed[0]["claims_after_delivery"])
 	}
-	if n, _ := rearmed[1]["claims_after_delivery"].(float64); n != 3 {
-		t.Errorf("second rearm claims_after_delivery = %v, want 3 (both windows' empty claims)",
+	if n, _ := rearmed[1]["claims_after_delivery"].(float64); n != 1 {
+		t.Errorf("second rearm claims_after_delivery = %v, want 1 (the replaced commit's own window)",
 			rearmed[1]["claims_after_delivery"])
 	}
 	if n, _ := rearmed[1]["deliveries"].(float64); n != 3 {
@@ -243,8 +243,8 @@ func TestDelivery02ClaimsAfterDeliveryAccumulateAcrossRearms(t *testing.T) {
 	if settled.FailureReason != scheduler.FailureReasonDeliveryUnconfirmed {
 		t.Fatalf("reason = %q, want %q", settled.FailureReason, scheduler.FailureReasonDeliveryUnconfirmed)
 	}
-	if settled.Deliveries != 3 || settled.ClaimsAfterDelivery != 5 {
-		t.Fatalf("settled entry = deliveries %d, claims_after_delivery %d; want 3 and 5 (2+1+2 empty batches)",
+	if settled.Deliveries != 3 || settled.ClaimsAfterDelivery != 2 {
+		t.Fatalf("settled entry = deliveries %d, claims_after_delivery %d; want 3 and 2 (the last commit's empties)",
 			settled.Deliveries, settled.ClaimsAfterDelivery)
 	}
 	if n := h.metrics.deliveryClaimCount(proxy.DeliveryClaimEmptyUnconfirmed); n != 5 {

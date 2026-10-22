@@ -37,6 +37,10 @@ const (
 	// can restart across: the Job Token TTL (claim → boot → task → drain,
 	// §6.1). The default covers the default token TTL with margin.
 	EnvTTL = "FOREMAN_STATE_ENTRY_TTL"
+	// EnvGrace is the short window a shared-state outage may keep serving
+	// from the local positive cache before every request fails closed
+	// (§10 共享状态不可用: 在途任务在宽限内按本地正缓存裁决，超宽限一律 401/503).
+	EnvGrace = "FOREMAN_STATE_GRACE"
 )
 
 const (
@@ -48,6 +52,9 @@ const (
 	// DefaultDialTimeout is the default bound of one shared-store
 	// connection attempt.
 	DefaultDialTimeout = 3 * time.Second
+	// DefaultGrace is the default cache-adjudication grace window during a
+	// shared-state outage.
+	DefaultGrace = 30 * time.Second
 )
 
 // Config is the shared state module's runtime configuration.
@@ -60,6 +67,8 @@ type Config struct {
 	DialTimeout time.Duration
 	// EntryTTL is the retention of one entry snapshot.
 	EntryTTL time.Duration
+	// Grace is the outage window during which cached facts still adjudicate.
+	Grace time.Duration
 }
 
 // LoadConfig reads the shared state configuration from env (os.Getenv when
@@ -73,6 +82,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	cfg := Config{
 		DialTimeout: DefaultDialTimeout,
 		EntryTTL:    DefaultTTL,
+		Grace:       DefaultGrace,
 	}
 	cfg.URL = strings.TrimSpace(getenv(EnvURL))
 	cfg.Password = getenv(EnvPassword)
@@ -95,6 +105,16 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("%s must be positive, got %s", EnvTTL, d)
 		}
 		cfg.EntryTTL = d
+	}
+	if raw := strings.TrimSpace(getenv(EnvGrace)); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be a duration: %v", EnvGrace, err)
+		}
+		if d < 0 {
+			return Config{}, fmt.Errorf("%s must be non-negative, got %s", EnvGrace, d)
+		}
+		cfg.Grace = d
 	}
 	return cfg, nil
 }

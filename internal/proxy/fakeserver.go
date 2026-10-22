@@ -25,7 +25,7 @@ const maxLocalBodyBytes = 32 << 20
 // TaskScheduler is the fake server's scheduling surface (§2.1):
 // S6 delivery, S8–S17 report handling, task-vanish settlement.
 type TaskScheduler interface {
-	Deliver(daemonID, runtimeID string, maxTasks int) ([]json.RawMessage, error)
+	Deliver(ctx context.Context, workspaceID, daemonID, runtimeID string, maxTasks int) (scheduler.Delivery, error)
 	OnReport(ctx context.Context, ep scheduler.Endpoint, e registry.TaskEntry, body []byte, sessionID string) (int, []byte, error)
 	OnTaskVanished(ctx context.Context, taskID string) error
 	// FailJob settles a Job whose daemon was refused at S4: the entry reaches
@@ -348,7 +348,7 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 // entryFor re-reads the token's mapping entry; it may have been deleted
 // between Verify and here (terminal cleanup).
 func (s *FakeServer) entryFor(w http.ResponseWriter, claims auth.Claims) (registry.TaskEntry, bool) {
-	e, ok := s.reg.ByDaemon(claims.JobName)
+	e, ok := s.reg.ByDaemonInWorkspace(claims.WorkspaceID, claims.JobName)
 	if !ok {
 		writeError(w, http.StatusNotFound, "unknown task")
 		return registry.TaskEntry{}, false
@@ -411,12 +411,16 @@ func (s *FakeServer) noteLegacyClaim(e registry.TaskEntry) bool {
 // jobLookup adapts the registry to auth.JobLookup.
 type jobLookup struct{ reg *registry.Registry }
 
-func (a jobLookup) ByDaemon(daemonID string) (auth.JobEntry, bool) {
-	e, ok := a.reg.ByDaemon(daemonID)
+func (a jobLookup) ByDaemonInWorkspace(workspaceID, daemonID string) (auth.JobEntry, bool) {
+	e, ok := a.reg.ByDaemonInWorkspace(workspaceID, daemonID)
 	if !ok {
 		return auth.JobEntry{}, false
 	}
-	return auth.JobEntry{JobRuntimeID: e.JobRuntimeID, WorkspaceID: e.WorkspaceID}, true
+	return auth.JobEntry{
+		JobRuntimeID: e.JobRuntimeID,
+		WorkspaceID:  e.WorkspaceID,
+		Terminal:     e.IsTerminal(),
+	}, true
 }
 
 // JobTokenIssuer builds the Job Token issuer over the registry's read view

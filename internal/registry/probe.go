@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"slices"
@@ -161,6 +162,64 @@ type ProbeRegistry struct {
 	mu        sync.RWMutex
 	probes    map[string]ProbeSession // job name → session
 	byRuntime map[string]string       // job runtime id → job name
+	// shared is the stage-two probe-session face: the session table is shared
+	// so a probe's registration, heartbeat and result may land on any instance
+	// (02-contracts.md §6.3, §1.3). Nil keeps the process-local table.
+	shared ProbeStore
+}
+
+// ProbeStore is the shared probe-session face (capability detection; the
+// stage-two Redis store implements it, the phase-one fakes do not).
+type ProbeStore interface {
+	PutProbeSession(ctx context.Context, jobName string, raw []byte, ttl time.Duration) error
+	CASProbeSession(ctx context.Context, jobName string, expected, next []byte, ttl time.Duration) (bool, error)
+	GetProbeSession(ctx context.Context, jobName string) ([]byte, bool, error)
+	DeleteProbeSession(ctx context.Context, jobName string) error
+	ListProbeSessions(ctx context.Context) (map[string][]byte, error)
+}
+
+// probeSharedTTL is the retention of a shared probe session row: the probe's
+// own deadline plus a margin for the teardown/replay paths that read it after
+// the deadline.
+const probeSharedTTL = 24 * time.Hour
+
+// AttachShared wires the shared probe-session face. The table keeps serving
+// as the local cache; the shared row is the cross-instance authority.
+func (r *ProbeRegistry) AttachShared(s ProbeStore) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.shared = s
+}
+
+func probeStoreCtx() (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.Background(), 2*time.Second)
+}
+
+// storeLocked writes the session to the shared table; the caller holds mu.
+func (r *ProbeRegistry) storeLocked(s ProbeSession) error {
+	if r.shared == nil {
+		return nil
+	}
+	raw, err := json.Marshal(s)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := probeStoreCtx()
+	defer cancel()
+	return r.shared.PutProbeSession(ctx, s.JobName, raw, probeSharedTTL)
+}
+
+// cacheLocked inserts s into the local table and its runtime index; the
+// caller holds mu.
+func (r *ProbeRegistry) cacheLocked(s ProbeSession) {
+	if old, ok := r.probes[s.JobName]; ok {
+		r.dropRuntimeIndexLocked(old.JobRuntime, s.JobName)
+	}
+	e := s.clone()
+	r.probes[e.JobName] = e
+	if e.JobRuntime != "" {
+		r.byRuntime[e.JobRuntime] = e.JobName
+	}
 }
 
 // NewProbeRegistry returns an empty probe session table.
@@ -190,35 +249,78 @@ func (r *ProbeRegistry) PutProbe(s ProbeSession) error {
 	if e.JobRuntime != "" {
 		r.byRuntime[e.JobRuntime] = e.JobName
 	}
-	return nil
+	return r.storeLocked(e)
 }
 
 // ProbeByJob returns a copy of the session of jobName; it backs the probe
 // branch of auth.Verify (the entry reads token hash, request ids and runtime).
 func (r *ProbeRegistry) ProbeByJob(jobName string) (ProbeSession, bool) {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
-	s, ok := r.probes[jobName]
-	if !ok {
+	shared := r.shared
+	cached, cachedOK := r.probes[jobName]
+	r.mu.RUnlock()
+	if shared != nil {
+		ctx, cancel := probeStoreCtx()
+		raw, ok, err := shared.GetProbeSession(ctx, jobName)
+		cancel()
+		if err == nil && ok {
+			var s ProbeSession
+			if json.Unmarshal(raw, &s) == nil {
+				r.mu.Lock()
+				r.cacheLocked(s)
+				r.mu.Unlock()
+				return s.clone(), true
+			}
+		}
+		if err != nil && cachedOK {
+			// Store unreachable: the local row is the grace-window answer.
+			return cached.clone(), true
+		}
 		return ProbeSession{}, false
 	}
-	return s.clone(), true
+	if !cachedOK {
+		return ProbeSession{}, false
+	}
+	return cached.clone(), true
 }
 
 // ProbeByRuntime returns a copy of the session owning jobRuntimeID; it backs
 // the ownership check of S5 and S27. An unknown or empty runtime id misses.
 func (r *ProbeRegistry) ProbeByRuntime(jobRuntimeID string) (ProbeSession, bool) {
 	r.mu.RLock()
-	defer r.mu.RUnlock()
 	jobName, ok := r.byRuntime[jobRuntimeID]
+	if ok {
+		s, ok := r.probes[jobName]
+		r.mu.RUnlock()
+		if ok {
+			return s.clone(), true
+		}
+	} else {
+		r.mu.RUnlock()
+	}
+	if r.shared == nil {
+		return ProbeSession{}, false
+	}
+	ctx, cancel := probeStoreCtx()
+	rows, err := r.shared.ListProbeSessions(ctx)
+	cancel()
+	if err != nil {
+		return ProbeSession{}, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, raw := range rows {
+		var s ProbeSession
+		if json.Unmarshal(raw, &s) != nil || s.JobName == "" {
+			continue
+		}
+		r.cacheLocked(s)
+	}
+	name, ok := r.byRuntime[jobRuntimeID]
 	if !ok {
 		return ProbeSession{}, false
 	}
-	s, ok := r.probes[jobName]
-	if !ok {
-		return ProbeSession{}, false
-	}
-	return s.clone(), true
+	return r.probes[name].clone(), true
 }
 
 // DeleteProbe removes the session of jobName together with its reverse index
@@ -227,16 +329,37 @@ func (r *ProbeRegistry) ProbeByRuntime(jobRuntimeID string) (ProbeSession, bool)
 // (the credential must be dead) already holds.
 func (r *ProbeRegistry) DeleteProbe(jobName string) error {
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	if s, ok := r.probes[jobName]; ok {
 		r.dropRuntimeIndexLocked(s.JobRuntime, jobName)
 		delete(r.probes, jobName)
+	}
+	shared := r.shared
+	r.mu.Unlock()
+	if shared != nil {
+		ctx, cancel := probeStoreCtx()
+		defer cancel()
+		return shared.DeleteProbeSession(ctx, jobName)
 	}
 	return nil
 }
 
 // ListProbes returns a copy of every session, for the ops view and for tests.
 func (r *ProbeRegistry) ListProbes() []ProbeSession {
+	if r.shared != nil {
+		ctx, cancel := probeStoreCtx()
+		rows, err := r.shared.ListProbeSessions(ctx)
+		cancel()
+		if err == nil {
+			r.mu.Lock()
+			for _, raw := range rows {
+				var s ProbeSession
+				if json.Unmarshal(raw, &s) == nil && s.JobName != "" {
+					r.cacheLocked(s)
+				}
+			}
+			r.mu.Unlock()
+		}
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	out := make([]ProbeSession, 0, len(r.probes))
@@ -255,6 +378,9 @@ func (r *ProbeRegistry) ListProbes() []ProbeSession {
 // update), and the reverse index is repaired when the mutation moved
 // JobRuntime.
 func (r *ProbeRegistry) UpdateProbe(jobName string, mutate func(*ProbeSession)) (ProbeSession, bool) {
+	if r.shared != nil {
+		return r.updateProbeShared(jobName, mutate)
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	s, ok := r.probes[jobName]
@@ -345,4 +471,52 @@ func (c *StartupCatalog) Snapshot() map[string][]byte {
 		out[key] = slices.Clone(body)
 	}
 	return out
+}
+
+// updateProbeShared applies one single-field update against the shared row
+// with an optimistic CAS, so a write from another instance is never clobbered.
+func (r *ProbeRegistry) updateProbeShared(jobName string, mutate func(*ProbeSession)) (ProbeSession, bool) {
+	for range 8 {
+		ctx, cancel := probeStoreCtx()
+		raw, ok, err := r.shared.GetProbeSession(ctx, jobName)
+		cancel()
+		if err != nil {
+			// A store failure is not an update: the caller must treat the
+			// session as not updated (fail closed) rather than believe an
+			// unpersisted write landed.
+			return ProbeSession{}, false
+		}
+		if !ok {
+			return ProbeSession{}, false
+		}
+		var s ProbeSession
+		if json.Unmarshal(raw, &s) != nil {
+			return ProbeSession{}, false
+		}
+		oldRuntime := s.JobRuntime
+		mutate(&s)
+		s.JobName = jobName
+		next, err := json.Marshal(s)
+		if err != nil {
+			return ProbeSession{}, false
+		}
+		ctx, cancel = probeStoreCtx()
+		swapped, err := r.shared.CASProbeSession(ctx, jobName, raw, next, probeSharedTTL)
+		cancel()
+		if err != nil {
+			// Not persisted: report the update as unapplied. The store's own
+			// outage event carries the visibility (§9.1).
+			return ProbeSession{}, false
+		}
+		if swapped {
+			r.mu.Lock()
+			if oldRuntime != s.JobRuntime {
+				r.dropRuntimeIndexLocked(oldRuntime, jobName)
+			}
+			r.cacheLocked(s)
+			r.mu.Unlock()
+			return s.clone(), true
+		}
+	}
+	return ProbeSession{}, false
 }

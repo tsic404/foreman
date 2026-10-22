@@ -26,6 +26,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	"github.com/coder/websocket"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -33,10 +34,12 @@ import (
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 
 	"github.com/tsic404/foreman/internal/auth"
+	"github.com/tsic404/foreman/internal/coordination"
 	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/proxy"
 	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
+	"github.com/tsic404/foreman/internal/state"
 )
 
 var testKey = bytes.Repeat([]byte{0x24}, 32)
@@ -1431,6 +1434,91 @@ func (c *jobClient) jobCreated(name string) bool {
 }
 
 // jobDeleted reports whether the Job object was deleted.
+// jobCreatedCount counts how many create calls targeted name.
+func (c *jobClient) jobCreatedCount(name string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, job := range c.createdJobs {
+		if job.Name == name {
+			n++
+		}
+	}
+	return n
+}
+
+// deletedCount counts how many delete calls targeted name.
+func (c *jobClient) deletedCount(name string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, deleted := range c.deletedJobs {
+		if deleted == name {
+			n++
+		}
+	}
+	return n
+}
+
+// liveJobs counts the Job objects currently held.
+func (c *jobClient) liveJobs() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return len(c.jobs)
+}
+
+// prepareLeaseCalls counts the C-4 prepare-lease renewals the stub received.
+func (s *upstreamStub) prepareLeaseCalls() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	n := 0
+	for _, req := range s.requests {
+		if req.Method == "POST" && strings.HasSuffix(req.Path, "/prepare-lease") {
+			n++
+		}
+	}
+	return n
+}
+
+// queuedCount reports the stub server's queue length.
+func (s *upstreamStub) queuedCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return len(s.queued)
+}
+
+// heartbeatRuntimeIDs counts the heartbeat requests per runtime id.
+func (s *upstreamStub) heartbeatRuntimeIDs() map[string]int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	out := map[string]int{}
+	for _, req := range s.requests {
+		if req.Method != "POST" || req.Path != "/api/daemon/heartbeat" {
+			continue
+		}
+		var body struct {
+			RuntimeID string `json:"runtime_id"`
+		}
+		if json.Unmarshal(req.Body, &body) == nil && body.RuntimeID != "" {
+			out[body.RuntimeID]++
+		}
+	}
+	return out
+}
+
+// liveJobCount counts the Job objects currently held for name.
+func (c *jobClient) liveJobCount(name string) int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	n := 0
+	for _, job := range c.jobs {
+		if job.Name == name {
+			n++
+		}
+	}
+	return n
+}
+
 func (c *jobClient) jobDeleted(name string) bool {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -1532,7 +1620,26 @@ func (b *builder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, s
 	if err != nil {
 		return nil, nil, "", err
 	}
-	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name}}
+	// The canned object carries the per-task identity keys the K8s rebuild
+	// reads (§3 判定式), so a scenario judging the rebuild exercises the same
+	// object shape the production builder writes.
+	labels := map[string]string{
+		registry.LabelManagedBy:   registry.ManagedByForeman,
+		registry.LabelTaskID:      e.TaskID,
+		registry.LabelWorkspaceID: e.WorkspaceID,
+	}
+	if e.AgentID != "" {
+		labels[registry.LabelAgentID] = e.AgentID
+	}
+	annos := map[string]string{
+		registry.AnnoDaemonID:     "fm-" + e.TaskID,
+		registry.AnnoJobRuntimeID: e.JobRuntimeID,
+		registry.AnnoAttempt:      strconv.Itoa(e.Attempt),
+	}
+	if !e.ClaimedAt.IsZero() {
+		annos[registry.AnnoClaimedAt] = e.ClaimedAt.UTC().Format(time.RFC3339)
+	}
+	job := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels, Annotations: annos}}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name + "-cred"}}
 	b.mu.Lock()
 	if b.tokens == nil {
@@ -2175,6 +2282,13 @@ func (m *recordingMetrics) DeliveryClaim(result string) {
 
 func (m *recordingMetrics) DeliveryLatency(float64) {}
 
+func (m *recordingMetrics) QueueOp(string)                  {}
+func (m *recordingMetrics) QueueDepth(int)                  {}
+func (m *recordingMetrics) SharedSlots(string, int)         {}
+func (m *recordingMetrics) TaskLockWait(float64)            {}
+func (m *recordingMetrics) ReconcileResult(string, float64) {}
+func (m *recordingMetrics) StateError(string)               {}
+
 func (m *recordingMetrics) DeliveryUnconfirmed() {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -2550,6 +2664,14 @@ type harness struct {
 	jobImage string
 
 	schedCfg scheduler.Config
+	// Stage-two coordination face (ADR-046 决策 1-9): the shared store, this
+	// instance's identity and the leader lease a scenario drives explicitly.
+	coord      state.CoordStore
+	instanceID string
+	leaderCfg  coordination.Config
+	leader     *coordination.Leader
+	leaderStop context.CancelFunc
+	leaderDone chan struct{}
 	// revoker is the scheduler's credential-revocation seam. Nil leaves it
 	// inert (noRevoker): a scenario that judges the revocation set wires the
 	// shared issuer here and rebuilds the scheduler, as a deployment wires it.
@@ -2623,7 +2745,7 @@ func newHarnessWithOptions(t *testing.T, catalogEnabled bool, window time.Durati
 // face wired into the registry and the issuer (ADR-046): the harness mirrors
 // cmd/foreman's wiring, so a scenario can drive the restart-persistence
 // semantics against a real store (miniredis) instead of stubs.
-func newHarnessWithSharedState(t *testing.T, catalogEnabled bool, store registry.StateStore) *harness {
+func newHarnessWithSharedState(t *testing.T, catalogEnabled bool, store state.Store) *harness {
 	t.Helper()
 	return buildHarnessWith(t, catalogEnabled, deliveryConfirmWindow, nil, false, false, harnessOptions{store: store})
 }
@@ -2637,7 +2759,21 @@ type harnessOptions struct {
 	pendingOpts []scheduler.PendingReportsOption
 	// store is the shared state face the registry and the issuer persist
 	// through; nil keeps the pre-stage-one in-memory shape.
-	store registry.StateStore
+	store state.Store
+	// coord is the stage-two coordination face; nil keeps the scheduler on the
+	// stage-one in-memory delivery/counter path.
+	coord      state.CoordStore
+	instanceID string
+	// serverURL points this instance's proxy client at another instance's
+	// upstream stub: the two-instance fixtures share one server-side queue.
+	serverURL string
+	// jobs lets a second instance share the first instance's fake cluster.
+	jobs *jobClient
+	// grace is the shared-state outage window written to the issuer.
+	grace time.Duration
+	// mutateSched adjusts the scheduler config before construction.
+	mutateSched func(*scheduler.Config)
+	leaderCfg   coordination.Config
 }
 
 func buildHarness(t *testing.T, catalogEnabled bool, window time.Duration, skill func(*proxy.Config), realServer, wsEnabled bool) *harness {
@@ -2676,6 +2812,9 @@ func buildHarnessWith(t *testing.T, catalogEnabled bool, window time.Duration, s
 		SkillCacheMaxEntries:      skillMaxEntries,
 		SkillCacheMaxBytes:        skillMaxBytes,
 	}
+	if opts.serverURL != "" {
+		cfg.ServerURL = opts.serverURL
+	}
 	if skill != nil {
 		skill(&cfg)
 	}
@@ -2697,11 +2836,26 @@ func buildHarnessWith(t *testing.T, catalogEnabled bool, window time.Duration, s
 			}),
 		}, opts.clientOpts...)...,
 	)
-	issuer, err := proxy.JobTokenIssuer(testKey, reg, probes, auth.DefaultJobTokenTTL, opts.store)
+	if opts.coord != nil {
+		probes.AttachShared(opts.coord)
+		slots.AttachShared(opts.coord)
+	}
+	issuerOpts := []auth.Option{}
+	if opts.coord != nil {
+		grace := opts.grace
+		if grace == 0 {
+			grace = 30 * time.Second
+		}
+		issuerOpts = append(issuerOpts, auth.WithSharedHealth(opts.coord, grace))
+	}
+	issuer, err := proxy.JobTokenIssuer(testKey, reg, probes, auth.DefaultJobTokenTTL, opts.store, issuerOpts...)
 	if err != nil {
 		t.Fatalf("JobTokenIssuer: %v", err)
 	}
-	jobs := newJobClient()
+	jobs := opts.jobs
+	if jobs == nil {
+		jobs = newJobClient()
+	}
 	bld := &builder{issuer: issuer, probes: probes}
 	server := &schedulerServerClient{}
 	var serverClient scheduler.ServerClient = server
@@ -2738,13 +2892,32 @@ func buildHarnessWith(t *testing.T, catalogEnabled bool, window time.Duration, s
 		ReconcileInterval:      30 * time.Second,
 		Project:                payloadProjectIdentity{},
 	}
-	sched, err := scheduler.New(schedCfg, reg, jobs, bld, serverClient, metrics,
+	if opts.mutateSched != nil {
+		opts.mutateSched(&schedCfg)
+	}
+	h := &harness{coord: opts.coord, instanceID: opts.instanceID, leaderCfg: opts.leaderCfg}
+	schedOpts := []scheduler.Option{
 		scheduler.WithPendingReports(pending),
 		scheduler.WithRevoker(noRevoker{}),
 		scheduler.WithProbeRegistry(probes),
 		scheduler.WithLogger(slog.New(slog.NewJSONHandler(logs, nil))),
 		scheduler.WithRuntimeIdentity(client.RuntimeIdentity),
-	)
+	}
+	if opts.coord != nil {
+		instanceID := opts.instanceID
+		if instanceID == "" {
+			instanceID = "instance-1"
+		}
+		lockTTL := opts.leaderCfg.TaskLockTTL
+		if lockTTL == 0 {
+			lockTTL = 30 * time.Second
+		}
+		schedOpts = append(schedOpts,
+			scheduler.WithSharedStore(opts.coord, instanceID, lockTTL),
+			scheduler.WithLeaderGate(func() bool { return h.leader != nil && h.leader.Held() }),
+		)
+	}
+	sched, err := scheduler.New(schedCfg, reg, jobs, bld, serverClient, metrics, schedOpts...)
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
 	}
@@ -2766,13 +2939,30 @@ func buildHarnessWith(t *testing.T, catalogEnabled bool, window time.Duration, s
 	httpServer := httptest.NewServer(handler)
 	t.Cleanup(httpServer.Close)
 
-	return &harness{
-		t: t, cfg: cfg, reg: reg, probes: probes, startup: startup, slots: slots,
-		jobs: jobs, builder: bld, server: server, serverClient: serverClient, metrics: metrics, issuer: issuer,
-		client: client, sched: sched, pending: pending, upstream: upstream, handler: handler,
-		jobsHTTP: httpServer, logs: logs, handlerLogs: handlerLogs,
-		bundles: bundles, skillClock: skillClock, schedCfg: schedCfg,
-	}
+	h.t = t
+	h.cfg = cfg
+	h.reg = reg
+	h.probes = probes
+	h.startup = startup
+	h.slots = slots
+	h.jobs = jobs
+	h.builder = bld
+	h.server = server
+	h.serverClient = serverClient
+	h.metrics = metrics
+	h.issuer = issuer
+	h.client = client
+	h.sched = sched
+	h.pending = pending
+	h.upstream = upstream
+	h.handler = handler
+	h.jobsHTTP = httpServer
+	h.logs = logs
+	h.handlerLogs = handlerLogs
+	h.bundles = bundles
+	h.skillClock = skillClock
+	h.schedCfg = schedCfg
+	return h
 }
 
 // rebuildScheduler replaces the scheduler with one built from a mutated
@@ -2789,13 +2979,28 @@ func (h *harness) rebuildSchedulerWithLevel(t *testing.T, level slog.Level, muta
 	t.Helper()
 	cfg := h.schedCfg
 	mutate(&cfg)
-	sched, err := scheduler.New(cfg, h.reg, h.jobs, h.builder, h.serverClient, h.metrics,
+	opts := []scheduler.Option{
 		scheduler.WithPendingReports(h.pending),
 		scheduler.WithRevoker(credentialRevoker(h.revoker)),
 		scheduler.WithProbeRegistry(h.probes),
 		scheduler.WithLogger(slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: level}))),
 		scheduler.WithRuntimeIdentity(h.client.RuntimeIdentity),
-	)
+	}
+	if h.coord != nil {
+		instanceID := h.instanceID
+		if instanceID == "" {
+			instanceID = "instance-1"
+		}
+		lockTTL := h.leaderCfg.TaskLockTTL
+		if lockTTL == 0 {
+			lockTTL = 30 * time.Second
+		}
+		opts = append(opts,
+			scheduler.WithSharedStore(h.coord, instanceID, lockTTL),
+			scheduler.WithLeaderGate(func() bool { return h.leader != nil && h.leader.Held() }),
+		)
+	}
+	sched, err := scheduler.New(cfg, h.reg, h.jobs, h.builder, h.serverClient, h.metrics, opts...)
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
 	}
@@ -3130,4 +3335,259 @@ func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool)
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("timed out waiting for %s", what)
+}
+
+// startLeader runs this instance's control-plane lease until stopLeader (or
+// the test's cleanup). OnAcquire mirrors production: takeover reconciliation
+// before the control plane serves.
+func (h *harness) startLeader(t *testing.T) {
+	t.Helper()
+	h.runLeader(t)
+	if !h.leader.WaitHeld(context.Background(), 10*time.Second) {
+		t.Fatal("leader lease was not acquired")
+	}
+}
+
+// runLeader starts this instance's lease loop without waiting for ownership
+// (the follower side of a takeover scenario).
+func (h *harness) runLeader(t *testing.T) {
+	t.Helper()
+	if h.coord == nil {
+		t.Fatal("runLeader: no shared coordination face")
+	}
+	cfg := h.leaderCfg
+	if cfg.LeaseTTL == 0 {
+		cfg = coordination.Config{
+			LeaseTTL:       600 * time.Millisecond,
+			TakeoverWindow: 50 * time.Millisecond,
+			InstanceTTL:    5 * time.Second,
+			TaskLockTTL:    30 * time.Second,
+		}
+	}
+	instanceID := h.instanceID
+	if instanceID == "" {
+		instanceID = "instance-1"
+	}
+	h.leader = coordination.New(h.coord, instanceID, cfg,
+		coordination.WithLogger(slog.New(slog.NewJSONHandler(h.logs, nil))),
+		coordination.WithOnAcquire(h.sched.OnTakeover))
+	ctx, cancel := context.WithCancel(t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = h.leader.Run(ctx)
+	}()
+	h.leaderStop = cancel
+	h.leaderDone = done
+	t.Cleanup(func() { h.stopLeader(t) })
+}
+
+// crashLeader kills this instance's control plane without releasing the
+// lease: the survivor must wait out the lease TTL (a real process death).
+func (h *harness) crashLeader(t *testing.T) {
+	t.Helper()
+	if h.leader != nil {
+		h.leader.Crash()
+	}
+	h.stopLeader(t)
+}
+
+// stopLeader releases the lease and parks this instance's control plane.
+func (h *harness) stopLeader(t *testing.T) {
+	t.Helper()
+	if h.leaderStop == nil {
+		return
+	}
+	h.leaderStop()
+	<-h.leaderDone
+	h.leaderStop = nil
+	h.leaderDone = nil
+	h.leader = nil
+}
+
+// queueDepth reads the shared queue's marker count.
+func (h *harness) queueDepth(t *testing.T) int64 {
+	t.Helper()
+	n, err := h.coord.QueueDepth(context.Background())
+	if err != nil {
+		t.Fatalf("QueueDepth: %v", err)
+	}
+	return n
+}
+
+// twoInstances is the stage-two fixture: two full instances sharing one
+// miniredis store, one fake K8s cluster and one upstream stub (the leader's).
+type twoInstances struct {
+	t     *testing.T
+	mr    *miniredis.Miniredis
+	store state.Store
+	coord state.CoordStore
+	// stateEvents records the shared-state availability transitions the
+	// production event hook emits (§9.1).
+	stateEvents *syncBuffer
+	a, b        *harness
+}
+
+// twoInstanceOptions are the fixture knobs of the two-instance world.
+type twoInstanceOptions struct {
+	deliveryWindow   time.Duration
+	grace            time.Duration
+	bootTimeout      time.Duration
+	maxInflight      int
+	maxInflightPerWS int
+	leaderCfg        coordination.Config
+	// wsEnabled mounts the Job-side S-30 route (the subscription gate's
+	// evidence needs it).
+	wsEnabled bool
+	// workspaces overrides the scheduler's configured workspace set (the
+	// zero-row counter reconciliation needs a workspace with no live row).
+	workspaces []string
+}
+
+func newTwoInstances(t *testing.T, opts twoInstanceOptions) *twoInstances {
+	t.Helper()
+	if opts.deliveryWindow == 0 {
+		opts.deliveryWindow = 300 * time.Millisecond
+	}
+	if opts.grace == 0 {
+		opts.grace = 30 * time.Second
+	}
+	if opts.bootTimeout == 0 {
+		opts.bootTimeout = 300 * time.Second
+	}
+	if opts.maxInflight == 0 {
+		opts.maxInflight = 10
+	}
+	if opts.leaderCfg.LeaseTTL == 0 {
+		opts.leaderCfg = coordination.Config{
+			LeaseTTL:       600 * time.Millisecond,
+			TakeoverWindow: 50 * time.Millisecond,
+			InstanceTTL:    5 * time.Second,
+			TaskLockTTL:    30 * time.Second,
+		}
+	}
+	mr := miniredis.RunT(t)
+	stateEvents := &syncBuffer{}
+	st, err := state.New(state.Config{
+		URL:         "redis://" + mr.Addr(),
+		DialTimeout: time.Second,
+		EntryTTL:    48 * time.Hour,
+		Grace:       opts.grace,
+	}, state.WithEventHook(func(event string, downFor time.Duration, err error) {
+		detail := event
+		if event == "recovered" {
+			detail = event + " " + downFor.String()
+		}
+		_, _ = stateEvents.Write([]byte(detail + "\n"))
+	}))
+	if err != nil {
+		t.Fatalf("state.New: %v", err)
+	}
+	coord := st.(state.CoordStore)
+	mutate := func(c *scheduler.Config) {
+		c.JobBootTimeout = opts.bootTimeout
+		c.DeliveryConfirmTimeout = opts.deliveryWindow
+		c.MaxInflightJobs = opts.maxInflight
+		c.MaxInflightJobsPerWorkspace = opts.maxInflightPerWS
+		if len(opts.workspaces) > 0 {
+			c.Workspaces = opts.workspaces
+		}
+	}
+	a := buildHarnessWith(t, false, opts.deliveryWindow, nil, false, opts.wsEnabled, harnessOptions{
+		store: st, coord: coord, instanceID: "instance-a", grace: opts.grace,
+		mutateSched: mutate, leaderCfg: opts.leaderCfg,
+	})
+	b := buildHarnessWith(t, false, opts.deliveryWindow, nil, false, opts.wsEnabled, harnessOptions{
+		store: st, coord: coord, instanceID: "instance-b", grace: opts.grace,
+		mutateSched: mutate, leaderCfg: opts.leaderCfg,
+		serverURL: a.upstream.server.URL, jobs: a.jobs,
+	})
+	// One server-side declaration serves both clients.
+	a.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+	return &twoInstances{t: t, mr: mr, store: st, coord: coord, stateEvents: stateEvents, a: a, b: b}
+}
+
+// declare performs C1 for one instance through the shared upstream stub.
+func (tw *twoInstances) declare(t *testing.T, h *harness) {
+	t.Helper()
+	h.declare(declaredRuntimes())
+}
+
+// clientList renders the harness's client as the bootstrap's client slice.
+func (h *harness) clientList() []*proxy.Client { return []*proxy.Client{h.client} }
+
+// autoRegisterStartupProbe answers the startup probe's S-4 through the
+// harness's own Job face when the probe Job is created: the probe daemon
+// registers its declared runtime, which is the probe's completion signal.
+func (h *harness) autoRegisterStartupProbe(t *testing.T, workspaceID string) {
+	t.Helper()
+	h.jobs.onCreateJob = func(job *batchv1.Job) {
+		go func(name string) {
+			token := h.builder.probeToken(name)
+			if token == "" {
+				return
+			}
+			body, err := json.Marshal(map[string]any{
+				"daemon_id":    name,
+				"workspace_id": workspaceID,
+				"cli_version":  "0.6.1",
+				"runtimes": []map[string]string{{
+					"name": "foreman-job", "type": "omp", "version": "0.6.1",
+				}},
+			})
+			if err != nil {
+				t.Errorf("marshal probe registration: %v", err)
+				return
+			}
+			if code, resp := h.call("POST", "/api/daemon/register", token, body); code != 200 {
+				t.Errorf("probe S-4 = %d: %s", code, resp)
+			}
+		}(job.Name)
+	}
+}
+
+// startAssemblyControlPlane builds and starts the loop set through the
+// production builder (proxy.NewControlPlane) with the same gate/publisher
+// wiring cmd/foreman applies. It returns a stop function.
+func (h *harness) startAssemblyControlPlane(t *testing.T, gate func() bool, publisher func(context.Context, *proxy.Client) error) func() {
+	t.Helper()
+	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.client.CatalogSlots(), h.metrics)
+	plane := proxy.NewControlPlane(proxy.ControlPlaneOptions{
+		ProxyConfig: h.cfg,
+		Client:      h.client,
+		Scheduler:   h.sched,
+		Registry:    h.reg,
+		LeaseHooks:  h.sched,
+		Reporter:    reporter,
+		Metrics:     h.metrics,
+		Logger:      slog.New(slog.NewJSONHandler(h.logs, nil)),
+		WorkspaceID: "ws-1",
+		WSEnabled:   h.cfg.WSEnabled,
+	})
+	if gate != nil {
+		plane.SetLeaderGate(gate)
+	}
+	if publisher != nil {
+		plane.SetDeclarationPublisher(publisher)
+	}
+	ctx, cancel := context.WithCancel(t.Context())
+	var wg sync.WaitGroup
+	for _, component := range plane.Components() {
+		wg.Add(1)
+		go func(run func(context.Context) error) {
+			defer wg.Done()
+			_ = run(ctx)
+		}(component.Run)
+	}
+	stopped := false
+	stop := func() {
+		if stopped {
+			return
+		}
+		stopped = true
+		cancel()
+		wg.Wait()
+	}
+	t.Cleanup(stop)
+	return stop
 }

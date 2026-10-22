@@ -4,6 +4,7 @@
 package acceptance
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
@@ -48,7 +49,8 @@ func TestTechMultiWS01ParallelChainsDoNotCross(t *testing.T) {
 	// Each daemon receives only its own workspace's task; the runtime id is
 	// rewritten to its own job runtime.
 	for _, e := range []registry.TaskEntry{entryA, entryB} {
-		tasks, err := m.sched.Deliver(e.DaemonID, e.JobRuntimeID, 1)
+		delivery, err := m.sched.Deliver(context.Background(), e.WorkspaceID, e.DaemonID, e.JobRuntimeID, 1)
+		tasks := delivery.Tasks
 		if err != nil {
 			t.Fatalf("Deliver(%s): %v", e.DaemonID, err)
 		}

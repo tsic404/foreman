@@ -53,11 +53,13 @@ type RequestScope struct {
 
 // JobLookup is the auth module's read view of the task registry.
 type JobLookup interface {
-	// ByDaemon returns the entry bound to daemonID (= job name); ok is false
-	// when no entry exists. Entry existence IS credential validity: an entry
-	// survives its task's verdict for as long as its Job does (draining),
-	// and disappears at the credential reclaim (ADR-017).
-	ByDaemon(daemonID string) (JobEntry, bool)
+	// ByDaemonInWorkspace returns the entry bound to daemonID (= job name) in
+	// workspaceID; ok is false when no entry exists. Entry existence IS
+	// credential validity: an entry survives its task's verdict for as long
+	// as its Job does (draining), and disappears at the credential reclaim
+	// (ADR-017). Stage two's lookup is partitioned: a local miss reads the
+	// shared row, so any instance authenticates any Job (§2.1 任实例服务).
+	ByDaemonInWorkspace(workspaceID, daemonID string) (JobEntry, bool)
 }
 
 // JobEntry is the subset of a registry entry that Verify needs. WorkspaceID
@@ -66,6 +68,9 @@ type JobLookup interface {
 type JobEntry struct {
 	JobRuntimeID string
 	WorkspaceID  string
+	// Terminal reports the entry's terminal state: a revoked token may still
+	// replay a terminal endpoint of its own already-settled task (§6.4, AC-74).
+	Terminal bool
 }
 
 // DoneIndex reports tasks that reached terminal state within the retention
@@ -114,6 +119,28 @@ type Issuer struct {
 	// revokeErr observes shared-state failures (§9.1: the shared face's
 	// unavailability is an event, never silent).
 	revokeErr func(op string, err error)
+	// health is the shared state's availability face plus the cache grace
+	// window (§10 共享状态不可用). Nil keeps the stage-one behaviour.
+	health StateHealth
+	grace  time.Duration
+}
+
+// StateHealth is the shared state's outage face the issuer's fail-closed path
+// reads (satisfied by *state.Health).
+type StateHealth interface {
+	Available() bool
+	DownFor() time.Duration
+}
+
+// WithSharedHealth wires the outage face and the cache grace window.
+func WithSharedHealth(health StateHealth, grace time.Duration) Option {
+	return func(i *Issuer) { i.health = health; i.grace = grace }
+}
+
+// WithRevocationReader wires the stage-two cross-instance revocation read: a
+// digest revoked on another instance is seen here on its first Verify.
+func WithRevocationReader(store RevocationStore) Option {
+	return func(i *Issuer) { i.revokeStore = store }
 }
 
 // RevocationStore is the shared revocation set face; satisfied by
@@ -338,7 +365,11 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 		}
 		return claims, nil
 	}
-	entry, ok := i.jobs.ByDaemon(payload.JobName)
+	if i.health != nil && !i.health.Available() && i.health.DownFor() > i.grace {
+		// Beyond the grace window the cached facts no longer adjudicate.
+		return Claims{}, fmt.Errorf("%w: outage %s", ErrStateUnavailable, i.health.DownFor())
+	}
+	entry, ok := i.jobs.ByDaemonInWorkspace(payload.WorkspaceID, payload.JobName)
 	if !ok {
 		if i.done.IsDone(payload.WorkspaceID, payload.TaskID) && req.IsTerminalEndpoint {
 			// The replay is idempotent only for the token's own task: the
@@ -370,8 +401,31 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 	// cache with the revocation window) is stage two's contract (§6.1
 	// 跨实例一致); doing it here would put a store call on every daemon
 	// request for no stage-one gain.
-	if i.revocations.IsRevoked(i.Hash(token)) {
-		return Claims{}, ErrRevoked
+	digest := i.Hash(token)
+	if i.revocations.IsRevoked(digest) {
+		return revocationVerdict(entry, payload, req, claims)
+	}
+	if i.revokeStore != nil {
+		// Stage two's cross-instance read (§6.1 跨实例一致): a digest revoked
+		// on another instance must be seen here inside the bounded window.
+		// The read is bounded; a failed read is fail-closed on the token face
+		// (the entry existence above already passed).
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		revoked, err := i.revokeStore.IsRevoked(ctx, payload.WorkspaceID, digest)
+		cancel()
+		if err != nil {
+			// The outage face: within the grace window the in-process set is
+			// the adjudication source (a revocation written elsewhere during
+			// the outage is the bounded-window tolerance, §6.1); beyond it the
+			// health gate at the top of Verify already failed closed.
+			if i.revokeErr != nil {
+				i.revokeErr("read", err)
+			}
+		}
+		if revoked {
+			i.revocations.Revoke(digest, claims.ExpiresAt.Add(ClockSkew))
+			return revocationVerdict(entry, payload, req, claims)
+		}
 	}
 	// 6. The request resource must match the token scope.
 	if req.TaskID != "" && req.TaskID != payload.TaskID {
@@ -418,4 +472,25 @@ func (i *Issuer) Revoke(tokenHash, workspaceID string) {
 			i.revokeErr("revoke", err)
 		}
 	}
+}
+
+// revocationVerdict is the revoked-token face (§6.4, AC-74). A terminal
+// endpoint of the token's own settled task is an idempotent replay; the same
+// endpoint with a foreign task or runtime id is the §2.1 rule-1 scope
+// mismatch (403), judged before the revocation verdict; every other endpoint
+// stays 401.
+func revocationVerdict(entry JobEntry, payload tokenPayload, req RequestScope, claims Claims) (Claims, error) {
+	if req.IsTerminalEndpoint {
+		if req.TaskID != "" && req.TaskID != payload.TaskID {
+			return Claims{}, fmt.Errorf("%w: task %s", ErrScopeMismatch, req.TaskID)
+		}
+		if req.RuntimeID != "" && req.RuntimeID != entry.JobRuntimeID {
+			return Claims{}, fmt.Errorf("%w: runtime %s", ErrScopeMismatch, req.RuntimeID)
+		}
+		if entry.Terminal {
+			claims.IsLateReplay = true
+			return claims, nil
+		}
+	}
+	return Claims{}, ErrRevoked
 }

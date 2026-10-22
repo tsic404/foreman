@@ -34,7 +34,7 @@ import (
 )
 
 // multi08Store builds the stage-one shared state face over miniredis.
-func multi08Store(t *testing.T) (registry.StateStore, *miniredis.Miniredis) {
+func multi08Store(t *testing.T) (state.Store, *miniredis.Miniredis) {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	cfg := state.Config{

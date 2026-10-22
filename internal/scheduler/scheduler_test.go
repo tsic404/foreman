@@ -372,6 +372,13 @@ type tokenUsageSample struct {
 	cacheWrite int64
 }
 
+func (f *fakeMetrics) QueueOp(string)                  {}
+func (f *fakeMetrics) QueueDepth(int)                  {}
+func (f *fakeMetrics) SharedSlots(string, int)         {}
+func (f *fakeMetrics) TaskLockWait(float64)            {}
+func (f *fakeMetrics) ReconcileResult(string, float64) {}
+func (f *fakeMetrics) StateError(string)               {}
+
 func (f *fakeMetrics) ClaimError(reason string) {
 	f.mu.Lock()
 	f.claimErrors = append(f.claimErrors, reason)
@@ -452,6 +459,13 @@ type fixture struct {
 	sched   *Scheduler
 	pending *fakePendingReports
 	now     time.Time
+}
+
+// deliverStageOne drives one S-6 delivery on a fixture without the shared
+// store (the stage-one in-memory gate).
+func deliverStageOne(f *fixture, daemonID, runtimeID string, maxTasks int) ([]json.RawMessage, error) {
+	d, err := f.sched.Deliver(context.Background(), "", daemonID, runtimeID, maxTasks)
+	return d.Tasks, err
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -1254,11 +1268,11 @@ func TestDeliverHandsTaskOnceWithRuntimeRewrite(t *testing.T) {
 	// job_created is not deliverable: the daemon must register first.
 	f2 := newFixture(t)
 	e2 := f2.claim(t, "task-9")
-	if got, err := f2.sched.Deliver(e2.DaemonID, e2.JobRuntimeID, 1); err != nil || len(got) != 0 {
+	if got, err := deliverStageOne(f2, e2.DaemonID, e2.JobRuntimeID, 1); err != nil || len(got) != 0 {
 		t.Fatalf("pre-register deliver = %v, %v", got, err)
 	}
 
-	got, err := f.sched.Deliver(e.DaemonID, e.JobRuntimeID, 1)
+	got, err := deliverStageOne(f, e.DaemonID, e.JobRuntimeID, 1)
 	if err != nil || len(got) != 1 {
 		t.Fatalf("Deliver = %v, %v", got, err)
 	}
@@ -1295,7 +1309,7 @@ func TestDeliverHandsTaskOnceWithRuntimeRewrite(t *testing.T) {
 	}
 
 	// At-most-once: the second claim gets nothing.
-	got, err = f.sched.Deliver(e.DaemonID, e.JobRuntimeID, 1)
+	got, err = deliverStageOne(f, e.DaemonID, e.JobRuntimeID, 1)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("second Deliver = %v, %v", got, err)
 	}
@@ -1316,7 +1330,7 @@ func TestDeliverRearmsAnUnconfirmedDelivery(t *testing.T) {
 		t.Fatal("MarkDaemonRegistered failed")
 	}
 
-	first, err := f.sched.Deliver(e.DaemonID, e.JobRuntimeID, 1)
+	first, err := deliverStageOne(f, e.DaemonID, e.JobRuntimeID, 1)
 	if err != nil || len(first) != 1 {
 		t.Fatalf("first Deliver = %v, %v", first, err)
 	}
@@ -1327,14 +1341,14 @@ func TestDeliverRearmsAnUnconfirmedDelivery(t *testing.T) {
 	// Inside the window the commit stands: the response may still be in
 	// flight, so the daemon's claim is answered empty.
 	f.now = testNow.Add(window - time.Second)
-	if got, err := f.sched.Deliver(e.DaemonID, e.JobRuntimeID, 1); err != nil || len(got) != 0 {
+	if got, err := deliverStageOne(f, e.DaemonID, e.JobRuntimeID, 1); err != nil || len(got) != 0 {
 		t.Fatalf("in-window Deliver = %v, %v, want an empty batch", got, err)
 	}
 
 	// Past the window the payload is released: the next claim is the
 	// re-delivery, byte-identical to the first hand-over.
 	f.now = testNow.Add(window + time.Second)
-	second, err := f.sched.Deliver(e.DaemonID, e.JobRuntimeID, 1)
+	second, err := deliverStageOne(f, e.DaemonID, e.JobRuntimeID, 1)
 	if err != nil || len(second) != 1 {
 		t.Fatalf("re-delivery = %v, %v, want the payload again", second, err)
 	}
@@ -1366,7 +1380,7 @@ func TestDeliverRearmsAnUnconfirmedDelivery(t *testing.T) {
 		t.Fatal("MarkStarted failed")
 	}
 	f.now = f.now.Add(window + time.Second)
-	if got, err := f.sched.Deliver(e.DaemonID, e.JobRuntimeID, 1); err != nil || len(got) != 0 {
+	if got, err := deliverStageOne(f, e.DaemonID, e.JobRuntimeID, 1); err != nil || len(got) != 0 {
 		t.Fatalf("post-start Deliver = %v, %v, want an empty batch", got, err)
 	}
 }
@@ -1376,13 +1390,13 @@ func TestDeliverRejectsStrangers(t *testing.T) {
 	e := f.claim(t, "task-1")
 	f.reg.MarkDaemonRegistered(e.DaemonID, testNow)
 
-	if _, err := f.sched.Deliver("ghost", e.JobRuntimeID, 1); !errors.Is(err, ErrUnknownDaemon) {
+	if _, err := deliverStageOne(f, "ghost", e.JobRuntimeID, 1); !errors.Is(err, ErrUnknownDaemon) {
 		t.Fatalf("unknown daemon: %v", err)
 	}
-	if _, err := f.sched.Deliver(e.DaemonID, "rt-other", 1); !errors.Is(err, ErrRuntimeMismatch) {
+	if _, err := deliverStageOne(f, e.DaemonID, "rt-other", 1); !errors.Is(err, ErrRuntimeMismatch) {
 		t.Fatalf("runtime mismatch: %v", err)
 	}
-	if got, err := f.sched.Deliver(e.DaemonID, e.JobRuntimeID, 0); err != nil || len(got) != 0 {
+	if got, err := deliverStageOne(f, e.DaemonID, e.JobRuntimeID, 0); err != nil || len(got) != 0 {
 		t.Fatalf("zero budget: %v, %v", got, err)
 	}
 }
@@ -3109,7 +3123,7 @@ func TestTaskEventsCarryIdentity(t *testing.T) {
 		}); err != nil {
 			t.Fatalf("Put: %v", err)
 		}
-		if got, err := f.sched.Deliver("fm-task-1", "rt-1", 1); err != nil || len(got) != 0 {
+		if got, err := deliverStageOne(f, "fm-task-1", "rt-1", 1); err != nil || len(got) != 0 {
 			t.Fatalf("Deliver = %v, %v", got, err)
 		}
 		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.payload_missing"), "task-1", "fm-task-1", "fm-task-1")
@@ -3122,7 +3136,7 @@ func TestTaskEventsCarryIdentity(t *testing.T) {
 		if _, ok := f.reg.MarkDaemonRegistered(e.DaemonID, f.now); !ok {
 			t.Fatal("MarkDaemonRegistered failed")
 		}
-		if got, err := f.sched.Deliver(e.DaemonID, e.JobRuntimeID, 1); err != nil || len(got) != 1 {
+		if got, err := deliverStageOne(f, e.DaemonID, e.JobRuntimeID, 1); err != nil || len(got) != 1 {
 			t.Fatalf("Deliver = %v, %v", got, err)
 		}
 		assertTaskIdentity(t, findLogRecord(t, buf.Bytes(), "task.delivered"), "task-1", "fm-task-1", "fm-task-1")

@@ -332,6 +332,20 @@ restores them instead of rebuilding from K8s (ADR-046 阶段一,
   store. It must cover the Job Token TTL (`24h7m`: claim → boot → task →
   drain) plus the settled-record window (24h), which is why the default is
   48h.
+- `FOREMAN_STATE_GRACE` (default `30s`) — the outage window during which the
+  local positive cache still adjudicates. Past it every non-terminal request
+  fails closed (401/503). Keep it far below the Job Token TTL: a cached
+  adjudication may not outlive the revocation window (§6.1).
+- `FOREMAN_LEADER_LEASE_TTL` (default `10s`) and
+  `FOREMAN_LEADER_TAKEOVER_WINDOW` (default `2s`) — the control-plane lease
+  and the quiet period the new holder observes before it reconciles and
+  claims. The takeover bound is the lease plus this window.
+- `FOREMAN_INSTANCE_TTL` (default `30s`) — a replica's liveness row; the
+  shutdown path uses it to decide whether this replica is the last one.
+- `FOREMAN_TASK_LOCK_TTL` (default `120s`) — the per-task write lock's lease.
+  It must cover the longest locked action (the claim chain, including the
+  Job-name wait); a dead holder's lock expires after it and the convergence
+  round takes the action over.
 
 Requirements (§7 部署面):
 

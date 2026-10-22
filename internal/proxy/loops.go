@@ -21,10 +21,16 @@ const tokenRenewInterval = 72 * time.Hour
 type ClaimScheduler interface {
 	// ClaimBudget is how many tasks may be claimed right now.
 	ClaimBudget() int
-	// OnClaim registers a claimed task and creates its Job; duplicate
-	// claims (server redispatch) are settled inside (§4.3), so the loop hands
-	// every claimed task over.
-	OnClaim(ctx context.Context, task json.RawMessage) error
+	// ReserveSlots reserves up to want in-flight slots before the C3 call and
+	// returns how many were actually reserved (0 when the cap is reached). A
+	// claim is only issued for reserved slots (§10: claim 前必须持有预留).
+	ReserveSlots(ctx context.Context, want int) (int, error)
+	// ReleaseSlots returns reservations C3 did not fill.
+	ReleaseSlots(ctx context.Context, n int)
+	// OnClaimReserved registers a claimed task against an already-held
+	// reservation; duplicate claims (server redispatch) are settled inside
+	// (§4.3), so the loop hands every claimed task over.
+	OnClaimReserved(ctx context.Context, task json.RawMessage) error
 }
 
 // ClaimLoop is the polling claim loop (S-6 + §10): it claims up
@@ -40,7 +46,22 @@ type ClaimLoop struct {
 	log     *slog.Logger
 	wake    chan struct{} // cap 1: the single consumer is this loop
 	backoff *backoff
+	// leader gates the control plane: only the lease holder claims
+	// (02-contracts.md §1.1 发出者口径). Nil keeps the gate open (stage one).
+	leader func() bool
+	// onRegistered runs once the preflight's C1 succeeded: the leader stores
+	// the registration identity for followers/takeovers (ADR-046 决策 2).
+	onRegistered func(context.Context, *Client) error
 }
+
+// SetRegisteredHook wires the post-C1 declaration writer.
+func (l *ClaimLoop) SetRegisteredHook(fn func(context.Context, *Client) error) { l.onRegistered = fn }
+
+// leaderPollInterval is how often a parked control loop re-checks ownership.
+const leaderPollInterval = 500 * time.Millisecond
+
+// SetLeaderGate wires the control-plane ownership check.
+func (l *ClaimLoop) SetLeaderGate(g func() bool) { l.leader = g }
 
 // NewClaimLoop builds the claim loop.
 func NewClaimLoop(cfg Config, client *Client, sched ClaimScheduler) *ClaimLoop {
@@ -70,6 +91,12 @@ func (l *ClaimLoop) Wake() {
 // §1.5, AC-86).
 func (l *ClaimLoop) Run(ctx context.Context) error {
 	for {
+		if l.leader != nil && !l.leader() {
+			if !sleepOrDone(ctx, leaderPollInterval) {
+				return nil
+			}
+			continue
+		}
 		err := l.client.Preflight(ctx)
 		if err == nil {
 			break
@@ -81,7 +108,25 @@ func (l *ClaimLoop) Run(ctx context.Context) error {
 		}
 	}
 	l.backoff.reset()
+	if l.onRegistered != nil {
+		for {
+			if err := l.onRegistered(ctx, l.client); err == nil {
+				break
+			} else {
+				l.log.Error("registration declaration not stored", "err", err)
+			}
+			if !sleepOrDone(ctx, l.backoff.next()) {
+				return nil
+			}
+		}
+	}
 	for {
+		if l.leader != nil && !l.leader() {
+			if !sleepOrDone(ctx, leaderPollInterval) {
+				return nil
+			}
+			continue
+		}
 		if err := l.iterate(ctx); err != nil {
 			wait := l.backoff.next()
 			l.log.Error("claim failed", "err", err, "backoff", wait)
@@ -100,18 +145,27 @@ func (l *ClaimLoop) Run(ctx context.Context) error {
 	}
 }
 
-// iterate runs one claim round: budget → C3 → OnClaim per task.
+// iterate runs one claim round: budget → reserve → C3 → OnClaimReserved per
+// task, returning the reservations C3 did not fill.
 func (l *ClaimLoop) iterate(ctx context.Context) error {
 	n := l.sched.ClaimBudget()
 	if n == 0 {
 		return nil
 	}
-	tasks, err := l.client.ClaimTasks(ctx, n)
+	reserved, err := l.sched.ReserveSlots(ctx, n)
 	if err != nil {
 		return err
 	}
+	if reserved == 0 {
+		return nil
+	}
+	tasks, err := l.client.ClaimTasks(ctx, reserved)
+	if err != nil {
+		l.sched.ReleaseSlots(ctx, reserved)
+		return err
+	}
 	for _, task := range tasks {
-		if err := l.sched.OnClaim(ctx, task); err != nil {
+		if err := l.sched.OnClaimReserved(ctx, task); err != nil {
 			if errors.Is(err, scheduler.ErrUnnameableClaim) {
 				// The scheduler counted it and logged at a bounded rate; the
 				// server's lease expiry is the convergence. A per-attempt line
@@ -120,6 +174,9 @@ func (l *ClaimLoop) iterate(ctx context.Context) error {
 			}
 			l.log.Error("on-claim failed", "err", err)
 		}
+	}
+	if unused := reserved - len(tasks); unused > 0 {
+		l.sched.ReleaseSlots(ctx, unused)
 	}
 	return nil
 }
@@ -157,7 +214,13 @@ type HeartbeatLoop struct {
 	// it with a near-zero progression so a retry-count assertion does not
 	// spend the real 1s→30s waits.
 	newBackoff func() *backoff
+	// leader gates the control plane: a non-holder opens no heartbeat stream
+	// (§1.1 发出者口径). Nil keeps the gate open (stage one).
+	leader func() bool
 }
+
+// SetLeaderGate wires the control-plane ownership check.
+func (l *HeartbeatLoop) SetLeaderGate(g func() bool) { l.leader = g }
 
 // NewHeartbeatLoop builds the heartbeat loop.
 func NewHeartbeatLoop(client *Client, reporter *ModelCatalogReporter) *HeartbeatLoop {
@@ -220,6 +283,13 @@ func (l *HeartbeatLoop) Run(ctx context.Context) error {
 		}
 	}
 	for {
+		if l.leader != nil && !l.leader() {
+			stopAll()
+			if !sleepOrDone(ctx, leaderPollInterval) {
+				return nil
+			}
+			continue
+		}
 		reconcile()
 		select {
 		case <-ctx.Done():

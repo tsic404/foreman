@@ -26,6 +26,8 @@ import (
 	"k8s.io/client-go/tools/clientcmd"
 
 	"github.com/tsic404/foreman/internal/auth"
+	"github.com/tsic404/foreman/internal/bootstrap"
+	"github.com/tsic404/foreman/internal/coordination"
 	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/observability"
 	"github.com/tsic404/foreman/internal/platform"
@@ -149,13 +151,24 @@ func run() error {
 	// the pre-stage-one behaviour (in-memory index + K8s rebuild) — the
 	// shared state is an optional persistence face at stage one, never a
 	// startup requirement (02-contracts.md §7 部署面).
+	var stateEventMetrics *observability.Metrics
 	stateCfg, err := state.LoadConfig(getenv)
 	if err != nil {
 		return err
 	}
 	var shared state.Store
 	if stateCfg.URL != "" {
-		shared, err = state.New(stateCfg)
+		shared, err = state.New(stateCfg, state.WithEventHook(func(event string, downFor time.Duration, err error) {
+			switch event {
+			case "unavailable":
+				if stateEventMetrics != nil {
+					stateEventMetrics.StateError("shared_state")
+				}
+				log.Warn("state.unavailable", "err", err.Error())
+			case "recovered":
+				log.Info("state.recovered", "outage_seconds", downFor.Seconds())
+			}
+		}))
 		if err != nil {
 			return err
 		}
@@ -178,13 +191,28 @@ func run() error {
 				"detail", "FOREMAN_STATE_PASSWORD is empty or still the REPLACE_ME placeholder, and the URL carries no data-node credential: the shared state store is unauthenticated")
 		}
 	}
+	// Stage two (ADR-046 决策 1-9): the coordination primitives are active
+	// whenever the configured store exposes them. A deployment without the
+	// shared store keeps the stage-one process-local form.
+	coord, coordEnabled := shared.(state.CoordStore)
+	coordCfg, err := coordination.LoadConfig(getenv)
+	if err != nil {
+		return err
+	}
+	instanceID := coordination.InstanceIDFor(fmt.Sprintf("%d-%d", os.Getpid(), started.UnixNano()))
+
+	var metricsForState scheduler.Metrics
 	reg := registry.New(time.Now,
 		registry.WithDrainTimeout(schedCfg.JobDrainTimeout),
+		registry.WithSessionTTL(recCfg.AgentStateTTL),
 		registry.WithDeliveryConfirmTimeout(schedCfg.DeliveryConfirmTimeout),
 		registry.WithStateStore(shared),
 		// §9.1: a shared-state failure is an event, never silent. The
 		// in-memory transition stands (the K8s rebuild is the backstop).
 		registry.WithStateErrorHook(func(op, taskID string, err error) {
+			if metricsForState != nil {
+				metricsForState.StateError(op)
+			}
 			log.Warn("state.entry_failed", "op", op, "task_id", taskID, "err", err.Error())
 		}))
 	// The catalog probe's identity lives beside the task registry (ADR-019):
@@ -192,6 +220,8 @@ func run() error {
 	// lifecycle all read.
 	probes := registry.NewProbeRegistry()
 	metrics := observability.NewMetrics()
+	stateEventMetrics = metrics
+	metricsForState = metrics
 
 	// The user-scoped discovery form resolves its workspace set before any
 	// client exists: C-17 with the single credential, the manifest rule
@@ -227,6 +257,11 @@ func run() error {
 		cfg.WorkspaceID = identity.WorkspaceID
 		cfg.DaemonID = identity.DaemonID
 		slots := proxy.NewCatalogSlots()
+		if coordEnabled {
+			// §1.3 跨实例口径: a probe result landed on the holder replays on
+			// any instance that receives the command.
+			slots.AttachShared(coord)
+		}
 		slotsByWorkspace[identity.WorkspaceID] = slots
 		tokenByWorkspace[identity.WorkspaceID] = identity.Token
 		client := proxy.NewClient(cfg, identity.Token,
@@ -309,10 +344,18 @@ func run() error {
 		return err
 	}
 
-	issuer, err := proxy.JobTokenIssuer(authCfg.Key, reg, probes, authCfg.TokenTTL, shared,
+	issuerOpts := []auth.Option{
 		auth.WithRevocationErrorHook(func(op string, err error) {
+			metrics.StateError(op)
 			log.Warn("state.revocation_failed", "op", op, "err", err.Error())
-		}))
+		}),
+	}
+	if coordEnabled {
+		// §10 共享状态不可用: during the grace window cached facts still
+		// adjudicate; beyond it every non-terminal request fails closed (503).
+		issuerOpts = append(issuerOpts, auth.WithSharedHealth(coord, stateCfg.Grace))
+	}
+	issuer, err := proxy.JobTokenIssuer(authCfg.Key, reg, probes, authCfg.TokenTTL, shared, issuerOpts...)
 	if err != nil {
 		return err
 	}
@@ -342,13 +385,7 @@ func run() error {
 	// the adapter breaks the construction cycle.
 	late := &lateReconciler{}
 	serverRouter := &workspaceServer{reg: reg, clients: clientSet}
-	sched, err := scheduler.New(
-		schedCfg,
-		reg,
-		jobs,
-		builder,
-		serverRouter,
-		metrics,
+	schedOpts := []scheduler.Option{
 		scheduler.WithPendingReports(pending),
 		scheduler.WithReconciler(late),
 		scheduler.WithRevoker(issuer),
@@ -357,11 +394,38 @@ func run() error {
 		// The claim-time dispatch record S-4 matches on: ids move on a rebuild,
 		// identities do not (§2.3).
 		scheduler.WithRuntimeIdentity(clientSet.RuntimeIdentity),
+	}
+	var leader *coordination.Leader
+	if coordEnabled {
+		schedOpts = append(schedOpts,
+			scheduler.WithSharedStore(coord, instanceID, coordCfg.TaskLockTTL),
+			scheduler.WithLeaderGate(func() bool { return leader == nil || leader.Held() }),
+		)
+		probes.AttachShared(coord)
+	}
+	sched, err := scheduler.New(
+		schedCfg,
+		reg,
+		jobs,
+		builder,
+		serverRouter,
+		metrics,
+		schedOpts...,
 	)
 	if err != nil {
 		return err
 	}
 	discoveryProbe = sched
+	if coordEnabled {
+		leader = coordination.New(coord, instanceID, coordCfg,
+			coordination.WithLogger(baseLog),
+			coordination.WithMetrics(metrics),
+			coordination.WithOnAcquire(func(ctx context.Context) error {
+				// Takeover reconciliation before the new control plane serves
+				// (AC-77 先对账后清扫).
+				return sched.OnTakeover(ctx)
+			}))
+	}
 
 	objects := recovery.NewK8sObjects(clientset, schedCfg.JobNamespace)
 	reconciler, err := recovery.New(
@@ -378,6 +442,9 @@ func run() error {
 		return err
 	}
 	late.r = reconciler
+	if coordEnabled {
+		reconciler.SetLeaderGate(func() bool { return leader.Held() })
+	}
 
 	// Fake server: S1–S30 for the Job daemons, plus the cluster-internal
 	// ops surface (S25). Both share one listener on :8080.
@@ -430,6 +497,14 @@ func run() error {
 		}
 	}
 
+	// The control-plane lease and the liveness row run for the whole process
+	// lifetime: the lease decides which instance registers, heartbeats,
+	// subscribes, claims and converges (02-contracts.md §0 术语「leader」).
+	if leader != nil {
+		run("leader", leader.Run)
+		run("instance-liveness", leader.HeartbeatInstance)
+	}
+
 	// Startup orchestration (ADR-025): the startup probe runs before C1, so
 	// the server sees the template environment's real runtimes. The listener
 	// must already be serving — the probe daemon registers through it.
@@ -449,7 +524,12 @@ func run() error {
 	// the display names the partition-key resolution reads), so the probe is
 	// the next startup step.
 
-	discoveries, err := sched.RunStartupProbe(ctx)
+	var discoveries map[string]registry.Discovery
+	if leader != nil {
+		discoveries, err = bootstrap.StartupDiscoveries(ctx, leader, coord, sched, clientSet.All(), schedCfg.StartupProbeTimeout, log)
+	} else {
+		discoveries, err = sched.RunStartupProbe(ctx)
+	}
 	if err != nil {
 		// Fail-fast, visible: no registration inside the window means the
 		// template (or the probe) is not runnable, and Foreman must not
@@ -484,7 +564,13 @@ func run() error {
 			unregisteredRefs = append(unregisteredRefs, workspace.Ref{ID: id, Name: name})
 			continue
 		}
-		c.Declare(discovery)
+		if len(c.RuntimeIDs()) == 0 {
+			// The probe's discovery is declared here and C1 sends it from the
+			// claim loop's preflight. An adopted declaration already carries
+			// the server-assigned ids and must not be re-sent (AC-77
+			// 不重新注册).
+			c.Declare(discovery)
+		}
 		served = append(served, c)
 		id, name := c.Workspace()
 		servedRefs = append(servedRefs, workspace.Ref{ID: id, Name: name})
@@ -517,28 +603,54 @@ func run() error {
 	// beside it can list one of those Jobs and write its payload-less
 	// projection over the live entry — losing the payload, the token digest
 	// and the boot/lease deadlines.
-	if err := sched.Start(ctx); err != nil {
+	if leader != nil && !leader.Held() {
+		// A follower restores the shared rows so it serves any Job's daemon
+		// face; rebuilding from K8s and converging belong to the leader
+		// (§4.3 阶段二重建职责).
+		if err := sched.AttachShared(ctx); err != nil {
+			log.Error("foreman.startup_aborted", "stage", "attach", "err", err.Error())
+			return err
+		}
+	} else if err := sched.Start(ctx); err != nil {
 		log.Error("foreman.startup_aborted", "stage", "rebuild", "err", err.Error())
 		return err
 	}
 
 	for _, c := range served {
 		workspaceID := c.WorkspaceID()
-		claimLoop := proxy.NewClaimLoop(proxyCfg, c, workspaceClaimScheduler{sched: sched, workspaceID: workspaceID})
 		reporter := proxy.NewModelCatalogReporter(proxyCfg, c, sched, c.CatalogSlots(), metrics,
 			proxy.WithReporterLogger(baseLog))
-		runWorkspace("claim/"+workspaceID, claimLoop.Run)
-		runWorkspace("heartbeat/"+workspaceID, proxy.NewHeartbeatLoop(c, reporter).Run)
-		runWorkspace("lease/"+workspaceID, proxy.NewLeaseKeeper(c, reg, sched, proxyCfg.LeaseRefreshInterval,
-			proxy.WithLeaseWorkspace(workspaceID)).Run)
-		refresher := proxy.NewProfileRefresher(c, proxy.WithProfileRefresherLogger(baseLog))
-		if proxyCfg.WSEnabled {
-			// §1.6: the refresh trigger is the C-20 invalidation hint. With
-			// WS closed the loop is not started: profile changes degrade to
-			// "effective on the next restart", as the deployment note says.
-			runWorkspace("ws-subscriber/"+workspaceID, proxy.NewWSSubscriber(c, claimLoop.Wake, metrics,
-				proxy.WithProfileChangeNotify(refresher.Notify)).Run)
-			runWorkspace("profile-refresh/"+workspaceID, refresher.Run)
+		plane := proxy.NewControlPlane(proxy.ControlPlaneOptions{
+			ProxyConfig: proxyCfg,
+			Client:      c,
+			Scheduler:   workspaceClaimScheduler{sched: sched, workspaceID: workspaceID},
+			Registry:    reg,
+			LeaseHooks:  sched,
+			Reporter:    reporter,
+			Metrics:     metrics,
+			Logger:      baseLog,
+			WorkspaceID: workspaceID,
+			WSEnabled:   proxyCfg.WSEnabled,
+		})
+		if leader != nil {
+			// §1.1 发出者口径 / F11: every control-plane loop runs only on the
+			// lease holder — claim, heartbeat (ack consumption), WS
+			// subscription, profile refresh and the proactive lease renewal.
+			plane.SetLeaderGate(leader.Held)
+		}
+		if coordEnabled {
+			// The holder publishes each workspace's registration identity after
+			// C1; followers and a future takeover adopt it (AC-77).
+			ws := workspaceID
+			plane.SetDeclarationPublisher(func(ctx context.Context, cl *proxy.Client) error {
+				return bootstrap.PublishDeclaration(ctx, coord, ws, cl)
+			})
+		}
+		// §1.6: with WS closed the profile-refresh/subscriber loops are not
+		// started: profile changes degrade to "effective on the next restart",
+		// as the deployment note says.
+		for _, component := range plane.Components() {
+			runWorkspace(component.Name+"/"+workspaceID, component.Run)
 		}
 	}
 	run("recovery", reconciler.Run)
@@ -587,9 +699,27 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	log.Info("foreman.stopping", "reason", reason)
-	for _, c := range served {
-		if err := c.Deregister(shutdownCtx); err != nil {
-			log.Warn("daemon.deregister_failed", "workspace_id", c.WorkspaceID(), "err", err.Error())
+	deregister := true
+	if leader != nil {
+		// §4.6 优雅关闭: deregistration narrows to the last live instance with
+		// a reachable shared store. Another survivor keeps the logical
+		// identity (the server's own expiry converges it), and an unreachable
+		// store cannot prove the instance count.
+		last, lerr := leader.LastInstance(shutdownCtx)
+		if lerr != nil || !last {
+			deregister = false
+			detail := "another instance is alive"
+			if lerr != nil {
+				detail = "shared state unavailable"
+			}
+			log.Info("daemon.deregister_skipped", "reason", detail)
+		}
+	}
+	if deregister {
+		for _, c := range served {
+			if err := c.Deregister(shutdownCtx); err != nil {
+				log.Warn("daemon.deregister_failed", "workspace_id", c.WorkspaceID(), "err", err.Error())
+			}
 		}
 	}
 	if err := srv.Shutdown(shutdownCtx); err != nil {
@@ -712,8 +842,16 @@ type workspaceClaimScheduler struct {
 
 func (w workspaceClaimScheduler) ClaimBudget() int { return w.sched.ClaimBudgetFor(w.workspaceID) }
 
-func (w workspaceClaimScheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
-	return w.sched.OnClaimFor(ctx, w.workspaceID, task)
+func (w workspaceClaimScheduler) ReserveSlots(ctx context.Context, want int) (int, error) {
+	return w.sched.ReserveClaimSlots(ctx, w.workspaceID, want)
+}
+
+func (w workspaceClaimScheduler) ReleaseSlots(ctx context.Context, n int) {
+	w.sched.ReleaseClaimSlots(ctx, w.workspaceID, n)
+}
+
+func (w workspaceClaimScheduler) OnClaimReserved(ctx context.Context, task json.RawMessage) error {
+	return w.sched.OnClaimReservedFor(ctx, w.workspaceID, task)
 }
 
 // workspaceServer routes a task-addressed server call to the client of the

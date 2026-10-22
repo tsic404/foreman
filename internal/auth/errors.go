@@ -15,6 +15,10 @@ var (
 	ErrRevoked        = errors.New("job token revoked")
 	ErrUnknownJob     = errors.New("unknown or terminal job")
 	ErrScopeMismatch  = errors.New("token scope does not match request resource")
+	// ErrStateUnavailable is the shared state's fail-closed answer: the store
+	// cannot adjudicate and the outage has outlived the grace window
+	// (§10 共享状态不可用: 超宽限一律 401/503).
+	ErrStateUnavailable = errors.New("shared state unavailable")
 )
 
 // ErrKeyTooShort rejects an HMAC key below MinKeyBytes.
@@ -29,6 +33,8 @@ func HTTPStatus(err error) int {
 	switch {
 	case errors.Is(err, ErrScopeMismatch):
 		return http.StatusForbidden
+	case errors.Is(err, ErrStateUnavailable):
+		return http.StatusServiceUnavailable
 	case errors.Is(err, ErrMalformedToken), errors.Is(err, ErrBadSignature),
 		errors.Is(err, ErrExpired), errors.Is(err, ErrRevoked), errors.Is(err, ErrUnknownJob):
 		return http.StatusUnauthorized

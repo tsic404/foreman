@@ -6,6 +6,7 @@ package acceptance
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"log/slog"
 	"testing"
@@ -128,7 +129,8 @@ func TestTechMultiWS09NoManifestDiscovery(t *testing.T) {
 		if _, ok := m.reg.MarkDaemonRegistered(entry.DaemonID, time.Now()); !ok {
 			t.Fatalf("MarkDaemonRegistered(%s) refused", entry.DaemonID)
 		}
-		tasks, err := m.sched.Deliver(entry.DaemonID, entry.JobRuntimeID, 1)
+		delivery, err := m.sched.Deliver(context.Background(), entry.WorkspaceID, entry.DaemonID, entry.JobRuntimeID, 1)
+		tasks := delivery.Tasks
 		if err != nil || len(tasks) != 1 {
 			t.Fatalf("Deliver(%s) = %d tasks, %v", workspaceID, len(tasks), err)
 		}

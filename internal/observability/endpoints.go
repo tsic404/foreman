@@ -24,12 +24,20 @@ const (
 // TaskIndex is the registry read view the ops endpoints need; satisfied by
 // *registry.Registry.
 type TaskIndex interface {
-	Get(taskID string) (registry.TaskEntry, bool)
-	// Settled returns the retained terminal record of an already-reclaimed
-	// task (§4.3, ADR-032): the single-task endpoint answers with it
-	// inside the retention window.
-	Settled(taskID string) (registry.TaskEntry, bool)
-	List() []registry.TaskEntry
+	// GetInWorkspace returns one live row; the workspace dimension is part of
+	// the projection's partition (§4.1). A shared-state index reads the row
+	// from the adjudication face, so every instance answers the same (§9.3
+	// 多实例口径).
+	GetInWorkspace(workspaceID, taskID string) (registry.TaskEntry, bool)
+	// SettledInWorkspace returns the retained terminal record of an
+	// already-reclaimed task (§4.3, ADR-032): the single-task endpoint answers
+	// with it inside the retention window.
+	SettledInWorkspace(workspaceID, taskID string) (registry.TaskEntry, bool)
+	// ListInWorkspace lists the workspace's live rows ("" = every row, the
+	// legacy single-workspace shape).
+	ListInWorkspace(workspaceID string) []registry.TaskEntry
+	// Inflight is the shared two-level counter's cluster value in stage two
+	// and the local index count otherwise (§10 两级在途上限).
 	Inflight() int
 }
 
@@ -106,16 +114,7 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 			writeError(w, http.StatusBadRequest, "workspace is required")
 			return
 		}
-		entries := index.List()
-		if workspaceID != "" {
-			filtered := entries[:0]
-			for _, entry := range entries {
-				if entry.WorkspaceID == workspaceID {
-					filtered = append(filtered, entry)
-				}
-			}
-			entries = filtered
-		}
+		entries := index.ListInWorkspace(workspaceID)
 		if entries == nil {
 			entries = []registry.TaskEntry{}
 		}
@@ -128,14 +127,14 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 			return
 		}
 		taskID := r.PathValue("taskID")
-		e, ok := index.Get(taskID)
+		e, ok := index.GetInWorkspace(workspaceID, taskID)
 		if !ok {
 			// A reclaimed task keeps answering with its terminal record until
 			// the retention window expires (§9.3, ADR-032):
 			// the convergence instant is no longer the end of the evidence
 			// window. Beyond it, a reclaimed task and one that never existed
 			// are again indistinguishable.
-			e, ok = index.Settled(taskID)
+			e, ok = index.SettledInWorkspace(workspaceID, taskID)
 		}
 		if !ok {
 			writeError(w, http.StatusNotFound, "task not found")
@@ -159,7 +158,7 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 			writeError(w, http.StatusNotFound, "task not found")
 			return
 		}
-		serveJobLogs(w, r, index, logs, log)
+		serveJobLogs(w, r, index, workspaceID, logs, log)
 	})
 	mux.HandleFunc("GET /foreman/tasks/{taskID}/payload-preview", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID, scoped := workspaceScope(r, cfg.WorkspaceIDs)
@@ -167,7 +166,7 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 			writeError(w, http.StatusBadRequest, "workspace is required")
 			return
 		}
-		e, ok := index.Get(r.PathValue("taskID"))
+		e, ok := index.GetInWorkspace(workspaceID, r.PathValue("taskID"))
 		if ok && !workspaceVisible(index, e.TaskID, workspaceID) {
 			ok = false
 		}
@@ -211,8 +210,8 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 }
 
 // serveJobLogs proxies the newest pod's log tail for the task's Job.
-func serveJobLogs(w http.ResponseWriter, r *http.Request, index TaskIndex, logs PodLogReader, log *slog.Logger) {
-	e, ok := index.Get(r.PathValue("taskID"))
+func serveJobLogs(w http.ResponseWriter, r *http.Request, index TaskIndex, workspaceID string, logs PodLogReader, log *slog.Logger) {
+	e, ok := index.GetInWorkspace(workspaceID, r.PathValue("taskID"))
 	if !ok {
 		writeError(w, http.StatusNotFound, "task not found")
 		return
@@ -292,9 +291,9 @@ func workspaceVisible(index TaskIndex, taskID, workspaceID string) bool {
 	if workspaceID == "" {
 		return true
 	}
-	e, ok := index.Get(taskID)
+	e, ok := index.GetInWorkspace(workspaceID, taskID)
 	if !ok {
-		e, ok = index.Settled(taskID)
+		e, ok = index.SettledInWorkspace(workspaceID, taskID)
 	}
 	return ok && e.WorkspaceID == workspaceID
 }

@@ -93,6 +93,10 @@ type Registry struct {
 	// at the alive → draining transition (ADR-017).
 	drainTimeout time.Duration
 
+	// sessionTTL is the shared soft-affinity row's retention
+	// (FOREMAN_AGENT_STATE_TTL, §4.5). Zero keeps the store default.
+	sessionTTL time.Duration
+
 	// deliveryConfirm is FOREMAN_DELIVERY_CONFIRM_TIMEOUT: the S6 delivery
 	// confirmation window stamped at each accepted delivery commit (ADR-032).
 	// Zero leaves the window unarmed — the delivery is then committed once
@@ -126,6 +130,11 @@ type Registry struct {
 	// K8s rebuild owns restart recovery.
 	state    StateStore
 	stateErr func(op, taskID string, err error)
+	// shared is the stage-two coordination face the configured store exposes
+	// (capability detection): when set, the decisive transitions run against
+	// the shared row atomically and lookups fall back to it, so any instance
+	// serves any Job (ADR-046 决策 1-2; 02-contracts.md §2.1 任实例服务).
+	shared SharedStore
 	// stateCh is the ordered write queue; nil when no shared state face is
 	// wired. statePending counts the writes queued but not yet applied.
 	stateCh      chan stateOp
@@ -142,6 +151,17 @@ func WithDrainTimeout(d time.Duration) Option {
 	return func(r *Registry) {
 		if d > 0 {
 			r.drainTimeout = d
+		}
+	}
+}
+
+// WithSessionTTL sets the shared soft-affinity row's retention
+// (FOREMAN_AGENT_STATE_TTL): the index is shared in stage two, so the store
+// row must live as long as the configured retention (§4.5).
+func WithSessionTTL(d time.Duration) Option {
+	return func(r *Registry) {
+		if d > 0 {
+			r.sessionTTL = d
 		}
 	}
 }
@@ -182,6 +202,9 @@ func New(now func() time.Time, opts ...Option) *Registry {
 		opt(r)
 	}
 	if r.state != nil {
+		if shared, ok := r.state.(SharedStore); ok && shared.Shared() {
+			r.shared = shared
+		}
 		r.stateCh = make(chan stateOp, stateQueueSize)
 		go r.runStateWriter()
 	}
@@ -204,6 +227,9 @@ func (r *Registry) Put(e TaskEntry) error {
 	}
 	r.live[e.TaskID] = e
 	r.indexLocked(e)
+	if r.shared != nil {
+		return r.writeShared(e)
+	}
 	r.persist(e.TaskID, e)
 	return nil
 }
@@ -248,6 +274,7 @@ const (
 	stateOpPut stateOpKind = iota
 	stateOpDelete
 	stateOpPutSettled
+	stateOpMerge
 )
 
 // stateOp is one queued write. The snapshot is taken under the registry lock
@@ -259,6 +286,7 @@ type stateOp struct {
 	ws     string
 	taskID string
 	e      TaskEntry
+	patch  EntryPatch
 }
 
 // persist enqueues the live row's snapshot. The memory index is the runtime
@@ -267,11 +295,19 @@ type stateOp struct {
 // disturb the in-memory transition — the miss only means the restart rebuilds
 // that row from K8s (§4.3). Called with r.mu held.
 func (r *Registry) persist(taskID string, e TaskEntry) {
+	if r.shared != nil {
+		// Stage two writes through the field-level merge/CAS scripts; a full
+		// snapshot would clobber a concurrent gate write.
+		return
+	}
 	r.enqueueState(stateOp{kind: stateOpPut, ws: e.WorkspaceID, taskID: taskID, e: e})
 }
 
 // persistDelete enqueues the removal of the live row's snapshot.
 func (r *Registry) persistDelete(taskID string, e TaskEntry) {
+	if r.shared != nil {
+		return
+	}
 	r.enqueueState(stateOp{kind: stateOpDelete, ws: e.WorkspaceID, taskID: taskID})
 }
 
@@ -279,6 +315,11 @@ func (r *Registry) persistDelete(taskID string, e TaskEntry) {
 // needs to keep answering the post-reclaim single-task endpoint; §4.3,
 // ADR-032).
 func (r *Registry) persistSettled(taskID string, e TaskEntry) {
+	if r.shared != nil {
+		// CommitTerminal writes the settled record in the same atomic script
+		// as the terminal verdict.
+		return
+	}
 	r.enqueueState(stateOp{kind: stateOpPutSettled, ws: e.WorkspaceID, taskID: taskID, e: e})
 }
 
@@ -321,6 +362,8 @@ func (r *Registry) applyStateOp(op stateOp) {
 		err = r.state.DeleteEntry(ctx, op.ws, op.taskID)
 	case stateOpPutSettled:
 		err = r.state.PutSettled(ctx, op.ws, op.taskID, op.e)
+	case stateOpMerge:
+		err = r.shared.MergeEntry(ctx, op.ws, op.taskID, op.patch)
 	}
 	if err != nil {
 		opName := "put_entry"
@@ -483,6 +526,19 @@ func (r *Registry) Delete(taskID string) error {
 		r.dropIndexesLocked(e)
 		delete(r.live, taskID)
 		r.dropRuntimeLocked(e.JobRuntimeID, e.DaemonID)
+		if r.shared != nil {
+			ctx, cancel := r.sharedCtx()
+			defer cancel()
+			if err := r.shared.DeleteEntry(ctx, e.WorkspaceID, taskID); err != nil {
+				return err
+			}
+			if e.State != StateTerminal {
+				// A row deleted before its terminal transition (a discarded
+				// pre-delivery attempt) still held its in-flight slot.
+				r.releaseSlotsShared(e.WorkspaceID)
+			}
+			return nil
+		}
 		r.persistDelete(taskID, e)
 	}
 	return nil
@@ -498,6 +554,10 @@ func (r *Registry) SetLastStatusSeen(taskID, status string) {
 	if e, ok := r.live[taskID]; ok {
 		e.LastStatusSeen = status
 		r.live[taskID] = e
+		if r.shared != nil {
+			r.mergeShared(taskID, e, EntryPatch{LastStatusSeen: &status})
+			return
+		}
 		r.persist(taskID, e)
 	}
 }
@@ -516,6 +576,10 @@ func (r *Registry) SetLeaseKeepUntil(taskID string, until time.Time) {
 	if e, ok := r.live[taskID]; ok {
 		e.LeaseKeepUntil = until
 		r.live[taskID] = e
+		if r.shared != nil {
+			r.mergeShared(taskID, e, EntryPatch{LeaseKeepUntil: &until})
+			return
+		}
 		r.persist(taskID, e)
 	}
 }
@@ -534,6 +598,14 @@ func (r *Registry) List() []TaskEntry {
 
 // Inflight counts non-terminal entries (§4.2).
 func (r *Registry) Inflight() int {
+	if r.shared != nil {
+		ctx, cancel := r.sharedCtx()
+		if n, err := r.shared.Slots(ctx, ""); err == nil {
+			cancel()
+			return int(n)
+		}
+		cancel()
+	}
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	n := 0
@@ -622,6 +694,33 @@ func (r *Registry) MarkTerminal(taskID string, result Result, reason string, com
 	if e.State == StateTerminal {
 		return e, false, nil
 	}
+	if r.shared != nil {
+		drainDeadline := r.now().Add(r.drainTimeout)
+		r.mu.Unlock()
+		ctx, cancel := r.sharedCtx()
+		entry, first, err := r.shared.CommitTerminal(ctx, e.WorkspaceID, taskID, result, reason, completedAt, drainDeadline)
+		cancel()
+		r.mu.Lock()
+		if err != nil {
+			r.stateFailure("terminal", taskID, err)
+			return TaskEntry{}, false, err
+		}
+		if entry.TaskID == "" {
+			return TaskEntry{}, false, fmt.Errorf("unknown task %s", taskID)
+		}
+		r.cacheEntryLocked(entry)
+		if entry.State == StateTerminal {
+			at := entry.CompletedAt
+			if at.IsZero() {
+				at = entry.DrainDeadline
+			}
+			r.done.put(taskID, at, settledRecord(entry))
+		}
+		if first {
+			r.releaseSlotsShared(entry.WorkspaceID)
+		}
+		return entry, first, nil
+	}
 	e.State = StateTerminal
 	e.JobPhase = JobPhaseDraining
 	e.DrainDeadline = r.now().Add(r.drainTimeout)
@@ -653,6 +752,26 @@ func (r *Registry) SettleNoResult(taskID string, expected Result) (TaskEntry, bo
 	e, ok := r.live[taskID]
 	if !ok || e.State != StateTerminal || e.Result != expected {
 		return e, false
+	}
+	if r.shared != nil {
+		r.mu.Unlock()
+		ctx, cancel := r.sharedCtx()
+		entry, first, err := r.shared.SettleNoResult(ctx, e.WorkspaceID, taskID, expected)
+		cancel()
+		r.mu.Lock()
+		if err != nil {
+			r.stateFailure("settle_no_result", taskID, err)
+			return e, false
+		}
+		if !first {
+			return entry, false
+		}
+		if _, at, ok := r.done.get(taskID); ok {
+			r.done.put(taskID, at, settledRecord(entry))
+		}
+		r.cacheEntryLocked(entry)
+		r.mu.Unlock()
+		return entry, true
 	}
 	e.Result = ""
 	e.FailureReason = ""
@@ -707,6 +826,21 @@ func (r *Registry) RegisterDecidedReport(taskID string, body []byte) (TaskEntry,
 		// The decided body is part of the mapping record (ADR-046 决策 0).
 		// Both call paths register it right after MarkTerminal, whose write
 		// predates this field, so this write-through is what persists it.
+		if r.shared != nil {
+			r.mu.Unlock()
+			ctx, cancel := r.sharedCtx()
+			entry, first, err := r.shared.CommitDecidedReport(ctx, e.WorkspaceID, taskID, body)
+			cancel()
+			r.mu.Lock()
+			if err != nil {
+				r.stateFailure("decided_report", taskID, err)
+			} else if !first {
+				// Another instance decided first; adopt its body.
+				e = entry
+				r.cacheEntryLocked(entry)
+			}
+			return e, true
+		}
 		r.persist(taskID, e)
 	}
 	return e, true
@@ -726,6 +860,9 @@ func (r *Registry) SetTokenHash(taskID, tokenHash string) {
 	}
 	e.TokenHash = tokenHash
 	r.live[taskID] = e
+	if r.shared != nil {
+		r.mergeNow(taskID, e, EntryPatch{TokenHash: &tokenHash})
+	}
 }
 
 // MarkJobCreated advances pending → job_created and records the apiserver's
@@ -741,6 +878,23 @@ func (r *Registry) MarkJobCreated(taskID string, at time.Time) (TaskEntry, bool)
 	e, ok := r.live[taskID]
 	if !ok || e.State == StateTerminal {
 		return TaskEntry{}, false
+	}
+	if r.shared != nil {
+		r.mu.Unlock()
+		ctx, cancel := r.sharedCtx()
+		entry, first, err := r.shared.CommitJobCreated(ctx, e.WorkspaceID, taskID, at)
+		cancel()
+		r.mu.Lock()
+		if err != nil {
+			r.stateFailure("job_created", taskID, err)
+			return TaskEntry{}, false
+		}
+		if !first {
+			r.cacheEntryLocked(entry)
+			return TaskEntry{}, false
+		}
+		r.cacheEntryLocked(entry)
+		return entry, true
 	}
 	if e.State == StatePending {
 		e.State = StateJobCreated
@@ -761,6 +915,22 @@ func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntr
 	if !ok || e.State == StateTerminal || e.State == StatePending {
 		// pending has no Job yet, so no daemon can exist for it.
 		return TaskEntry{}, false
+	}
+	if r.shared != nil {
+		r.mu.Unlock()
+		ctx, cancel := r.sharedCtx()
+		entry, first, err := r.shared.CommitDaemonRegistered(ctx, e.WorkspaceID, e.TaskID, at)
+		cancel()
+		r.mu.Lock()
+		if err != nil {
+			r.stateFailure("daemon_registered", e.TaskID, err)
+			return TaskEntry{}, false
+		}
+		if !first {
+			return TaskEntry{}, false
+		}
+		r.cacheEntryLocked(entry)
+		return entry, true
 	}
 	if e.State == StateJobCreated || e.State == StateDaemonRegistered {
 		e.State = StateDaemonRegistered
@@ -783,12 +953,34 @@ func (r *Registry) MarkDelivering(daemonID string, at time.Time, delivered json.
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.get(r.byDaemon[daemonID])
-	if !ok || !deliverable(e, at) {
+	if !ok || !Deliverable(e, at) {
 		return TaskEntry{}, false
+	}
+	if r.shared != nil {
+		// The shared row is the delivery authority (stage two delivers through
+		// the queue pickup; this path persists the accounting when a caller
+		// commits directly).
+		r.mu.Unlock()
+		ctx, cancel := r.sharedCtx()
+		entry, first, err := r.shared.CommitDelivering(ctx, e.WorkspaceID, e.TaskID, at, delivered, r.deliveryConfirm)
+		cancel()
+		r.mu.Lock()
+		if err != nil {
+			r.stateFailure("delivering", e.TaskID, err)
+			return TaskEntry{}, false
+		}
+		if !first {
+			return TaskEntry{}, false
+		}
+		r.cacheEntryLocked(entry)
+		return entry, true
 	}
 	e.State = StateDelivering
 	e.DeliveredAt = at
 	e.Deliveries++
+	// §4.1: the claim-after-delivery count is scoped to the replaced commit,
+	// so a new commit starts from zero.
+	e.ClaimsAfterDelivery = 0
 	e.Payload = delivered
 	if r.deliveryConfirm > 0 {
 		e.DeliveryDeadline = at.Add(r.deliveryConfirm)
@@ -798,11 +990,12 @@ func (r *Registry) MarkDelivering(daemonID string, at time.Time, delivered json.
 	return e, true
 }
 
-// deliverable is the S6 gate: the entry's first delivery, or the re-delivery
+// Deliverable is the S6 gate: the entry's first delivery, or the re-delivery
 // an expired confirmation window released. A started, terminal or draining
 // entry is never deliverable, and so is a delivered entry whose window is
-// still open — the commit the daemon has not answered yet (ADR-032).
-func deliverable(e TaskEntry, at time.Time) bool {
+// still open — the commit the daemon has not answered yet (ADR-032). It is
+// exported so the shared-row commit applies the identical predicate.
+func Deliverable(e TaskEntry, at time.Time) bool {
 	if e.State == StateDaemonRegistered && e.DeliveredAt.IsZero() {
 		return true
 	}
@@ -817,6 +1010,11 @@ func deliverable(e TaskEntry, at time.Time) bool {
 func (r *Registry) NoteClaimAfterDelivery(taskID string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.shared != nil {
+		// The shared pickup counts the empty claim in the same atomic step
+		// that decides it; counting again here would double it.
+		return
+	}
 	if e, ok := r.live[taskID]; ok {
 		e.ClaimsAfterDelivery++
 		r.live[taskID] = e
@@ -833,6 +1031,26 @@ func (r *Registry) NoteClaimAfterDelivery(taskID string) {
 func (r *Registry) MarkStarted(taskID string, at time.Time) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.shared != nil {
+		e, ok := r.live[taskID]
+		if !ok {
+			return TaskEntry{}, false
+		}
+		r.mu.Unlock()
+		ctx, cancel := r.sharedCtx()
+		entry, _, err := r.shared.ConfirmStart(ctx, e.WorkspaceID, taskID, at, true)
+		cancel()
+		r.mu.Lock()
+		if err != nil {
+			r.stateFailure("started", taskID, err)
+			return TaskEntry{}, false
+		}
+		if entry.TaskID == "" || entry.State == StateTerminal {
+			return TaskEntry{}, false
+		}
+		r.cacheEntryLocked(entry)
+		return entry, true
+	}
 	e, ok := r.startFactLocked(taskID, at)
 	if !ok {
 		return TaskEntry{}, false
@@ -850,6 +1068,26 @@ func (r *Registry) MarkStarted(taskID string, at time.Time) (TaskEntry, bool) {
 func (r *Registry) MarkStartFact(taskID string, at time.Time) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.shared != nil {
+		e, ok := r.live[taskID]
+		if !ok {
+			return TaskEntry{}, false
+		}
+		r.mu.Unlock()
+		ctx, cancel := r.sharedCtx()
+		entry, _, err := r.shared.ConfirmStart(ctx, e.WorkspaceID, taskID, at, false)
+		cancel()
+		r.mu.Lock()
+		if err != nil {
+			r.stateFailure("start_fact", taskID, err)
+			return TaskEntry{}, false
+		}
+		if entry.TaskID == "" || entry.State == StateTerminal {
+			return TaskEntry{}, false
+		}
+		r.cacheEntryLocked(entry)
+		return entry, true
+	}
 	e, ok := r.startFactLocked(taskID, at)
 	if ok {
 		r.persist(taskID, e)
@@ -884,6 +1122,12 @@ func (r *Registry) SetNode(taskID, nodeName string) {
 	}
 	e.NodeName = nodeName
 	r.live[taskID] = e
+	if r.shared != nil {
+		// §4.1/§4.5: node_name is read back through the shared row by the
+		// daemon report path (session learning) and the ops projection, so it
+		// must not stay process-local in stage two.
+		r.mergeShared(taskID, e, EntryPatch{NodeName: &nodeName})
+	}
 }
 
 // ActiveJobsByNode counts the non-terminal entries placed on each node

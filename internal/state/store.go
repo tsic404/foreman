@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/redis/go-redis/v9"
@@ -273,6 +274,13 @@ func WithClock(now func() time.Time) Option {
 	return func(s *redisStore) { s.now = now }
 }
 
+// WithEventHook observes the two shared-state availability transitions
+// (§9.1 共享状态面不可用与恢复): event is "unavailable" (err carries the first
+// failure) or "recovered" (downFor is the outage duration).
+func WithEventHook(fn func(event string, downFor time.Duration, err error)) Option {
+	return func(s *redisStore) { s.event = fn }
+}
+
 // redisStore is the Redis-backed shared state implementation. It uses the
 // go-redis client, whose connection information is the URL + password pair
 // from the config (the deployment interface list carries both, §7).
@@ -280,6 +288,14 @@ type redisStore struct {
 	cfg Config
 	now func() time.Time
 	rdb *redis.Client
+	// downSince is the Unix-nano instant of the first failed operation since
+	// the last success (0 = available); the outage face of §10.
+	downSince int64
+	// resSeq numbers slot reservations within this process.
+	resSeq atomic.Int64
+	// event observes the availability transitions (§9.1 共享状态面不可用与
+	// 恢复).
+	event func(event string, downFor time.Duration, err error)
 }
 
 func (s *redisStore) init() error {
@@ -434,10 +450,6 @@ func (s *redisStore) ListEntries(ctx context.Context) ([]registry.TaskEntry, err
 		return nil, err
 	}
 	return out, nil
-}
-
-func (s *redisStore) DeleteEntry(ctx context.Context, ws, taskID string) error {
-	return s.rdb.Del(ctx, s.entryKey(ws, taskID)).Err()
 }
 
 func (s *redisStore) PutSettled(ctx context.Context, ws, taskID string, e registry.TaskEntry) error {

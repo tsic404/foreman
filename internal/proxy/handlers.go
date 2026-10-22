@@ -263,15 +263,35 @@ func (s *FakeServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		s.heartbeatProbe(w, claims, req.RuntimeID)
 		return
 	}
-	rt, ok := s.reg.RuntimeByID(req.RuntimeID)
+	// The runtime row is instance-local; the entry is the shared truth. A
+	// runtime id that is not this Job's is answered 404 so the daemon
+	// re-registers (§1.4); the job's own runtime is (re)seeded locally when
+	// this instance serves the Job first (§2.1 任实例服务).
+	e, ok := s.reg.ByDaemonInWorkspace(claims.WorkspaceID, claims.JobName)
 	if !ok {
 		writeError(w, http.StatusNotFound, "runtime not found")
 		return
 	}
-	if rt.DaemonID != claims.JobName {
-		writeError(w, http.StatusForbidden, "runtime does not belong to this job")
+	if req.RuntimeID != e.JobRuntimeID {
+		if _, known := s.reg.RuntimeByID(req.RuntimeID); known {
+			// Another Job's runtime: the cross-Job impersonation case
+			// (§2.1 rule 1).
+			writeError(w, http.StatusForbidden, "runtime does not belong to this job")
+			return
+		}
+		// Unknown runtime → 404 so the daemon re-registers (§1.4).
+		writeError(w, http.StatusNotFound, "runtime not found")
 		return
 	}
+	s.reg.PutRuntime(registry.JobRuntime{
+		JobRuntimeID:    e.JobRuntimeID,
+		DaemonID:        e.DaemonID,
+		TaskID:          e.TaskID,
+		Provider:        "omp",
+		Name:            "foreman-job",
+		Online:          true,
+		LastHeartbeatAt: time.Now(),
+	})
 	s.reg.TouchHeartbeat(req.RuntimeID, time.Now())
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "runtime_id": req.RuntimeID})
 }
@@ -291,6 +311,8 @@ func (s *FakeServer) handleDeregister(w http.ResponseWriter, r *http.Request) {
 	}
 	if rt, ok := s.reg.RuntimeByDaemon(claims.JobName); ok {
 		s.reg.SetRuntimeOffline(rt.JobRuntimeID)
+	} else if e, ok := s.reg.ByDaemonInWorkspace(claims.WorkspaceID, claims.JobName); ok {
+		s.reg.SetRuntimeOffline(e.JobRuntimeID)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
@@ -340,7 +362,7 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 	// is the classification's monotone fact — a commit that is not the first one
 	// is the re-delivery the expired window released — while the window test
 	// itself stays in the registry's gate (one clock, one decision).
-	pending, pendingOK := s.reg.ByDaemon(req.DaemonID)
+	pending, pendingOK := s.reg.ByDaemonInWorkspace(claims.WorkspaceID, req.DaemonID)
 	if pendingOK && pending.WorkspaceID != claims.WorkspaceID {
 		// The token addresses another workspace's task: the cross-workspace
 		// impersonation case, judged like a cross-Job one (§2.1).
@@ -358,10 +380,16 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	unconfirmed := pendingOK && pending.DeliveryUnconfirmed(s.reg.Now())
-	tasks, err := s.sched.Deliver(req.DaemonID, runtimeID, req.MaxTasks)
+	delivery, err := s.sched.Deliver(r.Context(), claims.WorkspaceID, req.DaemonID, runtimeID, req.MaxTasks)
 	if err != nil {
 		if errors.Is(err, scheduler.ErrUnknownDaemon) || errors.Is(err, scheduler.ErrRuntimeMismatch) {
 			writeError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		if errors.Is(err, scheduler.ErrStoreUnavailable) {
+			// Fail closed: a delivery that cannot be adjudicated against the
+			// shared row is never handed over (§10 共享状态不可用).
+			writeError(w, http.StatusServiceUnavailable, "shared state unavailable")
 			return
 		}
 		s.log.Error("deliver failed", "daemon_id", req.DaemonID, "err", err)
@@ -369,25 +397,28 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch {
-	case len(tasks) > 0 && pendingOK && pending.Deliveries > 0:
+	case delivery.Delivered && delivery.Deliveries > 1:
 		// The window's exit: the delivery committed at delivered_at was never
-		// confirmed, and this claim exercised the re-delivery the registry's
-		// gate released (the scheduler records the event).
+		// confirmed, and this claim exercised the re-delivery the shared
+		// lease released (the scheduler records the event).
 		s.metrics.DeliveryClaim(DeliveryClaimRedelivered)
-	case len(tasks) > 0:
+	case delivery.Delivered:
 		s.metrics.DeliveryClaim(DeliveryClaimDelivered)
 		if pendingOK {
 			s.metrics.DeliveryLatency(time.Since(pending.ClaimedAt).Seconds())
 		}
+	case delivery.Held:
+		// Inside the confirmation window: the request arrived and the
+		// response was lost. The shared pickup already bumped the per-entry
+		// counter; the stage-one path counts it below.
+		s.metrics.DeliveryClaim(DeliveryClaimEmptyUnconfirmed)
 	case unconfirmed:
-		// The daemon keeps asking inside the window (or with the exit off):
-		// the request arrived and the response was lost, which is what the
-		// per-entry counter records for the post-hoc query face.
 		s.metrics.DeliveryClaim(DeliveryClaimEmptyUnconfirmed)
 		s.reg.NoteClaimAfterDelivery(pending.TaskID)
 	default:
 		s.metrics.DeliveryClaim(DeliveryClaimEmpty)
 	}
+	tasks := delivery.Tasks
 	if tasks == nil {
 		tasks = []json.RawMessage{}
 	}
@@ -405,7 +436,7 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	entry, ok := s.reg.ByDaemon(claims.JobName)
+	entry, ok := s.reg.ByDaemonInWorkspace(claims.WorkspaceID, claims.JobName)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
