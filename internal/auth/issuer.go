@@ -137,12 +137,6 @@ func WithSharedHealth(health StateHealth, grace time.Duration) Option {
 	return func(i *Issuer) { i.health = health; i.grace = grace }
 }
 
-// WithRevocationReader wires the stage-two cross-instance revocation read: a
-// digest revoked on another instance is seen here on its first Verify.
-func WithRevocationReader(store RevocationStore) Option {
-	return func(i *Issuer) { i.revokeStore = store }
-}
-
 // RevocationStore is the shared revocation set face; satisfied by
 // internal/state.Store.
 type RevocationStore interface {
