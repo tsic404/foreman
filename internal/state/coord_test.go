@@ -2,6 +2,7 @@ package state
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync"
 	"testing"
@@ -344,5 +345,84 @@ func TestCoordEntryWithoutJobNameWritesNoIndex(t *testing.T) {
 	}
 	if got, ok, err := s.GetEntry(ctx, "ws-1", "task-1"); err != nil || !ok || got.TaskID != "task-1" {
 		t.Fatalf("GetEntry: ok=%v err=%v", ok, err)
+	}
+}
+
+// outageStore builds a coord store over miniredis and records the availability
+// events the outage face emits (§9.1).
+func outageStore(t *testing.T) (CoordStore, *miniredis.Miniredis, *[]string) {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	var events []string
+	s, err := New(Config{
+		URL:         "redis://" + mr.Addr(),
+		DialTimeout: time.Second,
+		EntryTTL:    time.Hour,
+	}, WithEventHook(func(event string, _ time.Duration, _ error) {
+		events = append(events, event)
+	}))
+	if err != nil {
+		t.Fatalf("state.New: %v", err)
+	}
+	return s.(CoordStore), mr, &events
+}
+
+// TestCoordCancelledOperationIsNotAnOutage pins the availability
+// classification: a caller that cancels (the shutdown path, an abandoned
+// request) says nothing about the store, so it neither starts nor clears an
+// outage.
+func TestCoordCancelledOperationIsNotAnOutage(t *testing.T) {
+	store, mr, events := outageStore(t)
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if err := store.DropQueue(cancelled, "ws-1", "task-1"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled op = %v, want context.Canceled", err)
+	}
+	if !store.Available() || store.DownFor() != 0 {
+		t.Fatalf("cancelled op moved the outage face: available=%v downFor=%s", store.Available(), store.DownFor())
+	}
+	if len(*events) != 0 {
+		t.Fatalf("cancelled op emitted events %v", *events)
+	}
+
+	// A real failure opens the outage; a later cancellation must not close it.
+	mr.SetError("outage")
+	if err := store.DropQueue(context.Background(), "ws-1", "task-1"); err == nil {
+		t.Fatal("store error was not reported")
+	}
+	if store.Available() {
+		t.Fatal("a real store failure did not mark the store down")
+	}
+	if err := store.DropQueue(cancelled, "ws-1", "task-1"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled op during an outage = %v, want context.Canceled", err)
+	}
+	if store.Available() {
+		t.Fatal("a cancelled op cleared the outage")
+	}
+	if got := *events; len(got) != 1 || got[0] != "unavailable" {
+		t.Fatalf("events = %v, want only the unavailable transition", got)
+	}
+}
+
+// TestCoordStoreFailureIsAnOutage pins the other side: a genuine store failure
+// still opens the outage and its recovery closes it.
+func TestCoordStoreFailureIsAnOutage(t *testing.T) {
+	store, mr, events := outageStore(t)
+	mr.SetError("outage")
+	if err := store.DropQueue(context.Background(), "ws-1", "task-1"); err == nil {
+		t.Fatal("store failure was not reported")
+	}
+	if store.Available() || store.DownFor() == 0 {
+		t.Fatalf("real failure did not open the outage: available=%v downFor=%s", store.Available(), store.DownFor())
+	}
+	mr.SetError("")
+	if err := store.DropQueue(context.Background(), "ws-1", "task-1"); err != nil {
+		t.Fatalf("recovered store: %v", err)
+	}
+	if !store.Available() || store.DownFor() != 0 {
+		t.Fatalf("recovery did not clear the outage: available=%v downFor=%s", store.Available(), store.DownFor())
+	}
+	if got := *events; len(got) != 2 || got[0] != "unavailable" || got[1] != "recovered" {
+		t.Fatalf("events = %v, want unavailable then recovered", got)
 	}
 }

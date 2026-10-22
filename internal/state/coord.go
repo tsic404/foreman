@@ -225,10 +225,15 @@ func (s *redisStore) DownFor() time.Duration {
 }
 
 // mark records the outcome of one store operation for the outage face
-// (§10 共享状态不可用). The first failure starts the outage clock and emits
-// the unavailable event; the first success after an outage clears it and
-// emits the recovered event with the outage duration (§9.1).
+// (§10 共享状态不可用). The first store failure starts the outage clock and
+// emits the unavailable event; the first success after an outage clears it and
+// emits the recovered event with the outage duration (§9.1). A caller's
+// cancellation is not evidence about the store, so it neither starts nor
+// clears an outage.
 func (s *redisStore) mark(err error) {
+	if errors.Is(err, context.Canceled) {
+		return
+	}
 	if err == nil {
 		if prev := atomic.SwapInt64(&s.downSince, 0); prev != 0 && s.event != nil {
 			s.event("recovered", s.now().Sub(time.Unix(0, prev)), nil)
