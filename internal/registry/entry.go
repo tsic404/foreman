@@ -58,11 +58,11 @@ const (
 // TaskEntry is the mapping table row (§4.1). The four trigger-context
 // fields (issue/autopilot/chat) are optional: an empty value means that context
 // does not exist and is never an error (ADR-014). The JSON projection keeps all
-// four keys with an empty string instead of omitting them, so consumers can
-// test `== ""` (§4.1). Payload is the task body kept in process memory only —
-// the raw claim payload until delivery, the S6 delivery body (runtime_id
-// rewritten to job_runtime_id) afterwards: it carries auth_token and must never
-// be serialized into annotations, Secrets, or logs (F3).
+// four keys (empty string, not omitted), so consumers can test `== ""` (§4.1).
+// Payload is the task body — the raw claim payload until delivery, the S6
+// delivery body (runtime_id rewritten to job_runtime_id) afterwards; it
+// carries auth_token and must never reach annotations, Secrets, logs or the
+// projection (F3), but the shared state snapshot persists it (§4.3, ADR-046).
 type TaskEntry struct {
 	TaskID          string `json:"task_id"`
 	AgentID         string `json:"agent_id"`
@@ -321,8 +321,9 @@ const (
 
 // TaskEntryFromJob rebuilds an entry from a Job's labels and annotations
 // (§4.3). The state starts at the conservative StateJobCreated and
-// is advanced by the startup C13 convergence; the payload is not restored
-// (it never leaves process memory, so a restarted Foreman cannot re-deliver).
+// is advanced by the startup C13 convergence. The payload is not restored:
+// a Job object cannot carry it (F3), so a rebuilt entry has none, while a
+// shared-state restore brings the whole row back (§4.3, ADR-046 阶段一).
 // The four trigger-context annotations are conditional blocks: a missing key
 // means that context does not exist, never a rebuild error (ADR-014).
 func TaskEntryFromJob(job batchv1.Job) (TaskEntry, error) {

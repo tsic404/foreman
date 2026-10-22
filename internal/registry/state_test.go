@@ -302,7 +302,7 @@ func TestRegistryPersistsTransitions(t *testing.T) {
 		t.Fatalf("MarkTerminal did not persist the settled record: %+v", settled)
 	}
 	if settled.TokenHash != "" || settled.Payload != nil {
-		t.Fatal("the settled record carries memory-only secrets")
+		t.Fatal("the settled record carries non-projected faces")
 	}
 
 	if err := r.Delete("t1"); err != nil {
