@@ -337,6 +337,37 @@ func TestEnqueueFailureStagesReportUntilWritable(t *testing.T) {
 	}
 }
 
+// The queued report owns its bytes: a caller that reuses its buffer after
+// Enqueue must not rewrite a report that is still waiting to be delivered.
+func TestEnqueueCopiesTheBody(t *testing.T) {
+	dir := filepath.Join(t.TempDir(), "pending-reports")
+	p, err := NewPendingReports(dir)
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	// An unwritable queue keeps the report staged in memory, where the next
+	// drain reads the body.
+	makeQueueUnwritable(t, dir)
+	body := []byte(`{"failure_reason":"job_failed"}`)
+	if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "", EPFail, body, ""); err == nil {
+		t.Fatal("Enqueue against an unwritable queue: want the write error")
+	}
+	for i := range body {
+		body[i] = 'X'
+	}
+	if err := os.Chmod(dir, 0o700); err != nil {
+		t.Fatalf("restore dir: %v", err)
+	}
+	sender := &fakeSender{code: 200}
+	if _, err := p.Drain(context.Background(), sender); err != nil {
+		t.Fatalf("Drain: %v", err)
+	}
+	want := `task-1:fail:{"failure_reason":"job_failed"}`
+	if len(sender.sent) != 1 || sender.sent[0] != want {
+		t.Fatalf("sent = %v, want the body as it was at enqueue time", sender.sent)
+	}
+}
+
 // An id that cannot name a queue file is never a durable entry: Queued
 // answers false without touching the filesystem, and the drain delivers the
 // staged report straight from memory so the terminal callback is not lost.
