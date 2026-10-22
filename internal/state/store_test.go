@@ -39,7 +39,7 @@ func TestSnapshotRoundTripKeepsProjectedFieldsAndDropsSecrets(t *testing.T) {
 		JobPhase:         registry.JobPhaseAlive,
 		DrainDeadline:    time.Date(2026, 10, 4, 12, 1, 0, 0, time.UTC),
 		DeliveryDeadline: time.Date(2026, 10, 4, 12, 0, 30, 0, time.UTC),
-		// The memory-only secrets must never reach the store.
+		// The mapping record persists all three; only the settled record strips them.
 		TokenHash:       "deadbeef",
 		Payload:         []byte(`{"auth_token":"secret"}`),
 		DecidedReport:   []byte(`{"result":"completed"}`),
