@@ -274,9 +274,11 @@ func TestDelivery01DeliveredEntryKeepsItsAttributionAtTheBootBound(t *testing.T)
 		t.Errorf("compensated reason = %q, want %q (the boot branch stole the attribution)",
 			reason, scheduler.FailureReasonDeliveryUnconfirmed)
 	}
-	if !h.jobs.jobDeleted("fm-task-1") {
-		t.Error("the Job must be deleted with the verdict")
-	}
+	// The verdict write precedes the fail report and only a landed report
+	// deletes the Job: poll the deletion instead of sampling it at the write.
+	waitFor(t, "the Job fm-task-1 deletion after the delivery-unconfirmed verdict", 5*time.Second, func() bool {
+		return h.jobs.jobDeleted("fm-task-1")
+	})
 }
 
 // TestDelivery01ClosedWindowDeliversExactlyOnce covers the TC's negative form:
