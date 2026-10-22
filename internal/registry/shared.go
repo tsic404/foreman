@@ -19,6 +19,15 @@ type EntryPatch struct {
 	TokenHash      *string
 }
 
+// SharedSessionNode is one soft-affinity row read from the shared store: the
+// raw body plus the lifetime the store still holds on it (zero when the row
+// has no expiry). The lifetime comes from the store's clock — the reader turns
+// it into its own clock once instead of comparing two hosts' timestamps.
+type SharedSessionNode struct {
+	Raw       []byte
+	Remaining time.Duration
+}
+
 // SharedStore is the stage-two face the registry consumes when the configured
 // shared state implements it (internal/state's Redis store does; the phase-one
 // test fakes and the no-op store do not). Capability detection keeps a
@@ -68,14 +77,12 @@ type SharedStore interface {
 	ListSettled(ctx context.Context) ([]TaskEntry, error)
 	// ListRevoked lists the revocation set (takeover resync).
 	ListRevoked(ctx context.Context) (map[string]time.Time, error)
-	// PutSessionNode stores one soft-affinity row (§4.5 共享索引).
+	// PutSessionNode stores one soft-affinity row (§4.5 共享索引) with its
+	// retention as the store-side TTL.
 	PutSessionNode(ctx context.Context, ws, key string, raw []byte, ttl time.Duration) error
-	// GetSessionNode reads one soft-affinity row.
-	GetSessionNode(ctx context.Context, ws, key string) ([]byte, bool, error)
-	// DeleteSessionNode removes one soft-affinity row.
-	DeleteSessionNode(ctx context.Context, ws, key string) error
-	// ListSessionNodes lists every soft-affinity row.
-	ListSessionNodes(ctx context.Context) (map[string][]byte, error)
+	// GetSessionNode reads one soft-affinity row and its remaining store-side
+	// lifetime (zero = no expiry).
+	GetSessionNode(ctx context.Context, ws, key string) (SharedSessionNode, bool, error)
 	// Slots reads one in-flight counter (empty ws = cluster level).
 	Slots(ctx context.Context, ws string) (int64, error)
 }

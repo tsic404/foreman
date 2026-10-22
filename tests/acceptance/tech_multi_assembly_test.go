@@ -351,19 +351,18 @@ func TestMultiAssemblySessionLearningAcrossInstances(t *testing.T) {
 	}
 }
 
-// TestMultiAssemblySessionIndexSharedAndPruned covers the shared index's
-// removal face: a row written by one instance is readable on the other, and an
-// expired row is deleted from the shared store by the pruning round (the row
-// body carries its own workspace/key, so the store key layout is irrelevant).
-func TestMultiAssemblySessionIndexSharedAndPruned(t *testing.T) {
+// TestMultiAssemblySessionIndexSharedAndExpired covers the shared index's
+// lifetime face: a row written by one instance is readable on the other, and
+// its retention is enforced by the store's own TTL — the server clock — so no
+// instance deletes a row by comparing its clock with the writer's stamp.
+func TestMultiAssemblySessionIndexSharedAndExpired(t *testing.T) {
 	tw := newTwoInstances(t, twoInstanceOptions{})
 	ctx := t.Context()
-	old := time.Now().Add(-2 * time.Hour)
 	raw, err := json.Marshal(map[string]any{
 		"workspace_id": "ws-1",
 		"key":          "sess-old",
 		"node":         "node-a",
-		"learned_at":   old,
+		"learned_at":   time.Now(),
 	})
 	if err != nil {
 		t.Fatalf("marshal session row: %v", err)
@@ -374,14 +373,43 @@ func TestMultiAssemblySessionIndexSharedAndPruned(t *testing.T) {
 	if got := tw.b.reg.LastNodeForSession("ws-1", "sess-old"); got != "node-a" {
 		t.Fatalf("cross-instance session lookup = %q, want node-a", got)
 	}
-	if dropped := tw.b.reg.PruneExpiredSessions(time.Hour); dropped == 0 {
-		t.Fatal("the expired session was not pruned")
-	}
+	tw.mr.FastForward(time.Hour + time.Second)
 	if _, ok, err := tw.a.coord.GetSessionNode(ctx, "ws-1", "sess-old"); err != nil || ok {
-		t.Fatalf("shared session row survived the prune (ok=%v err=%v)", ok, err)
+		t.Fatalf("shared session row survived its TTL (ok=%v err=%v)", ok, err)
 	}
 	if got := tw.a.reg.LastNodeForSession("ws-1", "sess-old"); got != "" {
-		t.Fatalf("lookup after the prune = %q, want a miss", got)
+		t.Fatalf("lookup after the TTL = %q, want a miss", got)
+	}
+}
+
+// TestMultiAssemblySessionIndexSurvivesWriterClockSkew pins the other half of
+// the lifetime face: a row whose writer's learned_at is 5h old but whose store
+// TTL is 3h is not expired by the reconciling instance's prune. The writer's
+// stamp never decides a row's lifetime; reading the shared side (not B's
+// cache, whose hit would hide a deleted row) proves the row survived.
+func TestMultiAssemblySessionIndexSurvivesWriterClockSkew(t *testing.T) {
+	tw := newTwoInstances(t, twoInstanceOptions{})
+	ctx := t.Context()
+	raw, err := json.Marshal(map[string]any{
+		"workspace_id": "ws-1",
+		"key":          "sess-skew",
+		"node":         "node-a",
+		"learned_at":   time.Now().Add(-5 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("marshal session row: %v", err)
+	}
+	if err := tw.a.coord.PutSessionNode(ctx, "ws-1", "sess-skew", raw, 3*time.Hour); err != nil {
+		t.Fatalf("PutSessionNode: %v", err)
+	}
+	if got := tw.b.reg.LastNodeForSession("ws-1", "sess-skew"); got != "node-a" {
+		t.Fatalf("cross-instance session lookup = %q, want node-a", got)
+	}
+	if dropped := tw.b.reg.PruneExpiredSessions(3 * time.Hour); dropped != 0 {
+		t.Fatalf("prune dropped %d entries: a slow writer's stamp expired a live row", dropped)
+	}
+	if _, ok, err := tw.a.coord.GetSessionNode(ctx, "ws-1", "sess-skew"); err != nil || !ok {
+		t.Fatalf("shared row gone after prune (ok=%v err=%v)", ok, err)
 	}
 }
 

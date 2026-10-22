@@ -186,15 +186,12 @@ type CoordStore interface {
 	// ListProbeSessions lists every probe session row.
 	ListProbeSessions(ctx context.Context) (map[string][]byte, error)
 
-	// PutSessionNode stores one soft-affinity row (the session → node index).
+	// PutSessionNode stores one soft-affinity row (the session → node index)
+	// with its retention as the store-side TTL.
 	PutSessionNode(ctx context.Context, ws, key string, raw []byte, ttl time.Duration) error
-	// GetSessionNode reads one soft-affinity row.
-	GetSessionNode(ctx context.Context, ws, key string) ([]byte, bool, error)
-	// DeleteSessionNode removes one soft-affinity row.
-	DeleteSessionNode(ctx context.Context, ws, key string) error
-	// ListSessionNodes lists every soft-affinity row, keyed by
-	// ws + "\x00" + session key.
-	ListSessionNodes(ctx context.Context) (map[string][]byte, error)
+	// GetSessionNode reads one soft-affinity row and its remaining store-side
+	// lifetime (zero = no expiry).
+	GetSessionNode(ctx context.Context, ws, key string) (registry.SharedSessionNode, bool, error)
 
 	// PutCatalogSlot stores one real runtime's catalog slot (§1.3: the read
 	// and write may land on different instances).
@@ -307,12 +304,14 @@ redis.call('DEL', KEYS[3])
 return 1`)
 
 	// slotReserve: KEYS[1]=counter, KEYS[2]=reservation zset;
-	// ARGV[1]=limit, ARGV[2]=now ms, ARGV[3]=reservation ttl ms,
-	// ARGV[4]=reservation id. Expired reservations are purged (and their
-	// slots returned) before the cap check, so a dead reserver self-heals on
-	// the next claim. The counter is the cap check (AC-76).
+	// ARGV[1]=limit, ARGV[2]=reservation ttl ms, ARGV[3]=reservation id.
+	// Expired reservations are purged (and their slots returned) before the
+	// cap check, so a dead reserver self-heals on the next claim. The score
+	// and the purge cutoff come from the server clock, so one instance's
+	// skew can neither drop a live reservation nor keep a dead one (AC-76).
 	scriptSlotReserve = redis.NewScript(`
-local now = tonumber(ARGV[2])
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local before = redis.call('ZCARD', KEYS[2])
 redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
 local purged = before - redis.call('ZCARD', KEYS[2])
@@ -323,7 +322,7 @@ if n >= tonumber(ARGV[1]) then
   return 0
 end
 redis.call('SET', KEYS[1], n + 1)
-redis.call('ZADD', KEYS[2], now + tonumber(ARGV[3]), ARGV[4])
+redis.call('ZADD', KEYS[2], now + tonumber(ARGV[2]), ARGV[3])
 return 1`)
 
 	// slotConsume: pop one reservation, counter unchanged (the row counts).
@@ -347,9 +346,11 @@ redis.call('SET', KEYS[1], n)
 return 1`)
 
 	// slotSnapshot: purge expired reservations, adjust the counter, and
-	// return {counter, live reservation count} from one atomic read.
+	// return {counter, live reservation count} from one atomic read. The
+	// cutoff is the server clock, the same clock that scored the writes.
 	scriptSlotSnapshot = redis.NewScript(`
-local now = tonumber(ARGV[1])
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
 local before = redis.call('ZCARD', KEYS[2])
 redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
 local purged = before - redis.call('ZCARD', KEYS[2])
@@ -365,21 +366,22 @@ if cur ~= tonumber(ARGV[1]) then return 0 end
 redis.call('SET', KEYS[1], ARGV[2])
 return 1`)
 
-	// lockAcquire: take the lock when it is free or its holder's lease has
-	// expired. The value carries the owner and the deadline
-	// ("owner\x00untilMillis"), so a store whose TTL collection is lazy never
-	// keeps a dead holder's lock forever (and tests drive expiry by time, not
-	// by a store clock). ARGV: new value, now ms, ttl ms.
+	// sessionGet: KEYS[1]=row. Returns {value, pttl ms}, or an empty array on
+	// a miss. The PTTL is the store's own remaining lifetime: the reader
+	// converts it into its local clock once, so a row's retention is never
+	// judged by comparing the writer's stamp with the reader's now.
+	scriptSessionGet = redis.NewScript(`
+local v = redis.call('GET', KEYS[1])
+if not v then return {} end
+return {v, redis.call('PTTL', KEYS[1])}`)
+
+	// lockAcquire: take the lock only when its key is absent. The key's PX
+	// TTL is the lease — Redis expires it on the server clock, so no
+	// instance's clock can shorten or extend another's hold. ARGV: owner,
+	// ttl ms.
 	scriptLockAcquire = redis.NewScript(`
-local cur = redis.call('GET', KEYS[1])
-local now = tonumber(ARGV[2])
-if cur then
-  local sep = string.find(cur, '\0', 1, true)
-  local untilMs = nil
-  if sep then untilMs = tonumber(string.sub(cur, sep + 1)) end
-  if not untilMs or untilMs > now then return 0 end
-end
-redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[3])
+if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
 return 1`)
 
 	// lockRelease: delete only when the owner still holds the lock.
@@ -393,39 +395,31 @@ if owner == ARGV[1] then
 end
 return 0`)
 
-	// leaderAcquire: take the lease when it is free or expired (same value
-	// shape as the task lock). ARGV: new value, now ms, ttl ms.
+	// leaderAcquire: take the lease only when its key is absent — the PX TTL
+	// is the only expiry authority, exactly as for the task lock. ARGV:
+	// owner, ttl ms.
 	scriptLeaderAcquire = redis.NewScript(`
-local cur = redis.call('GET', KEYS[1])
-local now = tonumber(ARGV[2])
-if cur then
-  local sep = string.find(cur, '\0', 1, true)
-  local untilMs = nil
-  if sep then untilMs = tonumber(string.sub(cur, sep + 1)) end
-  if not untilMs or untilMs > now then return 0 end
-end
-redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[3])
+if redis.call('EXISTS', KEYS[1]) == 1 then return 0 end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
 return 1`)
 
-	// leaderRenew: extend only when the owner still holds the lease.
-	// ARGV: owner, new value, ttl ms, now ms.
+	// leaderRenew: extend only when the owner still holds the lease. The
+	// owner prefix tolerates a value written before the deadline suffix was
+	// dropped, so a rolling upgrade never makes a live lease unrenewable.
+	// ARGV: owner, ttl ms.
 	scriptLeaderRenew = redis.NewScript(`
 local cur = redis.call('GET', KEYS[1])
 if not cur then return 0 end
 local sep = string.find(cur, '\0', 1, true)
-local owner = string.sub(cur, 1, (sep or 0) - 1)
-if owner ~= ARGV[1] then return 0 end
-redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[3])
+local holder = string.sub(cur, 1, (sep or 0) - 1)
+if holder ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
 return 1`)
 )
 
-// svcInstanceID is the lease/lock value: the owner plus the deadline the next
-// acquisition compares against.
-func svcInstanceID(owner string, until time.Time) string {
-	return owner + "\x00" + strconv.FormatInt(until.UnixMilli(), 10)
-}
-
-// svcOwner strips the deadline from a lease/lock value.
+// svcOwner reads the owner out of a lease/lock value. A value written before
+// the deadline suffix was dropped carries "owner\x00untilMillis"; the suffix
+// no longer takes part in any expiry decision and is only stripped here.
 func svcOwner(raw string) string {
 	if idx := strings.LastIndexByte(raw, 0); idx >= 0 {
 		return raw[:idx]
@@ -941,12 +935,12 @@ func (s *redisStore) GetEntryByJob(ctx context.Context, jobName string) (registr
 	return s.GetEntry(ctx, ws, taskID)
 }
 
-// LockTask acquires the per-task write lock; a holder whose lease deadline has
-// passed is replaced.
+// LockTask acquires the per-task write lock. The lock's PX TTL is its lease:
+// once it lapses, Redis drops the key server-side and the next acquisition
+// wins, so the decision never compares two instances' clocks.
 func (s *redisStore) LockTask(ctx context.Context, ws, taskID, owner string, ttl time.Duration) (bool, error) {
-	now := s.now()
 	n, err := scriptLockAcquire.Run(ctx, s.rdb, []string{s.lockKey(ws, taskID)},
-		svcInstanceID(owner, now.Add(ttl)), now.UnixMilli(), ttl.Milliseconds()).Int()
+		owner, ttl.Milliseconds()).Int()
 	s.mark(err)
 	if err != nil {
 		return false, err
@@ -976,10 +970,10 @@ const reservationTTL = 5 * time.Minute
 // ReserveSlot reserves one in-flight slot below limit (AC-76).
 func (s *redisStore) ReserveSlot(ctx context.Context, ws string, limit int) (bool, error) {
 	counter, reservations := slotKeys(ws)
-	now := s.now()
-	id := strconv.FormatInt(now.UnixNano(), 36) + "-" + strconv.FormatInt(s.resSeq.Add(1), 36)
+	// The id only needs cross-instance uniqueness; no expiry decision reads it.
+	id := strconv.FormatInt(s.now().UnixNano(), 36) + "-" + strconv.FormatInt(s.resSeq.Add(1), 36)
 	n, err := scriptSlotReserve.Run(ctx, s.rdb, []string{counter, reservations},
-		limit, now.UnixMilli(), reservationTTL.Milliseconds(), id).Int()
+		limit, reservationTTL.Milliseconds(), id).Int()
 	s.mark(err)
 	if err != nil {
 		return false, err
@@ -1015,7 +1009,7 @@ func (s *redisStore) ReleaseEntry(ctx context.Context, ws string) error {
 // counter and live reservation count.
 func (s *redisStore) SlotSnapshot(ctx context.Context, ws string) (int64, int64, error) {
 	counter, reservations := slotKeys(ws)
-	values, err := scriptSlotSnapshot.Run(ctx, s.rdb, []string{counter, reservations}, s.now().UnixMilli()).Int64Slice()
+	values, err := scriptSlotSnapshot.Run(ctx, s.rdb, []string{counter, reservations}).Int64Slice()
 	s.mark(err)
 	if err != nil {
 		return 0, 0, err
@@ -1079,12 +1073,11 @@ func (s *redisStore) Slots(ctx context.Context, ws string) (int64, error) {
 	return n, nil
 }
 
-// AcquireLeadership takes the control-plane lease when it is free (§10 控制面
-// 接管有界).
+// AcquireLeadership takes the control-plane lease when it is free; the PX TTL
+// is its only expiry (§10 控制面接管有界).
 func (s *redisStore) AcquireLeadership(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
-	now := s.now()
 	n, err := scriptLeaderAcquire.Run(ctx, s.rdb, []string{keyLeader},
-		svcInstanceID(owner, now.Add(ttl)), now.UnixMilli(), ttl.Milliseconds()).Int()
+		owner, ttl.Milliseconds()).Int()
 	s.mark(err)
 	if err != nil {
 		return false, err
@@ -1094,9 +1087,8 @@ func (s *redisStore) AcquireLeadership(ctx context.Context, owner string, ttl ti
 
 // RenewLeadership extends the lease when owner still holds it.
 func (s *redisStore) RenewLeadership(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
-	now := s.now()
 	n, err := scriptLeaderRenew.Run(ctx, s.rdb, []string{keyLeader},
-		owner, svcInstanceID(owner, now.Add(ttl)), ttl.Milliseconds()).Int()
+		owner, ttl.Milliseconds()).Int()
 	s.mark(err)
 	if err != nil {
 		return false, err
@@ -1206,41 +1198,27 @@ func (s *redisStore) PutSessionNode(ctx context.Context, ws, key string, raw []b
 	return err
 }
 
-// GetSessionNode reads one soft-affinity row.
-func (s *redisStore) GetSessionNode(ctx context.Context, ws, key string) ([]byte, bool, error) {
-	raw, err := s.rdb.Get(ctx, keySession+ws+":"+key).Bytes()
-	if errors.Is(err, redis.Nil) {
-		s.mark(nil)
-		return nil, false, nil
-	}
+// GetSessionNode reads one soft-affinity row together with the lifetime the
+// store still holds on it. The expiry of the shared row belongs to the store
+// (PTTL), not to the instance that wrote it.
+func (s *redisStore) GetSessionNode(ctx context.Context, ws, key string) (registry.SharedSessionNode, bool, error) {
+	values, err := scriptSessionGet.Run(ctx, s.rdb, []string{keySession + ws + ":" + key}).Slice()
+	s.mark(err)
 	if err != nil {
-		s.mark(err)
-		return nil, false, err
+		return registry.SharedSessionNode{}, false, err
 	}
-	return raw, true, nil
-}
-
-// DeleteSessionNode removes one soft-affinity row.
-func (s *redisStore) DeleteSessionNode(ctx context.Context, ws, key string) error {
-	err := s.rdb.Del(ctx, keySession+ws+":"+key).Err()
-	s.mark(err)
-	return err
-}
-
-// ListSessionNodes lists every soft-affinity row.
-func (s *redisStore) ListSessionNodes(ctx context.Context) (map[string][]byte, error) {
-	out := make(map[string][]byte)
-	iter := s.rdb.Scan(ctx, 0, keySession+"*", 256).Iterator()
-	for iter.Next(ctx) {
-		raw, err := s.rdb.Get(ctx, iter.Val()).Bytes()
-		if err != nil {
-			continue
-		}
-		out[strings.TrimPrefix(iter.Val(), keySession)] = raw
+	if len(values) == 0 {
+		return registry.SharedSessionNode{}, false, nil
 	}
-	err := iter.Err()
-	s.mark(err)
-	return out, err
+	raw, ok := values[0].(string)
+	if !ok {
+		return registry.SharedSessionNode{}, false, fmt.Errorf("shared state: session row %s:%s is not a string", ws, key)
+	}
+	var remaining time.Duration
+	if ms, ok := values[1].(int64); ok && ms > 0 {
+		remaining = time.Duration(ms) * time.Millisecond
+	}
+	return registry.SharedSessionNode{Raw: []byte(raw), Remaining: remaining}, true, nil
 }
 
 // PutProbeSession stores one probe session row.
