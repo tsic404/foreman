@@ -12,6 +12,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/tsic404/foreman/internal/registry"
 )
@@ -60,6 +61,20 @@ const (
 // Such a report stays in process memory only; the error is the 告警面, never
 // a reason to drop it (ADR-046 decision 6).
 var ErrCarrierPayloadTooLarge = errors.New("pending report exceeds the carrier object bound")
+
+// ErrCarrierTaskIDInvalid reports a report whose task id cannot be a label
+// value — the carrier's locator (§3, §6.5). Such a report has no cross-process
+// persistence face: it is kept in process memory only and this error is the
+// alarm face, never a reason to drop it (§10, ADR-046 decision 2).
+var ErrCarrierTaskIDInvalid = errors.New("pending report task id is not a valid label value")
+
+// carrierTaskIDValid reports whether taskID can ride the carrier's task-id
+// label. The carrier's name is a hash, so the node-local queue's file-name
+// grammar is not this bound: a task id carrying "." or "_" is a legal label
+// value and keeps its cross-process face (§3, §6.5).
+func carrierTaskIDValid(taskID string) bool {
+	return taskID != "" && len(validation.IsValidLabelValue(taskID)) == 0
+}
 
 // Carrier is one pending report's durable form (ADR-046 decision 1).
 type Carrier struct {
@@ -131,8 +146,8 @@ func (c Carrier) sizeBytes() int {
 }
 
 func (s *secretCarrierStore) PutCarrier(ctx context.Context, c Carrier) error {
-	if c.TaskID == "" {
-		return errors.New("carrier task id is required")
+	if !carrierTaskIDValid(c.TaskID) {
+		return fmt.Errorf("%w: %q", ErrCarrierTaskIDInvalid, c.TaskID)
 	}
 	if c.sizeBytes() > MaxCarrierBytes {
 		return fmt.Errorf("%w: %d bytes > %d", ErrCarrierPayloadTooLarge, c.sizeBytes(), MaxCarrierBytes)
