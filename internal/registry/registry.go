@@ -19,6 +19,10 @@ const DoneIndexTTL = 24 * time.Hour
 // to a non-terminal state (§4.2 invariant: terminal is irreversible).
 var ErrTerminalImmutable = errors.New("terminal entry cannot become non-terminal")
 
+// ErrNoLiveEntry rejects a write that needs a live entry the index does not
+// hold: the fact was recorded nowhere, so a caller must not act as if it had.
+var ErrNoLiveEntry = errors.New("no live entry for the task")
+
 // StateStore is the shared state face stage one persists through
 // (ADR-046 决策 0, 02-contracts.md §4.3/§6.1): the live mapping rows, the
 // settled terminal records and the token revocation set live in a shared,
@@ -940,23 +944,29 @@ func (r *Registry) RegisterDecidedReport(taskID string, body []byte) (TaskEntry,
 	return e, true
 }
 
-// SetTokenHash records sha256(token) of the Job's credential. OnClaim is the
-// only writer, right after the builder produced the Secret (ADR-017): the
+// SetTokenHash records sha256(token) of the Job's credential. The issuance
+// paths write it right after the builder produced the Secret (ADR-017): the
 // reclaim path feeds it to the revocation set so a re-dispatched task cannot
 // be claimed by its predecessor's pod. A rebuilt entry has no hash — it never
-// leaves memory — and the reclaim degrades visibly instead.
-func (r *Registry) SetTokenHash(taskID, tokenHash string) {
+// leaves memory — and the reclaim degrades visibly instead. The shared write's
+// failure is returned: a digest the row did not take must not be handed out
+// (ADR-046 决策 7). A caller holds the task write lock and has just read the
+// entry; a missing entry is ErrNoLiveEntry, never a silent success.
+func (r *Registry) SetTokenHash(taskID, tokenHash string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.live[taskID]
 	if !ok {
-		return
+		return fmt.Errorf("%w: token digest", ErrNoLiveEntry)
 	}
 	e.TokenHash = tokenHash
 	r.live[taskID] = e
 	if r.shared != nil {
-		r.mergeNow(taskID, e, EntryPatch{TokenHash: &tokenHash})
+		// A row the other instances cannot read the digest from cannot
+		// adjudicate the credential, so the failure reaches the caller.
+		return r.mergeNow(taskID, e, EntryPatch{TokenHash: &tokenHash})
 	}
+	return nil
 }
 
 // MarkJobCreated advances pending → job_created and records the apiserver's

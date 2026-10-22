@@ -627,7 +627,12 @@ func (s *Scheduler) ContinueClaim(ctx context.Context, taskID string) error {
 		s.failClaim(ctx, e, err)
 		return err
 	}
-	s.reg.SetTokenHash(e.TaskID, tokenHash)
+	if err := s.reg.SetTokenHash(e.TaskID, tokenHash); err != nil {
+		// The row cannot carry the digest, so issuing the credential would
+		// leave no instance able to adjudicate or revoke it (ADR-046 决策 7).
+		// Nothing has been created yet; the next round retries the continuation.
+		return fmt.Errorf("%w: record token digest: %v", ErrStoreUnavailable, err)
+	}
 	_ = s.jobs.DeleteSecret(ctx, jobbuilder.CredentialSecretName(e.DaemonID))
 	if err := s.jobs.CreateSecret(ctx, secret); err != nil {
 		s.failClaim(ctx, e, fmt.Errorf("create credential secret: %w", err))
