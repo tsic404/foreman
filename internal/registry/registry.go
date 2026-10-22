@@ -372,6 +372,8 @@ func (r *Registry) applyStateOp(op stateOp) {
 			opName = "delete_entry"
 		case stateOpPutSettled:
 			opName = "put_settled"
+		case stateOpMerge:
+			opName = "merge_entry"
 		}
 		r.stateFailure(opName, op.taskID, err)
 	}
