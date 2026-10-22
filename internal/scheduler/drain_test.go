@@ -278,9 +278,10 @@ func TestReclaimGatesTheJobDeletionOnTheQueuedReport(t *testing.T) {
 	}
 }
 
-// A rebuilt entry has no token digest (it never leaves process memory), so
-// the reclaim cannot revoke it — the degradation must be visible instead of
-// silent (ADR-017 已知边界).
+// An entry rebuilt from the Job object face has no token digest (that face
+// carries identity only, F3), and with no shared mapping record there is
+// nothing to restore it from — so the reclaim cannot revoke the credential.
+// The degradation must be visible instead of silent (ADR-017 已知边界).
 func TestReclaimWithoutDigestIsVisible(t *testing.T) {
 	f := newFixture(t)
 	var logs bytes.Buffer

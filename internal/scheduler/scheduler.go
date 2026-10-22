@@ -2442,8 +2442,12 @@ func (s *Scheduler) rebuildFromK8s(ctx context.Context) error {
 		})
 		rebuilt++
 	}
-	// Payloads never leave process memory (F3), so every rebuilt entry lacks
-	// one; the C13 convergence releases pre-start entries for redispatch.
+	// This rebuild reads the Job object face, which carries identity and
+	// trigger context only (F3) — no payload, no token digest. Both live on
+	// the shared-state mapping record, so a restart that restores it keeps
+	// the entry whole (Registry.Restore); only a Job the store could not
+	// supply is rebuilt here. The C13 convergence releases pre-start entries
+	// for redispatch.
 	s.log.InfoContext(ctx, "registry.rebuilt", "jobs", rebuilt)
 	return nil
 }
