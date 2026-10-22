@@ -547,6 +547,26 @@ before copying the reference template:
   producing an id-less daemon — the identity no longer depends on the Job
   controller's `job-name` label.
 
+**The agent backend's source is a registered trade-off, not an oversight.** The
+reference template resolves `omp` from upstream's newest release at every Job
+boot and verifies it against that same release's manifest (`ADR-033`), and
+Foreman neither reviews, pins nor records the version it receives. A deployment
+that copies the reference template accepts:
+
+- **no review and no rollback anchor on the Foreman side** — a new upstream
+  release reaches every Job created afterwards without a deploy change; rolling
+  the backend back means editing the template, and a deployment that needs a
+  fixed version writes its own template, which nothing checks (§8.1);
+- **a same-origin checksum, not an independent trust anchor** — manifest and
+  asset come from the same release, so verification catches a corrupted download
+  but not a release replaced in place; template content is not a security
+  boundary (§8.7);
+- **`github.com` as a Job-start prerequisite beside the registry** — an
+  unreachable origin makes the init container exit non-zero (pod `Failed` →
+  task `failed`, `failure_reason=job_failed`), and an origin that stalls spends
+  the boot window (`job_boot_timeout`); nothing falls back to an image-carried
+  backend.
+
 ### Catalog probe and model catalog (startup)
 
 Before Foreman registers with Multica Server it runs **one catalog probe Job**:
