@@ -1,4 +1,4 @@
-package main
+package lifecycle
 
 import (
 	"context"
@@ -12,19 +12,19 @@ import (
 	"github.com/tsic404/foreman/internal/observability"
 )
 
-func testSupervisor(t *testing.T, health *observability.Health) (*supervisor, context.Context, context.CancelFunc) {
+func testSupervisor(t *testing.T, health *observability.Health) (*Supervisor, context.Context, context.CancelFunc) {
 	t.Helper()
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	return newSupervisor(slog.New(slog.NewJSONHandler(io.Discard, nil)), health, cancel), ctx, cancel
+	return New(slog.New(slog.NewJSONHandler(io.Discard, nil)), health, cancel), ctx, cancel
 }
 
 // drain waits for every component goroutine to return, with a bound.
-func drain(t *testing.T, sup *supervisor) {
+func drain(t *testing.T, sup *Supervisor) {
 	t.Helper()
 	waitCtx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	if !sup.wait(waitCtx) {
+	if !sup.Wait(waitCtx) {
 		t.Fatal("components did not return within the drain budget")
 	}
 }
@@ -38,14 +38,14 @@ func TestSupervisorEscalatesComponentFailure(t *testing.T) {
 	health := observability.NewHealth()
 	sup, ctx, _ := testSupervisor(t, health)
 
-	sup.run(ctx, "claim", func(context.Context) error { return errors.New("403 config error") })
+	sup.Run(ctx, "claim", func(context.Context) error { return errors.New("403 config error") })
 
 	select {
 	case <-ctx.Done():
 	case <-time.After(2 * time.Second):
 		t.Fatal("a component failure must cancel the root context")
 	}
-	err := sup.failure()
+	err := sup.Failure()
 	if err == nil || !strings.Contains(err.Error(), "claim") || !strings.Contains(err.Error(), "403") {
 		t.Fatalf("failure = %v, want the claim component's error", err)
 	}
@@ -62,18 +62,18 @@ func TestSupervisorKeepsGracefulShutdownQuiet(t *testing.T) {
 	health := observability.NewHealth()
 	sup, ctx, cancel := testSupervisor(t, health)
 
-	sup.run(ctx, "heartbeat", func(c context.Context) error {
+	sup.Run(ctx, "heartbeat", func(c context.Context) error {
 		<-c.Done()
 		return nil
 	})
-	sup.run(ctx, "recovery", func(c context.Context) error {
+	sup.Run(ctx, "recovery", func(c context.Context) error {
 		<-c.Done()
 		return errors.New("upstream closed during shutdown")
 	})
 
 	cancel()
 	drain(t, sup)
-	if err := sup.failure(); err != nil {
+	if err := sup.Failure(); err != nil {
 		t.Fatalf("failure = %v, want nil on a graceful shutdown", err)
 	}
 	if got := health.Stopped(); len(got) != 2 {

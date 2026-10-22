@@ -30,7 +30,9 @@ import (
 	"github.com/coder/websocket"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 
 	"github.com/tsic404/foreman/internal/auth"
@@ -1264,6 +1266,15 @@ type jobClient struct {
 	// onCreateJob runs before a create is answered (scenario setup hooks).
 	onCreateJob func(job *batchv1.Job)
 
+	// deleteJobErr makes the next Job deletion fail: a terminating
+	// predecessor keeps its name without the apiserver having removed it.
+	deleteJobErr error
+	// nameHeld makes CreateJob answer AlreadyExists for a name, as the
+	// apiserver does while a predecessor still holds it.
+	nameHeld map[string]bool
+	// onGetJob runs before a GetJob is answered (scenario clock hooks).
+	onGetJob func()
+
 	existingJobs map[string]*batchv1.Job
 	jobs         []batchv1.Job
 	secrets      []corev1.Secret
@@ -1284,6 +1295,9 @@ func (c *jobClient) CreateJob(_ context.Context, job *batchv1.Job) (*batchv1.Job
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.nameHeld[job.Name] {
+		return nil, apierrors.NewAlreadyExists(schema.GroupResource{Resource: "jobs"}, job.Name)
+	}
 	if c.createJobErr != nil {
 		return nil, c.createJobErr
 	}
@@ -1299,6 +1313,9 @@ func (c *jobClient) CreateJob(_ context.Context, job *batchv1.Job) (*batchv1.Job
 func (c *jobClient) DeleteJob(_ context.Context, name string) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.deleteJobErr != nil {
+		return c.deleteJobErr
+	}
 	c.deletedJobs = append(c.deletedJobs, name)
 	// A deleted object leaves the list face too, or a "delete then restart"
 	// scenario would rebuild a ghost entry from it.
@@ -1320,9 +1337,39 @@ func (c *jobClient) setDeleteSecretError(err error) {
 	c.deleteSecretErr = err
 }
 
+// setOnGetJob programs the GetJob hook (nil clears it). The hook runs under
+// the client lock, so the write takes the same lock as the read.
+func (c *jobClient) setOnGetJob(fn func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onGetJob = fn
+}
+
+// setDeleteJobError programs Job deletion to fail (nil clears it): a
+// terminating predecessor that keeps its name.
+func (c *jobClient) setDeleteJobError(err error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.deleteJobErr = err
+}
+
+// setNameHeld makes CreateJob answer AlreadyExists for name (false clears it),
+// as the apiserver does while a predecessor holds the name.
+func (c *jobClient) setNameHeld(name string, held bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.nameHeld == nil {
+		c.nameHeld = map[string]bool{}
+	}
+	c.nameHeld[name] = held
+}
+
 func (c *jobClient) GetJob(_ context.Context, name string) (*batchv1.Job, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.onGetJob != nil {
+		c.onGetJob()
+	}
 	c.getJobs = append(c.getJobs, name)
 	job, ok := c.existingJobs[name]
 	if !ok {
@@ -2657,6 +2704,9 @@ type harness struct {
 	// is its clock seam, which a scenario steps to age entries.
 	bundles    *proxy.SkillCache
 	skillClock *steppedClock
+	// schedClock is the scheduler's clock seam; a scenario that has to exhaust
+	// a wall-clock bound (the Job-name wait) sets it before rebuilding.
+	schedClock func() time.Time
 
 	// jobImage overrides the reference template's <job-image> value: a
 	// scenario that asserts the deployment's own reference sets it before
@@ -2985,6 +3035,9 @@ func (h *harness) rebuildSchedulerWithLevel(t *testing.T, level slog.Level, muta
 		scheduler.WithProbeRegistry(h.probes),
 		scheduler.WithLogger(slog.New(slog.NewJSONHandler(h.logs, &slog.HandlerOptions{Level: level}))),
 		scheduler.WithRuntimeIdentity(h.client.RuntimeIdentity),
+	}
+	if h.schedClock != nil {
+		opts = append(opts, scheduler.WithClock(h.schedClock))
 	}
 	if h.coord != nil {
 		instanceID := h.instanceID
