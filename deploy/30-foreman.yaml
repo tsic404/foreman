@@ -233,10 +233,12 @@ spec:
             # Control-plane lease: the holder owns registration, heartbeat,
             # subscription, claim and convergence; a dead holder is replaced
             # after this lease plus the takeover window (§10 控制面接管有界).
+            # The window must be at least a third of the lease (one renewal
+            # tick), or startup is refused.
             - name: FOREMAN_LEADER_LEASE_TTL
               value: "10s"
             - name: FOREMAN_LEADER_TAKEOVER_WINDOW
-              value: "2s"
+              value: "5s"
             # Liveness row of one replica; the shutdown path deregisters only
             # when this replica is the last live one (§4.6 优雅关闭).
             - name: FOREMAN_INSTANCE_TTL

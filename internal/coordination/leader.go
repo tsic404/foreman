@@ -9,6 +9,7 @@ package coordination
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"sync"
@@ -25,8 +26,10 @@ const (
 	// window adds to it).
 	EnvLeaseTTL = "FOREMAN_LEADER_LEASE_TTL"
 	// EnvTakeoverWindow is the quiet period a new leader observes before it
-	// runs reconciliation and starts claiming: the old holder's in-flight
-	// actions settle inside it (§10 接管窗口内不产生新 claim).
+	// runs reconciliation and starts claiming (§10 接管窗口内不产生新 claim).
+	// It must be at least one renewal tick (a third of EnvLeaseTTL): the old
+	// holder notices the loss on its next renewal, so a shorter window lets
+	// its stale hold outlive the new holder's grant. LoadConfig rejects one.
 	EnvTakeoverWindow = "FOREMAN_LEADER_TAKEOVER_WINDOW"
 	// EnvInstanceTTL is the liveness-row retention used by the shutdown
 	// narrowing: an instance is alive while its row exists.
@@ -39,11 +42,25 @@ const (
 )
 
 const (
-	defaultLeaseTTL       = 10 * time.Second
-	defaultTakeoverWindow = 2 * time.Second
+	defaultLeaseTTL = 10 * time.Second
+	// defaultTakeoverWindow clears one renewal tick of the default lease
+	// (10s/3, about 3.3s) so the old holder's stale hold clears inside the
+	// quiet period; the relation, not this number, is what LoadConfig checks.
+	defaultTakeoverWindow = 5 * time.Second
 	defaultInstanceTTL    = 30 * time.Second
 	defaultTaskLockTTL    = 120 * time.Second
 )
+
+// renewalTick is the lease renewal cadence. Run renews every tick, so a
+// takeover window shorter than one tick can end before the old holder's next
+// renewal clears its hold (§10 接管窗口内不产生新 claim).
+func renewalTick(leaseTTL time.Duration) time.Duration {
+	tick := leaseTTL / 3
+	if tick < 100*time.Millisecond {
+		tick = 100 * time.Millisecond
+	}
+	return tick
+}
 
 // Config is the coordination module's runtime configuration.
 type Config struct {
@@ -54,7 +71,8 @@ type Config struct {
 }
 
 // LoadConfig reads the coordination configuration from env (os.Getenv when
-// getenv is nil).
+// getenv is nil) and cross-checks the lease timings: a takeover window
+// shorter than one renewal tick is a configuration error (§10 控制面接管有界).
 func LoadConfig(getenv func(string) string) (Config, error) {
 	cfg := Config{
 		LeaseTTL:       defaultLeaseTTL,
@@ -92,6 +110,10 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			return Config{}, errors.New(EnvTaskLockTTL + " must be a positive duration")
 		}
 		cfg.TaskLockTTL = d
+	}
+	if tick := renewalTick(cfg.LeaseTTL); cfg.TakeoverWindow < tick {
+		return Config{}, fmt.Errorf("%s (%s) must be >= one renewal tick %s of %s (%s): a shorter quiet period lets the old holder act after the new holder serves",
+			EnvTakeoverWindow, cfg.TakeoverWindow, tick, EnvLeaseTTL, cfg.LeaseTTL)
 	}
 	return cfg, nil
 }
@@ -178,10 +200,7 @@ func (l *Leader) Held() bool { return l.held.Load() }
 // fatal error: an unreachable store parks the instance as a follower and the
 // retry continues (§10 共享状态不可用).
 func (l *Leader) Run(ctx context.Context) error {
-	tick := l.cfg.LeaseTTL / 3
-	if tick < 100*time.Millisecond {
-		tick = 100 * time.Millisecond
-	}
+	tick := renewalTick(l.cfg.LeaseTTL)
 	for {
 		if !l.held.Load() {
 			ok, err := l.store.AcquireLeadership(ctx, l.id, l.cfg.LeaseTTL)

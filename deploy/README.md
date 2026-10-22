@@ -337,9 +337,13 @@ restores them instead of rebuilding from K8s (ADR-046 阶段一,
   fails closed (401/503). Keep it far below the Job Token TTL: a cached
   adjudication may not outlive the revocation window (§6.1).
 - `FOREMAN_LEADER_LEASE_TTL` (default `10s`) and
-  `FOREMAN_LEADER_TAKEOVER_WINDOW` (default `2s`) — the control-plane lease
+  `FOREMAN_LEADER_TAKEOVER_WINDOW` (default `5s`) — the control-plane lease
   and the quiet period the new holder observes before it reconciles and
-  claims. The takeover bound is the lease plus this window.
+  claims. The takeover bound is the lease plus this window. The window must
+  be at least one renewal tick (a third of the lease): the old holder learns
+  it lost the lease on its next renewal, so a shorter window would let it
+  keep acting after the new holder serves; such a pair is refused at
+  start-up.
 - `FOREMAN_INSTANCE_TTL` (default `30s`) — a replica's liveness row; the
   shutdown path uses it to decide whether this replica is the last one.
 - `FOREMAN_TASK_LOCK_TTL` (default `120s`) — the per-task write lock's lease.
