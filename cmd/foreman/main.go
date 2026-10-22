@@ -29,6 +29,7 @@ import (
 	"github.com/tsic404/foreman/internal/bootstrap"
 	"github.com/tsic404/foreman/internal/coordination"
 	"github.com/tsic404/foreman/internal/jobbuilder"
+	"github.com/tsic404/foreman/internal/lifecycle"
 	"github.com/tsic404/foreman/internal/observability"
 	"github.com/tsic404/foreman/internal/platform"
 	"github.com/tsic404/foreman/internal/proxy"
@@ -482,8 +483,8 @@ func run() error {
 	// The loops are supervised: a stop with a live context is a process-level
 	// failure (§1.5) and takes the process down for a visible restart, while
 	// the ordinary cancellation path stays a graceful shutdown.
-	sup := newSupervisor(baseLog, health, stop)
-	run := func(component string, f func(context.Context) error) { sup.run(ctx, component, f) }
+	sup := lifecycle.New(baseLog, health, stop)
+	run := func(component string, f func(context.Context) error) { sup.Run(ctx, component, f) }
 	runWorkspace := run
 	if workspaces.Len() > 1 {
 		// A workspace identity's control plane failing at runtime is confined
@@ -491,7 +492,7 @@ func run() error {
 		// while every other workspace keeps serving. Only a single-workspace
 		// deployment keeps §1.5's process-level failure.
 		runWorkspace = func(component string, f func(context.Context) error) {
-			sup.run(ctx, component, func(ctx context.Context) error {
+			sup.Run(ctx, component, func(ctx context.Context) error {
 				return isolateWorkspaceLoop(ctx, component, baseLog, workspaceRetryDelay, f)
 			})
 		}
@@ -688,7 +689,7 @@ func run() error {
 	// credential/identity defect cannot be retried into working, and a
 	// non-zero exit is what makes the Deployment restart (and eventually
 	// CrashLoopBackOff) — the alarm §1.5 requires.
-	fatalErr := sup.failure()
+	fatalErr := sup.Failure()
 	reason := "signal"
 	if fatalErr != nil {
 		reason = "component failure"
@@ -729,7 +730,7 @@ func run() error {
 	// deployment's terminationGracePeriodSeconds (30s), and the 20s budget
 	// here stays inside it — an unbounded wait would leave no
 	// foreman.stopped line at all.
-	if !sup.wait(shutdownCtx) {
+	if !sup.Wait(shutdownCtx) {
 		log.Warn("loops.shutdown_timeout", "err", shutdownCtx.Err().Error())
 	}
 	// The shared-state writes run on an ordered writer outside the registry
