@@ -172,6 +172,26 @@ func TestLoadConfigDeliveryConfirmWindow(t *testing.T) {
 	})); err != nil {
 		t.Fatalf("a window below the configured boot bound must be accepted: %v", err)
 	}
+
+	// A boot bound switched off (0 = no upper bound) has nothing for the
+	// window to stay under: any positive value is accepted, including the
+	// 30s the unset key already defaults to, and the bound stays off.
+	for _, raw := range []string{"30s", "10m"} {
+		cfg, err := LoadConfig(testEnv(map[string]string{
+			EnvJobBootTimeout: "0", EnvDeliveryConfirmTimeout: raw,
+		}))
+		if err != nil {
+			t.Fatalf("window %s under a disabled boot bound: %v", raw, err)
+		}
+		want, err := time.ParseDuration(raw)
+		if err != nil {
+			t.Fatalf("parse %q: %v", raw, err)
+		}
+		if cfg.JobBootTimeout != 0 || cfg.DeliveryConfirmTimeout != want {
+			t.Fatalf("window %s under a disabled boot bound = %v, boot = %v; want %v and 0",
+				raw, cfg.DeliveryConfirmTimeout, cfg.JobBootTimeout, want)
+		}
+	}
 }
 
 func TestLoadConfigRejectsBadValues(t *testing.T) {
