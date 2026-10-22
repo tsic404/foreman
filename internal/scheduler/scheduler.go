@@ -2262,6 +2262,12 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 			if firstErr == nil {
 				firstErr = err
 			}
+			// The criterion is satisfied but the delete failed: the Secret
+			// stays and the next round retries it. Without this line the only
+			// trace is the round's aggregate error.
+			s.log.WarnContext(ctx, "cred.orphan_secret_delete_failed",
+				"task_id", taskID, "workspace_id", workspaceID,
+				"secret", secret.Name, "err", err.Error())
 			continue
 		}
 		// job_name is derived for attribution only: the Job is gone, so there
@@ -2297,6 +2303,8 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 			if firstErr == nil {
 				firstErr = err
 			}
+			s.log.WarnContext(ctx, "pending.carrier_delete_failed",
+				"task_id", taskID, "secret", secret.Name, "err", err.Error())
 			continue
 		}
 		s.log.InfoContext(ctx, "pending.carrier_removed",

@@ -398,6 +398,24 @@ func TestSweepSecretDomainsKeepCarriersOutOfTheCredentialCriterion(t *testing.T)
 	}
 }
 
+// A failed orphan delete is retried next round and logged per object: the
+// round's aggregate error alone does not say which Secret survived.
+func TestSweepOrphanSecretsLogsAFailedDelete(t *testing.T) {
+	f := newFixture(t)
+	var logs bytes.Buffer
+	f.sched.log = slog.New(slog.NewJSONHandler(&logs, nil))
+	f.jobs.secrets = []corev1.Secret{secretObject("fm-task-orphan-cred", "task-orphan")}
+	f.jobs.deleteSecretErr = errors.New("apiserver unavailable")
+
+	if err := f.sched.SweepOrphanSecrets(context.Background()); err == nil {
+		t.Fatal("SweepOrphanSecrets: want the delete error surfaced")
+	}
+	event := decodeLogEvent(t, &logs, "cred.orphan_secret_delete_failed")
+	if event["task_id"] != "task-orphan" || event["secret"] != "fm-task-orphan-cred" {
+		t.Fatalf("event = %v, want the surviving Secret's identity", event)
+	}
+}
+
 // A ListJobs that fails is not a NotFound: the criterion demands an explicit
 // absence, so the Secret survives the round.
 func TestSweepOrphanSecretsKeepsSecretOnAPIError(t *testing.T) {
