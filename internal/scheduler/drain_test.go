@@ -258,8 +258,8 @@ func TestReclaimGatesTheJobDeletionOnTheQueuedReport(t *testing.T) {
 	if _, ok := f.reg.Get("task-1"); ok {
 		t.Fatal("the credential reclaim must not wait for the report")
 	}
-	if len(f.revoker.revoked) != 1 || len(f.jobs.deletedSecrets) != 1 {
-		t.Fatalf("revoked=%v secrets=%v, want the credential reclaimed", f.revoker.revoked, f.jobs.deletedSecrets)
+	if len(f.revoker.digests()) != 1 || len(f.jobs.deletedSecrets) != 1 {
+		t.Fatalf("revoked=%v secrets=%v, want the credential reclaimed", f.revoker.digests(), f.jobs.deletedSecrets)
 	}
 
 	// The report landed: the next reclaim catch-up deletes the Job (idempotent
@@ -298,8 +298,8 @@ func TestReclaimWithoutDigestIsVisible(t *testing.T) {
 		t.Fatalf("OnJobTerminated: %v", err)
 	}
 	decodeLogEvent(t, &logs, "cred.revoke_unavailable")
-	if len(f.revoker.revoked) != 0 {
-		t.Fatalf("revoked = %v, want none without a digest", f.revoker.revoked)
+	if len(f.revoker.digests()) != 0 {
+		t.Fatalf("revoked = %v, want none without a digest", f.revoker.digests())
 	}
 }
 

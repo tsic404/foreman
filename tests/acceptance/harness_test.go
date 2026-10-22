@@ -922,6 +922,10 @@ func (s *upstreamStub) enqueueTask(taskID string) {
 func (s *upstreamStub) claim(maxTasks int) []json.RawMessage {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if maxTasks < 0 {
+		// A negative batch asks for nothing; make() would panic on it.
+		maxTasks = 0
+	}
 	served := make([]json.RawMessage, 0, maxTasks)
 	for _, task := range s.queued {
 		if len(served) >= maxTasks {
