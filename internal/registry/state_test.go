@@ -3,9 +3,164 @@ package registry
 import (
 	"context"
 	"errors"
+	"fmt"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+// A write racing Close is either applied or refused — never accepted into a
+// queue whose writer has already returned. That stranded state leaves
+// statePending above zero and FlushState waiting for a drain that cannot
+// happen, which is exactly the shutdown order (flush, then close).
+func TestCloseDoesNotStrandARacingWrite(t *testing.T) {
+	const (
+		rounds  = 200
+		writers = 32
+	)
+	for round := range rounds {
+		store := newFakeStateStore()
+		var refused atomic.Int64
+		r := New(fixedClock(), WithStateStore(store), WithStateErrorHook(func(op, _ string, _ error) {
+			if op == "closed" {
+				refused.Add(1)
+			}
+		}))
+		var wg sync.WaitGroup
+		start := make(chan struct{})
+		for i := range writers {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-start
+				r.enqueueState(stateOp{kind: stateOpPut, ws: "ws-1", taskID: fmt.Sprintf("t-%d", i)})
+			}()
+		}
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			r.Close(context.Background())
+		}()
+		close(start)
+		wg.Wait()
+
+		if pending := r.statePending.Load(); pending != 0 {
+			t.Fatalf("round %d: statePending = %d after Close, want every accepted write applied", round, pending)
+		}
+		if landed, dropped := len(store.puts), int(refused.Load()); landed+dropped != writers {
+			t.Fatalf("round %d: %d writes landed and %d were refused, want each of %d to do one or the other",
+				round, landed, dropped, writers)
+		}
+	}
+}
+
+// stalledStore blocks every write until released: a shared store that still
+// answers the connection but stops completing writes, which is the shutdown
+// case the close budget exists for.
+type stalledStore struct {
+	*fakeStateStore
+	started chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newStalledStore() *stalledStore {
+	return &stalledStore{
+		fakeStateStore: newFakeStateStore(),
+		started:        make(chan struct{}),
+		release:        make(chan struct{}),
+	}
+}
+
+func (s *stalledStore) PutEntry(context.Context, string, string, TaskEntry) error {
+	s.once.Do(func() { close(s.started) })
+	<-s.release
+	return nil
+}
+
+// A backlog that outlives the close budget is counted off and reported, not
+// waited out: shutdown must stay inside the pod's grace period even when the
+// shared store stopped completing writes.
+func TestCloseReportsTheBacklogWhenTheBudgetRunsOut(t *testing.T) {
+	store := newStalledStore()
+	var refused atomic.Int64
+	r := New(fixedClock(), WithStateStore(store), WithStateErrorHook(func(op, _ string, _ error) {
+		if op == "closed" {
+			refused.Add(1)
+		}
+	}))
+	const queued = 5
+	for i := range queued {
+		r.enqueueState(stateOp{kind: stateOpPut, ws: "ws-1", taskID: fmt.Sprintf("t-%d", i)})
+	}
+	<-store.started // the writer is inside the first store call
+
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	err := r.Close(ctx)
+	if !errors.Is(err, errStateDrainTimeout) {
+		t.Fatalf("Close = %v, want the drain-timeout error", err)
+	}
+	if got := refused.Load(); got != queued-1 {
+		t.Fatalf("refused = %d, want %d (the in-flight write is still being applied)", got, queued-1)
+	}
+	if pending := r.statePending.Load(); pending != 1 {
+		t.Fatalf("statePending = %d after the budget ran out, want the one in-flight write", pending)
+	}
+
+	// Releasing the store lets the in-flight write land and the writer exit.
+	close(store.release)
+	select {
+	case <-r.stateDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("writer did not exit after the store was released")
+	}
+	if pending := r.statePending.Load(); pending != 0 {
+		t.Fatalf("statePending = %d after the writer exited, want 0", pending)
+	}
+}
+
+// Close ends the writer goroutine and refuses later writes through the
+// failure hook: an instance must not leak one writer per registry, and a
+// dropped transition must not be silent.
+func TestCloseStopsTheStateWriter(t *testing.T) {
+	store := newFakeStateStore()
+	var ops []string
+	r := New(fixedClock(), WithStateStore(store), WithStateErrorHook(func(op, _ string, _ error) {
+		ops = append(ops, op)
+	}))
+	if err := r.Close(context.Background()); err != nil {
+		t.Fatalf("Close: %v", err)
+	}
+	if err := r.Close(context.Background()); err != nil { // idempotent
+		t.Fatalf("second Close: %v", err)
+	}
+
+	select {
+	case <-r.stateDone:
+	default:
+		t.Fatal("writer goroutine still running after Close")
+	}
+	r.enqueueState(stateOp{kind: stateOpPut, taskID: "t-1"})
+	if len(ops) != 1 || ops[0] != "closed" {
+		t.Fatalf("failure hook ops = %v, want one closed write", ops)
+	}
+	if err := r.FlushState(context.Background()); err != nil {
+		t.Fatalf("FlushState after Close: %v", err)
+	}
+}
+
+// newStateRegistry builds a store-backed registry and stops its writer when
+// the test ends: the writer is a goroutine per instance, so a test that never
+// closes it leaves one behind.
+func newStateRegistry(t *testing.T, store StateStore) *Registry {
+	t.Helper()
+	r := New(fixedClock(), WithStateStore(store))
+	t.Cleanup(func() { r.Close(context.Background()) })
+	return r
+}
 
 // fakeStateStore records the registry's shared-state traffic and answers the
 // restore scan from programmed rows.
@@ -87,7 +242,7 @@ func flushState(t *testing.T, r *Registry) {
 
 func TestRegistryPersistsTransitions(t *testing.T) {
 	store := newFakeStateStore()
-	r := New(fixedClock(), WithStateStore(store))
+	r := newStateRegistry(t, store)
 	e := entryFor("t1")
 	e.WorkspaceID = "ws-1"
 
@@ -181,7 +336,7 @@ func TestRegistryRestoreRebuildsIndexesAndRuntime(t *testing.T) {
 		CompletedAt: restoredAt,
 	}
 
-	r := New(fixedClock(), WithStateStore(store))
+	r := newStateRegistry(t, store)
 	entries, answered, err := r.Restore(context.Background())
 	if err != nil || !answered || len(entries) != 1 {
 		t.Fatalf("Restore = %d entries, answered %v, err %v", len(entries), answered, err)
@@ -213,7 +368,7 @@ func TestRegistryRestoreRebuildsIndexesAndRuntime(t *testing.T) {
 func TestRegistryRestoreReportsStoreOutage(t *testing.T) {
 	store := newFakeStateStore()
 	store.pingErr = errors.New("connection refused")
-	r := New(fixedClock(), WithStateStore(store))
+	r := newStateRegistry(t, store)
 	entries, answered, err := r.Restore(context.Background())
 	// A store outage is an error (the caller logs registry.restore_failed)
 	// and a miss: the K8s rebuild owns recovery.
@@ -255,7 +410,7 @@ func (s *slowStateStore) PutEntry(ctx context.Context, ws, taskID string, e Task
 func TestRegistryReadsDoNotBlockOnAStalledStore(t *testing.T) {
 	inner := newFakeStateStore()
 	store := &slowStateStore{fakeStateStore: inner, gate: make(chan struct{})}
-	r := New(fixedClock(), WithStateStore(store))
+	r := newStateRegistry(t, store)
 	if err := r.Put(entryFor("t1")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
@@ -288,7 +443,7 @@ func TestRegistryReadsDoNotBlockOnAStalledStore(t *testing.T) {
 func TestRegistryFlushReportsAStuckQueue(t *testing.T) {
 	inner := newFakeStateStore()
 	store := &slowStateStore{fakeStateStore: inner, gate: make(chan struct{})}
-	r := New(fixedClock(), WithStateStore(store))
+	r := newStateRegistry(t, store)
 	if err := r.Put(entryFor("t1")); err != nil {
 		t.Fatalf("Put: %v", err)
 	}

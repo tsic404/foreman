@@ -740,6 +740,12 @@ func run() error {
 			log.Warn("state.flush_incomplete", "err", err.Error())
 		}
 	}
+	// Stop the writer inside the same budget: a backlog the flush could not
+	// drain is counted off and reported as closed writes, never waited out
+	// past the pod's grace period.
+	if err := reg.Close(shutdownCtx); err != nil {
+		log.Warn("state.close_timeout", "err", err.Error())
+	}
 	log.Info("foreman.stopped")
 	if fatalErr != nil {
 		return fatalErr

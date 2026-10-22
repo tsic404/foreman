@@ -2834,6 +2834,7 @@ func buildHarness(t *testing.T, catalogEnabled bool, window time.Duration, skill
 func buildHarnessWith(t *testing.T, catalogEnabled bool, window time.Duration, skill func(*proxy.Config), realServer, wsEnabled bool, opts harnessOptions) *harness {
 	upstream := newUpstreamStub(t)
 	reg := registry.New(time.Now, registry.WithDeliveryConfirmTimeout(window), registry.WithStateStore(opts.store))
+	t.Cleanup(func() { reg.Close(context.Background()) })
 	probes := registry.NewProbeRegistry()
 	startup := registry.NewStartupCatalog()
 	slots := proxy.NewCatalogSlots()
