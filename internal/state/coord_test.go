@@ -12,7 +12,7 @@ import (
 	"github.com/tsic404/foreman/internal/registry"
 )
 
-func coordTestStore(t *testing.T) (Store, CoordStore, *time.Time) {
+func coordTestStore(t *testing.T) (Store, CoordStore, *time.Time, *miniredis.Miniredis) {
 	t.Helper()
 	mr := miniredis.RunT(t)
 	now := time.Now()
@@ -25,7 +25,7 @@ func coordTestStore(t *testing.T) (Store, CoordStore, *time.Time) {
 	if err != nil {
 		t.Fatalf("state.New: %v", err)
 	}
-	return s, s.(CoordStore), &now
+	return s, s.(CoordStore), &now, mr
 }
 
 func coordTestEntry(taskID, payload string) registry.TaskEntry {
@@ -44,7 +44,7 @@ func coordTestEntry(taskID, payload string) registry.TaskEntry {
 
 func TestCoordEnqueueIsSingleAndKeepsThePayload(t *testing.T) {
 	ctx := context.Background()
-	_, store, _ := coordTestStore(t)
+	_, store, _, _ := coordTestStore(t)
 	first := coordTestEntry("task-1", `{"body":"first"}`)
 	created, err := store.EnqueueEntry(ctx, "ws-1", "task-1", first)
 	if err != nil || !created {
@@ -69,7 +69,7 @@ func TestCoordEnqueueIsSingleAndKeepsThePayload(t *testing.T) {
 
 func TestCoordPickupIsSingleFlightAndRearms(t *testing.T) {
 	ctx := context.Background()
-	_, store, now := coordTestStore(t)
+	_, store, now, _ := coordTestStore(t)
 	if _, err := store.EnqueueEntry(ctx, "ws-1", "task-1", coordTestEntry("task-1", `{"body":"x"}`)); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
@@ -137,7 +137,7 @@ func TestCoordPickupIsSingleFlightAndRearms(t *testing.T) {
 
 func TestCoordTerminalIsWrittenOnce(t *testing.T) {
 	ctx := context.Background()
-	full, store, now := coordTestStore(t)
+	full, store, now, _ := coordTestStore(t)
 	if _, err := store.EnqueueEntry(ctx, "ws-1", "task-1", coordTestEntry("task-1", `{"body":"x"}`)); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
@@ -159,7 +159,7 @@ func TestCoordTerminalIsWrittenOnce(t *testing.T) {
 
 func TestCoordMergeCannotRevertAGateField(t *testing.T) {
 	ctx := context.Background()
-	_, store, now := coordTestStore(t)
+	_, store, now, _ := coordTestStore(t)
 	if _, err := store.EnqueueEntry(ctx, "ws-1", "task-1", coordTestEntry("task-1", `{"body":"x"}`)); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
@@ -184,7 +184,7 @@ func TestCoordMergeCannotRevertAGateField(t *testing.T) {
 
 func TestCoordSlotsAndLocks(t *testing.T) {
 	ctx := context.Background()
-	_, store, now := coordTestStore(t)
+	_, store, _, mr := coordTestStore(t)
 	if ok, err := store.ReserveSlot(ctx, "", 2); err != nil || !ok {
 		t.Fatalf("reserve 1: ok=%v err=%v", ok, err)
 	}
@@ -220,8 +220,9 @@ func TestCoordSlotsAndLocks(t *testing.T) {
 	if ok, err := store.LockTask(ctx, "ws-1", "task-1", "owner-b", time.Second); err != nil || ok {
 		t.Fatalf("lock after a foreign unlock attempt: ok=%v err=%v, want false", ok, err)
 	}
-	// The holder's deadline passed: the lock is takeable without a release.
-	*now = now.Add(2 * time.Second)
+	// The holder's TTL lapsed on the store's clock: the lock is takeable
+	// without a release.
+	mr.FastForward(2 * time.Second)
 	if ok, err := store.LockTask(ctx, "ws-1", "task-1", "owner-b", time.Second); err != nil || !ok {
 		t.Fatalf("expired lock: ok=%v err=%v, want true", ok, err)
 	}
@@ -232,7 +233,7 @@ func TestCoordSlotsAndLocks(t *testing.T) {
 
 func TestCoordLeaderLeaseExpires(t *testing.T) {
 	ctx := context.Background()
-	_, store, now := coordTestStore(t)
+	_, store, _, mr := coordTestStore(t)
 	if ok, err := store.AcquireLeadership(ctx, "a", time.Second); err != nil || !ok {
 		t.Fatalf("acquire: ok=%v err=%v", ok, err)
 	}
@@ -245,7 +246,7 @@ func TestCoordLeaderLeaseExpires(t *testing.T) {
 	if ok, err := store.RenewLeadership(ctx, "b", time.Second); err != nil || ok {
 		t.Fatalf("foreign renew: ok=%v err=%v, want false", ok, err)
 	}
-	*now = now.Add(2 * time.Second)
+	mr.FastForward(2 * time.Second)
 	if ok, err := store.AcquireLeadership(ctx, "b", time.Second); err != nil || !ok {
 		t.Fatalf("acquire after expiry: ok=%v err=%v, want true", ok, err)
 	}
@@ -256,14 +257,17 @@ func TestCoordLeaderLeaseExpires(t *testing.T) {
 
 func TestCoordSessionIndex(t *testing.T) {
 	ctx := context.Background()
-	_, store, _ := coordTestStore(t)
+	_, store, _, _ := coordTestStore(t)
 	raw := []byte(`{"node":"node-a","learned_at":"2026-10-21T00:00:00Z"}`)
 	if err := store.PutSessionNode(ctx, "ws-1", "sess-1", raw, time.Hour); err != nil {
 		t.Fatalf("put: %v", err)
 	}
 	got, ok, err := store.GetSessionNode(ctx, "ws-1", "sess-1")
-	if err != nil || !ok || string(got) != string(raw) {
-		t.Fatalf("get = %s (ok=%v err=%v)", got, ok, err)
+	if err != nil || !ok || string(got.Raw) != string(raw) {
+		t.Fatalf("get = %s (ok=%v err=%v)", got.Raw, ok, err)
+	}
+	if got.Remaining <= 0 || got.Remaining > time.Hour {
+		t.Fatalf("remaining = %v, want (0, 1h]", got.Remaining)
 	}
 	if _, ok, err := store.GetSessionNode(ctx, "ws-2", "sess-1"); err != nil || ok {
 		t.Fatalf("cross-workspace get: ok=%v err=%v, want a miss", ok, err)
@@ -275,7 +279,7 @@ func TestCoordSessionIndex(t *testing.T) {
 // CAS decline (never lose the +1), and an unchanged counter must be writable.
 func TestCoordSlotSnapshotCAS(t *testing.T) {
 	ctx := context.Background()
-	_, store, now := coordTestStore(t)
+	_, store, _, mr := coordTestStore(t)
 	if ok, err := store.ReserveSlot(ctx, "", 10); err != nil || !ok {
 		t.Fatalf("reserve: ok=%v err=%v", ok, err)
 	}
@@ -309,12 +313,88 @@ func TestCoordSlotSnapshotCAS(t *testing.T) {
 		t.Fatalf("counter after the CAS = %d, want 1", got)
 	}
 
-	// Expiry is part of the snapshot: past the reservation TTL the slot is
-	// returned and the reservation count drops to zero.
-	*now = now.Add(reservationTTL + time.Minute)
+	// Expiry is part of the snapshot: past the reservation TTL (store clock)
+	// the slot is returned and the reservation count drops to zero. The score
+	// is written with the server's TIME, so the server clock is what moves.
+	mr.SetTime(time.Now().Add(reservationTTL + time.Minute))
 	count, reservations, err = store.SlotSnapshot(ctx, "")
 	if err != nil || count != 0 || reservations != 0 {
 		t.Fatalf("snapshot after expiry = (%d,%d) err=%v, want (0,0)", count, reservations, err)
+	}
+}
+
+// coordStoreAt builds one store over an existing miniredis with the given
+// clock, so one test can stand two instances with different clocks on the same
+// shared store.
+func coordStoreAt(t *testing.T, mr *miniredis.Miniredis, now func() time.Time) CoordStore {
+	t.Helper()
+	s, err := New(Config{
+		URL:         "redis://" + mr.Addr(),
+		DialTimeout: time.Second,
+		EntryTTL:    48 * time.Hour,
+	}, WithClock(now))
+	if err != nil {
+		t.Fatalf("state.New: %v", err)
+	}
+	return s.(CoordStore)
+}
+
+// TestCoordLeaseIgnoresClientClockSkew pins the expiry authority: a live lock
+// and a live lease are held by the store-side TTL, so an instance whose clock
+// runs an hour ahead must not preempt them. Only the server clock ending the
+// TTL releases them.
+func TestCoordLeaseIgnoresClientClockSkew(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	onTime := coordStoreAt(t, mr, time.Now)
+	ahead := coordStoreAt(t, mr, func() time.Time { return time.Now().Add(time.Hour) })
+
+	if ok, err := onTime.LockTask(ctx, "ws-1", "task-1", "owner-a", time.Second); err != nil || !ok {
+		t.Fatalf("lock: ok=%v err=%v", ok, err)
+	}
+	if ok, err := ahead.LockTask(ctx, "ws-1", "task-1", "owner-b", time.Second); err != nil || ok {
+		t.Fatalf("the fast clock preempted a live task lock: ok=%v err=%v", ok, err)
+	}
+	if ok, err := onTime.AcquireLeadership(ctx, "a", time.Second); err != nil || !ok {
+		t.Fatalf("acquire: ok=%v err=%v", ok, err)
+	}
+	if ok, err := ahead.AcquireLeadership(ctx, "b", time.Second); err != nil || ok {
+		t.Fatalf("the fast clock preempted a live lease: ok=%v err=%v", ok, err)
+	}
+
+	// The server clock ends the TTL: now either instance may take both.
+	mr.FastForward(2 * time.Second)
+	if ok, err := ahead.LockTask(ctx, "ws-1", "task-1", "owner-b", time.Second); err != nil || !ok {
+		t.Fatalf("expired lock not takeable: ok=%v err=%v", ok, err)
+	}
+	if ok, err := ahead.AcquireLeadership(ctx, "b", time.Second); err != nil || !ok {
+		t.Fatalf("expired lease not takeable: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestCoordSlotsIgnoreClientClockSkew pins the reservation clock: scores and
+// the purge cutoff come from the store's TIME, so a fast instance neither
+// returns another instance's live reservation nor slips past the cap.
+func TestCoordSlotsIgnoreClientClockSkew(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	onTime := coordStoreAt(t, mr, time.Now)
+	ahead := coordStoreAt(t, mr, func() time.Time { return time.Now().Add(time.Hour) })
+
+	if ok, err := onTime.ReserveSlot(ctx, "", 1); err != nil || !ok {
+		t.Fatalf("reserve: ok=%v err=%v", ok, err)
+	}
+	if ok, err := ahead.ReserveSlot(ctx, "", 1); err != nil || ok {
+		t.Fatalf("the fast clock purged a live reservation: ok=%v err=%v", ok, err)
+	}
+	if n, live, err := ahead.SlotSnapshot(ctx, ""); err != nil || n != 1 || live != 1 {
+		t.Fatalf("snapshot = (%d,%d) err=%v, want (1,1)", n, live, err)
+	}
+
+	// The reservation TTL lapses on the store's clock: the slot comes back.
+	mr.SetTime(time.Now().Add(reservationTTL + time.Minute))
+	if ok, err := ahead.ReserveSlot(ctx, "", 1); err != nil || !ok {
+		t.Fatalf("expired reservation was not returned: ok=%v err=%v", ok, err)
 	}
 }
 

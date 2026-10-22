@@ -1,6 +1,8 @@
 package registry
 
 import (
+	"context"
+	"encoding/json"
 	"testing"
 	"time"
 )
@@ -80,5 +82,66 @@ func TestPruneExpiredSessions(t *testing.T) {
 	}
 	if got := r.LastNodeForSession("ws-1", "fresh"); got != "node-b" {
 		t.Fatalf("ttl=0 evicted a live key: %q", got)
+	}
+}
+
+// fakeSessionStore serves one shared soft-affinity row with a fixed remaining
+// store lifetime. Reads are counted so a test can tell a local hit from a new
+// store read; the embedded nil interface keeps the other methods unused.
+type fakeSessionStore struct {
+	SharedStore
+	row       []byte
+	remaining time.Duration
+	reads     int
+}
+
+func (f *fakeSessionStore) GetSessionNode(context.Context, string, string) (SharedSessionNode, bool, error) {
+	f.reads++
+	if f.row == nil {
+		return SharedSessionNode{}, false, nil
+	}
+	return SharedSessionNode{Raw: f.row, Remaining: f.remaining}, true, nil
+}
+
+// TestPruneExpiredSessionsUsesStoreRemaining pins the local deadline of a row
+// read from the shared index: this process's now plus the store-side remaining
+// lifetime, never the writer's learned_at. A 10s remainder is retained at
+// now+9s (from the cache, no new read) and dropped at now+11s.
+func TestPruneExpiredSessionsUsesStoreRemaining(t *testing.T) {
+	now := testNow
+	raw, err := json.Marshal(sessionNodeRow{
+		WorkspaceID: "ws-1",
+		Key:         "sess-1",
+		Node:        "node-a",
+		LearnedAt:   now.Add(-5 * time.Hour),
+	})
+	if err != nil {
+		t.Fatalf("marshal session row: %v", err)
+	}
+	shared := &fakeSessionStore{row: raw, remaining: 10 * time.Second}
+	r := New(func() time.Time { return now })
+	r.shared = shared
+
+	if got := r.LastNodeForSession("ws-1", "sess-1"); got != "node-a" {
+		t.Fatalf("lookup = %q, want node-a", got)
+	}
+	if shared.reads != 1 {
+		t.Fatalf("store reads after the first lookup = %d, want 1", shared.reads)
+	}
+
+	now = now.Add(9 * time.Second)
+	if dropped := r.PruneExpiredSessions(time.Hour); dropped != 0 {
+		t.Fatalf("dropped %d rows 9s into a 10s store lifetime", dropped)
+	}
+	if got := r.LastNodeForSession("ws-1", "sess-1"); got != "node-a" {
+		t.Fatalf("retained row lookup = %q, want node-a", got)
+	}
+	if shared.reads != 1 {
+		t.Fatalf("retained row fell back to the store (%d reads)", shared.reads)
+	}
+
+	now = now.Add(2 * time.Second) // one second past the store's remainder
+	if dropped := r.PruneExpiredSessions(time.Hour); dropped != 1 {
+		t.Fatalf("dropped = %d, want 1 once the store lifetime ended", dropped)
 	}
 }

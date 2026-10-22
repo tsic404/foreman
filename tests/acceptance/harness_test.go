@@ -3525,6 +3525,9 @@ func newTwoInstances(t *testing.T, opts twoInstanceOptions) *twoInstances {
 		}
 	}
 	mr := miniredis.RunT(t)
+	// A real store expires keys on its own clock (the lease takeover depends on
+	// it); miniredis leaves TTLs frozen unless ClockTTL is on.
+	mr.ClockTTL(true)
 	stateEvents := &syncBuffer{}
 	st, err := state.New(state.Config{
 		URL:         "redis://" + mr.Addr(),
