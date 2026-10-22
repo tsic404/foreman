@@ -32,8 +32,12 @@ var ErrNoLiveEntry = errors.New("no live entry for the task")
 // shared state face.
 type StateStore interface {
 	// PutEntry stores the live row's snapshot. The registry writes it after
-	// every transition; the snapshot never carries the memory-only secrets
-	// (Payload, DecidedReport, TokenHash — the store's FromEntry drops them).
+	// every transition; the snapshot is the mapping record, so once set it
+	// carries the delivery body (Payload), the verdict body (DecidedReport)
+	// and the token digest (TokenHash) — a restart keeps delivering and
+	// reclaiming from them (ADR-046 决策 0). The store therefore holds
+	// credentials and is treated as one (§10 安全); only the settled record
+	// strips those faces (settledRecord).
 	PutEntry(ctx context.Context, ws, taskID string, e TaskEntry) error
 	// GetEntry reads the live row of one task. Reserved for stage two's
 	// partitioned lookups; stage one restores through ListEntries and then
@@ -882,10 +886,10 @@ func (r *Registry) SettleNoResult(taskID string, expected Result) (TaskEntry, bo
 	return e, true
 }
 
-// settledRecord strips the memory-only secrets from the entry the settled
-// index retains: the retention window must never hold a payload body (F3), a
-// token digest (ADR-017) or a decided terminal body (the durable queue keeps
-// its own copy).
+// settledRecord strips the mapping record's non-projected faces from the entry
+// the settled index retains: the retention window must never hold a payload
+// body (F3), a token digest (ADR-017) or a decided terminal body (the durable
+// queue keeps its own copy).
 func settledRecord(e TaskEntry) TaskEntry {
 	e.Payload = nil
 	e.TokenHash = ""
