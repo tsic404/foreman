@@ -600,6 +600,7 @@ func (c *Collector) expireFiles(ctx context.Context, root, dir, ext string, ttl 
 			if err != nil {
 				errs = append(errs, err)
 			}
+			c.reapEmptyDir(ctx, root, path, ttl)
 			continue
 		}
 		if !e.Type().IsRegular() || (ext != "" && filepath.Ext(e.Name()) != ext) {
@@ -622,6 +623,28 @@ func (c *Collector) expireFiles(ctx context.Context, root, dir, ext string, ttl 
 		freed += n
 	}
 	return removed, freed, errors.Join(errs...)
+}
+
+// reapEmptyDir removes dir when this round left it empty and its own mtime is
+// past ttl. The mtime gate keeps a directory another process just created or
+// wrote: only shells the rule can prove stale are removed.
+func (c *Collector) reapEmptyDir(ctx context.Context, root, dir string, ttl time.Duration) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil || len(entries) != 0 {
+		return false
+	}
+	info, err := os.Stat(dir)
+	if err != nil || !c.expired(info.ModTime(), ttl) {
+		return false
+	}
+	if _, err := c.delete(root, dir, filepath.Base(dir), "agent-state"); err != nil {
+		c.log.Warn("cache.gc.delete_failed", "node", c.cfg.Node, "path", dir, "err", err.Error())
+		return false
+	}
+	return true
 }
 
 // expire deletes path when its newest write is older than ttl, reporting
@@ -671,6 +694,8 @@ func (c *Collector) report(st Stats) {
 		"freed_bytes", st.FreedBytes,
 		"task_dirs", st.TaskDirs,
 		"bare_repos", st.BareRepos,
+		"agent_state", st.AgentState,
+		"agent_memory", st.AgentMemory,
 		"cache_bytes", st.CacheBytes,
 		"cache_measured", st.CacheMeasured,
 	)
