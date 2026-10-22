@@ -59,6 +59,11 @@ func (c *Client) ListWorkspaces(ctx context.Context) ([]workspace.Ref, error) {
 	for _, w := range list {
 		id := strings.TrimSpace(w.ID)
 		if id == "" {
+			// A malformed entry is the upstream's defect, not a discovery
+			// answer: it is skipped, but the drop stays visible — the
+			// discovery set decides what this deployment serves.
+			c.log.Debug("workspace.discovery_entry_skipped",
+				"reason", "empty workspace id", "name", w.Name)
 			continue
 		}
 		out = append(out, workspace.Ref{ID: id, Name: w.Name})
