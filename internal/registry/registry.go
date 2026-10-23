@@ -1296,8 +1296,14 @@ func (r *Registry) Saturated(nodeName string) bool {
 }
 
 func (r *Registry) dropIndexesLocked(e TaskEntry) {
-	delete(r.byJob, e.JobName)
-	delete(r.byDaemon, e.DaemonID)
+	// A reissued job or daemon key may already belong to another entry:
+	// only drop a mapping while it still points at this one.
+	if r.byJob[e.JobName] == e.TaskID {
+		delete(r.byJob, e.JobName)
+	}
+	if r.byDaemon[e.DaemonID] == e.TaskID {
+		delete(r.byDaemon, e.DaemonID)
+	}
 }
 
 // PutRuntime upserts the fake runtime of a Job's daemon (S4 registration,
@@ -1391,5 +1397,9 @@ func (r *Registry) dropRuntimeLocked(jobRuntimeID, daemonID string) {
 		daemonID = rt.DaemonID
 	}
 	delete(r.runtimes, jobRuntimeID)
-	delete(r.runtimeByDaemon, daemonID)
+	// A re-registration may have already re-keyed this daemon to a newer
+	// runtime row: keep that mapping while it no longer points at this one.
+	if daemonID != "" && r.runtimeByDaemon[daemonID] == jobRuntimeID {
+		delete(r.runtimeByDaemon, daemonID)
+	}
 }
