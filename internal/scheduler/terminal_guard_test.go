@@ -118,11 +118,14 @@ func TestFailEntryOnADecidedTaskDoesNotCountTheVerdict(t *testing.T) {
 // TestSettleReplayedLosingTheVanishedRaceDoesNotCountTheVerdict guards
 // settleReplayed's `first` check. The verdict is written between the fresh
 // read and the write — the window a vanished verdict can land in — so the
-// replay's MarkTerminal returns first=false and it must leave the count to
-// the path that actually transitioned the entry.
+// replay's MarkTerminal returns first=false and it must leave the count and
+// the task.terminal event to the path that actually transitioned the entry.
 func TestSettleReplayedLosingTheVanishedRaceDoesNotCountTheVerdict(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
+
+	buf := &strings.Builder{}
+	f.sched.log = slog.New(slog.NewJSONHandler(buf, nil)).With("component", "scheduler")
 
 	fired := false
 	f.sched.now = func() time.Time {
@@ -146,6 +149,9 @@ func TestSettleReplayedLosingTheVanishedRaceDoesNotCountTheVerdict(t *testing.T)
 	}
 	if got := f.metrics.terminal; len(got) != 0 {
 		t.Errorf("terminal metric = %v, want no count for the losing replay", got)
+	}
+	if records := collectLogRecords(t, []byte(buf.String()), "task.terminal"); len(records) != 0 {
+		t.Errorf("task.terminal events = %d, want 0 for the losing replay", len(records))
 	}
 }
 

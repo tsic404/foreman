@@ -1,9 +1,9 @@
 // TC-tech-observability-02 implements AC-10's log faces: one task's events are
 // traceable by its task id from claim to deletion, and no log line carries a
 // credential. The chain half covers every path that writes the terminal line
-// (forwarded report and server-already-terminal settlement); the no-token half
-// drives the production logger with the dominant "err", err call shape, whose
-// value is an error rather than a string.
+// (forwarded report, server-already-terminal settlement and the restart
+// replay); the no-token half drives the production logger with the dominant
+// "err", err call form, whose value is an error rather than a string.
 package acceptance
 
 import (
@@ -89,6 +89,63 @@ func TestObservability02SettledTerminalKeepsTheDaemonKey(t *testing.T) {
 	assertEventKeys(t, event, observability02TerminalKeys)
 	if got, ok := event["daemon_id"]; !ok || got != "" {
 		t.Errorf("daemon_id = %v (present %v), want the empty string present", got, ok)
+	}
+}
+
+// TestObservability02RestartReplayCarriesTheTerminalLine (AC-10,
+// TC-tech-observability-02): after a restart the rebuilt entry carries no
+// verdict, so replaying its queued report is the task's terminal step. That
+// step must write its own line with the identity the rebuild restored —
+// without it the chain ends before 终态 on exactly the path a restart creates.
+func TestObservability02RestartReplayCarriesTheTerminalLine(t *testing.T) {
+	h := newDeliveryHarness(t)
+	h.useRealBuilder(t)
+	queueTerminalReport(t, h, []byte(`{"result":"ok"}`))
+
+	// The pre-restart process wrote its own line before its forward failed;
+	// this scenario judges the line the replay adds.
+	before := len(h.events("task.terminal"))
+
+	reg, pending, sched := restartOverCluster(t, h)
+	if err := sched.Rebuild(t.Context()); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	if got := pending.Len(); got != 1 {
+		t.Fatalf("rebuilt queue depth = %d, want the one carried report", got)
+	}
+
+	h.server.setForwardCode(0)
+	if remaining, err := sched.DrainPendingReports(t.Context()); err != nil || remaining != 0 {
+		t.Fatalf("DrainPendingReports = %d, %v; want 0, nil", remaining, err)
+	}
+
+	events := h.events("task.terminal")
+	if len(events) != before+1 {
+		t.Fatalf("task.terminal events after the replay = %d, want %d", len(events), before+1)
+	}
+	event := events[len(events)-1]
+	assertEventKeys(t, event, observability02TerminalKeys)
+	for key, want := range map[string]string{
+		"task_id":      "task-1",
+		"job_name":     "fm-task-1",
+		"daemon_id":    "fm-task-1",
+		"workspace_id": "ws-1",
+		"result":       string(registry.ResultCompleted),
+	} {
+		if got := event[key]; got != want {
+			t.Errorf("%s = %v, want %q", key, got, want)
+		}
+	}
+	if e, ok := reg.Settled("task-1"); !ok || e.Result != registry.ResultCompleted {
+		t.Fatalf("settled record = %+v, %v; want the replayed completed verdict", e, ok)
+	}
+
+	// A second drain has nothing left to replay: the verdict is observed once.
+	if remaining, err := sched.DrainPendingReports(t.Context()); err != nil || remaining != 0 {
+		t.Fatalf("second DrainPendingReports = %d, %v; want 0, nil", remaining, err)
+	}
+	if got := len(h.events("task.terminal")); got != before+1 {
+		t.Errorf("task.terminal events after a second drain = %d, want %d", got, before+1)
 	}
 }
 
