@@ -22,7 +22,7 @@ import (
 // must carry. Checking presence (not just value) is the point: an absent key
 // reads as "unknown field" to a log query, while an empty value says the
 // identity is empty.
-var observability02TerminalKeys = []string{"task_id", "job_name", "daemon_id", "result"}
+var observability02TerminalKeys = []string{"task_id", "job_name", "daemon_id", "workspace_id", "result"}
 
 // TestObservability02ForwardedTerminalCarriesDaemonIdentity drives a task
 // through claim → register → start → terminal report and reads the line the
