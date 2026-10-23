@@ -219,9 +219,10 @@ func TestPolicyKeys01Resolution(t *testing.T) {
 			{kind: "agent", name: "agent-1", conclusion: "unavailable", level: "WARN"},
 			{kind: "project", name: "proj-x", conclusion: "unavailable", level: "WARN"},
 		})
-		// The project section has no identifier index, so a task carrying any
-		// identifier reads no_definition for the project side — there is no
-		// fallback to name matching.
+		// The unavailable resolution leaves the project section without an
+		// identifier index, so a task carrying any identifier reads
+		// no_definition for the project side — there is no fallback to name
+		// matching. The agent section still matches by exact name.
 		job, _, _, err := builder.Build(jobbuilder.TaskEntry{
 			TaskID: "task-1", AgentID: "agent-1", WorkspaceID: "ws-1",
 			JobRuntimeID: "rid-1", ClaimedAt: testClaimTime, Attempt: 1,
@@ -230,8 +231,8 @@ func TestPolicyKeys01Resolution(t *testing.T) {
 		if err != nil {
 			t.Fatalf("Build: %v", err)
 		}
-		if got := job.Spec.Template.Spec.NodeSelector["example.com/pool"]; got == "project-pool" {
-			t.Errorf("the project definition was injected without an identifier mapping")
+		if got := job.Spec.Template.Spec.NodeSelector["example.com/pool"]; got != "p1" {
+			t.Errorf("nodeSelector pool = %q, want the agent definition p1 under the unavailable degradation", got)
 		}
 	})
 
