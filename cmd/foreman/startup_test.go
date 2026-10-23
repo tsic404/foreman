@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tsic404/foreman/internal/proxy"
+	"github.com/tsic404/foreman/internal/startup"
 	"github.com/tsic404/foreman/internal/workspace"
 )
 
@@ -108,7 +109,7 @@ func TestRunStartupSelfCheckWorkspaceScope(t *testing.T) {
 		stub.setC17(http.StatusForbidden, `{"error":"forbidden"}`)
 		var logs bytes.Buffer
 		log := slog.New(slog.NewJSONHandler(&logs, nil))
-		err := runStartupSelfCheck(t.Context(), workspace.ScopeWorkspace,
+		err := startup.RunSelfCheck(t.Context(), workspace.ScopeWorkspace,
 			[]*proxy.Client{startupClient(stub.server.URL, "ws-a")}, log)
 		if err == nil {
 			t.Fatal("a 403 C-17 answer must refuse startup")
@@ -126,7 +127,7 @@ func TestRunStartupSelfCheckWorkspaceScope(t *testing.T) {
 		stub.setC17(http.StatusOK, `[{"id":"ws-a","name":"A"},{"id":"ws-b","name":"B"}]`)
 		var logs bytes.Buffer
 		log := slog.New(slog.NewJSONHandler(&logs, nil))
-		err := runStartupSelfCheck(t.Context(), workspace.ScopeWorkspace,
+		err := startup.RunSelfCheck(t.Context(), workspace.ScopeWorkspace,
 			[]*proxy.Client{startupClient(stub.server.URL, "ws-a")}, log)
 		if err == nil {
 			t.Fatal("a C-17 superset must refuse startup")
@@ -149,7 +150,7 @@ func TestRunStartupSelfCheckWorkspaceScope(t *testing.T) {
 		stub.setC17(http.StatusInternalServerError, `{"error":"boom"}`)
 		var logs bytes.Buffer
 		log := slog.New(slog.NewJSONHandler(&logs, nil))
-		if err := runStartupSelfCheck(t.Context(), workspace.ScopeWorkspace,
+		if err := startup.RunSelfCheck(t.Context(), workspace.ScopeWorkspace,
 			[]*proxy.Client{startupClient(stub.server.URL, "ws-a")}, log); err != nil {
 			t.Fatalf("a 5xx C-17 answer must not refuse startup: %v", err)
 		}
@@ -166,7 +167,7 @@ func TestRunStartupSelfCheckWorkspaceScope(t *testing.T) {
 		stub.server.Close()
 		var logs bytes.Buffer
 		log := slog.New(slog.NewJSONHandler(&logs, nil))
-		if err := runStartupSelfCheck(t.Context(), workspace.ScopeWorkspace,
+		if err := startup.RunSelfCheck(t.Context(), workspace.ScopeWorkspace,
 			[]*proxy.Client{startupClient(stub.server.URL, "ws-a")}, log); err != nil {
 			t.Fatalf("an unreachable C-17 must not refuse startup: %v", err)
 		}
@@ -179,9 +180,9 @@ func TestRunStartupSelfCheckWorkspaceScope(t *testing.T) {
 		stub := newStartupStub(t)
 		var logs bytes.Buffer
 		log := slog.New(slog.NewJSONHandler(&logs, nil))
-		if err := runStartupSelfCheck(t.Context(), workspace.ScopeWorkspace,
+		if err := startup.RunSelfCheck(t.Context(), workspace.ScopeWorkspace,
 			[]*proxy.Client{startupClient(stub.server.URL, "ws-a")}, log); err != nil {
-			t.Fatalf("runStartupSelfCheck: %v", err)
+			t.Fatalf("RunSelfCheck: %v", err)
 		}
 		discovered := events(t, &logs, "workspace.discovery")
 		if len(discovered) != 1 || discovered[0]["source"] != proxy.DiscoverySourceWorkspaceScope {
@@ -196,7 +197,7 @@ func TestRunStartupSelfCheckWorkspaceScope(t *testing.T) {
 		stub.mu.Unlock()
 		var logs bytes.Buffer
 		log := slog.New(slog.NewJSONHandler(&logs, nil))
-		if err := runStartupSelfCheck(t.Context(), workspace.ScopeUser,
+		if err := startup.RunSelfCheck(t.Context(), workspace.ScopeUser,
 			[]*proxy.Client{startupClient(stub.server.URL, "ws-a")}, log); err != nil {
 			t.Fatalf("a C-18 failure must not refuse startup: %v", err)
 		}
@@ -358,7 +359,7 @@ func TestC17AnswerWithoutDisplayNameAbortsStartup(t *testing.T) {
 		var logs bytes.Buffer
 		log := slog.New(slog.NewJSONHandler(&logs, nil))
 
-		err := runStartupSelfCheck(t.Context(), workspace.ScopeWorkspace,
+		err := startup.RunSelfCheck(t.Context(), workspace.ScopeWorkspace,
 			[]*proxy.Client{startupClient(stub.server.URL, "ws-a")}, log)
 		if err == nil {
 			t.Fatal("a C-17 answer without a display name must refuse startup")

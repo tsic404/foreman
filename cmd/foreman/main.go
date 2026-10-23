@@ -36,6 +36,7 @@ import (
 	"github.com/tsic404/foreman/internal/recovery"
 	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
+	"github.com/tsic404/foreman/internal/startup"
 	"github.com/tsic404/foreman/internal/state"
 	"github.com/tsic404/foreman/internal/workspace"
 )
@@ -308,7 +309,7 @@ func run() error {
 	// AC-86). The signal context is created later, so the checks run on a
 	// background context — the default signal handling still terminates a
 	// start-up process.
-	if err := runStartupSelfCheck(context.Background(), deployment.Scope, clientSet.All(), log); err != nil {
+	if err := startup.RunSelfCheck(context.Background(), deployment.Scope, clientSet.All(), log); err != nil {
 		return err
 	}
 
