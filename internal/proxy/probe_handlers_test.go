@@ -219,6 +219,42 @@ func TestProbeModelResultAbsorbsStartupDiscovery(t *testing.T) {
 	}
 }
 
+// A startup discovery whose workspace this deployment does not serve has no
+// slot to fill: the absorb is refused (403, like the relay branch) instead of
+// answering the success shape and claiming a landing that never happened.
+func TestProbeModelResultRefusesStartupAbsorbForUnservedWorkspace(t *testing.T) {
+	r := newTestRig(t)
+	token, err := r.issuer.IssueProbe("fm-catalog-startup-other", "startup-other", "ws-other", time.Hour)
+	if err != nil {
+		t.Fatalf("IssueProbe: %v", err)
+	}
+	session := registry.ProbeSession{
+		JobName:      "fm-catalog-startup-other",
+		Mode:         registry.ProbeStartupDiscovery,
+		JobRuntime:   "rid-startup-other",
+		SelfMintedID: "startup-other",
+		TokenHash:    r.issuer.Hash(token),
+		Runtimes:     []registry.DiscoveredRuntime{{Name: "aa-omp", Type: "omp"}},
+	}
+	if err := r.probes.PutProbe(session); err != nil {
+		t.Fatalf("PutProbe: %v", err)
+	}
+
+	code, body := r.call(t, "POST",
+		"/api/daemon/runtimes/"+session.JobRuntime+"/models/"+session.SelfMintedID+"/result",
+		token, []byte(`{"status":"completed","models":[]}`))
+	if code != http.StatusForbidden {
+		t.Fatalf("absorb for an unserved workspace = %d: %s, want 403", code, body)
+	}
+	updated, _ := r.probes.ProbeByJob(session.JobName)
+	if !updated.RelayedAt.IsZero() || updated.RelayedCode != 0 {
+		t.Errorf("a refused absorb must not claim completion: %+v", updated)
+	}
+	if staged, ok := r.client.startup.Take("omp", ""); ok {
+		t.Errorf("a refused absorb must not stage the body: %q", staged)
+	}
+}
+
 func TestProbeModelResultRelaysCommandDriven(t *testing.T) {
 	r := newTestRig(t)
 	token, session := startProbeToken(t, r, "cmd-1", "rid-real")

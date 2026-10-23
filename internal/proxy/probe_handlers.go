@@ -235,9 +235,17 @@ func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 		if workspaceID == "" {
 			workspaceID = claims.WorkspaceID
 		}
-		if client := s.clientFor(workspaceID); client != nil {
-			client.stageStartupCatalog(provider, profileID, body)
+		client := s.clientFor(workspaceID)
+		if client == nil {
+			// Without a configured workspace there is no slot to fill; the
+			// success shape would report a landing that never happened and
+			// hide the misconfiguration (§1.3 失败面).
+			s.log.Error("startup discovery absorb refused: workspace is not configured",
+				"job_name", claims.JobName, "workspace_id", workspaceID)
+			writeError(w, http.StatusForbidden, "workspace is not configured")
+			return
 		}
+		client.stageStartupCatalog(provider, profileID, body)
 		s.probes.UpdateProbe(claims.JobName, func(probe *registry.ProbeSession) {
 			probe.RelayedAt = now
 			probe.RelayedCode = http.StatusOK
