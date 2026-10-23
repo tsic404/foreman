@@ -659,6 +659,91 @@ func TestDeleteCascadesRuntimeIndex(t *testing.T) {
 	}
 }
 
+// TestDeleteKeepsAReissuedOwnersIndexes reproduces a job/daemon key reissued
+// to another entry: deleting the previous owner must not unmap the new one.
+func TestDeleteKeepsAReissuedOwnersIndexes(t *testing.T) {
+	r := New(fixedClock())
+	old := entryFor("t1")
+	if err := r.Put(old); err != nil {
+		t.Fatalf("Put old: %v", err)
+	}
+	newer := entryFor("t2")
+	newer.JobName = old.JobName
+	newer.DaemonID = old.DaemonID
+	if err := r.Put(newer); err != nil {
+		t.Fatalf("Put newer: %v", err)
+	}
+
+	if err := r.Delete("t1"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if got, ok := r.ByJob(old.JobName); !ok || got.TaskID != "t2" {
+		t.Fatalf("ByJob(%q) = %v, %v; want t2", old.JobName, got, ok)
+	}
+	if got, ok := r.ByDaemon(old.DaemonID); !ok || got.TaskID != "t2" {
+		t.Fatalf("ByDaemon(%q) = %v, %v; want t2", old.DaemonID, got, ok)
+	}
+}
+
+// TestPutKeepsAReissuedOwnersIndexes covers the replace path: re-Putting the
+// old entry after another one took its keys must leave that mapping intact.
+func TestPutKeepsAReissuedOwnersIndexes(t *testing.T) {
+	r := New(fixedClock())
+	old := entryFor("t1")
+	if err := r.Put(old); err != nil {
+		t.Fatalf("Put old: %v", err)
+	}
+	newer := entryFor("t2")
+	newer.JobName = old.JobName
+	newer.DaemonID = old.DaemonID
+	if err := r.Put(newer); err != nil {
+		t.Fatalf("Put newer: %v", err)
+	}
+
+	replaced := old
+	replaced.JobName = "fm-t1-next"
+	replaced.DaemonID = "fm-t1-next"
+	if err := r.Put(replaced); err != nil {
+		t.Fatalf("Put replaced: %v", err)
+	}
+	if got, ok := r.ByJob(old.JobName); !ok || got.TaskID != "t2" {
+		t.Fatalf("ByJob(%q) = %v, %v; want t2", old.JobName, got, ok)
+	}
+	if got, ok := r.ByDaemon(old.DaemonID); !ok || got.TaskID != "t2" {
+		t.Fatalf("ByDaemon(%q) = %v, %v; want t2", old.DaemonID, got, ok)
+	}
+	if got, ok := r.ByJob(replaced.JobName); !ok || got.TaskID != "t1" {
+		t.Fatalf("ByJob(%q) = %v, %v; want t1", replaced.JobName, got, ok)
+	}
+}
+
+// TestRuntimeCleanupKeepsAReRegisteredRowsIndex: re-registration re-keys the
+// daemon to a newer runtime row; dropping the superseded row keeps it.
+func TestRuntimeCleanupKeepsAReRegisteredRowsIndex(t *testing.T) {
+	r := New(fixedClock())
+	e := entryFor("t1")
+	if err := r.Put(e); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	r.PutRuntime(JobRuntime{JobRuntimeID: e.JobRuntimeID, DaemonID: e.DaemonID, TaskID: e.TaskID})
+	renewed := JobRuntime{JobRuntimeID: "rt-t1-next", DaemonID: e.DaemonID, TaskID: e.TaskID}
+	r.PutRuntime(renewed)
+
+	if err := r.Delete("t1"); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if got, ok := r.RuntimeByDaemon(e.DaemonID); !ok || got.JobRuntimeID != renewed.JobRuntimeID {
+		t.Fatalf("RuntimeByDaemon(%q) = %v, %v; want %q", e.DaemonID, got, ok, renewed.JobRuntimeID)
+	}
+
+	r.PutRuntime(JobRuntime{JobRuntimeID: "rt-stale", DaemonID: e.DaemonID, TaskID: e.TaskID})
+	r.PutRuntime(renewed)
+	r.DeleteRuntime("rt-stale")
+	if got, ok := r.RuntimeByDaemon(e.DaemonID); !ok || got.JobRuntimeID != renewed.JobRuntimeID {
+		t.Fatalf("RuntimeByDaemon after DeleteRuntime = %v, %v; want %q", got, ok, renewed.JobRuntimeID)
+	}
+}
+
 func TestSetLastStatusSeenPreservesOtherFields(t *testing.T) {
 	r := New(fixedClock())
 	e := entryFor("t1")
