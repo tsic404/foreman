@@ -516,6 +516,51 @@ func TestTechObservability01UsageLabelSpaceBounded(t *testing.T) {
 	})
 }
 
+// TestTechObservability01UsageCountsAcceptedReportOnly drives S-12 through the
+// production forward client: the token metric counts the usage the upstream
+// accepted. A refused report reaches the daemon as the transient 502 and stays
+// uncounted; the daemon's retry, once taken, is the single count.
+func TestTechObservability01UsageCountsAcceptedReportOnly(t *testing.T) {
+	h := newHarnessWithRealServer(t, false)
+	const taskID = "task-usage-retry"
+	payload, err := json.Marshal(map[string]any{
+		"id": taskID, "agent_id": "agent-1", "workspace_id": "ws-1",
+		"runtime_id": "rid-zz", "issue_id": "issue-1", "issue_identifier": "TSI-1",
+		"agent": map[string]any{"name": "agent-a"},
+	})
+	if err != nil {
+		t.Fatalf("marshal claim: %v", err)
+	}
+	tcPolicyAxisClaimRaw(t, h, payload)
+	token := issueJobToken(t, h, taskID)
+	registerTaskDaemon(t, h, taskID, token)
+	claimTask(t, h, taskID, token)
+	if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/start", token, []byte(`{}`)); code != http.StatusOK {
+		t.Fatalf("S8 = %d: %s", code, answer)
+	}
+	body := []byte(`{"usage":[{"provider":"omp","model":"kimi","input_tokens":9}]}`)
+
+	h.upstream.setLifecycleStatus(string(scheduler.EPUsage), http.StatusServiceUnavailable)
+	if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/usage", token, body); code != http.StatusBadGateway {
+		t.Fatalf("S12 with the upstream refusing = %d: %s", code, answer)
+	}
+	if got := h.metrics.tokenUsageSnapshot(); len(got) != 0 {
+		t.Fatalf("token usage after a refused forward = %+v, want none", got)
+	}
+
+	h.upstream.setLifecycleStatus(string(scheduler.EPUsage), 0)
+	if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/usage", token, body); code != http.StatusOK {
+		t.Fatalf("retried S12 = %d: %s", code, answer)
+	}
+	got := h.metrics.tokenUsageSnapshot()
+	if len(got) != 1 {
+		t.Fatalf("token usage = %+v, want one counted entry", got)
+	}
+	if got[0].provider != "omp" || got[0].model != "kimi" || got[0].input != 9 {
+		t.Errorf("token usage = %+v, want (omp, kimi) input 9", got[0])
+	}
+}
+
 // observability01RunTask drives one claimed task to a terminal result through
 // the daemon face. The claim carries the agent identity the policy axes read.
 func observability01RunTask(t *testing.T, h *harness, taskID, agentName string, isSuccess bool) {
