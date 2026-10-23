@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2797,10 +2798,11 @@ type harness struct {
 	// leaderMu guards the lease handles: the claim and heartbeat gates read
 	// them from their own goroutines while a scenario starts, crashes or
 	// stops the lease from the test goroutine.
-	leaderMu   sync.Mutex
-	leader     *coordination.Leader
-	leaderStop context.CancelFunc
-	leaderDone chan struct{}
+	leaderMu    sync.Mutex
+	leader      *coordination.Leader
+	leaderLease *killedLease
+	leaderStop  context.CancelFunc
+	leaderDone  chan struct{}
 	// revoker is the scheduler's credential-revocation seam. Nil leaves it
 	// inert (noRevoker): a scenario that judges the revocation set wires the
 	// shared issuer here and rebuilds the scheduler, as a deployment wires it.
@@ -3561,7 +3563,10 @@ func (h *harness) runLeader(t *testing.T) {
 	if instanceID == "" {
 		instanceID = "instance-1"
 	}
-	leader := coordination.New(h.coord, instanceID, cfg,
+	// The scenario owns the kill switch: a loop stopped this way must leave
+	// its lease to expire, so the store's release call is suppressed below.
+	lease := &killedLease{CoordStore: h.coord}
+	leader := coordination.New(lease, instanceID, cfg,
 		coordination.WithLogger(slog.New(slog.NewJSONHandler(h.logs, nil))),
 		coordination.WithOnAcquire(h.sched.OnTakeover))
 	ctx, cancel := context.WithCancel(t.Context())
@@ -3572,6 +3577,7 @@ func (h *harness) runLeader(t *testing.T) {
 	}()
 	h.leaderMu.Lock()
 	h.leader = leader
+	h.leaderLease = lease
 	h.leaderStop = cancel
 	h.leaderDone = done
 	h.leaderMu.Unlock()
@@ -3582,10 +3588,29 @@ func (h *harness) runLeader(t *testing.T) {
 // lease: the survivor must wait out the lease TTL (a real process death).
 func (h *harness) crashLeader(t *testing.T) {
 	t.Helper()
-	if leader := h.currentLeader(); leader != nil {
-		leader.Crash()
+	h.leaderMu.Lock()
+	if h.leaderLease != nil {
+		h.leaderLease.killed.Store(true)
 	}
+	h.leaderMu.Unlock()
 	h.stopLeader(t)
+}
+
+// killedLease is the crash scenario's test-side kill switch: once killed, the
+// lease loop's exit release is swallowed and the lease expires on its own,
+// which is the state a killed process leaves behind.
+type killedLease struct {
+	state.CoordStore
+	killed atomic.Bool
+}
+
+// ReleaseLeadership drops a killed instance's release, so its lease lasts to
+// the TTL the survivor is waiting out.
+func (s *killedLease) ReleaseLeadership(ctx context.Context, owner string) error {
+	if s.killed.Load() {
+		return nil
+	}
+	return s.CoordStore.ReleaseLeadership(ctx, owner)
 }
 
 // stopLeader releases the lease and parks this instance's control plane. The
@@ -3595,7 +3620,7 @@ func (h *harness) stopLeader(t *testing.T) {
 	t.Helper()
 	h.leaderMu.Lock()
 	stop, done := h.leaderStop, h.leaderDone
-	h.leaderStop, h.leaderDone, h.leader = nil, nil, nil
+	h.leaderStop, h.leaderDone, h.leader, h.leaderLease = nil, nil, nil, nil
 	h.leaderMu.Unlock()
 	if stop == nil {
 		return
