@@ -12,6 +12,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/tsic404/foreman/internal/registry"
 )
@@ -558,5 +559,60 @@ func TestSecretCarrierStoreShapeAndDomains(t *testing.T) {
 		got.JobName != "fm-task-1" || got.DaemonID != "fm-task-1" ||
 		got.WorkspaceID != "ws-a" || !bytes.Equal(got.Body, body) {
 		t.Errorf("listed carrier = %+v, want the stored identity, workspace and body", got)
+	}
+}
+
+// createOnlySecretJobs is the apiserver's Secret create face: the first
+// create lands, a second one under the same name gets the AlreadyExists the
+// real apiserver answers.
+type createOnlySecretJobs struct {
+	*fakeJobs
+	landed map[string]*corev1.Secret
+}
+
+func (f *createOnlySecretJobs) CreateSecret(_ context.Context, secret *corev1.Secret) error {
+	if _, ok := f.landed[secret.Name]; ok {
+		return apierrors.NewAlreadyExists(corev1.Resource("secrets"), secret.Name)
+	}
+	f.landed[secret.Name] = secret.DeepCopy()
+	return nil
+}
+
+// TestSecretCarrierKeepsTheFirstBodyOnReEnqueue pins what the queue's replay
+// depends on: the carrier is create-only, so a re-enqueue adopts the object
+// already there and the body a restart replays stays the first enqueue's.
+// The disk face replaces the entry's body; that the two agree rests on the
+// decided body being the same at both writes, which the same-body and
+// different-body cases below hold to one outcome at this layer.
+func TestSecretCarrierKeepsTheFirstBodyOnReEnqueue(t *testing.T) {
+	first := []byte(`{"result":"ok","summary":"done"}`)
+	for _, tc := range []struct {
+		name      string
+		reEnqueue []byte
+	}{
+		{name: "same body", reEnqueue: first},
+		{name: "different body", reEnqueue: []byte(`{"result":"ok","summary":"done","late":true}`)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			jobs := &createOnlySecretJobs{fakeJobs: &fakeJobs{}, landed: map[string]*corev1.Secret{}}
+			p, err := NewPendingReports(t.TempDir(),
+				WithPendingReportsCarrier(NewSecretCarrierStore(jobs)))
+			if err != nil {
+				t.Fatalf("NewPendingReports: %v", err)
+			}
+			restoreForServe(t, p)
+			for _, body := range [][]byte{first, tc.reEnqueue} {
+				if err := p.Enqueue(context.Background(), "task-1", "fm-task-1", "fm-task-1", "ws-a", EPComplete, body, ""); err != nil {
+					t.Fatalf("Enqueue(%s): %v", body, err)
+				}
+			}
+			landed, ok := jobs.landed[carrierSecretName("task-1")]
+			if !ok {
+				t.Fatal("no carrier landed")
+			}
+			if got := landed.Data[carrierKeyBody]; !bytes.Equal(got, first) {
+				t.Fatalf("carrier body = %s, want the first enqueue's %s", got, first)
+			}
+		})
 	}
 }

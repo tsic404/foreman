@@ -98,7 +98,8 @@ type Carrier struct {
 
 // CarrierStore is the K8s Secret face the pending-report queue persists
 // through. PutCarrier is create-only for a given task: one queued report per
-// task, so a re-enqueue replaces the object. DeleteCarrier is idempotent.
+// task, so a re-enqueue lands on the object already there. DeleteCarrier is
+// idempotent.
 type CarrierStore interface {
 	PutCarrier(ctx context.Context, c Carrier) error
 	DeleteCarrier(ctx context.Context, taskID string) error
@@ -170,10 +171,14 @@ func (s *secretCarrierStore) PutCarrier(ctx context.Context, c Carrier) error {
 		Data: c.data(),
 	}
 	if err := s.jobs.CreateSecret(ctx, secret); err != nil {
-		// One carrier per task: a retry after a lost create response finds
-		// its own object. The body is the decided one either way (a
-		// re-enqueue keeps the original enqueue clock and the first verdict
-		// owns the body), so the existing object is the landed write.
+		// One carrier per task and create-only: the object already there is
+		// the landed write. Both writes that reach it — a create whose
+		// response was lost, and a re-enqueue — carry the same body,
+		// because 02-contracts §4.4 fixes the instance's decided body at
+		// its first terminal forward and every later forward takes it. The
+		// disk face replaces the entry's body on re-enqueue; that equality
+		// is the precondition this branch relies on, not one it proves, so
+		// the first body wins here.
 		if apierrors.IsAlreadyExists(err) {
 			return nil
 		}
