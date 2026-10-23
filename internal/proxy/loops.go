@@ -22,15 +22,16 @@ type ClaimScheduler interface {
 	// ClaimBudget is how many tasks may be claimed right now.
 	ClaimBudget() int
 	// ReserveSlots reserves up to want in-flight slots before the C3 call and
-	// returns how many were actually reserved (0 when the cap is reached). A
-	// claim is only issued for reserved slots (§10: claim 前必须持有预留).
-	ReserveSlots(ctx context.Context, want int) (int, error)
+	// returns the reservation pairs actually taken (empty when the cap is
+	// reached). A claim is only issued for a reserved pair (§10: claim 前必须
+	// 持有预留), and each claimed task retires its own pair.
+	ReserveSlots(ctx context.Context, want int) ([]scheduler.SlotReservation, error)
 	// ReleaseSlots returns reservations C3 did not fill.
-	ReleaseSlots(ctx context.Context, n int)
+	ReleaseSlots(ctx context.Context, reserved []scheduler.SlotReservation)
 	// OnClaimReserved registers a claimed task against an already-held
 	// reservation; duplicate claims (server redispatch) are settled inside
 	// (§4.3), so the loop hands every claimed task over.
-	OnClaimReserved(ctx context.Context, task json.RawMessage) error
+	OnClaimReserved(ctx context.Context, task json.RawMessage, reserved scheduler.SlotReservation) error
 }
 
 // ClaimLoop is the polling claim loop (S-6 + §10): it claims up
@@ -156,16 +157,24 @@ func (l *ClaimLoop) iterate(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if reserved == 0 {
+	if len(reserved) == 0 {
 		return nil
 	}
-	tasks, err := l.client.ClaimTasks(ctx, reserved)
+	tasks, err := l.client.ClaimTasks(ctx, len(reserved))
 	if err != nil {
 		l.sched.ReleaseSlots(ctx, reserved)
 		return err
 	}
-	for _, task := range tasks {
-		if err := l.sched.OnClaimReserved(ctx, task); err != nil {
+	// Each claimed task retires exactly the pair reserved for it. A response
+	// larger than max_tasks carries no pair of its own: the server's own bound
+	// makes that a contract violation, and the task is handed over unpaired.
+	paired := min(len(tasks), len(reserved))
+	for i, task := range tasks {
+		var res scheduler.SlotReservation
+		if i < paired {
+			res = reserved[i]
+		}
+		if err := l.sched.OnClaimReserved(ctx, task, res); err != nil {
 			if errors.Is(err, scheduler.ErrUnnameableClaim) {
 				// The scheduler counted it and logged at a bounded rate; the
 				// server's lease expiry is the convergence. A per-attempt line
@@ -175,7 +184,7 @@ func (l *ClaimLoop) iterate(ctx context.Context) error {
 			l.log.Error("on-claim failed", "err", err)
 		}
 	}
-	if unused := reserved - len(tasks); unused > 0 {
+	if unused := reserved[paired:]; len(unused) > 0 {
 		l.sched.ReleaseSlots(ctx, unused)
 	}
 	return nil

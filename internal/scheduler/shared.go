@@ -98,73 +98,92 @@ func sharedDetachedCtx() (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.Background(), sharedCallTimeout)
 }
 
-// reserveSlots takes one slot on both levels (AC-76). A refused workspace
-// reservation returns the global one it already took.
-func (s *Scheduler) reserveSlots(ctx context.Context, ws string) error {
+// SlotReservation is one reservation pair: the ids the shared store returned
+// for the global level and, when the workspace level applies, for that
+// workspace's level. Consume and release take the handle, so a claim only ever
+// retires the pending markers it took itself and never another claim's
+// (AC-76: 预留与 claim 按身份逐套).
+type SlotReservation struct {
+	// workspaceID names the workspace level; levelID is that level's
+	// reservation id and is empty when the pair has no workspace level.
+	workspaceID string
+	globalID    string
+	levelID     string
+}
+
+// isZero reports that no reservation id is held: a stage-one deployment has no
+// shared store, so its slot pairs are empty and every slot write is a no-op.
+func (r SlotReservation) isZero() bool { return r.globalID == "" && r.levelID == "" }
+
+// reserveSlots takes one slot on both levels (AC-76) and returns their ids. A
+// refused workspace reservation returns the global one it already took.
+func (s *Scheduler) reserveSlots(ctx context.Context, ws string) (SlotReservation, error) {
+	var res SlotReservation
 	if s.shared == nil {
-		return nil
+		return res, nil
 	}
 	callCtx, cancel := s.sharedCtx(ctx)
 	defer cancel()
-	ok, err := s.shared.ReserveSlot(callCtx, "", s.cfg.MaxInflightJobs)
+	globalID, ok, err := s.shared.ReserveSlot(callCtx, "", s.cfg.MaxInflightJobs)
 	if err != nil {
 		s.metrics.StateError("reserve_slot")
-		return fmt.Errorf("%w: reserve global slot: %v", ErrStoreUnavailable, err)
+		return res, fmt.Errorf("%w: reserve global slot: %v", ErrStoreUnavailable, err)
 	}
 	if !ok {
-		return ErrNoSlot
+		return res, ErrNoSlot
 	}
+	res.globalID = globalID
 	if s.cfg.MaxInflightJobsPerWorkspace > 0 && ws != "" {
-		ok, err = s.shared.ReserveSlot(callCtx, ws, s.cfg.MaxInflightJobsPerWorkspace)
+		levelID, ok, err := s.shared.ReserveSlot(callCtx, ws, s.cfg.MaxInflightJobsPerWorkspace)
 		if err != nil {
-			s.releaseGlobalReservation()
-			return fmt.Errorf("%w: reserve workspace slot: %v", ErrStoreUnavailable, err)
+			s.releaseGlobalReservation(globalID)
+			return SlotReservation{}, fmt.Errorf("%w: reserve workspace slot: %v", ErrStoreUnavailable, err)
 		}
 		if !ok {
-			s.releaseGlobalReservation()
-			return ErrNoSlot
+			s.releaseGlobalReservation(globalID)
+			return SlotReservation{}, ErrNoSlot
 		}
+		res.workspaceID = ws
+		res.levelID = levelID
 	}
-	return nil
+	return res, nil
 }
 
-// releaseGlobalReservation returns the global slot whose workspace half was
-// refused. The write is detached: the refusal usually means the call budget is
-// spent, so inheriting that context would make the compensation itself fail
-// and leak the reservation until the TTL/reconcile edge.
-func (s *Scheduler) releaseGlobalReservation() {
+// releaseGlobalReservation returns the named global reservation whose
+// workspace half was refused. The write is detached: the refusal usually means
+// the call budget is spent, so inheriting that context would make the
+// compensation itself fail and leak the reservation until the TTL/reconcile
+// edge.
+func (s *Scheduler) releaseGlobalReservation(globalID string) {
 	callCtx, cancel := sharedDetachedCtx()
 	defer cancel()
-	_ = s.shared.ReleaseSlot(callCtx, "")
+	_ = s.shared.ReleaseSlot(callCtx, "", globalID)
 }
 
-// consumeSlots turns one reservation into entry ownership on both levels. The
-// release-style writes use a detached context: a cancelled claim loop must
-// still return its slots.
+// consumeSlots turns the caller's own reservations into entry ownership on
+// both levels. The writes use a detached context: a cancelled claim loop must
+// still retire its markers.
 //
-// A failed consume is reported but never retried. Popping a reservation is not
-// idempotent: a response lost after the pop was applied would make the retry
-// pop a different pending claim's reservation at the same level, which is a
-// slot that claim still owns. The unapplied case heals on its own — the
-// member is still pending, so the expiry purge lowers the counter for it, and
-// the periodic reconcile raises a counter that fell below the live rows.
-func (s *Scheduler) consumeSlots(ctx context.Context, ws string) {
-	if s.shared == nil {
+// A failed consume is reported but not retried: only the named ids go away, so
+// a lost attempt leaves its own marker pending, and the lease purge plus the
+// periodic reconciliation repair the counter without touching any other claim.
+func (s *Scheduler) consumeSlots(ctx context.Context, res SlotReservation) {
+	if s.shared == nil || res.isZero() {
 		return
 	}
-	if s.cfg.MaxInflightJobsPerWorkspace > 0 && ws != "" {
-		s.consumeSlotLevel(ws)
+	if res.levelID != "" {
+		s.consumeSlotLevel(res.workspaceID, res.levelID)
 	}
-	s.consumeSlotLevel("")
+	s.consumeSlotLevel("", res.globalID)
 }
 
-// consumeSlotLevel pops one reservation on one level, single attempt: a retry
-// would consume another claim's pending reservation (see consumeSlots). The
-// failure is still visible (§9.1 共享状态错误; §10 两级在途上限).
-func (s *Scheduler) consumeSlotLevel(ws string) {
+// consumeSlotLevel retires one reservation id on one level, single attempt
+// (see consumeSlots). The failure is still visible (§9.1 共享状态错误;
+// §10 两级在途上限).
+func (s *Scheduler) consumeSlotLevel(ws, id string) {
 	callCtx, cancel := sharedDetachedCtx()
 	defer cancel()
-	err := s.shared.ConsumeSlotReservation(callCtx, ws)
+	err := s.shared.ConsumeSlotReservation(callCtx, ws, id)
 	if err != nil {
 		s.metrics.StateError("consume_slot")
 		s.log.Warn("coordination.consume_slot_failed",
@@ -172,66 +191,70 @@ func (s *Scheduler) consumeSlotLevel(ws string) {
 	}
 }
 
-// releaseSlots abandons one reservation on both levels. The write is
-// detached from the caller's context: a claim loop cancelled mid-batch (or a
-// shutting-down process) must not leak its reservation.
-func (s *Scheduler) releaseSlots(ctx context.Context, ws string) {
-	if s.shared == nil {
+// releaseSlots abandons the caller's own reservations on both levels. The
+// write is detached from the caller's context: a claim loop cancelled mid-batch
+// (or a shutting-down process) must not leak its reservation.
+func (s *Scheduler) releaseSlots(ctx context.Context, res SlotReservation) {
+	if s.shared == nil || res.isZero() {
 		return
 	}
 	callCtx, cancel := sharedDetachedCtx()
 	defer cancel()
-	if s.cfg.MaxInflightJobsPerWorkspace > 0 && ws != "" {
-		_ = s.shared.ReleaseSlot(callCtx, ws)
+	if res.levelID != "" {
+		_ = s.shared.ReleaseSlot(callCtx, res.workspaceID, res.levelID)
 	}
-	_ = s.shared.ReleaseSlot(callCtx, "")
+	_ = s.shared.ReleaseSlot(callCtx, "", res.globalID)
 }
 
 // ReserveClaimSlots reserves up to want slots before a C3 call (§10: claim 前
-// 必须持有槽位预留). It returns how many were taken; a reached cap returns
-// fewer (0 when full), which the caller uses as the claim batch size.
-func (s *Scheduler) ReserveClaimSlots(ctx context.Context, ws string, want int) (int, error) {
-	if s.shared == nil {
-		return want, nil
-	}
+// 必须持有槽位预留). A reached cap returns fewer (0 when full), and the caller
+// uses the returned pairs as its claim batch: each claimed task consumes its
+// own pair and the unused ones are released.
+func (s *Scheduler) ReserveClaimSlots(ctx context.Context, ws string, want int) ([]SlotReservation, error) {
 	if want <= 0 {
-		return 0, nil
+		return nil, nil
 	}
-	got := 0
+	if s.shared == nil {
+		// No shared store means no shared cap: every wanted slot is free.
+		return make([]SlotReservation, want), nil
+	}
+	reserved := make([]SlotReservation, 0, want)
 	for range want {
-		if err := s.reserveSlots(ctx, ws); err != nil {
+		res, err := s.reserveSlots(ctx, ws)
+		if err != nil {
 			if errors.Is(err, ErrNoSlot) {
 				break
 			}
-			s.ReleaseClaimSlots(ctx, ws, got)
-			return 0, err
+			s.ReleaseClaimSlots(ctx, reserved)
+			return nil, err
 		}
-		got++
+		reserved = append(reserved, res)
 	}
-	return got, nil
+	return reserved, nil
 }
 
-// ReleaseClaimSlots returns n reservations the C3 call did not fill.
-func (s *Scheduler) ReleaseClaimSlots(ctx context.Context, ws string, n int) {
-	for range n {
-		s.releaseSlots(ctx, ws)
+// ReleaseClaimSlots returns the reservations the C3 call did not fill.
+func (s *Scheduler) ReleaseClaimSlots(ctx context.Context, reserved []SlotReservation) {
+	for _, res := range reserved {
+		s.releaseSlots(ctx, res)
 	}
 }
 
 // The raw Scheduler also serves the single-workspace claim loop directly (the
 // harness and the legacy wiring): the workspace is the legacy configured one.
-func (s *Scheduler) ReserveSlots(ctx context.Context, want int) (int, error) {
+func (s *Scheduler) ReserveSlots(ctx context.Context, want int) ([]SlotReservation, error) {
 	return s.ReserveClaimSlots(ctx, s.cfg.WorkspaceID, want)
 }
 
 // ReleaseSlots returns reservations the single-workspace loop did not fill.
-func (s *Scheduler) ReleaseSlots(ctx context.Context, n int) {
-	s.ReleaseClaimSlots(ctx, s.cfg.WorkspaceID, n)
+func (s *Scheduler) ReleaseSlots(ctx context.Context, reserved []SlotReservation) {
+	s.ReleaseClaimSlots(ctx, reserved)
 }
 
-// OnClaimReserved registers a claimed task for the legacy single workspace.
-func (s *Scheduler) OnClaimReserved(ctx context.Context, task json.RawMessage) error {
-	return s.OnClaimReservedFor(ctx, "", task)
+// OnClaimReserved registers a claimed task for the legacy single workspace
+// against the reservation pair the loop holds.
+func (s *Scheduler) OnClaimReserved(ctx context.Context, task json.RawMessage, reserved SlotReservation) error {
+	return s.OnClaimReservedFor(ctx, "", task, reserved)
 }
 
 // ReconcileSlots is the leader's periodic two-level reconciliation (§10 计数按

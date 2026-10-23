@@ -30,7 +30,7 @@ func (f *fakeClaimScheduler) ClaimBudget() int {
 	return f.budget
 }
 
-func (f *fakeClaimScheduler) ReserveSlots(_ context.Context, want int) (int, error) {
+func (f *fakeClaimScheduler) ReserveSlots(_ context.Context, want int) ([]scheduler.SlotReservation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	granted := want
@@ -38,13 +38,13 @@ func (f *fakeClaimScheduler) ReserveSlots(_ context.Context, want int) (int, err
 		granted = f.budget
 	}
 	f.reserved += granted
-	return granted, nil
+	return make([]scheduler.SlotReservation, granted), nil
 }
 
-func (f *fakeClaimScheduler) ReleaseSlots(_ context.Context, n int) {
+func (f *fakeClaimScheduler) ReleaseSlots(_ context.Context, reserved []scheduler.SlotReservation) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.released += n
+	f.released += len(reserved)
 }
 
 func (f *fakeClaimScheduler) reservedCount() int {
@@ -59,7 +59,7 @@ func (f *fakeClaimScheduler) releasedCount() int {
 	return f.released
 }
 
-func (f *fakeClaimScheduler) OnClaimReserved(_ context.Context, task json.RawMessage) error {
+func (f *fakeClaimScheduler) OnClaimReserved(_ context.Context, task json.RawMessage, _ scheduler.SlotReservation) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.claimed = append(f.claimed, task)

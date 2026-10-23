@@ -71,7 +71,7 @@ func TestTechMulti03GlobalInflightLimitAndSlotReconciliation(t *testing.T) {
 	tw.settleTask(t, tw.b, "task-2")
 	tw.waitSlots(t, limit-1)
 	ctx := context.Background()
-	reserved, err := tw.coord.ReserveSlot(ctx, "", limit+1) // limit > current forces one stray slot
+	_, reserved, err := tw.coord.ReserveSlot(ctx, "", limit+1) // limit > current forces one stray slot
 	if err != nil || !reserved {
 		t.Fatalf("stray reservation: ok=%v err=%v", reserved, err)
 	}
