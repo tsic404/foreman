@@ -21,6 +21,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/tsic404/foreman/internal/recovery"
 	"github.com/tsic404/foreman/internal/registry"
@@ -238,5 +239,90 @@ func TestRecovery02ConvergenceCompensationLeavesTheAttributionUndecided(t *testi
 	}
 	if !h.jobs.jobDeleted("fm-task-1") {
 		t.Error("the Job was not deleted after the compensation")
+	}
+}
+
+// TestRecovery05ExpiredWaitReleasesTheSelfReportWithVisibleDegradation is
+// TC-tech-recovery-05's executable form (AC-108, ADR-031's wait bound, §10):
+// a pod carries a platform-initiated deletion while the platform fact never
+// appears. On expiry the gate must release the daemon's self-report verbatim
+// and leave the degradation visible: exactly one decision=degraded event
+// with no fact source, no compensation body or event. The scheduler clock is
+// injected because the bound belongs to it; reading wall time instead would
+// spend the full 15s and trip the elapsed check below.
+func TestRecovery05ExpiredWaitReleasesTheSelfReportWithVisibleDegradation(t *testing.T) {
+	clock := &steppedClock{}
+	h := buildHarnessWith(t, false, deliveryConfirmWindow, nil, false, false, harnessOptions{clock: clock.now})
+	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+	h.declare(declaredRuntimes())
+
+	if err := h.sched.OnClaim(t.Context(), deliveryPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	token := issueJobToken(t, h, "task-1")
+	registerTaskDaemon(t, h, "task-1", token)
+	claimTask(t, h, "task-1", token)
+	if code, body := h.call("POST", "/api/daemon/tasks/task-1/start", token, []byte(`{}`)); code != 200 {
+		t.Fatalf("S8 = %d (%s), want 200", code, body)
+	}
+	entry, ok := h.reg.Get("task-1")
+	if !ok || entry.State != registry.StateRunning {
+		t.Fatalf("entry = %+v, want a running task before the report", entry)
+	}
+
+	// The wait signal holds: the instance's pod already carries a
+	// platform-initiated deletion. No object carries the deadline fact, so the
+	// gate waits — and the fact stays absent.
+	deletedAt := metav1.Now()
+	h.jobs.mu.Lock()
+	h.jobs.pods = []corev1.Pod{{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              entry.JobName + "-0",
+			Labels:            map[string]string{"job-name": entry.JobName},
+			CreationTimestamp: metav1.NewTime(time.Now()),
+			DeletionTimestamp: &deletedAt,
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}}
+	h.jobs.mu.Unlock()
+	// Every evidence read steps the scheduler clock past the gate's bound, so
+	// the second read lands beyond it and the wait ends after one poll.
+	h.jobs.setOnGetJob(func() { clock.advance(30 * time.Second) })
+	h.server.setStatus("task-1", "running")
+
+	daemonBody := []byte(`{"error":"agent died","failure_reason":"agent_error"}`)
+	start := time.Now()
+	code, body := h.call("POST", "/api/daemon/tasks/task-1/fail", token, daemonBody)
+	if code != 200 {
+		t.Fatalf("S14 = %d (%s), want 200", code, body)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Fatalf("S14 took %s: the expired wait must read the scheduler clock, not spend the bound in wall time", elapsed)
+	}
+
+	// The released self-report is the daemon's own body: no compensation.
+	forwards := h.server.forwarded(scheduler.EPFail)
+	if len(forwards) != 1 || string(forwards[0].Body) != string(daemonBody) {
+		t.Fatalf("fail forwards = %+v, want the daemon's body verbatim", forwards)
+	}
+	settled, ok := h.reg.Get("task-1")
+	if !ok || !settled.IsTerminal() || settled.Result != registry.ResultFailed {
+		t.Fatalf("entry = %+v, want a terminal failed verdict", settled)
+	}
+	if settled.FailureReason != "" {
+		t.Fatalf("failure_reason = %q, want the daemon's own verdict without a platform attribution", settled.FailureReason)
+	}
+	if events := h.events("task.failed_compensated"); len(events) != 0 {
+		t.Fatalf("task.failed_compensated = %+v, want none on the degraded branch", events)
+	}
+	decided := h.events("task.attribution_decided")
+	if len(decided) != 1 {
+		t.Fatalf("task.attribution_decided = %+v, want exactly one decision", decided)
+	}
+	if decided[0]["decision"] != scheduler.DecisionDegraded {
+		t.Fatalf("task.attribution_decided = %+v, want decision=degraded", decided[0])
+	}
+	if source, present := decided[0]["fact_source"]; present && source != "" {
+		t.Fatalf("task.attribution_decided fact_source = %v, want none on the degraded branch", source)
 	}
 }
