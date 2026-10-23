@@ -510,9 +510,12 @@ func TestProbeRegisterOnlyHeartbeatOwnsNoCommand(t *testing.T) {
 
 // reapingProbeStore is one instance's shared probe-session face over a row that
 // disappears at its first write: the reap that lands between the handler's
-// lookup and its update (02-contracts.md §6.3 会话不存在 ⇒ 恒 401).
+// lookup and its update (02-contracts.md §6.3 会话不存在 ⇒ 恒 401). land is how
+// many writes the store accepts before the reap, so a handler with more than
+// one write-back can be reaped at a later one; the zero value reaps the first.
 type reapingProbeStore struct {
 	rows map[string][]byte
+	land int
 }
 
 func (s *reapingProbeStore) PutProbeSession(_ context.Context, jobName string, raw []byte, _ time.Duration) error {
@@ -520,7 +523,12 @@ func (s *reapingProbeStore) PutProbeSession(_ context.Context, jobName string, r
 	return nil
 }
 
-func (s *reapingProbeStore) CASProbeSession(_ context.Context, jobName string, _, _ []byte, _ time.Duration) (bool, error) {
+func (s *reapingProbeStore) CASProbeSession(_ context.Context, jobName string, _, next []byte, _ time.Duration) (bool, error) {
+	if s.land > 0 {
+		s.land--
+		s.rows[jobName] = next
+		return true, nil
+	}
 	delete(s.rows, jobName)
 	return false, nil
 }
@@ -582,5 +590,101 @@ func TestProbeRegisterReapedSessionIsUnauthorized(t *testing.T) {
 				t.Error("the update must not resurrect a reaped session row")
 			}
 		})
+	}
+}
+
+// TestProbeModelResultReapedSessionIsUnauthorized pins the S27 window: the
+// session still resolves at lookup and is reaped before the handler's first
+// write. Neither branch may answer 200 or run its side effect — the absorb
+// must not stage a catalog body, the relay must not call the upstream.
+func TestProbeModelResultReapedSessionIsUnauthorized(t *testing.T) {
+	for _, tc := range []struct {
+		name, requestID, realRuntimeID string
+	}{
+		{name: "startup-discovery", requestID: "startup-reaped"},
+		{name: "command-driven", requestID: "cmd-reaped", realRuntimeID: "rid-real"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newTestRig(t)
+			token, session := startProbeToken(t, r, tc.requestID, tc.realRuntimeID)
+			// The startup branch absorbs only once a runtime is declared, and
+			// this registration is the write that precedes the reap.
+			code, body := r.call(t, "POST", "/api/daemon/register", token, []byte(`{
+				"daemon_id": "fm-catalog-`+tc.requestID+`",
+				"runtimes": [{"name": "aa-omp", "type": "omp", "version": "1.0.0"}]
+			}`))
+			if code != http.StatusOK {
+				t.Fatalf("probe register = %d: %s", code, body)
+			}
+			current, ok := r.probes.ProbeByJob(session.JobName)
+			if !ok {
+				t.Fatalf("probe session %s missing", session.JobName)
+			}
+			raw, err := json.Marshal(current)
+			if err != nil {
+				t.Fatalf("marshal session: %v", err)
+			}
+			store := &reapingProbeStore{rows: map[string][]byte{session.JobName: raw}}
+			r.probes.AttachShared(store)
+			r.stub.on("POST", "/api/daemon/runtimes/rid-real/models/"+tc.requestID+"/result",
+				func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+					writeJSONStub(w, http.StatusOK, map[string]string{"status": "ok", "models": "upstream-answer"})
+				})
+
+			reqID := current.SelfMintedID
+			if current.RequestID != "" {
+				reqID = current.RequestID
+			}
+			code, body = r.call(t, "POST",
+				"/api/daemon/runtimes/"+session.JobRuntime+"/models/"+reqID+"/result", token,
+				[]byte(`{"status":"completed","models":[]}`))
+			if code != http.StatusUnauthorized {
+				t.Fatalf("result of a reaped session = %d: %s, want 401", code, body)
+			}
+			if _, ok := store.rows[session.JobName]; ok {
+				t.Error("the update must not resurrect a reaped session row")
+			}
+			if staged := r.client.startup.Snapshot(); len(staged) != 0 {
+				t.Errorf("the absorb staged a catalog body for an ownerless session: %q", staged)
+			}
+			if got := len(r.stub.calls("POST", "/api/daemon/runtimes/rid-real/models/"+tc.requestID+"/result")); got != 0 {
+				t.Errorf("the relay called the upstream %d times for an ownerless session", got)
+			}
+		})
+	}
+}
+
+// TestProbeModelResultReapedMidRelayIsUnauthorized pins the other half of the
+// relay window: the session still takes the pre-relay write, so the C21 goes
+// out, and it is reaped before the result is recorded. The upstream answer must
+// not reach the probe daemon — the token has no owner left (§6.3).
+func TestProbeModelResultReapedMidRelayIsUnauthorized(t *testing.T) {
+	r := newTestRig(t)
+	token, session := startProbeToken(t, r, "cmd-mid-reap", "rid-real")
+	r.stub.on("POST", "/api/daemon/runtimes/rid-real/models/cmd-mid-reap/result",
+		func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+			writeJSONStub(w, http.StatusOK, map[string]string{"status": "ok", "models": "upstream-answer"})
+		})
+	raw, err := json.Marshal(session)
+	if err != nil {
+		t.Fatalf("marshal session: %v", err)
+	}
+	store := &reapingProbeStore{rows: map[string][]byte{session.JobName: raw}, land: 1}
+	r.probes.AttachShared(store)
+
+	code, body := r.call(t, "POST",
+		"/api/daemon/runtimes/"+session.JobRuntime+"/models/cmd-mid-reap/result", token,
+		[]byte(`{"status":"completed","models":[]}`))
+	if code != http.StatusUnauthorized {
+		t.Fatalf("result of a session reaped during the relay = %d: %s, want 401", code, body)
+	}
+	if strings.Contains(string(body), "upstream-answer") {
+		t.Errorf("the upstream answer was replayed to the daemon: %s", body)
+	}
+	if _, ok := store.rows[session.JobName]; ok {
+		t.Error("the update must not resurrect a reaped session row")
+	}
+	if got := len(r.stub.calls("POST", "/api/daemon/runtimes/rid-real/models/cmd-mid-reap/result")); got != 1 {
+		t.Errorf("C21 calls = %d, want the pre-relay write to let exactly one through", got)
 	}
 }

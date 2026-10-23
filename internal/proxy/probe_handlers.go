@@ -248,11 +248,17 @@ func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "workspace is not configured")
 			return
 		}
-		client.stageStartupCatalog(provider, profileID, body)
-		s.probes.UpdateProbe(claims.JobName, func(probe *registry.ProbeSession) {
+		// The write-back is the only authority, and it lands before the slot:
+		// a reap between the lookup above and here must leave neither a staged
+		// body nor the success shape behind (§6.3 会话不存在 ⇒ 恒 401).
+		if _, applied := s.probes.UpdateProbe(claims.JobName, func(probe *registry.ProbeSession) {
 			probe.RelayedAt = now
 			probe.RelayedCode = http.StatusOK
-		})
+		}); !applied {
+			writeError(w, http.StatusUnauthorized, "unknown probe session")
+			return
+		}
+		client.stageStartupCatalog(provider, profileID, body)
 		s.log.Info("model.catalog_absorbed", "job_name", claims.JobName, "provider", provider)
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	case session.RequestID != "" && req == session.RequestID:
@@ -264,6 +270,13 @@ func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "workspace is not configured")
 			return
 		}
+		// The relay must not outrun the verdict: an empty write-back proves the
+		// session still takes one, and a reap between the lookup above and this
+		// update keeps the C21 from being sent at all (§6.3 会话不存在 ⇒ 恒 401).
+		if _, applied := s.probes.UpdateProbe(claims.JobName, func(*registry.ProbeSession) {}); !applied {
+			writeError(w, http.StatusUnauthorized, "unknown probe session")
+			return
+		}
 		status, resp, err := relayCatalog(r.Context(), client, session.RealRuntimeID, req, body, session.Deadline, s.log)
 		code := status
 		if err != nil {
@@ -271,14 +284,21 @@ func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 			// Code 0 marks "nothing was relayed" for the waiter: it is not a
 			// status any C21 answer can carry.
 			code = 0
+		}
+		// The answer is gated on the same verdict: an upstream reply the
+		// session can no longer record has no owner waiting for it.
+		if _, applied := s.probes.UpdateProbe(claims.JobName, func(probe *registry.ProbeSession) {
+			probe.RelayedAt = now
+			probe.RelayedCode = code
+		}); !applied {
+			writeError(w, http.StatusUnauthorized, "unknown probe session")
+			return
+		}
+		if err != nil {
 			writeError(w, http.StatusBadGateway, "upstream unavailable")
 		} else {
 			writeRaw(w, status, resp)
 		}
-		s.probes.UpdateProbe(claims.JobName, func(probe *registry.ProbeSession) {
-			probe.RelayedAt = now
-			probe.RelayedCode = code
-		})
 	default:
 		writeError(w, http.StatusNotFound, "not found")
 	}
