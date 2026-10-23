@@ -214,16 +214,26 @@ func (s *Scheduler) gateDecided(e registry.TaskEntry, body []byte) (registry.Tas
 	return e, body, false
 }
 
+// gateDecision is one attribution decision a gate round leaves for its caller
+// to apply: the values task.attribution_decided carries (§9.1, ADR-031). The
+// path that applies the decision emits it, under the lock that applies it, so
+// the event never names a decision another path superseded.
+type gateDecision struct {
+	decision    string
+	factSource  string
+	errorSource string
+}
+
 // gateUndecidedExit is the gate's non-settling exit: another path's decision
-// wins and emits nothing; otherwise the decision event is emitted and the
-// caller keeps the terminal decision.
-func (s *Scheduler) gateUndecidedExit(ctx context.Context, e registry.TaskEntry, body []byte, decision, factSource, errorSource string) (registry.TaskEntry, []byte, gateVerdict) {
+// wins and emits nothing; otherwise the decision travels back to the caller,
+// which emits it when — and only when — its own terminal write is the one that
+// decides.
+func (s *Scheduler) gateUndecidedExit(e registry.TaskEntry, body []byte, decision, factSource, errorSource string) (registry.TaskEntry, []byte, gateVerdict, gateDecision) {
 	fresh, decidedBody, decided := s.gateDecided(e, body)
 	if decided {
-		return fresh, decidedBody, gateDecidedElsewhere
+		return fresh, decidedBody, gateDecidedElsewhere, gateDecision{}
 	}
-	s.attributionDecided(ctx, fresh, decision, factSource, errorSource)
-	return fresh, body, gateUndecided
+	return fresh, body, gateUndecided, gateDecision{decision: decision, factSource: factSource, errorSource: errorSource}
 }
 
 // attributionGate is §4.4's gate, the S14 branch's first step (ADR-031). It
@@ -233,31 +243,32 @@ func (s *Scheduler) gateUndecidedExit(ctx context.Context, e registry.TaskEntry,
 // entry after the gate — settled with the compensation body when the platform
 // fact decided the failure — the returned body is what the caller forwards,
 // and the last result is the gate's verdict: only gateUndecided leaves the
-// terminal write to the caller.
-func (s *Scheduler) attributionGate(ctx context.Context, e registry.TaskEntry, body []byte, sessionID string) (registry.TaskEntry, []byte, gateVerdict) {
+// terminal write to the caller, and the pending decision rides back with it so
+// the caller announces it at that write.
+func (s *Scheduler) attributionGate(ctx context.Context, e registry.TaskEntry, body []byte, sessionID string) (registry.TaskEntry, []byte, gateVerdict, gateDecision) {
 	ev, err := s.readPlatformEvidence(ctx, e)
 	if err != nil {
 		// A read that failed is not a teardown sign: the report is forwarded
 		// as it arrived, with the failure recorded.
-		return s.gateUndecidedExit(ctx, e, body, DecisionReadError, "", "platform_fact")
+		return s.gateUndecidedExit(e, body, DecisionReadError, "", "platform_fact")
 	}
 	if !ev.hit {
 		if !ev.waiting() {
 			// Neither wait signal holds: the attribution stays with the daemon
 			// and the report is forwarded as it arrived.
-			return s.gateUndecidedExit(ctx, e, body, DecisionDaemonSelfReport, "", "")
+			return s.gateUndecidedExit(e, body, DecisionDaemonSelfReport, "", "")
 		}
 		ev, err = s.awaitPlatformFact(ctx, e)
 		if err != nil {
 			if ctx.Err() != nil {
-				return e, body, gateUndecided
+				return e, body, gateUndecided, gateDecision{}
 			}
-			return s.gateUndecidedExit(ctx, e, body, DecisionReadError, "", "platform_fact")
+			return s.gateUndecidedExit(e, body, DecisionReadError, "", "platform_fact")
 		}
 		if !ev.hit {
 			// The bound expired without a fact: the self-report is released
 			// and the degradation is visible (the design's failure face).
-			return s.gateUndecidedExit(ctx, e, body, DecisionDegraded, "", "")
+			return s.gateUndecidedExit(e, body, DecisionDegraded, "", "")
 		}
 	}
 	// The platform fact holds: the server's verdict and the decision run under
@@ -269,7 +280,7 @@ func (s *Scheduler) attributionGate(ctx context.Context, e registry.TaskEntry, b
 		// The shared task lock is unreachable: never decide on a snapshot
 		// another instance may be changing; the report is forwarded as-is and
 		// the shared CAS keeps the terminal write single.
-		return e, body, gateDecidedElsewhere
+		return e, body, gateDecidedElsewhere, gateDecision{}
 	}
 	defer unlock()
 	if fresh, ok := s.reg.Get(e.TaskID); ok {
@@ -277,30 +288,27 @@ func (s *Scheduler) attributionGate(ctx context.Context, e registry.TaskEntry, b
 	}
 	if e.IsTerminal() || len(e.DecidedReport) > 0 {
 		if decided, ok := s.reg.DecidedReport(e.TaskID); ok {
-			return e, decided, gateDecidedElsewhere
+			return e, decided, gateDecidedElsewhere, gateDecision{}
 		}
-		return e, body, gateDecidedElsewhere
+		return e, body, gateDecidedElsewhere, gateDecision{}
 	}
 	// The server's own verdict is consulted before Foreman decides on the
-	// daemon's behalf (§4.4: 补偿前必查 C13).
+	// daemon's behalf (§4.4: 补偿前必查 C13). These exits leave the terminal
+	// write to the caller, so their decision rides back unannounced.
 	st, err := s.server.TaskStatus(ctx, e.TaskID)
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
-		s.attributionDecided(ctx, e, DecisionC13Settled, "", "")
-		return e, body, gateUndecided
+		return e, body, gateUndecided, gateDecision{decision: DecisionC13Settled}
 	case err != nil:
-		s.attributionDecided(ctx, e, DecisionReadError, "", "c13")
-		return e, body, gateUndecided
+		return e, body, gateUndecided, gateDecision{decision: DecisionReadError, errorSource: "c13"}
 	}
 	s.reg.SetLastStatusSeen(e.TaskID, st)
 	if registry.IsTerminalResult(st) {
-		s.attributionDecided(ctx, e, DecisionC13Settled, "", "")
-		return e, body, gateUndecided
+		return e, body, gateUndecided, gateDecision{decision: DecisionC13Settled}
 	}
 	// The fact suppresses this instance's failure self-report: the verdict is
 	// the compensation body, registered before the forward, session value
 	// included.
-	s.attributionDecided(ctx, e, DecisionPlatform, ev.source, "")
 	settled, decided, err := s.settleFailure(ctx, e, failReport{
 		reason:    FailureReasonJobDeadline,
 		message:   "task terminated by the platform before the daemon's failure report",
@@ -310,14 +318,22 @@ func (s *Scheduler) attributionGate(ctx context.Context, e registry.TaskEntry, b
 		s.log.ErrorContext(ctx, "task.settle_failed",
 			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 			"reason", FailureReasonJobDeadline, "err", err)
-		return e, body, gateUndecided
+		// The platform verdict never landed: the daemon report decides after
+		// all, and the event names that decision at the caller's write.
+		return e, body, gateUndecided, gateDecision{decision: DecisionDaemonSelfReport}
 	}
-	return settled, decided, gateSettled
+	// The settlement landed inside this lock, so the event names the verdict
+	// that stands (§9.1).
+	s.attributionDecided(ctx, e, DecisionPlatform, ev.source, "")
+	return settled, decided, gateSettled, gateDecision{}
 }
 
 // attributionDecided emits the gate's decision event (§9.1, ADR-031). It is
 // the gate's own event face only: a replay or a convergence compensation
-// never emits it.
+// never emits it. Both callers emit it under the lock that applies the
+// verdict — the gate once its own settlement landed, OnReport at the terminal
+// write it leaves to the report — so the event never names a decision a
+// failed write or another path left without a verdict.
 func (s *Scheduler) attributionDecided(ctx context.Context, e registry.TaskEntry, decision, factSource, errorSource string) {
 	fields := []any{
 		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
