@@ -978,10 +978,9 @@ func (r *Registry) SetTokenHash(taskID, tokenHash string) error {
 // MarkJobCreated advances pending → job_created and records the apiserver's
 // creationTimestamp as job_created_at (§4.1: the pod instance
 // filter's basis, never a local clock reading). It writes in place — the
-// claim's snapshot predates the Job create, which can wait up to jobNameWait
-// on a name still held by a terminating predecessor, so re-Putting that
-// snapshot would revert a prepare-lease renewal the LeaseKeeper landed in
-// the window (lost update). Returns false once the entry is gone or settled.
+// claim's snapshot predates the Job create, so re-Putting that snapshot would
+// revert a prepare-lease renewal the LeaseKeeper landed in the window (lost
+// update). Returns false once the entry is gone or settled.
 func (r *Registry) MarkJobCreated(taskID string, at time.Time) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()

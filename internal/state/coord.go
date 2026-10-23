@@ -989,7 +989,7 @@ func slotKeys(ws string) (counter, reservations string) {
 }
 
 // reservationTTL bounds how long a reservation can outlive its reserver: it
-// must cover one claim batch (C3 + OnClaim up to the Job-name wait).
+// must cover one claim batch (C3 + OnClaim).
 const reservationTTL = 5 * time.Minute
 
 // ReserveSlot reserves one in-flight slot below limit, or unconditionally when
