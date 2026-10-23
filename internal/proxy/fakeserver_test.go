@@ -71,6 +71,9 @@ func (f *fakeJobs) DeleteSecret(_ context.Context, name string) error {
 }
 
 func (f *fakeJobs) ListJobs(context.Context) ([]batchv1.Job, error) { return nil, nil }
+func (f *fakeJobs) ListJobsByTask(context.Context, string, string) ([]batchv1.Job, error) {
+	return nil, nil
+}
 func (f *fakeJobs) ListSecrets(context.Context) ([]corev1.Secret, error) {
 	return nil, nil
 }

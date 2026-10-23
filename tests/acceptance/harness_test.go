@@ -1429,6 +1429,24 @@ func (c *jobClient) ListJobs(context.Context) ([]batchv1.Job, error) {
 	return append([]batchv1.Job(nil), c.jobs...), nil
 }
 
+// ListJobsByTask is the orphan sweep's per-task presence face: the label pair
+// identifies the task's Job, never a name composed from the task id.
+func (c *jobClient) ListJobsByTask(_ context.Context, workspaceID, taskID string) ([]batchv1.Job, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	var out []batchv1.Job
+	for _, job := range c.jobs {
+		if job.Labels[registry.LabelTaskID] != taskID {
+			continue
+		}
+		if job.Labels[registry.LabelWorkspaceID] != workspaceID {
+			continue
+		}
+		out = append(out, job)
+	}
+	return out, nil
+}
+
 func (c *jobClient) ListSecrets(context.Context) ([]corev1.Secret, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()

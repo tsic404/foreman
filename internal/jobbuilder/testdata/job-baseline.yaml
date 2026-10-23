@@ -195,7 +195,7 @@ kind: Secret
 metadata:
   name: fm-<task_id>-cred
   namespace: multica-agents
-  labels: { app.kubernetes.io/managed-by: foreman, foreman.tsic.top/task-id: "<task_id>" }
+  labels: { app.kubernetes.io/managed-by: foreman, foreman.tsic.top/task-id: "<task_id>", foreman.tsic.top/workspace-id: "<workspace_id>" }
 type: Opaque
 stringData:
   config.json: '{"token":"fmj_<payload>.<sig>"}'

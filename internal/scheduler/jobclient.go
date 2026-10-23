@@ -30,6 +30,11 @@ type JobClient interface {
 	DeleteSecret(ctx context.Context, name string) error
 	// ListJobs returns the foreman-managed Jobs in the configured namespace.
 	ListJobs(ctx context.Context) ([]batchv1.Job, error)
+	// ListJobsByTask returns the foreman-managed Jobs carrying one task's
+	// task-id label in one workspace: the per-task presence face the orphan
+	// sweep re-evaluates under the task's write lock, where the round's own
+	// list would already be stale (§6.5).
+	ListJobsByTask(ctx context.Context, workspaceID, taskID string) ([]batchv1.Job, error)
 	// ListSecrets returns the foreman-managed Secrets in the configured
 	// namespace — both the credential domain and the pending-report carrier
 	// domain. It is the list face of the orphan/carrier sweeps and of the
@@ -110,6 +115,30 @@ func (c *k8sJobClient) ListJobs(ctx context.Context) ([]batchv1.Job, error) {
 		return nil, err
 	}
 	return list.Items, nil
+}
+
+// ListJobsByTask selects by the label pair that identifies a task's Jobs
+// (§4.3), never by a name composed from the task id. The workspace term is
+// filtered here rather than in the selector: an empty value is a partition of
+// its own (objects without the label), not a wildcard (§6.5 按 workspace
+// 分区).
+func (c *k8sJobClient) ListJobsByTask(ctx context.Context, workspaceID, taskID string) ([]batchv1.Job, error) {
+	list, err := c.client.BatchV1().Jobs(c.namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.Set{
+			registry.LabelManagedBy: registry.ManagedByForeman,
+			registry.LabelTaskID:    taskID,
+		}.String(),
+	})
+	if err != nil {
+		return nil, err
+	}
+	out := make([]batchv1.Job, 0, len(list.Items))
+	for i := range list.Items {
+		if list.Items[i].Labels[registry.LabelWorkspaceID] == workspaceID {
+			out = append(out, list.Items[i])
+		}
+	}
+	return out, nil
 }
 
 func (c *k8sJobClient) ListSecrets(ctx context.Context) ([]corev1.Secret, error) {

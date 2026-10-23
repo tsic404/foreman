@@ -433,8 +433,9 @@ func TestBuildSecret(t *testing.T) {
 		t.Errorf("secret %q/%q", secret.Namespace, secret.Name)
 	}
 	wantLabels := map[string]string{
-		"app.kubernetes.io/managed-by": "foreman",
-		"foreman.tsic.top/task-id":     testTaskID,
+		"app.kubernetes.io/managed-by":  "foreman",
+		"foreman.tsic.top/task-id":      testTaskID,
+		"foreman.tsic.top/workspace-id": entry.WorkspaceID,
 	}
 	if len(secret.Labels) != len(wantLabels) {
 		t.Fatalf("secret labels = %v, want exactly %v", secret.Labels, wantLabels)

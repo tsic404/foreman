@@ -115,16 +115,19 @@ var (
 
 // credentialSecret is the per-task Secret. Its name derives from the identity
 // name (fm-<task_id>-cred), so it never follows the template's display name
-// (ADR-034 decision 8, §3).
-func (b *Builder) credentialSecret(daemonID, taskID, token string) *corev1.Secret {
+// (ADR-034 decision 8, §3). The workspace label is the object's own identity
+// in the sweep's partition (§6.5): the sweep never derives it from the
+// deployment's configuration, or a lease key would not match the claim's.
+func (b *Builder) credentialSecret(daemonID, taskID, workspaceID, token string) *corev1.Secret {
 	configJSON := `{"token":` + strconv.Quote(token) + `}`
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      CredentialSecretName(daemonID),
 			Namespace: b.cfg.JobNamespace,
 			Labels: map[string]string{
-				labelManagedBy: managedByForeman,
-				labelTaskID:    taskID,
+				labelManagedBy:   managedByForeman,
+				labelTaskID:      taskID,
+				labelWorkspaceID: workspaceID,
 			},
 		},
 		Type:       corev1.SecretTypeOpaque,

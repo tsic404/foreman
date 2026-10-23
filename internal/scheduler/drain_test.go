@@ -5,8 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,7 +17,9 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
+	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/state"
 )
 
 // newLoggingScheduler builds a scheduler over f's seams with a log buffer the
@@ -339,6 +344,171 @@ func TestSweepOrphanSecretsCriterion(t *testing.T) {
 	}
 }
 
+// The criterion must hold at the moment of deletion (§6.5): the sweep
+// re-reads both halves under the task's write lock, and that lock key must be
+// the one the claim takes — workspace included. The fake shared store records
+// every LockTask call and serializes by the real store's key, so a sweep that
+// guesses its workspace (or falls back to "") does not block the claim: the
+// claim rebuilds the Secret, the sweep deletes it, and the survivor check
+// fails. The claim runs on a second scheduler with its own keyed mutex, so the
+// in-process mutex cannot mask a key mismatch the way a same-scheduler test
+// would.
+func TestSweepOrphanSecretsKeepsTheCredentialOfAConcurrentClaim(t *testing.T) {
+	const (
+		taskID    = "task-race"
+		workspace = "ws-1"
+	)
+	env := map[string]string{EnvWorkspaceID: workspace}
+	sweeper := newFixtureWithEnv(t, env)
+	claimer := newFixtureWithEnv(t, env)
+	name := jobbuilder.CredentialSecretName(jobbuilder.DaemonIDFor(taskID))
+
+	store := newLockStore()
+	sweeper.sched.shared = store
+	sweeper.sched.instanceID = "sweeper"
+	sweeper.sched.taskLockTTL = time.Second
+	claimer.sched.shared = store
+	claimer.sched.instanceID = "claimer"
+	claimer.sched.taskLockTTL = time.Second
+	// One cluster: the claim writes the same Secret objects the sweep lists.
+	claimer.sched.jobs = sweeper.jobs
+	claimer.builder.secret = &corev1.Secret{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Data:       map[string][]byte{"token": []byte("claim")},
+	}
+
+	sweeper.jobs.liveSecrets = map[string]*corev1.Secret{
+		name: {
+			ObjectMeta: metav1.ObjectMeta{
+				Name: name,
+				Labels: map[string]string{
+					registry.LabelManagedBy:   registry.ManagedByForeman,
+					registry.LabelTaskID:      taskID,
+					registry.LabelWorkspaceID: workspace,
+				},
+			},
+			Data: map[string][]byte{"token": []byte("stale")},
+		},
+	}
+
+	claimDone := make(chan struct{})
+	var claimErr error
+	var opened atomic.Bool
+	sweeper.jobs.onDeleteSecret = func() {
+		// Only the sweep's delete opens the race: the claim's own stale-clear
+		// must not re-enter it.
+		if !opened.CompareAndSwap(false, true) {
+			return
+		}
+		go func() {
+			defer close(claimDone)
+			claimErr = claimer.sched.OnClaim(context.Background(), claimPayload(taskID))
+		}()
+		// Deterministic handshake: the claim has either reached the shared
+		// lock (and waits for the sweep to release it) or, on a key mismatch,
+		// already finished. No fixed sleep decides the outcome.
+		select {
+		case <-store.contended:
+		case <-claimDone:
+		case <-time.After(5 * time.Second):
+			t.Error("the concurrent claim neither reached the task lock nor finished")
+		}
+	}
+
+	if err := sweeper.sched.SweepOrphanSecrets(context.Background()); err != nil {
+		t.Fatalf("SweepOrphanSecrets: %v", err)
+	}
+	select {
+	case <-claimDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the concurrent claim did not finish")
+	}
+	if claimErr != nil {
+		t.Fatalf("OnClaim: %v", claimErr)
+	}
+	if _, ok := claimer.reg.Get(taskID); !ok {
+		t.Fatalf("task %s not registered", taskID)
+	}
+
+	// Both sides took the same lease key. This is the assertion the local
+	// keyed mutex cannot make: it keys by task id alone.
+	wantKey := workspace + ":" + taskID
+	store.mu.Lock()
+	calls := append([]lockCall(nil), store.calls...)
+	store.mu.Unlock()
+	if len(calls) < 2 {
+		t.Fatalf("LockTask calls = %v, want the sweep and the claim", calls)
+	}
+	for _, call := range calls {
+		if got := call.ws + ":" + call.taskID; got != wantKey {
+			t.Fatalf("LockTask(ws=%q, task=%q): want the shared lease key %q", call.ws, call.taskID, wantKey)
+		}
+	}
+
+	survivor, ok := sweeper.jobs.liveSecrets[name]
+	if !ok {
+		t.Fatal("the sweep deleted the credential Secret of the concurrent claim")
+	}
+	if string(survivor.Data["token"]) != "claim" {
+		t.Fatalf("surviving Secret carries %q, want the claim's own", survivor.Data["token"])
+	}
+}
+
+// A credential Secret without the workspace label predates the identity: it
+// carries no partition, so no snapshot key, Job filter or lease key can be
+// taken from it. The sweep fails closed and logs the skip once per round.
+func TestSweepOrphanSecretsSkipsUnpartitionedLegacyCredential(t *testing.T) {
+	f := newFixture(t)
+	var logs bytes.Buffer
+	f.sched.log = slog.New(slog.NewJSONHandler(&logs, nil))
+	legacy := corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: "fm-task-legacy-cred",
+		Labels: map[string]string{
+			registry.LabelManagedBy: registry.ManagedByForeman,
+			registry.LabelTaskID:    "task-legacy",
+		},
+	}}
+	f.jobs.secrets = []corev1.Secret{
+		legacy,
+		// A genuine orphan in the same round: its deletion proves the sweep
+		// ran, so the survivor is attributable to the missing partition.
+		secretObject("fm-task-orphan-cred", "task-orphan"),
+	}
+
+	if err := f.sched.SweepOrphanSecrets(context.Background()); err != nil {
+		t.Fatalf("SweepOrphanSecrets: %v", err)
+	}
+	if len(f.jobs.deletedSecrets) != 1 || f.jobs.deletedSecrets[0] != "fm-task-orphan-cred" {
+		t.Fatalf("deleted secrets = %v, want only the partitioned orphan", f.jobs.deletedSecrets)
+	}
+	event := decodeLogEvent(t, &logs, "cred.orphan_secret_workspace_unlabelled")
+	if event["count"] != float64(1) {
+		t.Fatalf("event = %v, want one unlabelled Secret counted", event)
+	}
+}
+
+// A lock acquisition failure happened before any delete: reporting it as a
+// failed delete sends an operator after the wrong fault (lock contention or
+// shared-state outage, not the apiserver).
+func TestSweepOrphanSecretsLogsLockFailureSeparately(t *testing.T) {
+	f := newFixture(t)
+	var logs bytes.Buffer
+	f.sched.log = slog.New(slog.NewJSONHandler(&logs, nil))
+	store := newLockStore()
+	store.lockErr = errors.New("shared state unavailable")
+	f.sched.shared = store
+	f.sched.instanceID = "sweeper"
+	f.jobs.secrets = []corev1.Secret{secretObject("fm-task-orphan-cred", "task-orphan")}
+
+	if err := f.sched.SweepOrphanSecrets(context.Background()); err == nil {
+		t.Fatal("SweepOrphanSecrets: want the lock failure surfaced")
+	}
+	decodeLogEvent(t, &logs, "cred.orphan_secret_lock_failed")
+	if len(f.jobs.deletedSecrets) != 0 {
+		t.Fatalf("deleted secrets = %v, want none without the lock", f.jobs.deletedSecrets)
+	}
+}
+
 // A Secret whose name and task-id label disagree is not a design product:
 // the creation path writes both from one task id. Deleting by label would hit
 // a same-named in-flight credential, so both positive criteria hold and the
@@ -369,8 +539,9 @@ func TestSweepSecretDomainsKeepCarriersOutOfTheCredentialCriterion(t *testing.T)
 	f.pending.queued = map[string]bool{"task-pending": true}
 	secret := func(name, taskID, role string) corev1.Secret {
 		labels := map[string]string{
-			registry.LabelManagedBy: registry.ManagedByForeman,
-			registry.LabelTaskID:    taskID,
+			registry.LabelManagedBy:   registry.ManagedByForeman,
+			registry.LabelTaskID:      taskID,
+			registry.LabelWorkspaceID: testWorkspaceID,
 		}
 		if role != "" {
 			labels[registry.LabelRole] = role
@@ -447,8 +618,100 @@ func secretObject(name, taskID string) corev1.Secret {
 	return corev1.Secret{ObjectMeta: metav1.ObjectMeta{
 		Name: name,
 		Labels: map[string]string{
-			registry.LabelManagedBy: registry.ManagedByForeman,
-			registry.LabelTaskID:    taskID,
+			registry.LabelManagedBy:   registry.ManagedByForeman,
+			registry.LabelTaskID:      taskID,
+			registry.LabelWorkspaceID: testWorkspaceID,
 		},
 	}}
 }
+
+// lockStore is the shared-state seam for the sweep/claim key test: it
+// serializes by the real store's lease key and records every LockTask call.
+// contended closes once a caller has had to wait, so the test hands control
+// over deterministically instead of sleeping. The slot and queue methods are
+// the minimum a claim takes through the shared branch.
+type lockStore struct {
+	state.CoordStore
+
+	mu        sync.Mutex
+	held      map[string]string
+	calls     []lockCall
+	contended chan struct{}
+	once      sync.Once
+	lockErr   error
+
+	slots  map[string]int64
+	nextID int
+}
+
+type lockCall struct {
+	ws, taskID, owner string
+}
+
+func newLockStore() *lockStore {
+	return &lockStore{contended: make(chan struct{})}
+}
+
+func (l *lockStore) LockTask(ctx context.Context, ws, taskID, owner string, ttl time.Duration) (bool, error) {
+	l.mu.Lock()
+	err := l.lockErr
+	l.mu.Unlock()
+	if err != nil {
+		return false, err
+	}
+	key := ws + ":" + taskID
+	for {
+		l.mu.Lock()
+		l.calls = append(l.calls, lockCall{ws: ws, taskID: taskID, owner: owner})
+		if l.held[key] == "" {
+			if l.held == nil {
+				l.held = map[string]string{}
+			}
+			l.held[key] = owner
+			l.mu.Unlock()
+			return true, nil
+		}
+		l.mu.Unlock()
+		l.once.Do(func() { close(l.contended) })
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(time.Millisecond):
+		}
+	}
+}
+
+func (l *lockStore) UnlockTask(_ context.Context, ws, taskID, owner string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	key := ws + ":" + taskID
+	if l.held[key] == owner {
+		delete(l.held, key)
+	}
+	return nil
+}
+
+func (l *lockStore) Slots(context.Context, string) (int64, error) { return 0, nil }
+
+func (l *lockStore) ReserveSlot(_ context.Context, ws string, limit int) (string, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if limit > 0 && l.slots[ws] >= int64(limit) {
+		return "", false, nil
+	}
+	if l.slots == nil {
+		l.slots = map[string]int64{}
+	}
+	l.slots[ws]++
+	l.nextID++
+	return fmt.Sprintf("%s#%d", ws, l.nextID), true, nil
+}
+
+func (l *lockStore) ConsumeSlotReservation(context.Context, string, string) error { return nil }
+func (l *lockStore) ReleaseSlot(context.Context, string, string) error            { return nil }
+
+func (l *lockStore) EnqueueEntry(context.Context, string, string, registry.TaskEntry) (bool, error) {
+	return true, nil
+}
+
+func (l *lockStore) QueueDepth(context.Context) (int64, error) { return 0, nil }
