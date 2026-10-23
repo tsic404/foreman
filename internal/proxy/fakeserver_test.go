@@ -834,7 +834,9 @@ func TestS20GCCheckForwarded(t *testing.T) {
 }
 
 func TestS7PrepareLeaseForwardsC4(t *testing.T) {
-	rig := newTestRig(t)
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	rig := newTestRigWithClock(t, func(stub *stubUpstream) { stubRegister(stub, "rid-real") },
+		testDiscovery(), func() time.Time { return now })
 	var buf bytes.Buffer
 	rig.handler.(*FakeServer).log = slog.New(slog.NewJSONHandler(&buf, nil)).With("component", "fake-server")
 	rig.claimTask(t, "t-lease")
@@ -848,9 +850,10 @@ func TestS7PrepareLeaseForwardsC4(t *testing.T) {
 	if !ok {
 		t.Fatal("entry missing after claim")
 	}
-	start := time.Now()
+	// Advance the one injected clock past the claim-time stamp so the two
+	// writers' values are distinguishable.
+	now = now.Add(10 * time.Second)
 	code, body := rig.call(t, "POST", "/api/daemon/runtimes/"+jobRID+"/tasks/t-lease/prepare-lease", tok, []byte(`{}`))
-	end := time.Now()
 	if code != 200 || string(body) != `{"status":"ok"}` {
 		t.Fatalf("S7 = %d %s", code, body)
 	}
@@ -860,14 +863,14 @@ func TestS7PrepareLeaseForwardsC4(t *testing.T) {
 	}
 	// S7's local renewal bookkeeping (§2.2 S-7): the daemon's
 	// renewal restamped the server lease, so lease_keep_until (§4.1) moves to
-	// the renewal moment plus the 45s TTL.
+	// the renewal moment plus the 45s TTL — the renewal moment being the
+	// injected clock's observation instant, never the wall clock.
 	after, ok := rig.reg.Get("t-lease")
 	if !ok {
 		t.Fatal("entry missing after S7")
 	}
-	lo, hi := start.Add(scheduler.PrepareLeaseTTL), end.Add(scheduler.PrepareLeaseTTL)
-	if after.LeaseKeepUntil.Before(lo) || after.LeaseKeepUntil.After(hi) {
-		t.Errorf("lease_keep_until = %v, want within [%v, %v]", after.LeaseKeepUntil, lo, hi)
+	if want := now.Add(scheduler.PrepareLeaseTTL); !after.LeaseKeepUntil.Equal(want) {
+		t.Errorf("lease_keep_until = %v, want the injected clock's %v", after.LeaseKeepUntil, want)
 	}
 	if !after.LeaseKeepUntil.After(before.LeaseKeepUntil) {
 		t.Errorf("S7 left lease_keep_until unadvanced: before %v, after %v",

@@ -474,8 +474,11 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 		// Local renewal bookkeeping (§2.2 S-7): the daemon's
 		// renewal restamped the same server lease the keeper renews, so the
 		// entry's lease_keep_until advances here too (§4.1) and the
-		// same Info observation line is emitted.
-		until := time.Now().Add(scheduler.PrepareLeaseTTL)
+		// same Info observation line is emitted. The keeper stamps the same
+		// projection field from this registry clock by construction
+		// (NewLeaseKeeper defaults to reg.Now), so both writers share one
+		// observation instant.
+		until := s.reg.Now().Add(scheduler.PrepareLeaseTTL)
 		s.reg.SetLeaseKeepUntil(tid, until)
 		s.log.Info("lease.renewed", "task_id", tid, "job_name", claims.JobName,
 			"lease_keep_until", registry.ProjectedTime(until))
