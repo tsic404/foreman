@@ -117,15 +117,25 @@ func (s *Scheduler) reserveSlots(ctx context.Context, ws string) error {
 	if s.cfg.MaxInflightJobsPerWorkspace > 0 && ws != "" {
 		ok, err = s.shared.ReserveSlot(callCtx, ws, s.cfg.MaxInflightJobsPerWorkspace)
 		if err != nil {
-			_ = s.shared.ReleaseSlot(callCtx, "")
+			s.releaseGlobalReservation()
 			return fmt.Errorf("%w: reserve workspace slot: %v", ErrStoreUnavailable, err)
 		}
 		if !ok {
-			_ = s.shared.ReleaseSlot(callCtx, "")
+			s.releaseGlobalReservation()
 			return ErrNoSlot
 		}
 	}
 	return nil
+}
+
+// releaseGlobalReservation returns the global slot whose workspace half was
+// refused. The write is detached: the refusal usually means the call budget is
+// spent, so inheriting that context would make the compensation itself fail
+// and leak the reservation until the TTL/reconcile edge.
+func (s *Scheduler) releaseGlobalReservation() {
+	callCtx, cancel := sharedDetachedCtx()
+	defer cancel()
+	_ = s.shared.ReleaseSlot(callCtx, "")
 }
 
 // consumeSlots turns one reservation into entry ownership on both levels. The
