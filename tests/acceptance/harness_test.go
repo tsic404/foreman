@@ -226,8 +226,11 @@ const forwardProbeBulkBytes = 33<<20 + 7
 type upstreamStub struct {
 	mu sync.Mutex
 	// workspaceID is the workspace the C-17 answer names (a multi-workspace
-	// fixture gives each stub its own).
-	workspaceID string
+	// fixture gives each stub its own). workspacesBody, when non-nil, is the
+	// answer verbatim — a scenario judging a malformed entry (an id with an
+	// empty or whitespace-only display name) programs it.
+	workspaceID    string
+	workspacesBody []byte
 	// registerIDs maps a declared provider type to the runtime id the server
 	// answers with; a missing entry means the provider is not registered.
 	// profileIDs holds the profile identities, keyed by RuntimeIdentityKey.
@@ -499,8 +502,14 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 	mux.HandleFunc("GET /api/daemon/workspaces", func(w http.ResponseWriter, r *http.Request) {
 		stub.record(r, "/api/daemon/workspaces", nil)
 		stub.mu.Lock()
-		id := stub.workspaceID
+		// bytes.Clone keeps a programmed empty answer non-nil, so it cannot fall back.
+		id, body := stub.workspaceID, bytes.Clone(stub.workspacesBody)
 		stub.mu.Unlock()
+		if body != nil {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(body)
+			return
+		}
 		if id == "" {
 			id = "ws-1"
 		}
@@ -846,6 +855,14 @@ func (s *upstreamStub) setWorkspaceID(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.workspaceID = id
+}
+
+// setWorkspacesAnswer programs the C-17 answer verbatim; the scenario owns the
+// entry shapes (an empty or whitespace-only display name is a malformed one).
+func (s *upstreamStub) setWorkspacesAnswer(body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.workspacesBody = []byte(body)
 }
 
 func (s *upstreamStub) setRuntimeID(provider, profileID, id string) {
@@ -3785,4 +3802,39 @@ func (h *harness) startAssemblyControlPlane(t *testing.T, gate func() bool, publ
 	}
 	t.Cleanup(stop)
 	return stop
+}
+
+// TestUpstreamStubC17AnswerVerbatim pins the C-17 fixture's programming
+// contract: an answer set by setWorkspacesAnswer reaches the caller byte for
+// byte, and only an unset one falls back to the default entry. A zero-length
+// answer is a programmed answer — a fallback there would let a scenario assert
+// against an answer it never programmed and still pass.
+func TestUpstreamStubC17AnswerVerbatim(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		program func(*upstreamStub)
+		want    string
+	}{
+		{"unset falls back to the default entry", func(*upstreamStub) {}, `[{"id":"ws-1","name":"foreman"}]`},
+		{"empty answer is delivered empty", func(s *upstreamStub) { s.setWorkspacesAnswer("") }, ""},
+		{"answer is delivered verbatim", func(s *upstreamStub) { s.setWorkspacesAnswer(`[{"id":"ws-b","name":""}]`) }, `[{"id":"ws-b","name":""}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newUpstreamStub(t)
+			tc.program(stub)
+
+			resp, err := http.Get(stub.server.URL + "/api/daemon/workspaces")
+			if err != nil {
+				t.Fatalf("GET C-17 answer: %v", err)
+			}
+			defer resp.Body.Close()
+			got, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read C-17 answer: %v", err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("C-17 answer = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }
