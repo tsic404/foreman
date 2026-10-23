@@ -397,12 +397,11 @@ func (r *Reconciler) round(ctx context.Context) error {
 		// Node placement is the fact the per-node soft cap counts
 		// (FOREMAN_MAX_JOBS_PER_NODE, contract §3: Pod 读 spec.nodeName),
 		// and the node_name the terminal report's learning face reads
-		// (ADR-015). The pods are already listed for this round; record the
-		// node once it is known.
-		if e.NodeName == "" {
-			if node := podNodeName(current); node != "" {
-				r.reg.SetNode(e.TaskID, node)
-			}
+		// (ADR-015). The pods are already listed for this round; the current
+		// observation wins, so a pod rebuilt onto another node (eviction,
+		// drain) moves the entry — and both consumers — with it.
+		if node := podNodeName(current); node != "" && node != e.NodeName {
+			r.reg.SetNode(e.TaskID, node)
 		}
 		if err := r.reconcileOne(ctx, e, current); err != nil {
 			r.log.WarnContext(ctx, "reconcile entry failed",
