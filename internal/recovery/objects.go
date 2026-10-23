@@ -47,10 +47,12 @@ func indexPods(pods []corev1.Pod) map[string][]corev1.Pod {
 
 // instancePods keeps the pods of the current Job instance. The Job controller
 // creates an instance's pods after the Job object, so a pod created before
-// job_created_at belongs to a predecessor that held the same name — the name
-// fm-<task_id> is reused on a re-run, and GC lag leaves the predecessor's
-// corpse on the list face. Such a pod must not decide this instance's facts;
-// the scheduler's jobPods family applies the same filter (ADR-017).
+// job_created_at belongs to a predecessor whose name was reused; GC lag leaves
+// that corpse on the list face, and it must not decide this instance's facts.
+// Both sides are apiserver timestamps of second granularity, so a corpse pod
+// created in the same second passes — an accepted residual: ADR-017 fixes the
+// criterion to that timestamp (the scheduler's jobPods family filters the same
+// way) and a finer key, the creator's UID in ownerReferences, would change it.
 func instancePods(pods []corev1.Pod, since time.Time) []corev1.Pod {
 	current := make([]corev1.Pod, 0, len(pods))
 	for i := range pods {

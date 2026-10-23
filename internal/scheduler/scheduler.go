@@ -2124,12 +2124,13 @@ func (s *Scheduler) drainSeconds(taskID string) float64 {
 }
 
 // jobPods is the single ownership + instance filter behind every termination
-// fact: the pods the Job controller labelled with this Job's name,
-// restricted to the current instance — a pod created before
-// this Job instance belongs to a reused name's predecessor, whose disposal is
-// the revoke-and-discard path, never this Job's credential verdict. since is
-// the Job's apiserver creationTimestamp, so both sides of the comparison are
-// apiserver timestamps (§4.1).
+// fact: the pods the Job controller labelled with this Job's name, restricted
+// to the current instance — a predecessor's pod must never decide this Job's
+// credential verdict. since is the Job's apiserver creationTimestamp (§4.1):
+// both sides are second-granularity apiserver facts, so a same-second
+// predecessor pod still passes — an accepted residual, since ADR-017 fixes
+// the criterion to that timestamp and a finer key (the creator's UID in the
+// pod's ownerReferences) would change it.
 func (s *Scheduler) jobPods(ctx context.Context, jobName string, since time.Time) ([]corev1.Pod, error) {
 	pods, err := s.jobs.ListPods(ctx, jobNameSelector(jobName))
 	if err != nil {
