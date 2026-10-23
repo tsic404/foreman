@@ -312,10 +312,10 @@ type Scheduler struct {
 	// identity; nil leaves entries without one (S-4 then refuses).
 	runtimeIdentity RuntimeIdentityResolver
 
-	// attributionWait is the attribution gate's wait upper bound (ADR-031):
-	// the implementation constant defaultAttributionWait. It is kept as a
-	// field only so package tests can shrink it — it is not a configuration
-	// item and no env carries it.
+	// attributionWait is the attribution gate path's budget (ADR-031): the
+	// implementation constant defaultAttributionWait. It is kept as a field
+	// only so package tests can shrink it — it is not a configuration item
+	// and no env carries it.
 	attributionWait time.Duration
 
 	// beforeJobLock is a test seam in OnJobTerminated between the Job-name
@@ -1198,62 +1198,78 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		defer s.SyncInflight()
 		verdict := gateUndecided
 		var decision gateDecision
+		var gateDeadline time.Time
 		if !e.IsTerminal() && len(e.DecidedReport) == 0 && ep == EPFail {
 			// §4.4/ADR-031: the S14 branch's first step is the attribution
 			// gate. It faces only this shape — an undecided inbound daemon
 			// failure self-report; a decided instance and the forwards
 			// produced by a verdict (compensation, queue replay) never enter.
-			e, body, verdict, decision = s.attributionGate(ctx, e, body, sessionID)
+			// The round's one budget starts here. The gate spends its share
+			// and leaves the reserve to the terminal write below, so the
+			// exits that exhaust the gate's share still write the verdict
+			// (§10, ADR-031).
+			gateDeadline = time.Now().Add(s.attributionWait)
+			e, body, verdict, decision = s.attributionGate(ctx, e, body, sessionID, gateDeadline)
 			now = s.now()
 		}
-		// The terminal write and the decided-body registration run under the
-		// task's lock, on a fresh read: the gate's wait opens a window in
-		// which another path (the convergence compensation, a late report)
-		// can settle this instance, and §4.4 forbids rewriting a decided one.
-		// The gate's verdict distinguishes its own settlement from such a
-		// decision; both skip this report's write.
-		unlockTerminal, lockErr := s.lockTaskFor(ctx, e.TaskID)
-		if lockErr != nil {
-			return http.StatusServiceUnavailable, nil, lockErr
-		}
-		if fresh, ok := s.reg.Get(e.TaskID); ok {
+		// An exit the gate already decided writes nothing here: it settled the
+		// instance itself, or it found another path's decision. Forwarding the
+		// decided body needs no lock, and re-taking the shared lease would put
+		// the unbounded lease wait back on the S14 path after the gate's
+		// budget ran out (§10, ADR-031).
+		//
+		// Only gateUndecided leaves the terminal write to this report, and
+		// that write still runs under the task's lock on a fresh read: the
+		// gate's wait opens a window in which another path (the convergence
+		// compensation, a late report) can settle this instance, and §4.4
+		// forbids rewriting a decided one. The lock draws on the reserve the
+		// gate left unspent, so a held lease cannot extend the S14 round.
+		if verdict == gateUndecided {
+			unlockTerminal, lockErr := s.lockTaskWithin(ctx, e.TaskID, gateDeadline)
+			if lockErr != nil {
+				return http.StatusServiceUnavailable, nil, lockErr
+			}
+			if fresh, ok := s.reg.Get(e.TaskID); ok {
+				e = fresh
+			}
+			undecided = !e.IsTerminal() && len(e.DecidedReport) == 0
+			if undecided {
+				// §10 write-ahead: the report is durable before the verdict
+				// exists only in memory. Marking first and enqueueing on failure
+				// left a window where a crash lost both the verdict and the
+				// report; the rebuilt Job then read a completed task as failed.
+				s.enqueuePending(ctx, e, ep, "", body)
+				result := registry.Result(ep.TerminalResult())
+				_, first, err := s.reg.MarkTerminal(e.TaskID, result, "", now)
+				if err != nil {
+					unlockTerminal()
+					return 0, nil, err
+				}
+				if first {
+					s.metrics.TaskTerminal(string(result))
+					s.log.InfoContext(ctx, "task.terminal",
+						"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+						"workspace_id", e.WorkspaceID,
+						"result", string(result),
+						"duration_seconds", now.Sub(e.ClaimedAt).Seconds())
+					// The decision event is emitted here, under the lock that
+					// wrote the verdict: a decision another path landed in the
+					// window between the gate's read and this write left this
+					// report undecided, so no event names a superseded decision.
+					if decision.decision != "" {
+						s.attributionDecided(ctx, e, decision.decision, decision.factSource, decision.errorSource)
+					}
+					// The instance's first terminal forward decides its body:
+					// every later terminal forward takes this one (§4.4).
+					if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body); ok {
+						e = registered
+					}
+				}
+			}
+			unlockTerminal()
+		} else if fresh, ok := s.reg.Get(e.TaskID); ok {
 			e = fresh
 		}
-		undecided = verdict == gateUndecided && !e.IsTerminal() && len(e.DecidedReport) == 0
-		if undecided {
-			// §10 write-ahead: the report is durable before the verdict
-			// exists only in memory. Marking first and enqueueing on failure
-			// left a window where a crash lost both the verdict and the
-			// report; the rebuilt Job then read a completed task as failed.
-			s.enqueuePending(ctx, e, ep, "", body)
-			result := registry.Result(ep.TerminalResult())
-			_, first, err := s.reg.MarkTerminal(e.TaskID, result, "", now)
-			if err != nil {
-				unlockTerminal()
-				return 0, nil, err
-			}
-			if first {
-				s.metrics.TaskTerminal(string(result))
-				s.log.InfoContext(ctx, "task.terminal",
-					"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
-					"workspace_id", e.WorkspaceID,
-					"result", string(result),
-					"duration_seconds", now.Sub(e.ClaimedAt).Seconds())
-				// The decision event is emitted here, under the lock that
-				// wrote the verdict: a decision another path landed in the
-				// window between the gate's read and this write left this
-				// report undecided, so no event names a superseded decision.
-				if decision.decision != "" {
-					s.attributionDecided(ctx, e, decision.decision, decision.factSource, decision.errorSource)
-				}
-				// The instance's first terminal forward decides its body:
-				// every later terminal forward takes this one (§4.4).
-				if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body); ok {
-					e = registered
-				}
-			}
-		}
-		unlockTerminal()
 		if decided, ok := s.reg.DecidedReport(e.TaskID); ok {
 			body = decided
 		}

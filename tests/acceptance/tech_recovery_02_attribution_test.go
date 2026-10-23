@@ -26,6 +26,7 @@ import (
 	"github.com/tsic404/foreman/internal/recovery"
 	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
+	"github.com/tsic404/foreman/internal/state"
 )
 
 // TestRecovery02PlatformDeadlineAttributionWinsOverTheDaemonSelfReport is
@@ -330,11 +331,11 @@ func TestRecovery05ExpiredWaitReleasesTheSelfReportWithVisibleDegradation(t *tes
 // TestRecovery02GateExpiresAtTheProductionWaitBound is the wait bound's
 // production form: no short wait is injected, one wait signal holds (the
 // instance pod carries a platform deletion) and the fact never appears, so the
-// gate expires at its upper bound — the daemon's self-report is released
+// gate expires inside its bound — the daemon's self-report is released
 // verbatim and the degradation is visible. The fixed clock does not follow
 // wall time and every evidence read steps it 1s, so the observed span is
-// exactly the bound plus that step — a drifted bound fails here too; the exact
-// 15s value is pinned by the scheduler's constant assertion.
+// exactly the gate's share of the bound — a drifted bound fails here too; the
+// exact 15s value is pinned by the scheduler's constant assertion.
 func TestRecovery02GateExpiresAtTheProductionWaitBound(t *testing.T) {
 	clock := newFixedClock()
 	h := buildHarnessWith(t, false, deliveryConfirmWindow, nil, false, false,
@@ -381,12 +382,13 @@ func TestRecovery02GateExpiresAtTheProductionWaitBound(t *testing.T) {
 	if code != 200 {
 		t.Fatalf("S14 = %d (%s), want 200", code, body)
 	}
-	// The entry read steps the clock before the bound is computed, so the exit
-	// is exactly one step past the 15s production bound. An exact span keeps a
-	// drift inside the old 15s..30s bracket (say 20s) from passing silently.
-	const wantGateSpan = 16 * time.Second
+	// The round's budget starts before the first evidence read and the gate
+	// stops one reserve short of it, so the exit lands at the 15s production
+	// bound less the 2s the terminal write keeps: the first read is inside the
+	// span, and a drifted bound (say the old 45s) still fails here.
+	const wantGateSpan = 13 * time.Second
 	if span := clock.now().Sub(start); span != wantGateSpan {
-		t.Fatalf("gate released after %s of scheduler time, want exactly %s (the 15s bound plus the entry read's step)", span, wantGateSpan)
+		t.Fatalf("gate released after %s of scheduler time, want exactly %s (the 15s bound less the terminal write's reserve)", span, wantGateSpan)
 	}
 
 	// Expiry releases the daemon's own report verbatim: no compensation body.
@@ -404,5 +406,84 @@ func TestRecovery02GateExpiresAtTheProductionWaitBound(t *testing.T) {
 	decided := h.events("task.attribution_decided")
 	if len(decided) != 1 || decided[0]["decision"] != scheduler.DecisionDegraded {
 		t.Fatalf("task.attribution_decided = %+v, want decision=degraded", decided)
+	}
+}
+
+// newSharedDeliveryHarness is newDeliveryHarness on the deployment's shared
+// store: the task lease the gate's terminal write takes is the real one, so a
+// scenario judging the gate path's budget exercises the lease's deadline
+// instead of the local mutex a shared-less fixture answers with.
+func newSharedDeliveryHarness(t *testing.T) *harness {
+	t.Helper()
+	store, _ := multi08Store(t)
+	coord, ok := store.(state.CoordStore)
+	if !ok {
+		t.Fatal("the shared store does not expose the coordination face")
+	}
+	h := buildHarnessWith(t, false, deliveryConfirmWindow, nil, false, false, harnessOptions{
+		store: store, coord: coord, instanceID: "instance-1",
+	})
+	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+	h.declare(declaredRuntimes())
+	return h
+}
+
+// TestRecovery02GatePathStaysInsideTheAttributionBudget is AC-08's latency
+// clause in executable form: the platform fact is visible and the server's C13
+// answer never arrives, so the gate's remaining budget — not a fresh
+// control-plane timeout stacked behind the wait — is what ends the S14 round.
+// The round stays inside the start point plus the attribution wait bound and
+// takes the undecidable branch, forwarding the daemon's body verbatim. The
+// shared store is the deployment's lease shape: the terminal write has to land
+// on the reserve the gate left, not fail closed on an expired deadline.
+func TestRecovery02GatePathStaysInsideTheAttributionBudget(t *testing.T) {
+	h := newSharedDeliveryHarness(t)
+	if err := h.sched.OnClaim(t.Context(), deliveryPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	token := issueJobToken(t, h, "task-1")
+	registerTaskDaemon(t, h, "task-1", token)
+	claimTask(t, h, "task-1", token)
+	if code, body := h.call("POST", "/api/daemon/tasks/task-1/start", token, []byte(`{}`)); code != 200 {
+		t.Fatalf("S8 = %d (%s), want 200", code, body)
+	}
+	entry, ok := h.reg.Get("task-1")
+	if !ok || entry.State != registry.StateRunning {
+		t.Fatalf("entry = %+v, want a running task before the kill", entry)
+	}
+	killed := h.createdJob(t, entry.JobName).DeepCopy()
+	killed.Status.Conditions = []batchv1.JobCondition{{
+		Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "DeadlineExceeded",
+	}}
+	h.jobs.programGetJob(killed)
+	h.server.setStatus("task-1", "running")
+	h.server.setStatusHangs(true)
+
+	daemonBody := []byte(`{"error":"agent died","failure_reason":"agent_error"}`)
+	start := time.Now()
+	// The client bound only keeps a missing gate bound from hanging the
+	// suite; the judged bound is the gate path's own.
+	code, body := h.callWithin(40*time.Second, "POST", "/api/daemon/tasks/task-1/fail", token, daemonBody)
+	elapsed := time.Since(start)
+	if code != 200 {
+		t.Fatalf("S14 = %d (%s), want 200", code, body)
+	}
+	// §10 门路径不超过起算点加归因等待上界: the bound is the implementation
+	// constant (15s) plus a small margin for the round's own bookkeeping — a
+	// path that merely fits the daemon's 30s timeout is not enough.
+	if elapsed >= 17*time.Second {
+		t.Fatalf("S14 took %s, want it inside the start point plus the attribution bound", elapsed)
+	}
+	decided := h.events("task.attribution_decided")
+	if len(decided) != 1 || decided[0]["decision"] != scheduler.DecisionReadError || decided[0]["error_source"] != "c13" {
+		t.Fatalf("task.attribution_decided = %+v, want decision=read_error error_source=c13", decided)
+	}
+	forwards := h.server.forwarded(scheduler.EPFail)
+	if len(forwards) != 1 || string(forwards[0].Body) != string(daemonBody) {
+		t.Fatalf("fail forwards = %+v, want the daemon's body verbatim", forwards)
+	}
+	settled, ok := h.reg.Get("task-1")
+	if !ok || !settled.IsTerminal() || settled.Result != registry.ResultFailed || settled.FailureReason != "" {
+		t.Fatalf("entry = %+v, want the daemon's own failed verdict", settled)
 	}
 }

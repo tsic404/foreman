@@ -66,7 +66,10 @@ type fakeJobs struct {
 	existingJobs    map[string]*batchv1.Job
 	terminatingJobs map[string]bool
 	onGetJob        func()
-	onCreateJob     func()
+	// blockGetJob holds a GetJob read open until it closes or the caller's
+	// context ends: the fake read honours its context like the real client.
+	blockGetJob <-chan struct{}
+	onCreateJob func()
 
 	// secrets and pods back ListSecrets/ListPods: the orphan-Secret sweep
 	// and the Job-termination evidence read them.
@@ -123,11 +126,23 @@ func (f *fakeJobs) DeleteJob(_ context.Context, name string) error {
 
 // GetJob answers from existingJobs: a name listed in terminatingJobs comes
 // back with a deletionTimestamp (the foreground deletion window). onGetJob
-// runs first — on error probes too — so a test can count probes or stage a
-// fact on a later read.
-func (f *fakeJobs) GetJob(_ context.Context, name string) (*batchv1.Job, error) {
+// runs first — on error probes too — so a test can count probes, stage a
+// fact on a later read, trip the wait deadline, or clear getJobErr. The read
+// honours its context the way the real client does: an already-ended context
+// fails it, and blockGetJob holds it open until the context ends first.
+func (f *fakeJobs) GetJob(ctx context.Context, name string) (*batchv1.Job, error) {
 	if f.onGetJob != nil {
 		f.onGetJob()
+	}
+	if f.blockGetJob != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-f.blockGetJob:
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if f.getJobErr != nil {
 		return nil, f.getJobErr
@@ -260,6 +275,9 @@ type fakeServer struct {
 	status    string
 	statusErr error
 	onStatus  func() // test hook: fires inside TaskStatus (simulates mid-C13 races)
+	// statusBlocks holds TaskStatus until its context ends: a control-plane
+	// answer that arrives after the caller's budget.
+	statusBlocks bool
 
 	forwardCode int
 	forwardErr  error
@@ -267,9 +285,13 @@ type fakeServer struct {
 	forwards    []forwardCall
 }
 
-func (f *fakeServer) TaskStatus(context.Context, string) (string, error) {
+func (f *fakeServer) TaskStatus(ctx context.Context, _ string) (string, error) {
 	if f.onStatus != nil {
 		f.onStatus()
+	}
+	if f.statusBlocks {
+		<-ctx.Done()
+		return "", ctx.Err()
 	}
 	return f.status, f.statusErr
 }

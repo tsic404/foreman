@@ -14,6 +14,7 @@ import (
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/state"
 )
 
 // ---- the single platform-fact judgement (ADR-031) ----
@@ -282,11 +283,13 @@ func TestOnReportAttributionGateSettlementFailureFallsBackToDaemon(t *testing.T)
 
 // TestOnReportAttributionGateWaitsForTheFact covers the wait face: the fact
 // is not visible yet, the pod already carries a platform deletion, and the
-// gate re-reads until the fact appears (bounded by attributionWait).
+// gate re-reads until the fact appears (bounded by attributionWait). The
+// budget is larger than one poll interval so C13 still has room after the
+// wait — the wait and the C13 re-check share it (§10).
 func TestOnReportAttributionGateWaitsForTheFact(t *testing.T) {
 	g := newGateFixture(t)
 	e := g.runningTask(t, "task-1", "running")
-	g.sched.attributionWait = 200 * time.Millisecond
+	g.sched.attributionWait = 600 * time.Millisecond
 
 	pod := testPod(e.JobName, corev1.PodRunning)
 	now := metav1.Now()
@@ -499,6 +502,340 @@ func TestOnReportAttributionGateC13Settled(t *testing.T) {
 	}
 	if events := g.events("task.failed_compensated"); len(events) != 0 {
 		t.Fatalf("failed_compensated events = %+v, want none for a settled task", events)
+	}
+}
+
+// TestOnReportAttributionGateC13SpendsTheRemainingBudget pins §10's gate-path
+// bound (ADR-031): the wait and the C13 re-check share one attributionWait
+// budget, so a control plane that never answers cannot push the S14 round
+// past it — the gate lands on its undecidable branch instead.
+func TestOnReportAttributionGateC13SpendsTheRemainingBudget(t *testing.T) {
+	g := newGateFixture(t)
+	e := g.runningTask(t, "task-1", "running")
+	g.sched.attributionWait = 700 * time.Millisecond
+	// The deployment's lease shape: the terminal write must still fit on the
+	// shared store after the gate's share is spent.
+	g.sched.shared = &idleTaskLockStore{}
+	g.sched.instanceID = "instance-1"
+
+	// One wait signal holds and the fact shows up only on the second read:
+	// one poll interval of the gate's share is gone before C13 is consulted.
+	pod := testPod(e.JobName, corev1.PodRunning)
+	deleted := metav1.Now()
+	pod.DeletionTimestamp = &deleted
+	g.jobs.pods = []corev1.Pod{pod}
+	reads := 0
+	g.jobs.onGetJob = func() {
+		reads++
+		if reads > 1 {
+			g.jobs.existingJobs[e.JobName] = deadlineJob(e.JobName, e.JobCreatedAt)
+		}
+	}
+	statusCalled := false
+	g.server.onStatus = func() { statusCalled = true }
+	g.server.statusBlocks = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	daemonBody := []byte(`{"error":"agent crashed","failure_reason":"agent_error"}`)
+	start := time.Now()
+	code, _, err := g.sched.OnReport(ctx, EPFail, e, daemonBody, "")
+	elapsed := time.Since(start)
+	if err != nil || code != 200 {
+		t.Fatalf("OnReport = %d, %v", code, err)
+	}
+	if !statusCalled {
+		t.Fatal("C13 was never consulted: the fact was visible and the budget had room")
+	}
+	if elapsed > g.sched.attributionWait+250*time.Millisecond {
+		t.Fatalf("S14 round took %s, want it inside the attribution budget %s", elapsed, g.sched.attributionWait)
+	}
+	if got := g.server.forwards[0].body; got != string(daemonBody) {
+		t.Fatalf("forward body = %q, want the daemon's own body on the undecidable branch", got)
+	}
+	decided := g.events("task.attribution_decided")
+	if len(decided) != 1 || decided[0]["decision"] != DecisionReadError || decided[0]["error_source"] != "c13" {
+		t.Fatalf("attribution_decided = %+v, want decision=read_error error_source=c13", decided)
+	}
+}
+
+// TestOnReportAttributionGateSkipsC13WhenTheBudgetIsSpent: an evidence read
+// the budget cuts off leaves nothing for C13 — the gate makes no call rather
+// than opening a fresh control-plane timeout behind the read (§10, ADR-031).
+// The fake read blocks until its context ends, so a read that went out on the
+// request context instead of the gate's would outlive the budget and fail the
+// elapsed assertion.
+func TestOnReportAttributionGateSkipsC13WhenTheBudgetIsSpent(t *testing.T) {
+	g := newGateFixture(t)
+	e := g.runningTask(t, "task-1", "running")
+	g.sched.attributionWait = 200 * time.Millisecond
+	// The deployment's lease shape: the degraded terminal write must still
+	// take the lease on the reserve, or the round ends 503 instead of 200.
+	g.sched.shared = &idleTaskLockStore{}
+	g.sched.instanceID = "instance-1"
+
+	// The read never answers on its own: only the gate's budget ends it.
+	blocked := make(chan struct{})
+	defer close(blocked)
+	g.jobs.blockGetJob = blocked
+	statusCalled := false
+	g.server.onStatus = func() { statusCalled = true }
+	g.server.statusBlocks = true
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	daemonBody := []byte(`{"error":"agent crashed","failure_reason":"agent_error"}`)
+	start := time.Now()
+	code, _, err := g.sched.OnReport(ctx, EPFail, e, daemonBody, "")
+	elapsed := time.Since(start)
+	if err != nil || code != 200 {
+		t.Fatalf("OnReport = %d, %v", code, err)
+	}
+	if statusCalled {
+		t.Fatal("C13 must not be consulted once the budget is spent")
+	}
+	if elapsed > g.sched.attributionWait+250*time.Millisecond {
+		t.Fatalf("S14 round took %s, want the read cut at the attribution budget %s", elapsed, g.sched.attributionWait)
+	}
+	if got := g.server.forwards[0].body; got != string(daemonBody) {
+		t.Fatalf("forward body = %q, want the daemon's own body on the undecidable branch", got)
+	}
+	decided := g.events("task.attribution_decided")
+	if len(decided) != 1 || decided[0]["decision"] != DecisionReadError || decided[0]["error_source"] != "platform_fact" {
+		t.Fatalf("attribution_decided = %+v, want decision=read_error error_source=platform_fact", decided)
+	}
+}
+
+// TestOnReportAttributionGateWaitFailureMapping pins what ends a wait that
+// never produced a fact: the budget's own expiry is the degraded face (the
+// instance could not observe), while a read that broke on its own is the
+// environment face (read_error). Both leave the report to the daemon.
+func TestOnReportAttributionGateWaitFailureMapping(t *testing.T) {
+	tests := []struct {
+		name        string
+		arm         func(*gateFixture)
+		decision    string
+		errorSource string
+	}{
+		{
+			name: "the budget ends the wait",
+			arm: func(g *gateFixture) {
+				// The fixture clock never reaches the bound, so the wall-clock
+				// budget is what ends the wait.
+				g.sched.attributionWait = 200 * time.Millisecond
+			},
+			decision: DecisionDegraded,
+		},
+		{
+			name: "the re-read fails",
+			arm: func(g *gateFixture) {
+				g.sched.attributionWait = 600 * time.Millisecond
+				reads := 0
+				g.jobs.onGetJob = func() {
+					reads++
+					if reads == 2 {
+						g.jobs.getJobErr = errors.New("apiserver down")
+					}
+				}
+			},
+			decision:    DecisionReadError,
+			errorSource: "platform_fact",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := newGateFixture(t)
+			e := g.runningTask(t, "task-1", "running")
+			// The deployment's lease shape: the expired-budget exits must
+			// write the verdict on the reserve, not fail the shared lease.
+			g.sched.shared = &idleTaskLockStore{}
+			g.sched.instanceID = "instance-1"
+			pod := testPod(e.JobName, corev1.PodRunning)
+			now := metav1.Now()
+			pod.DeletionTimestamp = &now
+			g.jobs.pods = []corev1.Pod{pod}
+			tt.arm(g)
+
+			daemonBody := []byte(`{"error":"agent crashed","failure_reason":"agent_error"}`)
+			start := time.Now()
+			code, _, err := g.sched.OnReport(context.Background(), EPFail, e, daemonBody, "")
+			elapsed := time.Since(start)
+			if err != nil || code != 200 {
+				t.Fatalf("OnReport = %d, %v", code, err)
+			}
+			if elapsed > g.sched.attributionWait+250*time.Millisecond {
+				t.Fatalf("S14 round took %s, want it inside the attribution budget %s", elapsed, g.sched.attributionWait)
+			}
+			if got := g.server.forwards[0].body; got != string(daemonBody) {
+				t.Fatalf("forward body = %q, want the daemon's own body", got)
+			}
+			decided := g.events("task.attribution_decided")
+			if len(decided) != 1 || decided[0]["decision"] != tt.decision {
+				t.Fatalf("attribution_decided = %+v, want decision=%s", decided, tt.decision)
+			}
+			if got, _ := decided[0]["error_source"].(string); got != tt.errorSource {
+				t.Fatalf("error_source = %q, want %q", got, tt.errorSource)
+			}
+			settled, _ := g.reg.Get("task-1")
+			if !settled.IsTerminal() || settled.Result != registry.ResultFailed || settled.FailureReason != "" {
+				t.Fatalf("entry = %+v, want the daemon's own failed verdict", settled)
+			}
+		})
+	}
+}
+
+// TestOnReportAttributionGateWritesTheVerdictOnAnExpiredBudget: the wait
+// signal holds and the fact never appears, so the gate spends its share of
+// attributionWait and releases the self-report as degraded. On the
+// deployment's shared lease the caller's terminal write must still land: the
+// gate stopped one reserve short, so the verdict, the queued report and the
+// decision event all follow instead of failing closed on an expired deadline
+// (§10, ADR-031).
+func TestOnReportAttributionGateWritesTheVerdictOnAnExpiredBudget(t *testing.T) {
+	g := newGateFixture(t)
+	e := g.runningTask(t, "task-1", "running")
+	g.sched.attributionWait = 400 * time.Millisecond
+	// A free lease that still refuses an expired caller: the local mutex
+	// shape cannot show this, the deployed shared store is exactly this.
+	g.sched.shared = &idleTaskLockStore{}
+	g.sched.instanceID = "instance-1"
+	g.sched.taskLockTTL = time.Second
+	pod := testPod(e.JobName, corev1.PodRunning)
+	deleted := metav1.Now()
+	pod.DeletionTimestamp = &deleted
+	g.jobs.pods = []corev1.Pod{pod}
+
+	daemonBody := []byte(`{"error":"agent crashed","failure_reason":"agent_error"}`)
+	start := time.Now()
+	code, _, err := g.sched.OnReport(context.Background(), EPFail, e, daemonBody, "")
+	elapsed := time.Since(start)
+	if err != nil || code != 200 {
+		t.Fatalf("OnReport = %d, %v (a spent gate budget must not fail the write closed)", code, err)
+	}
+	if elapsed > g.sched.attributionWait+250*time.Millisecond {
+		t.Fatalf("S14 round took %s, want it inside the attribution budget %s", elapsed, g.sched.attributionWait)
+	}
+	if got := g.server.forwards[0].body; got != string(daemonBody) {
+		t.Fatalf("forward body = %q, want the daemon's own body", got)
+	}
+	queued := g.pending.reports
+	if len(queued) != 1 || queued[0].ep != EPFail || queued[0].body != string(daemonBody) {
+		t.Fatalf("pending reports = %+v, want the daemon's body queued for replay", queued)
+	}
+	settled, _ := g.reg.Get("task-1")
+	if !settled.IsTerminal() || settled.Result != registry.ResultFailed || settled.FailureReason != "" {
+		t.Fatalf("entry = %+v, want the daemon's own failed verdict", settled)
+	}
+	decided := g.events("task.attribution_decided")
+	if len(decided) != 1 || decided[0]["decision"] != DecisionDegraded {
+		t.Fatalf("attribution_decided = %+v, want decision=degraded", decided)
+	}
+	if source, present := decided[0]["fact_source"]; present && source != "" {
+		t.Fatalf("attribution_decided fact_source = %v, want none on the degraded branch", source)
+	}
+}
+
+// TestTaskStatusWithinMakesNoCallOnASpentBudget pins C13's precheck: once the
+// gate path's deadline has passed, the re-check makes no control-plane call
+// at all (§10, ADR-031).
+func TestTaskStatusWithinMakesNoCallOnASpentBudget(t *testing.T) {
+	g := newGateFixture(t)
+	called := false
+	g.server.onStatus = func() { called = true }
+	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
+	defer cancel()
+	if _, err := g.sched.taskStatusWithin(ctx, "task-1"); err == nil || !strings.Contains(err.Error(), "attribution budget exhausted") {
+		t.Fatalf("taskStatusWithin err = %v, want the budget-exhausted refusal", err)
+	}
+	if called {
+		t.Fatal("C13 must not be called once the budget is spent")
+	}
+}
+
+// heldTaskLockStore models a task lease another instance holds: an
+// acquisition is refused until the hold runs out, and the caller's own
+// context ends the wait when it comes first. The embedded interface covers
+// the faces this scenario never reaches.
+type heldTaskLockStore struct {
+	state.CoordStore
+	until time.Time
+}
+
+func (s *heldTaskLockStore) LockTask(ctx context.Context, _, _, _ string, _ time.Duration) (bool, error) {
+	for {
+		if !time.Now().Before(s.until) {
+			return true, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+}
+
+func (s *heldTaskLockStore) UnlockTask(context.Context, string, string, string) error { return nil }
+
+func (s *heldTaskLockStore) Slots(context.Context, string) (int64, error) { return 0, nil }
+
+// idleTaskLockStore is an available shared store in the deployment's shape:
+// the lease is free, so any acquisition succeeds — but only while the
+// caller's context still stands. An expired deadline is refused exactly as
+// the real store refuses it, which is what the local mutex shape cannot show.
+type idleTaskLockStore struct {
+	state.CoordStore
+}
+
+func (s *idleTaskLockStore) LockTask(ctx context.Context, _, _, _ string, _ time.Duration) (bool, error) {
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func (s *idleTaskLockStore) UnlockTask(context.Context, string, string, string) error { return nil }
+
+func (s *idleTaskLockStore) Slots(context.Context, string) (int64, error) { return 0, nil }
+
+// TestOnReportAttributionGateCutsTheLockWaitAtTheBudget: another instance
+// holds the task lease past the gate's budget. The gate path — lock wait
+// included — is bounded by that budget, so the gate gives up on the lock and
+// takes the decided-elsewhere exit: it neither waits the lease out nor
+// settles the instance on a snapshot it does not own (§10, ADR-031). The
+// caller writes nothing on that exit, so it must not take the lease again
+// either — the round ends at the gate's budget, not at the lease's end.
+func TestOnReportAttributionGateCutsTheLockWaitAtTheBudget(t *testing.T) {
+	g := newGateFixture(t)
+	e := g.runningTask(t, "task-1", "running")
+	g.sched.attributionWait = 150 * time.Millisecond
+	// The platform fact holds: a gate that reaches the lock inside the budget
+	// would settle the instance with the platform verdict.
+	g.jobs.existingJobs[e.JobName] = deadlineJob(e.JobName, e.JobCreatedAt)
+	g.server.status = "running"
+	// The lease outlives the gate's budget; the caller must not wait it out
+	// for a write it does not perform.
+	g.sched.shared = &heldTaskLockStore{until: time.Now().Add(600 * time.Millisecond)}
+	g.sched.instanceID = "instance-1"
+	g.sched.taskLockTTL = time.Second
+
+	daemonBody := []byte(`{"error":"agent crashed","failure_reason":"agent_error"}`)
+	start := time.Now()
+	code, _, err := g.sched.OnReport(context.Background(), EPFail, e, daemonBody, "")
+	elapsed := time.Since(start)
+	if err != nil || code != 200 {
+		t.Fatalf("OnReport = %d, %v", code, err)
+	}
+	if elapsed > g.sched.attributionWait+250*time.Millisecond {
+		t.Fatalf("S14 round took %s, want the gate budget %s to bound it, not the lease", elapsed, g.sched.attributionWait)
+	}
+	if decided := g.events("task.attribution_decided"); len(decided) != 0 {
+		t.Fatalf("attribution_decided = %+v, want none: the gate never held the lock", decided)
+	}
+	if got := g.server.forwards[0].body; got != string(daemonBody) {
+		t.Fatalf("forward body = %q, want the daemon's own body", got)
+	}
+	if settled, ok := g.reg.Get("task-1"); !ok || settled.IsTerminal() {
+		t.Fatalf("entry = %+v, want a non-terminal entry: the gate must not decide without the lock", settled)
 	}
 }
 
