@@ -54,6 +54,32 @@ func IsCredentialConfigError(err error) bool {
 	return errors.As(err, &status) && (status.Code == http.StatusUnauthorized || status.Code == http.StatusForbidden)
 }
 
+// DiscoveryAnswerError reports a C-17 answer Foreman cannot use: an entry
+// carries a workspace id but no display name. C-17 is the display-name
+// authority for the policy's partition keys (§8.5), and "" must not enter the
+// cache as a name — it reads as "the authority has not answered yet", which
+// would let a genuinely absent key boot with a warning instead of refusing
+// startup. The defect is deterministic, so it refuses startup rather than
+// retrying like a transient upstream failure (§1.1, AC-96).
+type DiscoveryAnswerError struct {
+	// WorkspaceID names the answer entry that carried no display name.
+	WorkspaceID string
+}
+
+func (e *DiscoveryAnswerError) Error() string {
+	return fmt.Sprintf("C-17 answer has no display name for workspace %s", e.WorkspaceID)
+}
+
+// IsStartupFatal reports the self-check outcomes that refuse startup: a
+// credential bound elsewhere or rejected outright, and a C-17 answer that
+// cannot serve as the discovery and display-name authority. Transient
+// upstream failures are never in this class — the loops converge instead
+// (§1.1, AC-86).
+func IsStartupFatal(err error) bool {
+	var answer *DiscoveryAnswerError
+	return errors.As(err, &answer) || IsCredentialConfigError(err)
+}
+
 // ErrTerminalUndelivered reports a terminal forward (C9–C11) whose retry
 // budget (4s/8s/16s/32s/64s) is exhausted; the caller must enqueue the
 // report to PendingReports (§10: terminal callbacks are never dropped).

@@ -345,3 +345,68 @@ func TestIsolateWorkspaceLoopSharedCredential(t *testing.T) {
 		}
 	}
 }
+
+// TestC17AnswerWithoutDisplayNameAbortsStartup pins the C-17 completeness rule
+// at the startup seam: a 200 answer carrying a workspace without a display
+// name is a malformed answer, not a transient failure — the process refuses to
+// start (both credential forms) instead of booting with the name authority
+// unseeded and every absent partition key degraded to a warning.
+func TestC17AnswerWithoutDisplayNameAbortsStartup(t *testing.T) {
+	t.Run("workspace-scoped self-check aborts and names the workspace", func(t *testing.T) {
+		stub := newStartupStub(t)
+		stub.setC17(http.StatusOK, `[{"id":"ws-a","name":""}]`)
+		var logs bytes.Buffer
+		log := slog.New(slog.NewJSONHandler(&logs, nil))
+
+		err := runStartupSelfCheck(t.Context(), workspace.ScopeWorkspace,
+			[]*proxy.Client{startupClient(stub.server.URL, "ws-a")}, log)
+		if err == nil {
+			t.Fatal("a C-17 answer without a display name must refuse startup")
+		}
+		var answer *proxy.DiscoveryAnswerError
+		if !errors.As(err, &answer) || answer.WorkspaceID != "ws-a" {
+			t.Fatalf("error = %v, want a DiscoveryAnswerError naming ws-a", err)
+		}
+		if !proxy.IsStartupFatal(err) {
+			t.Error("the malformed answer must classify as startup-fatal")
+		}
+		aborted := events(t, &logs, "foreman.startup_aborted")
+		if len(aborted) != 1 {
+			t.Fatalf("startup_aborted lines = %d, want 1", len(aborted))
+		}
+		if aborted[0]["stage"] != "workspace_discovery" {
+			t.Errorf("startup_aborted stage = %v, want workspace_discovery", aborted[0]["stage"])
+		}
+		if summary, _ := aborted[0]["err"].(string); !strings.Contains(summary, "ws-a") {
+			t.Errorf("startup_aborted err = %q, want it to name ws-a", summary)
+		}
+		if got := events(t, &logs, "workspace.credential_check_failed"); len(got) != 0 {
+			t.Errorf("credential_check_failed lines = %d, want none (not transient)", len(got))
+		}
+	})
+
+	t.Run("user-scoped discovery aborts", func(t *testing.T) {
+		stub := newStartupStub(t)
+		stub.setC17(http.StatusOK, `[{"id":"ws-a","name":"A"},{"id":"ws-b","name":""}]`)
+		var logs bytes.Buffer
+		log := slog.New(slog.NewJSONHandler(&logs, nil))
+		deployment := workspace.Deployment{Scope: workspace.ScopeUser, UserToken: "mul_user", BaseDaemonID: "foreman"}
+
+		_, _, err := discoverUserScope(t.Context(), deployment,
+			proxy.Config{ServerURL: stub.server.URL, Version: "0.1.0"}, nil, log)
+		if err == nil {
+			t.Fatal("a user-scoped discovery answer without a display name must refuse startup")
+		}
+		var answer *proxy.DiscoveryAnswerError
+		if !errors.As(err, &answer) || answer.WorkspaceID != "ws-b" {
+			t.Fatalf("error = %v, want a DiscoveryAnswerError naming ws-b", err)
+		}
+		failed := events(t, &logs, "workspace.discovery_failed")
+		if len(failed) != 1 {
+			t.Fatalf("workspace.discovery_failed lines = %d, want 1", len(failed))
+		}
+		if failed[0]["credential_scope"] != "user" {
+			t.Errorf("credential_scope = %v, want user", failed[0]["credential_scope"])
+		}
+	})
+}

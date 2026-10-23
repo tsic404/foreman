@@ -66,6 +66,12 @@ func (c *Client) ListWorkspaces(ctx context.Context) ([]workspace.Ref, error) {
 				"reason", "empty workspace id", "name", w.Name)
 			continue
 		}
+		if strings.TrimSpace(w.Name) == "" {
+			// The answer is the display-name authority for partition keys;
+			// caching "" would read as "not answered yet" and turn a truly
+			// absent name key into a warn-and-boot unseeded one (§8.5).
+			return nil, fmt.Errorf("list workspaces: %w", &DiscoveryAnswerError{WorkspaceID: id})
+		}
 		out = append(out, workspace.Ref{ID: id, Name: w.Name})
 	}
 	return out, nil
