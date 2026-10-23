@@ -196,8 +196,11 @@ func TestMulti08SettledRecordSurvivesRestart(t *testing.T) {
 	}
 	// §4.3: the retention window holds the terminal projection only. The
 	// projection comparison below cannot see these faces (json:"-"), so
-	// assert them on the record itself.
+	// assert them on the record itself. The stripped faces are the negative
+	// half: the projection that remains must still carry the verdict.
 	multi08AssertProjectionOnly(t, "before restart", beforeSettled)
+	multi08AssertProjectionContent(t, "before restart", beforeSettled,
+		registry.StateTerminal, registry.ResultCompleted)
 
 	// Reclaim the credential on the first process (revoke → delete Secret →
 	// drop the entry): the live row is gone, the settled record stays in the
@@ -222,6 +225,25 @@ func TestMulti08SettledRecordSurvivesRestart(t *testing.T) {
 		t.Fatal("the retention window holds no settled row after the reclaim")
 	}
 	multi08AssertProjectionOnly(t, "shared settled row", row)
+	multi08AssertProjectionContent(t, "shared settled row", row,
+		registry.StateTerminal, registry.ResultCompleted)
+
+	// The post-reclaim answer face is that record (the live row is gone, so
+	// the endpoint falls through to the retention window): it must serve the
+	// verdict, not an empty row.
+	code, raw := httpGet(t, ops.URL+"/foreman/tasks/task-1")
+	if code != http.StatusOK {
+		t.Errorf("post-reclaim GET /foreman/tasks/task-1 = %d (%s), want 200", code, raw)
+	} else {
+		var projected map[string]any
+		if err := json.Unmarshal(raw, &projected); err != nil {
+			t.Fatalf("decode retained projection: %v (%s)", err, raw)
+		}
+		if projected["state"] != string(registry.StateTerminal) || projected["result"] != string(registry.ResultCompleted) {
+			t.Errorf("retained projection state/result = %v/%v, want terminal/completed",
+				projected["state"], projected["result"])
+		}
+	}
 
 	// Restart: the settled record must restore the post-reclaim answer, and
 	// its projection must match field by field (AC-73's 终态记录逐字段一致).
@@ -234,6 +256,8 @@ func TestMulti08SettledRecordSurvivesRestart(t *testing.T) {
 		t.Fatal("settled record lost across restart")
 	}
 	multi08AssertProjectionOnly(t, "after restart", settled)
+	multi08AssertProjectionContent(t, "after restart", settled,
+		registry.StateTerminal, registry.ResultCompleted)
 	wantJSON := multi08ProjectionJSON(t, beforeSettled)
 	gotJSON := multi08ProjectionJSON(t, settled)
 	for key, want := range wantJSON {
@@ -297,6 +321,8 @@ func TestMulti08SettledRecordStripsDecidedBody(t *testing.T) {
 		t.Fatal("the first process writes no settled record")
 	}
 	multi08AssertProjectionOnly(t, "before restart", beforeSettled)
+	multi08AssertProjectionContent(t, "before restart", beforeSettled,
+		registry.StateTerminal, registry.ResultCompleted)
 
 	// Reclaim the credential: the live row goes, the settled record stays.
 	if err := h.sched.OnJobTerminated(t.Context(), live.JobName,
@@ -315,6 +341,8 @@ func TestMulti08SettledRecordStripsDecidedBody(t *testing.T) {
 		t.Fatal("the retention window holds no settled row after the reclaim")
 	}
 	multi08AssertProjectionOnly(t, "shared settled row", row)
+	multi08AssertProjectionContent(t, "shared settled row", row,
+		registry.StateTerminal, registry.ResultCompleted)
 
 	h2 := newHarnessWithSharedState(t, false, store)
 	if err := h2.sched.Rebuild(t.Context()); err != nil {
@@ -325,6 +353,8 @@ func TestMulti08SettledRecordStripsDecidedBody(t *testing.T) {
 		t.Fatal("settled record lost across restart")
 	}
 	multi08AssertProjectionOnly(t, "after restart", settled)
+	multi08AssertProjectionContent(t, "after restart", settled,
+		registry.StateTerminal, registry.ResultCompleted)
 }
 
 // TestMulti08RevocationSurvivesRestart covers the revocation half of AC-73:
@@ -507,6 +537,21 @@ func multi08AssertProjectionOnly(t *testing.T, label string, e registry.TaskEntr
 	}
 	if e.DecidedReport != nil {
 		t.Errorf("%s: settled record retains a decided terminal body (%d bytes)", label, len(e.DecidedReport))
+	}
+}
+
+// multi08AssertProjectionContent asserts the retained record still carries the
+// projection the strip leaves in place: the terminal state and the verdict's
+// result. Without it a record stripped of its own content passes every absence
+// check, and the retention window answers a blank row.
+func multi08AssertProjectionContent(t *testing.T, label string, e registry.TaskEntry,
+	wantState registry.State, wantResult registry.Result) {
+	t.Helper()
+	if e.State != wantState {
+		t.Errorf("%s: retained state = %q, want %q", label, e.State, wantState)
+	}
+	if e.Result != wantResult {
+		t.Errorf("%s: retained result = %q, want %q", label, e.Result, wantResult)
 	}
 }
 
