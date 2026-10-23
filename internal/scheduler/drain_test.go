@@ -60,30 +60,39 @@ func TestOnClaimTakesJobCreatedAtFromTheApiserver(t *testing.T) {
 // The ownership + instance filter is the single evidence surface: a pod from
 // a reused name's predecessor (created before this Job instance) must not
 // count, or the termination verdict of the new Job would be decided by the
-// old one's pod (ADR-017).
+// old one's pod. The boundary is inclusive — a pod created at exactly
+// job_created_at is the current instance's (ADR-017).
 func TestJobPodsFiltersPredecessorInstances(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "task-1")
 	since := e.JobCreatedAt
 
-	stale := testPod("fm-task-1", corev1.PodRunning)
-	stale.Name = "fm-task-1-stale"
-	stale.CreationTimestamp = metav1.Time{Time: since.Add(-time.Minute)}
+	predecessor := testPod("fm-task-1", corev1.PodRunning)
+	predecessor.Name = "fm-task-1-predecessor"
+	predecessor.CreationTimestamp = metav1.Time{Time: since.Add(-time.Second)}
+	boundary := testPod("fm-task-1", corev1.PodRunning)
+	boundary.Name = "fm-task-1-boundary"
+	boundary.CreationTimestamp = metav1.Time{Time: since}
 	fresh := testPod("fm-task-1", corev1.PodSucceeded)
-	f.jobs.pods = []corev1.Pod{stale, fresh}
+	fresh.Name = "fm-task-1-fresh"
+	fresh.CreationTimestamp = metav1.Time{Time: since.Add(time.Second)}
+	f.jobs.pods = []corev1.Pod{predecessor, boundary, fresh}
 
 	pods, err := f.sched.jobPods(context.Background(), "fm-task-1", since)
 	if err != nil {
 		t.Fatalf("jobPods: %v", err)
 	}
-	if len(pods) != 1 || pods[0].Name != fresh.Name {
-		t.Fatalf("jobPods = %+v, want only the current instance's pod", pods)
+	if len(pods) != 2 || pods[0].Name != boundary.Name || pods[1].Name != fresh.Name {
+		t.Fatalf("jobPods = %+v, want the boundary and fresh pods", pods)
 	}
-	// The stale pod is Running; without the filter it would keep the Job
-	// alive forever.
+	// The boundary pod is alive: dropping it would hide a running daemon from
+	// the verdict. The predecessor is alive too but is not this instance's pod.
 	ev, err := f.sched.JobTerminationEvidence(context.Background(), "fm-task-1", since)
-	if err != nil || !ev.IsTerminated || ev.AlivePods != 0 {
-		t.Fatalf("JobTerminationEvidence = %+v, %v; want a terminated current instance", ev, err)
+	if err != nil {
+		t.Fatalf("JobTerminationEvidence: %v", err)
+	}
+	if ev.IsTerminated || ev.AlivePods != 1 {
+		t.Fatalf("JobTerminationEvidence = %+v, want one alive pod (the boundary one)", ev)
 	}
 }
 
