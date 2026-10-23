@@ -1251,6 +1251,14 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			result := registry.Result(ep.TerminalResult())
 			_, first, err := s.reg.MarkTerminal(e.TaskID, result, "", now)
 			if err != nil {
+				// The verdict this entry was written ahead of never landed,
+				// so the entry must not outlive it: a replay would make a
+				// report this instance never decided the terminal source
+				// (§4.3). Withdraw this snapshot — carrier included, and only
+				// while the queue still holds it: a concurrent enqueue of the
+				// same task owns its own entry and its own carrier. The
+				// caller's retry then walks the whole order again.
+				s.pendingReports.DropIfUnchanged(ctx, e.TaskID, ep, body)
 				unlockTerminal()
 				return 0, nil, err
 			}
@@ -1729,6 +1737,12 @@ func (s *Scheduler) settleFailure(ctx context.Context, e registry.TaskEntry, rep
 	s.enqueuePending(ctx, e, EPFail, report.reason, body)
 	settled, first, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, report.reason, s.now())
 	if err != nil {
+		// Same order as an inbound report: the entry preceded the verdict,
+		// so a verdict that failed takes this snapshot with it (§4.6) — and
+		// only this snapshot: another path's newer entry for the same task
+		// keeps its queue home. The convergence round re-derives this
+		// failure from the entry's facts.
+		s.pendingReports.DropIfUnchanged(ctx, e.TaskID, EPFail, body)
 		return e, body, err
 	}
 	if first {
@@ -2663,9 +2677,11 @@ func (s *Scheduler) resolveRuntimeIdentity(runtimeID string) string {
 }
 
 // failClaim settles a task whose Job could not be created
-// (pending → terminal, result=failed) and tells the server. The verdict's
-// write-ahead report stays queued when the forward does not land, and the
-// terminal entry stays until a round drains it (§10).
+// (pending → terminal, result=failed) and tells the server. A verdict write
+// that fails takes its write-ahead report with it and returns: there is no
+// decision to announce, and the next claim round re-derives the failure. A
+// verdict that lands keeps its report queued when the forward does not land,
+// and the terminal entry stays until a round drains it (§10).
 func (s *Scheduler) failClaim(ctx context.Context, e registry.TaskEntry, cause error) {
 	defer s.SyncInflight()
 	// An invalid task ID is not a create failure: the Job must not be
@@ -2676,10 +2692,15 @@ func (s *Scheduler) failClaim(ctx context.Context, e registry.TaskEntry, cause e
 	}
 	_, body, err := s.settleFailure(ctx, e, failReport{reason: reason, message: cause.Error()})
 	if err != nil {
+		// No verdict, no report: settleFailure has withdrawn the queued
+		// entry, and a forward here would announce a failure this instance
+		// never decided — the divergence the write-ahead order exists to
+		// prevent (§10).
 		s.log.ErrorContext(ctx, "mark terminal failed", "task_id", e.TaskID, "err", err)
+		return
 	}
-	// A report whose forward does not land goes to the durable queue
-	// (场景 #10); the entry stays terminal until a round drains it.
+	// The verdict landed: a forward that does not land stays in the durable
+	// queue (场景 #10), and the terminal entry waits for a round to drain it.
 	_ = s.reportFail(ctx, e, body)
 }
 

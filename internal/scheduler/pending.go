@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"hash/fnv"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -104,6 +105,14 @@ type PendingReports struct {
 	mu       sync.Mutex
 	onChange func(int) // foreman_pending_reports gauge hook
 
+	// carrierLocks serialize one task's carrier writes against its deletes:
+	// the carrier is create-once, so a create that lands inside a delete's
+	// window is answered as a landed write and then removed by that delete —
+	// the entry it belonged to keeps its mark with no object behind it, and
+	// the sweep cannot repair it (§6.5). Striped because only the same task's
+	// operations contend and the queue's working scale is bounded (§4.6).
+	carrierLocks [carrierLockStripes]sync.Mutex
+
 	// maxEntries is the retention bound on held entries (§4.6, ADR-046
 	// decision 6); Enqueue refuses a new entry once the queue holds this many.
 	maxEntries int
@@ -132,6 +141,19 @@ type PendingReports struct {
 	// and no settlement may read it as empty (§4.3). Without a carrier store
 	// the disk is the whole persistence face, so there is nothing to rebuild.
 	restored bool
+}
+
+// carrierLockStripes bounds PendingReports.carrierLocks. Carrier operations
+// for different tasks never contend, so a fixed table is enough and cannot
+// grow with the task history.
+const carrierLockStripes = 64
+
+// carrierLock returns the lock that serializes taskID's carrier writes and
+// deletes.
+func (p *PendingReports) carrierLock(taskID string) *sync.Mutex {
+	h := fnv.New32a()
+	_, _ = h.Write([]byte(taskID)) // hash writes never fail
+	return &p.carrierLocks[h.Sum32()%carrierLockStripes]
 }
 
 // PendingReportsOption customizes a PendingReports queue.
@@ -335,7 +357,29 @@ func (p *PendingReports) persistCarrier(ctx context.Context, rep pendingReport) 
 	if carrier.sizeBytes() > MaxCarrierBytes {
 		err = fmt.Errorf("%w: %d bytes > %d", ErrCarrierPayloadTooLarge, carrier.sizeBytes(), MaxCarrierBytes)
 	} else {
+		// The create and the post-write check are one step against a delete
+		// for the same task: a delete that ran between them would remove this
+		// write while the entry is still queued, and the create-once store
+		// would answer the next write as already landed.
+		lock := p.carrierLock(rep.TaskID)
+		lock.Lock()
 		err = p.carriers.PutCarrier(ctx, carrier)
+		if err == nil {
+			p.mu.Lock()
+			stillQueued := p.entryPresentLocked(rep.TaskID)
+			if stillQueued {
+				p.carrierBacked[rep.TaskID] = true
+				p.notifyLocked()
+			}
+			p.mu.Unlock()
+			if !stillQueued {
+				// The entry left while the write was in flight: the carrier
+				// must not outlive it. The caller locks the same stripe, so
+				// no concurrent create can land in between.
+				p.deleteCarrier(ctx, rep.TaskID)
+			}
+		}
+		lock.Unlock()
 	}
 	if errors.Is(err, ErrCarrierPayloadTooLarge) {
 		// Registered boundary: the report is kept in process memory and the
@@ -355,18 +399,6 @@ func (p *PendingReports) persistCarrier(ctx context.Context, rep pendingReport) 
 			"reason", "pending-report carrier write failed", "err", err)
 		return err
 	}
-
-	p.mu.Lock()
-	if !p.entryPresentLocked(rep.TaskID) {
-		// The direct forward settled the report while the carrier write was
-		// in flight: the carrier must not outlive the queue entry.
-		p.mu.Unlock()
-		p.deleteCarrier(ctx, rep.TaskID)
-		return nil
-	}
-	p.carrierBacked[rep.TaskID] = true
-	p.notifyLocked()
-	p.mu.Unlock()
 	return nil
 }
 
@@ -418,7 +450,7 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 		_ = p.persistCarrier(ctx, rep)
 	}
 	for _, taskID := range expired {
-		p.deleteCarrier(ctx, taskID)
+		p.deleteCarrierUnlessQueued(ctx, taskID)
 	}
 
 	p.mu.Lock()
@@ -436,7 +468,7 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 			deleteCarrier := p.dropSettledLocked(rep)
 			p.mu.Unlock()
 			if deleteCarrier {
-				p.deleteCarrier(ctx, rep.TaskID)
+				p.deleteCarrierUnlessQueued(ctx, rep.TaskID)
 			}
 			continue
 		}
@@ -459,7 +491,7 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 		}
 		p.mu.Unlock()
 		if deleteCarrier {
-			p.deleteCarrier(ctx, rep.TaskID)
+			p.deleteCarrierUnlessQueued(ctx, rep.TaskID)
 		}
 		if err != nil && firstErr == nil {
 			firstErr = err
@@ -590,18 +622,45 @@ func (p *PendingReports) bumpAttemptsLocked(taskID string) {
 // have replaced the body while the forward was in flight; the newer record then
 // stays queued for the next drain instead of being deleted by task id.
 func (p *PendingReports) dropIfUnchangedLocked(sent pendingReport) {
-	same := func(rep pendingReport) bool {
-		return rep.Endpoint == sent.Endpoint && bytes.Equal(rep.Body, sent.Body)
-	}
 	if validTaskID(sent.TaskID) {
-		if cur, ok := p.readLocked(sent.TaskID); ok && !same(cur) {
+		if cur, ok := p.readLocked(sent.TaskID); ok && !samePendingReport(cur, sent) {
 			return
 		}
 		p.removeLocked(sent.TaskID)
 	}
-	if cur, ok := p.staged[sent.TaskID]; ok && same(cur) {
+	if cur, ok := p.staged[sent.TaskID]; ok && samePendingReport(cur, sent) {
 		delete(p.staged, sent.TaskID)
 	}
+}
+
+// samePendingReport reports whether a queue record still holds the snapshot
+// sent. The endpoint and the body are one enqueue's identity; the task id is
+// not, because a concurrent enqueue for the same task replaces both.
+func samePendingReport(sent, cur pendingReport) bool {
+	return cur.Endpoint == sent.Endpoint && sameReportBody(cur.Body, sent.Body)
+}
+
+// sameReportBody compares two bodies as the queue encodes them. The disk face
+// stores a pendingReport through json.Marshal, which compacts the body and
+// escapes <, > and &, so a caller's raw bytes only match the encoded record by
+// luck: a body carrying whitespace or those characters would never compare
+// equal and a rollback would silently keep the entry. The fast path is the
+// queue's own copy against itself; the encoding runs only when the bytes
+// differ. A body that does not encode has no canonical form, and the two then
+// match only verbatim — never dropped on a guess (§10).
+func sameReportBody(a, b []byte) bool {
+	if bytes.Equal(a, b) {
+		return true
+	}
+	encodedA, err := json.Marshal(json.RawMessage(a))
+	if err != nil {
+		return false
+	}
+	encodedB, err := json.Marshal(json.RawMessage(b))
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(encodedA, encodedB)
 }
 
 // dropSettledLocked removes the snapshot a drain just settled and reports
@@ -845,12 +904,45 @@ func (p *PendingReports) Drop(ctx context.Context, taskID string) {
 	if wasBacked {
 		// The sweep is the retry handle: a settled carrier whose delete
 		// failed is removed on the next round (§6.5).
-		p.deleteCarrier(ctx, taskID)
+		p.deleteCarrierUnlessQueued(ctx, taskID)
+	}
+}
+
+// DropIfUnchanged forgets the report a caller wrote ahead of a verdict that
+// then failed to land, and only while the queue still holds that same
+// snapshot. A concurrent enqueue for the same task — the attribution gate's
+// compensation, a late report — has replaced the endpoint and body, and that
+// newer entry keeps its queue home and its carrier (§10): dropping it by task
+// id would leave its own forward without a write-ahead entry.
+func (p *PendingReports) DropIfUnchanged(ctx context.Context, taskID string, ep Endpoint, body []byte) {
+	sent := pendingReport{TaskID: taskID, Endpoint: string(ep), Body: body}
+	p.mu.Lock()
+	// The faces are compared one by one: a newer body on the disk never hides
+	// this snapshot in staging, and the staged copy is only the latest write
+	// that did not land.
+	if validTaskID(taskID) {
+		if cur, ok := p.readLocked(taskID); ok && samePendingReport(sent, cur) {
+			p.removeLocked(taskID)
+		}
+	}
+	if cur, ok := p.staged[taskID]; ok && samePendingReport(sent, cur) {
+		delete(p.staged, taskID)
+	}
+	wasBacked := false
+	if !p.entryPresentLocked(taskID) {
+		wasBacked = p.carrierBacked[taskID]
+		delete(p.carrierBacked, taskID)
+	}
+	p.notifyLocked()
+	p.mu.Unlock()
+	if wasBacked {
+		p.deleteCarrierUnlessQueued(ctx, taskID)
 	}
 }
 
 // deleteCarrier removes one carrier; a failure is the sweep's retry handle
-// (§6.5), never a reason to resurrect the queue entry.
+// (§6.5), never a reason to resurrect the queue entry. The caller holds the
+// task's carrier lock, so no write for the same task can interleave.
 func (p *PendingReports) deleteCarrier(ctx context.Context, taskID string) {
 	if p.carriers == nil {
 		return
@@ -858,6 +950,31 @@ func (p *PendingReports) deleteCarrier(ctx context.Context, taskID string) {
 	if err := p.carriers.DeleteCarrier(ctx, taskID); err != nil {
 		p.log.Error("pending carrier delete failed", "task_id", taskID, "err", err)
 	}
+}
+
+// deleteCarrierUnlessQueued removes taskID's carrier while no queue entry
+// holds the task. Enqueue writes its entry under mu before it writes the
+// carrier, so checking entry presence under the task's carrier lock orders the
+// two: either this delete runs first and the enqueue's create lands a fresh
+// object, or the entry is already visible and the carrier stays with it. An
+// unconditional delete here would remove a create that the store answered as
+// already-landed, leaving that entry's mark true with no object behind it —
+// and §6.5 cannot repair it, because the entry is still queued.
+func (p *PendingReports) deleteCarrierUnlessQueued(ctx context.Context, taskID string) {
+	if p.carriers == nil {
+		return
+	}
+	lock := p.carrierLock(taskID)
+	lock.Lock()
+	defer lock.Unlock()
+	p.mu.Lock()
+	if p.entryPresentLocked(taskID) {
+		p.mu.Unlock()
+		return
+	}
+	delete(p.carrierBacked, taskID)
+	p.mu.Unlock()
+	p.deleteCarrier(ctx, taskID)
 }
 
 // Restore rebuilds the queue from its carriers (§4.3). It is the same

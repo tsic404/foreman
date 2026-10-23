@@ -26,6 +26,11 @@ type memCarrierStore struct {
 	listErr  error
 	delErr   error
 	puts     int
+	// beforePut and beforeDelete run before the call takes the store's lock,
+	// so a test can park one call and observe another arriving while it is
+	// held — the interleaving the queue's carrier lock must forbid.
+	beforePut    func()
+	beforeDelete func()
 }
 
 func newMemCarrierStore() *memCarrierStore {
@@ -33,6 +38,9 @@ func newMemCarrierStore() *memCarrierStore {
 }
 
 func (s *memCarrierStore) PutCarrier(_ context.Context, c Carrier) error {
+	if s.beforePut != nil {
+		s.beforePut()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.puts++
@@ -44,6 +52,9 @@ func (s *memCarrierStore) PutCarrier(_ context.Context, c Carrier) error {
 }
 
 func (s *memCarrierStore) DeleteCarrier(_ context.Context, taskID string) error {
+	if s.beforeDelete != nil {
+		s.beforeDelete()
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.delErr != nil {
