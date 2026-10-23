@@ -1332,6 +1332,8 @@ type jobClient struct {
 	// nameHeld makes CreateJob answer AlreadyExists for a name, as the
 	// apiserver does while a predecessor still holds it.
 	nameHeld map[string]bool
+	// onGetJob runs before a GetJob is answered (scenario clock hooks).
+	onGetJob func()
 
 	existingJobs map[string]*batchv1.Job
 	jobs         []batchv1.Job
@@ -1403,6 +1405,14 @@ func (c *jobClient) setDeleteJobError(err error) {
 	c.deleteJobErr = err
 }
 
+// setOnGetJob programs the GetJob hook (nil clears it). The hook runs under
+// the client lock, so the write takes the same lock as the read.
+func (c *jobClient) setOnGetJob(fn func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onGetJob = fn
+}
+
 // setNameHeld makes CreateJob answer AlreadyExists for name (false clears it),
 // as the apiserver does while a predecessor holds the name.
 func (c *jobClient) setNameHeld(name string, held bool) {
@@ -1417,6 +1427,9 @@ func (c *jobClient) setNameHeld(name string, held bool) {
 func (c *jobClient) GetJob(_ context.Context, name string) (*batchv1.Job, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.onGetJob != nil {
+		c.onGetJob()
+	}
 	c.getJobs = append(c.getJobs, name)
 	job, ok := c.existingJobs[name]
 	if !ok {
