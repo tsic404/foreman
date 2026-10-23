@@ -1,7 +1,8 @@
 // TC-tech-multiws-05 implements AC-85: the in-flight budget has two levels —
 // the global cap and each workspace's own cap. With the per-workspace cap
 // active and below the global cap, one workspace's flood never stops another
-// workspace's claim.
+// workspace's claim, and an over-budget claim waits on the server's queue
+// instead of being dropped or taken in flight.
 package acceptance
 
 import (
@@ -51,6 +52,12 @@ func TestTechMultiWS05TwoLevelBudget(t *testing.T) {
 	if got := m.sched.ClaimBudgetFor("ws-b"); got > m.sched.ClaimBudget() {
 		t.Errorf("workspace budget %d exceeds the global budget %d", got, m.sched.ClaimBudget())
 	}
+
+	// The queue half of the same criterion: an over-budget claim is not lost
+	// and not taken in flight — it waits on the server until a slot frees.
+	t.Run("excess claim waits on the server queue", func(t *testing.T) {
+		multiWSExcessClaimStaysQueued(t, newMultiWS(t, "ws-a", "ws-b", "ws-c"))
+	})
 }
 
 // TestTechMultiWS05TwoLevelBudgetShared judges the same two-level budget on the
@@ -75,4 +82,10 @@ func TestTechMultiWS05TwoLevelBudgetShared(t *testing.T) {
 	if got := m.sched.ClaimBudget(); got != 1 {
 		t.Errorf("global budget = %d, want 1 free of 2", got)
 	}
+
+	// Same queue half on the shared counters: the excess claim must stay on
+	// the server until the shared budget reports a free slot.
+	t.Run("excess claim waits on the server queue", func(t *testing.T) {
+		multiWSExcessClaimStaysQueued(t, newMultiWSShared(t, "ws-a", "ws-b", "ws-c"))
+	})
 }

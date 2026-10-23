@@ -465,6 +465,181 @@ func (m *multiWS) tasksByWorkspace(workspaceID string) []registry.TaskEntry {
 	return out
 }
 
+// multiWSClaimInterval is the per-workspace claim loop cadence the queued-claim
+// sub-case drives: short enough for bounded waits, identical for every
+// workspace so a queued task is never mistaken for a slow loop.
+const multiWSClaimInterval = 10 * time.Millisecond
+
+// multiWSWorkspaceClaimer binds the shared scheduler to one workspace's claim
+// budget and reservation face, exactly as cmd/foreman wires the per-workspace
+// claim loops (§10 两级预算: 每 workspace 一套控制面).
+type multiWSWorkspaceClaimer struct {
+	sched       *scheduler.Scheduler
+	workspaceID string
+}
+
+func (w multiWSWorkspaceClaimer) ClaimBudget() int { return w.sched.ClaimBudgetFor(w.workspaceID) }
+
+func (w multiWSWorkspaceClaimer) ReserveSlots(ctx context.Context, want int) ([]scheduler.SlotReservation, error) {
+	return w.sched.ReserveClaimSlots(ctx, w.workspaceID, want)
+}
+
+func (w multiWSWorkspaceClaimer) ReleaseSlots(ctx context.Context, reserved []scheduler.SlotReservation) {
+	w.sched.ReleaseClaimSlots(ctx, reserved)
+}
+
+func (w multiWSWorkspaceClaimer) OnClaimReserved(ctx context.Context, task json.RawMessage, reserved scheduler.SlotReservation) error {
+	return w.sched.OnClaimReservedFor(ctx, w.workspaceID, task, reserved)
+}
+
+// startClaimLoopFor runs the production claim loop under one workspace's
+// identity until the returned stop function (or the test's cleanup) cancels
+// it. Stopping waits for the loop to finish its current round, so the caller
+// reads a settled fixture rather than a claim in flight.
+func (m *multiWS) startClaimLoopFor(workspaceID string) func() {
+	m.t.Helper()
+	client, ok := m.clients[workspaceID]
+	if !ok {
+		m.t.Fatalf("no proxy client for workspace %q", workspaceID)
+	}
+	loop := proxy.NewClaimLoop(proxy.Config{
+		ClaimInterval:     multiWSClaimInterval,
+		ClaimIntervalIdle: multiWSClaimInterval,
+	}, client, multiWSWorkspaceClaimer{sched: m.sched, workspaceID: workspaceID})
+	ctx, cancel := context.WithCancel(m.t.Context())
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_ = loop.Run(ctx)
+	}()
+	var once sync.Once
+	stop := func() {
+		once.Do(func() {
+			cancel()
+			<-done
+		})
+	}
+	m.t.Cleanup(stop)
+	return stop
+}
+
+// multiWSExcessClaimStaysQueued judges the queue half of TC-tech-multiws-05:
+// with A and B at their own caps the global budget is exhausted, so a third
+// workspace's claim is never issued — its task stays on the server's queue,
+// outside the local registry and outside the in-flight count — and only a later
+// dispatch, after a slot frees, reads that same entry. The steps are identical
+// for the process-local and the shared-state form; m is the three-workspace
+// fixture (ws-a, ws-b, ws-c) of either.
+func multiWSExcessClaimStaysQueued(t *testing.T, m *multiWS) {
+	t.Helper()
+	const (
+		globalCap       = 2
+		perWorkspaceCap = 1
+		queuedTaskID    = "task-ws-c"
+		// queuedClaimWindow spans several claim intervals: long enough that a
+		// loop which would prefetch issues its C3 request.
+		queuedClaimWindow = 20 * multiWSClaimInterval
+	)
+	m.rebuildScheduler(func(cfg *scheduler.Config) {
+		cfg.MaxInflightJobs = globalCap
+		cfg.MaxInflightJobsPerWorkspace = perWorkspaceCap
+	})
+	for _, workspaceID := range []string{"ws-a", "ws-b", "ws-c"} {
+		m.upstream[workspaceID].setRuntimeID("omp", "", "rid-"+workspaceID)
+		m.clients[workspaceID].Declare(registry.Discovery{
+			CLIVersion: "0.6.1",
+			Runtimes:   []registry.DiscoveredRuntime{{Name: "foreman-" + workspaceID, Type: "omp", Version: "0.6.1"}},
+		})
+		m.upstream[workspaceID].enqueueTaskFor("task-"+workspaceID, workspaceID)
+	}
+
+	// A and B fill their own caps through the production claim loop. Each loop
+	// is stopped once its entry is in flight, so only the third workspace's
+	// loop is running when the slot frees.
+	for _, workspaceID := range []string{"ws-a", "ws-b"} {
+		stop := m.startClaimLoopFor(workspaceID)
+		taskID := "task-" + workspaceID
+		awaitCondition(t, workspaceID+"'s task dispatched", func() bool {
+			return m.upstream[workspaceID].taskStatus(taskID) == taskStatusDispatched
+		})
+		awaitCondition(t, workspaceID+"'s claim applied", func() bool {
+			_, ok := m.reg.Get(taskID)
+			return ok && m.jobs.jobCreated("fm-"+taskID)
+		})
+		stop()
+	}
+	if got := m.reg.Inflight(); got != globalCap {
+		t.Fatalf("in-flight entries = %d, want %d", got, globalCap)
+	}
+	if got := m.sched.ClaimBudget(); got != 0 {
+		t.Fatalf("global claim budget = %d with both caps full, want 0", got)
+	}
+	if got := m.sched.ClaimBudgetFor("ws-c"); got != 0 {
+		t.Fatalf("third workspace claim budget = %d, want 0 (the global cap is exhausted)", got)
+	}
+	if m.coord != nil {
+		ctx := t.Context()
+		if used, err := m.coord.Slots(ctx, ""); err != nil || used != globalCap {
+			t.Fatalf("shared global slots = %d (err %v), want %d", used, err, globalCap)
+		}
+		if used, err := m.coord.Slots(ctx, "ws-c"); err != nil || used != 0 {
+			t.Fatalf("shared ws-c slots = %d (err %v), want 0", used, err)
+		}
+	}
+
+	// The third workspace's loop runs but must not prefetch: with no budget it
+	// issues no C3 request, so the server's queue keeps the task.
+	stopC := m.startClaimLoopFor("ws-c")
+	defer stopC()
+	awaitCondition(t, "third workspace claim loop preflighted", func() bool {
+		return len(m.upstream["ws-c"].calls("POST", "/api/daemon/register")) > 0
+	})
+	time.Sleep(queuedClaimWindow)
+	if got := m.upstream["ws-c"].taskStatus(queuedTaskID); got != taskStatusQueued {
+		t.Fatalf("server-side task status = %q, want %q (the excess claim must stay queued)", got, taskStatusQueued)
+	}
+	if got := len(m.upstream["ws-c"].calls("POST", "/api/daemon/tasks/claim")); got != 0 {
+		t.Fatalf("third workspace issued %d claim requests with no budget — Foreman prefetched", got)
+	}
+	if _, ok := m.reg.Get(queuedTaskID); ok {
+		t.Fatalf("entry %s registered while the global budget was exhausted", queuedTaskID)
+	}
+	if m.jobs.jobCreated("fm-" + queuedTaskID) {
+		t.Fatalf("Job fm-%s created while the global budget was exhausted", queuedTaskID)
+	}
+
+	// Freeing A's slot is what lets the queued claim be read: the shared form
+	// lowers its counter on the leader's reconciliation round, the local form
+	// derives it from the registry.
+	if _, _, err := m.reg.MarkTerminal("task-ws-a", registry.ResultCompleted, "", time.Now()); err != nil {
+		t.Fatalf("MarkTerminal(task-ws-a): %v", err)
+	}
+	if err := m.sched.ReconcileSlots(t.Context()); err != nil {
+		t.Fatalf("ReconcileSlots: %v", err)
+	}
+	awaitCondition(t, "the queued task dispatched once a slot frees", func() bool {
+		return m.upstream["ws-c"].taskStatus(queuedTaskID) == taskStatusDispatched
+	})
+	awaitCondition(t, "the dispatch reads the queued entry", func() bool {
+		e, ok := m.reg.Get(queuedTaskID)
+		return ok && e.WorkspaceID == "ws-c"
+	})
+	awaitCondition(t, "the dispatch creates its Job", func() bool {
+		return m.jobs.jobCreated("fm-" + queuedTaskID)
+	})
+	if got := m.sched.ClaimBudgetFor("ws-c"); got != 0 {
+		t.Fatalf("third workspace claim budget after its dispatch = %d, want 0 (at its own cap)", got)
+	}
+	if got := m.reg.Inflight(); got != globalCap {
+		t.Fatalf("in-flight entries after the deferred dispatch = %d, want %d", got, globalCap)
+	}
+	if m.coord != nil {
+		if used, err := m.coord.Slots(t.Context(), ""); err != nil || used != globalCap {
+			t.Fatalf("shared global slots after the deferred dispatch = %d (err %v), want %d", used, err, globalCap)
+		}
+	}
+}
+
 // multiWSTemplate is the fixture template for TC-02/TC-08: workspace
 // placeholders appear in labels, env values (one string repeating the
 // placeholder), a list element, and a volume path, beside a fixed literal that

@@ -905,9 +905,20 @@ func (s *upstreamStub) statusFor(runtimeID string) int {
 // enqueueTask puts one task on the stub server's queue in the queued state.
 // The payload carries the fields the scheduler indexes.
 func (s *upstreamStub) enqueueTask(taskID string) {
+	s.enqueuePayload(taskID, "agent-1", "ws-1", "rid-zz")
+}
+
+// enqueueTaskFor puts one task on a workspace-scoped stub's queue: the payload
+// names the workspace and the runtime that workspace's claim carries, so the
+// scheduler registers the entry under the expected identity.
+func (s *upstreamStub) enqueueTaskFor(taskID, workspaceID string) {
+	s.enqueuePayload(taskID, "agent-"+workspaceID, workspaceID, "rid-"+workspaceID)
+}
+
+func (s *upstreamStub) enqueuePayload(taskID, agentID, workspaceID, runtimeID string) {
 	payload, _ := json.Marshal(map[string]any{
-		"id": taskID, "agent_id": "agent-1", "workspace_id": "ws-1",
-		"runtime_id": "rid-zz", "agent": map[string]any{"model": "k3"},
+		"id": taskID, "agent_id": agentID, "workspace_id": workspaceID,
+		"runtime_id": runtimeID, "agent": map[string]any{"model": "k3"},
 	})
 	s.mu.Lock()
 	defer s.mu.Unlock()
