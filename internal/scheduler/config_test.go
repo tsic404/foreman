@@ -2,6 +2,7 @@ package scheduler
 
 import (
 	"maps"
+	"strings"
 	"testing"
 	"time"
 )
@@ -128,6 +129,46 @@ func TestLoadConfigOverrides(t *testing.T) {
 	}
 }
 
+// TestLoadConfigPerWorkspaceCapDomain pins the per-workspace cap's value
+// domain (AC-101): absent leaves the level off, a positive value at or below
+// the global cap arms it, and one above the global cap is refused with both
+// figures named.
+func TestLoadConfigPerWorkspaceCapDomain(t *testing.T) {
+	cfg, err := LoadConfig(testEnv(nil))
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	if cfg.MaxInflightJobsPerWorkspace != 0 {
+		t.Fatalf("MaxInflightJobsPerWorkspace = %d with the key unset, want 0 (level off)",
+			cfg.MaxInflightJobsPerWorkspace)
+	}
+
+	// The boundary is legal: equal to the global cap stays on.
+	cfg, err = LoadConfig(testEnv(map[string]string{
+		EnvMaxInflightJobs:         "5",
+		EnvMaxInflightPerWorkspace: "5",
+	}))
+	if err != nil {
+		t.Fatalf("a per-workspace cap equal to the global cap was refused: %v", err)
+	}
+	if cfg.MaxInflightJobs != 5 || cfg.MaxInflightJobsPerWorkspace != 5 {
+		t.Fatalf("caps = %d/%d, want 5/5", cfg.MaxInflightJobs, cfg.MaxInflightJobsPerWorkspace)
+	}
+
+	_, err = LoadConfig(testEnv(map[string]string{
+		EnvMaxInflightJobs:         "5",
+		EnvMaxInflightPerWorkspace: "6",
+	}))
+	if err == nil {
+		t.Fatal("a per-workspace cap above the global cap was accepted")
+	}
+	for _, want := range []string{EnvMaxInflightPerWorkspace, "(6)", EnvMaxInflightJobs, "(5)", "must not exceed"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal %q does not name %q", err, want)
+		}
+	}
+}
+
 func TestLoadConfigClampsClaimBatchToServerCeiling(t *testing.T) {
 	cfg, err := LoadConfig(testEnv(map[string]string{EnvClaimBatchMax: "100"}))
 	if err != nil {
@@ -198,6 +239,10 @@ func TestLoadConfigRejectsBadValues(t *testing.T) {
 	for _, env := range []map[string]string{
 		{EnvMaxInflightJobs: "0"},
 		{EnvMaxInflightJobs: "abc"},
+		// The per-workspace cap is a positive integer or absent; zero means
+		// "level off" only as the absent form, never as a written value.
+		{EnvMaxInflightPerWorkspace: "0"},
+		{EnvMaxInflightPerWorkspace: "-1"},
 		{EnvMaxJobsPerNode: "0"},
 		{EnvMaxJobsPerNode: "-1"},
 		{EnvMaxJobsPerNode: "4.5"},
