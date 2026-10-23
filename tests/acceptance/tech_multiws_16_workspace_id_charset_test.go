@@ -133,7 +133,7 @@ func TestTechMultiWS16WorkspaceIDCharset(t *testing.T) {
 					t.Fatalf("NewBuilder: %v", err)
 				}
 				task := taskEntryFor("11111111-1111-4111-8111-111111111111", validated[0], "")
-				job, _, _, err := builder.Build(task)
+				job, secret, _, err := builder.Build(task)
 				if err != nil {
 					t.Fatalf("Build: %v", err)
 				}
@@ -142,6 +142,9 @@ func TestTechMultiWS16WorkspaceIDCharset(t *testing.T) {
 				}
 				if got := job.Spec.Template.Labels[registry.LabelWorkspaceID]; got != id {
 					t.Errorf("pod workspace label = %q, want %q verbatim", got, id)
+				}
+				if got := secret.Labels[registry.LabelWorkspaceID]; got != id {
+					t.Errorf("credential Secret workspace label = %q, want %q verbatim", got, id)
 				}
 				var home string
 				for _, volume := range job.Spec.Template.Spec.Volumes {
