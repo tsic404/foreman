@@ -151,6 +151,11 @@ type PendingReportQueue interface {
 	HasQueuedEntry(taskID string) bool
 	// Drop forgets taskID's report after its direct forward settled it.
 	Drop(ctx context.Context, taskID string)
+	// SweepCarrier deletes one listed carrier object when no queue entry
+	// holds its task. The check and the delete are one step under that
+	// task's carrier lock, so an enqueue landing in between keeps its object
+	// (§6.5).
+	SweepCarrier(ctx context.Context, taskID, name string) (bool, error)
 	// Drain re-delivers every queued report once through sender and returns
 	// how many are still undelivered.
 	Drain(ctx context.Context, sender ReportSender) (int, error)

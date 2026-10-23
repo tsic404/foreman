@@ -98,11 +98,13 @@ type Carrier struct {
 
 // CarrierStore is the K8s Secret face the pending-report queue persists
 // through. PutCarrier is create-only for a given task: one queued report per
-// task, so a re-enqueue lands on the object already there. DeleteCarrier is
+// task, so an existing object answers AlreadyExists as landed, and a
+// re-enqueue lands on the object already there. DeleteCarrier takes the
+// object name, so the sweep removes the exact object it listed, and is
 // idempotent.
 type CarrierStore interface {
 	PutCarrier(ctx context.Context, c Carrier) error
-	DeleteCarrier(ctx context.Context, taskID string) error
+	DeleteCarrier(ctx context.Context, name string) error
 	ListCarriers(ctx context.Context) ([]Carrier, error)
 }
 
@@ -187,9 +189,9 @@ func (s *secretCarrierStore) PutCarrier(ctx context.Context, c Carrier) error {
 	return nil
 }
 
-func (s *secretCarrierStore) DeleteCarrier(ctx context.Context, taskID string) error {
-	if err := s.jobs.DeleteSecret(ctx, carrierSecretName(taskID)); err != nil {
-		return fmt.Errorf("delete carrier for task %s: %w", taskID, err)
+func (s *secretCarrierStore) DeleteCarrier(ctx context.Context, name string) error {
+	if err := s.jobs.DeleteSecret(ctx, name); err != nil {
+		return fmt.Errorf("delete carrier %s: %w", name, err)
 	}
 	return nil
 }

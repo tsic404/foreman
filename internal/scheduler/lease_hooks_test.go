@@ -19,6 +19,9 @@ type fakePendingReports struct {
 	// notRebuilt models an outstanding carrier list: Queued answers true for
 	// every task (unknown is not empty) and Rebuilt answers false.
 	notRebuilt bool
+	// deleteCarrier is the cluster delete the queue performs for a settled
+	// carrier; the fixture wires it to the job-client fake.
+	deleteCarrier func(context.Context, string) error
 }
 
 type pendingCall struct {
@@ -62,6 +65,21 @@ func (f *fakePendingReports) HasQueuedEntry(taskID string) bool { return f.queue
 // Drop forgets the report the direct forward settled.
 func (f *fakePendingReports) Drop(_ context.Context, taskID string) { delete(f.queued, taskID) }
 
+// SweepCarrier models the queue's one-step settled check and delete: an
+// unfinished rebuild or a live entry keeps the object.
+func (f *fakePendingReports) SweepCarrier(ctx context.Context, taskID, name string) (bool, error) {
+	if f.Queued(taskID) {
+		return false, nil
+	}
+	if f.deleteCarrier == nil {
+		return false, nil
+	}
+	if err := f.deleteCarrier(ctx, name); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Restore is the carrier rebuild: the fake has no carriers.
 func (f *fakePendingReports) Restore(context.Context) error { return nil }
 
@@ -84,6 +102,9 @@ func (f *fixture) withPendingReports() *fakePendingReports {
 	// The fixture wires a queue for every test (New requires one); this
 	// resets it so a test sees only the reports it causes.
 	f.pending = &fakePendingReports{}
+	// The sweep's carrier delete goes through the queue seam; this helper
+	// rebuilds the fake, so it restores the wiring newFixtureUnder applies.
+	f.pending.deleteCarrier = f.jobs.DeleteSecret
 	WithPendingReports(f.pending)(f.sched)
 	return f.pending
 }
