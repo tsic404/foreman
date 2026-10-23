@@ -2723,6 +2723,10 @@ type harness struct {
 	coord      state.CoordStore
 	instanceID string
 	leaderCfg  coordination.Config
+	// leaderMu guards the lease handles: the claim and heartbeat gates read
+	// them from their own goroutines while a scenario starts, crashes or
+	// stops the lease from the test goroutine.
+	leaderMu   sync.Mutex
 	leader     *coordination.Leader
 	leaderStop context.CancelFunc
 	leaderDone chan struct{}
@@ -2969,7 +2973,7 @@ func buildHarnessWith(t *testing.T, catalogEnabled bool, window time.Duration, s
 		}
 		schedOpts = append(schedOpts,
 			scheduler.WithSharedStore(opts.coord, instanceID, lockTTL),
-			scheduler.WithLeaderGate(func() bool { return h.leader != nil && h.leader.Held() }),
+			scheduler.WithLeaderGate(h.leaderHeld),
 		)
 	}
 	sched, err := scheduler.New(schedCfg, reg, jobs, bld, serverClient, metrics, schedOpts...)
@@ -3055,7 +3059,7 @@ func (h *harness) rebuildSchedulerWithLevel(t *testing.T, level slog.Level, muta
 		}
 		opts = append(opts,
 			scheduler.WithSharedStore(h.coord, instanceID, lockTTL),
-			scheduler.WithLeaderGate(func() bool { return h.leader != nil && h.leader.Held() }),
+			scheduler.WithLeaderGate(h.leaderHeld),
 		)
 	}
 	sched, err := scheduler.New(cfg, h.reg, h.jobs, h.builder, h.serverClient, h.metrics, opts...)
@@ -3395,13 +3399,32 @@ func waitFor(t *testing.T, what string, timeout time.Duration, cond func() bool)
 	t.Fatalf("timed out waiting for %s", what)
 }
 
+// currentLeader returns the lease loop this harness runs, nil when none is.
+func (h *harness) currentLeader() *coordination.Leader {
+	h.leaderMu.Lock()
+	defer h.leaderMu.Unlock()
+	return h.leader
+}
+
+// leaderHeld is the gate the claim loop, the heartbeat loop and the control
+// plane take: true while this instance's lease is held.
+func (h *harness) leaderHeld() bool {
+	h.leaderMu.Lock()
+	defer h.leaderMu.Unlock()
+	return h.leader != nil && h.leader.Held()
+}
+
 // startLeader runs this instance's control-plane lease until stopLeader (or
 // the test's cleanup). OnAcquire mirrors production: takeover reconciliation
 // before the control plane serves.
 func (h *harness) startLeader(t *testing.T) {
 	t.Helper()
 	h.runLeader(t)
-	if !h.leader.WaitHeld(context.Background(), 10*time.Second) {
+	leader := h.currentLeader()
+	if leader == nil {
+		t.Fatal("startLeader: no lease loop was started")
+	}
+	if !leader.WaitHeld(context.Background(), 10*time.Second) {
 		t.Fatal("leader lease was not acquired")
 	}
 }
@@ -3426,17 +3449,20 @@ func (h *harness) runLeader(t *testing.T) {
 	if instanceID == "" {
 		instanceID = "instance-1"
 	}
-	h.leader = coordination.New(h.coord, instanceID, cfg,
+	leader := coordination.New(h.coord, instanceID, cfg,
 		coordination.WithLogger(slog.New(slog.NewJSONHandler(h.logs, nil))),
 		coordination.WithOnAcquire(h.sched.OnTakeover))
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		_ = h.leader.Run(ctx)
+		_ = leader.Run(ctx)
 	}()
+	h.leaderMu.Lock()
+	h.leader = leader
 	h.leaderStop = cancel
 	h.leaderDone = done
+	h.leaderMu.Unlock()
 	t.Cleanup(func() { h.stopLeader(t) })
 }
 
@@ -3444,23 +3470,26 @@ func (h *harness) runLeader(t *testing.T) {
 // lease: the survivor must wait out the lease TTL (a real process death).
 func (h *harness) crashLeader(t *testing.T) {
 	t.Helper()
-	if h.leader != nil {
-		h.leader.Crash()
+	if leader := h.currentLeader(); leader != nil {
+		leader.Crash()
 	}
 	h.stopLeader(t)
 }
 
-// stopLeader releases the lease and parks this instance's control plane.
+// stopLeader releases the lease and parks this instance's control plane. The
+// handles are cleared first so the gates close before the loop is awaited and
+// a second call (cleanup after an explicit stop) is a no-op.
 func (h *harness) stopLeader(t *testing.T) {
 	t.Helper()
-	if h.leaderStop == nil {
+	h.leaderMu.Lock()
+	stop, done := h.leaderStop, h.leaderDone
+	h.leaderStop, h.leaderDone, h.leader = nil, nil, nil
+	h.leaderMu.Unlock()
+	if stop == nil {
 		return
 	}
-	h.leaderStop()
-	<-h.leaderDone
-	h.leaderStop = nil
-	h.leaderDone = nil
-	h.leader = nil
+	stop()
+	<-done
 }
 
 // queueDepth reads the shared queue's marker count.

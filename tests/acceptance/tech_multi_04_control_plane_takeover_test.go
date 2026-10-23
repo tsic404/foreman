@@ -75,7 +75,7 @@ func TestTechMulti04ControlPlaneTakeover(t *testing.T) {
 
 	// The survivor takes over and claims the queued task.
 	deadline = time.Now().Add(10 * time.Second)
-	for !tw.b.leader.Held() {
+	for !tw.b.leaderHeld() {
 		if time.Now().After(deadline) {
 			holder, _ := tw.coord.LeadershipHolder(context.Background())
 			t.Fatalf("the survivor never acquired the lease; holder=%q\nB logs: %s", holder, tw.b.logs.String())
@@ -126,7 +126,7 @@ func startHeartbeatLoop(t *testing.T, h *harness) func() {
 	t.Helper()
 	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.client.CatalogSlots(), h.metrics)
 	loop := proxy.NewHeartbeatLoop(h.client, reporter)
-	loop.SetLeaderGate(func() bool { return h.leader != nil && h.leader.Held() })
+	loop.SetLeaderGate(h.leaderHeld)
 	ctx, cancel := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
