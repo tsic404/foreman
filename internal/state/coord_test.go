@@ -249,6 +249,27 @@ func TestCoordSlotRetireOnlyTouchesItsOwnReservation(t *testing.T) {
 	}
 }
 
+func TestCoordSlotReserveNonPositiveLimitIsUncapped(t *testing.T) {
+	ctx := context.Background()
+	_, store, _, _ := coordTestStore(t)
+	// A non-positive limit is the "no cap" sentinel the interface documents,
+	// not a zero budget: every reservation at such a level must be admitted.
+	for i := range 3 {
+		if _, ok, err := store.ReserveSlot(ctx, "ws-1", 0); err != nil || !ok {
+			t.Fatalf("workspace reserve %d at limit 0: ok=%v err=%v, want true", i+1, ok, err)
+		}
+	}
+	if n, err := store.Slots(ctx, "ws-1"); err != nil || n != 3 {
+		t.Fatalf("workspace slots = %d (err %v), want 3", n, err)
+	}
+	if _, ok, err := store.ReserveSlot(ctx, "", -1); err != nil || !ok {
+		t.Fatalf("global reserve at limit -1: ok=%v err=%v, want true", ok, err)
+	}
+	if n, err := store.Slots(ctx, ""); err != nil || n != 1 {
+		t.Fatalf("global slots = %d (err %v), want 1", n, err)
+	}
+}
+
 // assertReservations checks one level's pending reservation ids as a set.
 func assertReservations(t *testing.T, mr *miniredis.Miniredis, key string, want ...string) {
 	t.Helper()
