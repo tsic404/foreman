@@ -630,6 +630,52 @@ func TestProbeDeregisterReapedSessionIsUnauthorized(t *testing.T) {
 	}
 }
 
+// TestProbeWorkspacesReapedSessionIsUnauthorized pins S-1's side of §6.3: the
+// shared row still serves the authentication lookup and is gone by the
+// handler's own lookup. The answer must be 401 with no workspace named — the
+// token's claims are not a fallback workspace list, and the discovery set must
+// not answer for a session that no longer exists.
+func TestProbeWorkspacesReapedSessionIsUnauthorized(t *testing.T) {
+	for _, tc := range []struct {
+		name, requestID, realRuntimeID string
+	}{
+		{name: "command-driven", requestID: "cmd-reaped", realRuntimeID: "rid-real"},
+		{name: "startup-discovery", requestID: "startup-reaped"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newTestRig(t)
+			token, session := startProbeToken(t, r, tc.requestID, tc.realRuntimeID)
+
+			// One read backs the token's authentication; the handler's lookup
+			// is the read that finds the session gone.
+			raw, err := json.Marshal(session)
+			if err != nil {
+				t.Fatalf("marshal session: %v", err)
+			}
+			store := &reapingProbeStore{rows: map[string][]byte{session.JobName: raw}, readsBeforeReap: 1}
+			r.probes.AttachShared(store)
+
+			code, body := r.call(t, "GET", "/api/daemon/workspaces", token, nil)
+			if code != http.StatusUnauthorized {
+				t.Fatalf("S-1 of a reaped session = %d: %s, want 401", code, body)
+			}
+			// Both markers the live answer carries: the workspace id and its
+			// display name. Neither may leak from the token's claims.
+			for _, marker := range []string{"ws-1", "ws-one"} {
+				if strings.Contains(string(body), marker) {
+					t.Errorf("the answer for an ownerless session names a workspace (%q): %s", marker, body)
+				}
+			}
+			if len(r.metrics.authFails) != 0 {
+				t.Errorf("auth failures = %v, want the 401 to come from the handler, not verification", r.metrics.authFails)
+			}
+			if _, ok := store.rows[session.JobName]; ok {
+				t.Error("the 401 path must not resurrect the reaped session")
+			}
+		})
+	}
+}
+
 // TestProbeModelResultReapedSessionIsUnauthorized pins the S27 window: the
 // session still resolves at lookup and is reaped before the handler's first
 // write. Neither branch may answer 200 or run its side effect — the absorb
