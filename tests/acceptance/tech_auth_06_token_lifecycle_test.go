@@ -325,11 +325,22 @@ func TestAuth06OrphanSecretSweepLeavesTheNegativeShapes(t *testing.T) {
 		return corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Labels: labels}}
 	}
 	managed := map[string]string{registry.LabelManagedBy: registry.ManagedByForeman}
-	withTask := func(taskID string) map[string]string {
+	// One helper per label shape: the workspace partition must come from the
+	// object itself, so each shape is a separate negative.
+	withTaskWorkspace := func(taskID, workspaceID string) map[string]string {
 		return map[string]string{
 			registry.LabelManagedBy:   registry.ManagedByForeman,
 			registry.LabelTaskID:      taskID,
-			registry.LabelWorkspaceID: "ws-1",
+			registry.LabelWorkspaceID: workspaceID,
+		}
+	}
+	withTask := func(taskID string) map[string]string {
+		return withTaskWorkspace(taskID, "ws-1")
+	}
+	withTaskNoWorkspace := func(taskID string) map[string]string {
+		return map[string]string{
+			registry.LabelManagedBy: registry.ManagedByForeman,
+			registry.LabelTaskID:    taskID,
 		}
 	}
 	h.jobs.programListed(nil, []corev1.Secret{
@@ -343,6 +354,14 @@ func TestAuth06OrphanSecretSweepLeavesTheNegativeShapes(t *testing.T) {
 		secret("fm-task-other-cred", withTask("task-orphan")),
 		// Negative: a live entry owns it.
 		secret("fm-task-live-cred", withTask("task-live")),
+		// Negative: no workspace identity label — there is no partition, and
+		// the deployment's own workspace must not stand in for it.
+		secret("fm-task-nows-cred", withTaskNoWorkspace("task-nows")),
+		// Negative: the workspace identity label is present but empty.
+		secret("fm-task-emptyws-cred", withTaskWorkspace("task-emptyws", "")),
+		// Negative: another workspace's orphan — this deployment does not
+		// serve ws-2, so the object is outside its sweep domain.
+		secret("fm-task-foreignws-cred", withTaskWorkspace("task-foreignws", "ws-2")),
 	})
 
 	// Two convergence rounds: the sweep is a round action, and the positive
@@ -359,5 +378,17 @@ func TestAuth06OrphanSecretSweepLeavesTheNegativeShapes(t *testing.T) {
 	events := h.events("cred.orphan_secret_removed")
 	if len(events) != 1 || events[0]["task_id"] != "task-orphan" {
 		t.Fatalf("cred.orphan_secret_removed = %+v, want one event for task-orphan", events)
+	}
+	// The two unpartitioned shapes (missing and empty workspace label) are
+	// skipped fail-closed and reported once per round with the round's count.
+	// The foreign workspace is partitioned, so it is neither swept nor counted.
+	skipped := h.events("cred.orphan_secret_workspace_unlabelled")
+	if len(skipped) != 2 {
+		t.Fatalf("cred.orphan_secret_workspace_unlabelled = %+v, want one event per round", skipped)
+	}
+	for round, event := range skipped {
+		if event["count"] != float64(2) {
+			t.Errorf("round %d skipped count = %v, want 2", round+1, event["count"])
+		}
 	}
 }

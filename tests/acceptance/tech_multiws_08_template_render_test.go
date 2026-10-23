@@ -32,14 +32,19 @@ func TestTechMultiWS08TemplateRendersPerWorkspace(t *testing.T) {
 	}{"ws-a": {"ws-a", "ws-b"}, "ws-b": {"ws-b", "ws-a"}} {
 		ws := job.workspaceID
 		built := jobA
+		builtSecret := secretA
 		if name == "ws-b" {
 			built = jobB
+			builtSecret = secretB
 		}
 		if got := built.Labels[registry.LabelWorkspaceID]; got != ws {
 			t.Errorf("%s Job workspace label = %q, want %s", name, got, ws)
 		}
 		if got := built.Spec.Template.Labels[registry.LabelWorkspaceID]; got != ws {
 			t.Errorf("%s pod workspace label = %q, want %s", name, got, ws)
+		}
+		if got := builtSecret.Labels[registry.LabelWorkspaceID]; got != ws {
+			t.Errorf("%s credential Secret workspace label = %q, want %s", name, got, ws)
 		}
 		// Repeated placeholder in one string: all occurrences land.
 		if got := built.Spec.Template.Labels["pair"]; got != ws+"|"+ws {
