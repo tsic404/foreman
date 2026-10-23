@@ -11,10 +11,14 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"testing"
+	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/tsic404/foreman/internal/observability"
+	"github.com/tsic404/foreman/internal/recovery"
 	"github.com/tsic404/foreman/internal/registry"
 )
 
@@ -141,5 +145,103 @@ func TestMapping01ProjectionMatchesJobAnnotations(t *testing.T) {
 	// An unknown task is the plain 404.
 	if code, _ := tcMapping01Projection(t, server.URL, "task-missing"); code != http.StatusNotFound {
 		t.Errorf("unknown task projection = %d, want 404", code)
+	}
+}
+
+// tcMapping01Pod is one pod of a foreman Job on node, created at created —
+// the list face a convergence round reads. An empty node is the unscheduled
+// replacement of a rebuild.
+func tcMapping01Pod(jobName, node string, created time.Time) corev1.Pod {
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              jobName + "-pod",
+			Labels:            map[string]string{"job-name": jobName},
+			CreationTimestamp: metav1.NewTime(created),
+		},
+		Spec:   corev1.PodSpec{NodeName: node},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	if node == "" {
+		pod.Status.Phase = corev1.PodPending
+	}
+	return pod
+}
+
+// The projected node name is the placement the Pod observation reports (§3,
+// §4.5) and only a non-empty placement is a write source: empty before the
+// first non-empty observation, following the current pod onto another node
+// (eviction, drain), and keeping the recorded node while the replacement pod
+// of a rebuild has not landed yet.
+func TestMapping01ProjectionFollowsTheRebuiltPod(t *testing.T) {
+	h := newDeliveryHarness(t)
+	h.useRealBuilder(t)
+	if err := h.sched.OnClaim(t.Context(), deliveryPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	job := h.createdJob(t, "fm-task-1").DeepCopy()
+	h.jobs.programGetJob(job)
+	rec, err := recovery.New(
+		recovery.Config{ReconcileInterval: time.Second},
+		h.reg, queueObjects{jobs: h.jobs}, h.server, h.sched)
+	if err != nil {
+		t.Fatalf("recovery.New: %v", err)
+	}
+	ops := observability.NewOpsHandler(observability.NewMetrics(), h.reg, nil, observability.OpsConfig{})
+	server := httptest.NewServer(ops)
+	t.Cleanup(server.Close)
+
+	setPods := func(pods ...corev1.Pod) {
+		t.Helper()
+		h.jobs.mu.Lock()
+		h.jobs.pods = pods
+		h.jobs.mu.Unlock()
+	}
+	reconcile := func(what string) {
+		t.Helper()
+		if err := rec.Reconcile(t.Context()); err != nil {
+			t.Fatalf("Reconcile %s: %v", what, err)
+		}
+	}
+	projectNode := func(what string) string {
+		t.Helper()
+		code, projection := tcMapping01Projection(t, server.URL, "task-1")
+		if code != http.StatusOK {
+			t.Fatalf("%s: projection = %d, want 200", what, code)
+		}
+		node, _ := projection["node_name"].(string)
+		return node
+	}
+
+	// Before the first non-empty observation the projection carries the empty
+	// string, and a round that only sees the unscheduled pod leaves it empty.
+	if got := projectNode("before any pod observation"); got != "" {
+		t.Fatalf("node_name before any pod observation = %q, want the empty string", got)
+	}
+	setPods(tcMapping01Pod("fm-task-1", "", time.Now()))
+	reconcile("while the first pod is unscheduled")
+	if got := projectNode("while the first pod is unscheduled"); got != "" {
+		t.Fatalf("node_name while the first pod is unscheduled = %q, want the empty string", got)
+	}
+
+	// The first placement is recorded.
+	setPods(tcMapping01Pod("fm-task-1", "node-a", time.Now()))
+	reconcile("after the first placement")
+	if got := projectNode("after the first placement"); got != "node-a" {
+		t.Fatalf("node_name after the first placement = %q, want node-a", got)
+	}
+
+	// The rebuild window: the predecessor pod is gone and the replacement has
+	// not landed, so the empty observation keeps the recorded node.
+	setPods(tcMapping01Pod("fm-task-1", "", time.Now().Add(time.Minute)))
+	reconcile("during the rebuild window")
+	if got := projectNode("during the rebuild window"); got != "node-a" {
+		t.Fatalf("node_name during the rebuild window = %q, want node-a retained", got)
+	}
+
+	// The controller's replacement pod lands on another node.
+	setPods(tcMapping01Pod("fm-task-1", "node-b", time.Now().Add(2*time.Minute)))
+	reconcile("after the rebuild")
+	if got := projectNode("after the rebuild"); got != "node-b" {
+		t.Fatalf("node_name after the rebuild = %q, want node-b", got)
 	}
 }

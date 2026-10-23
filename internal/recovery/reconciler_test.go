@@ -1239,6 +1239,84 @@ func TestReconcileRecordsPodNodePlacement(t *testing.T) {
 	}
 }
 
+// A Job rebuilds its pod after an eviction or a node drain. The placement fact
+// follows the current pod: the per-node cap counts the entry on the node it now
+// occupies, and the learning face names the node the session was written on.
+func TestReconcileFollowsRebuiltPodToAnotherNode(t *testing.T) {
+	reg := newRegistry(t, testEntry("t1"))
+	objs := &fakeObjects{
+		job: runningJob("fm-t1"),
+		pods: []corev1.Pod{podFor("fm-t1", func(p *corev1.Pod) {
+			p.CreationTimestamp = metav1.NewTime(time.Now().Add(-time.Minute))
+			p.Spec.NodeName = "company-01"
+		})},
+	}
+	r := newTestReconciler(t, reg, objs, &fakeStatus{status: "running"}, &fakeSettler{})
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if load := reg.ActiveJobsByNode(); load["company-01"] != 1 || len(load) != 1 {
+		t.Fatalf("ActiveJobsByNode = %v, want company-01=1", load)
+	}
+
+	// The controller's replacement pod lands on another node.
+	objs.mu.Lock()
+	objs.pods = []corev1.Pod{podFor("fm-t1", func(p *corev1.Pod) {
+		p.CreationTimestamp = metav1.NewTime(time.Now())
+		p.Spec.NodeName = "company-02"
+	})}
+	objs.mu.Unlock()
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile after the rebuild: %v", err)
+	}
+	got, _ := reg.Get("t1")
+	if got.NodeName != "company-02" {
+		t.Fatalf("node_name = %q, want company-02 from the rebuilt pod", got.NodeName)
+	}
+	load := reg.ActiveJobsByNode()
+	if load["company-01"] != 0 || load["company-02"] != 1 {
+		t.Fatalf("ActiveJobsByNode = %v, want the entry counted on company-02 only", load)
+	}
+}
+
+// A rebuild leaves a window in which the predecessor pod is gone and the
+// replacement is not scheduled yet, so the round observes no placement at all.
+// An empty observation is not a write source (§3, §4.5): the recorded node
+// survives, keeping the per-node load and the terminal report's learning face
+// on the last real placement.
+func TestReconcileKeepsNodeWhileRebuiltPodIsPending(t *testing.T) {
+	reg := newRegistry(t, testEntry("t1"))
+	objs := &fakeObjects{
+		job:  runningJob("fm-t1"),
+		pods: []corev1.Pod{podFor("fm-t1", func(p *corev1.Pod) { p.Spec.NodeName = "company-01" })},
+	}
+	r := newTestReconciler(t, reg, objs, &fakeStatus{status: "running"}, &fakeSettler{})
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+	if got, _ := reg.Get("t1"); got.NodeName != "company-01" {
+		t.Fatalf("node_name = %q, want company-01 after the first placement", got.NodeName)
+	}
+
+	// The controller's replacement pod has no node yet.
+	objs.mu.Lock()
+	objs.pods = []corev1.Pod{podFor("fm-t1", nil)}
+	objs.mu.Unlock()
+
+	if err := r.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile during the rebuild: %v", err)
+	}
+	if got, _ := reg.Get("t1"); got.NodeName != "company-01" {
+		t.Fatalf("node_name = %q, want company-01 retained while the replacement is unscheduled", got.NodeName)
+	}
+	if load := reg.ActiveJobsByNode(); load["company-01"] != 1 || len(load) != 1 {
+		t.Fatalf("ActiveJobsByNode = %v, want company-01=1 retained", load)
+	}
+}
+
 func TestReconcileLeavesNodeEmptyWhilePodIsPending(t *testing.T) {
 	e := testEntry("t1")
 	reg := newRegistry(t, e)

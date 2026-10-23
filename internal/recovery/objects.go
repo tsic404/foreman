@@ -62,16 +62,23 @@ func instancePods(pods []corev1.Pod, since time.Time) []corev1.Pod {
 	return current
 }
 
-// podNodeName returns the node a Job's pod was scheduled on ("" while the pod
-// is Pending or does not exist yet). A Job has at most one pod
-// (parallelism: 1), so the first placement found is the placement.
+// podNodeName returns the node of the newest scheduled pod ("" while no pod
+// has a placement). A task runs one pod at a time, but a rebuild after an
+// eviction or a drain leaves the predecessor pod on the list face; the newest
+// pod is the one carrying the task now, so its node is the current placement.
 func podNodeName(pods []corev1.Pod) string {
+	node := ""
+	var newest time.Time
 	for i := range pods {
-		if node := pods[i].Spec.NodeName; node != "" {
-			return node
+		if pods[i].Spec.NodeName == "" {
+			continue
+		}
+		if node == "" || pods[i].CreationTimestamp.After(newest) {
+			node = pods[i].Spec.NodeName
+			newest = pods[i].CreationTimestamp.Time
 		}
 	}
-	return ""
+	return node
 }
 
 // jobEndReason applies the Job/Pod facts of 判据模型: the Job object says
