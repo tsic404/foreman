@@ -53,28 +53,17 @@ func probeFaces() []probeFace {
 	}
 }
 
-// seedCatalogProbe issues the probe's own Job Token and inserts the session
-// row the token is adjudicated against (§6.3).
+// seedCatalogProbe seeds this case's probe session through the shared
+// constructor, pinned to the deployment's served workspace.
 func seedCatalogProbe(t *testing.T, h *harness) (string, registry.ProbeSession) {
 	t.Helper()
-	token, err := h.issuer.IssueProbe(catalog11ProbeName, catalog11RequestID, h.schedCfg.WorkspaceID, 10*time.Minute)
-	if err != nil {
-		t.Fatalf("IssueProbe: %v", err)
-	}
-	session := registry.ProbeSession{
-		JobName:       catalog11ProbeName,
-		Mode:          registry.ProbeCommandDriven,
-		RequestID:     catalog11RequestID,
-		TokenHash:     h.issuer.Hash(token),
-		JobRuntime:    catalog11ProbeRuntime,
-		RealRuntimeID: catalog11RealRuntime,
-		WorkspaceID:   h.schedCfg.WorkspaceID,
-		Deadline:      time.Now().Add(time.Minute),
-	}
-	if err := h.probes.PutProbe(session); err != nil {
-		t.Fatalf("PutProbe: %v", err)
-	}
-	return token, session
+	return seedProbeSession(t, h.issuer, h.probes, probeSeed{
+		jobName:     catalog11ProbeName,
+		requestID:   catalog11RequestID,
+		jobRuntime:  catalog11ProbeRuntime,
+		realRuntime: catalog11RealRuntime,
+		workspaceID: h.schedCfg.WorkspaceID,
+	})
 }
 
 func TestCatalog11ProbeTokenDiesWithItsSession(t *testing.T) {
