@@ -8,6 +8,7 @@ package acceptance
 import (
 	"bytes"
 	"log/slog"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -39,7 +40,7 @@ spec:
           hostPath: { path: /var/lib/foreman/home/<workspace_id>, type: DirectoryOrCreate }
 `
 
-func TestTechMultiWS13WorkspaceIDCharset(t *testing.T) {
+func TestTechMultiWS16WorkspaceIDCharset(t *testing.T) {
 	workspaceScoped := func(id string) func(string) string {
 		return func(key string) string {
 			switch key {
@@ -57,6 +58,8 @@ func TestTechMultiWS13WorkspaceIDCharset(t *testing.T) {
 			"bare parent":    "..",
 			"leading dot":    ".hidden",
 			"trailing dot":   "trailing.",
+			"leading hyphen": "-team",
+			"bare hyphen":    "-",
 			"space":          "ws id",
 			"colon":          "ws:8080",
 			"over length":    strings.Repeat("a", 64),
@@ -67,7 +70,7 @@ func TestTechMultiWS13WorkspaceIDCharset(t *testing.T) {
 				if err == nil {
 					t.Fatalf("workspace id %q started", id)
 				}
-				if !strings.Contains(err.Error(), id) {
+				if !strings.Contains(err.Error(), strconv.Quote(id)) {
 					t.Errorf("error %q must name %q", err, id)
 				}
 				if !strings.Contains(err.Error(), "label value") {
@@ -94,7 +97,7 @@ func TestTechMultiWS13WorkspaceIDCharset(t *testing.T) {
 		}
 		if _, err := workspace.NewSet(dep.Identities([]workspace.Ref{{ID: "ws/escape"}})); err == nil {
 			t.Fatal("a discovered workspace with an illegal id started")
-		} else if !strings.Contains(err.Error(), "ws/escape") {
+		} else if !strings.Contains(err.Error(), strconv.Quote("ws/escape")) {
 			t.Errorf("error %q must name the discovered id", err)
 		}
 	})
@@ -107,8 +110,13 @@ func TestTechMultiWS13WorkspaceIDCharset(t *testing.T) {
 			strings.Repeat("a", 63),
 		} {
 			t.Run(id, func(t *testing.T) {
-				if _, err := workspace.LoadDeployment(workspaceScoped(id)); err != nil {
+				dep, err := workspace.LoadDeployment(workspaceScoped(id))
+				if err != nil {
 					t.Fatalf("workspace id %q refused: %v", id, err)
+				}
+				validated := dep.Set.IDs()
+				if len(validated) != 1 {
+					t.Fatalf("validated ids = %v, want exactly one", validated)
 				}
 
 				cfg, err := jobbuilder.LoadConfig(func(string) string { return "" })
@@ -118,13 +126,13 @@ func TestTechMultiWS13WorkspaceIDCharset(t *testing.T) {
 				cfg.TemplatePath = writeTemplateFile(t, charsetTemplate)
 				cfg.JobImage = harnessJobImage
 				cfg.Issuer = stubIssuer{}
-				cfg.WorkspaceIDs = []string{id}
+				cfg.WorkspaceIDs = validated
 				cfg.Logger = observability.NewLogger(&bytes.Buffer{}, slog.LevelInfo, "")
 				builder, err := jobbuilder.NewBuilder(cfg)
 				if err != nil {
 					t.Fatalf("NewBuilder: %v", err)
 				}
-				task := taskEntryFor("11111111-1111-4111-8111-111111111111", id, "")
+				task := taskEntryFor("11111111-1111-4111-8111-111111111111", validated[0], "")
 				job, _, _, err := builder.Build(task)
 				if err != nil {
 					t.Fatalf("Build: %v", err)

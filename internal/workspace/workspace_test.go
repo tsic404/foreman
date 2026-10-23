@@ -3,6 +3,7 @@ package workspace
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -236,6 +237,8 @@ func TestNewSetWorkspaceIDCharset(t *testing.T) {
 		"..",
 		".hidden",
 		"trailing.",
+		"-team",
+		"-",
 		"ws id",
 		"ws:8080",
 		strings.Repeat("a", 64),
@@ -246,7 +249,7 @@ func TestNewSetWorkspaceIDCharset(t *testing.T) {
 			t.Errorf("NewSet(%q) accepted an illegal label value", id)
 			continue
 		}
-		if !strings.Contains(err.Error(), id) {
+		if !strings.Contains(err.Error(), strconv.Quote(id)) {
 			t.Errorf("NewSet(%q) error %q does not name the id", id, err)
 		}
 		if !strings.Contains(err.Error(), "label value") {
