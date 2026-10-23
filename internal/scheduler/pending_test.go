@@ -368,9 +368,10 @@ func TestEnqueueCopiesTheBody(t *testing.T) {
 	}
 }
 
-// An id that cannot name a queue file is never a durable entry: Queued
-// answers false without touching the filesystem, and the drain delivers the
-// staged report straight from memory so the terminal callback is not lost.
+// An id that cannot name a queue file still has its in-memory copy as the
+// queue: it reads as queued and counts until the drain delivers it, and the
+// drain delivers it straight from memory so the terminal callback is not lost.
+// Nothing is ever written outside the queue directory.
 func TestDrainDeliversUnstorableTaskIDFromStaging(t *testing.T) {
 	root := t.TempDir()
 	dir := filepath.Join(root, "pending-reports")
@@ -384,8 +385,9 @@ func TestDrainDeliversUnstorableTaskIDFromStaging(t *testing.T) {
 	if err := p.Enqueue(context.Background(), "../escape", "", "", "", EPFail, []byte(`{"failure_reason":"invalid_task_id"}`), ""); err == nil {
 		t.Fatal("Enqueue with an unsafe task id: want an error")
 	}
-	if p.Len() != 0 {
-		t.Fatalf("Len = %d, want 0", p.Len())
+	if !p.Queued("../escape") || p.Len() != 1 {
+		t.Fatalf("Queued = %v, Len = %d; want true/1: the in-memory copy is the entry",
+			p.Queued("../escape"), p.Len())
 	}
 
 	sender := &fakeSender{code: 200}
@@ -395,6 +397,9 @@ func TestDrainDeliversUnstorableTaskIDFromStaging(t *testing.T) {
 	}
 	if len(sender.sent) != 1 || sender.sent[0] != `../escape:fail:{"failure_reason":"invalid_task_id"}` {
 		t.Fatalf("sent = %v, want the staged report delivered from memory", sender.sent)
+	}
+	if p.Queued("../escape") || p.Len() != 0 {
+		t.Fatalf("after delivery: Queued=%v Len=%d, want false/0", p.Queued("../escape"), p.Len())
 	}
 	if _, err := os.Stat(filepath.Join(root, "escape.json")); !os.IsNotExist(err) {
 		t.Fatalf("queue wrote outside its directory: %v", err)

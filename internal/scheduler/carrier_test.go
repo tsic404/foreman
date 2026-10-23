@@ -300,6 +300,57 @@ func TestPendingCarrierRetriesTaskIDsTheFileGrammarRejects(t *testing.T) {
 	}
 }
 
+// TestPendingCarrierUnbackedFileGrammarRejectingTaskIDStaysCounted: an id the
+// file grammar rejects has no disk face to wait for, so a carrier write that
+// fails leaves the in-memory copy as the queue itself. The depth and the
+// membership face must both see it — the Job gate and the gauge read those
+// answers — and the report leaves both once a drain delivers it from staging.
+func TestPendingCarrierUnbackedFileGrammarRejectingTaskIDStaysCounted(t *testing.T) {
+	const taskID = "task.a"
+	store := newMemCarrierStore()
+	store.putErr = errors.New("apiserver unavailable")
+	var gauge int
+	p, err := NewPendingReports(t.TempDir(),
+		WithPendingReportsCarrier(store),
+		WithPendingReportsGauge(func(n int) { gauge = n }))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	restoreForServe(t, p)
+	err = p.Enqueue(context.Background(), taskID, "fm-task.a", "fm-task.a", "ws-1", EPFail, []byte(`{"result":"ok"}`), "")
+	if !errors.Is(err, store.putErr) {
+		t.Fatalf("Enqueue = %v, want the refused carrier write", err)
+	}
+	if store.count() != 0 {
+		t.Fatalf("carriers = %d, want 0: the write was refused", store.count())
+	}
+	if got := p.Len(); got != 1 {
+		t.Fatalf("Len = %d, want 1: the in-memory copy is the whole queue", got)
+	}
+	if gauge != 1 {
+		t.Fatalf("foreman_pending_reports = %d, want 1", gauge)
+	}
+	if !p.Queued(taskID) || !p.HasQueuedEntry(taskID) {
+		t.Fatalf("Queued = %v, HasQueuedEntry = %v; want true: the Job must wait for this report",
+			p.Queued(taskID), p.HasQueuedEntry(taskID))
+	}
+
+	// The drain delivers straight from staging: no durability face ever held
+	// the report, and nothing keeps it queued afterwards.
+	sender := &fakeSender{code: 200}
+	remaining, err := p.Drain(context.Background(), sender)
+	if err != nil || remaining != 0 {
+		t.Fatalf("Drain = %d, %v; want the staged report delivered", remaining, err)
+	}
+	if len(sender.sent) != 1 || sender.sent[0] != taskID+":fail:"+`{"result":"ok"}` {
+		t.Fatalf("sent = %v, want the one staged report", sender.sent)
+	}
+	if p.Queued(taskID) || p.Len() != 0 || gauge != 0 {
+		t.Fatalf("after delivery: Queued=%v Len=%d gauge=%d, want false/0/0",
+			p.Queued(taskID), p.Len(), gauge)
+	}
+}
+
 // TestPendingCarrierTaskIDOutsideLabelGrammarIsVisible: an id the carrier's
 // task-id label cannot hold has no cross-process face at all. That is an error
 // event and a returned error — the alarm face (§10, ADR-046 decision 2) — and

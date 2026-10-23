@@ -137,10 +137,14 @@ func TestForward05LabelSyntaxCarrierWriteIsRetriedInProcess(t *testing.T) {
 	if got := len(h.jobs.carrierSecrets()); got != 0 {
 		t.Fatalf("carriers = %d, want 0: the programmed write failed", got)
 	}
-	// No durability face yet: the id cannot name a file and the carrier write
-	// did not land, so the report is staged in process memory only.
-	if got := h.pending.Len(); got != 0 {
-		t.Fatalf("durable depth = %d, want 0 before a carrier lands", got)
+	// No durability face yet, but the entry is queued: the id cannot name a
+	// file and the carrier write did not land, so the in-memory copy is the
+	// report's whole queue face — depth and membership read it.
+	if got := h.pending.Len(); got != 1 {
+		t.Fatalf("pending reports = %d, want 1 before a carrier lands", got)
+	}
+	if !h.pending.Queued(labelSyntaxTaskID) {
+		t.Fatal("a staged report whose id cannot name a queue file must read as queued")
 	}
 
 	h.jobs.setCreateCarrierErr(nil)
