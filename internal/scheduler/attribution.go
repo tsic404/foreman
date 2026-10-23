@@ -149,12 +149,14 @@ func (s *Scheduler) readPlatformEvidence(ctx context.Context, e registry.TaskEnt
 }
 
 // awaitPlatformFact waits up to attributionWait for the fact to become
-// visible, re-reading the evidence on attributionPollInterval. The bound runs
-// on the wall clock: it bounds this HTTP round, not a virtual one.
+// visible, re-reading the evidence on attributionPollInterval. The bound and
+// the overdue signal are read from the same clock — the scheduler's — so the
+// two halves of one wait decision never disagree; the poll cadence stays a
+// real timer, since it decides when to look again, not when the wait ends.
 func (s *Scheduler) awaitPlatformFact(ctx context.Context, e registry.TaskEntry) (platformEvidence, error) {
-	deadline := time.Now().Add(s.attributionWait)
+	deadline := s.now().Add(s.attributionWait)
 	for {
-		remaining := time.Until(deadline)
+		remaining := deadline.Sub(s.now())
 		if remaining <= 0 {
 			return platformEvidence{}, nil
 		}
