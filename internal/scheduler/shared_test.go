@@ -29,6 +29,14 @@ type fakeCoordStore struct {
 	consumeCalls           int
 	setCalls               []slotWrite
 	casCalls               []slotWrite
+	// workspaceReserveHook models the call that spends the last of a call
+	// budget: it runs inside the workspace reservation and leaves the caller's
+	// context dead, the way an exhausted store call does.
+	workspaceReserveHook func()
+	// releaseRejected records releases the store refused because the context
+	// they were issued under was already dead (a real client reports the
+	// context error instead of writing).
+	releaseRejected []string
 }
 
 type slotWrite struct {
@@ -51,6 +59,42 @@ func (f *fakeCoordStore) ConsumeSlotReservation(_ context.Context, ws string) er
 	if f.consumeFails > 0 {
 		f.consumeFails--
 		return errors.New("consume down")
+	}
+	if f.reservations[ws] > 0 {
+		f.reservations[ws]--
+	}
+	return nil
+}
+
+func (f *fakeCoordStore) ReserveSlot(ctx context.Context, ws string, limit int) (bool, error) {
+	if ws != "" && f.workspaceReserveHook != nil {
+		hook := f.workspaceReserveHook
+		f.workspaceReserveHook = nil
+		hook()
+		return false, ctx.Err()
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.counts[ws] >= int64(limit) {
+		return false, nil
+	}
+	f.counts[ws]++
+	f.reservations[ws]++
+	return true, nil
+}
+
+func (f *fakeCoordStore) ReleaseSlot(ctx context.Context, ws string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if err := ctx.Err(); err != nil {
+		f.releaseRejected = append(f.releaseRejected, ws)
+		return err
+	}
+	if f.counts[ws] > 0 {
+		f.counts[ws]--
 	}
 	if f.reservations[ws] > 0 {
 		f.reservations[ws]--
@@ -120,7 +164,7 @@ func newSlotTestScheduler(t *testing.T, store *fakeCoordStore, ws ...string) (*S
 	reg := registry.New(time.Now)
 	m := &recMetrics{}
 	return &Scheduler{
-		cfg:     Config{Workspaces: ws, MaxInflightJobsPerWorkspace: 2},
+		cfg:     Config{Workspaces: ws, MaxInflightJobs: 4, MaxInflightJobsPerWorkspace: 2},
 		reg:     reg,
 		shared:  store,
 		metrics: m,
@@ -185,6 +229,56 @@ func TestConsumeSlotsFailureOnBothLevelsNeverRetries(t *testing.T) {
 	}
 	if len(m.errors) != 2 {
 		t.Fatalf("state errors = %v, want two consume_slot", m.errors)
+	}
+}
+
+// TestReserveSlotsCompensationSurvivesAnExhaustedCall pins that the global slot
+// a refused workspace reservation already took is written back even when the
+// caller's budget is spent: a compensation issued under the dying context is a
+// guaranteed failure and leaks the reservation until the TTL/reconcile edge.
+func TestReserveSlotsCompensationSurvivesAnExhaustedCall(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	store := &fakeCoordStore{
+		counts:               map[string]int64{"": 0},
+		reservations:         map[string]int64{"": 0},
+		workspaceReserveHook: cancel,
+	}
+	s, _ := newSlotTestScheduler(t, store, "ws-a")
+
+	err := s.reserveSlots(ctx, "ws-a")
+	if !errors.Is(err, ErrStoreUnavailable) {
+		t.Fatalf("reserveSlots = %v, want ErrStoreUnavailable (the workspace half failed)", err)
+	}
+	if len(store.releaseRejected) != 0 {
+		t.Fatalf("compensation refused for a dead context: %v", store.releaseRejected)
+	}
+	if got := store.counts[""]; got != 0 {
+		t.Fatalf("global counter = %d, want 0 (the taken slot was returned)", got)
+	}
+	if got := store.reservations[""]; got != 0 {
+		t.Fatalf("global reservations = %d, want 0", got)
+	}
+}
+
+// TestReserveSlotsRefusedWorkspaceReturnsTheGlobalSlot pins the other refusal:
+// a workspace level at its cap returns the global slot it already took.
+func TestReserveSlotsRefusedWorkspaceReturnsTheGlobalSlot(t *testing.T) {
+	store := &fakeCoordStore{
+		counts:       map[string]int64{"": 0, "ws-a": 2},
+		reservations: map[string]int64{"": 0, "ws-a": 2},
+	}
+	s, _ := newSlotTestScheduler(t, store, "ws-a")
+
+	err := s.reserveSlots(context.Background(), "ws-a")
+	if !errors.Is(err, ErrNoSlot) {
+		t.Fatalf("reserveSlots = %v, want ErrNoSlot", err)
+	}
+	if got := store.counts[""]; got != 0 {
+		t.Fatalf("global counter = %d, want 0 (the taken slot was returned)", got)
+	}
+	if got := store.counts["ws-a"]; got != 2 {
+		t.Fatalf("workspace counter = %d, want 2 (no workspace reservation was taken)", got)
 	}
 }
 
