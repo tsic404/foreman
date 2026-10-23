@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strings"
@@ -468,5 +469,82 @@ func TestProbeRegisterOnlyHeartbeatOwnsNoCommand(t *testing.T) {
 	}
 	if staged, ok := r.client.startup.Take("omp", ""); ok {
 		t.Errorf("a registration-only probe must not stage a catalog body: %q", staged)
+	}
+}
+
+// reapingProbeStore is one instance's shared probe-session face over a row that
+// disappears at its first write: the reap that lands between the handler's
+// lookup and its update (02-contracts.md §6.3 会话不存在 ⇒ 恒 401).
+type reapingProbeStore struct {
+	rows map[string][]byte
+}
+
+func (s *reapingProbeStore) PutProbeSession(_ context.Context, jobName string, raw []byte, _ time.Duration) error {
+	s.rows[jobName] = raw
+	return nil
+}
+
+func (s *reapingProbeStore) CASProbeSession(_ context.Context, jobName string, _, _ []byte, _ time.Duration) (bool, error) {
+	delete(s.rows, jobName)
+	return false, nil
+}
+
+func (s *reapingProbeStore) GetProbeSession(_ context.Context, jobName string) ([]byte, bool, error) {
+	raw, ok := s.rows[jobName]
+	return raw, ok, nil
+}
+
+func (s *reapingProbeStore) DeleteProbeSession(_ context.Context, jobName string) error {
+	delete(s.rows, jobName)
+	return nil
+}
+
+func (s *reapingProbeStore) ListProbeSessions(context.Context) (map[string][]byte, error) {
+	out := make(map[string][]byte, len(s.rows))
+	for jobName, raw := range s.rows {
+		out[jobName] = raw
+	}
+	return out, nil
+}
+
+// TestProbeRegisterReapedSessionIsUnauthorized pins the update verdict as the
+// only authority for S4: the session is still resolvable when the handler
+// starts, so the registration body walks past the identity check, and it is
+// gone by the time the update lands. Every probe mode must then answer 401 —
+// a command-driven probe may not slip through on "my body is not a
+// declaration", because the missing session means the token no longer has an
+// owner.
+func TestProbeRegisterReapedSessionIsUnauthorized(t *testing.T) {
+	for _, tc := range []struct {
+		name, requestID, realRuntimeID string
+	}{
+		{name: "command-driven", requestID: "cmd-reaped", realRuntimeID: "rid-real"},
+		{name: "startup-discovery", requestID: "startup-reaped"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newTestRig(t)
+			token, session := startProbeToken(t, r, tc.requestID, tc.realRuntimeID)
+
+			// The row is on the shared face for the lookups, and the first
+			// write finds it reaped: the probe is authorized at lookup and
+			// ownerless at update.
+			raw, err := json.Marshal(session)
+			if err != nil {
+				t.Fatalf("marshal session: %v", err)
+			}
+			store := &reapingProbeStore{rows: map[string][]byte{session.JobName: raw}}
+			r.probes.AttachShared(store)
+
+			code, body := r.call(t, "POST", "/api/daemon/register", token, []byte(`{
+				"daemon_id": "fm-catalog-`+tc.requestID+`",
+				"runtimes": [{"name": "foreman-job", "type": "omp"}]
+			}`))
+			if code != http.StatusUnauthorized {
+				t.Fatalf("register of a reaped session = %d: %s, want 401", code, body)
+			}
+			if _, ok := store.rows[session.JobName]; ok {
+				t.Error("the update must not resurrect a reaped session row")
+			}
+		})
 	}
 }

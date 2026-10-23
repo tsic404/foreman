@@ -77,7 +77,7 @@ func (s *FakeServer) registerProbe(w http.ResponseWriter, r *http.Request, claim
 		return
 	}
 	now := time.Now()
-	updated, _ := s.probes.UpdateProbe(claims.JobName, func(session *registry.ProbeSession) {
+	_, applied := s.probes.UpdateProbe(claims.JobName, func(session *registry.ProbeSession) {
 		if !session.CapturesRegistration() {
 			return
 		}
@@ -103,7 +103,10 @@ func (s *FakeServer) registerProbe(w http.ResponseWriter, r *http.Request, claim
 			session.FailedProfiles = registration.FailedProfiles
 		}
 	})
-	if updated.RegisteredAt.IsZero() && session.CapturesRegistration() {
+	if !applied {
+		// The session was reaped between the lookup above and this update, so
+		// there is no authority left to answer (§6.3 会话不存在 ⇒ 恒 401); a
+		// command-driven probe may not slip through either.
 		writeError(w, http.StatusUnauthorized, "unknown probe session")
 		return
 	}
