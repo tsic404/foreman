@@ -60,9 +60,10 @@ const (
 // does not exist and is never an error (ADR-014). The JSON projection keeps all
 // four keys (empty string, not omitted), so consumers can test `== ""` (§4.1).
 // Payload is the task body — the raw claim payload until delivery, the S6
-// delivery body (runtime_id rewritten to job_runtime_id) afterwards; it
-// carries auth_token and must never reach annotations, Secrets, logs or the
-// projection (F3), but the shared state snapshot persists it (§4.3, ADR-046).
+// delivery body (runtime_id rewritten to job_runtime_id) afterwards. It lives
+// on the entry and in the shared-state mapping record (§4.3, ADR-046 阶段一),
+// so a restart restores it whole; it carries auth_token and must never reach a
+// K8s object, annotations, Secrets, logs or the projection (F3).
 type TaskEntry struct {
 	TaskID          string `json:"task_id"`
 	AgentID         string `json:"agent_id"`
@@ -321,9 +322,11 @@ const (
 
 // TaskEntryFromJob rebuilds an entry from a Job's labels and annotations
 // (§4.3). The state starts at the conservative StateJobCreated and
-// is advanced by the startup C13 convergence. The payload is not restored:
-// a Job object cannot carry it (F3), so a rebuilt entry has none, while a
-// shared-state restore brings the whole row back (§4.3, ADR-046 阶段一).
+// is advanced by the startup C13 convergence. This face carries identity and
+// trigger context only (F3), so the rebuilt entry has no payload, no decided
+// body and no credential digest; those live on the shared-state mapping
+// record, so a shared-state restore brings the whole row back (§4.3,
+// ADR-046 阶段一) — only a Job that record cannot supply is rebuilt here.
 // The four trigger-context annotations are conditional blocks: a missing key
 // means that context does not exist, never a rebuild error (ADR-014).
 func TaskEntryFromJob(job batchv1.Job) (TaskEntry, error) {

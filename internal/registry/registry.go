@@ -34,10 +34,10 @@ type StateStore interface {
 	// PutEntry stores the live row's snapshot. The registry writes it after
 	// every transition; the snapshot is the mapping record, so once set it
 	// carries the delivery body (Payload), the verdict body (DecidedReport)
-	// and the token digest (TokenHash) — a restart keeps delivering and
-	// reclaiming from them (ADR-046 决策 0). The store therefore holds
-	// credentials and is treated as one (§10 安全); only the settled record
-	// strips those faces (settledRecord).
+	// and the token digest (TokenHash) — what a restart needs to keep
+	// delivering, reclaiming and replaying (ADR-046 决策 0, §4.3). The store
+	// therefore holds credentials and is treated as one (§10 安全); only the
+	// settled record strips those faces (settledRecord).
 	PutEntry(ctx context.Context, ws, taskID string, e TaskEntry) error
 	// GetEntry reads the live row of one task. Reserved for stage two's
 	// partitioned lookups; stage one restores through ListEntries and then
@@ -951,11 +951,13 @@ func (r *Registry) RegisterDecidedReport(taskID string, body []byte) (TaskEntry,
 // SetTokenHash records sha256(token) of the Job's credential. The issuance
 // paths write it right after the builder produced the Secret (ADR-017): the
 // reclaim path feeds it to the revocation set so a re-dispatched task cannot
-// be claimed by its predecessor's pod. A rebuilt entry has no hash — it never
-// leaves memory — and the reclaim degrades visibly instead. The shared write's
-// failure is returned: a digest the row did not take must not be handed out
-// (ADR-046 决策 7). A caller holds the task write lock and has just read the
-// entry; a missing entry is ErrNoLiveEntry, never a silent success.
+// be claimed by its predecessor's pod. The digest is persisted on the
+// shared-state mapping record and comes back with a restored entry; only an
+// entry rebuilt from the Job object face has none, and its reclaim degrades
+// visibly instead. The shared write's failure is returned: a digest the row
+// did not take must not be handed out (ADR-046 决策 7). A caller holds the
+// task write lock and has just read the entry; a missing entry is
+// ErrNoLiveEntry, never a silent success.
 func (r *Registry) SetTokenHash(taskID, tokenHash string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
