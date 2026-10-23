@@ -32,7 +32,7 @@ type fakeCoordStore struct {
 	// was lost: the named member is gone and the caller saw an error.
 	consumeFailsAfterApply int
 	consumeCalls           int
-	setCalls               []slotWrite
+	resetCalls             []slotWrite
 	casCalls               []slotWrite
 	// workspaceReserveHook models the call that spends the last of a call
 	// budget: it runs inside the workspace reservation and leaves the caller's
@@ -48,6 +48,8 @@ type slotWrite struct {
 	ws       string
 	expected int64
 	next     int64
+	before   int64
+	cleared  int64
 }
 
 func (f *fakeCoordStore) ConsumeSlotReservation(_ context.Context, ws, id string) error {
@@ -156,12 +158,15 @@ func (f *fakeCoordStore) SlotSnapshot(_ context.Context, ws string) (int64, int6
 	return f.counts[ws], int64(len(f.pending[ws])), nil
 }
 
-func (f *fakeCoordStore) SetSlots(_ context.Context, ws string, n int64) error {
+func (f *fakeCoordStore) ResetSlots(_ context.Context, ws string, n int64) (int64, int64, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.setCalls = append(f.setCalls, slotWrite{ws: ws, next: n})
+	before := f.counts[ws]
+	cleared := int64(len(f.pending[ws]))
+	f.resetCalls = append(f.resetCalls, slotWrite{ws: ws, before: before, next: n, cleared: cleared})
+	delete(f.pending, ws)
 	f.counts[ws] = n
-	return nil
+	return before, cleared, nil
 }
 
 func (f *fakeCoordStore) CompareAndSetSlots(_ context.Context, ws string, expected, next int64) (bool, error) {
@@ -173,13 +178,6 @@ func (f *fakeCoordStore) CompareAndSetSlots(_ context.Context, ws string, expect
 	f.casCalls = append(f.casCalls, slotWrite{ws: ws, expected: expected, next: next})
 	f.counts[ws] = next
 	return true, nil
-}
-
-func (f *fakeCoordStore) ClearSlotReservations(_ context.Context, ws string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	delete(f.pending, ws)
-	return nil
 }
 
 type recMetrics struct {
@@ -380,6 +378,60 @@ func TestReconcileSlotsRaisesToTheRowFloor(t *testing.T) {
 	}
 }
 
+// TestReconcileSlotsExactResetsEachLevelInOneStep pins the takeover write: the
+// counter becomes the live-row count and that level's pending markers go away
+// in the same store call, so a reservation can never land between a clear and
+// a separate counter write. A reservation taken after the reset counts
+// normally.
+func TestReconcileSlotsExactResetsEachLevelInOneStep(t *testing.T) {
+	store := &fakeCoordStore{
+		counts:  map[string]int64{"": 2, "ws-a": 2},
+		pending: map[string][]string{"": {"g-dead"}, "ws-a": {"w-dead"}},
+	}
+	s, _ := newSlotTestScheduler(t, store, "ws-a")
+	if err := s.reg.Put(registry.TaskEntry{TaskID: "t-1", WorkspaceID: "ws-a", DaemonID: "d-1", State: registry.StateRunning}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	if err := s.reconcileSlots(context.Background(), true); err != nil {
+		t.Fatalf("reconcileSlots(exact): %v", err)
+	}
+	if len(store.resetCalls) != 2 {
+		t.Fatalf("reset calls = %+v, want the global and the workspace level", store.resetCalls)
+	}
+	for _, c := range store.resetCalls {
+		if c.next != 1 {
+			t.Fatalf("reset %q -> %d, want 1 (the live row)", c.ws, c.next)
+		}
+		if c.before != 2 || c.cleared != 1 {
+			t.Fatalf("reset %q reported before=%d cleared=%d, want 2/1", c.ws, c.before, c.cleared)
+		}
+	}
+	if len(store.casCalls) != 0 {
+		t.Fatalf("the exact path used the periodic CAS: %+v", store.casCalls)
+	}
+	for ws, want := range map[string]int64{"": 1, "ws-a": 1} {
+		if got := store.counts[ws]; got != want {
+			t.Fatalf("counter %q = %d, want %d", ws, got, want)
+		}
+		if got := store.pendingLen(ws); got != 0 {
+			t.Fatalf("level %q kept %d reservation markers, want 0", ws, got)
+		}
+	}
+
+	// A reservation taken after the reset is counted, so the exact write never
+	// leaves a level unable to accept claims.
+	id, ok, err := store.ReserveSlot(context.Background(), "", 4)
+	if err != nil || !ok {
+		t.Fatalf("reserve after reset: ok=%v err=%v", ok, err)
+	}
+	if got := store.counts[""]; got != 2 {
+		t.Fatalf("counter after a post-reset reservation = %d, want 2", got)
+	}
+	if !store.hasPending("", id) {
+		t.Fatal("the post-reset reservation lost its marker")
+	}
+}
+
 // TestReconcileSlotsStillLowersALeak pins the other periodic direction: a
 // counter above the rows plus live reservations is lowered.
 func TestReconcileSlotsStillLowersALeak(t *testing.T) {
@@ -427,7 +479,7 @@ func TestReconcileSlotsReportsSnapshotFailure(t *testing.T) {
 	if len(m.errors) != 1 || m.errors[0] != "read_slots" {
 		t.Fatalf("state errors = %v, want read_slots", m.errors)
 	}
-	if len(store.casCalls) != 0 || len(store.setCalls) != 0 {
-		t.Fatalf("wrote after a failed read: cas=%v set=%v", store.casCalls, store.setCalls)
+	if len(store.casCalls) != 0 || len(store.resetCalls) != 0 {
+		t.Fatalf("wrote after a failed read: cas=%v reset=%v", store.casCalls, store.resetCalls)
 	}
 }

@@ -491,8 +491,14 @@ func (s *Scheduler) syncQueueDepth(ctx context.Context) {
 //
 // exact=true writes the truth in both directions: the takeover / startup path
 // uses it after a data loss (the store's counters are gone while the K8s rows
-// are rebuilt), where no concurrent claim can exist because the caller is not
-// yet the serving holder. exact=false is the periodic leader-round repair:
+// are rebuilt), where no claim of this instance can exist because the caller
+// is not yet the serving holder. The previous holder's reservations cannot
+// become rows, so each level is reset to its live-row count and its markers
+// are dropped in one atomic step: a split clear-then-write would let a
+// reservation land in between, keep its marker, and later have that marker
+// purged as a second decrement of a slot it never owned.
+//
+// exact=false is the periodic leader-round repair:
 //
 //   - a counter above the truth is a leak and is lowered;
 //   - a counter below the live-row count is a lost decrement (a failed
@@ -522,22 +528,52 @@ func (s *Scheduler) reconcileSlots(ctx context.Context, exact bool) error {
 			levels = append(levels, ws)
 		}
 	}
+	if exact {
+		return s.resetSlots(callCtx, levels)
+	}
+	return s.repairSlots(callCtx, levels)
+}
 
+// resetSlots is the exact write: every level's counter becomes its live-row
+// count and that level's pending markers go away in the same store step.
+func (s *Scheduler) resetSlots(ctx context.Context, levels []string) error {
+	total, perWS := s.liveRows()
+	for _, ws := range levels {
+		rows := total
+		if ws != "" {
+			rows = perWS[ws]
+		}
+		before, cleared, err := s.shared.ResetSlots(ctx, ws, rows)
+		if err != nil {
+			s.metrics.StateError("reset_slots")
+			return fmt.Errorf("%w: reset slots: %v", ErrStoreUnavailable, err)
+		}
+		fields := []any{
+			"level", "workspace", "workspace_id", ws,
+			"before", before, "after", rows, "reservations_cleared", cleared,
+		}
+		if ws == "" {
+			fields = []any{
+				"level", "global",
+				"before", before, "after", rows, "reservations_cleared", cleared,
+			}
+		}
+		s.log.WarnContext(ctx, "coordination.slots_reconciled", fields...)
+		s.metrics.SharedSlots(ws, int(rows))
+	}
+	return nil
+}
+
+// repairSlots is the periodic downward/floor repair: the snapshot and the
+// CAS in each direction keep it from losing a concurrent claim's reservation.
+func (s *Scheduler) repairSlots(ctx context.Context, levels []string) error {
 	type levelSnapshot struct {
 		count        int64
 		reservations int64
 	}
 	snapshots := make(map[string]levelSnapshot, len(levels))
 	for _, ws := range levels {
-		if exact {
-			// The previous holder is gone: its pending reservations cannot
-			// become rows, so they are reclaimed now (AC-76).
-			if err := s.shared.ClearSlotReservations(callCtx, ws); err != nil {
-				s.metrics.StateError("clear_slot_reservations")
-				return fmt.Errorf("%w: clear slot reservations: %v", ErrStoreUnavailable, err)
-			}
-		}
-		count, reservations, err := s.shared.SlotSnapshot(callCtx, ws)
+		count, reservations, err := s.shared.SlotSnapshot(ctx, ws)
 		if err != nil {
 			s.metrics.StateError("read_slots")
 			return fmt.Errorf("%w: read slot snapshot: %v", ErrStoreUnavailable, err)
@@ -547,26 +583,16 @@ func (s *Scheduler) reconcileSlots(ctx context.Context, exact bool) error {
 	}
 
 	// One traversal: rows are read after every level's snapshot (see above).
-	total := int64(0)
-	perWS := make(map[string]int64, len(levels))
-	for _, e := range s.reg.List() {
-		if e.State == registry.StateTerminal {
-			continue
+	total, perWS := s.liveRows()
+	for _, ws := range levels {
+		rows := total
+		if ws != "" {
+			rows = perWS[ws]
 		}
-		total++
-		if e.WorkspaceID != "" {
-			perWS[e.WorkspaceID]++
-		}
-	}
-
-	reconcileLevel := func(ws string, rows int64) error {
 		snap := snapshots[ws]
 		next := int64(0)
 		write := false
 		switch {
-		case exact:
-			next = rows + snap.reservations
-			write = true
 		case snap.count > rows+snap.reservations:
 			// A leak: lower to the row + live-reservation truth.
 			next = rows + snap.reservations
@@ -578,24 +604,17 @@ func (s *Scheduler) reconcileSlots(ctx context.Context, exact bool) error {
 			write = true
 		}
 		if !write {
-			return nil
+			continue
 		}
-		if exact {
-			if err := s.shared.SetSlots(callCtx, ws, next); err != nil {
-				s.metrics.StateError("reconcile_slots")
-				return fmt.Errorf("%w: reconcile slots: %v", ErrStoreUnavailable, err)
-			}
-		} else {
-			swapped, err := s.shared.CompareAndSetSlots(callCtx, ws, snap.count, next)
-			if err != nil {
-				s.metrics.StateError("reconcile_slots")
-				return fmt.Errorf("%w: reconcile slots: %v", ErrStoreUnavailable, err)
-			}
-			if !swapped {
-				// A claim moved the counter after the snapshot: this round has
-				// no safe value to write (the next round recomputes).
-				return nil
-			}
+		swapped, err := s.shared.CompareAndSetSlots(ctx, ws, snap.count, next)
+		if err != nil {
+			s.metrics.StateError("reconcile_slots")
+			return fmt.Errorf("%w: reconcile slots: %v", ErrStoreUnavailable, err)
+		}
+		if !swapped {
+			// A claim moved the counter after the snapshot: this round has
+			// no safe value to write (the next round recomputes).
+			continue
 		}
 		fields := []any{"level", "workspace", "workspace_id", ws, "before", snap.count, "after", next}
 		if ws == "" {
@@ -603,18 +622,24 @@ func (s *Scheduler) reconcileSlots(ctx context.Context, exact bool) error {
 		}
 		s.log.WarnContext(ctx, "coordination.slots_reconciled", fields...)
 		s.metrics.SharedSlots(ws, int(next))
-		return nil
-	}
-
-	if err := reconcileLevel("", total); err != nil {
-		return err
-	}
-	for _, ws := range levels[1:] {
-		if err := reconcileLevel(ws, perWS[ws]); err != nil {
-			return err
-		}
 	}
 	return nil
+}
+
+// liveRows counts the non-terminal rows once: the global total and the
+// per-workspace totals the two counter levels need.
+func (s *Scheduler) liveRows() (total int64, perWS map[string]int64) {
+	perWS = make(map[string]int64)
+	for _, e := range s.reg.List() {
+		if e.State == registry.StateTerminal {
+			continue
+		}
+		total++
+		if e.WorkspaceID != "" {
+			perWS[e.WorkspaceID]++
+		}
+	}
+	return total, perWS
 }
 
 // AttachShared attaches a follower instance to the shared state: it restores
