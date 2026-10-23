@@ -112,6 +112,10 @@ func TestMulti10SettleNoResultRetainsProjectionOnly(t *testing.T) {
 		t.Errorf("done key before settlement has result %q, want %q (the 404 settlement clears it)",
 			preSettle.Result, registry.ResultCompleted)
 	}
+	if preSettle.State != registry.StateTerminal {
+		t.Errorf("done key before settlement has state %q, want %q",
+			preSettle.State, registry.StateTerminal)
+	}
 
 	unblock()
 	got := <-done
@@ -141,6 +145,10 @@ func TestMulti10SettleNoResultRetainsProjectionOnly(t *testing.T) {
 			row.Result, row.FailureReason)
 	}
 	multi08AssertProjectionOnly(t, "settled done key", row)
+	// The settlement's signature is the cleared result, so this row pins the
+	// other half: the state must still say terminal. A record stripped of its
+	// own projection would keep neither.
+	multi08AssertProjectionContent(t, "settled done key", row, registry.StateTerminal, "")
 
 	// The restart face: the recovered terminal record answers the retention
 	// window too, with the same projection-only shape.
@@ -154,7 +162,5 @@ func TestMulti10SettleNoResultRetainsProjectionOnly(t *testing.T) {
 		t.Fatal("the settled record was lost across restart")
 	}
 	multi08AssertProjectionOnly(t, "after restart", restored)
-	if restored.Result != "" {
-		t.Errorf("restored settled record has result %q, want none", restored.Result)
-	}
+	multi08AssertProjectionContent(t, "after restart", restored, registry.StateTerminal, "")
 }
