@@ -35,18 +35,12 @@ const jobGoneGracePeriod = 60 * time.Second
 // is not. The metric counts every occurrence.
 const malformedClaimLogInterval = time.Minute
 
-// jobNamePollInterval is the cadence at which a claim retries a Job create
-// whose name is still held by a foreground-terminating predecessor.
-const jobNamePollInterval = 500 * time.Millisecond
-
-// jobNameWait bounds that retry. The Job controller deletes the pods first
-// and the Job object follows once they are gone, normally within the 30s
-// terminationGracePeriodSeconds of the template (§8.7).
-const jobNameWait = 45 * time.Second
-
-// errJobNameHeld reports that a Job name was still held after jobNameWait (by
-// a terminating predecessor or an object this task does not own): the claim is
-// deferred to the server's re-dispatch, never reported as this task's failure.
+// errJobNameHeld reports that a Job name is still held by a predecessor this
+// claim may not displace: the object is terminating, it belongs to another
+// task, or its deletion failed. The claim is deferred to the server's
+// re-dispatch — never reported as this task's failure, and never waited on:
+// the claim round carries a whole batch (C-3 batch = free slots), so one held
+// name must not stall the tasks behind it (§9.1 task.claim_deferred).
 var errJobNameHeld = errors.New("job name still held")
 
 // PrepareLeaseTTL is the server-side prepare lease (C-3): the claim
@@ -949,74 +943,63 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 	return nil
 }
 
-// createJob places the entry's Job and returns the object the apiserver
-// holds. AlreadyExists is never an adoption: adoption is the rebuild row of
-// the disposal table and needs the payload (§4.3), while this claim carries no
-// facts of any existing Job — the object is a predecessor corpse. It is
-// deleted and the create retried within jobNameWait; adopting it would burn
-// the whole boot bound and mix the pod instance domains (AC-08). A terminating
-// object holds its name until its pods are gone (bounded wait, then
-// errJobNameHeld — a deferred claim, never this task's failure).
+// createJob places the entry's Job in one bounded attempt: create, and on
+// AlreadyExists one name probe (plus at most one stale-corpse delete and one
+// retry). It never waits for the name to free — a name still held defers the
+// claim to the server's re-dispatch instead (§9.1 task.claim_deferred), so one
+// task cannot hold up the rest of the batch.
+//
+// AlreadyExists is never an adoption (§4.3, AC-08): the object is a
+// predecessor corpse, and adopting it would mix the pod instance domains and
+// burn the boot bound.
 func (s *Scheduler) createJob(ctx context.Context, e registry.TaskEntry, job *batchv1.Job) (*batchv1.Job, error) {
-	deadline := s.now().Add(jobNameWait)
-	// maxPolls backs the clock bound so the loop cannot spin on a clock the
-	// caller froze (tests) or on a view that keeps reporting the name as
-	// free while Create disagrees.
-	maxPolls := int(jobNameWait / jobNamePollInterval)
-	// staleDeleteErr keeps the last failed attempt to free the name, so a
-	// deferred claim carries its cause.
-	var staleDeleteErr error
-	for poll := 0; ; poll++ {
-		created, err := s.jobs.CreateJob(ctx, job)
-		if err == nil {
-			return created, nil
-		}
-		if !apierrors.IsAlreadyExists(err) {
-			return nil, err
-		}
-		existing, probeErr := s.jobs.GetJob(ctx, e.JobName)
-		if probeErr != nil {
-			// Truth unknown: the name may still be held, so keep polling.
-			// Transient read failures stay in Debug (cf. prepare-lease);
-			// task.claim_deferred at the bound is the alert, and the outcome
-			// here is a deferred claim, never a task failure (AC-09).
-			s.log.DebugContext(ctx, "job.probe_failed",
-				"task_id", e.TaskID, "job_name", e.JobName, "err", probeErr)
-		} else if existing != nil && existing.DeletionTimestamp == nil {
-			if !jobOwnedBy(existing, e) {
-				// The name is not a locating face for deletion (§3): an
-				// object this task does not own is never removed. Defer the
-				// claim instead; the occupied name stays visible through
-				// task.claim_deferred.
-				return nil, fmt.Errorf("%w: %s (held by an object this task does not own)", errJobNameHeld, e.JobName)
-			}
-			if derr := s.jobs.DeleteJob(ctx, e.JobName); derr != nil {
-				staleDeleteErr = derr
-				s.log.DebugContext(ctx, "job.stale_delete_failed",
-					"task_id", e.TaskID, "job_name", e.JobName, "err", derr)
-			} else {
-				staleDeleteErr = nil
-				s.log.InfoContext(ctx, "job.stale_deleted",
-					"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID)
-			}
-		}
-		if poll >= maxPolls || s.now().After(deadline) {
-			if staleDeleteErr != nil {
-				return nil, fmt.Errorf("%w: %s (delete stale job: %v)", errJobNameHeld, e.JobName, staleDeleteErr)
-			}
-			return nil, fmt.Errorf("%w: %s", errJobNameHeld, e.JobName)
-		}
-		if probeErr == nil && existing == nil {
-			// The name just freed (GetJob's nil means the object is gone):
-			// retry the create without waiting out a poll interval.
-			continue
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(jobNamePollInterval):
-		}
+	created, err := s.jobs.CreateJob(ctx, job)
+	if err == nil {
+		return created, nil
 	}
+	if !apierrors.IsAlreadyExists(err) {
+		return nil, err
+	}
+	existing, probeErr := s.jobs.GetJob(ctx, e.JobName)
+	switch {
+	case probeErr != nil:
+		// Truth unknown: the name may still be held. A deferred claim, never
+		// a task failure (AC-09); transient read failures stay in Debug and
+		// task.claim_deferred is the alert.
+		s.log.DebugContext(ctx, "job.probe_failed",
+			"task_id", e.TaskID, "job_name", e.JobName, "err", probeErr)
+		return nil, fmt.Errorf("%w: %s", errJobNameHeld, e.JobName)
+	case existing == nil:
+		// The name freed between the create and the probe: retry once.
+	case existing.DeletionTimestamp != nil:
+		// A terminating predecessor holds its name until its pods are gone.
+		return nil, fmt.Errorf("%w: %s", errJobNameHeld, e.JobName)
+	case !jobOwnedBy(existing, e):
+		// The name is not a locating face for deletion (§3): an object this
+		// task does not own is never removed. Defer the claim instead; the
+		// occupied name stays visible through task.claim_deferred.
+		return nil, fmt.Errorf("%w: %s (held by an object this task does not own)", errJobNameHeld, e.JobName)
+	default:
+		// A stale corpse of this task: delete it and retry the create in the
+		// same claim (Background deletion removes the object at once).
+		if derr := s.jobs.DeleteJob(ctx, e.JobName); derr != nil {
+			s.log.DebugContext(ctx, "job.stale_delete_failed",
+				"task_id", e.TaskID, "job_name", e.JobName, "err", derr)
+			return nil, fmt.Errorf("%w: %s (delete stale job: %v)", errJobNameHeld, e.JobName, derr)
+		}
+		s.log.InfoContext(ctx, "job.stale_deleted",
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID)
+	}
+	// One retry: the probe said the name just freed, or the stale corpse is
+	// gone.
+	created, err = s.jobs.CreateJob(ctx, job)
+	if err == nil {
+		return created, nil
+	}
+	if apierrors.IsAlreadyExists(err) {
+		return nil, fmt.Errorf("%w: %s", errJobNameHeld, e.JobName)
+	}
+	return nil, err
 }
 
 // jobOwnedBy reports whether the existing object is a Foreman task Job of this

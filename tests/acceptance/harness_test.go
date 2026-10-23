@@ -1314,8 +1314,6 @@ type jobClient struct {
 	// nameHeld makes CreateJob answer AlreadyExists for a name, as the
 	// apiserver does while a predecessor still holds it.
 	nameHeld map[string]bool
-	// onGetJob runs before a GetJob is answered (scenario clock hooks).
-	onGetJob func()
 
 	existingJobs map[string]*batchv1.Job
 	jobs         []batchv1.Job
@@ -1379,14 +1377,6 @@ func (c *jobClient) setDeleteSecretError(err error) {
 	c.deleteSecretErr = err
 }
 
-// setOnGetJob programs the GetJob hook (nil clears it). The hook runs under
-// the client lock, so the write takes the same lock as the read.
-func (c *jobClient) setOnGetJob(fn func()) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.onGetJob = fn
-}
-
 // setDeleteJobError programs Job deletion to fail (nil clears it): a
 // terminating predecessor that keeps its name.
 func (c *jobClient) setDeleteJobError(err error) {
@@ -1409,9 +1399,6 @@ func (c *jobClient) setNameHeld(name string, held bool) {
 func (c *jobClient) GetJob(_ context.Context, name string) (*batchv1.Job, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if c.onGetJob != nil {
-		c.onGetJob()
-	}
 	c.getJobs = append(c.getJobs, name)
 	job, ok := c.existingJobs[name]
 	if !ok {
@@ -2778,9 +2765,9 @@ type harness struct {
 	bundles    *proxy.SkillCache
 	skillClock *steppedClock
 	// schedClock is the scheduler's one clock seam: buildHarnessWith seeds it
-	// from harnessOptions.clock, and rebuildScheduler carries it forward. A
-	// scenario that has to exhaust a wall-clock bound (the Job-name wait) sets
-	// it before rebuilding.
+	// from harnessOptions.clock, and rebuildScheduler carries it forward. The
+	// delivery-latency scenarios inject a fixed clock here to sample the
+	// claim -> commit span.
 	schedClock func() time.Time
 
 	// jobImage overrides the reference template's <job-image> value: a

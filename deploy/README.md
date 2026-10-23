@@ -347,8 +347,8 @@ restores them instead of rebuilding from K8s (ADR-046 阶段一,
 - `FOREMAN_INSTANCE_TTL` (default `30s`) — a replica's liveness row; the
   shutdown path uses it to decide whether this replica is the last one.
 - `FOREMAN_TASK_LOCK_TTL` (default `120s`) — the per-task write lock's lease.
-  It must cover the longest locked action (the claim chain, including the
-  Job-name wait); a dead holder's lock expires after it and the convergence
+  It must cover the longest locked action (the claim chain: secret and Job
+  create); a dead holder's lock expires after it and the convergence
   round takes the action over.
 
 Requirements (§7 部署面):
