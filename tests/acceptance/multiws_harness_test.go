@@ -470,17 +470,74 @@ func (m *multiWS) tasksByWorkspace(workspaceID string) []registry.TaskEntry {
 // workspace so a queued task is never mistaken for a slow loop.
 const multiWSClaimInterval = 10 * time.Millisecond
 
+// claimRoundClock records when a claim round begins, on the producer side.
+// The loop reads its budget at the head of every round and calls ReserveSlots
+// only when that round is about to claim, so a budget instant promoted by the
+// following reserve marks a round that can put a request on the wire. A round
+// entered after the loop's context is cancelled is not one: its claim is
+// refused before it is sent, and charging it to the window would judge the
+// loop's own select race instead of the shutdown sequence.
+type claimRoundClock struct {
+	ctx context.Context
+
+	mu      sync.Mutex
+	pending time.Time
+	starts  []time.Time
+}
+
+// budget stamps the round head; the instant is kept only while the loop can
+// still reach the wire.
+func (c *claimRoundClock) budget() {
+	if c.ctx != nil && c.ctx.Err() != nil {
+		return
+	}
+	now := time.Now()
+	c.mu.Lock()
+	c.pending = now
+	c.mu.Unlock()
+}
+
+// reserve promotes the pending head: this round is now issuing its claim.
+func (c *claimRoundClock) reserve() {
+	c.mu.Lock()
+	if !c.pending.IsZero() {
+		c.starts = append(c.starts, c.pending)
+		c.pending = time.Time{}
+	}
+	c.mu.Unlock()
+}
+
+// window reports the last started round and how many started in total.
+func (c *claimRoundClock) window() (last time.Time, rounds int) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if len(c.starts) == 0 {
+		return time.Time{}, 0
+	}
+	return c.starts[len(c.starts)-1], len(c.starts)
+}
+
 // multiWSWorkspaceClaimer binds the shared scheduler to one workspace's claim
 // budget and reservation face, exactly as cmd/foreman wires the per-workspace
-// claim loops (§10 两级预算: 每 workspace 一套控制面).
+// claim loops (§10 两级预算: 每 workspace 一套控制面). A nil clock keeps the
+// plain production shape.
 type multiWSWorkspaceClaimer struct {
 	sched       *scheduler.Scheduler
 	workspaceID string
+	clock       *claimRoundClock
 }
 
-func (w multiWSWorkspaceClaimer) ClaimBudget() int { return w.sched.ClaimBudgetFor(w.workspaceID) }
+func (w multiWSWorkspaceClaimer) ClaimBudget() int {
+	if w.clock != nil {
+		w.clock.budget()
+	}
+	return w.sched.ClaimBudgetFor(w.workspaceID)
+}
 
 func (w multiWSWorkspaceClaimer) ReserveSlots(ctx context.Context, want int) ([]scheduler.SlotReservation, error) {
+	if w.clock != nil {
+		w.clock.reserve()
+	}
 	return w.sched.ReserveClaimSlots(ctx, w.workspaceID, want)
 }
 
@@ -493,34 +550,43 @@ func (w multiWSWorkspaceClaimer) OnClaimReserved(ctx context.Context, task json.
 }
 
 // startClaimLoopFor runs the production claim loop under one workspace's
-// identity until the returned stop function (or the test's cleanup) cancels
-// it. Stopping waits for the loop to finish its current round, so the caller
-// reads a settled fixture rather than a claim in flight.
+// identity until the returned stop function cancels it. Stopping waits for
+// the loop to finish its current round, so the caller reads a settled
+// fixture rather than a claim in flight.
 func (m *multiWS) startClaimLoopFor(workspaceID string) func() {
+	cancel, wait := m.startClaimLoopDetachedFor(workspaceID, nil)
+	var once sync.Once
+	return func() { once.Do(func() { cancel(); wait() }) }
+}
+
+// startClaimLoopDetachedFor runs the same loop and returns the two halves of
+// its stop: cancel asks the loop to stop without waiting, wait blocks until it
+// returned. Shutdown scenarios keep the halves apart to pin the exit ordering.
+// A non-nil clock observes the loop's claim rounds from inside its claimer.
+func (m *multiWS) startClaimLoopDetachedFor(workspaceID string, clock *claimRoundClock) (cancel func(), wait func()) {
 	m.t.Helper()
 	client, ok := m.clients[workspaceID]
 	if !ok {
 		m.t.Fatalf("no proxy client for workspace %q", workspaceID)
 	}
+	ctx, cancelCtx := context.WithCancel(m.t.Context())
+	if clock != nil {
+		clock.ctx = ctx
+	}
 	loop := proxy.NewClaimLoop(proxy.Config{
 		ClaimInterval:     multiWSClaimInterval,
 		ClaimIntervalIdle: multiWSClaimInterval,
-	}, client, multiWSWorkspaceClaimer{sched: m.sched, workspaceID: workspaceID})
-	ctx, cancel := context.WithCancel(m.t.Context())
+	}, client, multiWSWorkspaceClaimer{sched: m.sched, workspaceID: workspaceID, clock: clock})
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		_ = loop.Run(ctx)
 	}()
 	var once sync.Once
-	stop := func() {
-		once.Do(func() {
-			cancel()
-			<-done
-		})
-	}
-	m.t.Cleanup(stop)
-	return stop
+	cancel = func() { once.Do(cancelCtx) }
+	wait = func() { <-done }
+	m.t.Cleanup(func() { cancel(); wait() })
+	return cancel, wait
 }
 
 // multiWSExcessClaimStaysQueued judges the queue half of TC-tech-multiws-05:

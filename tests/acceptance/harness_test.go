@@ -260,6 +260,11 @@ type upstreamStub struct {
 	// heartbeats maps a real runtime id to the status the heartbeat answers
 	// with (default 200).
 	heartbeats map[string]int
+	// rows is the server-side real runtime row state: C-1 creates the row
+	// online, C-14 (graceful exit) flips the carried ids offline. The row is
+	// retained after going offline; the server's no-heartbeat expiry scan is
+	// not modelled here.
+	rows map[string]string
 	// modelsStatus is the C21 answer (default 200).
 	modelsStatus int
 	// models tracks the caller-facing model-list commands by request id.
@@ -322,6 +327,7 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		registerRepos:        json.RawMessage(`[]`),
 		registerReposVersion: "",
 		heartbeats:           map[string]int{},
+		rows:                 map[string]string{},
 		modelsStatus:         200,
 		models:               map[string]*modelCommand{},
 		skillStatus:          200,
@@ -374,6 +380,13 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 			}
 			answers = append(answers, answer)
 		}
+		stub.mu.Lock()
+		for _, answer := range answers {
+			if id, ok := answer["id"].(string); ok {
+				stub.rows[id] = "online"
+			}
+		}
+		stub.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"runtimes": answers, "repos": repos, "repos_version": version, "settings": settings,
 		})
@@ -479,6 +492,15 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 	mux.HandleFunc("POST /api/daemon/deregister", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		stub.record(r, "/api/daemon/deregister", body)
+		var req struct {
+			RuntimeIDs []string `json:"runtime_ids"`
+		}
+		_ = json.Unmarshal(body, &req)
+		stub.mu.Lock()
+		for _, id := range req.RuntimeIDs {
+			stub.rows[id] = "offline"
+		}
+		stub.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("POST /api/daemon/runtimes/{rid}/models/{req}/result", func(w http.ResponseWriter, r *http.Request) {
@@ -1097,6 +1119,14 @@ func (s *upstreamStub) calls(method, path string) []upstreamRequest {
 		}
 	}
 	return found
+}
+
+// rowStatus reads one real runtime's server-side row state ("online",
+// "offline", or "" when no C-1 ever created it).
+func (s *upstreamStub) rowStatus(runtimeID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rows[runtimeID]
 }
 
 func (s *upstreamStub) pathCalls(prefix string) []upstreamRequest {
@@ -3642,20 +3672,25 @@ func (s *killedLease) ReleaseLeadership(ctx context.Context, owner string) error
 	return s.CoordStore.ReleaseLeadership(ctx, owner)
 }
 
-// stopLeader releases the lease and parks this instance's control plane. The
-// handles are cleared first so the gates close before the loop is awaited and
-// a second call (cleanup after an explicit stop) is a no-op.
+// stopLeader releases the lease and parks this instance's control plane.
 func (h *harness) stopLeader(t *testing.T) {
 	t.Helper()
+	h.cancelLeader()()
+}
+
+// cancelLeader releases the lease without waiting for the loop to return; the
+// returned wait blocks until it did. The handles are cleared first so the
+// cleanup path stays a no-op and the gates close before the loop is awaited.
+func (h *harness) cancelLeader() func() {
 	h.leaderMu.Lock()
 	stop, done := h.leaderStop, h.leaderDone
 	h.leaderStop, h.leaderDone, h.leader, h.leaderLease = nil, nil, nil, nil
 	h.leaderMu.Unlock()
 	if stop == nil {
-		return
+		return func() {}
 	}
 	stop()
-	<-done
+	return func() { <-done }
 }
 
 // queueDepth reads the shared queue's marker count.
