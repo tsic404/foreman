@@ -21,6 +21,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/alicebob/miniredis/v2"
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
@@ -30,8 +31,13 @@ import (
 	"github.com/tsic404/foreman/internal/proxy"
 	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
+	"github.com/tsic404/foreman/internal/state"
 	"github.com/tsic404/foreman/internal/workspace"
 )
+
+// multiWSTaskLockTTL bounds one per-task write lock in the shared form of the
+// fixture, matching the two-instance fixture's value.
+const multiWSTaskLockTTL = 30 * time.Second
 
 // multiWS is the multi-workspace fixture.
 type multiWS struct {
@@ -52,6 +58,10 @@ type multiWS struct {
 	handler  http.Handler
 	jobsHTTP *httptest.Server
 	server   *multiServer
+	// coord is the stage-two coordination face the scheduler reads its
+	// counters from; nil keeps the process-local form.
+	coord      state.CoordStore
+	instanceID string
 }
 
 // multiBuilder is the multi-workspace scheduler's Job seam: the identity and
@@ -211,6 +221,48 @@ func newMultiWSWithURLs(t *testing.T, ids []string, urls map[string]string) *mul
 // deployment shares them.
 func newMultiWSFromIdentities(t *testing.T, identities []wsIdentity, urls map[string]string) *multiWS {
 	t.Helper()
+	return newMultiWSFromIdentitiesWithCoord(t, identities, urls, nil, "")
+}
+
+// newMultiWSShared builds the fixture over the stage-two coordination face: one
+// miniredis store shared by every workspace identity and wired into the
+// scheduler, as one deployment wires it. A face that reads the shared counters
+// is only reachable through this form; the process-local fixture never takes
+// those branches.
+func newMultiWSShared(t *testing.T, ids ...string) *multiWS {
+	t.Helper()
+	mr := miniredis.RunT(t)
+	// A real store expires its reservations on its own clock.
+	mr.ClockTTL(true)
+	st, err := state.New(state.Config{
+		URL:         "redis://" + mr.Addr(),
+		DialTimeout: time.Second,
+		EntryTTL:    48 * time.Hour,
+		Grace:       30 * time.Second,
+	})
+	if err != nil {
+		t.Fatalf("state.New: %v", err)
+	}
+	coord, ok := st.(state.CoordStore)
+	if !ok {
+		t.Fatalf("state.New returned a store without the coordination face")
+	}
+	identities := make([]wsIdentity, 0, len(ids))
+	for _, id := range ids {
+		identities = append(identities, wsIdentity{
+			workspaceID: id,
+			daemonID:    "foreman-" + id,
+			token:       "mdt_" + id,
+			name:        id,
+		})
+	}
+	return newMultiWSFromIdentitiesWithCoord(t, identities, nil, coord, "instance-multiws")
+}
+
+// newMultiWSFromIdentitiesWithCoord builds the fixture around a given identity
+// set and coordination face; a nil coord keeps the process-local form.
+func newMultiWSFromIdentitiesWithCoord(t *testing.T, identities []wsIdentity, urls map[string]string, coord state.CoordStore, instanceID string) *multiWS {
+	t.Helper()
 	if len(identities) < 1 {
 		t.Fatalf("newMultiWS needs at least one workspace")
 	}
@@ -302,13 +354,17 @@ func newMultiWSFromIdentities(t *testing.T, identities []wsIdentity, urls map[st
 		ReconcileInterval:           30 * time.Second,
 	}
 	server := &multiServer{reg: reg, clients: clients}
-	sched, err := scheduler.New(schedCfg, reg, jobs, bld, server, metrics,
+	schedOpts := []scheduler.Option{
 		scheduler.WithPendingReports(pending),
 		scheduler.WithRevoker(noRevoker{}),
 		scheduler.WithProbeRegistry(probes),
 		scheduler.WithLogger(slog.New(slog.NewJSONHandler(logs, nil))),
 		scheduler.WithRuntimeIdentity(clientSet.RuntimeIdentity),
-	)
+	}
+	if coord != nil {
+		schedOpts = append(schedOpts, scheduler.WithSharedStore(coord, instanceID, multiWSTaskLockTTL))
+	}
+	sched, err := scheduler.New(schedCfg, reg, jobs, bld, server, metrics, schedOpts...)
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
 	}
@@ -324,6 +380,7 @@ func newMultiWSFromIdentities(t *testing.T, identities []wsIdentity, urls map[st
 		metrics: metrics, logs: logs, pending: pending, sched: sched, schedCfg: schedCfg,
 		clients: clients, set: clientSet, upstream: upstream,
 		handler: fakeServer, jobsHTTP: httpServer, server: server,
+		coord: coord, instanceID: instanceID,
 	}
 }
 
@@ -333,13 +390,17 @@ func (m *multiWS) rebuildScheduler(mutate func(*scheduler.Config)) {
 	m.t.Helper()
 	cfg := m.schedCfg
 	mutate(&cfg)
-	sched, err := scheduler.New(cfg, m.reg, m.jobs, m.builder, m.server, m.metrics,
+	schedOpts := []scheduler.Option{
 		scheduler.WithPendingReports(m.pending),
 		scheduler.WithRevoker(noRevoker{}),
 		scheduler.WithProbeRegistry(m.probes),
 		scheduler.WithLogger(slog.New(slog.NewJSONHandler(m.logs, nil))),
 		scheduler.WithRuntimeIdentity(m.set.RuntimeIdentity),
-	)
+	}
+	if m.coord != nil {
+		schedOpts = append(schedOpts, scheduler.WithSharedStore(m.coord, m.instanceID, multiWSTaskLockTTL))
+	}
+	sched, err := scheduler.New(cfg, m.reg, m.jobs, m.builder, m.server, m.metrics, schedOpts...)
 	if err != nil {
 		m.t.Fatalf("scheduler.New: %v", err)
 	}
