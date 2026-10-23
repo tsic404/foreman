@@ -163,6 +163,13 @@ func newTestRigWithRegister(t *testing.T, register func(*stubUpstream)) *testRig
 // the caller's control (a profile identity needs its own discovery).
 func newTestRigWith(t *testing.T, register func(*stubUpstream), discovery registry.Discovery) *testRig {
 	t.Helper()
+	return newTestRigWithClock(t, register, discovery, time.Now)
+}
+
+// newTestRigWithClock is newTestRigWith with one clock injected into the
+// registry and the scheduler, the way the process wires both to time.Now.
+func newTestRigWithClock(t *testing.T, register func(*stubUpstream), discovery registry.Discovery, now func() time.Time) *testRig {
+	t.Helper()
 	upstream, stub := newStubUpstream(t)
 	register(stub)
 
@@ -193,7 +200,7 @@ func newTestRigWith(t *testing.T, register func(*stubUpstream), discovery regist
 		t.Fatalf("ValidateWorkspaceScope: %v", err)
 	}
 
-	rig.reg = registry.New(time.Now)
+	rig.reg = registry.New(now)
 	rig.jobs = &fakeJobs{created: time.Now()}
 	rig.revoker = &fakeRevoker{}
 	pending, err := scheduler.NewPendingReports(t.TempDir())
@@ -215,6 +222,7 @@ func newTestRigWith(t *testing.T, register func(*stubUpstream), discovery regist
 		scheduler.WithRevoker(rig.revoker),
 		scheduler.WithProbeRegistry(rig.probes),
 		scheduler.WithRuntimeIdentity(rig.client.RuntimeIdentity),
+		scheduler.WithClock(now),
 	)
 	if err != nil {
 		t.Fatalf("scheduler.New: %v", err)
@@ -361,6 +369,33 @@ func TestRoutingRules(t *testing.T) {
 	}
 	if n := len(rig.stub.calls("GET", "/api/daemon/unknown")); n != 0 {
 		t.Errorf("an fmj_ request must never pass through; upstream saw %d calls", n)
+	}
+}
+
+// The delivery histogram reads Foreman's clock, not the wall clock: claimed_at
+// and the commit instant both come from the scheduler's injected clock, so the
+// sample is their span even when that clock is not time.Now.
+func TestDeliveryLatencyReadsTheSchedulerClock(t *testing.T) {
+	now := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	rig := newTestRigWithClock(t, func(stub *stubUpstream) { stubRegister(stub, "rid-real") },
+		testDiscovery(), func() time.Time { return now })
+
+	rig.claimTask(t, "t-latency")
+	tok := rig.token(t, "t-latency")
+	jobRID := rig.registerDaemon(t, "t-latency", tok)
+
+	now = now.Add(12 * time.Second)
+	code, body := rig.call(t, "POST", "/api/daemon/tasks/claim", tok,
+		[]byte(`{"daemon_id":"fm-t-latency","runtime_ids":["`+jobRID+`"],"max_tasks":1}`))
+	if code != 200 || !bytes.Contains(body, []byte(`"id":"t-latency"`)) {
+		t.Fatalf("S6 = %d: %s", code, body)
+	}
+	spans := rig.metrics.deliveryLatencySpans()
+	if len(spans) != 1 {
+		t.Fatalf("delivery latency samples = %d, want 1", len(spans))
+	}
+	if spans[0] != 12 {
+		t.Fatalf("latency = %v seconds, want the injected clock's 12s claim -> commit span", spans[0])
 	}
 }
 
