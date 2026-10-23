@@ -64,11 +64,12 @@ type Store interface {
 	Revoke(ctx context.Context, ws, hash string, validUntil time.Time) error
 	// IsRevoked answers the revocation check for one digest.
 	IsRevoked(ctx context.Context, ws, hash string) (bool, error)
-	// ListRevoked lists the live revocations (digest → valid-until) so a
-	// restart can seed the in-process positive cache. The cache only ever
-	// holds revoked digests — the safe direction: it can reject a token
+	// ListRevoked lists the live revocations grouped by workspace
+	// (workspace → digest → valid-until) so a restart can seed the in-process
+	// positive cache without flattening the partition (§6.1). The cache only
+	// ever holds revoked digests — the safe direction: it can reject a token
 	// early, never accept one the shared set revoked.
-	ListRevoked(ctx context.Context) (map[string]time.Time, error)
+	ListRevoked(ctx context.Context) (map[string]map[string]time.Time, error)
 
 	// Ping verifies the store is reachable; a failed ping is the startup
 	// signal that the store is down (the restore then degrades to the K8s
@@ -245,8 +246,10 @@ func (noStore) ListSettled(context.Context) ([]registry.TaskEntry, error) { retu
 func (noStore) DeleteSettled(context.Context, string, string) error       { return nil }
 func (noStore) Revoke(context.Context, string, string, time.Time) error   { return nil }
 func (noStore) IsRevoked(context.Context, string, string) (bool, error)   { return false, nil }
-func (noStore) ListRevoked(context.Context) (map[string]time.Time, error) { return nil, nil }
-func (noStore) Ping(context.Context) error                                { return nil }
+func (noStore) ListRevoked(context.Context) (map[string]map[string]time.Time, error) {
+	return nil, nil
+}
+func (noStore) Ping(context.Context) error { return nil }
 
 // New returns the Store implementation for cfg. An empty URL yields the
 // no-op store (the deployment did not configure the shared state face); a
@@ -512,18 +515,22 @@ func (s *redisStore) Revoke(ctx context.Context, ws, hash string, validUntil tim
 	return s.rdb.Set(ctx, s.revokeKey(ws, hash), validUntil.Unix(), ttl).Err()
 }
 
-func (s *redisStore) ListRevoked(ctx context.Context) (map[string]time.Time, error) {
-	var out = make(map[string]time.Time)
+// ListRevoked returns the live revocations grouped by workspace
+// (workspace → digest → valid-until). The grouping is what keeps §6.1's
+// partition across a restart seed: a digest revoked in one workspace must not
+// adjudicate another workspace's token.
+func (s *redisStore) ListRevoked(ctx context.Context) (map[string]map[string]time.Time, error) {
+	out := make(map[string]map[string]time.Time)
 	iter := s.rdb.Scan(ctx, 0, keyRevoke+"*", 256).Iterator()
 	for iter.Next(ctx) {
 		key := iter.Val()
-		// Key shape: foreman:revocation:<ws>:<hash> — the digest is the last
-		// colon-separated segment.
-		idx := strings.LastIndex(key, ":")
-		if idx < 0 || idx == len(key)-1 {
+		// Key shape: foreman:revocation:<ws>:<hash>.
+		rest := strings.TrimPrefix(key, keyRevoke)
+		idx := strings.LastIndex(rest, ":")
+		if idx <= 0 || idx == len(rest)-1 {
 			continue
 		}
-		digest := key[idx+1:]
+		ws, digest := rest[:idx], rest[idx+1:]
 		raw, err := s.rdb.Get(ctx, key).Result()
 		if err != nil {
 			continue
@@ -532,7 +539,10 @@ func (s *redisStore) ListRevoked(ctx context.Context) (map[string]time.Time, err
 		if err != nil {
 			continue
 		}
-		out[digest] = time.Unix(sec, 0)
+		if out[ws] == nil {
+			out[ws] = make(map[string]time.Time)
+		}
+		out[ws][digest] = time.Unix(sec, 0)
 	}
 	if err := iter.Err(); err != nil {
 		return nil, err

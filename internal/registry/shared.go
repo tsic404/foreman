@@ -75,8 +75,9 @@ type SharedStore interface {
 	ListEntries(ctx context.Context) ([]TaskEntry, error)
 	// ListSettled lists every settled record (takeover resync).
 	ListSettled(ctx context.Context) ([]TaskEntry, error)
-	// ListRevoked lists the revocation set (takeover resync).
-	ListRevoked(ctx context.Context) (map[string]time.Time, error)
+	// ListRevoked lists the revocation set grouped by workspace (takeover
+	// resync).
+	ListRevoked(ctx context.Context) (map[string]map[string]time.Time, error)
 	// PutSessionNode stores one soft-affinity row (§4.5 共享索引) with its
 	// retention as the store-side TTL.
 	PutSessionNode(ctx context.Context, ws, key string, raw []byte, ttl time.Duration) error

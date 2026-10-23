@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -215,16 +216,27 @@ func (f *fakeStateStore) ListSettled(context.Context) ([]TaskEntry, error) {
 	}
 	return out, nil
 }
-func (f *fakeStateStore) Revoke(_ context.Context, _, hash string, until time.Time) error {
-	f.revoked[hash] = until
+func (f *fakeStateStore) Revoke(_ context.Context, ws, hash string, until time.Time) error {
+	f.revoked[ws+"\x00"+hash] = until
 	return nil
 }
-func (f *fakeStateStore) IsRevoked(_ context.Context, _, hash string) (bool, error) {
-	_, ok := f.revoked[hash]
+func (f *fakeStateStore) IsRevoked(_ context.Context, ws, hash string) (bool, error) {
+	_, ok := f.revoked[ws+"\x00"+hash]
 	return ok, nil
 }
-func (f *fakeStateStore) ListRevoked(context.Context) (map[string]time.Time, error) {
-	return f.revoked, nil
+func (f *fakeStateStore) ListRevoked(context.Context) (map[string]map[string]time.Time, error) {
+	out := make(map[string]map[string]time.Time)
+	for key, until := range f.revoked {
+		ws, hash, found := strings.Cut(key, "\x00")
+		if !found {
+			continue
+		}
+		if out[ws] == nil {
+			out[ws] = make(map[string]time.Time)
+		}
+		out[ws][hash] = until
+	}
+	return out, nil
 }
 func (f *fakeStateStore) Ping(context.Context) error { return f.pingErr }
 
