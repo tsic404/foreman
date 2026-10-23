@@ -1,4 +1,4 @@
-// TC-tech-multiws-13 implements AC-100: the workspace identifier's value face.
+// TC-tech-multiws-16 implements AC-105: the workspace identifier's value face.
 // A workspace id is a label value and a workspace-placeholder render value, so
 // a value outside the label grammar refuses startup (naming the id in both
 // credential shapes), while every legal shape starts and renders verbatim —
