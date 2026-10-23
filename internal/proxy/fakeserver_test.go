@@ -1092,6 +1092,32 @@ func TestS26SkillBundlesResolve(t *testing.T) {
 	}
 }
 
+// TestNewFakeServerSkillBundlesInvariant pins the resolve-cache invariant: a
+// built server always owns one, and a build that cannot supply it fails while
+// the server is assembled rather than on the first S-26 request.
+func TestNewFakeServerSkillBundlesInvariant(t *testing.T) {
+	t.Run("a build with neither a client nor bundles fails", func(t *testing.T) {
+		defer func() {
+			recovered := recover()
+			if recovered == nil {
+				t.Fatal("NewFakeServer with no client and no bundles did not fail")
+			}
+			if msg, ok := recovered.(string); !ok || !strings.Contains(msg, "WithSkillBundles") {
+				t.Fatalf("panic = %v, want the construction error naming WithSkillBundles", recovered)
+			}
+		}()
+		NewFakeServer(nil, nil, nil, nil, nil, &fakeMetrics{})
+	})
+
+	t.Run("injected bundles stand in for the client", func(t *testing.T) {
+		bundles := NewSkillCache(Config{}, nil, &fakeMetrics{})
+		handler := NewFakeServer(nil, nil, nil, nil, nil, &fakeMetrics{}, WithSkillBundles(bundles))
+		if got := handler.bundlesFor("ws-1"); got != bundles {
+			t.Fatalf("bundlesFor = %p, want the injected cache %p", got, bundles)
+		}
+	})
+}
+
 func TestS23PassthroughKeepsCallerCredential(t *testing.T) {
 	rig := newTestRig(t)
 	rig.claimTask(t, "t-hooks")

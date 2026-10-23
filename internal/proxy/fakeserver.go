@@ -102,7 +102,9 @@ func WithSkillBundles(cache *SkillCache) FakeServerOption {
 
 // NewFakeServer builds the handler with the full §2.2 endpoint table.
 // ws may be nil; the S30 route is then not registered and WS dials get a
-// 404 (the FOREMAN_WS_ENABLED=false degradation).
+// 404 (the FOREMAN_WS_ENABLED=false degradation). client may be nil only when
+// bundles are injected with WithSkillBundles: every built server resolves S-26
+// through a cache, so a build without one panics here.
 func NewFakeServer(issuer *auth.Issuer, reg *registry.Registry, sched TaskScheduler, client *Client, ws *WSHandler, metrics Metrics, opts ...FakeServerOption) *FakeServer {
 	s := &FakeServer{
 		issuer:  issuer,
@@ -124,7 +126,11 @@ func NewFakeServer(issuer *auth.Issuer, reg *registry.Registry, sched TaskSchedu
 			s.clients = set
 		}
 	}
-	if s.bundles == nil && client != nil {
+	if s.bundles == nil {
+		if client == nil {
+			// Reject a build that could only nil-panic on the first S-26 resolve.
+			panic("proxy: NewFakeServer needs a client or WithSkillBundles")
+		}
 		s.bundles = NewSkillCache(client.cfg, client, s.metrics)
 	}
 	s.routes()
