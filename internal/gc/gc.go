@@ -20,6 +20,16 @@ const (
 	skillCacheDir = ".skill-cache"
 )
 
+// Skill-bundle cache layout the upstream daemon writes (anchored in
+// docs/upstream-anchors.md): <workspaces>/.skill-cache/<version>/<workspace>/
+// <source>/<id>/<hash>/bundle.json. A directory holding the bundle file is one
+// entry; the depth bound keeps a foreign tree from turning a round into an
+// unbounded crawl.
+const (
+	skillBundleFile    = "bundle.json"
+	skillEntryMaxDepth = 4
+)
+
 // Node-local agent state layout (§8.8).
 // It lives on the `home` hostPath beside the workspaces tree, so every rule
 // below is covered by the same quiesce probe and the same state-root guard.
@@ -47,6 +57,7 @@ type Stats struct {
 	TaskDirs      int   `json:"task_dirs"`
 	TaskRoots     int   `json:"task_roots"`
 	BareRepos     int   `json:"bare_repos"`
+	SkillCache    int   `json:"skill_cache"`
 	AgentState    int   `json:"agent_state"`
 	AgentMemory   int   `json:"agent_memory"`
 	FreedBytes    int64 `json:"freed_bytes"`
@@ -96,8 +107,9 @@ func (c *Collector) Run(ctx context.Context) error {
 
 // RunOnce applies the rules in order: quiesce check, TTL reclamation of
 // task directories / bare caches / orphan task roots, the .repos size cap by
-// LRU, then the node-local agent state and memory rules. Every deletion is
-// best-effort: one failing path must not abort the round.
+// LRU, the per-workspace skill bundle cache rules (TTL and size cap), then the
+// node-local agent state and memory rules. Every deletion is best-effort: one
+// failing path must not abort the round.
 func (c *Collector) RunOnce(ctx context.Context) (Stats, error) {
 	var st Stats
 	root, err := filepath.Abs(c.cfg.StateRoot)
@@ -156,6 +168,16 @@ func (c *Collector) RunOnce(ctx context.Context) (Stats, error) {
 	st.FreedBytes += freed
 	st.CacheBytes = remaining
 	st.CacheMeasured = scanComplete
+	if err != nil {
+		errs = append(errs, err)
+	}
+
+	// Node-side skill bundle cache: the upstream daemon stores resolved
+	// bundles under <root>/workspaces/.skill-cache; the design leaves their
+	// reclamation to this component, with capacity and retention judged per
+	// workspace (§8.8).
+	bundles, bundleFreed, err := c.expireSkillCache(ctx, root)
+	st.SkillCache, st.FreedBytes = bundles, st.FreedBytes+bundleFreed
 	if err != nil {
 		errs = append(errs, err)
 	}
@@ -265,9 +287,9 @@ func (c *Collector) expireDirs(ctx context.Context, root, dir string, ttl time.D
 	return deleted, freed, nil
 }
 
-// cache is a bare repository measured during the TTL scan and reused for
-// the LRU pass.
-type cache struct {
+// cacheEntry is one reclaimable cache tree (a bare repository or a skill
+// bundle entry) measured during the scan and reused for the LRU pass.
+type cacheEntry struct {
 	path   string
 	usedAt time.Time
 	bytes  int64
@@ -275,7 +297,7 @@ type cache struct {
 }
 
 type cacheScan struct {
-	entries []cache
+	entries []cacheEntry
 	expired int
 }
 
@@ -321,36 +343,43 @@ func (c *Collector) expireRepos(ctx context.Context, root, repos string) (cacheS
 				}
 				freed += n
 				scan.expired++
-				scan.entries = append(scan.entries, cache{path: path, usedAt: usedAt, bytes: bytes, gone: true})
+				scan.entries = append(scan.entries, cacheEntry{path: path, usedAt: usedAt, bytes: bytes, gone: true})
 				continue
 			}
-			scan.entries = append(scan.entries, cache{path: path, usedAt: usedAt, bytes: bytes})
+			scan.entries = append(scan.entries, cacheEntry{path: path, usedAt: usedAt, bytes: bytes})
 		}
 	}
 	return scan, freed, errors.Join(errs...)
 }
 
 // enforceCacheLimit deletes the least recently used bare caches until the
-// total size of .repos is within FOREMAN_CACHE_MAX_BYTES. The scan's mtime is
-// only a snapshot: a Job may fetch into a cache after the scan, so each
-// victim is re-measured right before deletion and a cache written since the
-// scan is skipped for this round (it is no longer the least recently used).
-func (c *Collector) enforceCacheLimit(ctx context.Context, root string, entries []cache) (int, int64, int64, error) {
-	var total int64
-	live := make([]cache, 0, len(entries))
+// total size of .repos is within FOREMAN_CACHE_MAX_BYTES.
+func (c *Collector) enforceCacheLimit(ctx context.Context, root string, entries []cacheEntry) (int, int64, int64, error) {
+	live := make([]cacheEntry, 0, len(entries))
 	for _, e := range entries {
-		if e.gone {
-			continue
+		if !e.gone {
+			live = append(live, e)
 		}
+	}
+	return c.reclaimToLimit(ctx, root, live, c.cfg.CacheMaxBytes, "cache-lru")
+}
+
+// reclaimToLimit deletes the least recently used entries until their total
+// size fits limit. The scan's mtime is only a snapshot: a Job may write into a
+// cache after the scan, so each victim is re-measured right before deletion and
+// an entry written since the scan is skipped for this round (it is no longer
+// the least recently used).
+func (c *Collector) reclaimToLimit(ctx context.Context, root string, live []cacheEntry, limit int64, reason string) (int, int64, int64, error) {
+	var total int64
+	for _, e := range live {
 		total += e.bytes
-		live = append(live, e)
 	}
 	var (
 		deleted int
 		freed   int64
 		errs    []error
 	)
-	for total > c.cfg.CacheMaxBytes {
+	for total > limit {
 		oldest := -1
 		for i, e := range live {
 			if e.gone {
@@ -386,7 +415,7 @@ func (c *Collector) enforceCacheLimit(ctx context.Context, root string, entries 
 			c.log.Debug("cache.gc.lru_skip", "node", c.cfg.Node, "path", e.path, "reason", "cache refreshed since scan")
 			continue
 		}
-		n, err := c.delete(root, e.path, filepath.Base(e.path), "cache-lru")
+		n, err := c.delete(root, e.path, filepath.Base(e.path), reason)
 		if err != nil {
 			errs = append(errs, err)
 			e.gone = true // do not retry the same path in this round
@@ -398,6 +427,116 @@ func (c *Collector) enforceCacheLimit(ctx context.Context, root string, entries 
 		total -= n
 	}
 	return deleted, freed, total, errors.Join(errs...)
+}
+
+// expireSkillCache reclaims the node-side skill bundle cache the upstream
+// daemon keeps under <root>/workspaces/.skill-cache (§8.8): expired entries
+// first, then each workspace's total trimmed to the size cap, least recently
+// used first. Capacity is judged per workspace, so one workspace's growth
+// never evicts another workspace's entries.
+func (c *Collector) expireSkillCache(ctx context.Context, root string) (int, int64, error) {
+	base := filepath.Join(root, workspacesDir, skillCacheDir)
+	versions, err := readDirs(base)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, 0, nil
+		}
+		return 0, 0, fmt.Errorf("scan %q: %w", base, err)
+	}
+	var (
+		removed int
+		freed   int64
+		errs    []error
+		live    = make(map[string][]cacheEntry)
+	)
+	for _, version := range versions {
+		spaces, err := readDirs(filepath.Join(base, version.Name()))
+		if err != nil {
+			errs = append(errs, fmt.Errorf("scan %q: %w", version.Name(), err))
+			continue
+		}
+		for _, space := range spaces {
+			if ctx.Err() != nil {
+				return removed, freed, errors.Join(errs...)
+			}
+			entries, err := c.scanSkillEntries(ctx, filepath.Join(base, version.Name(), space.Name()))
+			if err != nil {
+				errs = append(errs, fmt.Errorf("scan %q: %w", space.Name(), err))
+				continue
+			}
+			for _, e := range entries {
+				if c.expired(e.usedAt, c.cfg.SkillCacheTTL) {
+					n, err := c.delete(root, e.path, filepath.Base(e.path), "skill-cache")
+					if err != nil {
+						errs = append(errs, err)
+						continue
+					}
+					removed++
+					freed += n
+					continue
+				}
+				// Aggregate across cache versions: the cap is one
+				// workspace's total, not one version's.
+				live[space.Name()] = append(live[space.Name()], e)
+			}
+		}
+	}
+	for _, entries := range live {
+		n, f, _, err := c.reclaimToLimit(ctx, root, entries, c.cfg.SkillCacheMaxBytes, "skill-cache-lru")
+		removed, freed = removed+n, freed+f
+		if err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return removed, freed, errors.Join(errs...)
+}
+
+// scanSkillEntries lists one workspace's skill bundle entries: a directory
+// holding bundle.json is one entry and is not descended into, any other
+// directory is a container on the way to one.
+func (c *Collector) scanSkillEntries(ctx context.Context, spaceRoot string) ([]cacheEntry, error) {
+	var entries []cacheEntry
+	err := filepath.WalkDir(spaceRoot, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if !d.IsDir() {
+			return nil
+		}
+		rel, err := filepath.Rel(spaceRoot, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		if depth := len(strings.Split(rel, string(filepath.Separator))); depth > skillEntryMaxDepth {
+			return fs.SkipDir
+		}
+		bundle, err := os.Stat(filepath.Join(path, skillBundleFile))
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return nil
+			}
+			return err
+		}
+		if !bundle.Mode().IsRegular() {
+			return nil
+		}
+		usedAt, bytes, err := measure(ctx, path)
+		if err != nil {
+			return err
+		}
+		entries = append(entries, cacheEntry{path: path, usedAt: usedAt, bytes: bytes})
+		return fs.SkipDir
+	})
+	if err != nil {
+		return nil, err
+	}
+	return entries, nil
 }
 
 // expireAgentState reclaims node-local agent sessions and transcripts: the
@@ -694,6 +833,7 @@ func (c *Collector) report(st Stats) {
 		"freed_bytes", st.FreedBytes,
 		"task_dirs", st.TaskDirs,
 		"bare_repos", st.BareRepos,
+		"skill_cache", st.SkillCache,
 		"agent_state", st.AgentState,
 		"agent_memory", st.AgentMemory,
 		"cache_bytes", st.CacheBytes,
