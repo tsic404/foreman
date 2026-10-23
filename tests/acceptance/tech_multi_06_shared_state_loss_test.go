@@ -11,6 +11,7 @@ import (
 	"time"
 
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/scheduler"
 )
 
 func TestTechMulti06SharedStateDataLoss(t *testing.T) {
@@ -96,6 +97,12 @@ func TestTechMulti06SharedStateDataLoss(t *testing.T) {
 		t.Fatalf("ghost token after data loss = %d, want 401", code)
 	}
 
+	// The scheduler's C13 seam is a separate fixture from the daemon face; it
+	// must agree with the world this case built, or its default "dispatched"
+	// would read the running task as a pre-start claim and discard its Job.
+	tw.a.server.setStatus("task-live", "running")
+	tw.a.server.setStatus("task-queue", taskStatusDispatched)
+
 	// The lost queue row converges through "discard, server re-dispatches":
 	// the payload-less rebuilt row is discarded (its Job deleted, the entry
 	// dropped), and a fresh claim re-creates it exactly once.
@@ -139,8 +146,34 @@ func TestTechMulti06SharedStateDataLoss(t *testing.T) {
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
-	if n := tw.a.jobs.deletedCount("fm-task-queue"); n != 2 {
-		// One delete for the discarded stale Job, one for the settled one.
-		t.Fatalf("Job deletions = %d, want 2 (discard + terminal)", n)
+	// Data loss is not a task failure (§10): the 401'd ghost and the discarded
+	// queue task converge on the server's own lease handling. The scheduler's
+	// ServerClient is the in-process seam in this fixture, so its forwards are
+	// where a synthesized fail would land.
+	for _, taskID := range []string{"task-ghost", "task-queue"} {
+		reports := 0
+		for _, req := range tw.a.server.forwarded(scheduler.EPFail) {
+			if req.Path == taskID {
+				reports++
+			}
+		}
+		if reports != 0 {
+			t.Fatalf("failure reports for %s = %d, want 0: data loss is not a task failure", taskID, reports)
+		}
+	}
+	// The only Jobs this case deletes are the queue task's: one for the
+	// discarded stale Job, one for the settled Job. A rebuild that deletes
+	// anything else (the live Job, or an object that never existed) shows up
+	// here as a third name.
+	tw.a.jobs.mu.Lock()
+	deleted := append([]string(nil), tw.a.jobs.deletedJobs...)
+	tw.a.jobs.mu.Unlock()
+	if len(deleted) != 2 {
+		t.Fatalf("Job deletions = %d (%v), want exactly 2 (discard + terminal)", len(deleted), deleted)
+	}
+	for _, name := range deleted {
+		if name != "fm-task-queue" {
+			t.Fatalf("Job deletion of %q, want only fm-task-queue: the rebuild must not delete K8s truth", name)
+		}
 	}
 }
