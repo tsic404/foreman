@@ -359,14 +359,10 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 	if len(req.RuntimeIDs) > 0 {
 		runtimeID = req.RuntimeIDs[0]
 	}
-	// Read the delivery face before the delivery attempt: an empty batch that
-	// answers an already-committed delivery is the lost-response signature
-	// (ADR-032), and the face that tells the kinds of empty batch apart is gone
-	// once the entry settles. A decided entry's empty batches are the designed
-	// ones (drain never delivers), so they stay plain empties. The commit count
-	// is the classification's monotone fact — a commit that is not the first one
-	// is the re-delivery the expired window released — while the window test
-	// itself stays in the registry's gate (one clock, one decision).
+	// This read answers the ownership checks and the latency measure. It is not
+	// the empty batch's classification face: a concurrent claim can commit a
+	// delivery before the registry's gate, so the default branch re-reads the
+	// entry after the attempt and classifies it there (ADR-032, §4.1).
 	pending, pendingOK := s.reg.ByDaemonInWorkspace(claims.WorkspaceID, req.DaemonID)
 	if pendingOK && pending.WorkspaceID != claims.WorkspaceID {
 		// The token addresses another workspace's task: the cross-workspace
@@ -384,7 +380,6 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	unconfirmed := pendingOK && pending.DeliveryUnconfirmed(s.reg.Now())
 	delivery, err := s.sched.Deliver(r.Context(), claims.WorkspaceID, req.DaemonID, runtimeID, req.MaxTasks)
 	if err != nil {
 		if errors.Is(err, scheduler.ErrUnknownDaemon) || errors.Is(err, scheduler.ErrRuntimeMismatch) {
@@ -415,13 +410,21 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 	case delivery.Held:
 		// Inside the confirmation window: the request arrived and the
 		// response was lost. The shared pickup already bumped the per-entry
-		// counter; the stage-one path counts it below.
+		// counter; the stage-one path counts it in the default branch.
 		s.metrics.DeliveryClaim(DeliveryClaimEmptyUnconfirmed)
-	case unconfirmed:
-		s.metrics.DeliveryClaim(DeliveryClaimEmptyUnconfirmed)
-		s.reg.NoteClaimAfterDelivery(pending.TaskID)
 	default:
-		s.metrics.DeliveryClaim(DeliveryClaimEmpty)
+		// The kind follows the gate's instant, not this request's snapshot: a
+		// delivery committed by a concurrent claim in between is still the
+		// lost-response signature and counts on the entry, while a decided
+		// entry's empties (drain never delivers) stay plain (§4.1 交付后的
+		// claim 计数). Re-read once, after the attempt.
+		if entry, ok := s.reg.ByDaemonInWorkspace(claims.WorkspaceID, req.DaemonID); ok &&
+			entry.DeliveryUnconfirmed(s.reg.Now()) {
+			s.metrics.DeliveryClaim(DeliveryClaimEmptyUnconfirmed)
+			s.reg.NoteClaimAfterDelivery(entry.TaskID)
+		} else {
+			s.metrics.DeliveryClaim(DeliveryClaimEmpty)
+		}
 	}
 	tasks := delivery.Tasks
 	if tasks == nil {
