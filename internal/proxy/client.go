@@ -630,7 +630,9 @@ func (c *Client) RenewToken(ctx context.Context) error {
 
 // SetWorkspaceName caches the workspace display name discovered from C-17
 // (ADR-049): the discovery answer names each workspace, and S-1 serves the
-// name verbatim. The id itself never changes for one client.
+// name verbatim. The id itself never changes for one client. The name is never
+// empty: the C-17 decode rejects an unnamed entry first, because "" would read
+// back as "the authority has not answered" (WorkspaceName).
 func (c *Client) SetWorkspaceName(name string) {
 	c.mu.Lock()
 	c.workspace = name

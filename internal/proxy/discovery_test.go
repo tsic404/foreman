@@ -202,3 +202,56 @@ func TestDiscoveryEventRendersSetAndExclusions(t *testing.T) {
 		t.Errorf("event unregistered = %v", event["unregistered"])
 	}
 }
+
+// TestC17EntryWithoutDisplayNameRefusesStartup pins the C-17 completeness
+// rule: the answer is the display-name authority for partition keys, so an
+// entry without a name is a malformed answer, not a seeded empty name. It
+// must refuse startup — seeding "" would read as "authority not answered" and
+// turn a genuinely absent partition key into a warn-and-boot unseeded one.
+func TestC17EntryWithoutDisplayNameRefusesStartup(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"empty name", `[{"id":"ws-a","name":""}]`},
+		{"whitespace name", `[{"id":"ws-a","name":"  "}]`},
+		{"absent name", `[{"id":"ws-a"}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := newC17Stub(t, http.StatusOK, tc.body)
+
+			t.Run("decode names the workspace", func(t *testing.T) {
+				c := NewClient(Config{ServerURL: srv.URL, WorkspaceID: "ws-a", Version: "0.1.0"}, "mdt_a")
+				_, err := c.ListWorkspaces(t.Context())
+				var answer *DiscoveryAnswerError
+				if !errors.As(err, &answer) {
+					t.Fatalf("ListWorkspaces error = %v, want a DiscoveryAnswerError", err)
+				}
+				if answer.WorkspaceID != "ws-a" {
+					t.Errorf("error names workspace %q, want ws-a", answer.WorkspaceID)
+				}
+				if !IsStartupFatal(err) {
+					t.Error("a C-17 entry without a display name must refuse startup")
+				}
+			})
+
+			t.Run("workspace-scoped self-check refuses and never seeds", func(t *testing.T) {
+				c := NewClient(Config{ServerURL: srv.URL, WorkspaceID: "ws-a", Version: "0.1.0"}, "mdt_a")
+				err := c.ValidateWorkspaceScope(t.Context())
+				var answer *DiscoveryAnswerError
+				if !errors.As(err, &answer) {
+					t.Fatalf("ValidateWorkspaceScope error = %v, want a DiscoveryAnswerError", err)
+				}
+				if _, seeded := c.WorkspaceName(); seeded {
+					t.Error("an empty display name must not seed the name authority")
+				}
+			})
+
+			t.Run("user-scoped discovery refuses", func(t *testing.T) {
+				c := NewClient(Config{ServerURL: srv.URL, Version: "0.1.0"}, "mul_user")
+				_, err := c.DiscoverWorkspaces(t.Context(), nil)
+				var answer *DiscoveryAnswerError
+				if !errors.As(err, &answer) {
+					t.Fatalf("DiscoverWorkspaces error = %v, want a DiscoveryAnswerError", err)
+				}
+			})
+		})
+	}
+}

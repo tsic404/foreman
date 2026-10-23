@@ -63,16 +63,23 @@ func discoverUserScope(ctx context.Context, deployment workspace.Deployment, cfg
 //
 //   - C-18 profile snapshot per workspace — never fatal (S-3 answers 404/503
 //     and the probe continues with the builtin runtime, §1.6).
-//   - C-17 exact-set check for the workspace-scoped credential form: the
-//     answer must equal the configured workspace.
+//   - C-17 check for the workspace-scoped credential form: the answer must
+//     equal the configured workspace, and every entry must carry a non-empty
+//     display name (whitespace-only counts as empty).
 //
-// Only a configuration error refuses startup: a C-17 set mismatch, or a
-// credential rejected outright (401/403). A transient upstream failure
-// (network, 5xx) is not a configuration error — it is logged as
-// workspace.credential_check_failed and the workspace's control loops converge
-// with the §1.5 backoff, exactly as they do at runtime (AC-86). Making it
-// fatal would turn a server blip into CrashLoopBackOff for every existing
-// single-workspace deployment.
+// Three findings refuse startup:
+//   - the C-17 set is not exactly the configured workspace;
+//   - the credential is rejected outright (401/403);
+//   - a C-17 answer entry carries no display name.
+//
+// The first two log stage=workspace_credential; an unnamed answer logs
+// stage=workspace_discovery, so the event names which face failed.
+//
+// A transient upstream failure (network, 5xx) is none of them — it is logged
+// as workspace.credential_check_failed and the workspace's control loops
+// converge with the §1.5 backoff, exactly as they do at runtime (AC-86).
+// Making it fatal would turn a server blip into CrashLoopBackOff for every
+// existing single-workspace deployment.
 //
 // The workspace-scoped form's §9.1 discovery event is emitted here, after the
 // checks seeded each display name.
@@ -85,18 +92,23 @@ func runStartupSelfCheck(ctx context.Context, scope workspace.CredentialScope, c
 			continue
 		}
 		if err := c.ValidateWorkspaceScope(ctx); err != nil {
-			if !proxy.IsCredentialConfigError(err) {
+			if !proxy.IsStartupFatal(err) {
 				// Transient: warn and let the workspace's loops retry (§1.5).
 				log.Warn("workspace.credential_check_failed", "workspace_id", c.WorkspaceID(), "err", err.Error())
 				continue
 			}
-			fields := []any{"stage", "workspace_credential", "workspace_id", c.WorkspaceID(), "err", err.Error()}
+			stage := "workspace_credential"
 			var mismatch *proxy.WorkspaceMismatchError
+			var answer *proxy.DiscoveryAnswerError
+			if errors.As(err, &answer) {
+				stage = "workspace_discovery"
+			}
+			fields := []any{"stage", stage, "workspace_id", c.WorkspaceID(), "err", err.Error()}
 			if errors.As(err, &mismatch) {
 				fields = append(fields, "visible_workspaces", mismatch.Visible)
 			}
 			log.Error("foreman.startup_aborted", fields...)
-			return fmt.Errorf("workspace %s credential rejected: %w", c.WorkspaceID(), err)
+			return fmt.Errorf("workspace %s startup self-check failed: %w", c.WorkspaceID(), err)
 		}
 	}
 	if scope == workspace.ScopeWorkspace {
