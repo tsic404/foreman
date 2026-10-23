@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -1492,6 +1493,64 @@ func TestOnReportUsageMalformedBodyIsForwardedWithoutMetric(t *testing.T) {
 	if len(f.server.forwards) != 1 || f.server.forwards[0].body != string(body) {
 		t.Fatalf("forwards = %+v, want the malformed body verbatim", f.server.forwards)
 	}
+}
+
+// The token metric counts the usage the upstream accepted: a report whose
+// forward failed is the daemon's to re-send, and the success after the retry
+// is the one count. Counting on receipt would count each attempt.
+func TestOnReportUsageCountsAcceptedForwardOnly(t *testing.T) {
+	const body = `{"usage":[{"provider":"omp","model":"kimi","input_tokens":11}]}`
+
+	t.Run("a transport failure counts nothing", func(t *testing.T) {
+		f := newFixture(t)
+		e := f.claim(t, "task-1")
+		f.server.forwardErr = errors.New("connect: connection refused")
+
+		if _, _, err := f.sched.OnReport(context.Background(), EPUsage, e, []byte(body), ""); err == nil {
+			t.Fatal("OnReport = nil error, want the forward's transport failure")
+		}
+		if len(f.metrics.tokenUsage) != 0 {
+			t.Fatalf("token usage = %+v, want none", f.metrics.tokenUsage)
+		}
+	})
+
+	t.Run("a rejected forward counts nothing", func(t *testing.T) {
+		f := newFixture(t)
+		e := f.claim(t, "task-1")
+		f.server.forwardCode = http.StatusServiceUnavailable
+
+		// The transient upstream answer reaches the daemon as the fixed 502:
+		// the report was not taken, so the metric must not count it.
+		code, _, err := f.sched.OnReport(context.Background(), EPUsage, e, []byte(body), "")
+		if err != nil || code != http.StatusBadGateway {
+			t.Fatalf("OnReport = %d, %v, want the transient 502", code, err)
+		}
+		if len(f.metrics.tokenUsage) != 0 {
+			t.Fatalf("token usage = %+v, want none", f.metrics.tokenUsage)
+		}
+	})
+
+	t.Run("the retry of a failed report counts once", func(t *testing.T) {
+		f := newFixture(t)
+		e := f.claim(t, "task-1")
+		f.server.forwardErr = errors.New("connect: connection refused")
+		if _, _, err := f.sched.OnReport(context.Background(), EPUsage, e, []byte(body), ""); err == nil {
+			t.Fatal("first OnReport = nil error, want the transport failure")
+		}
+
+		f.server.forwardErr = nil
+		code, _, err := f.sched.OnReport(context.Background(), EPUsage, e, []byte(body), "")
+		if err != nil || code != 200 {
+			t.Fatalf("retried OnReport = %d, %v", code, err)
+		}
+		want := []tokenUsageSample{{provider: "omp", model: "kimi", input: 11}}
+		if len(f.metrics.tokenUsage) != len(want) {
+			t.Fatalf("token usage = %+v, want %+v", f.metrics.tokenUsage, want)
+		}
+		if f.metrics.tokenUsage[0] != want[0] {
+			t.Errorf("token usage[0] = %+v, want %+v", f.metrics.tokenUsage[0], want[0])
+		}
+	})
 }
 
 // TestOnReportUsageBoundsLabelSpace: the usage body is the Job daemon's own

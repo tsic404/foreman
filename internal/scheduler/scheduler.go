@@ -1135,10 +1135,10 @@ type usageLabelPair struct {
 	model    string
 }
 
-// recordTokenUsage accumulates one S-12 report's entries into the token
-// metric (§9.2 / ADR-009 decision 4). A body that does not decode is
-// forwarded verbatim and contributes nothing: the upstream owns its
-// validation, and a metric must never change the forward's outcome.
+// recordTokenUsage accumulates one S-12 report the upstream accepted into the
+// token metric (§9.2 / ADR-009 decision 4). A body that does not decode
+// contributes nothing: the upstream owns its validation, and a metric must
+// never change the forward's outcome.
 func (s *Scheduler) recordTokenUsage(body []byte) {
 	var report usageReport
 	if err := json.Unmarshal(body, &report); err != nil {
@@ -1206,13 +1206,6 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		}
 	}
 	defer unlock()
-	if ep == EPUsage {
-		// §9.2 / ADR-009 decision 4: the usage face is accumulated while the
-		// report is forwarded. The body stays opaque everywhere else; only
-		// the metric's two label values and the four token counters are read,
-		// and a malformed report is still forwarded verbatim.
-		s.recordTokenUsage(body)
-	}
 	now := s.now()
 	// undecided is the instance's first terminal decision inside this report:
 	// it separates a fresh verdict from an already-decided replay, which
@@ -1299,6 +1292,14 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			return http.StatusBadGateway, upstreamUnavailableBody, nil
 		}
 		return 0, nil, fmt.Errorf("forward %s for task %s: %w", ep, e.TaskID, err)
+	}
+	if ep == EPUsage && code >= 200 && code < 300 {
+		// §9.2 / ADR-009 decision 4: the token metric counts the usage the
+		// upstream accepted. Counting on receipt would count the same report
+		// twice when the daemon re-sends it after a failed forward. The body
+		// stays opaque everywhere else; only the metric's two label values and
+		// the four token counters are read.
+		s.recordTokenUsage(body)
 	}
 	if ep.IsTerminal() {
 		switch {
