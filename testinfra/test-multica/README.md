@@ -58,8 +58,10 @@ server instead of leaving it answering with the old one.
 Absolute, not drifting: `deploy.yaml` pins every image to the `v0.6.1` release
 (`multica@2ea01ae4`) — `ghcr.io/multica-ai/multica-backend:v0.6.1`,
 `ghcr.io/multica-ai/multica-web:v0.6.1`, with `pgvector/pgvector:pg17` and
-`nginx:1.27-alpine` as the persistence and entry layers. The Job image must
-carry the same release's CLI (`MULTICA_CLI_VERSION=0.6.1`, the CI default).
+`nginx:1.27-alpine` as the persistence and entry layers. The Job image is not
+part of this pin: `build-foreman-job.yml` resolves upstream's newest release at
+build time and tags the image with that daemon version (`latest` follows the
+newest release), so the CLI a Job runs can be newer than the `v0.6.1` server.
 
 Upgrading means rebuilding the environment against a new anchor
 (`./recycle.sh && ./deploy.sh`), never an in-place upgrade. The environment
