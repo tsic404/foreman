@@ -579,36 +579,27 @@ func (r *Reconciler) reclaimIfDue(ctx context.Context, e registry.TaskEntry) err
 	// The Job's termination is the primary fact and is read every round: a
 	// Job that already terminated must be reclaimed as job_terminated even
 	// when the upper bound has also expired (the reason must follow the
-	// fact, not the timer).
-	terminated, err := r.settler.JobTerminated(ctx, e.JobName, since)
+	// fact, not the timer). One pod listing carries all three facts, so the
+	// verdict never issues a read per fact.
+	evidence, err := r.settler.JobTerminationEvidence(ctx, e.JobName, since)
 	if err != nil {
-		// No fact this round: it is not a verdict, so the empty result is
+		// No fact this round: it is not a verdict, so the zero evidence is
 		// never read as "terminated"; the upper bound still closes the
 		// window when it expires.
 		r.log.WarnContext(ctx, "job.termination_evidence_failed",
 			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
 	}
 	due := !e.DrainDeadline.IsZero() && !time.Now().Before(e.DrainDeadline)
-	if !terminated && !due {
+	if !evidence.IsTerminated && !due {
 		return nil
 	}
 	reason := scheduler.JobTerminationReasonDrainTimeout
 	var podTerminatedAt time.Time
-	if terminated {
+	if evidence.IsTerminated {
 		reason = scheduler.JobTerminationReasonJobTerminated
-		at, err := r.settler.LastPodTerminatedAt(ctx, e.JobName, since)
-		if err != nil {
-			r.log.WarnContext(ctx, "job.termination_evidence_failed",
-				"task_id", e.TaskID, "job_name", e.JobName, "err", err)
-		}
-		podTerminatedAt = at
+		podTerminatedAt = evidence.LastFinishedAt
 	}
-	orphans, err := r.settler.AlivePods(ctx, e.JobName, since)
-	if err != nil {
-		r.log.WarnContext(ctx, "job.termination_evidence_failed",
-			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
-	}
-	return r.settler.OnJobTerminated(ctx, e.JobName, reason, podTerminatedAt, orphans)
+	return r.settler.OnJobTerminated(ctx, e.JobName, reason, podTerminatedAt, evidence.AlivePods)
 }
 
 // settleEnded compensates a Job whose container ended (§4.6).

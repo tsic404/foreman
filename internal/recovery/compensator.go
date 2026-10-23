@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/scheduler"
 )
 
 // Settler is the scheduler's settlement surface.
@@ -43,16 +44,12 @@ type Settler interface {
 	// OnTaskVanished settles a task the server deleted (§4.6): terminal with an
 	// empty result, Job deleted, entry into drain.
 	OnTaskVanished(ctx context.Context, taskID string) error
-	// JobTerminated reports whether every pod of the Job instance has
-	// terminated (the pod objects are gone, or their phase is
-	// Succeeded/Failed). An error means no fact — never a verdict.
-	JobTerminated(ctx context.Context, jobName string, since time.Time) (bool, error)
-	// LastPodTerminatedAt is the kubelet-reported termination fact of the
-	// Job's last pod; zero when no pod carries one.
-	LastPodTerminatedAt(ctx context.Context, jobName string, since time.Time) (time.Time, error)
-	// AlivePods counts the Job's pods still alive at reclaim time
-	// (orphan_pods).
-	AlivePods(ctx context.Context, jobName string, since time.Time) (int, error)
+	// JobTerminationEvidence reads the Job instance's termination facts in a
+	// single pod listing: whether every pod has terminated (the pod objects
+	// are gone, or their phase is Succeeded/Failed), the kubelet-reported
+	// finish moment of the last pod, and the pods still alive. An error means
+	// no fact at all — never a verdict.
+	JobTerminationEvidence(ctx context.Context, jobName string, since time.Time) (scheduler.TerminationEvidence, error)
 	// OnJobTerminated is the credential-reclaim entry point (ADR-017):
 	// revoke → delete Secret → drop the entry.
 	OnJobTerminated(ctx context.Context, jobName, reason string, podTerminatedAt time.Time, orphanPods int) error
