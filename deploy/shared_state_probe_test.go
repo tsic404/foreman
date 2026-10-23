@@ -1,15 +1,13 @@
-// The shared-state Redis is the deployment's single persistence gate, and
-// redis-cli exits 0 even on NOAUTH / WRONGPASS, so the probe command text is
-// the judgment point: it must gate on the reply, authenticate through the
-// container env, and keep the credential off the process command line. The
-// manifest is the only place that shape lives — §7 fixes the store's
-// connection face and credential, not the probe's form — so this case reads
-// deploy/35-shared-state.yaml and holds its probe fields to that shape.
-package acceptance
+// Package deploy pins the manifests this repository ships. A declaration whose
+// only consumer is a deployment step has no Go caller to keep it honest, so its
+// regression check lives beside the file it constrains.
+package deploy
 
 import (
+	"bufio"
+	"bytes"
 	"encoding/json"
-	"path/filepath"
+	"os"
 	"slices"
 	"strings"
 	"testing"
@@ -20,11 +18,22 @@ import (
 	utilyaml "k8s.io/apimachinery/pkg/util/yaml"
 )
 
+// sharedStateManifest is the shipped shared-state baseline. A deployment may
+// point Foreman at its own persistent store instead; this pin covers the file
+// as shipped.
+const sharedStateManifest = "35-shared-state.yaml"
+
 // sharedStateProbeCommand is the reply-text gate both probes must carry. The
 // client's exit code says nothing about authentication, so the probe succeeds
 // only when the server answers exactly PONG.
 const sharedStateProbeCommand = "redis-cli ping | grep -qx PONG"
 
+// TestSharedStateProbesKeepCredentialOffTheCommandLine holds the probes to the
+// shape that makes a refused credential fail them: both gate on the reply text,
+// the password reaches redis-cli through the container environment, and no
+// probe argument carries it. redis-cli exits 0 on NOAUTH and WRONGPASS, so a
+// probe trusting the exit code would report a password-protected store as
+// healthy while it serves nothing.
 func TestSharedStateProbesKeepCredentialOffTheCommandLine(t *testing.T) {
 	container := sharedStateRedisContainer(t)
 
@@ -97,14 +106,14 @@ func execProbeCommand(t *testing.T, probe *corev1.Probe, name string) []string {
 	return probe.Exec.Command
 }
 
-// sharedStateRedisContainer decodes the first container out of the StatefulSet
-// in deploy/35-shared-state.yaml.
+// sharedStateRedisContainer decodes the first container out of the
+// shared-state StatefulSet.
 func sharedStateRedisContainer(t *testing.T) corev1.Container {
 	t.Helper()
-	for _, doc := range yamlDocuments(t, filepath.Join("..", "..", "deploy", "35-shared-state.yaml")) {
+	for _, doc := range manifestDocuments(t, sharedStateManifest) {
 		jsonBytes, err := utilyaml.ToJSON(doc)
 		if err != nil {
-			t.Fatalf("deploy/35-shared-state.yaml document is not valid YAML: %v", err)
+			t.Fatalf("%s document is not valid YAML: %v", sharedStateManifest, err)
 		}
 		var typeMeta metav1.TypeMeta
 		if err := json.Unmarshal(jsonBytes, &typeMeta); err != nil {
@@ -119,10 +128,32 @@ func sharedStateRedisContainer(t *testing.T) corev1.Container {
 		}
 		containers := statefulSet.Spec.Template.Spec.Containers
 		if len(containers) == 0 {
-			t.Fatal("deploy/35-shared-state.yaml StatefulSet carries no container")
+			t.Fatalf("%s StatefulSet carries no container", sharedStateManifest)
 		}
 		return containers[0]
 	}
-	t.Fatal("deploy/35-shared-state.yaml carries no StatefulSet")
+	t.Fatalf("%s carries no StatefulSet", sharedStateManifest)
 	return corev1.Container{}
+}
+
+// manifestDocuments reads one repository file and returns its YAML documents,
+// so a pin asserts against the manifest the deployment actually applies.
+func manifestDocuments(t *testing.T, path string) [][]byte {
+	t.Helper()
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	reader := utilyaml.NewYAMLReader(bufio.NewReader(bytes.NewReader(raw)))
+	var docs [][]byte
+	for {
+		doc, err := reader.Read()
+		if err != nil {
+			break
+		}
+		if len(bytes.TrimSpace(doc)) > 0 {
+			docs = append(docs, doc)
+		}
+	}
+	return docs
 }
