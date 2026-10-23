@@ -327,8 +327,9 @@ func TestAuth06OrphanSecretSweepLeavesTheNegativeShapes(t *testing.T) {
 	managed := map[string]string{registry.LabelManagedBy: registry.ManagedByForeman}
 	withTask := func(taskID string) map[string]string {
 		return map[string]string{
-			registry.LabelManagedBy: registry.ManagedByForeman,
-			registry.LabelTaskID:    taskID,
+			registry.LabelManagedBy:   registry.ManagedByForeman,
+			registry.LabelTaskID:      taskID,
+			registry.LabelWorkspaceID: "ws-1",
 		}
 	}
 	h.jobs.programListed(nil, []corev1.Secret{

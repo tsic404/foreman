@@ -150,7 +150,7 @@ func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, string, erro
 	}
 	b.logPolicyApplied(e, name, ev)
 	b.recordPolicyHits(ev)
-	return job, b.credentialSecret(daemonID, e.TaskID, token), b.cfg.Issuer.Hash(token), nil
+	return job, b.credentialSecret(daemonID, e.TaskID, e.WorkspaceID, token), b.cfg.Issuer.Hash(token), nil
 }
 
 // recordPolicyHits counts one evaluation per axis by source (§9.2 策略命中):

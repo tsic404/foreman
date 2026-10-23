@@ -2264,6 +2264,23 @@ func podTerminated(pod *corev1.Pod) bool {
 // is the template's business, so a name built from the task id would resolve
 // to nothing for every custom format and delete a live Job's credential
 // (ADR-034 decision 9 — the label is the only locator).
+//
+// The workspace partition value comes from the Secret's own workspace label,
+// never from the deployment configuration or an empty fallback: it is the
+// same value the claim used to build its lease key, so the sweep and the
+// claim take one lock. An object without the label predates the identity and
+// has no partition — it is skipped (fail-closed) and logged once per round;
+// an empty workspace is never a key.
+//
+// Both halves must hold at the moment of deletion (§6.5), so the round's
+// reads are skips, not decisions: the criterion is re-evaluated under the
+// task's write lock — the lock a claim holds from its entry write through
+// DeleteSecret → CreateSecret → CreateJob (§4.2 跨实例单写). A same-task
+// re-dispatch that slipped between the snapshot and the delete would rebuild
+// the identically named Secret and the sweep would remove the live
+// credential; under the lock that sequence lands entirely before the decision
+// (the entry is seen, nothing is deleted) or entirely after it (the claim
+// writes its own object), never across it.
 func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 	secrets, err := s.jobs.ListSecrets(ctx)
 	if err != nil {
@@ -2287,6 +2304,7 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		withJob[workspaceTaskKey(jobs[i].Labels[registry.LabelWorkspaceID], taskID)] = struct{}{}
 	}
 	var firstErr error
+	var unpartitioned int
 	for _, secret := range secrets {
 		// Ownership exclusion precedes the criterion: a role-labelled Secret
 		// belongs to another domain, and the carrier carries a task-id label
@@ -2299,6 +2317,13 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 			continue
 		}
 		workspaceID := secret.Labels[registry.LabelWorkspaceID]
+		if workspaceID == "" {
+			// No workspace identity on the object itself means no partition:
+			// the snapshot key, the Job filter and the task lock would all be
+			// guessed. Fail closed — never sweep on an empty workspace (§6.5).
+			unpartitioned++
+			continue
+		}
 		if !s.workspaceConfigured(workspaceID) {
 			// An object of a workspace this deployment does not serve is
 			// outside its sweep domain (§6.5: 跨 workspace 的对象不清扫).
@@ -2313,16 +2338,53 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		if _, ok := withJob[workspaceTaskKey(workspaceID, taskID)]; ok {
 			continue
 		}
-		if err := s.jobs.DeleteSecret(ctx, secret.Name); err != nil {
+		// The snapshot above only skips the live face cheaply; it is not the
+		// decision. Take the task's write lock and re-read both halves under
+		// it, so the delete cannot land between a same-task claim's entry
+		// write and the Secret it rebuilds.
+		unlock, lockErr := s.lockTaskIn(ctx, workspaceID, taskID)
+		if lockErr != nil {
 			if firstErr == nil {
-				firstErr = err
+				firstErr = lockErr
+			}
+			// No deletion happened: reporting this as a delete failure would
+			// send an operator after the wrong fault (lock contention/storage,
+			// not the apiserver).
+			s.log.WarnContext(ctx, "cred.orphan_secret_lock_failed",
+				"task_id", taskID, "workspace_id", workspaceID,
+				"secret", secret.Name, "err", lockErr.Error())
+			continue
+		}
+		owned, checkErr := s.credentialOwner(ctx, workspaceID, taskID)
+		var deleteErr error
+		if checkErr == nil && !owned {
+			deleteErr = s.jobs.DeleteSecret(ctx, secret.Name)
+		}
+		unlock()
+		if checkErr != nil {
+			if firstErr == nil {
+				firstErr = checkErr
+			}
+			s.log.WarnContext(ctx, "cred.orphan_secret_delete_failed",
+				"task_id", taskID, "workspace_id", workspaceID,
+				"secret", secret.Name, "err", checkErr.Error())
+			continue
+		}
+		if owned {
+			// Re-checked under the lock: a claim or a leftover Job claimed the
+			// identity after the round's snapshot. Nothing is deleted.
+			continue
+		}
+		if deleteErr != nil {
+			if firstErr == nil {
+				firstErr = deleteErr
 			}
 			// The criterion is satisfied but the delete failed: the Secret
 			// stays and the next round retries it. Without this line the only
 			// trace is the round's aggregate error.
 			s.log.WarnContext(ctx, "cred.orphan_secret_delete_failed",
 				"task_id", taskID, "workspace_id", workspaceID,
-				"secret", secret.Name, "err", err.Error())
+				"secret", secret.Name, "err", deleteErr.Error())
 			continue
 		}
 		// job_name is derived for attribution only: the Job is gone, so there
@@ -2331,6 +2393,13 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		s.log.InfoContext(ctx, "cred.orphan_secret_removed",
 			"task_id", taskID, "workspace_id", workspaceID,
 			"job_name", jobbuilder.DaemonIDFor(taskID), "secret", secret.Name)
+	}
+	if unpartitioned > 0 {
+		// One line per round: a legacy object without the workspace label has
+		// no partition, so it is never a candidate. Operators see the
+		// fail-closed skip without one warning per object per round.
+		s.log.WarnContext(ctx, "cred.orphan_secret_workspace_unlabelled",
+			"count", unpartitioned)
 	}
 	for _, secret := range secrets {
 		// Carrier domain: selected by the carrier role label ∧ managed-by.
@@ -2366,6 +2435,29 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 			"task_id", taskID, "secret", secret.Name)
 	}
 	return firstErr
+}
+
+// credentialOwner reports whether one task still owns a credential: an entry
+// in the index (any state) or a Job carrying the task's label pair. It is
+// called under the task's write lock, so both faces answer for the same
+// moment as the deletion that follows — the round's own list would be a
+// snapshot from before the lock (§6.5 判据面).
+func (s *Scheduler) credentialOwner(ctx context.Context, workspaceID, taskID string) (bool, error) {
+	if workspaceID == "" {
+		// No partition means no adjudication: the Job filter would match only
+		// objects without the label and the caller could delete a live
+		// credential. Fail closed (§6.5 按 workspace 分区).
+		return true, nil
+	}
+	if _, ok := s.reg.Get(taskID); ok {
+		return true, nil
+	}
+	jobs, err := s.jobs.ListJobsByTask(ctx, workspaceID, taskID)
+	if err != nil {
+		// A list error is not an explicit absence: the caller must not delete.
+		return false, fmt.Errorf("list jobs of task %s: %w", taskID, err)
+	}
+	return len(jobs) > 0, nil
 }
 
 // Reconcile converges the live index with the server. With a recovery

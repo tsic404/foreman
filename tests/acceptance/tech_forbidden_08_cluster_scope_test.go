@@ -103,7 +103,7 @@ func TestForbidden08ClusterObjectScope(t *testing.T) {
 	wantMethods := map[string]bool{
 		"CreateJob": true, "DeleteJob": true, "GetJob": true,
 		"CreateSecret": true, "DeleteSecret": true,
-		"ListJobs": true, "ListSecrets": true, "ListPods": true,
+		"ListJobs": true, "ListJobsByTask": true, "ListSecrets": true, "ListPods": true,
 	}
 	interfaceType := reflect.TypeOf((*scheduler.JobClient)(nil)).Elem()
 	for i := range interfaceType.NumMethod() {

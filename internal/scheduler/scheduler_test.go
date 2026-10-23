@@ -73,6 +73,11 @@ type fakeJobs struct {
 	secrets []corev1.Secret
 	pods    []corev1.Pod
 
+	// liveSecrets, when non-nil, models the cluster's Secret objects by name:
+	// CreateSecret adds the object and DeleteSecret removes it, so a scenario
+	// can assert which object survived instead of which call happened.
+	liveSecrets map[string]*corev1.Secret
+
 	// onSecretCreate / onDeleteSecret observe the probe teardown order.
 	onSecretCreate func()
 	onDeleteSecret func()
@@ -146,6 +151,9 @@ func (f *fakeJobs) CreateSecret(_ context.Context, secret *corev1.Secret) error 
 		return f.createSecretErr
 	}
 	f.createdSecrets = append(f.createdSecrets, secret)
+	if f.liveSecrets != nil {
+		f.liveSecrets[secret.Name] = secret.DeepCopy()
+	}
 	return nil
 }
 
@@ -157,6 +165,9 @@ func (f *fakeJobs) DeleteSecret(_ context.Context, name string) error {
 		return f.deleteSecretErr
 	}
 	f.deletedSecrets = append(f.deletedSecrets, name)
+	if f.liveSecrets != nil {
+		delete(f.liveSecrets, name)
+	}
 	return nil
 }
 
@@ -190,7 +201,33 @@ func (f *fakeJobs) ListJobs(context.Context) ([]batchv1.Job, error) {
 	return f.jobs, nil
 }
 
-func (f *fakeJobs) ListSecrets(context.Context) ([]corev1.Secret, error) { return f.secrets, nil }
+// ListJobsByTask filters the Jobs the test placed on the cluster face: the
+// per-task re-read the sweep makes under the task lock.
+func (f *fakeJobs) ListJobsByTask(_ context.Context, workspaceID, taskID string) ([]batchv1.Job, error) {
+	var out []batchv1.Job
+	for i := range f.jobs {
+		job := f.jobs[i]
+		if job.Labels[registry.LabelTaskID] != taskID {
+			continue
+		}
+		if job.Labels[registry.LabelWorkspaceID] != workspaceID {
+			continue
+		}
+		out = append(out, job)
+	}
+	return out, nil
+}
+
+func (f *fakeJobs) ListSecrets(context.Context) ([]corev1.Secret, error) {
+	if f.liveSecrets != nil {
+		out := make([]corev1.Secret, 0, len(f.liveSecrets))
+		for _, secret := range f.liveSecrets {
+			out = append(out, *secret.DeepCopy())
+		}
+		return out, nil
+	}
+	return f.secrets, nil
+}
 
 // ListPods applies the selector the scheduler passes (job-name=<job>), so the
 // tests exercise the same ownership key the informer-based path uses.
