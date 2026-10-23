@@ -513,9 +513,13 @@ func TestProbeRegisterOnlyHeartbeatOwnsNoCommand(t *testing.T) {
 // lookup and its update (02-contracts.md §6.3 会话不存在 ⇒ 恒 401). land is how
 // many writes the store accepts before the reap, so a handler with more than
 // one write-back can be reaped at a later one; the zero value reaps the first.
+// readsBeforeReap moves the reap onto the read side instead: the row survives
+// that many reads and the last one deletes it, which models a route whose only
+// authority is its own session lookup; zero keeps the row readable.
 type reapingProbeStore struct {
-	rows map[string][]byte
-	land int
+	rows            map[string][]byte
+	land            int
+	readsBeforeReap int
 }
 
 func (s *reapingProbeStore) PutProbeSession(_ context.Context, jobName string, raw []byte, _ time.Duration) error {
@@ -535,6 +539,12 @@ func (s *reapingProbeStore) CASProbeSession(_ context.Context, jobName string, _
 
 func (s *reapingProbeStore) GetProbeSession(_ context.Context, jobName string) ([]byte, bool, error) {
 	raw, ok := s.rows[jobName]
+	if ok && s.readsBeforeReap > 0 {
+		s.readsBeforeReap--
+		if s.readsBeforeReap == 0 {
+			delete(s.rows, jobName)
+		}
+	}
 	return raw, ok, nil
 }
 
@@ -590,6 +600,33 @@ func TestProbeRegisterReapedSessionIsUnauthorized(t *testing.T) {
 				t.Error("the update must not resurrect a reaped session row")
 			}
 		})
+	}
+}
+
+// TestProbeDeregisterReapedSessionIsUnauthorized pins S19's probe branch to the
+// shared session verdict: the row still backs the token's authentication, and
+// the reap lands before the handler's own lookup. The handshake must then be
+// refused instead of acknowledged — the token has no owner left and nothing is
+// deregistered (§6.3 会话不存在 ⇒ 恒 401).
+func TestProbeDeregisterReapedSessionIsUnauthorized(t *testing.T) {
+	r := newTestRig(t)
+	token, session := startProbeToken(t, r, "startup-reaped", "")
+	raw, err := json.Marshal(session)
+	if err != nil {
+		t.Fatalf("marshal session: %v", err)
+	}
+	// One read backs the token's authentication; the handler's lookup is the
+	// read that finds the session gone.
+	store := &reapingProbeStore{rows: map[string][]byte{session.JobName: raw}, readsBeforeReap: 1}
+	r.probes.AttachShared(store)
+
+	code, body := r.call(t, "POST", "/api/daemon/deregister", token,
+		[]byte(`{"runtime_ids": ["`+session.JobRuntime+`"]}`))
+	if code != http.StatusUnauthorized {
+		t.Fatalf("deregister of a reaped session = %d: %s, want 401", code, body)
+	}
+	if _, ok := store.rows[session.JobName]; ok {
+		t.Error("the 401 path must not resurrect the reaped session")
 	}
 }
 

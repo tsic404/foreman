@@ -311,6 +311,12 @@ func (s *FakeServer) handleDeregister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if claims.Role == catalogProbeRole {
+		// Only a live owner has a handshake to acknowledge: a reaped session
+		// leaves the token with nothing to deregister (§6.3 会话不存在 ⇒ 恒 401).
+		if _, found := s.probeSession(claims); !found {
+			writeError(w, http.StatusUnauthorized, "unknown probe session")
+			return
+		}
 		s.cancelProbe(w)
 		return
 	}
