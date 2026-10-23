@@ -1,4 +1,4 @@
-// TC-tech-cache-08 implements AC-100 on the production collector: the
+// TC-tech-cache-08 implements AC-103 on the production collector: the
 // node-side skill bundle cache the upstream daemon keeps under
 // workspaces/.skill-cache is reclaimed by retention and by a per-workspace
 // size cap. Expired entries go, fresh entries stay, and a capacity pass in
