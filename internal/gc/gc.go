@@ -365,10 +365,13 @@ func (c *Collector) enforceCacheLimit(ctx context.Context, root string, entries 
 }
 
 // reclaimToLimit deletes the least recently used entries until their total
-// size fits limit. The scan's mtime is only a snapshot: a Job may write into a
-// cache after the scan, so each victim is re-measured right before deletion and
-// an entry written since the scan is skipped for this round (it is no longer
-// the least recently used).
+// size fits limit. The scan's mtime is only a snapshot: an entry may be
+// re-written after the scan, so each victim is re-measured right before
+// deletion and an entry written since the scan is skipped for this round (it
+// is no longer the least recently used). That skip is not airtight: a write
+// landing between re-measure and delete, or one that leaves the mtime at the
+// scanned value (strict After below), still has its entry deleted this round —
+// an accepted residual window, not eliminable while deletion stays lock-free.
 func (c *Collector) reclaimToLimit(ctx context.Context, root string, live []cacheEntry, limit int64, reason string) (int, int64, int64, error) {
 	var total int64
 	for _, e := range live {
