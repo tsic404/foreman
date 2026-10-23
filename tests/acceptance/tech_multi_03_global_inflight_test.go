@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/state"
 )
 
 func TestTechMulti03GlobalInflightLimitAndSlotReconciliation(t *testing.T) {
@@ -89,6 +90,191 @@ func TestTechMulti03GlobalInflightLimitAndSlotReconciliation(t *testing.T) {
 	if slots, err := tw.coord.Slots(ctx, ""); err != nil || slots > limit {
 		t.Fatalf("shared counter = %d (err %v) after reconciliation, want at most %d", slots, err, limit)
 	}
+}
+
+// TestTechMulti03TakeoverResetDropsAReservationInFlight is AC-76's concurrent
+// face: a zombie previous holder takes one more reservation inside the new
+// holder's reset window. The serving path never puts one there — the claim loop
+// is gated on l.leader() and OnAcquire completes before leader.held is set — so
+// the window is built at the reset's own store calls (resetWindowZombie).
+func TestTechMulti03TakeoverResetDropsAReservationInFlight(t *testing.T) {
+	const limit = 2
+	var zombie *resetWindowZombie
+	tw := newTwoInstances(t, twoInstanceOptions{
+		maxInflight: limit,
+		leaderCfg:   smallLeaderCfg(1500 * time.Millisecond),
+		wrap: func(store state.Store, coord state.CoordStore) (state.Store, state.CoordStore) {
+			zombie = &resetWindowZombie{CoordStore: coord, limit: limit + 1}
+			return store, zombie
+		},
+	})
+	tw.declareAll(t)
+	tw.a.startLeader(t)
+	for i := range limit {
+		tw.a.upstream.enqueueTask(fmt.Sprintf("task-%d", i))
+	}
+	stopA := startConcurrency01ClaimLoop(t, tw.a)
+	waitFor(t, "the holder's two claimed Jobs", 10*time.Second, func() bool {
+		return tw.a.jobs.liveJobs() == limit
+	})
+	tw.waitSlots(t, limit)
+	stopA()
+	ctx := context.Background()
+	if _, reservations, err := tw.coord.SlotSnapshot(ctx, ""); err != nil || reservations != 0 {
+		t.Fatalf("reservations before the takeover = %d (err %v), want 0", reservations, err)
+	}
+
+	// The zombie holder wakes up inside the survivor's reset and reserves once.
+	zombie.arm()
+	tw.a.crashLeader(t)
+	tw.b.startLeader(t)
+	zombie.disarm()
+	id, took, err := zombie.took()
+	if err != nil || !took {
+		t.Fatalf("the reset window carried no reservation: id=%q ok=%v err=%v", id, took, err)
+	}
+
+	// One round after the takeover: the counter is the live-row truth and no
+	// marker of the dead holder survives (§10 两级在途上限，AC-76 末句).
+	liveRows := liveRowCount(t, tw.b)
+	if int(liveRows) != limit {
+		t.Fatalf("live rows = %d after the takeover, want %d", liveRows, limit)
+	}
+	count, reservations, err := tw.coord.SlotSnapshot(ctx, "")
+	if err != nil {
+		t.Fatalf("SlotSnapshot: %v", err)
+	}
+	if reservations != 0 {
+		t.Fatalf("takeover left %d pending reservation(s), want 0", reservations)
+	}
+	if count != liveRows {
+		t.Fatalf("global counter = %d after the takeover, want the %d live rows", count, liveRows)
+	}
+
+	// Retiring the zombie's reservation must not return a slot the reset
+	// already reclaimed: no permanent under-count below the live rows.
+	if err := tw.coord.ReleaseSlot(ctx, "", id); err != nil {
+		t.Fatalf("ReleaseSlot: %v", err)
+	}
+	if count, reservations, err = tw.coord.SlotSnapshot(ctx, ""); err != nil {
+		t.Fatalf("SlotSnapshot after the release: %v", err)
+	}
+	if count != liveRows || reservations != 0 {
+		t.Fatalf("counter = %d (reservations %d) after the zombie's reservation was retired, want %d (reservations 0)",
+			count, reservations, liveRows)
+	}
+
+	// The reclaimed budget is exact: with the cap filled by live rows the
+	// queued task is not claimed, and one settlement frees exactly one slot.
+	stopB := startConcurrency01ClaimLoop(t, tw.b)
+	defer stopB()
+	tw.a.upstream.enqueueTask("task-next")
+	time.Sleep(300 * time.Millisecond)
+	if tw.a.jobs.jobCreated("fm-task-next") {
+		t.Fatal("a claim was issued while the counter already matched the cap")
+	}
+	tw.settleTask(t, tw.b, "task-0")
+	tw.waitForTaskJob(t, "task-next", 10*time.Second)
+	tw.waitSlots(t, limit)
+	if got := liveRowCount(t, tw.b); got != liveRows {
+		t.Fatalf("live rows = %d after one settle and one claim, want %d", got, liveRows)
+	}
+}
+
+// resetWindowZombie decorates the shared coordination face for the reset
+// window: a resurrected holder takes a reservation, from another goroutine,
+// while a reset-shaped store call of the global level is in flight. ResetSlots
+// is the atomic reset's single call; SlotSnapshot is the split reset's read, so
+// the last reservation lands after it and before the counter write — the shape
+// that drops the +1 and keeps the marker.
+type resetWindowZombie struct {
+	state.CoordStore
+
+	limit int
+
+	mu   sync.Mutex
+	armd bool
+	ids  []string
+	err  error
+}
+
+func (z *resetWindowZombie) arm() {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.armd, z.ids, z.err = true, nil, nil
+}
+
+func (z *resetWindowZombie) disarm() {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	z.armd = false
+}
+
+// took names the reservation the window carried last ("" when none).
+func (z *resetWindowZombie) took() (string, bool, error) {
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	if len(z.ids) == 0 {
+		return "", false, z.err
+	}
+	return z.ids[len(z.ids)-1], true, z.err
+}
+
+func (z *resetWindowZombie) reserve() {
+	z.mu.Lock()
+	armed, limit := z.armd, z.limit
+	z.mu.Unlock()
+	if !armed {
+		return
+	}
+
+	done := make(chan struct{})
+	var id string
+	var ok bool
+	var err error
+	go func() {
+		defer close(done)
+		id, ok, err = z.CoordStore.ReserveSlot(context.Background(), "", limit)
+	}()
+	<-done
+
+	z.mu.Lock()
+	defer z.mu.Unlock()
+	if !z.armd {
+		return
+	}
+	if err != nil {
+		z.err = err
+	} else if ok {
+		z.ids = append(z.ids, id)
+	}
+}
+
+func (z *resetWindowZombie) ResetSlots(ctx context.Context, ws string, n int64) (int64, int64, error) {
+	if ws == "" {
+		z.reserve()
+	}
+	return z.CoordStore.ResetSlots(ctx, ws, n)
+}
+
+func (z *resetWindowZombie) SlotSnapshot(ctx context.Context, ws string) (int64, int64, error) {
+	count, reservations, err := z.CoordStore.SlotSnapshot(ctx, ws)
+	if ws == "" {
+		z.reserve()
+	}
+	return count, reservations, err
+}
+
+// liveRowCount counts h's non-terminal rows, the reset's own row truth.
+func liveRowCount(t *testing.T, h *harness) int64 {
+	t.Helper()
+	var n int64
+	for _, e := range h.reg.List() {
+		if e.State != registry.StateTerminal {
+			n++
+		}
+	}
+	return n
 }
 
 // waitSlots blocks until the shared global counter reaches n.

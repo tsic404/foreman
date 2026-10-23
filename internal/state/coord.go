@@ -148,12 +148,13 @@ type CoordStore interface {
 	// CompareAndSetSlots writes next only when the counter still equals
 	// expected, so a concurrent claim's reservation can never be lost.
 	CompareAndSetSlots(ctx context.Context, ws string, expected, next int64) (bool, error)
-	// ClearSlotReservations drops every pending reservation of one level.
-	// The takeover uses it: the previous holder is gone, so no reservation it
-	// left can still become a row (AC-76 未用预留在一轮对账内回收).
-	ClearSlotReservations(ctx context.Context, ws string) error
-	// SetSlots writes the reconciled counter value.
-	SetSlots(ctx context.Context, ws string, n int64) error
+	// ResetSlots is the takeover's exact write: it drops every pending
+	// reservation of one level and writes the counter in one step. The
+	// previous holder is gone, so none of its reservations can still become a
+	// row (AC-76 未用预留在一轮对账内回收), and the single step leaves no
+	// window in which a reservation's +1 could be overwritten while its marker
+	// survives. It returns the counter and the number of markers it dropped.
+	ResetSlots(ctx context.Context, ws string, n int64) (before, cleared int64, err error)
 	// Slots reads the counter (empty ws = cluster-level).
 	Slots(ctx context.Context, ws string) (int64, error)
 
@@ -369,6 +370,19 @@ local n = tonumber(redis.call('GET', KEYS[1]) or '0') - purged
 if n < 0 then n = 0 end
 redis.call('SET', KEYS[1], n)
 return {n, redis.call('ZCARD', KEYS[2])}`)
+
+	// slotReset: KEYS[1]=counter, KEYS[2]=reservation zset, ARGV[1]=value.
+	// The exact reconciliation's write: dropping the markers and writing the
+	// counter is one step, so no reservation can land between them. A split
+	// write would let a marker survive with its +1 overwritten, and the later
+	// purge would decrement that slot a second time. Returns the previous
+	// counter and the number of dropped markers.
+	scriptSlotReset = redis.NewScript(`
+local before = tonumber(redis.call('GET', KEYS[1]) or '0')
+local cleared = redis.call('ZCARD', KEYS[2])
+redis.call('DEL', KEYS[2])
+redis.call('SET', KEYS[1], ARGV[1])
+return {before, cleared}`)
 
 	// slotCAS: write next only when the counter still equals expected.
 	scriptSlotCAS = redis.NewScript(`
@@ -1049,23 +1063,20 @@ func (s *redisStore) CompareAndSetSlots(ctx context.Context, ws string, expected
 	return n == 1, nil
 }
 
-// ClearSlotReservations drops every pending reservation of one level.
-func (s *redisStore) ClearSlotReservations(ctx context.Context, ws string) error {
-	_, reservations := slotKeys(ws)
-	err := s.rdb.Del(ctx, reservations).Err()
+// ResetSlots drops every pending reservation of one level and writes the
+// counter in one atomic step; it returns the previous counter and the dropped
+// marker count.
+func (s *redisStore) ResetSlots(ctx context.Context, ws string, n int64) (int64, int64, error) {
+	counter, reservations := slotKeys(ws)
+	values, err := scriptSlotReset.Run(ctx, s.rdb, []string{counter, reservations}, n).Int64Slice()
 	s.mark(err)
-	return err
-}
-
-// SetSlots writes the reconciled counter value.
-func (s *redisStore) SetSlots(ctx context.Context, ws string, n int64) error {
-	key := keySlotAll
-	if ws != "" {
-		key = keySlotWS + ws
+	if err != nil {
+		return 0, 0, err
 	}
-	err := s.rdb.Set(ctx, key, n, 0).Err()
-	s.mark(err)
-	return err
+	if len(values) != 2 {
+		return 0, 0, fmt.Errorf("shared state: slot reset returned %d values", len(values))
+	}
+	return values[0], values[1], nil
 }
 
 // Slots reads the counter.

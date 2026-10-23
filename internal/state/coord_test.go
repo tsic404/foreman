@@ -322,8 +322,8 @@ func TestCoordSlotsAndLocks(t *testing.T) {
 	if n, err := store.Slots(ctx, ""); err != nil || n != 2 {
 		t.Fatalf("slots = %d (err %v), want 2", n, err)
 	}
-	if err := store.SetSlots(ctx, "", 0); err != nil {
-		t.Fatalf("set slots: %v", err)
+	if _, _, err := store.ResetSlots(ctx, "", 0); err != nil {
+		t.Fatalf("reset slots: %v", err)
 	}
 
 	// The task lock is owner-checked and lease-bounded.
@@ -439,6 +439,84 @@ func TestCoordSlotSnapshotCAS(t *testing.T) {
 	count, reservations, err = store.SlotSnapshot(ctx, "")
 	if err != nil || count != 0 || reservations != 0 {
 		t.Fatalf("snapshot after expiry = (%d,%d) err=%v, want (0,0)", count, reservations, err)
+	}
+}
+
+// TestCoordResetSlotsDropsMarkersAndWritesInOneStep pins the takeover write:
+// the reset drops every pending marker of the level while writing the counter,
+// returns what it found, and leaves the level ready to take new reservations.
+// A marker that survived the reset with its +1 overwritten would later be
+// purged as a second decrement of a slot it never owned.
+func TestCoordResetSlotsDropsMarkersAndWritesInOneStep(t *testing.T) {
+	ctx := context.Background()
+	_, store, _, mr := coordTestStore(t)
+	if _, ok, err := store.ReserveSlot(ctx, "", 10); err != nil || !ok {
+		t.Fatalf("global reserve: ok=%v err=%v", ok, err)
+	}
+	if _, ok, err := store.ReserveSlot(ctx, "ws-1", 10); err != nil || !ok {
+		t.Fatalf("workspace reserve: ok=%v err=%v", ok, err)
+	}
+
+	before, cleared, err := store.ResetSlots(ctx, "", 3)
+	if err != nil || before != 1 || cleared != 1 {
+		t.Fatalf("global reset = (%d,%d) err=%v, want (1,1)", before, cleared, err)
+	}
+	if got, err := store.Slots(ctx, ""); err != nil || got != 3 {
+		t.Fatalf("global counter = %d (err %v), want 3", got, err)
+	}
+	assertReservations(t, mr, keySlotResAll)
+	if _, live, err := store.SlotSnapshot(ctx, ""); err != nil || live != 0 {
+		t.Fatalf("global live reservations after reset = %d (err %v), want 0", live, err)
+	}
+
+	// A reset of one level never touches another level's markers or counter.
+	before, cleared, err = store.ResetSlots(ctx, "ws-1", 0)
+	if err != nil || before != 1 || cleared != 1 {
+		t.Fatalf("workspace reset = (%d,%d) err=%v, want (1,1)", before, cleared, err)
+	}
+	if got, err := store.Slots(ctx, "ws-1"); err != nil || got != 0 {
+		t.Fatalf("workspace counter = %d (err %v), want 0", got, err)
+	}
+	assertReservations(t, mr, keySlotResWS+"ws-1")
+
+	// The level accepts new reservations after the reset and counts each one.
+	if _, ok, err := store.ReserveSlot(ctx, "", 10); err != nil || !ok {
+		t.Fatalf("reserve after reset: ok=%v err=%v", ok, err)
+	}
+	if got, err := store.Slots(ctx, ""); err != nil || got != 4 {
+		t.Fatalf("global counter after a post-reset reserve = %d (err %v), want 4", got, err)
+	}
+}
+
+// TestCoordResetSlotsNeverLosesAConcurrentReservation pins the atomicity the
+// takeover relies on: a reservation taken while the level is being reset
+// either lands after the reset (counter and marker both present) or is dropped
+// by it (both gone). A marker can never survive with its +1 overwritten,
+// because the next purge would then decrement that slot a second time.
+func TestCoordResetSlotsNeverLosesAConcurrentReservation(t *testing.T) {
+	ctx := context.Background()
+	_, store, _, _ := coordTestStore(t)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for range 500 {
+			if _, _, err := store.ReserveSlot(ctx, "", 1<<30); err != nil {
+				return
+			}
+		}
+	}()
+	for range 50 {
+		if _, _, err := store.ResetSlots(ctx, "", 0); err != nil {
+			t.Fatalf("reset: %v", err)
+		}
+	}
+	<-done
+	count, live, err := store.SlotSnapshot(ctx, "")
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	if count != live {
+		t.Fatalf("counter = %d with %d live markers, want the two equal", count, live)
 	}
 }
 
