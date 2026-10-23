@@ -32,6 +32,13 @@ const (
 	EnvAgentStateTTL  = "FOREMAN_AGENT_STATE_TTL"
 	EnvAgentMemoryTTL = "FOREMAN_AGENT_MEMORY_TTL"
 
+	// EnvSkillCacheTTL / EnvSkillCacheMaxBytes bound the node-side skill
+	// bundle cache the upstream daemon keeps under the workspaces tree. The
+	// GC prefix keeps them apart from the proxy's in-process resolve cache
+	// settings, which share the FOREMAN_SKILL_CACHE_* namespace.
+	EnvSkillCacheTTL      = "FOREMAN_GC_SKILL_CACHE_TTL"
+	EnvSkillCacheMaxBytes = "FOREMAN_GC_SKILL_CACHE_MAX_BYTES"
+
 	// EnvNodeName carries the node the pod runs on (downward API
 	// spec.nodeName); it is the `node` field of the cache.gc log event.
 	EnvNodeName = "NODE_NAME"
@@ -51,6 +58,13 @@ const (
 	// defaults (14 days for sessions/transcripts, 90 days for memory).
 	DefaultAgentStateTTL  = 336 * time.Hour
 	DefaultAgentMemoryTTL = 2160 * time.Hour
+	// DefaultSkillCacheTTL matches the bare-cache retention: both are
+	// re-fetchable node caches.
+	DefaultSkillCacheTTL = 720 * time.Hour
+	// DefaultSkillCacheMaxBytes is the per-workspace ceiling. Bundle files are
+	// small, so a working set sits far below it; a reclaim only costs a
+	// re-fetch, never a task failure.
+	DefaultSkillCacheMaxBytes int64 = 10 << 30 // 10Gi
 )
 
 // Config is the gc module's runtime configuration.
@@ -77,6 +91,12 @@ type Config struct {
 	// AgentMemoryTTL is the retention for node-local agent memory
 	// (FOREMAN_AGENT_MEMORY_TTL); 0 disables the rule.
 	AgentMemoryTTL time.Duration
+	// SkillCacheTTL is the retention for the node-side skill bundle cache
+	// (FOREMAN_GC_SKILL_CACHE_TTL).
+	SkillCacheTTL time.Duration
+	// SkillCacheMaxBytes caps one workspace's skill bundle cache; the excess
+	// is reclaimed LRU-first (FOREMAN_GC_SKILL_CACHE_MAX_BYTES).
+	SkillCacheMaxBytes int64
 	// Interval is the round cadence (FOREMAN_GC_INTERVAL).
 	Interval time.Duration
 	// LogLevel comes from FOREMAN_LOG_LEVEL.
@@ -102,7 +122,10 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		Interval:       DefaultGCInterval,
 		AgentStateTTL:  DefaultAgentStateTTL,
 		AgentMemoryTTL: DefaultAgentMemoryTTL,
-		LogLevel:       obs.LogLevel,
+
+		SkillCacheTTL:      DefaultSkillCacheTTL,
+		SkillCacheMaxBytes: DefaultSkillCacheMaxBytes,
+		LogLevel:           obs.LogLevel,
 	}
 	if v := strings.TrimSpace(getenv(EnvStateRoot)); v != "" {
 		cfg.StateRoot = v
@@ -158,6 +181,22 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			return Config{}, err
 		}
 		cfg.AgentMemoryTTL = d
+	}
+	// The skill bundle cache is a live cache like the bare repos: a zero
+	// retention would wipe it every round, so it takes a positive value.
+	if v := strings.TrimSpace(getenv(EnvSkillCacheTTL)); v != "" {
+		d, err := positiveDuration(EnvSkillCacheTTL, v)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.SkillCacheTTL = d
+	}
+	if v := strings.TrimSpace(getenv(EnvSkillCacheMaxBytes)); v != "" {
+		n, err := byteSize(EnvSkillCacheMaxBytes, v)
+		if err != nil {
+			return Config{}, err
+		}
+		cfg.SkillCacheMaxBytes = n
 	}
 	return cfg, nil
 }

@@ -384,6 +384,15 @@ The DaemonSet's `hostPath.path` and the Deployment's `FOREMAN_STATE_ROOT` must
 be changed together; the collector's own view is the mount point, passed back
 in as `FOREMAN_STATE_ROOT=/state`.
 
+The upstream daemon also caches resolved skill bundles on that node tree
+(`workspaces/.skill-cache`), and its own GC is off in the Job template. The
+collector reclaims those entries by retention (`FOREMAN_GC_SKILL_CACHE_TTL`,
+default `720h`) and by a per-workspace size cap
+(`FOREMAN_GC_SKILL_CACHE_MAX_BYTES`, default `10Gi`, least recently used
+first). Both names carry the `GC` prefix to stay distinct from the proxy's
+in-process `FOREMAN_SKILL_CACHE_*` settings. A reclaimed entry is a cache
+miss, never a task failure; the next resolve re-fetches it.
+
 ## Configuration
 
 All keys with their contract defaults are spelled out in the Deployment env.

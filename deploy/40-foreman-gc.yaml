@@ -69,6 +69,13 @@ spec:
               value: "2160h"
             - name: FOREMAN_CACHE_MAX_BYTES
               value: "50Gi"
+            # The upstream daemon caches resolved skill bundles under
+            # ${FOREMAN_STATE_ROOT}/workspaces/.skill-cache; nothing else
+            # reclaims them. Capacity is judged per workspace.
+            - name: FOREMAN_GC_SKILL_CACHE_TTL
+              value: "720h"
+            - name: FOREMAN_GC_SKILL_CACHE_MAX_BYTES
+              value: "10Gi"
             - name: FOREMAN_GC_QUIESCE
               value: "30m"
             - name: FOREMAN_GC_INTERVAL

@@ -26,6 +26,9 @@ func testConfig(root string) Config {
 		Interval:       time.Hour,
 		AgentStateTTL:  DefaultAgentStateTTL,
 		AgentMemoryTTL: DefaultAgentMemoryTTL,
+
+		SkillCacheTTL:      DefaultSkillCacheTTL,
+		SkillCacheMaxBytes: DefaultSkillCacheMaxBytes,
 	}
 }
 
@@ -105,19 +108,20 @@ func growPack(t *testing.T, cacheDir string, extra int) {
 func TestRunOnceTTL(t *testing.T) {
 	root := t.TempDir()
 	makeTree(t, root, map[string]string{
-		"workspaces/ws-1/task-old/workdir/file.txt":        "old",
-		"workspaces/ws-1/task-new/workdir/file.txt":        "new",
-		"workspaces/ws-2/task-old/workdir/file.txt":        "old",
-		"workspaces/.repos/ws-1/repo-old.git/HEAD":         "old",
-		"workspaces/.repos/ws-1/repo-new.git/HEAD":         "new",
-		"workspaces/.task_roots/hash-old/work/file.txt":    "old",
-		"workspaces/.task_roots/hash-new/work/file.txt":    "new",
-		"workspaces/.skill-cache/ws-1/entry/blob.txt":      "ancient",
-		"home/.multica/pi-sessions/session-old.jsonl":      "ancient",
-		"home/.multica/pi-sessions/session-new.jsonl":      "new",
-		"workspaces/ws-1/task-old/sub/deep/file.txt":       "old",
-		"workspaces/ws-1/task-new/sub/deep/file.txt":       "new",
-		"workspaces/.repos/ws-1/repo-old.git/objects/pack": "old",
+		"workspaces/ws-1/task-old/workdir/file.txt":                   "old",
+		"workspaces/ws-1/task-new/workdir/file.txt":                   "new",
+		"workspaces/ws-2/task-old/workdir/file.txt":                   "old",
+		"workspaces/.repos/ws-1/repo-old.git/HEAD":                    "old",
+		"workspaces/.repos/ws-1/repo-new.git/HEAD":                    "new",
+		"workspaces/.task_roots/hash-old/work/file.txt":               "old",
+		"workspaces/.task_roots/hash-new/work/file.txt":               "new",
+		"workspaces/.skill-cache/v1/ws-1/src/id/hash-old/bundle.json": "old",
+		"workspaces/.skill-cache/v1/ws-1/src/id/hash-new/bundle.json": "new",
+		"home/.multica/pi-sessions/session-old.jsonl":                 "ancient",
+		"home/.multica/pi-sessions/session-new.jsonl":                 "new",
+		"workspaces/ws-1/task-old/sub/deep/file.txt":                  "old",
+		"workspaces/ws-1/task-new/sub/deep/file.txt":                  "new",
+		"workspaces/.repos/ws-1/repo-old.git/objects/pack":            "old",
 	})
 	// Everything ancient first, then re-freshen the parts that must survive.
 	ageTree(t, root, 1000*time.Hour)
@@ -128,6 +132,8 @@ func TestRunOnceTTL(t *testing.T) {
 	agePath(t, filepath.Join(root, "workspaces/.repos/ws-1/repo-new.git/HEAD"), 1*time.Hour)
 	agePath(t, filepath.Join(root, "workspaces/.task_roots/hash-new"), 1*time.Hour)
 	agePath(t, filepath.Join(root, "workspaces/.task_roots/hash-new/work/file.txt"), 1*time.Hour)
+	agePath(t, filepath.Join(root, "workspaces/.skill-cache/v1/ws-1/src/id/hash-new"), 1*time.Hour)
+	agePath(t, filepath.Join(root, "workspaces/.skill-cache/v1/ws-1/src/id/hash-new/bundle.json"), 1*time.Hour)
 	agePath(t, filepath.Join(root, "home/.multica/pi-sessions/session-new.jsonl"), 1*time.Hour)
 
 	c := newTestCollector(t, testConfig(root))
@@ -139,14 +145,15 @@ func TestRunOnceTTL(t *testing.T) {
 	if st.Skipped {
 		t.Fatal("round skipped; quiesce should not trigger for a cold tree")
 	}
-	if st.TaskDirs != 2 || st.TaskRoots != 1 || st.BareRepos != 1 || st.AgentState != 1 || st.AgentMemory != 0 {
-		t.Fatalf("stats = %+v, want 2 task dirs, 1 task root, 1 bare repo, 1 agent-state file", st)
+	if st.TaskDirs != 2 || st.TaskRoots != 1 || st.BareRepos != 1 || st.SkillCache != 1 || st.AgentState != 1 || st.AgentMemory != 0 {
+		t.Fatalf("stats = %+v, want 2 task dirs, 1 task root, 1 bare repo, 1 skill bundle, 1 agent-state file", st)
 	}
 	for _, gone := range []string{
 		"workspaces/ws-1/task-old",
 		"workspaces/ws-2/task-old",
 		"workspaces/.repos/ws-1/repo-old.git",
 		"workspaces/.task_roots/hash-old",
+		"workspaces/.skill-cache/v1/ws-1/src/id/hash-old",
 		"home/.multica/pi-sessions/session-old.jsonl",
 	} {
 		if exists(filepath.Join(root, gone)) {
@@ -157,9 +164,59 @@ func TestRunOnceTTL(t *testing.T) {
 		"workspaces/ws-1/task-new",
 		"workspaces/.repos/ws-1/repo-new.git",
 		"workspaces/.task_roots/hash-new",
-		// .skill-cache has no rule in the design: untouched.
-		"workspaces/.skill-cache/ws-1/entry/blob.txt",
+		"workspaces/.skill-cache/v1/ws-1/src/id/hash-new/bundle.json",
 		"home/.multica/pi-sessions/session-new.jsonl",
+	} {
+		if !exists(filepath.Join(root, kept)) {
+			t.Errorf("%s was reclaimed, want it kept", kept)
+		}
+	}
+}
+
+// TestRunOnceSkillCacheLimit pins the per-workspace size cap: the cache is
+// trimmed least-recently-used first, and one workspace's excess never evicts
+// another workspace's entries.
+func TestRunOnceSkillCacheLimit(t *testing.T) {
+	root := t.TempDir()
+	makeTree(t, root, map[string]string{
+		"workspaces/.skill-cache/v1/ws-1/src/id-a/hash-old/bundle.json":    strings.Repeat("a", 4096),
+		"workspaces/.skill-cache/v1/ws-1/src/id-a/hash-mid/bundle.json":    strings.Repeat("b", 4096),
+		"workspaces/.skill-cache/v1/ws-1/src/id-b/hash-new/bundle.json":    strings.Repeat("c", 4096),
+		"workspaces/.skill-cache/v1/ws-2/src/id-c/hash-oldest/bundle.json": strings.Repeat("d", 4096),
+	})
+	for _, entry := range []struct {
+		path string
+		age  time.Duration
+	}{
+		{"workspaces/.skill-cache/v1/ws-1/src/id-a/hash-old", 20 * 24 * time.Hour},
+		{"workspaces/.skill-cache/v1/ws-1/src/id-a/hash-mid", 10 * 24 * time.Hour},
+		{"workspaces/.skill-cache/v1/ws-1/src/id-b/hash-new", time.Hour},
+		{"workspaces/.skill-cache/v1/ws-2/src/id-c/hash-oldest", 25 * 24 * time.Hour},
+	} {
+		dir := filepath.Join(root, filepath.FromSlash(entry.path))
+		agePath(t, dir, entry.age)
+		agePath(t, filepath.Join(dir, "bundle.json"), entry.age)
+	}
+
+	cfg := testConfig(root)
+	cfg.Quiesce = 0               // the tree's parent dirs are fresh; keep the round
+	cfg.SkillCacheMaxBytes = 8192 // two bundles; ws-1 holds three
+	st, err := newTestCollector(t, cfg).RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if st.SkillCache != 1 {
+		t.Fatalf("SkillCache = %d, want 1 (ws-1's least recently used entry)", st.SkillCache)
+	}
+	if exists(filepath.Join(root, "workspaces/.skill-cache/v1/ws-1/src/id-a/hash-old")) {
+		t.Error("ws-1's least recently used entry survived the size cap")
+	}
+	for _, kept := range []string{
+		"workspaces/.skill-cache/v1/ws-1/src/id-a/hash-mid",
+		"workspaces/.skill-cache/v1/ws-1/src/id-b/hash-new",
+		// ws-2 is under its own cap: its entry is the oldest of all, but a
+		// capacity pass never reaches across workspaces.
+		"workspaces/.skill-cache/v1/ws-2/src/id-c/hash-oldest",
 	} {
 		if !exists(filepath.Join(root, kept)) {
 			t.Errorf("%s was reclaimed, want it kept", kept)
@@ -588,23 +645,26 @@ func TestLoadConfigDefaults(t *testing.T) {
 	if cfg.StateRoot != DefaultStateRoot || cfg.CacheTTL != DefaultCacheTTL ||
 		cfg.TaskDirTTL != DefaultTaskDirTTL || cfg.CacheMaxBytes != DefaultCacheMaxBytes ||
 		cfg.Quiesce != DefaultGCQuiesce || cfg.Interval != DefaultGCInterval ||
-		cfg.AgentStateTTL != DefaultAgentStateTTL || cfg.AgentMemoryTTL != DefaultAgentMemoryTTL {
+		cfg.AgentStateTTL != DefaultAgentStateTTL || cfg.AgentMemoryTTL != DefaultAgentMemoryTTL ||
+		cfg.SkillCacheTTL != DefaultSkillCacheTTL || cfg.SkillCacheMaxBytes != DefaultSkillCacheMaxBytes {
 		t.Fatalf("defaults = %+v", cfg)
 	}
 }
 
 func TestLoadConfigOverrides(t *testing.T) {
 	cfg, err := LoadConfig(envFrom(map[string]string{
-		EnvStateRoot:        "/state",
-		EnvCacheTTL:         "24h",
-		EnvTaskDirTTL:       "48h",
-		EnvCacheMaxBytes:    "512Mi",
-		EnvGCQuiesce:        "5m",
-		EnvGCInterval:       "30m",
-		EnvAgentStateTTL:    "12h",
-		EnvAgentMemoryTTL:   "0",
-		EnvNodeName:         "node-a",
-		"FOREMAN_LOG_LEVEL": "debug",
+		EnvStateRoot:          "/state",
+		EnvCacheTTL:           "24h",
+		EnvTaskDirTTL:         "48h",
+		EnvCacheMaxBytes:      "512Mi",
+		EnvGCQuiesce:          "5m",
+		EnvGCInterval:         "30m",
+		EnvAgentStateTTL:      "12h",
+		EnvAgentMemoryTTL:     "0",
+		EnvSkillCacheTTL:      "36h",
+		EnvSkillCacheMaxBytes: "2Gi",
+		EnvNodeName:           "node-a",
+		"FOREMAN_LOG_LEVEL":   "debug",
 	}))
 	if err != nil {
 		t.Fatalf("LoadConfig: %v", err)
@@ -623,6 +683,9 @@ func TestLoadConfigOverrides(t *testing.T) {
 	if cfg.CacheMaxBytes != 512<<20 {
 		t.Fatalf("CacheMaxBytes = %d, want %d", cfg.CacheMaxBytes, 512<<20)
 	}
+	if cfg.SkillCacheTTL != 36*time.Hour || cfg.SkillCacheMaxBytes != 2<<30 {
+		t.Fatalf("skill cache = ttl %s, max %d", cfg.SkillCacheTTL, cfg.SkillCacheMaxBytes)
+	}
 }
 
 func TestLoadConfigRejectsBadValues(t *testing.T) {
@@ -638,6 +701,9 @@ func TestLoadConfigRejectsBadValues(t *testing.T) {
 		"neg agent state":  {EnvAgentStateTTL: "-1h"},
 		"bad agent memory": {EnvAgentMemoryTTL: "1d"},
 		"neg agent memory": {EnvAgentMemoryTTL: "-336h"},
+		// The skill bundle cache takes a live retention and a byte quantity.
+		"zero skill ttl": {EnvSkillCacheTTL: "0s"},
+		"bad skill size": {EnvSkillCacheMaxBytes: "lots"},
 	}
 	for name, env := range cases {
 		if _, err := LoadConfig(envFrom(env)); err == nil {
