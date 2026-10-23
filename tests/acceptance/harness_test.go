@@ -286,6 +286,10 @@ type upstreamStub struct {
 	// is recorded, so a scenario can read the write-ahead window (queue depth
 	// and carrier) while the report is still in flight.
 	lifecycleGates map[string]chan struct{}
+	// lifecycleDrops makes the next C5–C12 forward for an endpoint fail at the
+	// transport: the connection is closed without a response head. One-shot,
+	// so the retry that follows takes the programmed answer.
+	lifecycleDrops map[string]bool
 	// gcStatus/gcBody are the S-20 answer (default 404).
 	gcStatus int
 	gcBody   []byte
@@ -321,6 +325,7 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		taskStatuses:         map[string]string{},
 		lifecycleCodes:       map[string]int{},
 		lifecycleGates:       map[string]chan struct{}{},
+		lifecycleDrops:       map[string]bool{},
 		gcStatus:             http.StatusNotFound,
 		gcBody:               []byte(`{"error":"not found"}`),
 		registerStatus:       http.StatusOK,
@@ -425,9 +430,20 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		mux.HandleFunc("POST /api/daemon/tasks/{tid}/"+ep, func(w http.ResponseWriter, r *http.Request) {
 			body, _ := io.ReadAll(r.Body)
 			stub.record(r, r.URL.Path, body)
-			gate, status := stub.lifecycleAnswer(ep)
+			gate, status, drop := stub.lifecycleAnswer(ep)
 			if gate != nil {
 				<-gate
+			}
+			if drop {
+				// Transport failure: the request landed but the answer never
+				// starts, the shape the client reports as an error rather than
+				// a status code.
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					return
+				}
+				_ = conn.Close()
+				return
 			}
 			if status == 0 {
 				status = http.StatusOK
@@ -704,14 +720,25 @@ func (s *upstreamStub) holdLifecycle(ep string) chan struct{} {
 	return gate
 }
 
-// lifecycleAnswer takes the pending gate and the programmed status for ep in
-// one locked step.
-func (s *upstreamStub) lifecycleAnswer(ep string) (chan struct{}, int) {
+// lifecycleAnswer takes the pending gate, the programmed status and the
+// one-shot drop flag for ep in one locked step.
+func (s *upstreamStub) lifecycleAnswer(ep string) (chan struct{}, int, bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	gate := s.lifecycleGates[ep]
 	delete(s.lifecycleGates, ep)
-	return gate, s.lifecycleCodes[ep]
+	drop := s.lifecycleDrops[ep]
+	delete(s.lifecycleDrops, ep)
+	return gate, s.lifecycleCodes[ep], drop
+}
+
+// dropNextLifecycle makes the next C5–C12 forward for ep fail before the
+// response head: the stub records the request, then closes the connection.
+// It is the client-side failure the upstream status cannot express.
+func (s *upstreamStub) dropNextLifecycle(ep string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.lifecycleDrops[ep] = true
 }
 
 // setGCCheck programs the S-20 answer.

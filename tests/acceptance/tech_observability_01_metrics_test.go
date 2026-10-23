@@ -518,47 +518,87 @@ func TestTechObservability01UsageLabelSpaceBounded(t *testing.T) {
 
 // TestTechObservability01UsageCountsAcceptedReportOnly drives S-12 through the
 // production forward client: the token metric counts the usage the upstream
-// accepted. A refused report reaches the daemon as the transient 502 and stays
+// accepted. Both shapes of an unaccepted forward — an upstream refusal and a
+// transport failure — reach the daemon as the transient 502 and stay
 // uncounted; the daemon's retry, once taken, is the single count.
 func TestTechObservability01UsageCountsAcceptedReportOnly(t *testing.T) {
-	h := newHarnessWithRealServer(t, false)
-	const taskID = "task-usage-retry"
-	payload, err := json.Marshal(map[string]any{
-		"id": taskID, "agent_id": "agent-1", "workspace_id": "ws-1",
-		"runtime_id": "rid-zz", "issue_id": "issue-1", "issue_identifier": "TSI-1",
-		"agent": map[string]any{"name": "agent-a"},
-	})
-	if err != nil {
-		t.Fatalf("marshal claim: %v", err)
-	}
-	tcPolicyAxisClaimRaw(t, h, payload)
-	token := issueJobToken(t, h, taskID)
-	registerTaskDaemon(t, h, taskID, token)
-	claimTask(t, h, taskID, token)
-	if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/start", token, []byte(`{}`)); code != http.StatusOK {
-		t.Fatalf("S8 = %d: %s", code, answer)
-	}
 	body := []byte(`{"usage":[{"provider":"omp","model":"kimi","input_tokens":9}]}`)
 
-	h.upstream.setLifecycleStatus(string(scheduler.EPUsage), http.StatusServiceUnavailable)
-	if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/usage", token, body); code != http.StatusBadGateway {
-		t.Fatalf("S12 with the upstream refusing = %d: %s", code, answer)
-	}
-	if got := h.metrics.tokenUsageSnapshot(); len(got) != 0 {
-		t.Fatalf("token usage after a refused forward = %+v, want none", got)
+	// claimUsageTask drives one task to its first S-12 report and returns the
+	// token the daemon face answers to.
+	claimUsageTask := func(t *testing.T, taskID string) (*harness, string) {
+		t.Helper()
+		h := newHarnessWithRealServer(t, false)
+		payload, err := json.Marshal(map[string]any{
+			"id": taskID, "agent_id": "agent-1", "workspace_id": "ws-1",
+			"runtime_id": "rid-zz", "issue_id": "issue-1", "issue_identifier": "TSI-1",
+			"agent": map[string]any{"name": "agent-a"},
+		})
+		if err != nil {
+			t.Fatalf("marshal claim: %v", err)
+		}
+		tcPolicyAxisClaimRaw(t, h, payload)
+		token := issueJobToken(t, h, taskID)
+		registerTaskDaemon(t, h, taskID, token)
+		claimTask(t, h, taskID, token)
+		if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/start", token, []byte(`{}`)); code != http.StatusOK {
+			t.Fatalf("S8 = %d: %s", code, answer)
+		}
+		return h, token
 	}
 
-	h.upstream.setLifecycleStatus(string(scheduler.EPUsage), 0)
-	if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/usage", token, body); code != http.StatusOK {
-		t.Fatalf("retried S12 = %d: %s", code, answer)
+	// assertCountedOnce takes the daemon's retry and reads the single count it
+	// must produce.
+	assertCountedOnce := func(t *testing.T, h *harness, taskID, token string) {
+		t.Helper()
+		if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/usage", token, body); code != http.StatusOK {
+			t.Fatalf("retried S12 = %d: %s", code, answer)
+		}
+		got := h.metrics.tokenUsageSnapshot()
+		if len(got) != 1 {
+			t.Fatalf("token usage = %+v, want one counted entry", got)
+		}
+		if got[0].provider != "omp" || got[0].model != "kimi" || got[0].input != 9 {
+			t.Errorf("token usage = %+v, want (omp, kimi) input 9", got[0])
+		}
 	}
-	got := h.metrics.tokenUsageSnapshot()
-	if len(got) != 1 {
-		t.Fatalf("token usage = %+v, want one counted entry", got)
-	}
-	if got[0].provider != "omp" || got[0].model != "kimi" || got[0].input != 9 {
-		t.Errorf("token usage = %+v, want (omp, kimi) input 9", got[0])
-	}
+
+	t.Run("an upstream refusal stays uncounted", func(t *testing.T) {
+		const taskID = "task-usage-refused"
+		h, token := claimUsageTask(t, taskID)
+
+		h.upstream.setLifecycleStatus(string(scheduler.EPUsage), http.StatusServiceUnavailable)
+		if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/usage", token, body); code != http.StatusBadGateway {
+			t.Fatalf("S12 with the upstream refusing = %d: %s", code, answer)
+		}
+		if got := h.metrics.tokenUsageSnapshot(); len(got) != 0 {
+			t.Fatalf("token usage after a refused forward = %+v, want none", got)
+		}
+
+		h.upstream.setLifecycleStatus(string(scheduler.EPUsage), 0)
+		assertCountedOnce(t, h, taskID, token)
+	})
+
+	t.Run("a transport failure stays uncounted", func(t *testing.T) {
+		const taskID = "task-usage-transport"
+		h, token := claimUsageTask(t, taskID)
+
+		// The upstream reads the report and drops the connection before the
+		// response head: the forward client reports a transport error, not a
+		// status, and the daemon sees the same transient 502.
+		h.upstream.dropNextLifecycle(string(scheduler.EPUsage))
+		if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/usage", token, body); code != http.StatusBadGateway {
+			t.Fatalf("S12 with the upstream dropping the connection = %d: %s", code, answer)
+		}
+		if calls := h.upstream.calls(http.MethodPost, "/api/daemon/tasks/"+taskID+"/usage"); len(calls) != 1 {
+			t.Errorf("upstream usage calls = %d, want the one forward that failed", len(calls))
+		}
+		if got := h.metrics.tokenUsageSnapshot(); len(got) != 0 {
+			t.Fatalf("token usage after a transport failure = %+v, want none", got)
+		}
+
+		assertCountedOnce(t, h, taskID, token)
+	})
 }
 
 // observability01RunTask drives one claimed task to a terminal result through
