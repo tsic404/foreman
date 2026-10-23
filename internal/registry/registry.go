@@ -872,7 +872,6 @@ func (r *Registry) SettleNoResult(taskID string, expected Result) (TaskEntry, bo
 			r.done.put(taskID, at, settledRecord(entry))
 		}
 		r.cacheEntryLocked(entry)
-		r.mu.Unlock()
 		return entry, true
 	}
 	e.Result = ""
