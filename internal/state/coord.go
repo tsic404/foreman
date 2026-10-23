@@ -118,8 +118,8 @@ type CoordStore interface {
 	ListEntries(ctx context.Context) ([]registry.TaskEntry, error)
 	// ListSettled lists every settled record.
 	ListSettled(ctx context.Context) ([]registry.TaskEntry, error)
-	// ListRevoked lists the revocation set.
-	ListRevoked(ctx context.Context) (map[string]time.Time, error)
+	// ListRevoked lists the revocation set grouped by workspace.
+	ListRevoked(ctx context.Context) (map[string]map[string]time.Time, error)
 
 	// LockTask acquires the per-task write lock (lease-bounded).
 	LockTask(ctx context.Context, ws, taskID, owner string, ttl time.Duration) (bool, error)

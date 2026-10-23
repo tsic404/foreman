@@ -147,10 +147,10 @@ type RevocationStore interface {
 	// latency. It is the seam stage two's bounded positive cache runs
 	// against (§6.1 跨实例一致).
 	IsRevoked(ctx context.Context, ws, hash string) (bool, error)
-	// ListRevoked lists the live revocations so a restart can seed the
-	// in-process positive cache (the safe direction: a cached digest can
-	// only reject a token early, never accept one).
-	ListRevoked(ctx context.Context) (map[string]time.Time, error)
+	// ListRevoked lists the live revocations grouped by workspace so a
+	// restart can seed the in-process cache without losing the partition
+	// (§6.1): the seed must stay under the workspace it was recorded for.
+	ListRevoked(ctx context.Context) (map[string]map[string]time.Time, error)
 }
 
 // Option customizes an Issuer.
@@ -206,9 +206,11 @@ func (i *Issuer) RestoreRevocations(ctx context.Context) error {
 		return err
 	}
 	now := i.now()
-	for hash, until := range revoked {
-		if until.After(now) {
-			i.revocations.Revoke(hash, until)
+	for ws, digests := range revoked {
+		for hash, until := range digests {
+			if until.After(now) {
+				i.revocations.Revoke(ws, hash, until)
+			}
 		}
 	}
 	return nil
@@ -396,7 +398,7 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 	// 跨实例一致); doing it here would put a store call on every daemon
 	// request for no stage-one gain.
 	digest := i.Hash(token)
-	if i.revocations.IsRevoked(digest) {
+	if i.revocations.IsRevoked(payload.WorkspaceID, digest) {
 		return revocationVerdict(entry, payload, req, claims)
 	}
 	if i.revokeStore != nil {
@@ -417,7 +419,7 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 			}
 		}
 		if revoked {
-			i.revocations.Revoke(digest, claims.ExpiresAt.Add(ClockSkew))
+			i.revocations.Revoke(payload.WorkspaceID, digest, claims.ExpiresAt.Add(ClockSkew))
 			return revocationVerdict(entry, payload, req, claims)
 		}
 	}
@@ -453,7 +455,7 @@ func (i *Issuer) Hash(token string) string {
 // never expires an entry early (conservative direction — the digest may
 // outlive the token, never the reverse).
 func (i *Issuer) Revoke(tokenHash, workspaceID string) {
-	i.revocations.Revoke(tokenHash, i.now().Add(i.tokenTTL+ClockSkew))
+	i.revocations.Revoke(workspaceID, tokenHash, i.now().Add(i.tokenTTL+ClockSkew))
 	if i.revokeStore != nil {
 		// The shared face is the cross-restart authority. A failure leaves
 		// the in-process set holding the digest, so the same-instance face

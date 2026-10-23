@@ -64,9 +64,10 @@ type StateStore interface {
 	// stage two's cross-instance read; stage one's in-process set is seeded at
 	// startup and written through, so the hot path needs no store read.
 	IsRevoked(ctx context.Context, ws, hash string) (bool, error)
-	// ListRevoked lists the live revocations (digest → valid-until) so a
-	// restart can seed the in-process positive cache.
-	ListRevoked(ctx context.Context) (map[string]time.Time, error)
+	// ListRevoked lists the live revocations grouped by workspace
+	// (workspace → digest → valid-until) so a restart can seed the in-process
+	// positive cache without losing the partition (§6.1).
+	ListRevoked(ctx context.Context) (map[string]map[string]time.Time, error)
 
 	// Ping verifies the store is reachable.
 	Ping(ctx context.Context) error

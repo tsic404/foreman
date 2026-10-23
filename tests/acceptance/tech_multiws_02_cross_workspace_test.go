@@ -4,9 +4,12 @@
 package acceptance
 
 import (
+	"errors"
 	"testing"
 	"time"
 
+	"github.com/tsic404/foreman/internal/auth"
+	"github.com/tsic404/foreman/internal/proxy"
 	"github.com/tsic404/foreman/internal/registry"
 )
 
@@ -104,5 +107,53 @@ func TestTechMultiWS02CrossWorkspaceRejected(t *testing.T) {
 	}
 	if _, has := jobB.Spec.Template.Spec.NodeSelector["pool"]; has {
 		t.Errorf("B nodeSelector carries A's pool definition: %+v", jobB.Spec.Template.Spec.NodeSelector)
+	}
+}
+
+// The revocation set stays partitioned after a restart seeds the in-process
+// cache from the shared store (AC-74 / AC-82): the digest under test is B's
+// own token digest recorded under A, the shape a cross-workspace digest
+// collision would produce and the only way one workspace's revocation could
+// ever reach another's adjudication.
+func TestTechMultiWS02RevocationRestoreStaysPartitioned(t *testing.T) {
+	m := newMultiWS(t, "ws-a", "ws-b")
+	m.claim("ws-a", "task-a1", "rid-a")
+	entryB := m.claim("ws-b", "task-b1", "rid-b")
+	tokenB := m.builder.tokenFor(entryB.JobName)
+	if tokenB == "" {
+		t.Fatal("missing B Job Token")
+	}
+	digestB := m.issuer.Hash(tokenB)
+	ctx := t.Context()
+
+	store, _ := multi08Store(t)
+	if err := store.Revoke(ctx, "ws-a", digestB, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("Revoke under ws-a: %v", err)
+	}
+	restarted, err := proxy.JobTokenIssuer(testKey, m.reg, m.probes, auth.DefaultJobTokenTTL, store)
+	if err != nil {
+		t.Fatalf("JobTokenIssuer: %v", err)
+	}
+	if err := restarted.RestoreRevocations(ctx); err != nil {
+		t.Fatalf("RestoreRevocations: %v", err)
+	}
+	if _, err := restarted.Verify(tokenB, auth.RequestScope{}); err != nil {
+		t.Fatalf("B token adjudicated by A's revocation: %v", err)
+	}
+
+	// Control: the same digest recorded under B is B's own revocation, so the
+	// restored set must reject it — proving the seed really ran.
+	if err := store.Revoke(ctx, "ws-b", digestB, time.Now().Add(time.Hour)); err != nil {
+		t.Fatalf("Revoke under ws-b: %v", err)
+	}
+	controlled, err := proxy.JobTokenIssuer(testKey, m.reg, m.probes, auth.DefaultJobTokenTTL, store)
+	if err != nil {
+		t.Fatalf("JobTokenIssuer: %v", err)
+	}
+	if err := controlled.RestoreRevocations(ctx); err != nil {
+		t.Fatalf("RestoreRevocations: %v", err)
+	}
+	if _, err := controlled.Verify(tokenB, auth.RequestScope{}); !errors.Is(err, auth.ErrRevoked) {
+		t.Fatalf("restored ws-b revocation: Verify err = %v, want ErrRevoked", err)
 	}
 }
