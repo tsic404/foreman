@@ -19,6 +19,8 @@ import (
 	"os"
 	"slices"
 	"strings"
+
+	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // Environment variable names of the multi-workspace interface.
@@ -257,7 +259,11 @@ func loadLegacy(getenv func(string) string) (Set, error) {
 // NewSet validates identities and returns the set. The rules are the
 // deployment invariants: every identity needs a workspace id, a daemon id and
 // a server credential; workspace ids and daemon ids are unique (one identity
-// per workspace, and no identity shared across workspaces, F2).
+// per workspace, and no identity shared across workspaces, F2). A workspace id
+// must also be a legal Kubernetes label value: it is written into Job, pod and
+// carrier labels and rendered into the workspace placeholder, so an illegal
+// value would otherwise surface only as an apiserver rejection at Job creation
+// (and, in a path-shaped placeholder, as an unintended node directory).
 func NewSet(identities []Identity) (Set, error) { return newSet(identities, os.Getenv) }
 
 func newSet(identities []Identity, getenv func(string) string) (Set, error) {
@@ -280,6 +286,10 @@ func newSet(identities []Identity, getenv func(string) string) (Set, error) {
 		identity.Token, identity.TokenEnv = token, ""
 		if identity.WorkspaceID == "" {
 			return Set{}, fmt.Errorf("workspace identity %d has no workspace_id", i)
+		}
+		if problems := validation.IsValidLabelValue(identity.WorkspaceID); len(problems) > 0 {
+			return Set{}, fmt.Errorf("workspace id %q is not a legal Kubernetes label value: %s",
+				identity.WorkspaceID, strings.Join(problems, "; "))
 		}
 		if identity.DaemonID == "" {
 			return Set{}, fmt.Errorf("workspace %s has no daemon_id", identity.WorkspaceID)

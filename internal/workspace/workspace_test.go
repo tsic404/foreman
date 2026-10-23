@@ -203,3 +203,54 @@ func TestDeploymentIdentities(t *testing.T) {
 		t.Fatalf("NewSet on derived identities: %v", err)
 	}
 }
+
+// TestNewSetWorkspaceIDCharset pins the value face the downstream writers
+// already impose: the id is a label value and a placeholder render value, so
+// anything outside the label grammar must fail here rather than at Job
+// creation, and every legal shape passes verbatim.
+func TestNewSetWorkspaceIDCharset(t *testing.T) {
+	identity := func(id string) []Identity {
+		return []Identity{{WorkspaceID: id, DaemonID: "foreman-" + id, Token: "mdt_token"}}
+	}
+
+	legal := []string{
+		"ws-a",
+		"11111111-1111-4111-8111-111111111111",
+		"WS_A.b",
+		strings.Repeat("a", 63),
+	}
+	for _, id := range legal {
+		set, err := NewSet(identity(id))
+		if err != nil {
+			t.Errorf("NewSet(%q) refused a legal label value: %v", id, err)
+			continue
+		}
+		if got := set.IDs(); len(got) != 1 || got[0] != id {
+			t.Errorf("NewSet(%q) ids = %v, want the value verbatim", id, got)
+		}
+	}
+
+	illegal := []string{
+		"/var/lib/foreman/home",
+		"../../escape",
+		"..",
+		".hidden",
+		"trailing.",
+		"ws id",
+		"ws:8080",
+		strings.Repeat("a", 64),
+	}
+	for _, id := range illegal {
+		_, err := NewSet(identity(id))
+		if err == nil {
+			t.Errorf("NewSet(%q) accepted an illegal label value", id)
+			continue
+		}
+		if !strings.Contains(err.Error(), id) {
+			t.Errorf("NewSet(%q) error %q does not name the id", id, err)
+		}
+		if !strings.Contains(err.Error(), "label value") {
+			t.Errorf("NewSet(%q) error %q does not state the rule", id, err)
+		}
+	}
+}
