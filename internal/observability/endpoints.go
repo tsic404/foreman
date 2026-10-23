@@ -64,11 +64,37 @@ type OpsConfig struct {
 	Logger       *slog.Logger
 }
 
+// OpsHandler is the ops surface's route table. It is the read side of the
+// payload write-face census (§9.3): RegisteredPatterns reports the patterns
+// recorded by register, the surface's one mount point. That every mount goes
+// through register is a convention, not a language guarantee; the census
+// reads this package's source and binds values: a foreign receiver, a pattern
+// that does not resolve to the recorded parameter, a shadowing parameter or
+// range variable, a reassigned name, an escaped mount method and a second
+// route table fail it. It does not follow a pattern mutated through a pointer.
+type OpsHandler struct {
+	// dispatch is the mux's ServeHTTP method value. The mux does not leave
+	// NewOpsHandler: no field or method hands it out, and the census fails on
+	// any other mux use in this function or construction in this package.
+	dispatch   http.HandlerFunc
+	registered []string
+}
+
+// ServeHTTP dispatches to the mounted routes.
+func (h *OpsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	h.dispatch(w, r)
+}
+
+// RegisteredPatterns returns the patterns the surface registered, in order.
+func (h *OpsHandler) RegisteredPatterns() []string {
+	return append([]string(nil), h.registered...)
+}
+
 // NewOpsHandler mounts the cluster-internal ops surface (§2.2 S-25): /metrics
 // plus /foreman/*. No Job Token check — these endpoints are
 // reachable only inside the cluster and never exposed via Ingress. A nil
 // logs reader keeps the route but answers 404 (optional endpoint).
-func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg OpsConfig) http.Handler {
+func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg OpsConfig) *OpsHandler {
 	if cfg.StartedAt.IsZero() {
 		cfg.StartedAt = time.Now()
 	}
@@ -77,17 +103,30 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 		log = slog.Default()
 	}
 	log = log.With("component", "observability")
+	handler := &OpsHandler{}
 	mux := http.NewServeMux()
+	// register is the single mount point: the pattern is recorded by the same
+	// call that mounts it, and the census requires every mount in this closure
+	// to pass that recorded binding, so the mounted set and the recorded set
+	// cannot diverge. Inside the closure the mux is legal only as a mount's
+	// receiver — passing it out, taking a method value or assigning it fails —
+	// and the package keeps one route table: a second construction, a
+	// reassigned or shadowed name, and a foreign receiver all fail.
+	register := func(pattern string, h http.Handler) {
+		handler.registered = append(handler.registered, pattern)
+		mux.Handle(pattern, h)
+	}
+	registerFn := func(pattern string, h http.HandlerFunc) { register(pattern, h) }
 	if metrics == nil {
 		// No metrics registry was wired: the endpoint is a readiness input
 		// (§9.3), so it answers "not ready" instead of dereferencing nil.
-		mux.HandleFunc("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
+		registerFn("GET /metrics", func(w http.ResponseWriter, _ *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "metrics are not wired")
 		})
 	} else {
-		mux.Handle("GET /metrics", metrics.Handler())
+		register("GET /metrics", metrics.Handler())
 	}
-	mux.HandleFunc("GET /foreman/healthz", func(w http.ResponseWriter, _ *http.Request) {
+	registerFn("GET /foreman/healthz", func(w http.ResponseWriter, _ *http.Request) {
 		runtimeIDs := []string{}
 		if cfg.RuntimeIDs != nil {
 			if ids := cfg.RuntimeIDs(); ids != nil {
@@ -112,7 +151,7 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 		}
 		writeJSON(w, status, body)
 	})
-	mux.HandleFunc("GET /foreman/tasks", func(w http.ResponseWriter, r *http.Request) {
+	registerFn("GET /foreman/tasks", func(w http.ResponseWriter, r *http.Request) {
 		// TaskEntry.Payload is json:"-" — the list never leaks payloads (F3).
 		workspaceID, ok := workspaceScope(r, cfg.WorkspaceIDs)
 		if !ok {
@@ -128,7 +167,7 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 		}
 		writeJSON(w, http.StatusOK, entries)
 	})
-	mux.HandleFunc("GET /foreman/tasks/{taskID}", func(w http.ResponseWriter, r *http.Request) {
+	registerFn("GET /foreman/tasks/{taskID}", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID, scoped := workspaceScope(r, cfg.WorkspaceIDs)
 		if !scoped {
 			writeError(w, http.StatusBadRequest, "workspace is required")
@@ -156,7 +195,7 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 		}
 		writeJSON(w, http.StatusOK, e)
 	})
-	mux.HandleFunc("GET /foreman/tasks/{taskID}/logs", func(w http.ResponseWriter, r *http.Request) {
+	registerFn("GET /foreman/tasks/{taskID}/logs", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID, scoped := workspaceScope(r, cfg.WorkspaceIDs)
 		if !scoped {
 			writeError(w, http.StatusBadRequest, "workspace is required")
@@ -168,7 +207,7 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 		}
 		serveJobLogs(w, r, index, workspaceID, logs, log)
 	})
-	mux.HandleFunc("GET /foreman/tasks/{taskID}/payload-preview", func(w http.ResponseWriter, r *http.Request) {
+	registerFn("GET /foreman/tasks/{taskID}/payload-preview", func(w http.ResponseWriter, r *http.Request) {
 		workspaceID, scoped := workspaceScope(r, cfg.WorkspaceIDs)
 		if !scoped {
 			writeError(w, http.StatusBadRequest, "workspace is required")
@@ -201,20 +240,21 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 	// S31 is read-only by design: it reports the startup discovery, the C1
 	// declaration and the catalog slots, and can never trigger a discovery or
 	// a refresh (ADR-025).
-	mux.HandleFunc("GET /foreman/register-source", func(w http.ResponseWriter, _ *http.Request) {
+	registerFn("GET /foreman/register-source", func(w http.ResponseWriter, _ *http.Request) {
 		if cfg.RegisterSource == nil {
 			writeError(w, http.StatusNotFound, "register source unavailable")
 			return
 		}
 		writeJSON(w, http.StatusOK, cfg.RegisterSource())
 	})
-	mux.HandleFunc("GET /foreman/version", func(w http.ResponseWriter, _ *http.Request) {
+	registerFn("GET /foreman/version", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
 			"version":   cfg.Version,
 			"job_image": cfg.JobImage,
 		})
 	})
-	return mux
+	handler.dispatch = mux.ServeHTTP
+	return handler
 }
 
 // serveJobLogs proxies the newest pod's log tail for the task's Job.
