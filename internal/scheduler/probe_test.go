@@ -468,6 +468,42 @@ func TestRunStartupProbeCatalogDisabledCompletesAtRegistration(t *testing.T) {
 	}
 }
 
+// TestRunStartupProbeDropsRegistrationOutsideDiscoverySet pins that a probe
+// registration for a workspace this deployment does not configure is reported
+// and never returned as a declaration: no client, credential or identity
+// exists for it, so an entry would be read by nobody (AC-94 negative).
+func TestRunStartupProbeDropsRegistrationOutsideDiscoverySet(t *testing.T) {
+	cfg := probeConfig(t)
+	cfg.ModelCatalogEnabled = false
+	cfg.StartupProbeTimeout = 2 * time.Second
+	p := newProbeFixture(t, cfg)
+	p.jobs.onCreateJob = func() {
+		name := "fm-catalog-" + p.builder.probeRequestID
+		p.probes.UpdateProbe(name, func(session *registry.ProbeSession) {
+			session.RegisteredAt = time.Now()
+			session.Registrations = map[string]registry.ProbeRegistration{
+				"ws-foreign": {
+					RegisteredAt: time.Now(),
+					CLIVersion:   "9.9.9",
+					Runtimes:     []registry.DiscoveredRuntime{{Name: "n-omp", Type: "omp", Version: "9.9.9"}},
+				},
+			}
+		})
+	}
+
+	discoveries, err := p.sched.RunStartupProbe(t.Context())
+	if err != nil {
+		t.Fatalf("RunStartupProbe: %v", err)
+	}
+	if len(discoveries) != 0 {
+		t.Fatalf("discoveries = %+v, want none: ws-foreign is outside the discovery set", discoveries)
+	}
+	events := p.events("probe.workspace_not_configured")
+	if len(events) != 1 || events[0]["workspace_id"] != "ws-foreign" {
+		t.Fatalf("probe.workspace_not_configured = %+v, want one event for ws-foreign", events)
+	}
+}
+
 // TestRunStartupProbePodRanThenExitedClass covers the third failure class: a
 // pod that started and then exited (the template-credential failure shape) is
 // "daemon never registered", not "pod never started".

@@ -392,10 +392,10 @@ func (s *Scheduler) probeTokenWorkspace() string {
 // runProbe is the shared orchestration of the startup probe and the
 // registration-discovery probe. waitCatalog selects the startup path's extra
 // wait for the model catalog result (§1.3); the discovery probe stops at
-// registration and never owns a catalog command (§1.6). The result is keyed
-// by workspace: each declaration covers exactly the workspaces the probe
-// registered to, and a discovery-set workspace with no registration is reported
-// (never silently served).
+// registration and never owns a catalog command (§1.6). The result is keyed by
+// discovery-set workspace: a workspace with no registration is reported, never
+// silently served. Entries outside the set are never returned; when nothing in
+// the set registered, each of them is also reported.
 func (s *Scheduler) runProbe(ctx context.Context, waitCatalog bool, kind string) (map[string]registry.Discovery, error) {
 	window := s.cfg.StartupProbeTimeout
 	minted, err := mintedProbeID()
@@ -532,13 +532,15 @@ settle:
 		}
 	}
 	if len(discoveries) == 0 && len(session.Registrations) > 0 {
-		// The probe registered to workspaces the deployment does not
-		// configure: no declaration is servable.
-		for workspaceID, registration := range session.Registrations {
+		// A registration outside the discovery set is not a servable
+		// declaration: this deployment holds no client, credential or
+		// identity for that workspace, and serving it would register
+		// outside the discovery set (AC-94 negative). Report it, return
+		// nothing.
+		for workspaceID := range session.Registrations {
 			s.log.WarnContext(ctx, "probe.workspace_not_configured", "job_name", handle.JobName,
 				"workspace_id", workspaceID, "kind", kind,
 				"detail", "probe registered a workspace this deployment does not configure")
-			discoveries[workspaceID] = registration.Discovery()
 		}
 	}
 	return discoveries, nil
