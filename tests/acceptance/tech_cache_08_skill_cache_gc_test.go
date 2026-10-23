@@ -2,8 +2,10 @@
 // node-side skill bundle cache the upstream daemon keeps under
 // workspaces/.skill-cache is reclaimed by retention and by a per-workspace
 // size cap. Expired entries go, fresh entries stay, and a capacity pass in
-// one workspace never touches another workspace's entries — even when that
-// other workspace holds the oldest entry on the node.
+// one workspace never touches another workspace's entries. The scenario
+// separates the two mechanisms: workspace "a" is the one over its cap, while
+// workspace "b" sits exactly at its cap and holds the node's oldest entry, so
+// only retention can remove anything there.
 package acceptance
 
 import (
@@ -26,14 +28,18 @@ type tcCache08Bundle struct {
 }
 
 // tcCache08Entries is the scenario's tree. Workspace "a" holds two expired
-// entries and three live ones; workspace "b" holds one entry that is older
-// than everything in "a" yet inside retention.
+// entries and three live ones — one more than its 2 KiB cap fits once the
+// expired ones are gone. Workspace "b" holds the node's oldest entry, which
+// is expired, plus a live entry older than every live entry of "a"; its two
+// entries exactly fill the cap, so a capacity pass would delete nothing and
+// only retention can remove the expired one.
 var tcCache08Entries = []tcCache08Bundle{
 	{"workspaces/.skill-cache/v1/ws-a/src/skill-1/hash-expired-1", 30 * 24 * time.Hour},
 	{"workspaces/.skill-cache/v1/ws-a/src/skill-2/hash-expired-2", 40 * 24 * time.Hour},
 	{"workspaces/.skill-cache/v1/ws-a/src/skill-1/hash-old", 20 * 24 * time.Hour},
 	{"workspaces/.skill-cache/v1/ws-a/src/skill-1/hash-mid", 10 * 24 * time.Hour},
 	{"workspaces/.skill-cache/v1/ws-a/src/skill-2/hash-new", time.Hour},
+	{"workspaces/.skill-cache/v1/ws-b/src/skill-4/hash-expired-3", 45 * 24 * time.Hour},
 	{"workspaces/.skill-cache/v1/ws-b/src/skill-3/hash-oldest", 25 * 24 * time.Hour},
 }
 
@@ -72,7 +78,9 @@ func TestCache08SkillCacheReclaim(t *testing.T) {
 		Interval:      time.Hour,
 		AgentStateTTL: gc.DefaultAgentStateTTL,
 		// Two live entries of 1 KiB fit; workspace "a" holds three, so one
-		// eviction is due after the two expired ones go.
+		// eviction is due after the two expired ones go. Workspace "b" holds
+		// two entries, exactly at the cap, so its capacity pass deletes
+		// nothing and only retention can remove its expired entry.
 		SkillCacheTTL:      gc.DefaultSkillCacheTTL,
 		SkillCacheMaxBytes: 2 * 1024,
 	}
@@ -85,6 +93,9 @@ func TestCache08SkillCacheReclaim(t *testing.T) {
 		"workspaces/.skill-cache/v1/ws-a/src/skill-1/hash-expired-1",
 		"workspaces/.skill-cache/v1/ws-a/src/skill-2/hash-expired-2",
 		"workspaces/.skill-cache/v1/ws-a/src/skill-1/hash-old",
+		// ws-b is at its cap, so nothing there is a capacity victim: this
+		// entry can only be gone because retention judged it expired.
+		"workspaces/.skill-cache/v1/ws-b/src/skill-4/hash-expired-3",
 	}
 	for _, name := range gone {
 		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(name))); !os.IsNotExist(err) {
@@ -94,8 +105,8 @@ func TestCache08SkillCacheReclaim(t *testing.T) {
 	kept := []string{
 		"workspaces/.skill-cache/v1/ws-a/src/skill-1/hash-mid",
 		"workspaces/.skill-cache/v1/ws-a/src/skill-2/hash-new",
-		// The capacity pass is per workspace: ws-b's entry is the oldest on
-		// the node, yet ws-b stays under its own cap.
+		// The capacity pass is per workspace: ws-b's live entry is older
+		// than every live entry of ws-a, yet ws-b stays at its own cap.
 		"workspaces/.skill-cache/v1/ws-b/src/skill-3/hash-oldest",
 	}
 	for _, name := range kept {
