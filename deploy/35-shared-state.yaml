@@ -86,6 +86,11 @@ spec:
                 secretKeyRef:
                   name: foreman-secret
                   key: FOREMAN_STATE_PASSWORD
+            # The probes authenticate through REDISCLI_AUTH instead of a
+            # password argument, keeping the credential off the process
+            # command line and the "-a" warning off stderr.
+            - name: REDISCLI_AUTH
+              value: "$(FOREMAN_STATE_PASSWORD)"
           ports:
             - name: redis
               containerPort: 6379
@@ -106,15 +111,18 @@ spec:
           volumeMounts:
             - name: data
               mountPath: /data
+          # redis-cli exits 0 even when the server answers NOAUTH or
+          # WRONGPASS (it only fails on connection errors), so both probes
+          # gate on the reply text instead of the client's exit code.
           livenessProbe:
             exec:
-              command: ["redis-cli", "-a", "$(FOREMAN_STATE_PASSWORD)", "ping"]
+              command: ["sh", "-c", "redis-cli ping | grep -qx PONG"]
             initialDelaySeconds: 10
             periodSeconds: 10
             timeoutSeconds: 3
           readinessProbe:
             exec:
-              command: ["redis-cli", "-a", "$(FOREMAN_STATE_PASSWORD)", "ping"]
+              command: ["sh", "-c", "redis-cli ping | grep -qx PONG"]
             initialDelaySeconds: 5
             periodSeconds: 10
             timeoutSeconds: 3
