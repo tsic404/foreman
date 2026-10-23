@@ -299,6 +299,9 @@ type redisStore struct {
 	// event observes the availability transitions (§9.1 共享状态面不可用与
 	// 恢复).
 	event func(event string, downFor time.Duration, err error)
+	// detached counts the operations still running after their caller's wait
+	// ended (§10 判定).
+	detached opTracker
 }
 
 func (s *redisStore) init() error {
@@ -330,6 +333,11 @@ func (s *redisStore) client() (*redis.Client, error) {
 			opts.Password = s.cfg.Password
 		}
 		opts.DialTimeout = s.cfg.DialTimeout
+		// Without this go-redis swaps the command's context for
+		// context.Background() and bounds the socket by ReadTimeout alone, so
+		// the store-side answer bound would never reach the operation (§10
+		// 共享状态不可用的判定; ADR-054 决策 1).
+		opts.ContextTimeoutEnabled = true
 		return redis.NewClient(opts), nil
 	}
 	opts, err := failoverOptions(s.cfg.URL, s.cfg.Password, s.cfg.DialTimeout)
@@ -370,6 +378,10 @@ func failoverOptions(raw, password string, dialTimeout time.Duration) (*redis.Fa
 		opts.Password = password
 	}
 	opts.DialTimeout = dialTimeout
+	// Same reason as the single-endpoint client: the store-side bound only
+	// bounds the operation when go-redis lets the command context reach the
+	// socket.
+	opts.ContextTimeoutEnabled = true
 	return opts, nil
 }
 
@@ -412,7 +424,7 @@ func (s *redisStore) revokeKey(ws, hash string) string {
 	return keyRevoke + ws + ":" + hash
 }
 
-func (s *redisStore) PutEntry(ctx context.Context, ws, taskID string, e registry.TaskEntry) error {
+func (s *redisStore) putEntry(ctx context.Context, ws, taskID string, e registry.TaskEntry) error {
 	raw, err := s.marshal(e)
 	if err != nil {
 		return err
@@ -420,7 +432,7 @@ func (s *redisStore) PutEntry(ctx context.Context, ws, taskID string, e registry
 	return s.rdb.Set(ctx, s.entryKey(ws, taskID), raw, s.cfg.EntryTTL).Err()
 }
 
-func (s *redisStore) GetEntry(ctx context.Context, ws, taskID string) (registry.TaskEntry, bool, error) {
+func (s *redisStore) getEntry(ctx context.Context, ws, taskID string) (registry.TaskEntry, bool, error) {
 	raw, err := s.rdb.Get(ctx, s.entryKey(ws, taskID)).Bytes()
 	if errors.Is(err, redis.Nil) {
 		return registry.TaskEntry{}, false, nil
@@ -435,7 +447,7 @@ func (s *redisStore) GetEntry(ctx context.Context, ws, taskID string) (registry.
 // ListEntries scans the workspace's entry namespace. The scan cursor is
 // bounded by the client's own iteration; the workspace prefix is what keeps
 // one workspace's scan from touching another's rows.
-func (s *redisStore) ListEntries(ctx context.Context) ([]registry.TaskEntry, error) {
+func (s *redisStore) listEntries(ctx context.Context) ([]registry.TaskEntry, error) {
 	var out []registry.TaskEntry
 	iter := s.rdb.Scan(ctx, 0, keyEntry+"*", 256).Iterator()
 	for iter.Next(ctx) {
@@ -455,7 +467,7 @@ func (s *redisStore) ListEntries(ctx context.Context) ([]registry.TaskEntry, err
 	return out, nil
 }
 
-func (s *redisStore) PutSettled(ctx context.Context, ws, taskID string, e registry.TaskEntry) error {
+func (s *redisStore) putSettled(ctx context.Context, ws, taskID string, e registry.TaskEntry) error {
 	raw, err := s.marshal(e)
 	if err != nil {
 		return err
@@ -463,7 +475,7 @@ func (s *redisStore) PutSettled(ctx context.Context, ws, taskID string, e regist
 	return s.rdb.Set(ctx, s.doneKey(ws, taskID), raw, s.cfg.EntryTTL).Err()
 }
 
-func (s *redisStore) GetSettled(ctx context.Context, ws, taskID string) (registry.TaskEntry, bool, error) {
+func (s *redisStore) getSettled(ctx context.Context, ws, taskID string) (registry.TaskEntry, bool, error) {
 	raw, err := s.rdb.Get(ctx, s.doneKey(ws, taskID)).Bytes()
 	if errors.Is(err, redis.Nil) {
 		return registry.TaskEntry{}, false, nil
@@ -475,12 +487,12 @@ func (s *redisStore) GetSettled(ctx context.Context, ws, taskID string) (registr
 	return e, err == nil, err
 }
 
-func (s *redisStore) DeleteSettled(ctx context.Context, ws, taskID string) error {
+func (s *redisStore) deleteSettled(ctx context.Context, ws, taskID string) error {
 	return s.rdb.Del(ctx, s.doneKey(ws, taskID)).Err()
 }
 
 // ListSettled scans the settled-record namespace.
-func (s *redisStore) ListSettled(ctx context.Context) ([]registry.TaskEntry, error) {
+func (s *redisStore) listSettled(ctx context.Context) ([]registry.TaskEntry, error) {
 	var out []registry.TaskEntry
 	iter := s.rdb.Scan(ctx, 0, keyDone+"*", 256).Iterator()
 	for iter.Next(ctx) {
@@ -504,7 +516,7 @@ func (s *redisStore) ListSettled(ctx context.Context) ([]registry.TaskEntry, err
 // validity, §6.1). The TTL is the remaining validity itself, so the shared
 // store expires the row exactly when the token would — the bounded window
 // across instances (§6.1 跨实例一致) needs no sweep.
-func (s *redisStore) Revoke(ctx context.Context, ws, hash string, validUntil time.Time) error {
+func (s *redisStore) revoke(ctx context.Context, ws, hash string, validUntil time.Time) error {
 	if hash == "" || !s.now().Before(validUntil) {
 		return nil
 	}
@@ -519,7 +531,7 @@ func (s *redisStore) Revoke(ctx context.Context, ws, hash string, validUntil tim
 // (workspace → digest → valid-until). The grouping is what keeps §6.1's
 // partition across a restart seed: a digest revoked in one workspace must not
 // adjudicate another workspace's token.
-func (s *redisStore) ListRevoked(ctx context.Context) (map[string]map[string]time.Time, error) {
+func (s *redisStore) listRevoked(ctx context.Context) (map[string]map[string]time.Time, error) {
 	out := make(map[string]map[string]time.Time)
 	iter := s.rdb.Scan(ctx, 0, keyRevoke+"*", 256).Iterator()
 	for iter.Next(ctx) {
@@ -550,7 +562,7 @@ func (s *redisStore) ListRevoked(ctx context.Context) (map[string]map[string]tim
 	return out, nil
 }
 
-func (s *redisStore) IsRevoked(ctx context.Context, ws, hash string) (bool, error) {
+func (s *redisStore) isRevoked(ctx context.Context, ws, hash string) (bool, error) {
 	n, err := s.rdb.Exists(ctx, s.revokeKey(ws, hash)).Result()
 	if err != nil {
 		return false, err
@@ -558,6 +570,6 @@ func (s *redisStore) IsRevoked(ctx context.Context, ws, hash string) (bool, erro
 	return n > 0, nil
 }
 
-func (s *redisStore) Ping(ctx context.Context) error {
+func (s *redisStore) ping(ctx context.Context) error {
 	return s.rdb.Ping(ctx).Err()
 }

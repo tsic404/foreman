@@ -336,6 +336,10 @@ restores them instead of rebuilding from K8s (ADR-046 阶段一,
   local positive cache still adjudicates. Past it every non-terminal request
   fails closed (401/503). Keep it far below the Job Token TTL: a cached
   adjudication may not outlive the revocation window (§6.1).
+- `FOREMAN_STATE_CALL_TIMEOUT` (default `2s`) — the store's own answer
+  bound for one operation. A caller may stop waiting earlier, but this bound
+  is what decides whether the store answered in time; it never follows a
+  caller's deadline (`02-contracts.md` §10 共享状态不可用的判定).
 - `FOREMAN_LEADER_LEASE_TTL` (default `10s`) and
   `FOREMAN_LEADER_TAKEOVER_WINDOW` (default `5s`) — the control-plane lease
   and the quiet period the new holder observes before it reconciles and

@@ -3648,6 +3648,13 @@ type twoInstanceOptions struct {
 	// wrap decorates the shared store both instances share: a scenario fails
 	// one command while the rest of the store stays healthy.
 	wrap func(store state.Store, coord state.CoordStore) (state.Store, state.CoordStore)
+	// callTimeout is the store-side bound both instances run their store
+	// operations under (zero = the production default). Callers can stop
+	// waiting earlier; they cannot shorten it.
+	callTimeout time.Duration
+	// storeURL replaces the store address built from miniredis, so a scenario
+	// can put a controllable network face between the clients and the store.
+	storeURL func(mrAddr string) string
 }
 
 func newTwoInstances(t *testing.T, opts twoInstanceOptions) *twoInstances {
@@ -3677,11 +3684,16 @@ func newTwoInstances(t *testing.T, opts twoInstanceOptions) *twoInstances {
 	// it); miniredis leaves TTLs frozen unless ClockTTL is on.
 	mr.ClockTTL(true)
 	stateEvents := &syncBuffer{}
+	storeURL := "redis://" + mr.Addr()
+	if opts.storeURL != nil {
+		storeURL = opts.storeURL(mr.Addr())
+	}
 	st, err := state.New(state.Config{
-		URL:         "redis://" + mr.Addr(),
+		URL:         storeURL,
 		DialTimeout: time.Second,
 		EntryTTL:    48 * time.Hour,
 		Grace:       opts.grace,
+		CallTimeout: opts.callTimeout,
 	}, state.WithEventHook(func(event string, downFor time.Duration, err error) {
 		detail := event
 		if event == "recovered" {
