@@ -2882,7 +2882,13 @@ func (s *Scheduler) settleReplayed(ctx context.Context, taskID string, ep Endpoi
 		return
 	}
 	if first {
+		// The replay's write is the settle this process performs: counting it
+		// without the event would leave a rebuilt entry's verdict off the
+		// log chain every other terminal writer feeds (§9.1).
 		s.metrics.TaskTerminal(string(result))
+		s.log.InfoContext(ctx, "task.terminal",
+			"task_id", fresh.TaskID, "job_name", fresh.JobName, "daemon_id", fresh.DaemonID,
+			"workspace_id", fresh.WorkspaceID, "result", string(result))
 	}
 }
 

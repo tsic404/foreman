@@ -383,6 +383,55 @@ func TestConvergeLeaseRefusedTerminalRecordsTheVerdict(t *testing.T) {
 	}
 }
 
+// TestSettleReplayedTerminalRecordsTheVerdict (AC-10,
+// TC-tech-observability-02): the recovery drain is a terminal writer of its
+// own — a rebuilt entry carries no verdict, so the replayed report is the only
+// source of one. That settle must reach both observation faces like every
+// other terminal write; counted but unlogged, the replayed result sits off the
+// single-task log chain (§9.1).
+func TestSettleReplayedTerminalRecordsTheVerdict(t *testing.T) {
+	for _, ep := range []Endpoint{EPComplete, EPFail, EPCancelAck} {
+		t.Run(string(ep), func(t *testing.T) {
+			f := newFixture(t)
+			buf := newLogScheduler(t, f, slog.LevelInfo)
+			e := f.claim(t, "t-rp")
+
+			// The rebuilt-entry shape: no verdict and no decided body, so the
+			// queue entry is what settles the task after the restart.
+			code, _, err := f.sched.DeliverQueued(context.Background(), ep, "t-rp", e.WorkspaceID, []byte(`{}`), "job_failed")
+			if err != nil || code != 200 {
+				t.Fatalf("DeliverQueued = %d, %v; want 200", code, err)
+			}
+			if got := f.metrics.terminal; len(got) != 1 || got[0] != ep.TerminalResult() {
+				t.Fatalf("terminal metric = %v, want [%s]", got, ep.TerminalResult())
+			}
+			records := collectLogRecords(t, buf.Bytes(), "task.terminal")
+			if len(records) != 1 {
+				t.Fatalf("task.terminal events = %d, want 1", len(records))
+			}
+			assertTaskIdentity(t, records[0], "t-rp", e.JobName, e.DaemonID)
+			if got := records[0]["workspace_id"]; got != "ws-1" {
+				t.Errorf("task.terminal workspace_id = %v, want ws-1", got)
+			}
+			if got := records[0]["result"]; got != ep.TerminalResult() {
+				t.Errorf("task.terminal result = %v, want %s", got, ep.TerminalResult())
+			}
+
+			// A second drain finds the entry settled: the verdict is observed
+			// once, never once per replay.
+			if _, _, err := f.sched.DeliverQueued(context.Background(), ep, "t-rp", e.WorkspaceID, []byte(`{}`), "job_failed"); err != nil {
+				t.Fatalf("second DeliverQueued: %v", err)
+			}
+			if got := f.metrics.terminal; len(got) != 1 {
+				t.Errorf("terminal metric after a second replay = %v, want one count", got)
+			}
+			if records := collectLogRecords(t, buf.Bytes(), "task.terminal"); len(records) != 1 {
+				t.Errorf("task.terminal events after a second replay = %d, want 1", len(records))
+			}
+		})
+	}
+}
+
 func TestOnReportTerminalFailureEnqueuesPendingReport(t *testing.T) {
 	f := newFixture(t)
 	p := f.withPendingReports()
