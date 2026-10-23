@@ -37,8 +37,13 @@ done
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 
-# __ENTRY_URL__ is the only host-specific value in the manifests.
-sed "s|__ENTRY_URL__|$ENTRY_URL|g" "$TEST_MULTICA_DIR/deploy.yaml" >"$work/deploy.yaml"
+# __ENTRY_URL__ is the only host-specific value in the manifests, embedded in
+# YAML double-quoted scalars. The origin is substituted as a literal, so each
+# layer is escaped in turn — YAML first (`\` and `"`), then sed's replacement
+# grammar (`&` re-expands the match) — or the other layer re-reads the value.
+entry_url_yaml=$(printf '%s' "$ENTRY_URL" | sed -e 's/\\/\\\\/g' -e 's/"/\\"/g')
+entry_url_escaped=$(printf '%s' "$entry_url_yaml" | sed 's/[\\&|]/\\&/g')
+sed "s|__ENTRY_URL__|$entry_url_escaped|g" "$TEST_MULTICA_DIR/deploy.yaml" >"$work/deploy.yaml"
 
 # 1. Namespace + Secret. The Secret is created once and then left alone: it
 #    holds the database password, and the data PVC outlives a re-deploy.
