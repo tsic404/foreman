@@ -17,6 +17,7 @@ set -eu
 
 need kubectl
 need sed
+need jq
 
 for arg in "$@"; do
 	case $arg in
