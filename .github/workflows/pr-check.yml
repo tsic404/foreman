@@ -62,6 +62,14 @@ jobs:
         # full test step below runs it too).
         run: go test ./tests/acceptance -run '^TestForbidden07DesignRepoHoldsNoRuntimeState$' -count=1 -v
 
+      - name: Acceptance matrix census
+        # The design repository lives on a LAN-only Gitea instance a hosted
+        # runner cannot reach, so the table travels in-repo as a
+        # commit-pinned bundle (tests/testinfra/testdata) whose HEAD the case
+        # verifies. A missing or off-anchor input fails the step rather than
+        # skipping it: a skipped census is a green step that decides nothing.
+        run: go test ./tests/testinfra -run '^TestAcceptanceMatrixIsBidirectionallyClosed$' -count=1 -v
+
       - name: Test
         # `internal/*` unit tests plus `tests/acceptance` (in-memory k8s fake
         # and httptest stubs) and `tests/release` (stubbed docker/git running

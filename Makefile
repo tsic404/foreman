@@ -29,7 +29,7 @@ MULTICA_CLI_SHA256 ?=
 GOFLAGS ?= -trimpath
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build build-foreman build-gc build-foreman-image build-job-image test vet fmt check
+.PHONY: all build build-foreman build-gc build-foreman-image build-job-image test vet fmt check acceptance-census acceptance-census-refresh
 
 all: build
 
@@ -71,6 +71,33 @@ test:
 
 vet:
 	go vet ./...
+
+# Acceptance matrix census: the design's TC numbers and the case names under
+# tests/acceptance must name each other. The design table travels as a
+# commit-pinned bundle under tests/testinfra/testdata, so no checkout is
+# needed; FOREMAN_DESIGN_DIR overrides it with a local one at the same
+# revision.
+acceptance-census:
+	go test ./tests/testinfra -run '^TestAcceptanceMatrixIsBidirectionallyClosed$$' -count=1 -v
+
+# Refresh that bundle after the design moves, then pin the printed revision in
+# acceptanceMatrixDesignAnchor. The bundle is written into this repo by
+# absolute path (git -C would resolve a relative one inside the design
+# checkout) and the superseded pin is dropped in the same step: one pin, one
+# file.
+acceptance-census-refresh:
+	@test -n "$(FOREMAN_DESIGN_DIR)" || { echo "FOREMAN_DESIGN_DIR must name a tsic/foreman-design checkout" >&2; exit 2; }
+	@short=$$(git -C "$(FOREMAN_DESIGN_DIR)" rev-parse --short=7 HEAD); \
+	 data="$(CURDIR)/tests/testinfra/testdata"; \
+	 out="$$data/foreman-design-$$short.bundle"; \
+	 trap 'rm -f "$$out.tmp"' EXIT; \
+	 git -C "$(FOREMAN_DESIGN_DIR)" bundle create "$$out.tmp" HEAD && \
+	 mv "$$out.tmp" "$$out" && \
+	 find "$$data" -name 'foreman-design-*.bundle' ! -name "foreman-design-$$short.bundle" -delete; \
+	 remaining=$$(find "$$data" -name 'foreman-design-*.bundle' | wc -l | tr -d ' '); \
+	 test "$$remaining" -eq 1 || { echo "expected exactly one pinned bundle in $$data, found $$remaining" >&2; exit 1; }; \
+	 echo "bundle: $$out"
+	@echo "pin acceptanceMatrixDesignAnchor to $$(git -C "$(FOREMAN_DESIGN_DIR)" rev-parse HEAD)"
 
 fmt:
 	gofmt -l .
