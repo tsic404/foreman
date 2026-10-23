@@ -41,6 +41,10 @@ const (
 	// from the local positive cache before every request fails closed
 	// (§10 共享状态不可用: 在途任务在宽限内按本地正缓存裁决，超宽限一律 401/503).
 	EnvGrace = "FOREMAN_STATE_GRACE"
+	// EnvCallTimeout bounds one shared-store operation on the store's own
+	// clock. It is the answer bound the unavailability evidence reads
+	// (§10 判定); a caller's shorter budget never shortens it.
+	EnvCallTimeout = "FOREMAN_STATE_CALL_TIMEOUT"
 )
 
 const (
@@ -55,6 +59,11 @@ const (
 	// DefaultGrace is the default cache-adjudication grace window during a
 	// shared-state outage.
 	DefaultGrace = 30 * time.Second
+	// DefaultCallTimeout bounds one shared-store operation on the store's own
+	// clock. It is the store-side answer bound the unavailability evidence
+	// reads (§10 共享状态不可用的判定); a caller's shorter budget never
+	// shortens it.
+	DefaultCallTimeout = 2 * time.Second
 )
 
 // Config is the shared state module's runtime configuration.
@@ -69,6 +78,11 @@ type Config struct {
 	EntryTTL time.Duration
 	// Grace is the outage window during which cached facts still adjudicate.
 	Grace time.Duration
+	// CallTimeout is the store-side bound of one operation
+	// (FOREMAN_STATE_CALL_TIMEOUT; zero = the default). Callers can stop
+	// waiting earlier; they cannot shorten the operation or turn their own
+	// deadline into evidence about the store.
+	CallTimeout time.Duration
 }
 
 // LoadConfig reads the shared state configuration from env (os.Getenv when
@@ -83,6 +97,7 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		DialTimeout: DefaultDialTimeout,
 		EntryTTL:    DefaultTTL,
 		Grace:       DefaultGrace,
+		CallTimeout: DefaultCallTimeout,
 	}
 	cfg.URL = strings.TrimSpace(getenv(EnvURL))
 	cfg.Password = getenv(EnvPassword)
@@ -115,6 +130,16 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 			return Config{}, fmt.Errorf("%s must be non-negative, got %s", EnvGrace, d)
 		}
 		cfg.Grace = d
+	}
+	if raw := strings.TrimSpace(getenv(EnvCallTimeout)); raw != "" {
+		d, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("%s must be a duration: %v", EnvCallTimeout, err)
+		}
+		if d <= 0 {
+			return Config{}, fmt.Errorf("%s must be positive, got %s", EnvCallTimeout, d)
+		}
+		cfg.CallTimeout = d
 	}
 	return cfg, nil
 }

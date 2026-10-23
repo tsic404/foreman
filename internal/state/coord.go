@@ -528,14 +528,14 @@ func (s *redisStore) casUpdate(ctx context.Context, key string, mutate func(regi
 }
 
 // SetEntry writes the full mapping row and its Job index.
-func (s *redisStore) SetEntry(ctx context.Context, ws, taskID string, e registry.TaskEntry) error {
+func (s *redisStore) setEntry(ctx context.Context, ws, taskID string, e registry.TaskEntry) error {
 	raw, err := s.marshal(e)
 	if err != nil {
 		return err
 	}
 	// A row whose Job name moved leaves the old index behind; drop it so a
 	// name lookup never resolves to a row that no longer owns it.
-	if old, ok, err := s.GetEntry(ctx, ws, taskID); err == nil && ok && old.JobName != "" && old.JobName != e.JobName {
+	if old, ok, err := s.getEntry(ctx, ws, taskID); err == nil && ok && old.JobName != "" && old.JobName != e.JobName {
 		_ = s.rdb.Del(ctx, s.jobIndexKey(old.JobName)).Err()
 	}
 	index := ws + "\x00" + taskID
@@ -556,7 +556,7 @@ func (s *redisStore) SetEntry(ctx context.Context, ws, taskID string, e registry
 // MergeEntry applies the in-place patch through the optimistic CAS loop: a
 // concurrent gate write wins and the merge re-reads, so a late field update
 // can never revert a transition.
-func (s *redisStore) MergeEntry(ctx context.Context, ws, taskID string, p registry.EntryPatch) error {
+func (s *redisStore) mergeEntry(ctx context.Context, ws, taskID string, p registry.EntryPatch) error {
 	_, _, err := s.casUpdate(ctx, s.entryKey(ws, taskID), func(e registry.TaskEntry) (registry.TaskEntry, bool, error) {
 		changed := false
 		if p.LastStatusSeen != nil && e.LastStatusSeen != *p.LastStatusSeen {
@@ -598,7 +598,7 @@ type queueMarker struct {
 }
 
 // EnqueueEntry performs the single enqueue (§5 单次入队).
-func (s *redisStore) EnqueueEntry(ctx context.Context, ws, taskID string, e registry.TaskEntry) (bool, error) {
+func (s *redisStore) enqueueEntry(ctx context.Context, ws, taskID string, e registry.TaskEntry) (bool, error) {
 	raw, err := s.marshal(e)
 	if err != nil {
 		return false, err
@@ -620,7 +620,7 @@ func (s *redisStore) EnqueueEntry(ctx context.Context, ws, taskID string, e regi
 // PickupDelivery is the atomic S-6 take (§5 单次派发). The delivery body and
 // the accounting are read and written in one CAS step, so two instances
 // claiming the same Job can never both win.
-func (s *redisStore) PickupDelivery(ctx context.Context, ws, taskID string, window time.Duration) (Pickup, error) {
+func (s *redisStore) pickupDelivery(ctx context.Context, ws, taskID string, window time.Duration) (Pickup, error) {
 	key := s.entryKey(ws, taskID)
 	now := s.now()
 	var out Pickup
@@ -679,7 +679,7 @@ func (s *redisStore) PickupDelivery(ctx context.Context, ws, taskID string, wind
 }
 
 // ConfirmStart writes the once-only start fact and drops the queue marker.
-func (s *redisStore) ConfirmStart(ctx context.Context, ws, taskID string, at time.Time, advance bool) (registry.TaskEntry, bool, error) {
+func (s *redisStore) confirmStart(ctx context.Context, ws, taskID string, at time.Time, advance bool) (registry.TaskEntry, bool, error) {
 	key := s.entryKey(ws, taskID)
 	var first bool
 	for range casRetries {
@@ -736,7 +736,7 @@ func (s *redisStore) ConfirmStart(ctx context.Context, ws, taskID string, at tim
 }
 
 // CommitDelivering records one delivery commit under the S6 gate (§5).
-func (s *redisStore) CommitDelivering(ctx context.Context, ws, taskID string, at time.Time, payload []byte, window time.Duration) (registry.TaskEntry, bool, error) {
+func (s *redisStore) commitDelivering(ctx context.Context, ws, taskID string, at time.Time, payload []byte, window time.Duration) (registry.TaskEntry, bool, error) {
 	entry, ok, err := s.casUpdate(ctx, s.entryKey(ws, taskID), func(e registry.TaskEntry) (registry.TaskEntry, bool, error) {
 		if !registry.Deliverable(e, at) {
 			return e, false, nil
@@ -755,7 +755,7 @@ func (s *redisStore) CommitDelivering(ctx context.Context, ws, taskID string, at
 }
 
 // CommitJobCreated records the apiserver creation timestamp.
-func (s *redisStore) CommitJobCreated(ctx context.Context, ws, taskID string, at time.Time) (registry.TaskEntry, bool, error) {
+func (s *redisStore) commitJobCreated(ctx context.Context, ws, taskID string, at time.Time) (registry.TaskEntry, bool, error) {
 	entry, ok, err := s.casUpdate(ctx, s.entryKey(ws, taskID), func(e registry.TaskEntry) (registry.TaskEntry, bool, error) {
 		if e.State == registry.StateTerminal {
 			return e, false, nil
@@ -770,7 +770,7 @@ func (s *redisStore) CommitJobCreated(ctx context.Context, ws, taskID string, at
 }
 
 // CommitDaemonRegistered records the S-4 registration.
-func (s *redisStore) CommitDaemonRegistered(ctx context.Context, ws, taskID string, at time.Time) (registry.TaskEntry, bool, error) {
+func (s *redisStore) commitDaemonRegistered(ctx context.Context, ws, taskID string, at time.Time) (registry.TaskEntry, bool, error) {
 	entry, ok, err := s.casUpdate(ctx, s.entryKey(ws, taskID), func(e registry.TaskEntry) (registry.TaskEntry, bool, error) {
 		if e.State == registry.StateTerminal || e.State == registry.StatePending {
 			return e, false, nil
@@ -786,7 +786,7 @@ func (s *redisStore) CommitDaemonRegistered(ctx context.Context, ws, taskID stri
 
 // CommitTerminal writes the terminal verdict, the settled record and drops the
 // queue marker in one atomic step (§4.2, §5).
-func (s *redisStore) CommitTerminal(ctx context.Context, ws, taskID string, result registry.Result, reason string, completedAt, drainDeadline time.Time) (registry.TaskEntry, bool, error) {
+func (s *redisStore) commitTerminal(ctx context.Context, ws, taskID string, result registry.Result, reason string, completedAt, drainDeadline time.Time) (registry.TaskEntry, bool, error) {
 	key := s.entryKey(ws, taskID)
 	for range casRetries {
 		raw, err := s.rdb.Get(ctx, key).Bytes()
@@ -845,7 +845,7 @@ func (s *redisStore) CommitTerminal(ctx context.Context, ws, taskID string, resu
 }
 
 // CommitDecidedReport records the decided terminal body once (§4.4 定论体).
-func (s *redisStore) CommitDecidedReport(ctx context.Context, ws, taskID string, body []byte) (registry.TaskEntry, bool, error) {
+func (s *redisStore) commitDecidedReport(ctx context.Context, ws, taskID string, body []byte) (registry.TaskEntry, bool, error) {
 	entry, ok, err := s.casUpdate(ctx, s.entryKey(ws, taskID), func(e registry.TaskEntry) (registry.TaskEntry, bool, error) {
 		if len(e.DecidedReport) != 0 || len(body) == 0 {
 			return e, false, nil
@@ -858,7 +858,7 @@ func (s *redisStore) CommitDecidedReport(ctx context.Context, ws, taskID string,
 
 // SettleNoResult clears the verdict of a terminal row whose report the server
 // answered with "task gone" (§4.4).
-func (s *redisStore) SettleNoResult(ctx context.Context, ws, taskID string, expected registry.Result) (registry.TaskEntry, bool, error) {
+func (s *redisStore) settleNoResult(ctx context.Context, ws, taskID string, expected registry.Result) (registry.TaskEntry, bool, error) {
 	key := s.entryKey(ws, taskID)
 	for range casRetries {
 		raw, err := s.rdb.Get(ctx, key).Bytes()
@@ -911,9 +911,9 @@ func (s *redisStore) SettleNoResult(ctx context.Context, ws, taskID string, expe
 }
 
 // DeleteEntry removes the live row, its queue marker and its Job index.
-func (s *redisStore) DeleteEntry(ctx context.Context, ws, taskID string) error {
+func (s *redisStore) deleteEntry(ctx context.Context, ws, taskID string) error {
 	jobName := ""
-	if e, ok, err := s.GetEntry(ctx, ws, taskID); err == nil && ok {
+	if e, ok, err := s.getEntry(ctx, ws, taskID); err == nil && ok {
 		jobName = e.JobName
 	}
 	keys := []string{s.entryKey(ws, taskID), s.queueKey(ws, taskID), s.jobIndexKey(jobName)}
@@ -923,14 +923,14 @@ func (s *redisStore) DeleteEntry(ctx context.Context, ws, taskID string) error {
 }
 
 // DropQueue removes the queue marker only.
-func (s *redisStore) DropQueue(ctx context.Context, ws, taskID string) error {
+func (s *redisStore) dropQueue(ctx context.Context, ws, taskID string) error {
 	err := s.rdb.Del(ctx, s.queueKey(ws, taskID)).Err()
 	s.mark(err)
 	return err
 }
 
 // QueueDepth counts the live queue markers.
-func (s *redisStore) QueueDepth(ctx context.Context) (int64, error) {
+func (s *redisStore) queueDepth(ctx context.Context) (int64, error) {
 	var n int64
 	iter := s.rdb.Scan(ctx, 0, keyQueue+"*", 256).Iterator()
 	for iter.Next(ctx) {
@@ -942,7 +942,7 @@ func (s *redisStore) QueueDepth(ctx context.Context) (int64, error) {
 }
 
 // GetEntryByJob resolves a Job name through the shared index.
-func (s *redisStore) GetEntryByJob(ctx context.Context, jobName string) (registry.TaskEntry, bool, error) {
+func (s *redisStore) getEntryByJob(ctx context.Context, jobName string) (registry.TaskEntry, bool, error) {
 	raw, err := s.rdb.Get(ctx, s.jobIndexKey(jobName)).Bytes()
 	if errors.Is(err, redis.Nil) {
 		s.mark(nil)
@@ -957,13 +957,13 @@ func (s *redisStore) GetEntryByJob(ctx context.Context, jobName string) (registr
 		return registry.TaskEntry{}, false, nil
 	}
 	ws, taskID := string(raw[:idx]), string(raw[idx+1:])
-	return s.GetEntry(ctx, ws, taskID)
+	return s.getEntry(ctx, ws, taskID)
 }
 
 // LockTask acquires the per-task write lock. The lock's PX TTL is its lease:
 // once it lapses, Redis drops the key server-side and the next acquisition
 // wins, so the decision never compares two instances' clocks.
-func (s *redisStore) LockTask(ctx context.Context, ws, taskID, owner string, ttl time.Duration) (bool, error) {
+func (s *redisStore) lockTask(ctx context.Context, ws, taskID, owner string, ttl time.Duration) (bool, error) {
 	n, err := scriptLockAcquire.Run(ctx, s.rdb, []string{s.lockKey(ws, taskID)},
 		owner, ttl.Milliseconds()).Int()
 	s.mark(err)
@@ -974,7 +974,7 @@ func (s *redisStore) LockTask(ctx context.Context, ws, taskID, owner string, ttl
 }
 
 // UnlockTask releases the lock only when owner still holds it.
-func (s *redisStore) UnlockTask(ctx context.Context, ws, taskID, owner string) error {
+func (s *redisStore) unlockTask(ctx context.Context, ws, taskID, owner string) error {
 	err := scriptLockRelease.Run(ctx, s.rdb, []string{s.lockKey(ws, taskID)}, owner).Err()
 	s.mark(err)
 	return err
@@ -995,7 +995,7 @@ const reservationTTL = 5 * time.Minute
 // ReserveSlot reserves one in-flight slot below limit, or unconditionally when
 // the limit is non-positive. It returns the reservation's id: the handle that
 // retires exactly this reservation.
-func (s *redisStore) ReserveSlot(ctx context.Context, ws string, limit int) (string, bool, error) {
+func (s *redisStore) reserveSlot(ctx context.Context, ws string, limit int) (string, bool, error) {
 	counter, reservations := slotKeys(ws)
 	// The id is the zset member and the caller's retire handle, so it needs
 	// cross-instance uniqueness; no expiry decision reads it.
@@ -1014,7 +1014,7 @@ func (s *redisStore) ReserveSlot(ctx context.Context, ws string, limit int) (str
 
 // ConsumeSlotReservation converts the caller's own reservation into entry
 // ownership; another claim's pending marker is never touched.
-func (s *redisStore) ConsumeSlotReservation(ctx context.Context, ws, id string) error {
+func (s *redisStore) consumeSlotReservation(ctx context.Context, ws, id string) error {
 	_, reservations := slotKeys(ws)
 	err := scriptSlotConsume.Run(ctx, s.rdb, []string{reservations}, id).Err()
 	s.mark(err)
@@ -1022,7 +1022,7 @@ func (s *redisStore) ConsumeSlotReservation(ctx context.Context, ws, id string) 
 }
 
 // ReleaseSlot abandons the caller's own reservation and returns its slot.
-func (s *redisStore) ReleaseSlot(ctx context.Context, ws, id string) error {
+func (s *redisStore) releaseSlot(ctx context.Context, ws, id string) error {
 	counter, reservations := slotKeys(ws)
 	err := scriptSlotRelease.Run(ctx, s.rdb, []string{counter, reservations}, id).Err()
 	s.mark(err)
@@ -1030,7 +1030,7 @@ func (s *redisStore) ReleaseSlot(ctx context.Context, ws, id string) error {
 }
 
 // ReleaseEntry returns an entry's in-flight slot.
-func (s *redisStore) ReleaseEntry(ctx context.Context, ws string) error {
+func (s *redisStore) releaseEntry(ctx context.Context, ws string) error {
 	counter, _ := slotKeys(ws)
 	err := scriptSlotReleaseEntry.Run(ctx, s.rdb, []string{counter}).Err()
 	s.mark(err)
@@ -1039,7 +1039,7 @@ func (s *redisStore) ReleaseEntry(ctx context.Context, ws string) error {
 
 // SlotSnapshot atomically purges expired reservations and returns the
 // counter and live reservation count.
-func (s *redisStore) SlotSnapshot(ctx context.Context, ws string) (int64, int64, error) {
+func (s *redisStore) slotSnapshot(ctx context.Context, ws string) (int64, int64, error) {
 	counter, reservations := slotKeys(ws)
 	values, err := scriptSlotSnapshot.Run(ctx, s.rdb, []string{counter, reservations}).Int64Slice()
 	s.mark(err)
@@ -1053,7 +1053,7 @@ func (s *redisStore) SlotSnapshot(ctx context.Context, ws string) (int64, int64,
 }
 
 // CompareAndSetSlots writes next only when the counter still equals expected.
-func (s *redisStore) CompareAndSetSlots(ctx context.Context, ws string, expected, next int64) (bool, error) {
+func (s *redisStore) compareAndSetSlots(ctx context.Context, ws string, expected, next int64) (bool, error) {
 	counter, _ := slotKeys(ws)
 	n, err := scriptSlotCAS.Run(ctx, s.rdb, []string{counter}, expected, next).Int()
 	s.mark(err)
@@ -1066,7 +1066,7 @@ func (s *redisStore) CompareAndSetSlots(ctx context.Context, ws string, expected
 // ResetSlots drops every pending reservation of one level and writes the
 // counter in one atomic step; it returns the previous counter and the dropped
 // marker count.
-func (s *redisStore) ResetSlots(ctx context.Context, ws string, n int64) (int64, int64, error) {
+func (s *redisStore) resetSlots(ctx context.Context, ws string, n int64) (int64, int64, error) {
 	counter, reservations := slotKeys(ws)
 	values, err := scriptSlotReset.Run(ctx, s.rdb, []string{counter, reservations}, n).Int64Slice()
 	s.mark(err)
@@ -1080,7 +1080,7 @@ func (s *redisStore) ResetSlots(ctx context.Context, ws string, n int64) (int64,
 }
 
 // Slots reads the counter.
-func (s *redisStore) Slots(ctx context.Context, ws string) (int64, error) {
+func (s *redisStore) slots(ctx context.Context, ws string) (int64, error) {
 	key := keySlotAll
 	if ws != "" {
 		key = keySlotWS + ws
@@ -1104,7 +1104,7 @@ func (s *redisStore) Slots(ctx context.Context, ws string) (int64, error) {
 
 // AcquireLeadership takes the control-plane lease when it is free; the PX TTL
 // is its only expiry (§10 控制面接管有界).
-func (s *redisStore) AcquireLeadership(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
+func (s *redisStore) acquireLeadership(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
 	n, err := scriptLeaderAcquire.Run(ctx, s.rdb, []string{keyLeader},
 		owner, ttl.Milliseconds()).Int()
 	s.mark(err)
@@ -1115,7 +1115,7 @@ func (s *redisStore) AcquireLeadership(ctx context.Context, owner string, ttl ti
 }
 
 // RenewLeadership extends the lease when owner still holds it.
-func (s *redisStore) RenewLeadership(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
+func (s *redisStore) renewLeadership(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
 	n, err := scriptLeaderRenew.Run(ctx, s.rdb, []string{keyLeader},
 		owner, ttl.Milliseconds()).Int()
 	s.mark(err)
@@ -1126,14 +1126,14 @@ func (s *redisStore) RenewLeadership(ctx context.Context, owner string, ttl time
 }
 
 // ReleaseLeadership drops the lease when owner still holds it.
-func (s *redisStore) ReleaseLeadership(ctx context.Context, owner string) error {
+func (s *redisStore) releaseLeadership(ctx context.Context, owner string) error {
 	err := scriptLockRelease.Run(ctx, s.rdb, []string{keyLeader}, owner).Err()
 	s.mark(err)
 	return err
 }
 
 // LeadershipHolder names the current lease holder ("" when free).
-func (s *redisStore) LeadershipHolder(ctx context.Context) (string, error) {
+func (s *redisStore) leadershipHolder(ctx context.Context) (string, error) {
 	raw, err := s.rdb.Get(ctx, keyLeader).Result()
 	if errors.Is(err, redis.Nil) {
 		s.mark(nil)
@@ -1147,14 +1147,14 @@ func (s *redisStore) LeadershipHolder(ctx context.Context) (string, error) {
 }
 
 // HeartbeatInstance refreshes one instance's liveness row.
-func (s *redisStore) HeartbeatInstance(ctx context.Context, id string, ttl time.Duration) error {
+func (s *redisStore) heartbeatInstance(ctx context.Context, id string, ttl time.Duration) error {
 	err := s.rdb.Set(ctx, keyInstance+id, s.now().Unix(), ttl).Err()
 	s.mark(err)
 	return err
 }
 
 // ListInstances lists the live instance ids.
-func (s *redisStore) ListInstances(ctx context.Context) ([]string, error) {
+func (s *redisStore) listInstances(ctx context.Context) ([]string, error) {
 	var out []string
 	iter := s.rdb.Scan(ctx, 0, keyInstance+"*", 256).Iterator()
 	for iter.Next(ctx) {
@@ -1166,14 +1166,14 @@ func (s *redisStore) ListInstances(ctx context.Context) ([]string, error) {
 }
 
 // PutDeclaration stores the registration identity of one workspace.
-func (s *redisStore) PutDeclaration(ctx context.Context, ws string, raw []byte) error {
+func (s *redisStore) putDeclaration(ctx context.Context, ws string, raw []byte) error {
 	err := s.rdb.Set(ctx, keyDecl+ws, raw, 0).Err()
 	s.mark(err)
 	return err
 }
 
 // GetDeclaration reads the registration identity of one workspace.
-func (s *redisStore) GetDeclaration(ctx context.Context, ws string) ([]byte, bool, error) {
+func (s *redisStore) getDeclaration(ctx context.Context, ws string) ([]byte, bool, error) {
 	raw, err := s.rdb.Get(ctx, keyDecl+ws).Bytes()
 	if errors.Is(err, redis.Nil) {
 		s.mark(nil)
@@ -1187,7 +1187,7 @@ func (s *redisStore) GetDeclaration(ctx context.Context, ws string) ([]byte, boo
 }
 
 // PutCatalogSlot stores one real runtime's catalog slot.
-func (s *redisStore) PutCatalogSlot(ctx context.Context, runtimeID string, raw []byte, ttl time.Duration) error {
+func (s *redisStore) putCatalogSlot(ctx context.Context, runtimeID string, raw []byte, ttl time.Duration) error {
 	if ttl <= 0 {
 		ttl = s.entryTTL()
 	}
@@ -1197,7 +1197,7 @@ func (s *redisStore) PutCatalogSlot(ctx context.Context, runtimeID string, raw [
 }
 
 // GetCatalogSlot reads one catalog slot.
-func (s *redisStore) GetCatalogSlot(ctx context.Context, runtimeID string) ([]byte, bool, error) {
+func (s *redisStore) getCatalogSlot(ctx context.Context, runtimeID string) ([]byte, bool, error) {
 	raw, err := s.rdb.Get(ctx, keyCatalog+runtimeID).Bytes()
 	if errors.Is(err, redis.Nil) {
 		s.mark(nil)
@@ -1211,14 +1211,14 @@ func (s *redisStore) GetCatalogSlot(ctx context.Context, runtimeID string) ([]by
 }
 
 // DeleteCatalogSlot removes one catalog slot.
-func (s *redisStore) DeleteCatalogSlot(ctx context.Context, runtimeID string) error {
+func (s *redisStore) deleteCatalogSlot(ctx context.Context, runtimeID string) error {
 	err := s.rdb.Del(ctx, keyCatalog+runtimeID).Err()
 	s.mark(err)
 	return err
 }
 
 // PutSessionNode stores one soft-affinity row (§4.5 共享索引).
-func (s *redisStore) PutSessionNode(ctx context.Context, ws, key string, raw []byte, ttl time.Duration) error {
+func (s *redisStore) putSessionNode(ctx context.Context, ws, key string, raw []byte, ttl time.Duration) error {
 	if ttl <= 0 {
 		ttl = s.entryTTL()
 	}
@@ -1230,7 +1230,7 @@ func (s *redisStore) PutSessionNode(ctx context.Context, ws, key string, raw []b
 // GetSessionNode reads one soft-affinity row together with the lifetime the
 // store still holds on it. The expiry of the shared row belongs to the store
 // (PTTL), not to the instance that wrote it.
-func (s *redisStore) GetSessionNode(ctx context.Context, ws, key string) (registry.SharedSessionNode, bool, error) {
+func (s *redisStore) getSessionNode(ctx context.Context, ws, key string) (registry.SharedSessionNode, bool, error) {
 	values, err := scriptSessionGet.Run(ctx, s.rdb, []string{keySession + ws + ":" + key}).Slice()
 	s.mark(err)
 	if err != nil {
@@ -1251,7 +1251,7 @@ func (s *redisStore) GetSessionNode(ctx context.Context, ws, key string) (regist
 }
 
 // PutProbeSession stores one probe session row.
-func (s *redisStore) PutProbeSession(ctx context.Context, jobName string, raw []byte, ttl time.Duration) error {
+func (s *redisStore) putProbeSession(ctx context.Context, jobName string, raw []byte, ttl time.Duration) error {
 	if ttl <= 0 {
 		ttl = s.entryTTL()
 	}
@@ -1261,7 +1261,7 @@ func (s *redisStore) PutProbeSession(ctx context.Context, jobName string, raw []
 }
 
 // GetProbeSession reads one probe session row.
-func (s *redisStore) GetProbeSession(ctx context.Context, jobName string) ([]byte, bool, error) {
+func (s *redisStore) getProbeSession(ctx context.Context, jobName string) ([]byte, bool, error) {
 	raw, err := s.rdb.Get(ctx, keyProbe+jobName).Bytes()
 	if errors.Is(err, redis.Nil) {
 		s.mark(nil)
@@ -1275,7 +1275,7 @@ func (s *redisStore) GetProbeSession(ctx context.Context, jobName string) ([]byt
 }
 
 // CASProbeSession replaces one probe session row only when unchanged.
-func (s *redisStore) CASProbeSession(ctx context.Context, jobName string, expected, next []byte, ttl time.Duration) (bool, error) {
+func (s *redisStore) casProbeSession(ctx context.Context, jobName string, expected, next []byte, ttl time.Duration) (bool, error) {
 	if ttl <= 0 {
 		ttl = s.entryTTL()
 	}
@@ -1288,14 +1288,14 @@ func (s *redisStore) CASProbeSession(ctx context.Context, jobName string, expect
 }
 
 // DeleteProbeSession removes one probe session row.
-func (s *redisStore) DeleteProbeSession(ctx context.Context, jobName string) error {
+func (s *redisStore) deleteProbeSession(ctx context.Context, jobName string) error {
 	err := s.rdb.Del(ctx, keyProbe+jobName).Err()
 	s.mark(err)
 	return err
 }
 
 // ListProbeSessions lists every probe session row.
-func (s *redisStore) ListProbeSessions(ctx context.Context) (map[string][]byte, error) {
+func (s *redisStore) listProbeSessions(ctx context.Context) (map[string][]byte, error) {
 	out := make(map[string][]byte)
 	iter := s.rdb.Scan(ctx, 0, keyProbe+"*", 256).Iterator()
 	for iter.Next(ctx) {

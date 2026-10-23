@@ -446,9 +446,7 @@ func (s *Scheduler) ClaimBudget() int {
 		if s.leaderHeld != nil && !s.leaderHeld() {
 			return 0
 		}
-		ctx, cancel := sharedDetachedCtx()
-		defer cancel()
-		used, err := s.shared.Slots(ctx, "")
+		used, err := s.shared.Slots(context.Background(), "")
 		if err != nil {
 			// A store that cannot answer stops new claims (§10 共享状态不可用).
 			return 0
@@ -479,8 +477,7 @@ func (s *Scheduler) ClaimBudgetFor(workspaceID string) int {
 		if s.leaderHeld != nil && !s.leaderHeld() {
 			return 0
 		}
-		ctx, cancel := sharedDetachedCtx()
-		defer cancel()
+		ctx := context.Background()
 		used, err := s.shared.Slots(ctx, "")
 		if err != nil {
 			return 0
@@ -555,7 +552,7 @@ func (s *Scheduler) SyncInflight() {
 	if s.shared != nil {
 		// The shared counters are the cluster-level truth (§10 两级在途上限);
 		// the local index understates another instance's load.
-		ctx, cancel := sharedDetachedCtx()
+		ctx := context.Background()
 		global, err := s.shared.Slots(ctx, "")
 		if err == nil {
 			s.metrics.InflightJobs(int(global))
@@ -568,10 +565,8 @@ func (s *Scheduler) SyncInflight() {
 					}
 				}
 			}
-			cancel()
 			return
 		}
-		cancel()
 	}
 	s.metrics.InflightJobs(s.reg.Inflight())
 	// The per-workspace series is the two-level budget's observable face

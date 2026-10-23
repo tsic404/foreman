@@ -643,6 +643,14 @@ func outageStore(t *testing.T) (CoordStore, *miniredis.Miniredis, *[]string) {
 	return s.(CoordStore), mr, &events
 }
 
+// awaitDetached waits for the store operations that outlived their caller, so
+// the assertions below read a settled availability face: the caller stopped
+// waiting, the operation still concluded (§10 判定).
+func awaitDetached(t *testing.T, store CoordStore) {
+	t.Helper()
+	store.(*redisStore).detached.wait()
+}
+
 // TestCoordCancelledOperationIsNotAnOutage pins the availability
 // classification: a caller that cancels (the shutdown path, an abandoned
 // request) says nothing about the store, so it neither starts nor clears an
@@ -651,8 +659,19 @@ func TestCoordCancelledOperationIsNotAnOutage(t *testing.T) {
 	store, mr, events := outageStore(t)
 	cancelled, cancel := context.WithCancel(context.Background())
 	cancel()
+	// A caller that is already done never starts the operation, so the queue
+	// marker survives the call: no write happens behind a wait that ended
+	// before it began.
+	queueKey := store.(*redisStore).queueKey("ws-1", "task-1")
+	if err := mr.Set(queueKey, "1"); err != nil {
+		t.Fatalf("seed queue marker: %v", err)
+	}
 	if err := store.DropQueue(cancelled, "ws-1", "task-1"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled op = %v, want context.Canceled", err)
+	}
+	awaitDetached(t, store)
+	if !mr.Exists(queueKey) {
+		t.Fatal("a pre-cancelled caller still executed the store write")
 	}
 	if !store.Available() || store.DownFor() != 0 {
 		t.Fatalf("cancelled op moved the outage face: available=%v downFor=%s", store.Available(), store.DownFor())
@@ -672,6 +691,7 @@ func TestCoordCancelledOperationIsNotAnOutage(t *testing.T) {
 	if err := store.DropQueue(cancelled, "ws-1", "task-1"); !errors.Is(err, context.Canceled) {
 		t.Fatalf("cancelled op during an outage = %v, want context.Canceled", err)
 	}
+	awaitDetached(t, store)
 	if store.Available() {
 		t.Fatal("a cancelled op cleared the outage")
 	}
