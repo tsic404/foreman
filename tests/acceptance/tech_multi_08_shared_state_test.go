@@ -406,6 +406,52 @@ func TestMulti08RevocationSurvivesRestart(t *testing.T) {
 	}
 }
 
+// TestMulti08RevocationSeedAdjudicatesWithoutSharedRead closes the gap the
+// restart scenario above leaves open: there the shared read is still up, so a
+// seed that flattens ListRevoked's workspace grouping is masked — the
+// per-request lookup answers the correct verdict and the test stays green.
+// Here the shared face fails its reads after the seed (the §10 outage shape),
+// so the restored in-process set is the only adjudication source and the
+// grouping is what decides.
+func TestMulti08RevocationSeedAdjudicatesWithoutSharedRead(t *testing.T) {
+	store, mr := multi08Store(t)
+	h := newHarnessWithSharedState(t, false, store)
+	token := multi08DriveClaim(t, h, "task-1")
+
+	h.revoker = h.issuer
+	h.rebuildScheduler(t, func(*scheduler.Config) {})
+	h.issuer.Revoke(h.issuer.Hash(token), "ws-1")
+	multi08Flush(t, h)
+
+	// Restart: the fresh process restores the entry index and seeds the
+	// revocation set, exactly as cmd/foreman's startup does.
+	h2 := newHarnessWithSharedState(t, false, store)
+	h2.jobs = h.jobs
+	h2.rebuildScheduler(t, func(*scheduler.Config) {})
+	if err := h2.sched.Rebuild(t.Context()); err != nil {
+		t.Fatalf("Rebuild after restart: %v", err)
+	}
+	if _, ok := h2.reg.Get("task-1"); !ok {
+		t.Fatal("restart lost the mapping entry: ErrUnknownJob would mask the revocation check")
+	}
+	if err := h2.issuer.RestoreRevocations(t.Context()); err != nil {
+		t.Fatalf("RestoreRevocations: %v", err)
+	}
+
+	// The shared read goes down after the seed: every per-request store read
+	// fails, so only the seeded set can reject the token.
+	mr.SetError("LOADING foreman shared state is loading")
+	// Self-proof of the premise the verdict rests on: with the injection gone
+	// the store fallback would answer and the assertion below would hold for
+	// a seed that never ran.
+	if _, err := store.IsRevoked(t.Context(), "ws-1", h2.issuer.Hash(token)); err == nil {
+		t.Fatal("shared read still answers after SetError: the seed is not the only adjudication source")
+	}
+	if _, err := h2.issuer.Verify(token, auth.RequestScope{}); !errors.Is(err, auth.ErrRevoked) {
+		t.Fatalf("seeded revocation with the shared read down: Verify err = %v, want ErrRevoked", err)
+	}
+}
+
 // TestMulti08UndeliveredTaskDeliversAfterRestart covers the delivery half of
 // AC-73: a claimed-but-not-yet-delivered task's payload is part of the mapping
 // record in the shared store (§4.3: 任务载荷存在共享状态的条目里), so the

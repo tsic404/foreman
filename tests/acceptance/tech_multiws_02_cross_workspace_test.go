@@ -126,7 +126,7 @@ func TestTechMultiWS02RevocationRestoreStaysPartitioned(t *testing.T) {
 	digestB := m.issuer.Hash(tokenB)
 	ctx := t.Context()
 
-	store, _ := multi08Store(t)
+	store, mr := multi08Store(t)
 	if err := store.Revoke(ctx, "ws-a", digestB, time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("Revoke under ws-a: %v", err)
 	}
@@ -142,7 +142,10 @@ func TestTechMultiWS02RevocationRestoreStaysPartitioned(t *testing.T) {
 	}
 
 	// Control: the same digest recorded under B is B's own revocation, so the
-	// restored set must reject it — proving the seed really ran.
+	// restored set must reject it — proving the seed really ran. The shared
+	// read goes down after the seed, so the verdict can only come from the
+	// seeded set: a seed that flattens the grouping accepts B's token here
+	// while the store fallback would have hidden it.
 	if err := store.Revoke(ctx, "ws-b", digestB, time.Now().Add(time.Hour)); err != nil {
 		t.Fatalf("Revoke under ws-b: %v", err)
 	}
@@ -152,6 +155,13 @@ func TestTechMultiWS02RevocationRestoreStaysPartitioned(t *testing.T) {
 	}
 	if err := controlled.RestoreRevocations(ctx); err != nil {
 		t.Fatalf("RestoreRevocations: %v", err)
+	}
+	mr.SetError("LOADING foreman shared state is loading")
+	// Self-proof of the premise: a no-op injection would leave the store
+	// answering, and the control would pass on the fallback instead of the
+	// seeded set.
+	if _, err := store.IsRevoked(ctx, "ws-b", digestB); err == nil {
+		t.Fatal("shared read still answers after SetError: the seeded set is not the only source")
 	}
 	if _, err := controlled.Verify(tokenB, auth.RequestScope{}); !errors.Is(err, auth.ErrRevoked) {
 		t.Fatalf("restored ws-b revocation: Verify err = %v, want ErrRevoked", err)
