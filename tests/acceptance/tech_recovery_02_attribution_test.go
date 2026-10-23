@@ -15,12 +15,14 @@ package acceptance
 
 import (
 	"encoding/json"
+	"log/slog"
 	"testing"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 
+	"github.com/tsic404/foreman/internal/recovery"
 	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
 )
@@ -150,5 +152,91 @@ func TestRecovery02DaemonSelfReportIsForwardedAtOnceWithoutAPlatformFact(t *test
 	decided := h.events("task.attribution_decided")
 	if len(decided) != 1 || decided[0]["decision"] != scheduler.DecisionDaemonSelfReport {
 		t.Fatalf("task.attribution_decided = %+v, want decision=daemon_self_report", decided)
+	}
+}
+
+// tcRecovery02FailJob marks the recorded Job as terminated by the platform:
+// the Job controller's Failed condition is the fact both the convergence
+// ladder and the attribution gate read.
+func tcRecovery02FailJob(t *testing.T, h *harness, jobName string) {
+	t.Helper()
+	h.jobs.mu.Lock()
+	defer h.jobs.mu.Unlock()
+	for i := range h.jobs.jobs {
+		if h.jobs.jobs[i].Name != jobName {
+			continue
+		}
+		h.jobs.jobs[i].Status.Conditions = []batchv1.JobCondition{{
+			Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "DeadlineExceeded",
+		}}
+		return
+	}
+	t.Fatalf("Job %s is not on the list face", jobName)
+}
+
+// TestRecovery02ConvergenceCompensationLeavesTheAttributionUndecided is step
+// 4b's executable form (the fallback path): a task the platform killed at its
+// deadline never self-reports, so the convergence loop compensates it —
+// Reconciler round → Compensator.Fail → Scheduler.FailJob, the real entry,
+// with no stub in between. The failure is attributed by the Job fact, but the
+// attribution gate never runs: task.attribution_decided must be absent.
+func TestRecovery02ConvergenceCompensationLeavesTheAttributionUndecided(t *testing.T) {
+	h := newDeliveryHarness(t)
+	if err := h.sched.OnClaim(t.Context(), deliveryPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	token := issueJobToken(t, h, "task-1")
+	registerTaskDaemon(t, h, "task-1", token)
+	claimTask(t, h, "task-1", token)
+	if code, body := h.call("POST", "/api/daemon/tasks/task-1/start", token, []byte(`{}`)); code != 200 {
+		t.Fatalf("S8 = %d (%s), want 200", code, body)
+	}
+	tcRecovery02FailJob(t, h, "fm-task-1")
+	// The server still holds the task as running: the convergence path, not
+	// the server's own verdict, settles it.
+	h.server.setStatus("task-1", "running")
+
+	rec, err := recovery.New(
+		recovery.Config{ReconcileInterval: time.Second},
+		h.reg, queueObjects{jobs: h.jobs}, h.server, h.sched,
+		recovery.WithLogger(slog.New(slog.NewJSONHandler(h.logs, nil))),
+	)
+	if err != nil {
+		t.Fatalf("recovery.New: %v", err)
+	}
+	// A deadline kill is compensated immediately: no recheck window.
+	if err := rec.Reconcile(t.Context()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	settled := waitTerminal(t, h, "task-1")
+	if settled.Result != registry.ResultFailed || settled.FailureReason != scheduler.FailureReasonJobDeadline {
+		t.Fatalf("entry = %+v, want failed/%s", settled, scheduler.FailureReasonJobDeadline)
+	}
+	// ① server side: the accepted terminal write is the failure carrying the
+	// platform's reason, so the server records result=failed with it.
+	writes := h.server.appliedTerminalWrites("task-1")
+	if len(writes) != 1 || writes[0].Method != string(scheduler.EPFail) {
+		t.Fatalf("server terminal writes = %+v, want exactly one fail", writes)
+	}
+	var applied map[string]string
+	if err := json.Unmarshal(writes[0].Body, &applied); err != nil {
+		t.Fatalf("server write body: %v", err)
+	}
+	if applied["failure_reason"] != scheduler.FailureReasonJobDeadline {
+		t.Fatalf("server failure_reason = %q, want %q", applied["failure_reason"], scheduler.FailureReasonJobDeadline)
+	}
+	// ② Foreman side: the compensation event is the path's event face.
+	if events := h.events("task.failed_compensated"); len(events) != 1 ||
+		events[0]["failure_reason"] != scheduler.FailureReasonJobDeadline {
+		t.Fatalf("task.failed_compensated = %+v, want one deadline event", events)
+	}
+	// 4b's judgement: the self-report never arrived, so the gate never judged
+	// this instance. Any decision event would name a decision nobody made.
+	if events := h.events("task.attribution_decided"); len(events) != 0 {
+		t.Fatalf("task.attribution_decided = %+v, want none on the fallback path", events)
+	}
+	if !h.jobs.jobDeleted("fm-task-1") {
+		t.Error("the Job was not deleted after the compensation")
 	}
 }

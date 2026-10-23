@@ -1219,12 +1219,13 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		// leave the pre-terminal value standing (§9.2, AC-10).
 		defer s.SyncInflight()
 		verdict := gateUndecided
+		var decision gateDecision
 		if !e.IsTerminal() && len(e.DecidedReport) == 0 && ep == EPFail {
 			// §4.4/ADR-031: the S14 branch's first step is the attribution
 			// gate. It faces only this shape — an undecided inbound daemon
 			// failure self-report; a decided instance and the forwards
 			// produced by a verdict (compensation, queue replay) never enter.
-			e, body, verdict = s.attributionGate(ctx, e, body, sessionID)
+			e, body, verdict, decision = s.attributionGate(ctx, e, body, sessionID)
 			now = s.now()
 		}
 		// The terminal write and the decided-body registration run under the
@@ -1260,6 +1261,13 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 					"workspace_id", e.WorkspaceID,
 					"result", string(result),
 					"duration_seconds", now.Sub(e.ClaimedAt).Seconds())
+				// The decision event is emitted here, under the lock that
+				// wrote the verdict: a decision another path landed in the
+				// window between the gate's read and this write left this
+				// report undecided, so no event names a superseded decision.
+				if decision.decision != "" {
+					s.attributionDecided(ctx, e, decision.decision, decision.factSource, decision.errorSource)
+				}
 				// The instance's first terminal forward decides its body:
 				// every later terminal forward takes this one (§4.4).
 				if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body); ok {

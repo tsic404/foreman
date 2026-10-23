@@ -32,10 +32,11 @@ func (q *enqueueHookQueue) Enqueue(ctx context.Context, taskID, jobName, daemonI
 	return q.fakePendingReports.Enqueue(ctx, taskID, jobName, daemonID, workspaceID, ep, body, failureReason)
 }
 
-// TestOnReportTerminalLosingReportDoesNotCountTheVerdict guards the `first`
-// check: a report whose MarkTerminal did not transition the entry must not
-// emit a terminal metric or task.terminal event of its own. The competing
-// path's single observation is the only one.
+// TestOnReportTerminalLosingReportDoesNotCountTheVerdict guards OnReport's
+// `first` check: a report whose MarkTerminal did not transition the entry must
+// not emit a terminal metric, a task.terminal event or a
+// task.attribution_decided of its own. The competing path's single
+// observation is the only one.
 func TestOnReportTerminalLosingReportDoesNotCountTheVerdict(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "task-1")
@@ -78,6 +79,12 @@ func TestOnReportTerminalLosingReportDoesNotCountTheVerdict(t *testing.T) {
 	}
 	if records[0]["result"] != string(registry.ResultCompleted) {
 		t.Fatalf("task.terminal result = %v, want completed", records[0]["result"])
+	}
+	// The gate judged this report undecided before the competing verdict
+	// landed, so this report's decision never took effect. Announcing it would
+	// name a verdict another path wrote (§9.1, ADR-031).
+	if records := collectLogRecords(t, []byte(buf.String()), "task.attribution_decided"); len(records) != 0 {
+		t.Errorf("task.attribution_decided = %+v, want none: the competing verdict decided", records)
 	}
 }
 

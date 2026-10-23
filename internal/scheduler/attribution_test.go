@@ -216,6 +216,70 @@ func TestOnReportAttributionGateDecidesPlatform(t *testing.T) {
 	}
 }
 
+// TestOnReportAttributionGateSettlementFailureFallsBackToDaemon covers the
+// gate's error exit: the platform fact holds but the settlement write fails,
+// so the daemon's own report is the verdict that stands. The event must name
+// that decision exactly once — a platform event would describe a verdict
+// whose write never landed.
+func TestOnReportAttributionGateSettlementFailureFallsBackToDaemon(t *testing.T) {
+	g := newGateFixture(t)
+	e := g.runningTask(t, "task-1", "running")
+	g.jobs.existingJobs[e.JobName] = deadlineJob(e.JobName, e.JobCreatedAt)
+
+	armed, removed, restored := false, false, false
+	var hookErr error
+	g.jobs.onGetJob = func() { armed = true }
+	// The evidence read precedes the settlement: the next clock read is
+	// settleFailure's, whose MarkTerminal then finds no entry. The read after
+	// that is OnReport's, once the gate has handed the report back as
+	// undecided; the entry is back before the report's terminal write.
+	g.sched.now = func() time.Time {
+		switch {
+		case armed && !removed:
+			removed = true
+			hookErr = g.reg.Delete("task-1")
+		case removed && !restored:
+			restored = true
+			hookErr = g.reg.Put(e)
+		}
+		return g.now
+	}
+
+	daemonBody := []byte(`{"error":"agent crashed","failure_reason":"agent_error"}`)
+	code, _, err := g.sched.OnReport(context.Background(), EPFail, e, daemonBody, "sess-1")
+	if err != nil || code != 200 {
+		t.Fatalf("OnReport = %d, %v", code, err)
+	}
+	if hookErr != nil {
+		t.Fatalf("arming the failed settlement: %v", hookErr)
+	}
+	if !removed || !restored {
+		t.Fatalf("the failed settlement never ran (removed=%v restored=%v)", removed, restored)
+	}
+	if events := g.events("task.settle_failed"); len(events) != 1 {
+		t.Fatalf("settle_failed events = %+v, want one", events)
+	}
+	if events := g.events("task.failed_compensated"); len(events) != 0 {
+		t.Fatalf("failed_compensated events = %+v, want none: the settlement did not land", events)
+	}
+	if forwards := g.server.forwards; len(forwards) != 1 || forwards[0].body != string(daemonBody) {
+		t.Fatalf("forwards = %+v, want the daemon body %q", forwards, daemonBody)
+	}
+	decided := g.events("task.attribution_decided")
+	if len(decided) != 1 {
+		t.Fatalf("attribution_decided events = %+v, want exactly one", decided)
+	}
+	if decided[0]["decision"] != DecisionDaemonSelfReport {
+		t.Fatalf("decision = %v, want %q", decided[0]["decision"], DecisionDaemonSelfReport)
+	}
+	if _, ok := decided[0]["fact_source"]; ok {
+		t.Fatalf("attribution_decided = %+v, want no fact_source on the daemon branch", decided[0])
+	}
+	if settled, ok := g.reg.Get("task-1"); !ok || settled.Result != registry.ResultFailed {
+		t.Fatalf("entry = %+v, want the daemon report's failed verdict", settled)
+	}
+}
+
 // TestOnReportAttributionGateWaitsForTheFact covers the wait face: the fact
 // is not visible yet, the pod already carries a platform deletion, and the
 // gate re-reads until the fact appears (bounded by attributionWait).
@@ -655,6 +719,82 @@ func TestOnReportAttributionGateDecidedDuringWait(t *testing.T) {
 			}
 			if !g.jobs.deleted(e.JobName) {
 				t.Fatal("the Job must be deleted once the decided body landed")
+			}
+		})
+	}
+}
+
+// TestOnReportAttributionGateDecisionSupersededBeforeTheWrite: the gate reads
+// an undecided instance and retires its lock, and another path settles the
+// instance before the caller's terminal write. The gate's decision no longer
+// stands, so nothing may announce it: the event names the decision the process
+// applied, never one a later write displaced (§9.1, ADR-031).
+func TestOnReportAttributionGateDecisionSupersededBeforeTheWrite(t *testing.T) {
+	tests := []struct {
+		name string
+		// arm gives the gate its undecided exit: the decision the other path
+		// then displaces.
+		arm func(g *gateFixture, e registry.TaskEntry)
+	}{
+		{
+			name: "neither wait signal holds",
+			arm: func(g *gateFixture, e registry.TaskEntry) {
+				g.jobs.existingJobs[e.JobName] = jobFailedWith(e.JobName, "BackoffLimitExceeded")
+			},
+		},
+		{
+			name: "the server already holds a verdict",
+			arm: func(g *gateFixture, e registry.TaskEntry) {
+				g.jobs.existingJobs[e.JobName] = deadlineJob(e.JobName, e.JobCreatedAt)
+				g.server.status = "completed"
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			g := newGateFixture(t)
+			e := g.runningTask(t, "task-1", "running")
+			tt.arm(g, e)
+
+			decided := []byte(`{"error":"the other path decided","failure_reason":"job_failed"}`)
+			armed, fired := false, false
+			var hookErr error
+			g.jobs.onGetJob = func() { armed = true }
+			// The evidence read precedes the gate's decision; the next clock
+			// read is OnReport's, after the gate returned and before it takes
+			// the terminal lock. Settling there lands in exactly that window.
+			g.sched.now = func() time.Time {
+				if armed && !fired {
+					fired = true
+					if _, _, err := g.reg.MarkTerminal("task-1", registry.ResultCompleted, "", testNow); err != nil {
+						hookErr = err
+					} else if _, ok := g.reg.RegisterDecidedReport("task-1", decided); !ok {
+						hookErr = errors.New("RegisterDecidedReport: entry missing")
+					}
+				}
+				return g.now
+			}
+
+			daemonBody := []byte(`{"error":"agent crashed","failure_reason":"agent_error"}`)
+			code, _, err := g.sched.OnReport(context.Background(), EPFail, e, daemonBody, "")
+			if err != nil || code != 200 {
+				t.Fatalf("OnReport = %d, %v", code, err)
+			}
+			if hookErr != nil {
+				t.Fatalf("the competing path failed to decide: %v", hookErr)
+			}
+			if !fired {
+				t.Fatal("the competing decision never landed between the gate's read and the terminal write")
+			}
+			if forwards := g.server.forwards; len(forwards) != 1 || forwards[0].body != string(decided) {
+				t.Fatalf("forwards = %+v, want the decided body %q", forwards, decided)
+			}
+			settled, ok := g.reg.Get("task-1")
+			if !ok || settled.Result != registry.ResultCompleted {
+				t.Fatalf("entry = %+v, want the other path's completed verdict", settled)
+			}
+			if events := g.events("task.attribution_decided"); len(events) != 0 {
+				t.Fatalf("attribution_decided events = %+v, want none for a superseded decision", events)
 			}
 		})
 	}
