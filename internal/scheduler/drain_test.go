@@ -76,13 +76,9 @@ func TestJobPodsFiltersPredecessorInstances(t *testing.T) {
 	}
 	// The stale pod is Running; without the filter it would keep the Job
 	// alive forever.
-	terminated, err := f.sched.JobTerminated(context.Background(), "fm-task-1", since)
-	if err != nil || !terminated {
-		t.Fatalf("JobTerminated = %v, %v; want true for the current instance", terminated, err)
-	}
-	alive, err := f.sched.AlivePods(context.Background(), "fm-task-1", since)
-	if err != nil || alive != 0 {
-		t.Fatalf("AlivePods = %d, %v; want 0", alive, err)
+	ev, err := f.sched.JobTerminationEvidence(context.Background(), "fm-task-1", since)
+	if err != nil || !ev.IsTerminated || ev.AlivePods != 0 {
+		t.Fatalf("JobTerminationEvidence = %+v, %v; want a terminated current instance", ev, err)
 	}
 }
 
@@ -93,14 +89,8 @@ func TestJobTerminationEvidenceSurfacesListErrors(t *testing.T) {
 	f.claim(t, "task-1")
 	f.jobs.listPodsErr = errors.New("apiserver unavailable")
 
-	if _, err := f.sched.JobTerminated(context.Background(), "fm-task-1", f.now); err == nil {
-		t.Fatal("JobTerminated: want the list error surfaced")
-	}
-	if _, err := f.sched.LastPodTerminatedAt(context.Background(), "fm-task-1", f.now); err == nil {
-		t.Fatal("LastPodTerminatedAt: want the list error surfaced")
-	}
-	if _, err := f.sched.AlivePods(context.Background(), "fm-task-1", f.now); err == nil {
-		t.Fatal("AlivePods: want the list error surfaced")
+	if _, err := f.sched.JobTerminationEvidence(context.Background(), "fm-task-1", f.now); err == nil {
+		t.Fatal("JobTerminationEvidence: want the list error surfaced")
 	}
 }
 
@@ -120,22 +110,50 @@ func TestLastPodTerminatedAtReadsKubeletFact(t *testing.T) {
 	}}
 	f.jobs.pods = []corev1.Pod{pod}
 
-	at, err := f.sched.LastPodTerminatedAt(context.Background(), "fm-task-1", since)
+	at, err := f.sched.JobTerminationEvidence(context.Background(), "fm-task-1", since)
 	if err != nil {
-		t.Fatalf("LastPodTerminatedAt: %v", err)
+		t.Fatalf("JobTerminationEvidence: %v", err)
 	}
-	if !at.Equal(finished) {
-		t.Fatalf("pod terminated at = %s, want %s", at, finished)
+	if !at.LastFinishedAt.Equal(finished) {
+		t.Fatalf("pod terminated at = %s, want %s", at.LastFinishedAt, finished)
 	}
 
 	// The pod object is gone: no k8s fact exists.
 	f.jobs.pods = nil
-	at, err = f.sched.LastPodTerminatedAt(context.Background(), "fm-task-1", since)
+	at, err = f.sched.JobTerminationEvidence(context.Background(), "fm-task-1", since)
 	if err != nil {
-		t.Fatalf("LastPodTerminatedAt without pods: %v", err)
+		t.Fatalf("JobTerminationEvidence without pods: %v", err)
 	}
-	if !at.IsZero() {
-		t.Fatalf("pod terminated at = %s, want the zero value (no k8s fact)", at)
+	if !at.LastFinishedAt.IsZero() {
+		t.Fatalf("pod terminated at = %s, want the zero value (no k8s fact)", at.LastFinishedAt)
+	}
+}
+
+// Every termination fact comes from one pod listing: a draining entry is
+// re-read every round, so a read per fact multiplies the apiserver load for
+// one verdict.
+func TestJobTerminationEvidenceReadsPodsOnce(t *testing.T) {
+	f := newFixture(t)
+	e := f.claim(t, "task-1")
+	finished := f.now.Add(-30 * time.Second)
+	pod := testPod("fm-task-1", corev1.PodSucceeded)
+	pod.CreationTimestamp = metav1.Time{Time: e.JobCreatedAt}
+	pod.Status.ContainerStatuses = []corev1.ContainerStatus{{
+		Name:  "agent",
+		State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{FinishedAt: metav1.Time{Time: finished}}},
+	}}
+	f.jobs.pods = []corev1.Pod{pod}
+
+	before := f.jobs.listPodsCalls.Load()
+	ev, err := f.sched.JobTerminationEvidence(context.Background(), "fm-task-1", e.JobCreatedAt)
+	if err != nil {
+		t.Fatalf("JobTerminationEvidence: %v", err)
+	}
+	if got := f.jobs.listPodsCalls.Load() - before; got != 1 {
+		t.Fatalf("pod listings = %d, want 1 for the whole fact set", got)
+	}
+	if !ev.IsTerminated || !ev.LastFinishedAt.Equal(finished) || ev.AlivePods != 0 {
+		t.Fatalf("evidence = %+v, want terminated with the kubelet fact and no live pods", ev)
 	}
 }
 

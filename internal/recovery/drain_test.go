@@ -46,7 +46,7 @@ func TestReclaimIfDueUsesTheJobTerminationFact(t *testing.T) {
 	reg := newDrainRegistry(t, time.Hour, e)
 	drainingEntry(t, reg, "t1")
 	finished := time.Now().Add(-2 * time.Minute)
-	set := &fakeSettler{terminated: true, lastTerminatedAt: finished, alivePods: 0}
+	set := &fakeSettler{evidence: scheduler.TerminationEvidence{IsTerminated: true, LastFinishedAt: finished}}
 
 	rec := newTestReconciler(t, reg, &fakeObjects{}, &fakeStatus{status: "running"}, set)
 	if err := rec.Reconcile(context.Background()); err != nil {
@@ -75,7 +75,7 @@ func TestReclaimIfDueFallsBackToTheUpperBound(t *testing.T) {
 	e := testEntry("t1")
 	reg := newDrainRegistry(t, 0, e) // bound already due
 	drainingEntry(t, reg, "t1")
-	set := &fakeSettler{terminated: false, alivePods: 2}
+	set := &fakeSettler{evidence: scheduler.TerminationEvidence{AlivePods: 2}}
 
 	rec := newTestReconciler(t, reg, &fakeObjects{}, &fakeStatus{status: "running"}, set)
 	if err := rec.Reconcile(context.Background()); err != nil {
@@ -103,7 +103,7 @@ func TestReclaimIfDueWaitsInsideTheWindow(t *testing.T) {
 	e := testEntry("t1")
 	reg := newDrainRegistry(t, time.Hour, e)
 	drainingEntry(t, reg, "t1")
-	set := &fakeSettler{terminated: false, alivePods: 1}
+	set := &fakeSettler{evidence: scheduler.TerminationEvidence{AlivePods: 1}}
 
 	rec := newTestReconciler(t, reg, &fakeObjects{}, &fakeStatus{status: "running"}, set)
 	if err := rec.Reconcile(context.Background()); err != nil {
@@ -121,7 +121,7 @@ func TestReclaimIfDueDoesNotTreatEvidenceErrorsAsFacts(t *testing.T) {
 	e := testEntry("t1")
 	reg := newDrainRegistry(t, time.Hour, e)
 	drainingEntry(t, reg, "t1")
-	set := &fakeSettler{terminatedErr: errors.New("apiserver unavailable")}
+	set := &fakeSettler{evidenceErr: errors.New("apiserver unavailable")}
 
 	rec := newTestReconciler(t, reg, &fakeObjects{}, &fakeStatus{status: "running"}, set)
 	if err := rec.Reconcile(context.Background()); err != nil {
@@ -142,7 +142,7 @@ func TestReclaimIfDueBoundClosesWhenEvidenceIsDown(t *testing.T) {
 	e := testEntry("t1")
 	reg := newDrainRegistry(t, 0, e)
 	drainingEntry(t, reg, "t1")
-	set := &fakeSettler{terminatedErr: errors.New("apiserver unavailable")}
+	set := &fakeSettler{evidenceErr: errors.New("apiserver unavailable")}
 
 	rec := newTestReconciler(t, reg, &fakeObjects{}, &fakeStatus{status: "running"}, set)
 	if err := rec.Reconcile(context.Background()); err != nil {

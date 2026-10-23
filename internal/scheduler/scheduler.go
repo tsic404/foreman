@@ -2145,35 +2145,60 @@ func (s *Scheduler) jobPods(ctx context.Context, jobName string, since time.Time
 	return current, nil
 }
 
-// JobTerminated reports whether every pod of the Job has terminated: the pod
-// objects are gone, or their phase is Succeeded/Failed. An empty set counts
-// as terminated (the objects are gone); an API error is not a fact and is
-// returned as such, so a read failure can never be mistaken for a verdict.
-func (s *Scheduler) JobTerminated(ctx context.Context, jobName string, since time.Time) (bool, error) {
-	pods, err := s.jobPods(ctx, jobName, since)
-	if err != nil {
-		return false, fmt.Errorf("list pods of job %s: %w", jobName, err)
-	}
-	for i := range pods {
-		if !podTerminated(&pods[i]) {
-			return false, nil
-		}
-	}
-	return true, nil
+// TerminationEvidence is the Job instance's termination fact set. Every field
+// is derived from one pod listing — the same snapshot and the same instance
+// filter — so the facts a drain verdict acts on can never describe different
+// observations of the same Job.
+type TerminationEvidence struct {
+	// IsTerminated reports whether every pod of the instance has terminated:
+	// the pod objects are gone, or their phase is Succeeded/Failed.
+	IsTerminated bool
+	// LastFinishedAt is the kubelet-reported finish moment of the last pod
+	// (node clock). Zero when no pod carries such a fact — the pod objects
+	// are gone, or none ever reported a finish.
+	LastFinishedAt time.Time
+	// AlivePods counts the instance's pods still alive at read time
+	// (orphan_pods).
+	AlivePods int
 }
 
-// LastPodTerminatedAt is the termination fact of the Job's last pod, taken
+// JobTerminationEvidence reads the Job instance's termination facts in one
+// pod listing: the ownership + instance filter runs once and every fact is
+// derived from that result, so a draining entry costs one read per round
+// instead of one per fact. An API error is not a fact and is returned as
+// such, so a read failure can never be mistaken for a verdict.
+func (s *Scheduler) JobTerminationEvidence(ctx context.Context, jobName string, since time.Time) (TerminationEvidence, error) {
+	pods, err := s.jobPods(ctx, jobName, since)
+	if err != nil {
+		return TerminationEvidence{}, fmt.Errorf("list pods of job %s: %w", jobName, err)
+	}
+	return TerminationEvidence{
+		IsTerminated:   jobTerminated(pods),
+		LastFinishedAt: lastPodTerminatedAt(pods),
+		AlivePods:      alivePods(pods),
+	}, nil
+}
+
+// jobTerminated is the Job half of the termination fact, read from the
+// already instance-filtered pods: an empty set counts as terminated (the
+// objects are gone).
+func jobTerminated(pods []corev1.Pod) bool {
+	for i := range pods {
+		if !podTerminated(&pods[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// lastPodTerminatedAt is the termination fact of the Job's last pod, taken
 // from the kubelet-reported state.terminated.finishedAt (node clock). Zero
 // when no pod carries such a fact — the pod objects are gone, or none ever
 // reported a finish — which the reclaim reads as "no k8s-domain fact" and
 // records as the observation moment in the observed domain (§10: the
 // clock domain must be declared with the value, because only the observed
 // domain compares directly against Foreman's clock).
-func (s *Scheduler) LastPodTerminatedAt(ctx context.Context, jobName string, since time.Time) (time.Time, error) {
-	pods, err := s.jobPods(ctx, jobName, since)
-	if err != nil {
-		return time.Time{}, fmt.Errorf("list pods of job %s: %w", jobName, err)
-	}
+func lastPodTerminatedAt(pods []corev1.Pod) time.Time {
 	var last time.Time
 	for i := range pods {
 		for _, cs := range pods[i].Status.ContainerStatuses {
@@ -2186,25 +2211,21 @@ func (s *Scheduler) LastPodTerminatedAt(ctx context.Context, jobName string, sin
 			}
 		}
 	}
-	return last, nil
+	return last
 }
 
-// AlivePods counts the pods of the Job that are still alive at reclaim time
+// alivePods counts the pods of the Job that are still alive at reclaim time
 // (orphan_pods): non-zero on the drain_timeout path means the credential was
 // reclaimed while a pod was still running — the bound closed the window, not
 // the Job.
-func (s *Scheduler) AlivePods(ctx context.Context, jobName string, since time.Time) (int, error) {
-	pods, err := s.jobPods(ctx, jobName, since)
-	if err != nil {
-		return 0, fmt.Errorf("list pods of job %s: %w", jobName, err)
-	}
+func alivePods(pods []corev1.Pod) int {
 	alive := 0
 	for i := range pods {
 		if !podTerminated(&pods[i]) {
 			alive++
 		}
 	}
-	return alive, nil
+	return alive
 }
 
 // podTerminated is the pod half of the termination fact: the phase is

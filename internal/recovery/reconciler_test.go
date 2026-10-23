@@ -97,19 +97,13 @@ type fakeSettler struct {
 	discardErrs []error
 
 	// Job termination evidence.
-	terminated       bool
-	terminatedErr    error
-	lastTerminatedAt time.Time
-	lastTermErr      error
-	alivePods        int
-	alivePodsErr     error
-	reclaimErr       error
-	sweepErr         error
-	// Evidence-call counters: the objectless reclaim must not read Job/pod
+	evidence    scheduler.TerminationEvidence
+	evidenceErr error
+	reclaimErr  error
+	sweepErr    error
+	// Evidence-call counter: the objectless reclaim must not read Job/pod
 	// termination evidence at all.
-	jobTerminatedCalls int
-	lastPodCalls       int
-	alivePodsCalls     int
+	evidenceReads int
 	// DrainPendingReports' programmed answer.
 	drainCalls     int
 	drainRemaining int
@@ -184,33 +178,19 @@ func (f *fakeSettler) SweepOrphanSecrets(context.Context) error {
 	return f.sweepErr
 }
 
-func (f *fakeSettler) JobTerminated(context.Context, string, time.Time) (bool, error) {
+func (f *fakeSettler) JobTerminationEvidence(context.Context, string, time.Time) (scheduler.TerminationEvidence, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.jobTerminatedCalls++
-	return f.terminated, f.terminatedErr
-}
-
-func (f *fakeSettler) LastPodTerminatedAt(context.Context, string, time.Time) (time.Time, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.lastPodCalls++
-	return f.lastTerminatedAt, f.lastTermErr
-}
-
-func (f *fakeSettler) AlivePods(context.Context, string, time.Time) (int, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.alivePodsCalls++
-	return f.alivePods, f.alivePodsErr
+	f.evidenceReads++
+	return f.evidence, f.evidenceErr
 }
 
 // evidenceCalls reports how often the reclaim read Job/pod termination
 // evidence: the objectless path must answer zero.
-func (f *fakeSettler) evidenceCalls() (jobTerminated, lastPod, alivePods int) {
+func (f *fakeSettler) evidenceCalls() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	return f.jobTerminatedCalls, f.lastPodCalls, f.alivePodsCalls
+	return f.evidenceReads
 }
 
 func (f *fakeSettler) OnJobTerminated(_ context.Context, jobName, reason string, at time.Time, orphans int) error {
@@ -1292,7 +1272,7 @@ func TestReconcileCleanupProceedsWhenPodsUnreadable(t *testing.T) {
 	if _, _, err := reg.MarkTerminal("t1", registry.ResultCompleted, "", time.Time{}); err != nil {
 		t.Fatalf("MarkTerminal: %v", err)
 	}
-	set := &fakeSettler{terminated: true}
+	set := &fakeSettler{evidence: scheduler.TerminationEvidence{IsTerminated: true}}
 	objs := &fakeObjects{podsErr: errors.New("api server down")}
 	r := newTestReconciler(t, reg, objs, &fakeStatus{status: "running"}, set)
 
@@ -1333,10 +1313,8 @@ func TestReclaimObjectlessEntrySkipsJobEvidence(t *testing.T) {
 	}
 	// The branch must sit before every evidence read: moving any of them ahead
 	// of it turns this red.
-	terminated, lastPod, alive := set.evidenceCalls()
-	if terminated != 0 || lastPod != 0 || alive != 0 {
-		t.Errorf("termination evidence reads = JobTerminated:%d LastPodTerminatedAt:%d AlivePods:%d, want none",
-			terminated, lastPod, alive)
+	if reads := set.evidenceCalls(); reads != 0 {
+		t.Errorf("termination evidence reads = %d, want none", reads)
 	}
 	if got := objs.jobGetsSeen(); got != 0 {
 		t.Errorf("GetJob calls = %d, want none for an objectless entry", got)

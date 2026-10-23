@@ -36,7 +36,7 @@ type JobClient interface {
 	// queue rebuild (§3, §4.3, §6.5).
 	ListSecrets(ctx context.Context) ([]corev1.Secret, error)
 	// ListPods returns the pods matching labelSelector in the configured
-	// namespace — the value surface of jobTerminated.
+	// namespace — the one value surface behind the termination evidence.
 	ListPods(ctx context.Context, labelSelector string) ([]corev1.Pod, error)
 }
 

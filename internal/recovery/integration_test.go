@@ -184,10 +184,15 @@ func TestIntegrationFailedJobIsCompensated(t *testing.T) {
 	}
 
 	// The pod terminates: the next round reclaims the credential —
-	// revoke, delete the Secret, drop the entry (ADR-017).
+	// revoke, delete the Secret, drop the entry (ADR-017) — off one pod
+	// listing, not one per termination fact.
 	jobs.setPods(fakeJobName("t1"), drainPod(fakeJobName("t1"), corev1.PodSucceeded))
+	listings := jobs.podListings()
 	if err := rec.Reconcile(ctx); err != nil {
 		t.Fatalf("Reconcile after pod termination: %v", err)
+	}
+	if got := jobs.podListings() - listings; got != 1 {
+		t.Fatalf("pod listings during the reclaim round = %d, want 1", got)
 	}
 	if _, ok := reg.Get("t1"); ok {
 		t.Fatal("the entry must be dropped by the credential reclaim")
@@ -565,6 +570,9 @@ type fakeJobClient struct {
 	// pods is keyed by Job name: the termination evidence reads it through
 	// ListPods with the job-name selector.
 	pods map[string][]corev1.Pod
+	// listPodsCalls counts the termination-evidence reads: one draining entry
+	// costs one listing per round, whatever the number of facts derived.
+	listPodsCalls int
 }
 
 func newFakeJobClient() *fakeJobClient {
@@ -612,6 +620,7 @@ func (c *fakeJobClient) ListPods(_ context.Context, labelSelector string) ([]cor
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	c.listPodsCalls++
 	var out []corev1.Pod
 	for _, pods := range c.pods {
 		for i := range pods {
@@ -621,6 +630,13 @@ func (c *fakeJobClient) ListPods(_ context.Context, labelSelector string) ([]cor
 		}
 	}
 	return out, nil
+}
+
+// podListings reports the termination-evidence reads the scheduler issued.
+func (c *fakeJobClient) podListings() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.listPodsCalls
 }
 
 func (c *fakeJobClient) DeleteJob(_ context.Context, name string) error {
