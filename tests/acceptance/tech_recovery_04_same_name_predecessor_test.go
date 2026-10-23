@@ -185,7 +185,7 @@ func TestRecovery04SameNamePredecessorPodsDoNotSettleTheTask(t *testing.T) {
 	h.jobs.mu.Unlock()
 
 	rec, err := recovery.New(
-		recovery.Config{ReconcileInterval: time.Second},
+		recovery.Config{ReconcileInterval: time.Second, RecheckWindow: recheckWindow},
 		h.reg, queueObjects{jobs: h.jobs}, h.server, h.sched,
 		recovery.WithLogger(slog.New(slog.NewJSONHandler(h.logs, nil))),
 	)
@@ -203,9 +203,9 @@ func TestRecovery04SameNamePredecessorPodsDoNotSettleTheTask(t *testing.T) {
 		t.Fatalf("node_name = %q, want company-01 (the predecessor's node must not be recorded)", got.NodeName)
 	}
 
-	// Past the 10s recheck window: the corpse pod must not have settled the
+	// Past the recheck window: the corpse pod must not have settled the
 	// task as evicted, and the healthy Job must still be there.
-	time.Sleep(11 * time.Second)
+	time.Sleep(3 * recheckWindow)
 	if err := rec.Reconcile(t.Context()); err != nil {
 		t.Fatalf("Reconcile round 2: %v", err)
 	}

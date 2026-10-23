@@ -21,9 +21,10 @@ import (
 )
 
 // Timing defaults of the failure-recovery paths. They are design
-// constants (only the interval is configurable); the reconciler
-// carries them as fields so its own tests can shrink them, and every timer
-// reads the real clock so a shrunk window is honoured by the loop.
+// constants (only the interval and the recheck window are configurable); the
+// reconciler carries them as fields so a caller or its own tests can shrink
+// them, and every timer reads the real clock so a shrunk window is honoured
+// by the loop.
 const (
 	// defaultRecheckWindow gives a daemon that just lost its container the
 	// chance to land its terminal report before Foreman synthesizes one
@@ -99,9 +100,11 @@ type Reconciler struct {
 	metrics Metrics
 	log     *slog.Logger
 
-	// Timing of the deferred settlements (design constants). Kept as
-	// fields so the package tests can shrink them; every timer below runs on
-	// the real clock, so the shrunk value is what the loop actually waits.
+	// Timing of the deferred settlements. The recheck window is the one the
+	// config carries (§4.6, 10s unless a caller injects one); the rest are
+	// design constants. All stay fields so the package tests can shrink them,
+	// and every timer below runs on the real clock, so a shrunk value is what
+	// the loop actually waits.
 	recheckWindow    time.Duration
 	cancelAckTimeout time.Duration
 	suspectThreshold time.Duration
@@ -167,6 +170,9 @@ func New(cfg Config, reg *registry.Registry, objects ObjectClient, server Status
 	if cfg.ReconcileInterval <= 0 {
 		cfg.ReconcileInterval = DefaultReconcileInterval
 	}
+	if cfg.RecheckWindow <= 0 {
+		cfg.RecheckWindow = defaultRecheckWindow
+	}
 	r := &Reconciler{
 		cfg:     cfg,
 		reg:     reg,
@@ -176,7 +182,7 @@ func New(cfg Config, reg *registry.Registry, objects ObjectClient, server Status
 		metrics: noopMetrics{},
 		log:     slog.Default().With("component", "reconciler"),
 
-		recheckWindow:    defaultRecheckWindow,
+		recheckWindow:    cfg.RecheckWindow,
 		cancelAckTimeout: defaultCancelAckTimeout,
 		suspectThreshold: defaultSuspectThreshold,
 		jobGoneWindow:    defaultJobGoneWindow,

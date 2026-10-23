@@ -37,6 +37,13 @@ type Config struct {
 	// every round drops the learned entries older than it. 0 disables
 	// expiry, so a key stays usable for the process's lifetime.
 	AgentStateTTL time.Duration
+	// RecheckWindow is the short window the loop waits after a Job ends
+	// without a daemon report before it re-reads the C13 status (§4.6).
+	// 0 keeps the 10s contract default. It is not an environment knob: the
+	// contract fixes the window, and the acceptance tests set a short one to
+	// exercise the window's semantics against the real reconciler instead of
+	// sleeping it out.
+	RecheckWindow time.Duration
 }
 
 // LoadConfig reads the recovery configuration from env (os.Getenv when

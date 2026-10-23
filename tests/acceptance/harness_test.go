@@ -2740,6 +2740,13 @@ const (
 	leaseKeeperInterval   = 20 * time.Millisecond
 )
 
+// Recheck window the recovery scenarios run with. The window is a contract
+// constant (10s, §4.6) that the reconciler takes from recovery.Config, so a
+// scenario injects a short one and waits a few of it: the window's semantics
+// run on the real reconciler, the suite does not pay the contract's wall
+// clock.
+const recheckWindow = 100 * time.Millisecond
+
 func newHarness(t *testing.T, catalogEnabled bool) *harness {
 	t.Helper()
 	return newHarnessWithWindow(t, catalogEnabled, deliveryConfirmWindow)
