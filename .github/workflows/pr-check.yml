@@ -66,11 +66,15 @@ jobs:
         # `internal/*` unit tests plus `tests/acceptance` (in-memory k8s fake
         # and httptest stubs) and `tests/release` (stubbed docker/git running
         # the release steps): no cluster and no credentials, minutes not hours.
+        # The race detector is on: claim loops, heartbeats, the reporter and
+        # the lease keeper are the bulk of this process, and a race regression
+        # passes a plain `go test`; the hosted runner has the cgo toolchain it
+        # needs. Every package carries it — no per-package split.
         # The exit code is the only failure signal — no `continue-on-error`,
         # no `if: always()`, and no `make check` either: that target's fmt only
         # lists unformatted files, so it would gate on something else than the
         # build + tests asked for here.
-        run: go test ./...
+        run: go test -race ./...
 
   image:
     name: Image build (no push)

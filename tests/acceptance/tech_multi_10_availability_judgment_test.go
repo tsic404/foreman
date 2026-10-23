@@ -140,7 +140,7 @@ func TestTechMulti10ShutdownCancellationKeepsTheLastInstanceVerdict(t *testing.T
 		t.Fatalf("a shutdown cancellation emitted availability events: %v -> %v", baseline, lines)
 	}
 
-	last, err := tw.a.leader.LastInstance(context.Background())
+	last, err := tw.a.currentLeader().LastInstance(context.Background())
 	if err != nil || !last {
 		t.Fatalf("last-instance verdict after a shutdown cancellation = %v, %v; want true, nil", last, err)
 	}

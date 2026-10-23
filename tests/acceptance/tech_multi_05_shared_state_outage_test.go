@@ -94,7 +94,7 @@ func TestTechMulti05SharedStateOutage(t *testing.T) {
 	// takeover reconciles, and claims resume.
 	tw.mr.SetError("")
 	deadline = time.Now().Add(15 * time.Second)
-	for !tw.a.leader.Held() {
+	for !tw.a.leaderHeld() {
 		if time.Now().After(deadline) {
 			t.Fatal("the holder never re-acquired the lease after recovery")
 		}

@@ -126,7 +126,7 @@ func TestForbidden10AuthorityStateIsSharedNotInProcess(t *testing.T) {
 	}
 
 	tw.a.upstream.enqueueTask("task-c")
-	stopHolder := tw.a.startAssemblyControlPlane(t, tw.a.leader.Held, nil)
+	stopHolder := tw.a.startAssemblyControlPlane(t, tw.a.leaderHeld, nil)
 	defer stopHolder()
 	tw.awaitClaimedJob(t, "task-c")
 	if got := len(tw.a.upstream.calls("POST", "/api/daemon/tasks/claim")); got <= c3Before {

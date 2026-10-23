@@ -78,7 +78,7 @@ func TestMultiAssemblyTwoReplicaStartup(t *testing.T) {
 
 	// A's startup: the startup probe runs (holder), the discovery is declared
 	// and the claim loop's C1 publishes the registration identity.
-	discA, err := bootstrap.StartupDiscoveries(ctx, tw.a.leader, tw.a.coord, tw.a.sched, tw.a.clientList(), 3*time.Second, assemblyLogger(tw.a))
+	discA, err := bootstrap.StartupDiscoveries(ctx, tw.a.currentLeader(), tw.a.coord, tw.a.sched, tw.a.clientList(), 3*time.Second, assemblyLogger(tw.a))
 	if err != nil {
 		t.Fatalf("A StartupDiscoveries: %v", err)
 	}
@@ -88,7 +88,7 @@ func TestMultiAssemblyTwoReplicaStartup(t *testing.T) {
 	if len(tw.a.client.RuntimeIDs()) == 0 {
 		tw.a.client.Declare(discA["ws-1"])
 	}
-	stopA := tw.a.startAssemblyControlPlane(t, tw.a.leader.Held, func(ctx context.Context, cl *proxy.Client) error {
+	stopA := tw.a.startAssemblyControlPlane(t, tw.a.leaderHeld, func(ctx context.Context, cl *proxy.Client) error {
 		return bootstrap.PublishDeclaration(ctx, tw.a.coord, "ws-1", cl)
 	})
 	waitDeclaration(t, tw.a.coord, tw.a.clientList())
@@ -100,7 +100,7 @@ func TestMultiAssemblyTwoReplicaStartup(t *testing.T) {
 
 	// B's startup: a follower adopts the published declaration — no probe, no
 	// C1 — and carries the same real runtime ids.
-	discB, err := bootstrap.StartupDiscoveries(ctx, tw.b.leader, tw.b.coord, tw.b.sched, tw.b.clientList(), 3*time.Second, assemblyLogger(tw.b))
+	discB, err := bootstrap.StartupDiscoveries(ctx, tw.b.currentLeader(), tw.b.coord, tw.b.sched, tw.b.clientList(), 3*time.Second, assemblyLogger(tw.b))
 	if err != nil {
 		t.Fatalf("B StartupDiscoveries: %v", err)
 	}
@@ -121,7 +121,7 @@ func TestMultiAssemblyTwoReplicaStartup(t *testing.T) {
 	// Non-holder zero: B's full loop set runs gated, so no upstream control
 	// call moves (C1, C2 heartbeat, C3 claim, C20 subscription).
 	before := controlCounts(tw.a.upstream)
-	stopB := tw.b.startAssemblyControlPlane(t, tw.b.leader.Held, nil)
+	stopB := tw.b.startAssemblyControlPlane(t, tw.b.leaderHeld, nil)
 	time.Sleep(1200 * time.Millisecond)
 	after := controlCounts(tw.a.upstream)
 	if after.c1 != before.c1 {
@@ -167,7 +167,7 @@ func TestMultiAssemblyTwoReplicaStartup(t *testing.T) {
 	tw.a.crashLeader(t)
 	tw.a.upstream.enqueueTask("task-takeover")
 	deadline := time.Now().Add(10 * time.Second)
-	for !tw.b.leader.Held() {
+	for !tw.b.leaderHeld() {
 		if time.Now().After(deadline) {
 			t.Fatal("the follower never acquired the lease")
 		}
