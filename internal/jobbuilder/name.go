@@ -23,8 +23,12 @@ const (
 	nameVarTaskKey      = "<task-key>"
 	nameVarTaskID       = "<task_id>"
 
-	// Segment budgets (ADR-034 decision 4) and the task-id budget of the
-	// worst-case length arithmetic.
+	// Segment budgets (ADR-034 decision 3) and the task-id budget of the
+	// worst-case length arithmetic. budgetTaskID is the length of a canonical
+	// hyphenated UUID — an assumption about the input, not a bound enforced on
+	// it: startup has no task id to measure, so a longer one is refused by the
+	// render-time check instead (invalid_task_id, once the name leaves the
+	// 63-character limit).
 	budgetIssueSegment = 20
 	budgetAgentSegment = 24
 	budgetTaskKey      = 12
@@ -147,7 +151,8 @@ type nameValues struct {
 	taskID       string
 }
 
-// nameWorstValues renders every variable at its longest budget.
+// nameWorstValues renders every variable at its longest budget. The task id's
+// entry is the UUID length assumption (budgetTaskID), not a bound on the input.
 func nameWorstValues() nameValues {
 	return nameValues{
 		issueSegment: strings.Repeat("a", budgetIssueSegment),

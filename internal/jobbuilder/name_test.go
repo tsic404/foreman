@@ -2,6 +2,7 @@ package jobbuilder
 
 import (
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 )
@@ -182,6 +183,68 @@ spec:
 		}
 		if first == second {
 			t.Errorf("both tasks resolved to %q, want distinct names", first)
+		}
+	})
+
+	// The startup arithmetic assumes a 36-character task id (a canonical UUID).
+	// The assumption is about the input, not a bound on it: the format below
+	// passes startup at exactly 63 and a one-character-longer id is refused by
+	// the render-time check, as invalid_task_id, not by the startup gate.
+	t.Run("a task id past the uuid budget fails the render, not startup", func(t *testing.T) {
+		format := strings.Repeat("a", 3) + "-<task_id>-" + strings.Repeat("a", 22)
+		cfg, _ := templateConfig(t, fmt.Sprintf(`
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: %s
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: agent
+          image: <job-image>
+`, format))
+		builder := newTestBuilder(t, cfg)
+
+		name, err := builder.ResolveName(TaskEntry{TaskID: strings.Repeat("a", budgetTaskID)})
+		if err != nil {
+			t.Fatalf("ResolveName at the budget: %v", err)
+		}
+		if len(name) != maxJobNameLength {
+			t.Errorf("name length = %d, want the %d limit exactly", len(name), maxJobNameLength)
+		}
+		if _, err := builder.ResolveName(TaskEntry{TaskID: strings.Repeat("a", budgetTaskID+1)}); !errors.Is(err, ErrInvalidTaskID) {
+			t.Errorf("ResolveName one over the budget = %v, want ErrInvalidTaskID", err)
+		}
+	})
+
+	// The positive control for the boundary above: the budget is no gate on the
+	// input. A short format leaves room for an id past it, and that id renders
+	// verbatim — a hard len(task_id) > budgetTaskID rejection fails here.
+	t.Run("a task id past the uuid budget renders under a shorter format", func(t *testing.T) {
+		cfg, _ := templateConfig(t, `
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: <task_id>
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: agent
+          image: <job-image>
+`)
+		builder := newTestBuilder(t, cfg)
+
+		taskID := strings.Repeat("a", budgetTaskID+4)
+		name, err := builder.ResolveName(TaskEntry{TaskID: taskID})
+		if err != nil {
+			t.Fatalf("ResolveName: %v", err)
+		}
+		if name != taskID {
+			t.Errorf("name = %q, want the task id verbatim %q", name, taskID)
 		}
 	})
 }
