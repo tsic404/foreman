@@ -14,6 +14,7 @@
 package acceptance
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -252,6 +253,78 @@ func TestMulti08SettledRecordSurvivesRestart(t *testing.T) {
 		[]byte(`{"exit_code":0}`)); code != http.StatusOK {
 		t.Errorf("post-reclaim terminal replay on the fresh process = %d (%s), want 200", code, body)
 	}
+}
+
+// TestMulti08SettledRecordStripsDecidedBody makes §4.3's 定论体 face of the
+// projection discriminating. The live mapping record is given the instance's
+// decided body (§4.4) before the verdict write, so the settled projection is
+// derived from a row that really holds one — the shape the other scenarios
+// cannot produce, since a boundary report registers its body after the
+// verdict. All three settled faces (local index, shared done key, post-restart
+// restore) must still carry no part of it, while the live row keeps the body
+// for the drain's terminal replay.
+func TestMulti08SettledRecordStripsDecidedBody(t *testing.T) {
+	store, _ := multi08Store(t)
+	h := newHarnessWithSharedState(t, false, store)
+	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+	h.declare(declaredRuntimes())
+	h.revoker = h.issuer
+	h.rebuildScheduler(t, func(*scheduler.Config) {})
+
+	multi08DriveClaim(t, h, "task-1")
+	decided := []byte(`{"exit_code":0,"result":"completed"}`)
+	if _, ok := h.reg.RegisterDecidedReport("task-1", decided); !ok {
+		t.Fatal("RegisterDecidedReport: task-1 has no live entry")
+	}
+	// The convergence settlement is the verdict write for an entry whose
+	// decided body is already on the mapping record (C13 already-terminal).
+	if err := h.sched.SettleTerminal(t.Context(), "task-1", string(registry.ResultCompleted)); err != nil {
+		t.Fatalf("SettleTerminal: %v", err)
+	}
+	live, ok := h.reg.Get("task-1")
+	if !ok || !live.IsDraining() {
+		t.Fatalf("task-1 not draining after the verdict: %+v", live)
+	}
+	// The fixture's positive control: the row the projection was taken from
+	// holds the body, and the live row keeps it.
+	if !bytes.Equal(live.DecidedReport, decided) {
+		t.Fatalf("live row decided body = %q, want %q", live.DecidedReport, decided)
+	}
+	multi08Flush(t, h)
+
+	beforeSettled, ok := h.reg.Settled("task-1")
+	if !ok {
+		t.Fatal("the first process writes no settled record")
+	}
+	multi08AssertProjectionOnly(t, "before restart", beforeSettled)
+
+	// Reclaim the credential: the live row goes, the settled record stays.
+	if err := h.sched.OnJobTerminated(t.Context(), live.JobName,
+		scheduler.JobTerminationReasonJobTerminated, time.Now().Add(-time.Second), 0); err != nil {
+		t.Fatalf("OnJobTerminated: %v", err)
+	}
+	if _, ok := h.reg.Get("task-1"); ok {
+		t.Fatal("live entry survived the reclaim")
+	}
+	multi08Flush(t, h)
+	row, ok, err := store.GetSettled(t.Context(), live.WorkspaceID, "task-1")
+	if err != nil {
+		t.Fatalf("GetSettled: %v", err)
+	}
+	if !ok {
+		t.Fatal("the retention window holds no settled row after the reclaim")
+	}
+	multi08AssertProjectionOnly(t, "shared settled row", row)
+
+	h2 := newHarnessWithSharedState(t, false, store)
+	if err := h2.sched.Rebuild(t.Context()); err != nil {
+		t.Fatalf("Rebuild after restart: %v", err)
+	}
+	settled, ok := h2.reg.Settled("task-1")
+	if !ok {
+		t.Fatal("settled record lost across restart")
+	}
+	multi08AssertProjectionOnly(t, "after restart", settled)
 }
 
 // TestMulti08RevocationSurvivesRestart covers the revocation half of AC-73:
