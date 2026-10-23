@@ -4,7 +4,9 @@
 // stays in process memory only. The queue keeps it, the error face names the
 // reason, no carrier object exists, and the task's Job is kept while the
 // report is undelivered. Process exit loses the entry: the rebuilt queue is
-// empty and equals the carrier list, which is the declared loss face.
+// empty and equals the carrier list, which is the declared loss face. An
+// identifier the queue's file grammar rejects has no disk face even to wait
+// for, so that in-memory copy is the queue itself and counts as one.
 package acceptance
 
 import (
@@ -115,4 +117,82 @@ func TestForward07RefusedCarrierWriteStaysInProcessOnly(t *testing.T) {
 
 	assertUnbackedQueueEntry(t, h, logs, "pending-report carrier write failed")
 	assertLostOnProcessExit(t, h)
+}
+
+// forward07UnnameableTaskID is an id the queue's file grammar rejects, so no
+// queue file can ever name it. The carrier's label face accepts it and the Job
+// name face does not, so the claim fails before any Job exists: the report this
+// id can have is its claim failure, and that report lives in memory only.
+const forward07UnnameableTaskID = "task.abcdef123456"
+
+// deliveredEvents counts the queue's delivered log rows for one task.
+func deliveredEvents(logs *syncBuffer, taskID string) int {
+	n := 0
+	for _, line := range bytes.Split(logs.Bytes(), []byte("\n")) {
+		var fields map[string]any
+		if json.Unmarshal(line, &fields) != nil {
+			continue
+		}
+		if fields["msg"] == "task.forward_delivered" && fields["task_id"] == taskID {
+			n++
+		}
+	}
+	return n
+}
+
+// TestForward07UnnameableTaskIDStaysCountedInProcess is the third unbacked
+// shape: the identifier itself cannot name a queue file. Such a report has no
+// disk face to wait for, so the in-memory copy is its queue — the pending
+// count reads 1 rather than 0, and the entry reads as queued while it is
+// undelivered. A drain then delivers it exactly once and clears both.
+func TestForward07UnnameableTaskIDStaysCountedInProcess(t *testing.T) {
+	logs := capturePendingLogs(t)
+	h := newDeliveryHarness(t)
+	h.useRealBuilder(t)
+	h.jobs.setCreateCarrierErr(errors.New("apiserver refused the carrier write"))
+	h.server.setForwardCode(503)
+
+	// The claim itself fails on the id (no legal Job name), so the failure
+	// report is the only report this task ever produces.
+	if err := h.sched.OnClaim(t.Context(), deliveryPayload(forward07UnnameableTaskID)); err == nil {
+		t.Fatal("OnClaim: want the invalid-task-id failure")
+	}
+	if jobs := h.jobs.liveJobs(); jobs != 0 {
+		t.Fatalf("live Jobs = %d, want 0: the claim never produced one", jobs)
+	}
+	if got := h.pending.Len(); got != 1 {
+		t.Fatalf("pending reports = %d, want 1: the in-memory copy is this id's whole queue", got)
+	}
+	if got := h.metrics.pendingReportsDepth(); got != 1 {
+		t.Fatalf("foreman_pending_reports = %d, want 1", got)
+	}
+	if !h.pending.Queued(forward07UnnameableTaskID) {
+		t.Fatal("the undelivered report read as delivered: the settlement gate is open")
+	}
+	if got := len(h.jobs.carrierSecrets()); got != 0 {
+		t.Fatalf("carriers = %d, want 0: the carrier write was refused", got)
+	}
+	assertUndeliveredEvent(t, logs, forward07UnnameableTaskID, "pending-report carrier write failed")
+
+	// The upstream and the carrier come back: one drain lands the carrier,
+	// delivers the report, and settles the entry.
+	h.jobs.setCreateCarrierErr(nil)
+	h.server.setForwardCode(0)
+	remaining, err := h.pending.Drain(t.Context(), h.sched)
+	if err != nil || remaining != 0 {
+		t.Fatalf("Drain = %d, %v; want the staged report delivered", remaining, err)
+	}
+	if h.pending.Queued(forward07UnnameableTaskID) || h.pending.Len() != 0 {
+		t.Fatalf("after the drain: Queued=%v Len=%d, want false/0",
+			h.pending.Queued(forward07UnnameableTaskID), h.pending.Len())
+	}
+	if got := h.metrics.pendingReportsDepth(); got != 0 {
+		t.Fatalf("foreman_pending_reports = %d, want 0", got)
+	}
+	if got := len(h.jobs.carrierSecrets()); got != 0 {
+		t.Fatalf("carriers after delivery = %d, want 0", got)
+	}
+	if got := deliveredEvents(logs, forward07UnnameableTaskID); got != 1 {
+		t.Fatalf("deliveries = %d, want exactly 1", got)
+	}
 }

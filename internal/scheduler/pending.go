@@ -61,8 +61,10 @@ type ReportSender interface {
 	DeliverQueued(ctx context.Context, ep Endpoint, taskID, workspaceID string, body []byte, failureReason string) (int, []byte, error)
 }
 
-// pendingReport is one queued terminal report (contract §10). The file is
-// the queue: a report is durable iff its file exists (staged until it lands).
+// pendingReport is one queued terminal report (contract §10). Its disk file is
+// one face of the queue, not the queue itself: until a face holds the entry it
+// lives staged in memory, and an id the disk cannot name stays queued on that
+// copy alone.
 type pendingReport struct {
 	TaskID   string `json:"task_id"`
 	JobName  string `json:"job_name"`
@@ -107,13 +109,11 @@ type PendingReports struct {
 	maxEntries int
 
 	// staged holds the reports the disk has not taken yet. A failed disk write
-	// (待发队列目录不可写：记 error + gauge 不增长；退避后重试) is retried as a
-	// disk write on every Drain; a crash loses it only if neither face landed.
-	// A task id that cannot name a queue file has its carrier as the only
-	// durability face: Drain retries that carrier write, and a landed carrier
-	// keeps the report across processes. Queued answers a failed disk write as
-	// undelivered while it stays staged; an id that cannot name a queue file
-	// only once its carrier landed. The gauge stays at the durable depth.
+	// is retried on every Drain; a crash loses it only if neither face landed.
+	// A task id that cannot name a queue file keeps its carrier as the
+	// durability face and its in-memory copy as the queue itself: Drain
+	// retries that carrier write and delivers from staging, and the entry
+	// reads as queued and counts on the gauge until it leaves.
 	staged map[string]pendingReport
 
 	// quarantineTried remembers malformed file names whose isolation was
@@ -711,21 +711,21 @@ func (p *PendingReports) dropLocked(taskID string) {
 }
 
 // queuedKnownLocked answers Queued from the entries the process actually
-// holds: the carrier-backed ids, the disk files, and the staged reports the
-// disk can still take. A staged report whose id can never name a queue file is
-// not a durable entry — only its carrier can make it one, and that face is
-// answered first.
+// holds: the carrier-backed ids, the staged reports and the disk files. A
+// staged report is an entry the process holds whichever durability face it can
+// still reach — an id the disk cannot name does not make its report delivered
+// (Drain delivers it straight from staging).
 func (p *PendingReports) queuedKnownLocked(taskID string) bool {
 	if p.carrierBacked[taskID] {
+		return true
+	}
+	if _, ok := p.staged[taskID]; ok {
 		return true
 	}
 	if !validTaskID(taskID) {
 		return false
 	}
-	if _, ok := p.readLocked(taskID); ok {
-		return true
-	}
-	_, ok := p.staged[taskID]
+	_, ok := p.readLocked(taskID)
 	return ok
 }
 
@@ -740,9 +740,12 @@ func (p *PendingReports) queuedLocked(taskID string) bool {
 	return p.queuedKnownLocked(taskID)
 }
 
-// lenLocked is the queue depth across both durability faces: the disk entries
-// and the carrier-backed ones (deduplicated by task id). A staged report with
-// neither face does not count — it is not durable (错误处理表).
+// lenLocked is the queue depth across its faces: the disk entries, the
+// carrier-backed ones and the staged reports the disk can never take — an id
+// the file grammar rejects has no disk face to wait for, so the in-memory copy
+// is its queue face until its carrier lands (deduplicated by task id). A
+// staged report a later write can still land is a write in flight and stays
+// off the gauge until it lands.
 func (p *PendingReports) lenLocked() int {
 	seen := make(map[string]struct{})
 	for _, rep := range p.listLocked() {
@@ -751,13 +754,17 @@ func (p *PendingReports) lenLocked() int {
 	for taskID := range p.carrierBacked {
 		seen[taskID] = struct{}{}
 	}
+	for taskID := range p.staged {
+		if !validTaskID(taskID) {
+			seen[taskID] = struct{}{}
+		}
+	}
 	return len(seen)
 }
 
 // undeliveredLocked is the drain's report count: the durable entries plus
-// the staged ones a failed write left in memory. It is the same union as the
-// gauge, plus the not-yet-durable staged reports the gauge deliberately does
-// not count.
+// the staged ones a failed write left in memory — every report the queue
+// holds, whichever face holds it.
 func (p *PendingReports) undeliveredLocked() int {
 	seen := make(map[string]struct{})
 	for _, rep := range p.listLocked() {
@@ -772,9 +779,11 @@ func (p *PendingReports) undeliveredLocked() int {
 	return len(seen)
 }
 
-// Len reports the durable queue depth — the foreman_pending_reports gauge.
-// A report counts once a durability face holds it (the disk write or the
-// carrier write); one both faces failed does not grow the gauge.
+// Len reports the queue depth — the foreman_pending_reports gauge. A report
+// counts once a durability face holds it (the disk write or the carrier
+// write); a report only reachable through staging counts once the disk can no
+// longer take it, because that staging copy is then the queue itself
+// (lenLocked).
 func (p *PendingReports) Len() int {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -793,9 +802,9 @@ func (p *PendingReports) Len() int {
 // list completed; HasQueuedEntry is the known-membership face for callers
 // deciding whether to write, not whether to settle.
 //
-// A task id that cannot name a queue file is answered without touching the
-// filesystem: the node-local copy cannot hold it, so only its carrier makes it
-// a durable entry — and a carrier-backed report answers true above.
+// A task id that cannot name a queue file is answered from the in-memory
+// entries only: the node-local copy can never hold it, so its staged report
+// and its carrier are the two faces that make it queued.
 func (p *PendingReports) Queued(taskID string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -824,8 +833,9 @@ func (p *PendingReports) HasQueuedEntry(taskID string) bool {
 
 // Drop forgets the report queued for taskID: the direct forward it was
 // written ahead of settled it (accepted, moot, or permanently refused), so no
-// replay is owed. A no-op when nothing is queued. The gauge follows the
-// durable depth; a carrier is deleted with the entry (ADR-046 decision 3).
+// replay is owed. A no-op when nothing is queued. The gauge follows the queue
+// depth — every entry the queue holds, whichever face holds it; a carrier is
+// deleted with the entry (ADR-046 decision 3).
 func (p *PendingReports) Drop(ctx context.Context, taskID string) {
 	p.mu.Lock()
 	wasBacked := p.carrierBacked[taskID]
