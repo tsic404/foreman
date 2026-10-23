@@ -414,6 +414,22 @@ func TestOnReportAttributionWaitBoundFollowsTheSchedulerClock(t *testing.T) {
 	}
 }
 
+// TestDefaultAttributionWaitStaysUnderTheDaemonControlPlaneTimeout pins the
+// gate's wait upper bound (ADR-031): 15s as the implementation constant, and
+// strictly under the Job daemon's 30s control-plane timeout so a gated
+// response never lands in the daemon's retry face. The value is not a config
+// item — a drift is a contract change, not a tuning choice.
+func TestDefaultAttributionWaitStaysUnderTheDaemonControlPlaneTimeout(t *testing.T) {
+	const daemonControlPlaneTimeout = 30 * time.Second
+	if defaultAttributionWait != 15*time.Second {
+		t.Fatalf("defaultAttributionWait = %v, want 15s", defaultAttributionWait)
+	}
+	if defaultAttributionWait >= daemonControlPlaneTimeout {
+		t.Fatalf("defaultAttributionWait = %v, want < %v (the Job daemon's control-plane timeout)",
+			defaultAttributionWait, daemonControlPlaneTimeout)
+	}
+}
+
 // TestOnReportAttributionGateDaemonSelfReport: neither wait signal holds, so
 // the report is forwarded at once and the attribution stays with the daemon.
 func TestOnReportAttributionGateDaemonSelfReport(t *testing.T) {

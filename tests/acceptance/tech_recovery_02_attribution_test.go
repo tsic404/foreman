@@ -326,3 +326,83 @@ func TestRecovery05ExpiredWaitReleasesTheSelfReportWithVisibleDegradation(t *tes
 		t.Fatalf("task.attribution_decided fact_source = %v, want none on the degraded branch", source)
 	}
 }
+
+// TestRecovery02GateExpiresAtTheProductionWaitBound is the wait bound's
+// production form: no short wait is injected, one wait signal holds (the
+// instance pod carries a platform deletion) and the fact never appears, so the
+// gate expires at its upper bound — the daemon's self-report is released
+// verbatim and the degradation is visible. The fixed clock does not follow
+// wall time and every evidence read steps it 1s, so the observed span is
+// exactly the bound plus that step — a drifted bound fails here too; the exact
+// 15s value is pinned by the scheduler's constant assertion.
+func TestRecovery02GateExpiresAtTheProductionWaitBound(t *testing.T) {
+	clock := newFixedClock()
+	h := buildHarnessWith(t, false, deliveryConfirmWindow, nil, false, false,
+		harnessOptions{clock: clock.now})
+	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+	h.declare(declaredRuntimes())
+
+	if err := h.sched.OnClaim(t.Context(), deliveryPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	token := issueJobToken(t, h, "task-1")
+	registerTaskDaemon(t, h, "task-1", token)
+	claimTask(t, h, "task-1", token)
+	if code, body := h.call("POST", "/api/daemon/tasks/task-1/start", token, []byte(`{}`)); code != 200 {
+		t.Fatalf("S8 = %d (%s), want 200", code, body)
+	}
+	entry, ok := h.reg.Get("task-1")
+	if !ok || entry.JobCreatedAt.IsZero() {
+		t.Fatalf("entry = %+v (%v), want a live instance", entry, ok)
+	}
+	h.server.setStatus("task-1", "running")
+
+	deletion := metav1.Now()
+	pod := corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:              entry.JobName + "-current",
+			Labels:            map[string]string{"job-name": entry.JobName},
+			CreationTimestamp: metav1.NewTime(entry.JobCreatedAt),
+			DeletionTimestamp: &deletion,
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	h.jobs.mu.Lock()
+	h.jobs.pods = append(h.jobs.pods, pod)
+	h.jobs.mu.Unlock()
+	// Each evidence read steps the fixed clock 1s: the gate re-reads until
+	// its bound is crossed instead of sleeping it out, and the exit lands on
+	// an exact clock value rather than on wall time.
+	h.jobs.setOnGetJob(func() { clock.advance(time.Second) })
+
+	daemonBody := []byte(`{"error":"agent died","failure_reason":"agent_error"}`)
+	start := clock.now()
+	code, body := h.call("POST", "/api/daemon/tasks/task-1/fail", token, daemonBody)
+	if code != 200 {
+		t.Fatalf("S14 = %d (%s), want 200", code, body)
+	}
+	// The entry read steps the clock before the bound is computed, so the exit
+	// is exactly one step past the 15s production bound. An exact span keeps a
+	// drift inside the old 15s..30s bracket (say 20s) from passing silently.
+	const wantGateSpan = 16 * time.Second
+	if span := clock.now().Sub(start); span != wantGateSpan {
+		t.Fatalf("gate released after %s of scheduler time, want exactly %s (the 15s bound plus the entry read's step)", span, wantGateSpan)
+	}
+
+	// Expiry releases the daemon's own report verbatim: no compensation body.
+	forwards := h.server.forwarded(scheduler.EPFail)
+	if len(forwards) != 1 || string(forwards[0].Body) != string(daemonBody) {
+		t.Fatalf("fail forwards = %+v, want the daemon's body verbatim", forwards)
+	}
+	settled, _ := h.reg.Get("task-1")
+	if settled.State != registry.StateTerminal || settled.Result != registry.ResultFailed || settled.FailureReason != "" {
+		t.Fatalf("entry = %+v, want the daemon's own failed verdict", settled)
+	}
+	if events := h.events("task.failed_compensated"); len(events) != 0 {
+		t.Fatalf("task.failed_compensated = %+v, want none on the expired wait", events)
+	}
+	decided := h.events("task.attribution_decided")
+	if len(decided) != 1 || decided[0]["decision"] != scheduler.DecisionDegraded {
+		t.Fatalf("task.attribution_decided = %+v, want decision=degraded", decided)
+	}
+}
