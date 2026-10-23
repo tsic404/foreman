@@ -614,6 +614,12 @@ func (r *Reconciler) settleEnded(ctx context.Context, e registry.TaskEntry, reas
 	if reason != scheduler.FailureReasonJobDeadline {
 		first, ok := r.ended[e.JobName]
 		if !ok {
+			// Stamp and time.Since both ride the process monotonic clock:
+			// a wall-clock step must never shorten the window — an early
+			// settle would beat the daemon's own report (判据模型). The
+			// price is that a suspend freezes this clock, so the window
+			// stretches by the suspend duration: a late retry, never an
+			// early one. K8s controllers accept that drift.
 			r.ended[e.JobName] = time.Now()
 			return nil
 		}
@@ -706,6 +712,8 @@ func (r *Reconciler) settleFromServer(ctx context.Context, e registry.TaskEntry)
 func (r *Reconciler) settleCancelled(ctx context.Context, e registry.TaskEntry) error {
 	first, ok := r.cancels[e.TaskID]
 	if !ok {
+		// Same monotonic stamp as the recheck window: immune to wall-clock
+		// steps, stretched — never shortened — by a process suspend.
 		r.cancels[e.TaskID] = time.Now()
 		r.log.InfoContext(ctx, "task.cancel_seen",
 			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID)
