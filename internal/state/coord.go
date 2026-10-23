@@ -126,9 +126,9 @@ type CoordStore interface {
 	// UnlockTask releases the lock only when owner still holds it.
 	UnlockTask(ctx context.Context, ws, taskID, owner string) error
 
-	// ReserveSlot reserves one in-flight slot when the counter is below limit
-	// (limit <= 0 means no per-workspace cap for the workspace counter) and
-	// returns the reservation's id on success. The reservation is tracked with
+	// ReserveSlot reserves one in-flight slot when the counter is below limit;
+	// a non-positive limit means that level is uncapped, not a zero budget.
+	// It returns the reservation's id on success. The reservation is tracked with
 	// a lease, so the reconciliation can tell a pending claim apart from a
 	// leaked count; the id is the handle that consumes or releases exactly
 	// this reservation and never another caller's.
@@ -308,8 +308,9 @@ return 1`)
 	// slotReserve: KEYS[1]=counter, KEYS[2]=reservation zset;
 	// ARGV[1]=limit, ARGV[2]=reservation ttl ms, ARGV[3]=reservation id.
 	// Expired reservations are purged (and their slots returned) before the
-	// cap check, so a dead reserver self-heals on the next claim. The score
-	// and the purge cutoff come from the server clock, so one instance's
+	// cap check, so a dead reserver self-heals on the next claim. A
+	// non-positive limit skips the cap entirely (the level is uncapped). The
+	// score and the purge cutoff come from the server clock, so one instance's
 	// skew can neither drop a live reservation nor keep a dead one (AC-76).
 	scriptSlotReserve = redis.NewScript(`
 local t = redis.call('TIME')
@@ -319,7 +320,8 @@ redis.call('ZREMRANGEBYSCORE', KEYS[2], '-inf', now)
 local purged = before - redis.call('ZCARD', KEYS[2])
 local n = tonumber(redis.call('GET', KEYS[1]) or '0') - purged
 if n < 0 then n = 0 end
-if n >= tonumber(ARGV[1]) then
+local limit = tonumber(ARGV[1])
+if limit > 0 and n >= limit then
   redis.call('SET', KEYS[1], n)
   return 0
 end
@@ -976,8 +978,9 @@ func slotKeys(ws string) (counter, reservations string) {
 // must cover one claim batch (C3 + OnClaim up to the Job-name wait).
 const reservationTTL = 5 * time.Minute
 
-// ReserveSlot reserves one in-flight slot below limit (AC-76) and returns the
-// reservation's id: the handle that retires exactly this reservation.
+// ReserveSlot reserves one in-flight slot below limit, or unconditionally when
+// the limit is non-positive. It returns the reservation's id: the handle that
+// retires exactly this reservation.
 func (s *redisStore) ReserveSlot(ctx context.Context, ws string, limit int) (string, bool, error) {
 	counter, reservations := slotKeys(ws)
 	// The id is the zset member and the caller's retire handle, so it needs
