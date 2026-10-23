@@ -52,7 +52,7 @@ func TestRecovery01JobEndedWithoutAReportIsCompensated(t *testing.T) {
 	h.server.setStatus("task-1", "running")
 
 	rec, err := recovery.New(
-		recovery.Config{ReconcileInterval: time.Second},
+		recovery.Config{ReconcileInterval: time.Second, RecheckWindow: recheckWindow},
 		h.reg, queueObjects{jobs: h.jobs}, h.server, h.sched,
 		recovery.WithLogger(slog.New(slog.NewJSONHandler(h.logs, nil))),
 	)
@@ -72,7 +72,7 @@ func TestRecovery01JobEndedWithoutAReportIsCompensated(t *testing.T) {
 	}
 
 	// Second round after the window: the compensation settles the task.
-	time.Sleep(11 * time.Second)
+	time.Sleep(3 * recheckWindow)
 	if err := rec.Reconcile(t.Context()); err != nil {
 		t.Fatalf("Reconcile round 2: %v", err)
 	}
