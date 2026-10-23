@@ -2134,36 +2134,37 @@ type tokenUsageRecord struct {
 // delivery face, the skill-cache resolve faces and the task-driven §9.2
 // families the observability scenarios judge.
 type recordingMetrics struct {
-	mu               sync.Mutex
-	catalogCodes     []string
-	catalogSecs      []float64
-	deliveryKinds    []string
-	unconfirmed      int
-	authReasons      []string
-	duplicates       int
-	skillResults     []string
-	skillEvicts      []string
-	skillEntries     int
-	skillBytes       int64
-	profileResults   []string
-	workspaceResults []string
-	taskResults      []string
-	policyHits       map[string]int
-	nameConclusions  []string
-	pendingReports   int
-	taskClaims       int
-	claimErrors      []string
-	jobCreateSamples []float64
-	jobBootSamples   []float64
-	inflight         []int
-	credReclaims     map[string]int
-	drainSamples     []float64
-	jobDeleteFailed  []string
-	forwards         []metricForward
-	tokenUsage       []tokenUsageRecord
-	terminalResults  []string
-	wsConnected      map[string]int
-	wsReconnects     map[string]int
+	mu                sync.Mutex
+	catalogCodes      []string
+	catalogSecs       []float64
+	deliveryKinds     []string
+	deliveryLatencies []float64
+	unconfirmed       int
+	authReasons       []string
+	duplicates        int
+	skillResults      []string
+	skillEvicts       []string
+	skillEntries      int
+	skillBytes        int64
+	profileResults    []string
+	workspaceResults  []string
+	taskResults       []string
+	policyHits        map[string]int
+	nameConclusions   []string
+	pendingReports    int
+	taskClaims        int
+	claimErrors       []string
+	jobCreateSamples  []float64
+	jobBootSamples    []float64
+	inflight          []int
+	credReclaims      map[string]int
+	drainSamples      []float64
+	jobDeleteFailed   []string
+	forwards          []metricForward
+	tokenUsage        []tokenUsageRecord
+	terminalResults   []string
+	wsConnected       map[string]int
+	wsReconnects      map[string]int
 }
 
 // Forward records one lifecycle forward by endpoint and status code
@@ -2342,7 +2343,11 @@ func (m *recordingMetrics) DeliveryClaim(result string) {
 	m.deliveryKinds = append(m.deliveryKinds, result)
 }
 
-func (m *recordingMetrics) DeliveryLatency(float64) {}
+func (m *recordingMetrics) DeliveryLatency(seconds float64) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.deliveryLatencies = append(m.deliveryLatencies, seconds)
+}
 
 func (m *recordingMetrics) QueueOp(string)                  {}
 func (m *recordingMetrics) QueueDepth(int)                  {}
@@ -2500,6 +2505,14 @@ func (m *recordingMetrics) deliveryClaimCount(result string) int {
 		}
 	}
 	return n
+}
+
+// deliveryLatencySamples returns the recorded S6 delivery spans in seconds,
+// in observation order.
+func (m *recordingMetrics) deliveryLatencySamples() []float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]float64(nil), m.deliveryLatencies...)
 }
 
 // deliveryUnconfirmedCount reports how many entries the confirmation window
@@ -2719,8 +2732,10 @@ type harness struct {
 	// is its clock seam, which a scenario steps to age entries.
 	bundles    *proxy.SkillCache
 	skillClock *steppedClock
-	// schedClock is the scheduler's clock seam; a scenario that has to exhaust
-	// a wall-clock bound (the Job-name wait) sets it before rebuilding.
+	// schedClock is the scheduler's one clock seam: buildHarnessWith seeds it
+	// from harnessOptions.clock, and rebuildScheduler carries it forward. A
+	// scenario that has to exhaust a wall-clock bound (the Job-name wait) sets
+	// it before rebuilding.
 	schedClock func() time.Time
 
 	// jobImage overrides the reference template's <job-image> value: a
@@ -2849,7 +2864,12 @@ type harnessOptions struct {
 	grace time.Duration
 	// mutateSched adjusts the scheduler config before construction.
 	mutateSched func(*scheduler.Config)
-	leaderCfg   coordination.Config
+	// clock seeds the harness's scheduler clock (h.schedClock) at construction,
+	// the same seam rebuildScheduler carries forward. The fake server is built
+	// around this scheduler, so S6 delivery (and the claim it commits) reads
+	// this clock, not wall time.
+	clock     func() time.Time
+	leaderCfg coordination.Config
 }
 
 func buildHarness(t *testing.T, catalogEnabled bool, window time.Duration, skill func(*proxy.Config), realServer, wsEnabled bool) *harness {
@@ -2972,13 +2992,16 @@ func buildHarnessWith(t *testing.T, catalogEnabled bool, window time.Duration, s
 	if opts.mutateSched != nil {
 		opts.mutateSched(&schedCfg)
 	}
-	h := &harness{coord: opts.coord, instanceID: opts.instanceID, leaderCfg: opts.leaderCfg}
+	h := &harness{coord: opts.coord, instanceID: opts.instanceID, leaderCfg: opts.leaderCfg, schedClock: opts.clock}
 	schedOpts := []scheduler.Option{
 		scheduler.WithPendingReports(pending),
 		scheduler.WithRevoker(noRevoker{}),
 		scheduler.WithProbeRegistry(probes),
 		scheduler.WithLogger(slog.New(slog.NewJSONHandler(logs, nil))),
 		scheduler.WithRuntimeIdentity(client.RuntimeIdentity),
+	}
+	if h.schedClock != nil {
+		schedOpts = append(schedOpts, scheduler.WithClock(h.schedClock))
 	}
 	if opts.coord != nil {
 		instanceID := opts.instanceID
@@ -3339,6 +3362,32 @@ func (c *steppedClock) now() time.Time {
 // advance moves the clock forward; the reporter reads the offset on its next
 // now() call.
 func (c *steppedClock) advance(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.offset += d
+}
+
+// fixedClock is a scenario clock that does not follow wall time: every read is
+// the base instant plus the steps taken. A span between two reads is therefore
+// exactly the stepped amount — steppedClock cannot serve that role, because its
+// wall-clock base keeps moving between the claim and the delivery.
+type fixedClock struct {
+	mu     sync.Mutex
+	base   time.Time
+	offset time.Duration
+}
+
+func newFixedClock() *fixedClock {
+	return &fixedClock{base: time.Now()}
+}
+
+func (c *fixedClock) now() time.Time {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.base.Add(c.offset)
+}
+
+func (c *fixedClock) advance(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.offset += d

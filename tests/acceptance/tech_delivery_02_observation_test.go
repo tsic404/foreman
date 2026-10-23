@@ -17,7 +17,9 @@ import (
 
 	"github.com/tsic404/foreman/internal/observability"
 	"github.com/tsic404/foreman/internal/proxy"
+	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
+	"github.com/tsic404/foreman/internal/state"
 )
 
 func TestDelivery02LostResponseLeavesMetricsEventsAndRetainedRecord(t *testing.T) {
@@ -267,4 +269,107 @@ func httpGet(t *testing.T, url string) (int, []byte) {
 		t.Fatalf("read %s: %v", url, err)
 	}
 	return resp.StatusCode, body
+}
+
+// newDelivery02LatencyHarness is the fixture the latency scenarios use: two
+// declared runtimes, the catalog route off, and the scheduler on the
+// scenario's clock. opts carries the stage-two shared-state face; the zero
+// value keeps the stage-one in-memory delivery path.
+func newDelivery02LatencyHarness(t *testing.T, clock func() time.Time, opts harnessOptions) *harness {
+	t.Helper()
+	opts.clock = clock
+	h := buildHarnessWith(t, false, deliveryConfirmWindow, nil, false, false, opts)
+	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+	h.declare(declaredRuntimes())
+	return h
+}
+
+// prepareLatencyDelivery drives one claim and one daemon registration, then
+// returns the token the S6 delivery uses. The scheduler clock is not stepped
+// here: the caller owns the claim -> commit span.
+func prepareLatencyDelivery(t *testing.T, h *harness, taskID string) string {
+	t.Helper()
+	if err := h.sched.OnClaim(t.Context(), deliveryPayload(taskID)); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	token := issueJobToken(t, h, taskID)
+	registerTaskDaemon(t, h, taskID, token)
+	return token
+}
+
+// assertDeliveryLatency judges the histogram face against the span the
+// scenario injected: one sample, and its value is that span.
+func assertDeliveryLatency(t *testing.T, h *harness, wantSeconds float64) {
+	t.Helper()
+	samples := h.metrics.deliveryLatencySamples()
+	if len(samples) != 1 {
+		t.Fatalf("delivery latency samples = %v, want exactly one committed delivery", samples)
+	}
+	if samples[0] != wantSeconds {
+		t.Fatalf("delivery latency = %v seconds, want the injected %vs claim -> commit span", samples[0], wantSeconds)
+	}
+}
+
+// TestDelivery02LatencySamplesClaimToCommitSpan covers the observation face on
+// the single-instance delivery path: the sample is the span between the claim
+// instant and the commit instant, both read from the scheduler clock — a reader
+// that paired the injected claim instant with a wall-clock reading would report
+// a fraction of a second instead of the injected 12s.
+func TestDelivery02LatencySamplesClaimToCommitSpan(t *testing.T) {
+	clock := newFixedClock()
+	h := newDelivery02LatencyHarness(t, clock.now, harnessOptions{})
+	token := prepareLatencyDelivery(t, h, "task-1")
+
+	clock.advance(12 * time.Second)
+	if got := claimTask(t, h, "task-1", token); !bytes.Contains(got, []byte(`"id":"task-1"`)) {
+		t.Fatalf("S6 claim = %s, want the task payload", got)
+	}
+	assertDeliveryLatency(t, h, 12)
+}
+
+// TestDelivery02LatencySamplesSharedPickupSpan covers the same face on the
+// stage-two shared pickup path: the take commits on the shared row and the
+// span starts at the row's claimed_at. The scenario stamps the row 5s before
+// this instance's claim instant, so the sample is 17s — not the 12s a span
+// anchored on this instance's own claim instant would report, and not the ~5s
+// a wall-clock reading would.
+func TestDelivery02LatencySamplesSharedPickupSpan(t *testing.T) {
+	clock := newFixedClock()
+	store, _ := multi08Store(t)
+	coord, ok := store.(state.CoordStore)
+	if !ok {
+		t.Fatal("the shared store does not expose the coordination face")
+	}
+	h := newDelivery02LatencyHarness(t, clock.now, harnessOptions{
+		store: store, coord: coord, instanceID: "instance-1",
+	})
+	token := prepareLatencyDelivery(t, h, "task-1")
+
+	// The row carries the claimed_at the span starts from, and this instance's
+	// own claim instant sits 5s later: the take must report the row's span.
+	multi08Flush(t, h)
+	row, ok, err := coord.GetEntry(t.Context(), "ws-1", "task-1")
+	if err != nil {
+		t.Fatalf("GetEntry: %v", err)
+	}
+	if !ok || row.State != registry.StateDaemonRegistered {
+		t.Fatalf("shared row state = %v (present %v), want daemon_registered before the take", row.State, ok)
+	}
+	if !row.ClaimedAt.Equal(clock.now()) {
+		t.Fatalf("shared row claimed_at = %v, want the claim instant %v", row.ClaimedAt, clock.now())
+	}
+	row.ClaimedAt = row.ClaimedAt.Add(-5 * time.Second)
+	if err := coord.SetEntry(t.Context(), "ws-1", "task-1", row); err != nil {
+		t.Fatalf("SetEntry: %v", err)
+	}
+	local, ok := h.reg.Get("task-1")
+	if !ok || !local.ClaimedAt.Equal(clock.now()) {
+		t.Fatalf("local cache claimed_at = %v (present %v), want the claim instant %v", local.ClaimedAt, ok, clock.now())
+	}
+
+	clock.advance(12 * time.Second)
+	if got := claimTask(t, h, "task-1", token); !bytes.Contains(got, []byte(`"id":"task-1"`)) {
+		t.Fatalf("S6 claim = %s, want the task payload", got)
+	}
+	assertDeliveryLatency(t, h, 17)
 }
