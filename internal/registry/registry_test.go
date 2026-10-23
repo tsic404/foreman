@@ -1,6 +1,7 @@
 package registry
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"sync"
@@ -179,6 +180,103 @@ func TestSettleNoResultOnlyReplacesTheReportsOwnVerdict(t *testing.T) {
 	// result is a decided verdict too.
 	if _, ok := r.SettleNoResult("t1", ResultCompleted); ok {
 		t.Fatal("a replay re-applied the in-place decision")
+	}
+}
+
+// settleSharedStore is the stage-two face of the in-place settlement: it
+// answers the programmed row, so the registry's adoption of the shared verdict
+// can be asserted. The embedded interface keeps the fixture to the methods New
+// and SettleNoResult actually reach.
+type settleSharedStore struct {
+	SharedStore
+
+	entry    TaskEntry
+	first    bool
+	settles  int
+	ws       string
+	taskID   string
+	expected Result
+}
+
+func (f *settleSharedStore) Shared() bool { return true }
+
+func (f *settleSharedStore) SettleNoResult(_ context.Context, ws, taskID string, expected Result) (TaskEntry, bool, error) {
+	f.settles++
+	f.ws = ws
+	f.taskID = taskID
+	f.expected = expected
+	return f.entry, f.first, nil
+}
+
+func (f *settleSharedStore) PutEntry(context.Context, string, string, TaskEntry) error { return nil }
+func (f *settleSharedStore) PutSettled(context.Context, string, string, TaskEntry) error {
+	return nil
+}
+func (f *settleSharedStore) GetSettled(context.Context, string, string) (TaskEntry, bool, error) {
+	return TaskEntry{}, false, nil
+}
+func (f *settleSharedStore) Revoke(context.Context, string, string, time.Time) error { return nil }
+func (f *settleSharedStore) IsRevoked(context.Context, string, string) (bool, error) {
+	return false, nil
+}
+func (f *settleSharedStore) Ping(context.Context) error { return nil }
+
+// TestSettleNoResultSharedSettlesOnceAndAdoptsTheDecidedRow pins the stage-two
+// branch's lock balance: the entry is unlocked once before the store call and
+// the deferred unlock is the only one on the way out. A second unlock aborts
+// the process, so reaching the assertions is itself the proof; the assertions
+// cover the settled verdict the cache, the settled index and the caller see
+// (§4.2, §4.4).
+func TestSettleNoResultSharedSettlesOnceAndAdoptsTheDecidedRow(t *testing.T) {
+	decided := entryFor("t1")
+	decided.WorkspaceID = "ws-1"
+	decided.State = StateTerminal
+	decided.Result = ResultCompleted
+	decided.CompletedAt = testNow
+	decided.DrainDeadline = testNow.Add(time.Minute)
+	decided.Payload = []byte(`{"id":"t1"}`)
+	decided.TokenHash = "digest"
+	decided.DecidedReport = []byte(`{"status":"completed"}`)
+
+	sharedRow := decided
+	sharedRow.Result = ""
+	sharedRow.FailureReason = ""
+	sharedRow.NodeName = "node-after-settle"
+	store := &settleSharedStore{entry: sharedRow, first: true}
+
+	r := newStateRegistry(t, store)
+	r.Cache(decided)
+	r.done.put("t1", decided.CompletedAt, settledRecord(decided))
+
+	got, ok := r.SettleNoResult("t1", ResultCompleted)
+	if !ok || got.Result != "" || got.FailureReason != "" || got.NodeName != "node-after-settle" {
+		t.Fatalf("SettleNoResult = %+v, %v; want the shared decided row", got, ok)
+	}
+	if store.settles != 1 || store.ws != "ws-1" || store.taskID != "t1" || store.expected != ResultCompleted {
+		t.Fatalf("shared settle = %d calls, ws %q, task %q, expected %q; want one call for ws-1/t1/completed",
+			store.settles, store.ws, store.taskID, store.expected)
+	}
+
+	// The cache and the settled index both carry the decided verdict, and the
+	// settled record strips the non-projected faces (§4.3).
+	if cached, ok := r.Get("t1"); !ok || cached.Result != "" || cached.NodeName != "node-after-settle" {
+		t.Fatalf("cache = %+v, %v; want the decided row", cached, ok)
+	}
+	record, ok := r.Settled("t1")
+	if !ok || record.Result != "" || record.FailureReason != "" || record.NodeName != "node-after-settle" {
+		t.Fatalf("settled record = %+v, %v; want the decided row", record, ok)
+	}
+	if record.Payload != nil || record.TokenHash != "" || record.DecidedReport != nil {
+		t.Fatal("the settled record carries non-projected faces")
+	}
+	if at, ok := r.DoneAt("t1"); !ok || !at.Equal(testNow) {
+		t.Fatalf("done instant = %v, %v; want the original verdict instant", at, ok)
+	}
+
+	// The old verdict is no longer the report's to replace: the cache carries
+	// the empty result, so a replay of the same expected value stays local.
+	if _, ok := r.SettleNoResult("t1", ResultCompleted); ok || store.settles != 1 {
+		t.Fatalf("replay reported a transition (shared calls=%d)", store.settles)
 	}
 }
 
