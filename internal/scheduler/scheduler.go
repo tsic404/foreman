@@ -674,26 +674,26 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 // (a cross-workspace claim must never produce an entry, AC-81). An empty
 // workspaceID keeps the legacy payload-derived form.
 func (s *Scheduler) OnClaimFor(ctx context.Context, workspaceID string, task json.RawMessage) error {
-	return s.onClaimFor(ctx, workspaceID, task, false)
+	return s.onClaimFor(ctx, workspaceID, task, SlotReservation{}, false)
 }
 
-// OnClaimReservedFor registers a task against a reservation the claim loop
-// already holds (§10: claim 前必须持有槽位预留). It never reserves again; a
-// task that produces no entry returns its slot to the caller's budget.
-func (s *Scheduler) OnClaimReservedFor(ctx context.Context, workspaceID string, task json.RawMessage) error {
-	return s.onClaimFor(ctx, workspaceID, task, true)
+// OnClaimReservedFor registers a task against the reservation pair the claim
+// loop already holds (§10: claim 前必须持有槽位预留). It never reserves again; a
+// task that produces no entry releases exactly that pair to the caller's
+// budget.
+func (s *Scheduler) OnClaimReservedFor(ctx context.Context, workspaceID string, task json.RawMessage, res SlotReservation) error {
+	return s.onClaimFor(ctx, workspaceID, task, res, true)
 }
 
-func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task json.RawMessage, reserved bool) error {
+func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task json.RawMessage, res SlotReservation, reserved bool) error {
 	defer s.SyncInflight()
 	workspace := workspaceID
-	held := reserved
 	owned := false
 	// The caller's reservation (or the one this call takes below) is consumed
 	// by the entry only when reg.Put lands; every other exit returns it.
 	defer func() {
-		if held && !owned {
-			s.releaseSlots(ctx, workspace)
+		if reserved && !owned {
+			s.releaseSlots(ctx, res)
 		}
 	}()
 	var head claimHead
@@ -810,22 +810,24 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 		name = daemonID
 	}
 	e.JobName = name
-	if s.shared != nil && !held {
+	if s.shared != nil && !reserved {
 		// Direct callers (not the claim loop) reserve here; the loop's
 		// reservation is already held and checked before C3.
-		if err := s.reserveSlots(ctx, e.WorkspaceID); err != nil {
+		var err error
+		res, err = s.reserveSlots(ctx, e.WorkspaceID)
+		if err != nil {
 			return err
 		}
-		held = true
+		reserved = true
 	}
 	if err := s.reg.Put(e); err != nil {
 		return fmt.Errorf("register task %s: %w", e.TaskID, err)
 	}
 	owned = true
-	if held {
-		// The reservation becomes the entry's in-flight slot (counter
-		// unchanged, pending marker gone).
-		s.consumeSlots(ctx, e.WorkspaceID)
+	if reserved {
+		// The reservations become the entry's in-flight slot (counter
+		// unchanged, pending markers gone).
+		s.consumeSlots(ctx, res)
 	}
 	// The claim is enqueued once, before any object exists: the queue row and
 	// the mapping row are the delivery face any instance reads (§5 单次入队).
@@ -2629,17 +2631,20 @@ func (s *Scheduler) settleMalformedClaim(ctx context.Context, id string, task js
 	// The malformed claim still occupies an in-flight slot until its terminal
 	// write releases it, so the accounting stays balanced (the workspace is
 	// unknown here: the global level alone applies).
+	var res SlotReservation
 	if s.shared != nil {
-		if err := s.reserveSlots(ctx, ""); err != nil {
+		var err error
+		res, err = s.reserveSlots(ctx, "")
+		if err != nil {
 			return err
 		}
 	}
 	if err := s.reg.Put(e); err != nil {
-		if s.shared != nil {
-			s.releaseSlots(ctx, "")
-		}
+		s.releaseSlots(ctx, res)
 		return err
 	}
+	// The reservation is the row's slot now; the terminal write returns it.
+	s.consumeSlots(ctx, res)
 	s.failClaim(ctx, e, cause)
 	return nil
 }

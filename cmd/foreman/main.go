@@ -849,16 +849,16 @@ type workspaceClaimScheduler struct {
 
 func (w workspaceClaimScheduler) ClaimBudget() int { return w.sched.ClaimBudgetFor(w.workspaceID) }
 
-func (w workspaceClaimScheduler) ReserveSlots(ctx context.Context, want int) (int, error) {
+func (w workspaceClaimScheduler) ReserveSlots(ctx context.Context, want int) ([]scheduler.SlotReservation, error) {
 	return w.sched.ReserveClaimSlots(ctx, w.workspaceID, want)
 }
 
-func (w workspaceClaimScheduler) ReleaseSlots(ctx context.Context, n int) {
-	w.sched.ReleaseClaimSlots(ctx, w.workspaceID, n)
+func (w workspaceClaimScheduler) ReleaseSlots(ctx context.Context, reserved []scheduler.SlotReservation) {
+	w.sched.ReleaseClaimSlots(ctx, reserved)
 }
 
-func (w workspaceClaimScheduler) OnClaimReserved(ctx context.Context, task json.RawMessage) error {
-	return w.sched.OnClaimReservedFor(ctx, w.workspaceID, task)
+func (w workspaceClaimScheduler) OnClaimReserved(ctx context.Context, task json.RawMessage, reserved scheduler.SlotReservation) error {
+	return w.sched.OnClaimReservedFor(ctx, w.workspaceID, task, reserved)
 }
 
 // workspaceServer routes a task-addressed server call to the client of the

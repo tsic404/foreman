@@ -247,10 +247,10 @@ func TestMultiAssemblyDataLossSlotRecovery(t *testing.T) {
 	}
 	// A dead holder's unused reservations: one on the row-less workspace, one
 	// global. Both must be reclaimed by the same takeover round (AC-76).
-	if ok, err := tw.coord.ReserveSlot(ctx, "ws-empty", 10); err != nil || !ok {
+	if _, ok, err := tw.coord.ReserveSlot(ctx, "ws-empty", 10); err != nil || !ok {
 		t.Fatalf("stray workspace reservation: ok=%v err=%v", ok, err)
 	}
-	if ok, err := tw.coord.ReserveSlot(ctx, "", 10); err != nil || !ok {
+	if _, ok, err := tw.coord.ReserveSlot(ctx, "", 10); err != nil || !ok {
 		t.Fatalf("stray global reservation: ok=%v err=%v", ok, err)
 	}
 

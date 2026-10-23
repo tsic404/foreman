@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"sync"
@@ -18,13 +19,17 @@ import (
 type fakeCoordStore struct {
 	state.CoordStore
 
-	mu           sync.Mutex
-	counts       map[string]int64
-	reservations map[string]int64
+	mu     sync.Mutex
+	counts map[string]int64
+	// pending lists each level's reservation ids. A consume removes the id it
+	// names, like the store's targeted delete, so a test can tell whose marker
+	// went away.
+	pending      map[string][]string
+	nextID       int
 	snapshotErr  error
 	consumeFails int
-	// consumeFailsAfterApply models a pop that landed while its response was
-	// lost: the member is gone and the caller saw an error.
+	// consumeFailsAfterApply models a delete that landed while its response
+	// was lost: the named member is gone and the caller saw an error.
 	consumeFailsAfterApply int
 	consumeCalls           int
 	setCalls               []slotWrite
@@ -45,61 +50,101 @@ type slotWrite struct {
 	next     int64
 }
 
-func (f *fakeCoordStore) ConsumeSlotReservation(_ context.Context, ws string) error {
+func (f *fakeCoordStore) ConsumeSlotReservation(_ context.Context, ws, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.consumeCalls++
 	if f.consumeFailsAfterApply > 0 {
 		f.consumeFailsAfterApply--
-		if f.reservations[ws] > 0 {
-			f.reservations[ws]--
-		}
+		f.removeReservation(ws, id)
 		return errors.New("consume response lost")
 	}
 	if f.consumeFails > 0 {
 		f.consumeFails--
 		return errors.New("consume down")
 	}
-	if f.reservations[ws] > 0 {
-		f.reservations[ws]--
-	}
+	f.removeReservation(ws, id)
 	return nil
 }
 
-func (f *fakeCoordStore) ReserveSlot(ctx context.Context, ws string, limit int) (bool, error) {
+// ReserveSlot mints the reservation id the store keeps as the zset member and
+// hands it back as the caller's retire handle. The workspace hook models the
+// call that spends the last of a call budget: it runs inside the workspace
+// reservation and leaves the caller's context dead.
+func (f *fakeCoordStore) ReserveSlot(ctx context.Context, ws string, limit int) (string, bool, error) {
 	if ws != "" && f.workspaceReserveHook != nil {
 		hook := f.workspaceReserveHook
 		f.workspaceReserveHook = nil
 		hook()
-		return false, ctx.Err()
+		return "", false, ctx.Err()
 	}
 	if err := ctx.Err(); err != nil {
-		return false, err
+		return "", false, err
 	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.counts[ws] >= int64(limit) {
-		return false, nil
+		return "", false, nil
+	}
+	if f.pending == nil {
+		f.pending = map[string][]string{}
 	}
 	f.counts[ws]++
-	f.reservations[ws]++
-	return true, nil
+	f.nextID++
+	id := fmt.Sprintf("%s#%d", ws, f.nextID)
+	f.pending[ws] = append(f.pending[ws], id)
+	return id, true, nil
 }
 
-func (f *fakeCoordStore) ReleaseSlot(ctx context.Context, ws string) error {
+// ReleaseSlot returns the slot only when the named member is still pending,
+// like the store's ZREM-guarded decrement: an id the lease expiry already
+// purged must not lower the counter a second time. A dead context is recorded
+// so a test can tell a refused compensation from an applied one.
+func (f *fakeCoordStore) ReleaseSlot(ctx context.Context, ws, id string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if err := ctx.Err(); err != nil {
 		f.releaseRejected = append(f.releaseRejected, ws)
 		return err
 	}
+	if !f.removeReservation(ws, id) {
+		return nil
+	}
 	if f.counts[ws] > 0 {
 		f.counts[ws]--
 	}
-	if f.reservations[ws] > 0 {
-		f.reservations[ws]--
-	}
 	return nil
+}
+
+// removeReservation deletes one pending id and reports whether it was there;
+// an id that is not pending is a no-op, like the store's ZREM of an already
+// purged member.
+func (f *fakeCoordStore) removeReservation(ws, id string) bool {
+	ids := f.pending[ws]
+	for i, member := range ids {
+		if member == id {
+			f.pending[ws] = append(ids[:i:i], ids[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeCoordStore) hasPending(ws, id string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, member := range f.pending[ws] {
+		if member == id {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeCoordStore) pendingLen(ws string) int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.pending[ws])
 }
 
 func (f *fakeCoordStore) SlotSnapshot(_ context.Context, ws string) (int64, int64, error) {
@@ -108,7 +153,7 @@ func (f *fakeCoordStore) SlotSnapshot(_ context.Context, ws string) (int64, int6
 	if f.snapshotErr != nil {
 		return 0, 0, f.snapshotErr
 	}
-	return f.counts[ws], f.reservations[ws], nil
+	return f.counts[ws], int64(len(f.pending[ws])), nil
 }
 
 func (f *fakeCoordStore) SetSlots(_ context.Context, ws string, n int64) error {
@@ -133,7 +178,7 @@ func (f *fakeCoordStore) CompareAndSetSlots(_ context.Context, ws string, expect
 func (f *fakeCoordStore) ClearSlotReservations(_ context.Context, ws string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.reservations[ws] = 0
+	delete(f.pending, ws)
 	return nil
 }
 
@@ -173,44 +218,61 @@ func newSlotTestScheduler(t *testing.T, store *fakeCoordStore, ws ...string) (*S
 	}, m
 }
 
-// TestConsumeSlotsReportsFailureWithoutRetry pins that a failed consume is
-// visible but never retried: a retry of a non-idempotent pop could remove a
-// different pending claim's reservation. The failed level keeps its pending
-// member (the expiry purge repairs it) and the other level still consumes.
-func TestConsumeSlotsReportsFailureWithoutRetry(t *testing.T) {
-	store := &fakeCoordStore{consumeFails: 1, reservations: map[string]int64{"ws-a": 2}}
+// slotPair is the reservation handle one claim call takes: the workspace
+// level and the global level.
+func slotPair(ws, globalID, levelID string) SlotReservation {
+	return SlotReservation{workspaceID: ws, globalID: globalID, levelID: levelID}
+}
+
+// TestConsumeSlotsRetiresOnlyTheHandlesOwnMarkers pins that the pair handed in
+// is the pair that goes away: another claim's pending marker at the same levels
+// stays untouched, and the failed response is not retried.
+func TestConsumeSlotsRetiresOnlyTheHandlesOwnMarkers(t *testing.T) {
+	store := &fakeCoordStore{
+		consumeFailsAfterApply: 1,
+		pending: map[string][]string{
+			"ws-a": {"w-mine", "w-other"},
+			"":     {"g-mine", "g-other"},
+		},
+	}
 	s, m := newSlotTestScheduler(t, store, "ws-a")
-	s.consumeSlots(context.Background(), "ws-a")
+	s.consumeSlots(context.Background(), slotPair("ws-a", "g-mine", "w-mine"))
 
 	if store.consumeCalls != 2 {
 		t.Fatalf("consume calls = %d, want 2 (one attempt per level, no retry)", store.consumeCalls)
 	}
-	if got := store.reservations["ws-a"]; got != 2 {
-		t.Fatalf("ws-a reservations = %d, want 2 (a failed attempt pops nothing, a retry would pop another claim's slot)", got)
+	for _, tc := range []struct{ ws, gone, kept string }{
+		{"ws-a", "w-mine", "w-other"},
+		{"", "g-mine", "g-other"},
+	} {
+		if store.hasPending(tc.ws, tc.gone) {
+			t.Fatalf("level %q still holds the retired marker %q", tc.ws, tc.gone)
+		}
+		if !store.hasPending(tc.ws, tc.kept) {
+			t.Fatalf("level %q lost the other claim's marker %q", tc.ws, tc.kept)
+		}
 	}
 	if len(m.errors) != 1 || m.errors[0] != "consume_slot" {
 		t.Fatalf("state errors = %v, want one consume_slot", m.errors)
 	}
 }
 
-// TestConsumeSlotsLostResponsePopsOnlyItsOwnReservation pins the hazard the
-// retry used to open: when the pop landed but its response was lost, the
-// single attempt removes exactly one member. A retry would pop the second —
-// another pending claim's reservation — and leave the window counter below the
-// true in-flight count.
-func TestConsumeSlotsLostResponsePopsOnlyItsOwnReservation(t *testing.T) {
+// TestConsumeSlotsReportsFailureWithoutRetry pins that a failed consume is
+// visible but attempted once: the marker keeps its lease, and the expiry purge
+// plus the periodic reconciliation repair the counter.
+func TestConsumeSlotsReportsFailureWithoutRetry(t *testing.T) {
 	store := &fakeCoordStore{
-		consumeFailsAfterApply: 1,
-		reservations:           map[string]int64{"ws-a": 2},
+		consumeFails: 1,
+		pending:      map[string][]string{"ws-a": {"w-mine"}},
 	}
 	s, m := newSlotTestScheduler(t, store, "ws-a")
-	s.consumeSlots(context.Background(), "ws-a")
+	s.consumeSlots(context.Background(), slotPair("ws-a", "g-mine", "w-mine"))
 
 	if store.consumeCalls != 2 {
-		t.Fatalf("consume calls = %d, want 2 (a lost response is not retried)", store.consumeCalls)
+		t.Fatalf("consume calls = %d, want 2 (one attempt per level, no retry)", store.consumeCalls)
 	}
-	if got := store.reservations["ws-a"]; got != 1 {
-		t.Fatalf("ws-a reservations = %d, want 1 (only the applied pop; a retry would have popped the other claim's reservation)", got)
+	if !store.hasPending("ws-a", "w-mine") {
+		t.Fatal("the failed level dropped its marker")
 	}
 	if len(m.errors) != 1 || m.errors[0] != "consume_slot" {
 		t.Fatalf("state errors = %v, want one consume_slot", m.errors)
@@ -222,7 +284,7 @@ func TestConsumeSlotsLostResponsePopsOnlyItsOwnReservation(t *testing.T) {
 func TestConsumeSlotsFailureOnBothLevelsNeverRetries(t *testing.T) {
 	store := &fakeCoordStore{consumeFails: 2}
 	s, m := newSlotTestScheduler(t, store, "ws-a")
-	s.consumeSlots(context.Background(), "ws-a")
+	s.consumeSlots(context.Background(), slotPair("ws-a", "g-mine", "w-mine"))
 
 	if store.consumeCalls != 2 {
 		t.Fatalf("consume calls = %d, want 2 (one attempt per level)", store.consumeCalls)
@@ -241,13 +303,11 @@ func TestReserveSlotsCompensationSurvivesAnExhaustedCall(t *testing.T) {
 	defer cancel()
 	store := &fakeCoordStore{
 		counts:               map[string]int64{"": 0},
-		reservations:         map[string]int64{"": 0},
 		workspaceReserveHook: cancel,
 	}
 	s, _ := newSlotTestScheduler(t, store, "ws-a")
 
-	err := s.reserveSlots(ctx, "ws-a")
-	if !errors.Is(err, ErrStoreUnavailable) {
+	if _, err := s.reserveSlots(ctx, "ws-a"); !errors.Is(err, ErrStoreUnavailable) {
 		t.Fatalf("reserveSlots = %v, want ErrStoreUnavailable (the workspace half failed)", err)
 	}
 	if len(store.releaseRejected) != 0 {
@@ -256,7 +316,7 @@ func TestReserveSlotsCompensationSurvivesAnExhaustedCall(t *testing.T) {
 	if got := store.counts[""]; got != 0 {
 		t.Fatalf("global counter = %d, want 0 (the taken slot was returned)", got)
 	}
-	if got := store.reservations[""]; got != 0 {
+	if got := store.pendingLen(""); got != 0 {
 		t.Fatalf("global reservations = %d, want 0", got)
 	}
 }
@@ -265,17 +325,18 @@ func TestReserveSlotsCompensationSurvivesAnExhaustedCall(t *testing.T) {
 // a workspace level at its cap returns the global slot it already took.
 func TestReserveSlotsRefusedWorkspaceReturnsTheGlobalSlot(t *testing.T) {
 	store := &fakeCoordStore{
-		counts:       map[string]int64{"": 0, "ws-a": 2},
-		reservations: map[string]int64{"": 0, "ws-a": 2},
+		counts: map[string]int64{"": 0, "ws-a": 2},
 	}
 	s, _ := newSlotTestScheduler(t, store, "ws-a")
 
-	err := s.reserveSlots(context.Background(), "ws-a")
-	if !errors.Is(err, ErrNoSlot) {
+	if _, err := s.reserveSlots(context.Background(), "ws-a"); !errors.Is(err, ErrNoSlot) {
 		t.Fatalf("reserveSlots = %v, want ErrNoSlot", err)
 	}
 	if got := store.counts[""]; got != 0 {
 		t.Fatalf("global counter = %d, want 0 (the taken slot was returned)", got)
+	}
+	if got := store.pendingLen(""); got != 0 {
+		t.Fatalf("global reservations = %d, want 0 (the compensation retired its own id)", got)
 	}
 	if got := store.counts["ws-a"]; got != 2 {
 		t.Fatalf("workspace counter = %d, want 2 (no workspace reservation was taken)", got)

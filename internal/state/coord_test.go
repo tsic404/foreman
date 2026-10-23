@@ -183,22 +183,119 @@ func TestCoordMergeCannotRevertAGateField(t *testing.T) {
 	}
 }
 
+// TestCoordSlotRetireOnlyTouchesItsOwnReservation pins the reservation id as an
+// identity: consume and release delete the marker they name, never the oldest
+// pending one that another claim still owns.
+func TestCoordSlotRetireOnlyTouchesItsOwnReservation(t *testing.T) {
+	ctx := context.Background()
+	_, store, _, mr := coordTestStore(t)
+	other, ok, err := store.ReserveSlot(ctx, "", 10)
+	if err != nil || !ok {
+		t.Fatalf("reserve other: ok=%v err=%v", ok, err)
+	}
+	mine, ok, err := store.ReserveSlot(ctx, "", 10)
+	if err != nil || !ok {
+		t.Fatalf("reserve mine: ok=%v err=%v", ok, err)
+	}
+	if mine == other {
+		t.Fatalf("two reservations share the id %q", mine)
+	}
+
+	// The consume retires only the caller's marker; the counter keeps counting
+	// the row that now owns the slot.
+	if err := store.ConsumeSlotReservation(ctx, "", mine); err != nil {
+		t.Fatalf("consume mine: %v", err)
+	}
+	assertReservations(t, mr, keySlotResAll, other)
+	if n, live, err := store.SlotSnapshot(ctx, ""); err != nil || n != 2 || live != 1 {
+		t.Fatalf("after consume: counter=%d live=%d err=%v, want (2,1)", n, live, err)
+	}
+
+	// Retiring a marker that is already gone leaves the counter alone: a
+	// repeated release must not decrement a live row's slot.
+	if err := store.ReleaseSlot(ctx, "", mine); err != nil {
+		t.Fatalf("release consumed marker: %v", err)
+	}
+	if n, live, err := store.SlotSnapshot(ctx, ""); err != nil || n != 2 || live != 1 {
+		t.Fatalf("after repeated release: counter=%d live=%d err=%v, want (2,1)", n, live, err)
+	}
+
+	if err := store.ReleaseSlot(ctx, "", other); err != nil {
+		t.Fatalf("release other: %v", err)
+	}
+	assertReservations(t, mr, keySlotResAll)
+	if n, live, err := store.SlotSnapshot(ctx, ""); err != nil || n != 1 || live != 0 {
+		t.Fatalf("after release: counter=%d live=%d err=%v, want (1,0)", n, live, err)
+	}
+
+	// The lease purge already returned a stale reservation's slot, so retiring
+	// its id afterwards must not decrement the counter a second time.
+	stale, ok, err := store.ReserveSlot(ctx, "", 10)
+	if err != nil || !ok {
+		t.Fatalf("reserve stale: ok=%v err=%v", ok, err)
+	}
+	mr.SetTime(time.Now().Add(reservationTTL + time.Minute))
+	if _, live, err := store.SlotSnapshot(ctx, ""); err != nil || live != 0 {
+		t.Fatalf("live reservations after expiry = %d (err %v), want 0", live, err)
+	}
+	if err := store.ConsumeSlotReservation(ctx, "", stale); err != nil {
+		t.Fatalf("consume stale: %v", err)
+	}
+	if err := store.ReleaseSlot(ctx, "", stale); err != nil {
+		t.Fatalf("release stale: %v", err)
+	}
+	if n, err := store.Slots(ctx, ""); err != nil || n != 1 {
+		t.Fatalf("counter after retiring the purged marker = %d (err %v), want 1", n, err)
+	}
+}
+
+// assertReservations checks one level's pending reservation ids as a set.
+func assertReservations(t *testing.T, mr *miniredis.Miniredis, key string, want ...string) {
+	t.Helper()
+	if !mr.Exists(key) {
+		// An empty ZSET loses its key, which is exactly "no pending marker".
+		if len(want) > 0 {
+			t.Fatalf("reservations at %s are gone, want %v", key, want)
+		}
+		return
+	}
+	got, err := mr.ZMembers(key)
+	if err != nil {
+		t.Fatalf("zmembers %s: %v", key, err)
+	}
+	if len(got) != len(want) {
+		t.Fatalf("reservations = %v, want %v", got, want)
+	}
+	for _, id := range want {
+		found := false
+		for _, member := range got {
+			if member == id {
+				found = true
+			}
+		}
+		if !found {
+			t.Fatalf("reservations = %v, want %v", got, want)
+		}
+	}
+}
+
 func TestCoordSlotsAndLocks(t *testing.T) {
 	ctx := context.Background()
 	_, store, _, mr := coordTestStore(t)
-	if ok, err := store.ReserveSlot(ctx, "", 2); err != nil || !ok {
+	first, ok, err := store.ReserveSlot(ctx, "", 2)
+	if err != nil || !ok {
 		t.Fatalf("reserve 1: ok=%v err=%v", ok, err)
 	}
-	if ok, err := store.ReserveSlot(ctx, "", 2); err != nil || !ok {
+	if _, ok, err := store.ReserveSlot(ctx, "", 2); err != nil || !ok {
 		t.Fatalf("reserve 2: ok=%v err=%v", ok, err)
 	}
-	if ok, err := store.ReserveSlot(ctx, "", 2); err != nil || ok {
+	if _, ok, err := store.ReserveSlot(ctx, "", 2); err != nil || ok {
 		t.Fatalf("reserve past the cap: ok=%v err=%v, want false", ok, err)
 	}
-	if err := store.ReleaseSlot(ctx, ""); err != nil {
+	if err := store.ReleaseSlot(ctx, "", first); err != nil {
 		t.Fatalf("release: %v", err)
 	}
-	if ok, err := store.ReserveSlot(ctx, "", 2); err != nil || !ok {
+	if _, ok, err := store.ReserveSlot(ctx, "", 2); err != nil || !ok {
 		t.Fatalf("reserve after release: ok=%v err=%v", ok, err)
 	}
 	if n, err := store.Slots(ctx, ""); err != nil || n != 2 {
@@ -281,7 +378,7 @@ func TestCoordSessionIndex(t *testing.T) {
 func TestCoordSlotSnapshotCAS(t *testing.T) {
 	ctx := context.Background()
 	_, store, _, mr := coordTestStore(t)
-	if ok, err := store.ReserveSlot(ctx, "", 10); err != nil || !ok {
+	if _, ok, err := store.ReserveSlot(ctx, "", 10); err != nil || !ok {
 		t.Fatalf("reserve: ok=%v err=%v", ok, err)
 	}
 	count, reservations, err := store.SlotSnapshot(ctx, "")
@@ -290,7 +387,7 @@ func TestCoordSlotSnapshotCAS(t *testing.T) {
 	}
 
 	// A claim reserves after the snapshot: the CAS must decline.
-	if ok, err := store.ReserveSlot(ctx, "", 10); err != nil || !ok {
+	if _, ok, err := store.ReserveSlot(ctx, "", 10); err != nil || !ok {
 		t.Fatalf("second reserve: ok=%v err=%v", ok, err)
 	}
 	swapped, err := store.CompareAndSetSlots(ctx, "", count, 0)
@@ -382,10 +479,10 @@ func TestCoordSlotsIgnoreClientClockSkew(t *testing.T) {
 	onTime := coordStoreAt(t, mr, time.Now)
 	ahead := coordStoreAt(t, mr, func() time.Time { return time.Now().Add(time.Hour) })
 
-	if ok, err := onTime.ReserveSlot(ctx, "", 1); err != nil || !ok {
+	if _, ok, err := onTime.ReserveSlot(ctx, "", 1); err != nil || !ok {
 		t.Fatalf("reserve: ok=%v err=%v", ok, err)
 	}
-	if ok, err := ahead.ReserveSlot(ctx, "", 1); err != nil || ok {
+	if _, ok, err := ahead.ReserveSlot(ctx, "", 1); err != nil || ok {
 		t.Fatalf("the fast clock purged a live reservation: ok=%v err=%v", ok, err)
 	}
 	if n, live, err := ahead.SlotSnapshot(ctx, ""); err != nil || n != 1 || live != 1 {
@@ -394,7 +491,7 @@ func TestCoordSlotsIgnoreClientClockSkew(t *testing.T) {
 
 	// The reservation TTL lapses on the store's clock: the slot comes back.
 	mr.SetTime(time.Now().Add(reservationTTL + time.Minute))
-	if ok, err := ahead.ReserveSlot(ctx, "", 1); err != nil || !ok {
+	if _, ok, err := ahead.ReserveSlot(ctx, "", 1); err != nil || !ok {
 		t.Fatalf("expired reservation was not returned: ok=%v err=%v", ok, err)
 	}
 }

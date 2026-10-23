@@ -127,15 +127,17 @@ type CoordStore interface {
 	UnlockTask(ctx context.Context, ws, taskID, owner string) error
 
 	// ReserveSlot reserves one in-flight slot when the counter is below limit
-	// (limit <= 0 means no per-workspace cap for the workspace counter). The
-	// reservation is tracked with a lease, so the reconciliation can tell a
-	// pending claim apart from a leaked count.
-	ReserveSlot(ctx context.Context, ws string, limit int) (bool, error)
-	// ConsumeSlotReservation converts one reservation into entry ownership:
-	// the counter is unchanged, only the pending marker goes away.
-	ConsumeSlotReservation(ctx context.Context, ws string) error
-	// ReleaseSlot abandons one reservation and returns its slot.
-	ReleaseSlot(ctx context.Context, ws string) error
+	// (limit <= 0 means no per-workspace cap for the workspace counter) and
+	// returns the reservation's id on success. The reservation is tracked with
+	// a lease, so the reconciliation can tell a pending claim apart from a
+	// leaked count; the id is the handle that consumes or releases exactly
+	// this reservation and never another caller's.
+	ReserveSlot(ctx context.Context, ws string, limit int) (id string, ok bool, err error)
+	// ConsumeSlotReservation converts the reservation id into entry ownership:
+	// the counter is unchanged, only that pending marker goes away.
+	ConsumeSlotReservation(ctx context.Context, ws, id string) error
+	// ReleaseSlot abandons the reservation id and returns its slot.
+	ReleaseSlot(ctx context.Context, ws, id string) error
 	// ReleaseEntry returns an entry's in-flight slot (terminal or reclaimed
 	// row). It never touches the pending reservations.
 	ReleaseEntry(ctx context.Context, ws string) error
@@ -325,17 +327,24 @@ redis.call('SET', KEYS[1], n + 1)
 redis.call('ZADD', KEYS[2], now + tonumber(ARGV[2]), ARGV[3])
 return 1`)
 
-	// slotConsume: pop one reservation, counter unchanged (the row counts).
+	// slotConsume: KEYS[1]=reservation zset, ARGV[1]=reservation id. Only the
+	// caller's own marker goes away and the counter is untouched (the row
+	// owns the slot). A marker the expiry purge already reclaimed is a no-op:
+	// that purge already returned its slot, and the periodic reconciliation
+	// raises a counter that fell below the live rows.
 	scriptSlotConsume = redis.NewScript(`
-if redis.call('ZCARD', KEYS[2]) > 0 then redis.call('ZPOPMIN', KEYS[2]) end
+redis.call('ZREM', KEYS[1], ARGV[1])
 return 1`)
 
-	// slotRelease (reservation): return the slot and drop one reservation.
+	// slotRelease (reservation): KEYS[1]=counter, KEYS[2]=reservation zset,
+	// ARGV[1]=reservation id. The slot is returned only when the caller's
+	// marker was still live: a purged marker has already had its slot
+	// returned, so a second decrement would under-count the counter.
 	scriptSlotRelease = redis.NewScript(`
-local n = tonumber(redis.call('GET', KEYS[1]) or '0')
-if n > 0 then n = n - 1 end
-redis.call('SET', KEYS[1], n)
-if redis.call('ZCARD', KEYS[2]) > 0 then redis.call('ZPOPMIN', KEYS[2]) end
+if redis.call('ZREM', KEYS[2], ARGV[1]) == 1 then
+  local n = tonumber(redis.call('GET', KEYS[1]) or '0')
+  if n > 0 then redis.call('SET', KEYS[1], n - 1) end
+end
 return 1`)
 
 	// slotReleaseEntry: return an entry's slot, leaving reservations alone.
@@ -967,32 +976,38 @@ func slotKeys(ws string) (counter, reservations string) {
 // must cover one claim batch (C3 + OnClaim up to the Job-name wait).
 const reservationTTL = 5 * time.Minute
 
-// ReserveSlot reserves one in-flight slot below limit (AC-76).
-func (s *redisStore) ReserveSlot(ctx context.Context, ws string, limit int) (bool, error) {
+// ReserveSlot reserves one in-flight slot below limit (AC-76) and returns the
+// reservation's id: the handle that retires exactly this reservation.
+func (s *redisStore) ReserveSlot(ctx context.Context, ws string, limit int) (string, bool, error) {
 	counter, reservations := slotKeys(ws)
-	// The id only needs cross-instance uniqueness; no expiry decision reads it.
+	// The id is the zset member and the caller's retire handle, so it needs
+	// cross-instance uniqueness; no expiry decision reads it.
 	id := strconv.FormatInt(s.now().UnixNano(), 36) + "-" + strconv.FormatInt(s.resSeq.Add(1), 36)
 	n, err := scriptSlotReserve.Run(ctx, s.rdb, []string{counter, reservations},
 		limit, reservationTTL.Milliseconds(), id).Int()
 	s.mark(err)
 	if err != nil {
-		return false, err
+		return "", false, err
 	}
-	return n == 1, nil
+	if n != 1 {
+		return "", false, nil
+	}
+	return id, true, nil
 }
 
-// ConsumeSlotReservation converts one reservation into entry ownership.
-func (s *redisStore) ConsumeSlotReservation(ctx context.Context, ws string) error {
+// ConsumeSlotReservation converts the caller's own reservation into entry
+// ownership; another claim's pending marker is never touched.
+func (s *redisStore) ConsumeSlotReservation(ctx context.Context, ws, id string) error {
 	_, reservations := slotKeys(ws)
-	err := scriptSlotConsume.Run(ctx, s.rdb, []string{reservations}).Err()
+	err := scriptSlotConsume.Run(ctx, s.rdb, []string{reservations}, id).Err()
 	s.mark(err)
 	return err
 }
 
-// ReleaseSlot abandons one reservation and returns its slot.
-func (s *redisStore) ReleaseSlot(ctx context.Context, ws string) error {
+// ReleaseSlot abandons the caller's own reservation and returns its slot.
+func (s *redisStore) ReleaseSlot(ctx context.Context, ws, id string) error {
 	counter, reservations := slotKeys(ws)
-	err := scriptSlotRelease.Run(ctx, s.rdb, []string{counter, reservations}).Err()
+	err := scriptSlotRelease.Run(ctx, s.rdb, []string{counter, reservations}, id).Err()
 	s.mark(err)
 	return err
 }
