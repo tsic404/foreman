@@ -1,4 +1,4 @@
-// TC-tech-multi-10 / AC-100: only a storage-side failure is evidence that the
+// TC-tech-multi-11 / AC-102: only a storage-side failure is evidence that the
 // shared state is unavailable. A caller's cancellation (an abandoned request,
 // the shutdown window) neither opens nor closes an outage, emits no
 // availability transition, and leaves both readers — the issuance gate and the
