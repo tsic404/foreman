@@ -63,6 +63,13 @@ func WithLeaseWorkspace(workspaceID string) LeaseKeeperOption {
 	return func(k *LeaseKeeper) { k.workspace = workspaceID }
 }
 
+// WithLeaseClock overrides the keeper's clock. The default is reg.Now, the
+// source the daemon renewal branch stamps lease_keep_until from (§4.1);
+// overriding it opts out of that single timeline.
+func WithLeaseClock(now func() time.Time) LeaseKeeperOption {
+	return func(k *LeaseKeeper) { k.now = now }
+}
+
 // NewLeaseKeeper builds the keeper; interval is cfg.LeaseRefreshInterval.
 func NewLeaseKeeper(client LeaseClient, reg *registry.Registry, hooks LeaseHooks, interval time.Duration, opts ...LeaseKeeperOption) *LeaseKeeper {
 	k := &LeaseKeeper{
@@ -70,7 +77,7 @@ func NewLeaseKeeper(client LeaseClient, reg *registry.Registry, hooks LeaseHooks
 		reg:      reg,
 		hooks:    hooks,
 		interval: interval,
-		now:      time.Now,
+		now:      reg.Now,
 		log:      slog.Default().With("component", "lease-keeper"),
 	}
 	for _, opt := range opts {

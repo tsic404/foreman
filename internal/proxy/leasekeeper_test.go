@@ -137,26 +137,31 @@ func TestLeaseKeeperRound(t *testing.T) {
 // 45s lease TTL — the field surface the acceptance case reads as
 // "lease_keep_until 持续推进". A refused or failed renewal moves nothing.
 func TestLeaseKeeperProjectsLeaseKeepUntil(t *testing.T) {
-	reg := registry.New(time.Now)
+	// A fixed clock makes the assertion discriminating: the keeper's default
+	// clock is the registry's own, so the stamp is exactly this clock + TTL.
+	// A second time source (time.Now) cannot satisfy the equality.
+	clock := time.Date(2026, 5, 1, 12, 0, 0, 0, time.UTC)
+	reg := registry.New(func() time.Time { return clock })
 	client := &fakeLeaseClient{
 		ready: map[string]bool{"t-renew": true, "t-refused": false},
 		err:   map[string]error{"t-err": errors.New("5xx")},
 	}
 	for _, e := range []registry.TaskEntry{
-		leaseEntry("t-renew", registry.StatePending, false, time.Now().Add(time.Hour)),
-		leaseEntry("t-refused", registry.StatePending, false, time.Now().Add(time.Hour)),
-		leaseEntry("t-err", registry.StatePending, false, time.Now().Add(time.Hour)),
+		leaseEntry("t-renew", registry.StatePending, false, clock.Add(time.Hour)),
+		leaseEntry("t-refused", registry.StatePending, false, clock.Add(time.Hour)),
+		leaseEntry("t-err", registry.StatePending, false, clock.Add(time.Hour)),
 	} {
 		if err := reg.Put(e); err != nil {
 			t.Fatalf("Put %s: %v", e.TaskID, err)
 		}
 	}
 
+	// No WithLeaseClock: the default must be the registry's clock (§4.1), so
+	// a keeper assembled without an explicit clock still writes one timeline.
 	k := NewLeaseKeeper(client, reg, &fakeLeaseHooks{}, 15*time.Second)
 	var buf bytes.Buffer
 	k.log = slog.New(slog.NewJSONHandler(&buf, nil)).With("component", "lease-keeper")
-	first := time.Now().Add(time.Minute)
-	k.now = func() time.Time { return first }
+	first := clock
 	k.round(t.Context())
 
 	renewed, ok := reg.Get("t-renew")
@@ -188,11 +193,21 @@ func TestLeaseKeeperProjectsLeaseKeepUntil(t *testing.T) {
 
 	// The next tick renews again: the deadline advances by the interval.
 	second := first.Add(15 * time.Second)
-	k.now = func() time.Time { return second }
+	clock = second
 	k.round(t.Context())
 	renewed, _ = reg.Get("t-renew")
 	if want := second.Add(scheduler.PrepareLeaseTTL); !renewed.LeaseKeepUntil.Equal(want) {
 		t.Fatalf("second lease_keep_until = %v, want %v", renewed.LeaseKeepUntil, want)
+	}
+
+	// WithLeaseClock remains an explicit override of the registry default.
+	override := second.Add(time.Minute)
+	k = NewLeaseKeeper(client, reg, &fakeLeaseHooks{}, 15*time.Second,
+		WithLeaseClock(func() time.Time { return override }))
+	k.round(t.Context())
+	renewed, _ = reg.Get("t-renew")
+	if want := override.Add(scheduler.PrepareLeaseTTL); !renewed.LeaseKeepUntil.Equal(want) {
+		t.Fatalf("override lease_keep_until = %v, want %v", renewed.LeaseKeepUntil, want)
 	}
 
 	for _, id := range []string{"t-refused", "t-err"} {
