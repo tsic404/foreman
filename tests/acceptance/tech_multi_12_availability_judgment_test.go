@@ -1,4 +1,4 @@
-// TC-tech-multi-10 / AC-100: only a storage-side failure is evidence that the
+// TC-tech-multi-12 / AC-106: only a storage-side failure is evidence that the
 // shared state is unavailable. A caller's cancellation (an abandoned request,
 // the shutdown window) neither opens nor closes an outage, emits no
 // availability transition, and leaves both readers — the issuance gate and the
@@ -15,10 +15,10 @@ import (
 	"time"
 )
 
-// TestTechMulti10CancellationKeepsTheAvailabilityVerdict covers the three
+// TestTechMulti12CancellationKeepsTheAvailabilityVerdict covers the three
 // event/interval criteria: a cancellation on a healthy store opens nothing, and
 // a cancellation during a real outage closes nothing.
-func TestTechMulti10CancellationKeepsTheAvailabilityVerdict(t *testing.T) {
+func TestTechMulti12CancellationKeepsTheAvailabilityVerdict(t *testing.T) {
 	grace := 500 * time.Millisecond
 	tw := newTwoInstances(t, twoInstanceOptions{
 		grace:     grace,
@@ -111,13 +111,13 @@ func TestTechMulti10CancellationKeepsTheAvailabilityVerdict(t *testing.T) {
 	}
 }
 
-// TestTechMulti10ShutdownCancellationKeepsTheLastInstanceVerdict covers the
+// TestTechMulti12ShutdownCancellationKeepsTheLastInstanceVerdict covers the
 // fourth criterion at this layer: the shutdown path cancels its loops, one
 // in-flight store call ends in context.Canceled, and the last-instance verdict
 // — the gate that decides whether C14 is sent — must still hold (§4.6 优雅关闭).
 // The C14 emission belongs to the shutdown path in cmd/foreman, which the
 // acceptance harness does not run.
-func TestTechMulti10ShutdownCancellationKeepsTheLastInstanceVerdict(t *testing.T) {
+func TestTechMulti12ShutdownCancellationKeepsTheLastInstanceVerdict(t *testing.T) {
 	tw := newTwoInstances(t, twoInstanceOptions{grace: time.Second})
 	tw.declareAll(t)
 	tw.a.startLeader(t)
