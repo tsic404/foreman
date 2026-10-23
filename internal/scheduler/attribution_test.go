@@ -124,6 +124,18 @@ func newGateFixture(t *testing.T) *gateFixture {
 	return &gateFixture{fixture: f, logs: buf}
 }
 
+// stepClock advances the fixture clock by step on every scheduler reading.
+// The gate's wait bound runs on that clock, the same source as the overdue
+// signal, so a bounded wait expires in scheduler time while the poll cadence
+// stays a real timer: no wall-clock sleep has to be waited out.
+func (g *gateFixture) stepClock(step time.Duration) {
+	g.sched.now = func() time.Time {
+		now := g.now
+		g.now = now.Add(step)
+		return now
+	}
+}
+
 // runningTask claims a task and programs the C13 answer the gate consults.
 func (g *gateFixture) runningTask(t *testing.T, taskID, status string) registry.TaskEntry {
 	t.Helper()
@@ -249,6 +261,7 @@ func TestOnReportAttributionGateWaitsForTheJobBudget(t *testing.T) {
 	g := newGateFixture(t)
 	e := g.runningTask(t, "task-1", "running")
 	g.sched.attributionWait = 30 * time.Millisecond
+	g.stepClock(10 * time.Millisecond)
 	g.jobs.existingJobs[e.JobName] = budgetJob(e.JobName, e.JobCreatedAt, 60)
 
 	reads := 0
@@ -278,6 +291,7 @@ func TestOnReportAttributionGateDegraded(t *testing.T) {
 	g := newGateFixture(t)
 	e := g.runningTask(t, "task-1", "running")
 	g.sched.attributionWait = 30 * time.Millisecond
+	g.stepClock(10 * time.Millisecond)
 
 	pod := testPod(e.JobName, corev1.PodRunning)
 	now := metav1.Now()
@@ -295,6 +309,40 @@ func TestOnReportAttributionGateDegraded(t *testing.T) {
 	settled, _ := g.reg.Get("task-1")
 	if !settled.IsTerminal() || settled.Result != registry.ResultFailed || settled.FailureReason != "" {
 		t.Fatalf("entry = %+v, want the daemon's own failed verdict", settled)
+	}
+	decided := g.events("task.attribution_decided")
+	if len(decided) != 1 || decided[0]["decision"] != DecisionDegraded {
+		t.Fatalf("attribution_decided = %+v, want decision=degraded", decided)
+	}
+}
+
+// TestOnReportAttributionWaitBoundFollowsTheSchedulerClock pins the bound to
+// the same clock as the overdue signal: a reading that is already past the
+// bound in scheduler time ends the wait without sleeping out the bound in
+// wall time. A wall-clock bound would spend the whole attributionWait here.
+func TestOnReportAttributionWaitBoundFollowsTheSchedulerClock(t *testing.T) {
+	g := newGateFixture(t)
+	e := g.runningTask(t, "task-1", "running")
+	g.sched.attributionWait = 3 * time.Second
+	// Every reading lands past the bound the previous reading computed.
+	g.stepClock(2 * g.sched.attributionWait)
+
+	pod := testPod(e.JobName, corev1.PodRunning)
+	now := metav1.Now()
+	pod.DeletionTimestamp = &now
+	g.jobs.pods = []corev1.Pod{pod}
+
+	daemonBody := []byte(`{"error":"agent crashed","failure_reason":"agent_error"}`)
+	start := time.Now()
+	code, _, err := g.sched.OnReport(context.Background(), EPFail, e, daemonBody, "")
+	if err != nil || code != 200 {
+		t.Fatalf("OnReport = %d, %v", code, err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("gate waited %s: the bound must read the scheduler clock, not the wall clock", elapsed)
+	}
+	if got := g.server.forwards[0].body; got != string(daemonBody) {
+		t.Fatalf("forward body = %q, want the daemon's own body", got)
 	}
 	decided := g.events("task.attribution_decided")
 	if len(decided) != 1 || decided[0]["decision"] != DecisionDegraded {
@@ -559,6 +607,7 @@ func TestOnReportAttributionGateDecidedDuringWait(t *testing.T) {
 			g := newGateFixture(t)
 			e := g.runningTask(t, "task-1", "running")
 			g.sched.attributionWait = 30 * time.Millisecond
+			g.stepClock(10 * time.Millisecond)
 			pod := testPod(e.JobName, corev1.PodRunning)
 			now := metav1.Now()
 			pod.DeletionTimestamp = &now
