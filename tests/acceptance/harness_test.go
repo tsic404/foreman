@@ -3396,16 +3396,21 @@ func credentialRevoker(r scheduler.Revoker) scheduler.Revoker {
 
 // steppedClock is the reporter's clock seam with a scenario-controlled offset:
 // a catalog scenario ages one request's budget without waiting it out, and the
-// span the reporter records stays exactly reproducible.
+// span the reporter records stays exactly reproducible. An armed step moves
+// the offset on every read, so a scenario can also expire a bound that runs on
+// this clock — the attribution gate's wait — without a wall-clock sleep.
 type steppedClock struct {
 	mu     sync.Mutex
 	offset time.Duration
+	step   time.Duration
 }
 
 func (c *steppedClock) now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return time.Now().Add(c.offset)
+	now := time.Now().Add(c.offset)
+	c.offset += c.step
+	return now
 }
 
 // advance moves the clock forward; the reporter reads the offset on its next
@@ -3414,6 +3419,13 @@ func (c *steppedClock) advance(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.offset += d
+}
+
+// stepEach arms the clock: every later read advances the offset by d.
+func (c *steppedClock) stepEach(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.step = d
 }
 
 // fixedClock is a scenario clock that does not follow wall time: every read is

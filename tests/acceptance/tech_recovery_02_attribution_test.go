@@ -285,9 +285,10 @@ func TestRecovery05ExpiredWaitReleasesTheSelfReportWithVisibleDegradation(t *tes
 		Status: corev1.PodStatus{Phase: corev1.PodRunning},
 	}}
 	h.jobs.mu.Unlock()
-	// Every evidence read steps the scheduler clock past the gate's bound, so
-	// the second read lands beyond it and the wait ends after one poll.
-	h.jobs.setOnGetJob(func() { clock.advance(30 * time.Second) })
+	// The gate's wait bound runs on the scheduler clock: arming the step makes
+	// the second reading land past the bound, so the wait expires without
+	// spending it in wall time.
+	clock.stepEach(30 * time.Second)
 	h.server.setStatus("task-1", "running")
 
 	daemonBody := []byte(`{"error":"agent died","failure_reason":"agent_error"}`)
