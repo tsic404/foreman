@@ -2,7 +2,9 @@ package registry
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
+	"errors"
 	"testing"
 	"time"
 )
@@ -97,6 +99,38 @@ func TestProbeRuntimeIndexFollowsSession(t *testing.T) {
 	if _, ok := r.ProbeByRuntime("rt-fm-catalog-1"); ok {
 		t.Fatal("runtime index kept an id the session no longer carries")
 	}
+}
+
+// TestProbeUpdateFailsClosedOnStoreError pins the shared write face: a store
+// error is not an update, so the caller must not believe the session landed.
+// The local row is seeded first, so a fallback to the local cache would be
+// caught rather than passing as the same (empty, false) result.
+func TestProbeUpdateFailsClosedOnStoreError(t *testing.T) {
+	r := NewProbeRegistry()
+	if err := r.PutProbe(ProbeSession{JobName: "fm-catalog-1", JobRuntime: "rt-fm-catalog-1"}); err != nil {
+		t.Fatalf("PutProbe: %v", err)
+	}
+	r.AttachShared(failingProbeStore{})
+
+	updated, ok := r.UpdateProbe("fm-catalog-1", func(s *ProbeSession) {
+		s.NodeName = "node-a"
+	})
+	if ok {
+		t.Fatal("an unpersisted probe session update was reported as applied")
+	}
+	if updated.JobName != "" {
+		t.Fatalf("failed update returned a session: %+v", updated)
+	}
+}
+
+// failingProbeStore is a shared face whose reads fail: the update must report
+// the write as unapplied rather than fall back to the local cache.
+type failingProbeStore struct {
+	ProbeStore
+}
+
+func (failingProbeStore) GetProbeSession(context.Context, string) ([]byte, bool, error) {
+	return nil, false, errors.New("shared state unavailable")
 }
 
 func TestProbeUpdate(t *testing.T) {
