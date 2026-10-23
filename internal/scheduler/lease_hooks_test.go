@@ -337,6 +337,52 @@ func TestConvergeLeaseRefused(t *testing.T) {
 	})
 }
 
+// TestConvergeLeaseRefusedTerminalRecordsTheVerdict (AC-10,
+// TC-tech-observability-01): C13 is the only writer of a verdict it converges
+// on, so that write must count foreman_tasks_total by result and emit
+// task.terminal with the task identity — a settle observed on neither face
+// leaves the result invisible (§9.1, §9.2).
+func TestConvergeLeaseRefusedTerminalRecordsTheVerdict(t *testing.T) {
+	for _, result := range []registry.Result{registry.ResultCompleted, registry.ResultFailed} {
+		t.Run(string(result), func(t *testing.T) {
+			f := newFixture(t)
+			buf := newLogScheduler(t, f, slog.LevelInfo)
+			e := f.claim(t, "t-lc")
+			f.server.status = string(result)
+
+			if err := f.sched.ConvergeLeaseRefused(context.Background(), "t-lc"); err != nil {
+				t.Fatalf("ConvergeLeaseRefused: %v", err)
+			}
+			if got := f.metrics.terminal; len(got) != 1 || got[0] != string(result) {
+				t.Fatalf("terminal metric = %v, want [%s]", got, result)
+			}
+			records := collectLogRecords(t, buf.Bytes(), "task.terminal")
+			if len(records) != 1 {
+				t.Fatalf("task.terminal events = %d, want 1", len(records))
+			}
+			assertTaskIdentity(t, records[0], "t-lc", e.JobName, e.DaemonID)
+			if got := records[0]["result"]; got != string(result) {
+				t.Errorf("task.terminal result = %v, want %s", got, result)
+			}
+			if got := records[0]["workspace_id"]; got != "ws-1" {
+				t.Errorf("task.terminal workspace_id = %v, want ws-1", got)
+			}
+
+			// The settled entry makes a second convergence a no-op: the
+			// verdict is observed once, never once per round.
+			if err := f.sched.ConvergeLeaseRefused(context.Background(), "t-lc"); err != nil {
+				t.Fatalf("second ConvergeLeaseRefused: %v", err)
+			}
+			if got := f.metrics.terminal; len(got) != 1 {
+				t.Errorf("terminal metric after reconvergence = %v, want one count", got)
+			}
+			if records := collectLogRecords(t, buf.Bytes(), "task.terminal"); len(records) != 1 {
+				t.Errorf("task.terminal events after reconvergence = %d, want 1", len(records))
+			}
+		})
+	}
+}
+
 func TestOnReportTerminalFailureEnqueuesPendingReport(t *testing.T) {
 	f := newFixture(t)
 	p := f.withPendingReports()

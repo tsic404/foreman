@@ -2,8 +2,9 @@
 // first=false: OnReport's terminal branch loses to a settlement landed at the
 // queue landing, settleFailure to a verdict already written before failEntry
 // (it does not pre-check IsTerminal), settleReplayed to a verdict written
-// between its fresh read and its write, and OnTaskVanished to a verdict
-// written after its pre-check. Each case must leave the single observation to
+// between its fresh read and its write, OnTaskVanished to a verdict written
+// after its pre-check, and ConvergeLeaseRefused to a verdict written while its
+// C13 answer was in flight. Each case must leave the single observation to
 // the path that actually transitioned the entry.
 package scheduler
 
@@ -145,6 +146,42 @@ func TestSettleReplayedLosingTheVanishedRaceDoesNotCountTheVerdict(t *testing.T)
 	}
 	if got := f.metrics.terminal; len(got) != 0 {
 		t.Errorf("terminal metric = %v, want no count for the losing replay", got)
+	}
+}
+
+// TestConvergeLeaseRefusedLosingTheRaceDoesNotCountTheVerdict guards
+// ConvergeLeaseRefused's `first` check: a settlement landing while the C13
+// answer is in flight leaves the entry terminal at the write (first=false), so
+// that round must not count or log a verdict it did not write.
+func TestConvergeLeaseRefusedLosingTheRaceDoesNotCountTheVerdict(t *testing.T) {
+	f := newFixture(t)
+	f.claim(t, "task-1")
+	f.server.status = string(registry.ResultFailed)
+
+	buf := &strings.Builder{}
+	f.sched.log = slog.New(slog.NewJSONHandler(buf, nil)).With("component", "scheduler")
+
+	f.server.onStatus = func() {
+		f.server.onStatus = nil
+		if _, _, err := f.reg.MarkTerminal("task-1", registry.ResultCompleted, "", f.now); err != nil {
+			t.Errorf("winning MarkTerminal: %v", err)
+		}
+		f.metrics.TaskTerminal(string(registry.ResultCompleted))
+	}
+
+	if err := f.sched.ConvergeLeaseRefused(context.Background(), "task-1"); err != nil {
+		t.Fatalf("ConvergeLeaseRefused: %v", err)
+	}
+
+	entry, ok := f.reg.Get("task-1")
+	if !ok || entry.Result != registry.ResultCompleted {
+		t.Fatalf("entry = %+v, %v; want the competing verdict", entry, ok)
+	}
+	if got := f.metrics.terminal; len(got) != 1 || got[0] != string(registry.ResultCompleted) {
+		t.Errorf("terminal metric = %v, want exactly the competing verdict once", got)
+	}
+	if records := collectLogRecords(t, []byte(buf.String()), "task.terminal"); len(records) != 0 {
+		t.Errorf("task.terminal events = %d, want 0 for the losing convergence", len(records))
 	}
 }
 

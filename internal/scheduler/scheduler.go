@@ -1547,8 +1547,17 @@ func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) err
 		s.reg.MarkStartFact(taskID, s.now())
 		return nil
 	case registry.IsTerminalResult(st):
-		if _, _, err := s.reg.MarkTerminal(taskID, registry.Result(st), "", s.now()); err != nil {
+		_, first, err := s.reg.MarkTerminal(taskID, registry.Result(st), "", s.now())
+		if err != nil {
 			return err
+		}
+		if first {
+			// C13 is this verdict's only writer: an uncounted, unlogged
+			// settle leaves the result invisible on both observation faces.
+			s.metrics.TaskTerminal(st)
+			s.log.InfoContext(ctx, "task.terminal",
+				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+				"workspace_id", e.WorkspaceID, "result", st)
 		}
 		return s.deleteJob(ctx, e)
 	case st == "queued" || st == "dispatched":
