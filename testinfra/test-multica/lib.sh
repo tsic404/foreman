@@ -206,7 +206,9 @@ stop_instance() {
 		return 0
 	fi
 	replicas=$(k -n "$INSTANCE_NS" get deploy "$INSTANCE" -o jsonpath='{.spec.replicas}')
-	if [ "${replicas:-0}" -eq 0 ]; then
+	# An absent spec.replicas reads as empty, and the API server's default is
+	# 1 — not 0. Empty must not take the "already stopped" path.
+	if [ "${replicas:-1}" -eq 0 ]; then
 		info "instance $INSTANCE_NS/$INSTANCE is already stopped"
 		return 0
 	fi

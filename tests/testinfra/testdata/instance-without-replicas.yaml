@@ -1,0 +1,20 @@
+# An instance Deployment that leaves spec.replicas out — the shape the API
+# server defaults to one replica. stop_instance must bring it down, not report
+# it as already stopped because the field reads empty.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: foreman
+  namespace: foreman
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: foreman
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: foreman
+    spec:
+      containers:
+        - name: foreman
+          image: ghcr.io/tsic404/foreman:latest
