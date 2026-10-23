@@ -409,9 +409,9 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 		s.metrics.DeliveryClaim(DeliveryClaimRedelivered)
 	case delivery.Delivered:
 		s.metrics.DeliveryClaim(DeliveryClaimDelivered)
-		if pendingOK {
-			s.metrics.DeliveryLatency(time.Since(pending.ClaimedAt).Seconds())
-		}
+		// The span is the scheduler's: it measured claim -> commit on the
+		// clock that stamped both ends (§9.2 交付延迟).
+		s.metrics.DeliveryLatency(delivery.Latency.Seconds())
 	case delivery.Held:
 		// Inside the confirmation window: the request arrived and the
 		// response was lost. The shared pickup already bumped the per-entry

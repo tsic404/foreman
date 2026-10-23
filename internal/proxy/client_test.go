@@ -1501,6 +1501,13 @@ func (m *fakeMetrics) deliveryClaimCount(result string) int {
 	return n
 }
 
+// deliveryLatencySpans returns the recorded S6 delivery spans (locked).
+func (m *fakeMetrics) deliveryLatencySpans() []float64 {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]float64(nil), m.deliverSpans...)
+}
+
 // catalogCodeCount counts the recorded relay outcomes per code (locked).
 func (m *fakeMetrics) catalogCodeCount(code string) int {
 	m.mu.Lock()

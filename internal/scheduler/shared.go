@@ -239,6 +239,12 @@ type Delivery struct {
 	// Deliveries is the delivery count carried by the entry after the take
 	// (1 on the first delivery, >1 on a re-delivery).
 	Deliveries int
+	// Latency is the claim -> commit span of a delivered take. It is measured
+	// here, on the clock that stamped claimed_at and the commit instant, and
+	// carried to the reader: a reader-side time.Since would pair a claim
+	// instant from one clock with a wall-clock reading and break the single
+	// clock the delivery bookkeeping keeps.
+	Latency time.Duration
 }
 
 // Deliver hands the Job's task to its daemon (S6). In stage two the take is
@@ -277,7 +283,12 @@ func (s *Scheduler) Deliver(ctx context.Context, workspaceID, daemonID, runtimeI
 	}
 	s.reg.SetRuntimeDeliveredTask(e.JobRuntimeID, e.TaskID)
 	s.logDelivery(e, prevDelivered, prevClaims, now)
-	return Delivery{Tasks: []json.RawMessage{out}, Delivered: true, Deliveries: e.Deliveries}, nil
+	return Delivery{
+		Tasks:      []json.RawMessage{out},
+		Delivered:  true,
+		Deliveries: e.Deliveries,
+		Latency:    now.Sub(e.ClaimedAt),
+	}, nil
 }
 
 // deliverShared performs the atomic shared pickup and mirrors the result into
@@ -308,10 +319,16 @@ func (s *Scheduler) deliverShared(ctx context.Context, e registry.TaskEntry) (De
 			s.metrics.QueueOp("taken")
 		}
 		s.syncQueueDepth(ctx)
+		now := s.now()
 		// The rearm event reports the commit this take released, not the new
 		// one (§4.1 交付后的 claim 计数).
-		s.logDelivery(e, pickup.PrevDeliveredAt, pickup.PrevClaims, s.now())
-		return Delivery{Tasks: []json.RawMessage{out}, Delivered: true, Deliveries: e.Deliveries}, nil
+		s.logDelivery(e, pickup.PrevDeliveredAt, pickup.PrevClaims, now)
+		return Delivery{
+			Tasks:      []json.RawMessage{out},
+			Delivered:  true,
+			Deliveries: e.Deliveries,
+			Latency:    now.Sub(e.ClaimedAt),
+		}, nil
 	}
 	if pickup.Held {
 		s.reg.Cache(pickup.Entry)
