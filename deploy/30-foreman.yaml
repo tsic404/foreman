@@ -244,7 +244,7 @@ spec:
             - name: FOREMAN_INSTANCE_TTL
               value: "30s"
             # Per-task write lock lease: bounds a dead holder's lock. Must
-            # cover the claim chain (including the Job-name wait).
+            # cover the claim chain (secret + Job create).
             - name: FOREMAN_TASK_LOCK_TTL
               value: "120s"
           livenessProbe:

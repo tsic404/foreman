@@ -23,6 +23,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -226,8 +227,11 @@ const forwardProbeBulkBytes = 33<<20 + 7
 type upstreamStub struct {
 	mu sync.Mutex
 	// workspaceID is the workspace the C-17 answer names (a multi-workspace
-	// fixture gives each stub its own).
-	workspaceID string
+	// fixture gives each stub its own). workspacesBody, when non-nil, is the
+	// answer verbatim — a scenario judging a malformed entry (an id with an
+	// empty or whitespace-only display name) programs it.
+	workspaceID    string
+	workspacesBody []byte
 	// registerIDs maps a declared provider type to the runtime id the server
 	// answers with; a missing entry means the provider is not registered.
 	// profileIDs holds the profile identities, keyed by RuntimeIdentityKey.
@@ -256,6 +260,11 @@ type upstreamStub struct {
 	// heartbeats maps a real runtime id to the status the heartbeat answers
 	// with (default 200).
 	heartbeats map[string]int
+	// rows is the server-side real runtime row state: C-1 creates the row
+	// online, C-14 (graceful exit) flips the carried ids offline. The row is
+	// retained after going offline; the server's no-heartbeat expiry scan is
+	// not modelled here.
+	rows map[string]string
 	// modelsStatus is the C21 answer (default 200).
 	modelsStatus int
 	// models tracks the caller-facing model-list commands by request id.
@@ -318,6 +327,7 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		registerRepos:        json.RawMessage(`[]`),
 		registerReposVersion: "",
 		heartbeats:           map[string]int{},
+		rows:                 map[string]string{},
 		modelsStatus:         200,
 		models:               map[string]*modelCommand{},
 		skillStatus:          200,
@@ -370,6 +380,13 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 			}
 			answers = append(answers, answer)
 		}
+		stub.mu.Lock()
+		for _, answer := range answers {
+			if id, ok := answer["id"].(string); ok {
+				stub.rows[id] = "online"
+			}
+		}
+		stub.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]any{
 			"runtimes": answers, "repos": repos, "repos_version": version, "settings": settings,
 		})
@@ -475,6 +492,15 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 	mux.HandleFunc("POST /api/daemon/deregister", func(w http.ResponseWriter, r *http.Request) {
 		body, _ := io.ReadAll(r.Body)
 		stub.record(r, "/api/daemon/deregister", body)
+		var req struct {
+			RuntimeIDs []string `json:"runtime_ids"`
+		}
+		_ = json.Unmarshal(body, &req)
+		stub.mu.Lock()
+		for _, id := range req.RuntimeIDs {
+			stub.rows[id] = "offline"
+		}
+		stub.mu.Unlock()
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 	})
 	mux.HandleFunc("POST /api/daemon/runtimes/{rid}/models/{req}/result", func(w http.ResponseWriter, r *http.Request) {
@@ -499,8 +525,14 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 	mux.HandleFunc("GET /api/daemon/workspaces", func(w http.ResponseWriter, r *http.Request) {
 		stub.record(r, "/api/daemon/workspaces", nil)
 		stub.mu.Lock()
-		id := stub.workspaceID
+		// bytes.Clone keeps a programmed empty answer non-nil, so it cannot fall back.
+		id, body := stub.workspaceID, bytes.Clone(stub.workspacesBody)
 		stub.mu.Unlock()
+		if body != nil {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(body)
+			return
+		}
 		if id == "" {
 			id = "ws-1"
 		}
@@ -848,6 +880,14 @@ func (s *upstreamStub) setWorkspaceID(id string) {
 	s.workspaceID = id
 }
 
+// setWorkspacesAnswer programs the C-17 answer verbatim; the scenario owns the
+// entry shapes (an empty or whitespace-only display name is a malformed one).
+func (s *upstreamStub) setWorkspacesAnswer(body string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.workspacesBody = []byte(body)
+}
+
 func (s *upstreamStub) setRuntimeID(provider, profileID, id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -1079,6 +1119,14 @@ func (s *upstreamStub) calls(method, path string) []upstreamRequest {
 		}
 	}
 	return found
+}
+
+// rowStatus reads one real runtime's server-side row state ("online",
+// "offline", or "" when no C-1 ever created it).
+func (s *upstreamStub) rowStatus(runtimeID string) string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.rows[runtimeID]
 }
 
 func (s *upstreamStub) pathCalls(prefix string) []upstreamRequest {
@@ -1379,20 +1427,20 @@ func (c *jobClient) setDeleteSecretError(err error) {
 	c.deleteSecretErr = err
 }
 
-// setOnGetJob programs the GetJob hook (nil clears it). The hook runs under
-// the client lock, so the write takes the same lock as the read.
-func (c *jobClient) setOnGetJob(fn func()) {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	c.onGetJob = fn
-}
-
 // setDeleteJobError programs Job deletion to fail (nil clears it): a
 // terminating predecessor that keeps its name.
 func (c *jobClient) setDeleteJobError(err error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.deleteJobErr = err
+}
+
+// setOnGetJob programs the GetJob hook (nil clears it). The hook runs under
+// the client lock, so the write takes the same lock as the read.
+func (c *jobClient) setOnGetJob(fn func()) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.onGetJob = fn
 }
 
 // setNameHeld makes CreateJob answer AlreadyExists for name (false clears it),
@@ -2040,13 +2088,21 @@ type schedulerServerClient struct {
 	// transition inside the round trip (an S8 start whose MarkStarted must
 	// beat the caller's next deletion decision).
 	onStatus func()
+	// statusHangs holds C13 until its context ends: a control-plane answer
+	// that never arrives inside the caller's budget.
+	statusHangs bool
 }
 
-func (c *schedulerServerClient) TaskStatus(_ context.Context, taskID string) (string, error) {
+func (c *schedulerServerClient) TaskStatus(ctx context.Context, taskID string) (string, error) {
 	c.mu.Lock()
 	status, err := c.statusAnswerLocked(taskID)
 	hook := c.onStatus
+	hangs := c.statusHangs
 	c.mu.Unlock()
+	if hangs {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
 	if hook != nil {
 		hook()
 	}
@@ -2069,6 +2125,15 @@ func (c *schedulerServerClient) setStatusHook(h func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.onStatus = h
+}
+
+// setStatusHangs makes C13 hold until its context ends, so a scenario can
+// judge what a caller bounded by its own budget does when the answer never
+// arrives.
+func (c *schedulerServerClient) setStatusHangs(hang bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.statusHangs = hang
 }
 
 // setStatus programs the C13 answer for one task: once any task has one, an
@@ -2778,9 +2843,9 @@ type harness struct {
 	bundles    *proxy.SkillCache
 	skillClock *steppedClock
 	// schedClock is the scheduler's one clock seam: buildHarnessWith seeds it
-	// from harnessOptions.clock, and rebuildScheduler carries it forward. A
-	// scenario that has to exhaust a wall-clock bound (the Job-name wait) sets
-	// it before rebuilding.
+	// from harnessOptions.clock, and rebuildScheduler carries it forward. The
+	// delivery-latency scenarios inject a fixed clock here to sample the
+	// claim -> commit span.
 	schedClock func() time.Time
 
 	// jobImage overrides the reference template's <job-image> value: a
@@ -2797,10 +2862,11 @@ type harness struct {
 	// leaderMu guards the lease handles: the claim and heartbeat gates read
 	// them from their own goroutines while a scenario starts, crashes or
 	// stops the lease from the test goroutine.
-	leaderMu   sync.Mutex
-	leader     *coordination.Leader
-	leaderStop context.CancelFunc
-	leaderDone chan struct{}
+	leaderMu    sync.Mutex
+	leader      *coordination.Leader
+	leaderLease *killedLease
+	leaderStop  context.CancelFunc
+	leaderDone  chan struct{}
 	// revoker is the scheduler's credential-revocation seam. Nil leaves it
 	// inert (noRevoker): a scenario that judges the revocation set wires the
 	// shared issuer here and rebuilds the scheduler, as a deployment wires it.
@@ -3198,6 +3264,13 @@ func (h *harness) declare(d registry.Discovery) {
 
 // call performs one Job-side request against the fake server.
 func (h *harness) call(method, path, token string, body []byte) (int, []byte) {
+	return h.callWithin(0, method, path, token, body)
+}
+
+// callWithin is call under a client bound: a scenario that judges a latency
+// bound then reads a failure instead of hanging when the bound is missing.
+// A zero timeout means no client bound.
+func (h *harness) callWithin(timeout time.Duration, method, path, token string, body []byte) (int, []byte) {
 	h.t.Helper()
 	req, err := http.NewRequest(method, h.jobsHTTP.URL+path, bytes.NewReader(body))
 	if err != nil {
@@ -3206,7 +3279,11 @@ func (h *harness) call(method, path, token string, body []byte) (int, []byte) {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := http.DefaultClient
+	if timeout > 0 {
+		client = &http.Client{Timeout: timeout}
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		h.t.Fatalf("%s %s: %v", method, path, err)
 	}
@@ -3392,16 +3469,21 @@ func credentialRevoker(r scheduler.Revoker) scheduler.Revoker {
 
 // steppedClock is the reporter's clock seam with a scenario-controlled offset:
 // a catalog scenario ages one request's budget without waiting it out, and the
-// span the reporter records stays exactly reproducible.
+// span the reporter records stays exactly reproducible. An armed step moves
+// the offset on every read, so a scenario can also expire a bound that runs on
+// this clock — the attribution gate's wait — without a wall-clock sleep.
 type steppedClock struct {
 	mu     sync.Mutex
 	offset time.Duration
+	step   time.Duration
 }
 
 func (c *steppedClock) now() time.Time {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	return time.Now().Add(c.offset)
+	now := time.Now().Add(c.offset)
+	c.offset += c.step
+	return now
 }
 
 // advance moves the clock forward; the reporter reads the offset on its next
@@ -3410,6 +3492,13 @@ func (c *steppedClock) advance(d time.Duration) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.offset += d
+}
+
+// stepEach arms the clock: every later read advances the offset by d.
+func (c *steppedClock) stepEach(d time.Duration) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.step = d
 }
 
 // fixedClock is a scenario clock that does not follow wall time: every read is
@@ -3561,7 +3650,10 @@ func (h *harness) runLeader(t *testing.T) {
 	if instanceID == "" {
 		instanceID = "instance-1"
 	}
-	leader := coordination.New(h.coord, instanceID, cfg,
+	// The scenario owns the kill switch: a loop stopped this way must leave
+	// its lease to expire, so the store's release call is suppressed below.
+	lease := &killedLease{CoordStore: h.coord}
+	leader := coordination.New(lease, instanceID, cfg,
 		coordination.WithLogger(slog.New(slog.NewJSONHandler(h.logs, nil))),
 		coordination.WithOnAcquire(h.sched.OnTakeover))
 	ctx, cancel := context.WithCancel(t.Context())
@@ -3572,6 +3664,7 @@ func (h *harness) runLeader(t *testing.T) {
 	}()
 	h.leaderMu.Lock()
 	h.leader = leader
+	h.leaderLease = lease
 	h.leaderStop = cancel
 	h.leaderDone = done
 	h.leaderMu.Unlock()
@@ -3582,26 +3675,50 @@ func (h *harness) runLeader(t *testing.T) {
 // lease: the survivor must wait out the lease TTL (a real process death).
 func (h *harness) crashLeader(t *testing.T) {
 	t.Helper()
-	if leader := h.currentLeader(); leader != nil {
-		leader.Crash()
+	h.leaderMu.Lock()
+	if h.leaderLease != nil {
+		h.leaderLease.killed.Store(true)
 	}
+	h.leaderMu.Unlock()
 	h.stopLeader(t)
 }
 
-// stopLeader releases the lease and parks this instance's control plane. The
-// handles are cleared first so the gates close before the loop is awaited and
-// a second call (cleanup after an explicit stop) is a no-op.
+// killedLease is the crash scenario's test-side kill switch: once killed, the
+// lease loop's exit release is swallowed and the lease expires on its own,
+// which is the state a killed process leaves behind.
+type killedLease struct {
+	state.CoordStore
+	killed atomic.Bool
+}
+
+// ReleaseLeadership drops a killed instance's release, so its lease lasts to
+// the TTL the survivor is waiting out.
+func (s *killedLease) ReleaseLeadership(ctx context.Context, owner string) error {
+	if s.killed.Load() {
+		return nil
+	}
+	return s.CoordStore.ReleaseLeadership(ctx, owner)
+}
+
+// stopLeader releases the lease and parks this instance's control plane.
 func (h *harness) stopLeader(t *testing.T) {
 	t.Helper()
+	h.cancelLeader()()
+}
+
+// cancelLeader releases the lease without waiting for the loop to return; the
+// returned wait blocks until it did. The handles are cleared first so the
+// cleanup path stays a no-op and the gates close before the loop is awaited.
+func (h *harness) cancelLeader() func() {
 	h.leaderMu.Lock()
 	stop, done := h.leaderStop, h.leaderDone
-	h.leaderStop, h.leaderDone, h.leader = nil, nil, nil
+	h.leaderStop, h.leaderDone, h.leader, h.leaderLease = nil, nil, nil, nil
 	h.leaderMu.Unlock()
 	if stop == nil {
-		return
+		return func() {}
 	}
 	stop()
-	<-done
+	return func() { <-done }
 }
 
 // queueDepth reads the shared queue's marker count.
@@ -3644,6 +3761,13 @@ type twoInstanceOptions struct {
 	// wrap decorates the shared store both instances share: a scenario fails
 	// one command while the rest of the store stays healthy.
 	wrap func(store state.Store, coord state.CoordStore) (state.Store, state.CoordStore)
+	// callTimeout is the store-side bound both instances run their store
+	// operations under (zero = the production default). Callers can stop
+	// waiting earlier; they cannot shorten it.
+	callTimeout time.Duration
+	// storeURL replaces the store address built from miniredis, so a scenario
+	// can put a controllable network face between the clients and the store.
+	storeURL func(mrAddr string) string
 }
 
 func newTwoInstances(t *testing.T, opts twoInstanceOptions) *twoInstances {
@@ -3673,11 +3797,16 @@ func newTwoInstances(t *testing.T, opts twoInstanceOptions) *twoInstances {
 	// it); miniredis leaves TTLs frozen unless ClockTTL is on.
 	mr.ClockTTL(true)
 	stateEvents := &syncBuffer{}
+	storeURL := "redis://" + mr.Addr()
+	if opts.storeURL != nil {
+		storeURL = opts.storeURL(mr.Addr())
+	}
 	st, err := state.New(state.Config{
-		URL:         "redis://" + mr.Addr(),
+		URL:         storeURL,
 		DialTimeout: time.Second,
 		EntryTTL:    48 * time.Hour,
 		Grace:       opts.grace,
+		CallTimeout: opts.callTimeout,
 	}, state.WithEventHook(func(event string, downFor time.Duration, err error) {
 		detail := event
 		if event == "recovered" {
@@ -3798,4 +3927,39 @@ func (h *harness) startAssemblyControlPlane(t *testing.T, gate func() bool, publ
 	}
 	t.Cleanup(stop)
 	return stop
+}
+
+// TestUpstreamStubC17AnswerVerbatim pins the C-17 fixture's programming
+// contract: an answer set by setWorkspacesAnswer reaches the caller byte for
+// byte, and only an unset one falls back to the default entry. A zero-length
+// answer is a programmed answer — a fallback there would let a scenario assert
+// against an answer it never programmed and still pass.
+func TestUpstreamStubC17AnswerVerbatim(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		program func(*upstreamStub)
+		want    string
+	}{
+		{"unset falls back to the default entry", func(*upstreamStub) {}, `[{"id":"ws-1","name":"foreman"}]`},
+		{"empty answer is delivered empty", func(s *upstreamStub) { s.setWorkspacesAnswer("") }, ""},
+		{"answer is delivered verbatim", func(s *upstreamStub) { s.setWorkspacesAnswer(`[{"id":"ws-b","name":""}]`) }, `[{"id":"ws-b","name":""}]`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := newUpstreamStub(t)
+			tc.program(stub)
+
+			resp, err := http.Get(stub.server.URL + "/api/daemon/workspaces")
+			if err != nil {
+				t.Fatalf("GET C-17 answer: %v", err)
+			}
+			defer resp.Body.Close()
+			got, err := io.ReadAll(resp.Body)
+			if err != nil {
+				t.Fatalf("read C-17 answer: %v", err)
+			}
+			if string(got) != tc.want {
+				t.Errorf("C-17 answer = %q, want %q", got, tc.want)
+			}
+		})
+	}
 }

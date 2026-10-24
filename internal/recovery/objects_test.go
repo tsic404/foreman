@@ -50,6 +50,31 @@ func TestInstancePodsDropsPredecessorPods(t *testing.T) {
 	}
 }
 
+func TestPodNodeNamePicksTheNewestScheduledPod(t *testing.T) {
+	base := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
+	pods := []corev1.Pod{
+		podFor("fm-a", func(p *corev1.Pod) {
+			p.CreationTimestamp = metav1.NewTime(base)
+			p.Spec.NodeName = "company-01"
+		}),
+		podFor("fm-a", func(p *corev1.Pod) {
+			p.CreationTimestamp = metav1.NewTime(base.Add(time.Minute))
+			p.Spec.NodeName = "company-02"
+		}),
+		// The newest pod of the rebuild has no placement yet: it must not
+		// blank the node the predecessor still holds.
+		podFor("fm-a", func(p *corev1.Pod) {
+			p.CreationTimestamp = metav1.NewTime(base.Add(2 * time.Minute))
+		}),
+	}
+	if got := podNodeName(pods); got != "company-02" {
+		t.Fatalf("podNodeName = %q, want company-02 from the newest scheduled pod", got)
+	}
+	if got := podNodeName([]corev1.Pod{podFor("fm-a", nil)}); got != "" {
+		t.Fatalf("podNodeName = %q, want empty while the pod is pending", got)
+	}
+}
+
 func TestJobEndReason(t *testing.T) {
 	tests := []struct {
 		name   string

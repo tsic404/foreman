@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -266,30 +267,32 @@ func TestTechConcurrency01ClaimBatchClampBinds(t *testing.T) {
 }
 
 // startConcurrency01ClaimLoop runs the production claim loop until the
-// returned stop function (or the test's cleanup) cancels it.
+// returned stop function cancels it.
 func startConcurrency01ClaimLoop(t *testing.T, h *harness) func() {
+	cancel, wait := startConcurrency01ClaimLoopDetached(t, h)
+	var once sync.Once
+	return func() { once.Do(func() { cancel(); wait() }) }
+}
+
+// startConcurrency01ClaimLoopDetached is the loop above with its stop split
+// into cancel and wait, for scenarios that pin the exit ordering.
+func startConcurrency01ClaimLoopDetached(t *testing.T, h *harness) (cancel func(), wait func()) {
 	t.Helper()
 	loopCfg := h.cfg
 	loopCfg.ClaimInterval = concurrency01ClaimInterval
 	loopCfg.ClaimIntervalIdle = concurrency01ClaimInterval
 	loop := proxy.NewClaimLoop(loopCfg, h.client, h.sched)
-	ctx, cancel := context.WithCancel(t.Context())
+	ctx, cancelCtx := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		_ = loop.Run(ctx)
 	}()
-	stopped := false
-	stop := func() {
-		if stopped {
-			return
-		}
-		stopped = true
-		cancel()
-		<-done
-	}
-	t.Cleanup(stop)
-	return stop
+	var once sync.Once
+	cancel = func() { once.Do(cancelCtx) }
+	wait = func() { <-done }
+	t.Cleanup(func() { cancel(); wait() })
+	return cancel, wait
 }
 
 // sampleConcurrency01 records the two independent projections of "in flight"

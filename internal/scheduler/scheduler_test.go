@@ -66,7 +66,10 @@ type fakeJobs struct {
 	existingJobs    map[string]*batchv1.Job
 	terminatingJobs map[string]bool
 	onGetJob        func()
-	onCreateJob     func()
+	// blockGetJob holds a GetJob read open until it closes or the caller's
+	// context ends: the fake read honours its context like the real client.
+	blockGetJob <-chan struct{}
+	onCreateJob func()
 
 	// secrets and pods back ListSecrets/ListPods: the orphan-Secret sweep
 	// and the Job-termination evidence read them.
@@ -123,11 +126,23 @@ func (f *fakeJobs) DeleteJob(_ context.Context, name string) error {
 
 // GetJob answers from existingJobs: a name listed in terminatingJobs comes
 // back with a deletionTimestamp (the foreground deletion window). onGetJob
-// runs first — on error probes too — so a test can release the name, trip
-// the wait deadline, or clear getJobErr.
-func (f *fakeJobs) GetJob(_ context.Context, name string) (*batchv1.Job, error) {
+// runs first — on error probes too — so a test can count probes, stage a
+// fact on a later read, trip the wait deadline, or clear getJobErr. The read
+// honours its context the way the real client does: an already-ended context
+// fails it, and blockGetJob holds it open until the context ends first.
+func (f *fakeJobs) GetJob(ctx context.Context, name string) (*batchv1.Job, error) {
 	if f.onGetJob != nil {
 		f.onGetJob()
+	}
+	if f.blockGetJob != nil {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-f.blockGetJob:
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if f.getJobErr != nil {
 		return nil, f.getJobErr
@@ -260,6 +275,9 @@ type fakeServer struct {
 	status    string
 	statusErr error
 	onStatus  func() // test hook: fires inside TaskStatus (simulates mid-C13 races)
+	// statusBlocks holds TaskStatus until its context ends: a control-plane
+	// answer that arrives after the caller's budget.
+	statusBlocks bool
 
 	forwardCode int
 	forwardErr  error
@@ -267,9 +285,13 @@ type fakeServer struct {
 	forwards    []forwardCall
 }
 
-func (f *fakeServer) TaskStatus(context.Context, string) (string, error) {
+func (f *fakeServer) TaskStatus(ctx context.Context, _ string) (string, error) {
 	if f.onStatus != nil {
 		f.onStatus()
+	}
+	if f.statusBlocks {
+		<-ctx.Done()
+		return "", ctx.Err()
 	}
 	return f.status, f.statusErr
 }
@@ -552,6 +574,9 @@ func newFixtureUnder(t *testing.T, opts []registry.Option, extra map[string]stri
 		pending: &fakePendingReports{},
 		now:     testNow,
 	}
+	// The sweep's carrier delete goes through the queue seam; in the fixture
+	// it lands on the job-client fake, as the production store does.
+	f.pending.deleteCarrier = f.jobs.DeleteSecret
 	// The registry shares the fixture clock: with the real clock its done
 	// index (TTL 24h) would expire entries stamped at testNow and the suite
 	// would rot with wall time.
@@ -691,10 +716,9 @@ func TestOnClaimCreatesSecretJobAndEntry(t *testing.T) {
 
 // TestClaimKeepsLeaseRenewedDuringJobCreate guards the claim path's second
 // registry write against a lost update: the claim's snapshot predates the Job
-// create — up to jobNameWait long when a terminating predecessor still holds
-// the name — so re-Putting that snapshot wholesale would revert
-// lease_keep_until behind the LeaseKeeper's last renewal, i.e. behind exactly
-// the advance TC-tech-lease-01 asserts.
+// create, so re-Putting that snapshot wholesale would revert lease_keep_until
+// behind the LeaseKeeper's last renewal, i.e. behind exactly the advance
+// TC-tech-lease-01 asserts.
 func TestClaimKeepsLeaseRenewedDuringJobCreate(t *testing.T) {
 	f := newFixture(t)
 	renewed := testNow.Add(2 * time.Minute)
@@ -1007,37 +1031,44 @@ func TestDuplicateClaimTaskGoneSettlesVanished(t *testing.T) {
 	}
 }
 
-// A pre-start replacement deletes the old Job with Foreground, so the name
-// (fm-<task_id>) stays taken until the cascade finishes. The replacement
-// must wait for it instead of swallowing AlreadyExists as a restart replay:
-// the entry would otherwise bind to a Job about to disappear and the task
-// would converge to job_missing (AC-09: no task lost).
-func TestDuplicateClaimWaitsForTerminatingJobName(t *testing.T) {
+// A pre-start replacement deletes the old Job, so the name (fm-<task_id>)
+// stays taken while the terminating object holds it. The replacement defers
+// instead of swallowing AlreadyExists as a restart replay — the entry would
+// otherwise bind to a Job about to disappear and the task would converge to
+// job_missing (AC-09: no task lost) — and the server's re-dispatch creates the
+// new Job once the name is free.
+func TestDuplicateClaimDefersWhileTerminatingJobName(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
 	f.server.status = "dispatched"
 	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
 	f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
-	probes := 0
-	f.jobs.onGetJob = func() {
-		probes++
-		if probes >= 2 {
-			delete(f.jobs.existingJobs, "fm-task-1") // the cascade finished
-		}
-	}
 
-	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
-		t.Fatalf("OnClaim: %v", err)
+	err := f.sched.OnClaim(context.Background(), claimPayload("task-1"))
+	if !errors.Is(err, errJobNameHeld) {
+		t.Fatalf("OnClaim err = %v, want errJobNameHeld", err)
 	}
-	if len(f.jobs.createdJobs) != 2 {
-		t.Fatalf("jobs created = %d, want 2", len(f.jobs.createdJobs))
+	if len(f.jobs.createdJobs) != 1 {
+		t.Fatalf("jobs created = %d, want 1 (nothing under a terminating name)", len(f.jobs.createdJobs))
 	}
 	if len(f.server.forwards) != 0 {
 		t.Fatalf("task reported failed on a name collision: %+v", f.server.forwards)
 	}
-	e, ok := f.reg.Get("task-1")
-	if !ok || e.State != registry.StateJobCreated || e.Attempt != 2 {
-		t.Fatalf("entry = %+v", e)
+	if _, ok := f.reg.Get("task-1"); ok {
+		t.Fatal("deferred replacement kept the entry: its lease would be renewed, never re-dispatched")
+	}
+
+	// The re-dispatch after the cascade finished creates the new Job.
+	f.jobs.terminatingJobs = nil
+	delete(f.jobs.existingJobs, "fm-task-1")
+	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
+		t.Fatalf("re-dispatch OnClaim: %v", err)
+	}
+	if len(f.jobs.createdJobs) != 2 {
+		t.Fatalf("jobs created = %d, want 2", len(f.jobs.createdJobs))
+	}
+	if e, ok := f.reg.Get("task-1"); !ok || e.State != registry.StateJobCreated {
+		t.Fatalf("entry = %+v, ok=%v; want job_created", e, ok)
 	}
 }
 
@@ -1050,7 +1081,6 @@ func TestClaimDefersWhileJobNameStillHeld(t *testing.T) {
 	f.server.status = "dispatched"
 	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
 	f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
-	f.jobs.onGetJob = func() { f.now = f.now.Add(jobNameWait + time.Second) }
 
 	err := f.sched.OnClaim(context.Background(), claimPayload("task-1"))
 	if !errors.Is(err, errJobNameHeld) {
@@ -1070,8 +1100,8 @@ func TestClaimDefersWhileJobNameStillHeld(t *testing.T) {
 // AlreadyExists on the claim path is never an adoption: adoption is the
 // rebuild row of the disposal table and needs the payload (§4.3), while this
 // entry carries no facts of any existing Job. The object is a predecessor
-// corpse — it is deleted and the claim creates its own Job within the same
-// bound. Adopting it would record the corpse's creationTimestamp as this
+// corpse — it is deleted and the claim creates its own Job in the same
+// attempt. Adopting it would record the corpse's creationTimestamp as this
 // instance's pod-filter basis and burn the whole boot bound (AC-08: no zombie
 // task).
 func TestClaimReclaimsStaleJobInsteadOfAdoptingIt(t *testing.T) {
@@ -1137,6 +1167,34 @@ func TestClaimDefersOnNameHeldByAnotherTasksJob(t *testing.T) {
 	}
 }
 
+// A held name must not occupy the claim round: the create makes one bounded
+// attempt (create → one probe) and defers, so the tasks behind it in the same
+// batch (C-3 batch = free slots) are claimed without waiting the name out.
+func TestClaimDeferralDoesNotOccupyTheClaimRound(t *testing.T) {
+	f := newFixture(t)
+	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
+	f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
+	probes := 0
+	f.jobs.onGetJob = func() { probes++ }
+
+	if err := f.sched.OnClaimReserved(context.Background(), claimPayload("task-1"), SlotReservation{}); !errors.Is(err, errJobNameHeld) {
+		t.Fatalf("OnClaimReserved(task-1) err = %v, want errJobNameHeld", err)
+	}
+	if err := f.sched.OnClaimReserved(context.Background(), claimPayload("task-2"), SlotReservation{}); err != nil {
+		t.Fatalf("OnClaimReserved(task-2): %v", err)
+	}
+
+	if probes != 1 {
+		t.Fatalf("name probes = %d, want 1 (a held name is deferred, not polled)", probes)
+	}
+	if _, ok := f.reg.Get("task-1"); ok {
+		t.Fatal("deferred claim kept the entry: its lease would be renewed, never re-dispatched")
+	}
+	if e, ok := f.reg.Get("task-2"); !ok || e.State != registry.StateJobCreated {
+		t.Fatalf("task-2 entry = %+v, ok=%v; want job_created behind the deferred task", e, ok)
+	}
+}
+
 // A stale Job whose deletion keeps failing is a deferred claim, never a task
 // failure: the entry goes and the server re-dispatches once the lease lapses.
 func TestClaimDefersWhenStaleJobDeletionFails(t *testing.T) {
@@ -1151,7 +1209,6 @@ func TestClaimDefersWhenStaleJobDeletionFails(t *testing.T) {
 			},
 		},
 	}}
-	f.jobs.onGetJob = func() { f.now = f.now.Add(jobNameWait + time.Second) }
 
 	err := f.sched.OnClaim(context.Background(), claimPayload("task-1"))
 	if !errors.Is(err, errJobNameHeld) {
@@ -1169,10 +1226,9 @@ func TestClaimDefersWhenStaleJobDeletionFails(t *testing.T) {
 }
 
 // A transient read failure on the name probe must not become a task
-// failure: the truth is unknown, so the claim keeps polling, hits the
-// bound, and defers (dropped entry → server re-dispatch). Reporting
-// job_create_failed here would settle a task that is still perfectly
-// resumable (AC-09: 0 task lost).
+// failure: the truth is unknown, so the claim defers (dropped entry → server
+// re-dispatch). Reporting job_create_failed here would settle a task that is
+// still perfectly resumable (AC-09: 0 task lost).
 func TestClaimProbeErrorDoesNotFailTask(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
@@ -1180,7 +1236,6 @@ func TestClaimProbeErrorDoesNotFailTask(t *testing.T) {
 	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
 	f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
 	f.jobs.getJobErr = errors.New("apiserver unavailable")
-	f.jobs.onGetJob = func() { f.now = f.now.Add(jobNameWait + time.Second) }
 
 	err := f.sched.OnClaim(context.Background(), claimPayload("task-1"))
 	if !errors.Is(err, errJobNameHeld) {
@@ -1194,37 +1249,39 @@ func TestClaimProbeErrorDoesNotFailTask(t *testing.T) {
 	}
 }
 
-// The other half of the unknown-truth rule: once the probe recovers and the
-// name is free, the claim creates its Job without waiting out a poll
-// interval (GetJob's nil,nil means the object is gone).
-func TestClaimProbeErrorClearsAndJobIsCreated(t *testing.T) {
+// The other half of the unknown-truth rule: the deferral is a re-dispatch
+// hand-off, so once the probe answers again and the name is free the next
+// claim creates its Job.
+func TestClaimProbeErrorDefersAndRedispatchCreates(t *testing.T) {
 	f := newFixture(t)
 	f.claim(t, "task-1")
 	f.server.status = "dispatched"
 	f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
 	f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
 	f.jobs.getJobErr = errors.New("apiserver unavailable")
-	probes := 0
-	f.jobs.onGetJob = func() {
-		probes++
-		if probes >= 2 {
-			f.jobs.getJobErr = nil
-			delete(f.jobs.existingJobs, "fm-task-1")
-		}
+
+	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); !errors.Is(err, errJobNameHeld) {
+		t.Fatalf("OnClaim err = %v, want errJobNameHeld", err)
+	}
+	if _, ok := f.reg.Get("task-1"); ok {
+		t.Fatal("deferred claim kept the entry: its lease would be renewed, never re-dispatched")
 	}
 
+	// Re-dispatch: the probe answers again and the name is free.
+	f.jobs.getJobErr = nil
+	f.jobs.terminatingJobs = nil
+	delete(f.jobs.existingJobs, "fm-task-1")
 	if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); err != nil {
-		t.Fatalf("OnClaim: %v", err)
+		t.Fatalf("re-dispatch OnClaim: %v", err)
 	}
 	if len(f.jobs.createdJobs) != 2 {
 		t.Fatalf("jobs created = %d, want 2", len(f.jobs.createdJobs))
 	}
+	if e, ok := f.reg.Get("task-1"); !ok || e.State != registry.StateJobCreated {
+		t.Fatalf("entry = %+v, ok=%v; want job_created", e, ok)
+	}
 	if len(f.server.forwards) != 0 {
 		t.Fatalf("recovered claim reported a failure: %+v", f.server.forwards)
-	}
-	e, ok := f.reg.Get("task-1")
-	if !ok || e.State != registry.StateJobCreated || e.Attempt != 2 {
-		t.Fatalf("entry = %+v", e)
 	}
 }
 
@@ -3215,7 +3272,6 @@ func TestTaskEventsCarryIdentity(t *testing.T) {
 		f.server.status = "dispatched"
 		f.jobs.existingJobs = map[string]*batchv1.Job{"fm-task-1": {ObjectMeta: metav1.ObjectMeta{Name: "fm-task-1"}}}
 		f.jobs.terminatingJobs = map[string]bool{"fm-task-1": true}
-		f.jobs.onGetJob = func() { f.now = f.now.Add(jobNameWait + time.Second) }
 		buf := newLogScheduler(t, f, slog.LevelInfo)
 		if err := f.sched.OnClaim(context.Background(), claimPayload("task-1")); !errors.Is(err, errJobNameHeld) {
 			t.Fatalf("OnClaim err = %v, want errJobNameHeld", err)

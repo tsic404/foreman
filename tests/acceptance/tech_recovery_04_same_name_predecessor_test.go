@@ -1,11 +1,12 @@
 // TC-tech-recovery-04 (AC-08): a same-name Job on the claim face is this
-// task's predecessor, never its instance. The claim deletes it and retries
-// inside the Job-name wait; when the deletion keeps failing the claim is
-// deferred — no adoption, no delivery, no failure report, no terminal write,
-// no lease renewal, and a default-level claim-deferred event. Once the name is
-// free the server's re-dispatch creates the new Job and the projection follows
-// it. The predecessor's pods are a separate face: a corpse left on the list
-// face must not name the healthy re-run (§4.1, §4.3, TC-tech-recovery-04 ①②③).
+// task's predecessor, never its instance. The claim deletes it and retries in
+// the same attempt; when the deletion keeps failing the name stays held and
+// the claim is deferred at once — no adoption, no delivery, no failure report,
+// no terminal write, no lease renewal, and a default-level claim-deferred
+// event. Once the name is free the server's re-dispatch creates the new Job
+// and the projection follows it. The predecessor's pods are a separate face: a
+// corpse left on the list face must not name the healthy re-run (§4.1, §4.3,
+// TC-tech-recovery-04 ①②③).
 package acceptance
 
 import (
@@ -26,15 +27,13 @@ import (
 )
 
 // TestRecovery04ClaimDefersWhileThePredecessorNameIsHeld is the claim-time
-// face: the same-name predecessor is owned by this task, its deletion fails
-// for the whole name wait, and the claim is deferred instead of settling the
-// task. The re-dispatch after the release creates the new Job.
+// face: the same-name predecessor is owned by this task, its deletion fails,
+// and the claim is deferred at once instead of settling the task. The
+// re-dispatch after the release creates the new Job.
 func TestRecovery04ClaimDefersWhileThePredecessorNameIsHeld(t *testing.T) {
 	h := newDeliveryHarness(t)
-	// The name wait is 45s of wall clock; the stepped clock lets the scenario
-	// exhaust it instead of sleeping.
-	clock := &steppedClock{}
-	h.schedClock = clock.now
+	// The deferred claim must stay inside the boot bound: it is not the boot
+	// face's task to settle.
 	h.rebuildScheduler(t, func(c *scheduler.Config) { c.JobBootTimeout = 300 * time.Second })
 
 	predecessor := &batchv1.Job{ObjectMeta: metav1.ObjectMeta{
@@ -48,9 +47,6 @@ func TestRecovery04ClaimDefersWhileThePredecessorNameIsHeld(t *testing.T) {
 	h.jobs.programGetJob(predecessor)
 	h.jobs.setNameHeld("fm-task-1", true)
 	h.jobs.setDeleteJobError(errors.New("apiserver unavailable"))
-	// Each name probe steps the clock past the claim's wait bound. The probe
-	// runs inside jobClient.GetJob's lock, so the hook only reads the clock.
-	h.jobs.setOnGetJob(func() { clock.advance(46 * time.Second) })
 
 	err := h.sched.OnClaim(t.Context(), deliveryPayload("task-1"))
 	if err == nil || !strings.Contains(err.Error(), "job name still held") {
@@ -100,7 +96,6 @@ func TestRecovery04ClaimDefersWhileThePredecessorNameIsHeld(t *testing.T) {
 	// predecessor's.
 	h.jobs.setDeleteJobError(nil)
 	h.jobs.setNameHeld("fm-task-1", false)
-	h.jobs.setOnGetJob(nil)
 	h.jobs.mu.Lock()
 	delete(h.jobs.existingJobs, "fm-task-1")
 	h.jobs.mu.Unlock()

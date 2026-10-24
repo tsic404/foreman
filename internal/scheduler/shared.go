@@ -21,19 +21,17 @@ var ErrNoSlot = errors.New("no in-flight slot available")
 var ErrStoreUnavailable = errors.New("shared state unavailable")
 
 // Scheduler-side constants of the stage-two faces.
-const (
-	sharedCallTimeout  = 2 * time.Second
-	defaultTaskLockTTL = 120 * time.Second
-)
+const defaultTaskLockTTL = 120 * time.Second
 
-func (s *Scheduler) sharedCtx(ctx context.Context) (context.Context, context.CancelFunc) {
+// callerCtx is the context a shared-store call hands over. It carries this
+// caller's willingness to wait and nothing else: the store bounds the
+// operation itself, so a caller's earlier deadline never shortens it and
+// never counts as availability evidence (§10 共享状态不可用的判定).
+func callerCtx(ctx context.Context) context.Context {
 	if ctx == nil {
-		return context.WithTimeout(context.Background(), sharedCallTimeout)
+		return context.Background()
 	}
-	if _, ok := ctx.Deadline(); ok {
-		return context.WithCancel(ctx)
-	}
-	return context.WithTimeout(ctx, sharedCallTimeout)
+	return ctx
 }
 
 // lockTaskFor takes the write lock of a task this process already knows; the
@@ -61,9 +59,7 @@ func (s *Scheduler) lockTaskIn(ctx context.Context, ws, taskID string) (func(), 
 	}
 	started := time.Now()
 	for {
-		lockCtx, cancel := s.sharedCtx(ctx)
-		ok, err := s.shared.LockTask(lockCtx, ws, taskID, owner, ttl)
-		cancel()
+		ok, err := s.shared.LockTask(callerCtx(ctx), ws, taskID, owner, ttl)
 		if err != nil {
 			return nil, fmt.Errorf("%w: task lock: %v", ErrStoreUnavailable, err)
 		}
@@ -87,15 +83,9 @@ func (s *Scheduler) lockTaskIn(ctx context.Context, ws, taskID string) (func(), 
 	return func() {
 		unlockLocal()
 		if s.shared != nil {
-			releaseCtx, cancel := sharedDetachedCtx()
-			defer cancel()
-			_ = s.shared.UnlockTask(releaseCtx, ws, taskID, owner)
+			_ = s.shared.UnlockTask(context.Background(), ws, taskID, owner)
 		}
 	}, nil
-}
-
-func sharedDetachedCtx() (context.Context, context.CancelFunc) {
-	return context.WithTimeout(context.Background(), sharedCallTimeout)
 }
 
 // SlotReservation is one reservation pair: the ids the shared store returned
@@ -122,8 +112,7 @@ func (s *Scheduler) reserveSlots(ctx context.Context, ws string) (SlotReservatio
 	if s.shared == nil {
 		return res, nil
 	}
-	callCtx, cancel := s.sharedCtx(ctx)
-	defer cancel()
+	callCtx := callerCtx(ctx)
 	globalID, ok, err := s.shared.ReserveSlot(callCtx, "", s.cfg.MaxInflightJobs)
 	if err != nil {
 		s.metrics.StateError("reserve_slot")
@@ -150,14 +139,11 @@ func (s *Scheduler) reserveSlots(ctx context.Context, ws string) (SlotReservatio
 }
 
 // releaseGlobalReservation returns the named global reservation whose
-// workspace half was refused. The write is detached: the refusal usually means
-// the call budget is spent, so inheriting that context would make the
-// compensation itself fail and leak the reservation until the TTL/reconcile
-// edge.
+// workspace half was refused. The compensation runs detached from the claim's
+// context: the refusal usually means that context is spent, and an aborted
+// compensation would leak the reservation until the TTL/reconcile edge.
 func (s *Scheduler) releaseGlobalReservation(globalID string) {
-	callCtx, cancel := sharedDetachedCtx()
-	defer cancel()
-	_ = s.shared.ReleaseSlot(callCtx, "", globalID)
+	_ = s.shared.ReleaseSlot(context.Background(), "", globalID)
 }
 
 // consumeSlots turns the caller's own reservations into entry ownership on
@@ -181,9 +167,7 @@ func (s *Scheduler) consumeSlots(ctx context.Context, res SlotReservation) {
 // (see consumeSlots). The failure is still visible (§9.1 共享状态错误;
 // §10 两级在途上限).
 func (s *Scheduler) consumeSlotLevel(ws, id string) {
-	callCtx, cancel := sharedDetachedCtx()
-	defer cancel()
-	err := s.shared.ConsumeSlotReservation(callCtx, ws, id)
+	err := s.shared.ConsumeSlotReservation(context.Background(), ws, id)
 	if err != nil {
 		s.metrics.StateError("consume_slot")
 		s.log.Warn("coordination.consume_slot_failed",
@@ -198,8 +182,7 @@ func (s *Scheduler) releaseSlots(ctx context.Context, res SlotReservation) {
 	if s.shared == nil || res.isZero() {
 		return
 	}
-	callCtx, cancel := sharedDetachedCtx()
-	defer cancel()
+	callCtx := context.Background()
 	if res.levelID != "" {
 		_ = s.shared.ReleaseSlot(callCtx, res.workspaceID, res.levelID)
 	}
@@ -329,8 +312,7 @@ func (s *Scheduler) Deliver(ctx context.Context, workspaceID, daemonID, runtimeI
 // empty; the payload comes from the shared row, because the row is the
 // authority on this instance's copy.
 func (s *Scheduler) deliverShared(ctx context.Context, e registry.TaskEntry) (Delivery, error) {
-	callCtx, cancel := s.sharedCtx(ctx)
-	defer cancel()
+	callCtx := callerCtx(ctx)
 	pickup, err := s.shared.PickupDelivery(callCtx, e.WorkspaceID, e.TaskID, s.cfg.DeliveryConfirmTimeout)
 	if err != nil {
 		return Delivery{}, fmt.Errorf("%w: delivery pickup: %v", ErrStoreUnavailable, err)
@@ -404,8 +386,7 @@ func (s *Scheduler) enqueueShared(ctx context.Context, e registry.TaskEntry) err
 	if s.shared == nil {
 		return nil
 	}
-	callCtx, cancel := s.sharedCtx(ctx)
-	defer cancel()
+	callCtx := callerCtx(ctx)
 	created, err := s.shared.EnqueueEntry(callCtx, e.WorkspaceID, e.TaskID, e)
 	if err != nil {
 		s.metrics.StateError("enqueue")
@@ -479,8 +460,7 @@ func (s *Scheduler) syncQueueDepth(ctx context.Context) {
 	if s.shared == nil {
 		return
 	}
-	callCtx, cancel := s.sharedCtx(ctx)
-	defer cancel()
+	callCtx := callerCtx(ctx)
 	if depth, err := s.shared.QueueDepth(callCtx); err == nil {
 		s.metrics.QueueDepth(int(depth))
 	}
@@ -519,8 +499,7 @@ func (s *Scheduler) reconcileSlots(ctx context.Context, exact bool) error {
 	if s.shared == nil {
 		return nil
 	}
-	callCtx, cancel := s.sharedCtx(ctx)
-	defer cancel()
+	callCtx := callerCtx(ctx)
 
 	levels := []string{""}
 	for _, ws := range s.WorkspaceIDs() {

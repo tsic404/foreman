@@ -11,6 +11,7 @@ import (
 
 	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/proxy"
+	"github.com/tsic404/foreman/internal/startup"
 	"github.com/tsic404/foreman/internal/workspace"
 )
 
@@ -111,7 +112,7 @@ func TestWorkspaceScopeC17TransientFailureDoesNotRefuseNameKeys(t *testing.T) {
 	var logs bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&logs, nil))
 
-	if err := runStartupSelfCheck(t.Context(), workspace.ScopeWorkspace,
+	if err := startup.RunSelfCheck(t.Context(), workspace.ScopeWorkspace,
 		[]*proxy.Client{client}, log); err != nil {
 		t.Fatalf("a transient C-17 failure must not refuse startup: %v", err)
 	}
@@ -142,7 +143,7 @@ func TestC17RecoversThenNameKeyResolves(t *testing.T) {
 	client := startupClient(stub.server.URL, "ws-a")
 	var logs bytes.Buffer
 	log := slog.New(slog.NewJSONHandler(&logs, nil))
-	if err := runStartupSelfCheck(t.Context(), workspace.ScopeWorkspace,
+	if err := startup.RunSelfCheck(t.Context(), workspace.ScopeWorkspace,
 		[]*proxy.Client{client}, log); err != nil {
 		t.Fatalf("a transient C-17 failure must not refuse startup: %v", err)
 	}

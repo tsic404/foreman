@@ -32,8 +32,21 @@ func (s *FakeServer) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 	}
 	ids := []string{claims.WorkspaceID}
 	if claims.Role == catalogProbeRole {
-		if session, found := s.probeSession(claims); found && session.WorkspaceID == "" {
+		session, found := s.probeSession(claims)
+		if !found {
+			// The session is a probe token's only validity face (§6.3): a
+			// token whose session was reaped has no owner left, so its claims
+			// must not answer for a workspace.
+			writeError(w, http.StatusUnauthorized, "unknown probe session")
+			return
+		}
+		// The session, not the claims, decides the answer: a workspace-pinned
+		// catalog probe sees its own workspace, a startup / discovery probe
+		// the discovery set (§2.2 S-1).
+		if session.WorkspaceID == "" {
 			ids = s.discoverySet()
+		} else {
+			ids = []string{session.WorkspaceID}
 		}
 	}
 	answer := make([]map[string]string, 0, len(ids))
@@ -311,6 +324,12 @@ func (s *FakeServer) handleDeregister(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if claims.Role == catalogProbeRole {
+		// Only a live owner has a handshake to acknowledge: a reaped session
+		// leaves the token with nothing to deregister (§6.3 会话不存在 ⇒ 恒 401).
+		if _, found := s.probeSession(claims); !found {
+			writeError(w, http.StatusUnauthorized, "unknown probe session")
+			return
+		}
 		s.cancelProbe(w)
 		return
 	}

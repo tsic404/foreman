@@ -3,6 +3,7 @@ package workspace
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -204,6 +205,41 @@ func TestDeploymentIdentities(t *testing.T) {
 	}
 }
 
+// TestNewSetNamesIllegalWorkspaceIDWithBadCredential pins a configuration that
+// is wrong twice: the identifier's own rule decides the refusal, so the id is
+// named in quoted form even when the credential is missing or malformed.
+func TestNewSetNamesIllegalWorkspaceIDWithBadCredential(t *testing.T) {
+	credentials := map[string]string{
+		"missing":    "",
+		"bad prefix": "not-a-token",
+	}
+	ids := []string{"ws id", "-", "trailing.", "../../escape", strings.Repeat("a", 64)}
+	for name, token := range credentials {
+		for _, id := range ids {
+			t.Run(name+"/"+id, func(t *testing.T) {
+				_, err := NewSet([]Identity{{WorkspaceID: id, DaemonID: "foreman-main", Token: token}})
+				if err == nil {
+					t.Fatalf("workspace id %q started with a %s credential", id, name)
+				}
+				if !strings.Contains(err.Error(), strconv.Quote(id)) {
+					t.Errorf("error %q does not name %q", err, id)
+				}
+				if !strings.Contains(err.Error(), "label value") {
+					t.Errorf("error %q does not state the id rule", err)
+				}
+			})
+		}
+	}
+
+	_, err := NewSet([]Identity{{WorkspaceID: " ", DaemonID: "foreman-main"}})
+	if err == nil {
+		t.Fatal("a blank workspace id started")
+	}
+	if !strings.Contains(err.Error(), "has no workspace_id") {
+		t.Errorf("error %q does not report the missing id", err)
+	}
+}
+
 // TestNewSetWorkspaceIDCharset pins the value face the downstream writers
 // already impose: the id is a label value and a placeholder render value, so
 // anything outside the label grammar must fail here rather than at Job
@@ -236,6 +272,8 @@ func TestNewSetWorkspaceIDCharset(t *testing.T) {
 		"..",
 		".hidden",
 		"trailing.",
+		"-team",
+		"-",
 		"ws id",
 		"ws:8080",
 		strings.Repeat("a", 64),
@@ -246,7 +284,7 @@ func TestNewSetWorkspaceIDCharset(t *testing.T) {
 			t.Errorf("NewSet(%q) accepted an illegal label value", id)
 			continue
 		}
-		if !strings.Contains(err.Error(), id) {
+		if !strings.Contains(err.Error(), strconv.Quote(id)) {
 			t.Errorf("NewSet(%q) error %q does not name the id", id, err)
 		}
 		if !strings.Contains(err.Error(), "label value") {

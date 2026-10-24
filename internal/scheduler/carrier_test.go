@@ -13,6 +13,7 @@ import (
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 
 	"github.com/tsic404/foreman/internal/registry"
 )
@@ -26,11 +27,11 @@ type memCarrierStore struct {
 	listErr  error
 	delErr   error
 	puts     int
-	// beforePut and beforeDelete run before the call takes the store's lock,
-	// so a test can park one call and observe another arriving while it is
-	// held — the interleaving the queue's carrier lock must forbid.
-	beforePut    func()
-	beforeDelete func()
+
+	// onPut and onDelete run outside s.mu before the operation takes effect:
+	// a test holds one open to interleave a carrier call with the other face.
+	onPut    func(c Carrier)
+	onDelete func(name string)
 }
 
 func newMemCarrierStore() *memCarrierStore {
@@ -38,8 +39,8 @@ func newMemCarrierStore() *memCarrierStore {
 }
 
 func (s *memCarrierStore) PutCarrier(_ context.Context, c Carrier) error {
-	if s.beforePut != nil {
-		s.beforePut()
+	if s.onPut != nil {
+		s.onPut(c)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -47,20 +48,26 @@ func (s *memCarrierStore) PutCarrier(_ context.Context, c Carrier) error {
 	if s.putErr != nil {
 		return s.putErr
 	}
+	c.Name = carrierSecretName(c.TaskID)
 	s.carriers[c.TaskID] = c
 	return nil
 }
 
-func (s *memCarrierStore) DeleteCarrier(_ context.Context, taskID string) error {
-	if s.beforeDelete != nil {
-		s.beforeDelete()
+func (s *memCarrierStore) DeleteCarrier(_ context.Context, name string) error {
+	if s.onDelete != nil {
+		s.onDelete(name)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.delErr != nil {
 		return s.delErr
 	}
-	delete(s.carriers, taskID)
+	for taskID, c := range s.carriers {
+		if c.Name == name {
+			delete(s.carriers, taskID)
+			return nil
+		}
+	}
 	return nil
 }
 
@@ -625,5 +632,338 @@ func TestSecretCarrierKeepsTheFirstBodyOnReEnqueue(t *testing.T) {
 				t.Fatalf("carrier body = %s, want the first enqueue's %s", got, first)
 			}
 		})
+	}
+}
+
+// TestCarrierDeleteKeepsAnEntryEnqueuedInTheWindow pins the settle/delete
+// race of §6.5 and ADR-046 decision 3: the carrier delete is a network call
+// issued after the entry left the queue, and a duplicate terminal report can
+// enqueue in that window. Its carrier write answers AlreadyExists for the
+// settled entry's object — a landed write — so a delete that removes the
+// object strips a live entry of its only cross-process face while
+// carrierBacked stays set; a process exit then loses the report AC-16 says
+// is kept.
+func TestCarrierDeleteKeepsAnEntryEnqueuedInTheWindow(t *testing.T) {
+	store := newMemCarrierStore()
+	p, err := NewPendingReports(t.TempDir(), WithPendingReportsCarrier(store))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	restoreForServe(t, p)
+	ctx := context.Background()
+	body := []byte(`{"result":"ok"}`)
+	if err := p.Enqueue(ctx, "task-1", "fm-task-1", "fm-task-1", "", EPComplete, body, ""); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+
+	// The settlement removed the entry; its carrier delete is still pending.
+	p.mu.Lock()
+	p.dropLocked("task-1")
+	p.mu.Unlock()
+
+	// A duplicate report lands in that window and adopts the old object.
+	if err := p.Enqueue(ctx, "task-1", "fm-task-1", "fm-task-1", "", EPComplete, body, ""); err != nil {
+		t.Fatalf("re-Enqueue: %v", err)
+	}
+	if !p.Queued("task-1") {
+		t.Fatal("the duplicate report must read as queued")
+	}
+
+	// The delayed delete must leave the object the live entry relies on.
+	p.deleteCarrier(ctx, "task-1")
+	if got := store.count(); got != 1 {
+		t.Fatalf("carriers after the delayed delete = %d, want 1", got)
+	}
+
+	// The carrier is the cross-process face: a restart rebuilds from it.
+	restarted, err := NewPendingReports(t.TempDir(), WithPendingReportsCarrier(store))
+	if err != nil {
+		t.Fatalf("NewPendingReports(restarted): %v", err)
+	}
+	restoreForServe(t, restarted)
+	if !restarted.HasQueuedEntry("task-1") {
+		t.Fatal("the rebuilt queue lost the report its carrier holds")
+	}
+}
+
+// TestSweepCarrierDeletesOnlySettledEntries: the sweep's criterion is the
+// settlement alone — a live entry keeps its object, a settled one lets it go,
+// and an uncompleted rebuild deletes nothing (unknown is not empty).
+func TestSweepCarrierDeletesOnlySettledEntries(t *testing.T) {
+	store := newMemCarrierStore()
+	p, err := NewPendingReports(t.TempDir(), WithPendingReportsCarrier(store))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	restoreForServe(t, p)
+	ctx := context.Background()
+	if err := p.Enqueue(ctx, "task-1", "fm-task-1", "fm-task-1", "", EPComplete, []byte(`{"result":"ok"}`), ""); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	name := carrierSecretName("task-1")
+	if deleted, err := p.SweepCarrier(ctx, "task-1", name); err != nil || deleted {
+		t.Fatalf("SweepCarrier on a live entry = %v, %v; want kept", deleted, err)
+	}
+	if got := store.count(); got != 1 {
+		t.Fatalf("carriers = %d, want the live entry's object", got)
+	}
+
+	p.mu.Lock()
+	p.dropLocked("task-1")
+	p.mu.Unlock()
+	if deleted, err := p.SweepCarrier(ctx, "task-1", name); err != nil || !deleted {
+		t.Fatalf("SweepCarrier on a settled entry = %v, %v; want deleted", deleted, err)
+	}
+	if got := store.count(); got != 0 {
+		t.Fatalf("carriers after the sweep = %d, want none", got)
+	}
+
+	// A queue whose carrier list did not complete reads every task as queued:
+	// the sweep must not touch anything before the rebuild.
+	if err := store.PutCarrier(ctx, Carrier{
+		TaskID: "task-2", Endpoint: string(EPFail), Body: []byte(`{}`), EnqueuedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("PutCarrier: %v", err)
+	}
+	fresh, err := NewPendingReports(t.TempDir(), WithPendingReportsCarrier(store))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	if deleted, err := fresh.SweepCarrier(ctx, "task-2", carrierSecretName("task-2")); err != nil || deleted {
+		t.Fatalf("SweepCarrier before the rebuild = %v, %v; want kept", deleted, err)
+	}
+}
+
+// TestCarrierWriteDoesNotSerializeAcrossTasks pins the carrier lock's scope:
+// the invariant is per task, so one task's slow cluster write must not hold
+// up another task's enqueue.
+func TestCarrierWriteDoesNotSerializeAcrossTasks(t *testing.T) {
+	store := newMemCarrierStore()
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	store.onPut = func(c Carrier) {
+		if c.TaskID == "task-slow" {
+			entered <- struct{}{}
+			<-release
+		}
+	}
+	p, err := NewPendingReports(t.TempDir(), WithPendingReportsCarrier(store))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	restoreForServe(t, p)
+	ctx := context.Background()
+
+	slowDone := make(chan error, 1)
+	go func() {
+		slowDone <- p.Enqueue(ctx, "task-slow", "fm-task-slow", "fm-task-slow", "", EPComplete, []byte(`{"result":"ok"}`), "")
+	}()
+	<-entered
+
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	fastDone := make(chan error, 1)
+	go func() {
+		fastDone <- p.Enqueue(ctx, "task-fast", "fm-task-fast", "fm-task-fast", "", EPComplete, []byte(`{"result":"ok"}`), "")
+	}()
+	select {
+	case err := <-fastDone:
+		if err != nil {
+			t.Fatalf("Enqueue(task-fast): %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Enqueue(task-fast) waited on another task's carrier write")
+	}
+
+	close(release)
+	released = true
+	if err := <-slowDone; err != nil {
+		t.Fatalf("Enqueue(task-slow): %v", err)
+	}
+	if got := store.count(); got != 2 {
+		t.Fatalf("carriers = %d, want both tasks' objects", got)
+	}
+}
+
+// TestCarrierDeleteSerializesWithAnEnqueueForTheSameTask pins the other side
+// of the per-task lock: while the settled entry's carrier delete is in
+// flight, a duplicate report for the same task must wait, then write its own
+// object. An enqueue released into that window adopts the object the delete
+// then removes — a live entry with no carrier.
+func TestCarrierDeleteSerializesWithAnEnqueueForTheSameTask(t *testing.T) {
+	store := newMemCarrierStore()
+	ctx := context.Background()
+	p, err := NewPendingReports(t.TempDir(), WithPendingReportsCarrier(store))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	restoreForServe(t, p)
+	// An orphan object the queue no longer holds: the sweep's delete target.
+	if err := store.PutCarrier(ctx, Carrier{
+		TaskID: "task-1", Endpoint: string(EPComplete),
+		Body: []byte(`{"result":"ok"}`), EnqueuedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("PutCarrier: %v", err)
+	}
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	store.onDelete = func(string) {
+		entered <- struct{}{}
+		<-release
+	}
+	deleteDone := make(chan struct{})
+	go func() {
+		p.deleteCarrier(ctx, "task-1")
+		close(deleteDone)
+	}()
+	<-entered
+
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	enqueued := make(chan error, 1)
+	go func() {
+		enqueued <- p.Enqueue(ctx, "task-1", "fm-task-1", "fm-task-1", "", EPComplete, []byte(`{"result":"ok"}`), "")
+	}()
+	select {
+	case err := <-enqueued:
+		t.Fatalf("Enqueue completed while the same task's carrier delete was in flight: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	released = true
+	<-deleteDone
+	if err := <-enqueued; err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if !p.Queued("task-1") {
+		t.Fatal("the enqueued report must read as queued")
+	}
+	if got := store.count(); got != 1 {
+		t.Fatalf("carriers = %d, want the enqueued report's object", got)
+	}
+}
+
+// TestSweepCarrierSerializesWithAnEnqueueForTheSameTask pins the sweep's lock
+// key: the delete runs under the task id the listed object carries, the key
+// the carrier write takes too — never the object name. A sweep keyed by name
+// (or one that took no lock) lets a duplicate report enqueue in the window
+// and adopt an object the sweep then removes: a live entry with no carrier
+// (§6.5, ADR-046 decision 1).
+func TestSweepCarrierSerializesWithAnEnqueueForTheSameTask(t *testing.T) {
+	store := newMemCarrierStore()
+	ctx := context.Background()
+	p, err := NewPendingReports(t.TempDir(), WithPendingReportsCarrier(store))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	restoreForServe(t, p)
+	// An orphan object the queue no longer holds: the sweep's delete target.
+	if err := store.PutCarrier(ctx, Carrier{
+		TaskID: "task-1", Endpoint: string(EPComplete),
+		Body: []byte(`{"result":"ok"}`), EnqueuedAt: time.Now(),
+	}); err != nil {
+		t.Fatalf("PutCarrier: %v", err)
+	}
+
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	store.onDelete = func(string) {
+		entered <- struct{}{}
+		<-release
+	}
+	swept := make(chan error, 1)
+	go func() {
+		deleted, err := p.SweepCarrier(ctx, "task-1", carrierSecretName("task-1"))
+		if err == nil && !deleted {
+			err = errors.New("SweepCarrier kept a settled entry's object")
+		}
+		swept <- err
+	}()
+	<-entered
+
+	released := false
+	defer func() {
+		if !released {
+			close(release)
+		}
+	}()
+	enqueued := make(chan error, 1)
+	go func() {
+		enqueued <- p.Enqueue(ctx, "task-1", "fm-task-1", "fm-task-1", "", EPComplete, []byte(`{"result":"ok"}`), "")
+	}()
+	select {
+	case err := <-enqueued:
+		t.Fatalf("Enqueue completed while the same task's carrier sweep was in flight: %v", err)
+	case <-time.After(200 * time.Millisecond):
+	}
+
+	close(release)
+	released = true
+	if err := <-swept; err != nil {
+		t.Fatalf("SweepCarrier: %v", err)
+	}
+	if err := <-enqueued; err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if !p.Queued("task-1") {
+		t.Fatal("the enqueued report must read as queued")
+	}
+	// The sweep removed the orphan, then the enqueue wrote its own object:
+	// the live entry still has its cross-process face.
+	if got := store.count(); got != 1 {
+		t.Fatalf("carriers = %d, want the enqueued report's object", got)
+	}
+}
+
+// TestSweepCarrierDeletesTheListedName pins the sweep's delete target: the
+// name comes from the listing, never re-derived from the task id. A carrier
+// written under a non-derived name still carries the task-id label, so a
+// sweep that derived the name would leave the listed object behind.
+func TestSweepCarrierDeletesTheListedName(t *testing.T) {
+	jobs := &fakeJobs{existingJobs: map[string]*batchv1.Job{}}
+	store := NewSecretCarrierStore(jobs)
+	p, err := NewPendingReports(t.TempDir(), WithPendingReportsCarrier(store))
+	if err != nil {
+		t.Fatalf("NewPendingReports: %v", err)
+	}
+	restoreForServe(t, p)
+	ctx := context.Background()
+
+	legacy := "pending-report-legacy-task-1"
+	if legacy == carrierSecretName("task-1") {
+		t.Fatalf("%q is the derived name; the test needs a different one", legacy)
+	}
+	jobs.secrets = []corev1.Secret{{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: legacy,
+			Labels: map[string]string{
+				registry.LabelRole:      registry.RolePendingReport,
+				registry.LabelManagedBy: registry.ManagedByForeman,
+				registry.LabelTaskID:    "task-1",
+			},
+		},
+		Type: corev1.SecretTypeOpaque,
+	}}
+	listed, err := store.ListCarriers(ctx)
+	if err != nil || len(listed) != 1 || listed[0].Name != legacy {
+		t.Fatalf("listed carriers = %+v, %v; want the legacy object", listed, err)
+	}
+
+	deleted, err := p.SweepCarrier(ctx, listed[0].TaskID, listed[0].Name)
+	if err != nil || !deleted {
+		t.Fatalf("SweepCarrier = %v, %v; want the listed object deleted", deleted, err)
+	}
+	if !jobs.secretDeleted(legacy) {
+		t.Fatalf("DeleteSecret did not get the listed name %q (deleted: %v)", legacy, jobs.deletedSecrets)
 	}
 }

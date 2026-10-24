@@ -11,7 +11,6 @@ package acceptance
 import (
 	"context"
 	"errors"
-	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -38,32 +37,36 @@ func buildForemanBinary(t *testing.T) string {
 
 // foremanStartupEnv is the environment a run starts with: the keys every
 // loader before the scheduler needs, so the value under test is what decides
-// the outcome. Ambient FOREMAN_*/MULTICA_* keys are dropped so the caller's
-// environment cannot change the verdict.
+// the outcome. Ambient FOREMAN_*/MULTICA_* keys and KUBECONFIG are dropped so
+// the caller's environment cannot change the verdict; an override replaces the
+// base value, including with the empty string.
 func foremanStartupEnv(serverURL string, overrides map[string]string) []string {
 	env := make([]string, 0, len(os.Environ())+8)
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
-		if strings.HasPrefix(key, "FOREMAN_") || strings.HasPrefix(key, "MULTICA_") {
+		if strings.HasPrefix(key, "FOREMAN_") || strings.HasPrefix(key, "MULTICA_") || key == "KUBECONFIG" {
 			continue
 		}
 		env = append(env, entry)
 	}
-	env = append(env,
-		"MULTICA_SERVER_URL="+serverURL,
-		"MULTICA_WORKSPACE_ID=ws-a",
-		"MULTICA_TOKEN=mdt_ws-a",
-		"FOREMAN_JOB_TOKEN_KEY="+strings.Repeat("ab", 32),
-	)
+	merged := map[string]string{
+		"MULTICA_SERVER_URL":    serverURL,
+		"MULTICA_WORKSPACE_ID":  "ws-a",
+		"MULTICA_TOKEN":         "mdt_ws-a",
+		"FOREMAN_JOB_TOKEN_KEY": strings.Repeat("ab", 32),
+	}
 	for key, value := range overrides {
+		merged[key] = value
+	}
+	for key, value := range merged {
 		env = append(env, key+"="+value)
 	}
 	return env
 }
 
 type foremanExit struct {
-	code   int
-	stderr string
+	code           int
+	stdout, stderr string
 }
 
 // runForeman starts the binary with the given overrides and waits for it to
@@ -75,8 +78,8 @@ func runForeman(t *testing.T, bin, serverURL string, overrides map[string]string
 	cmd := exec.CommandContext(ctx, bin)
 	cmd.Dir = t.TempDir()
 	cmd.Env = foremanStartupEnv(serverURL, overrides)
-	var stderr strings.Builder
-	cmd.Stdout = io.Discard
+	var stdout, stderr strings.Builder
+	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err := cmd.Run()
 	if ctx.Err() != nil {
@@ -84,12 +87,12 @@ func runForeman(t *testing.T, bin, serverURL string, overrides map[string]string
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		return foremanExit{code: exitErr.ExitCode(), stderr: stderr.String()}
+		return foremanExit{code: exitErr.ExitCode(), stdout: stdout.String(), stderr: stderr.String()}
 	}
 	if err != nil {
 		t.Fatalf("run foreman: %v", err)
 	}
-	return foremanExit{stderr: stderr.String()}
+	return foremanExit{stdout: stdout.String(), stderr: stderr.String()}
 }
 
 func TestTechMultiWS14PerWorkspaceCapDomain(t *testing.T) {

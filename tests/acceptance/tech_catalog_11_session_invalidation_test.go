@@ -3,9 +3,9 @@
 // SweepStaleProbes — take the session row with them, and the same token is then
 // 401 on every probe route: workspaces, registration, heartbeat, deregistration
 // and the result path. The registry-level removal is judged as well, so the
-// teardown order above is not the single path to the 401s. The window between
-// the lookup and the write-back is judged too: a session reaped before the
-// registration update must not be resurrected (02-contracts.md §6.3/§6.5).
+// teardown order above is not the single path to the 401s. The reaps between
+// authentication, the handler's lookup and the write-back are judged too: a
+// reaped session is neither resurrected nor acknowledged (02-contracts.md §6.3/§6.5).
 package acceptance
 
 import (
@@ -53,28 +53,17 @@ func probeFaces() []probeFace {
 	}
 }
 
-// seedCatalogProbe issues the probe's own Job Token and inserts the session
-// row the token is adjudicated against (§6.3).
+// seedCatalogProbe seeds this case's probe session through the shared
+// constructor, pinned to the deployment's served workspace.
 func seedCatalogProbe(t *testing.T, h *harness) (string, registry.ProbeSession) {
 	t.Helper()
-	token, err := h.issuer.IssueProbe(catalog11ProbeName, catalog11RequestID, h.schedCfg.WorkspaceID, 10*time.Minute)
-	if err != nil {
-		t.Fatalf("IssueProbe: %v", err)
-	}
-	session := registry.ProbeSession{
-		JobName:       catalog11ProbeName,
-		Mode:          registry.ProbeCommandDriven,
-		RequestID:     catalog11RequestID,
-		TokenHash:     h.issuer.Hash(token),
-		JobRuntime:    catalog11ProbeRuntime,
-		RealRuntimeID: catalog11RealRuntime,
-		WorkspaceID:   h.schedCfg.WorkspaceID,
-		Deadline:      time.Now().Add(time.Minute),
-	}
-	if err := h.probes.PutProbe(session); err != nil {
-		t.Fatalf("PutProbe: %v", err)
-	}
-	return token, session
+	return seedProbeSession(t, h.issuer, h.probes, probeSeed{
+		jobName:     catalog11ProbeName,
+		requestID:   catalog11RequestID,
+		jobRuntime:  catalog11ProbeRuntime,
+		realRuntime: catalog11RealRuntime,
+		workspaceID: h.schedCfg.WorkspaceID,
+	})
 }
 
 func TestCatalog11ProbeTokenDiesWithItsSession(t *testing.T) {
@@ -158,10 +147,13 @@ func TestCatalog11ProbeTokenDiesWithItsSession(t *testing.T) {
 	}
 }
 
-// reapOnWriteProbeStore is the shared session face whose row disappears at the
-// first write: the reap lands between the handler's lookup and its update.
+// reapOnWriteProbeStore is the shared session face whose row disappears under
+// the scenario's control: at the first write by default, or with
+// readsBeforeReap at the read that follows that many successful reads, so a
+// reap can also land between authentication and the handler's own lookup.
 type reapOnWriteProbeStore struct {
-	rows map[string][]byte
+	rows            map[string][]byte
+	readsBeforeReap int
 }
 
 func (s *reapOnWriteProbeStore) PutProbeSession(_ context.Context, jobName string, raw []byte, _ time.Duration) error {
@@ -176,6 +168,12 @@ func (s *reapOnWriteProbeStore) CASProbeSession(_ context.Context, jobName strin
 
 func (s *reapOnWriteProbeStore) GetProbeSession(_ context.Context, jobName string) ([]byte, bool, error) {
 	raw, ok := s.rows[jobName]
+	if ok && s.readsBeforeReap > 0 {
+		s.readsBeforeReap--
+		if s.readsBeforeReap == 0 {
+			delete(s.rows, jobName)
+		}
+	}
 	return raw, ok, nil
 }
 
@@ -213,5 +211,36 @@ func TestCatalog11ReapBetweenLookupAndWriteIsUnauthorized(t *testing.T) {
 	}
 	if _, ok := store.rows[catalog11ProbeName]; ok {
 		t.Error("the update must not resurrect a reaped session row")
+	}
+}
+
+// TestCatalog11DeregisterReapedSessionIsUnauthorized pins S19's own guard as
+// the authority when the reap lands between the token's authentication read and
+// the handler's lookup: the 401 must be the handler's verdict, not
+// authentication's, and no write may bring the row back (§6.3).
+func TestCatalog11DeregisterReapedSessionIsUnauthorized(t *testing.T) {
+	h := newHarness(t, true)
+	token, session := seedCatalogProbe(t, h)
+	raw, err := json.Marshal(session)
+	if err != nil {
+		t.Fatalf("marshal session: %v", err)
+	}
+	// One read backs the token's authentication; the handler's lookup is the
+	// read that finds the session gone.
+	store := &reapOnWriteProbeStore{rows: map[string][]byte{catalog11ProbeName: raw}, readsBeforeReap: 1}
+	h.probes.AttachShared(store)
+	authFailures := h.metrics.authFailureTotal()
+
+	code, resp := h.call(http.MethodPost, "/api/daemon/deregister", token, []byte(`{}`))
+	if code != http.StatusUnauthorized {
+		t.Fatalf("deregister of a reaped session = %d: %s, want 401", code, resp)
+	}
+	// Authentication passed by construction: a rejection recorded here would
+	// mean the 401 was not the handler's verdict.
+	if got := h.metrics.authFailureTotal(); got != authFailures {
+		t.Errorf("the 401 came from authentication (%d recorded failures), want the handler's own verdict", got-authFailures)
+	}
+	if _, ok := store.rows[catalog11ProbeName]; ok {
+		t.Error("the 401 path must not resurrect the reaped session")
 	}
 }

@@ -1,9 +1,11 @@
-// TC-tech-observability-02 implements AC-10's log faces: one task's events are
-// traceable by its task id from claim to deletion, and no log line carries a
-// credential. The chain half covers every path that writes the terminal line
-// (forwarded report, server-already-terminal settlement and the restart
-// replay); the no-token half drives the production logger with the dominant
-// "err", err call form, whose value is an error rather than a string.
+// TC-tech-observability-02 implements AC-10's observation faces: one task's
+// events are traceable by its task id from claim to deletion, no log line
+// carries a credential, and the image audit fields report the deployment
+// reference verbatim (reference-template window). The chain half covers every
+// path that writes the terminal line (forwarded report, server-already-terminal
+// settlement and the restart replay); the no-token half drives the production
+// logger with the dominant "err", err call form, whose value is an error
+// rather than a string; the image half reads both fields ADR-012 names.
 package acceptance
 
 import (
@@ -11,6 +13,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -187,5 +191,61 @@ func TestObservability02ErrorAttrCarriesNoToken(t *testing.T) {
 	cause, ok := line["cause"].(map[string]any)
 	if !ok || cause["Detail"] != "peer echoed [redacted]" {
 		t.Fatalf("cause = %v, want the JSON object with the token replaced", line["cause"])
+	}
+}
+
+// TestObservability02ImageAuditMatchesTheDeploymentReference covers the image
+// audit half of the TC (AC-10, ADR-012): in the reference-template window the
+// template writes <job-image>, so both audit fields — job.created's image and
+// /foreman/version's job_image — must report the deployment's reference
+// verbatim. The value differs from the template's own text and from the
+// suite's default, so a constant answer cannot pass.
+func TestObservability02ImageAuditMatchesTheDeploymentReference(t *testing.T) {
+	const ref = "registry.example.com/tsic404/foreman-job:audit-2026-10-24"
+
+	h := newDeliveryHarness(t)
+	h.jobImage = ref
+	h.useRealBuilder(t)
+	if err := h.sched.OnClaim(t.Context(), deliveryPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+
+	created := h.events("job.created")
+	if len(created) != 1 {
+		t.Fatalf("job.created events = %d, want 1", len(created))
+	}
+	if got := created[0]["image"]; got != ref {
+		t.Errorf("job.created image = %v, want the deployment reference %q verbatim", got, ref)
+	}
+
+	// The field audits what the Job will run: the agent container carries the
+	// same string, not the template's placeholder and not an assembled digest.
+	job := h.createdJob(t, "fm-task-1")
+	var agentImage string
+	for _, container := range job.Spec.Template.Spec.Containers {
+		if container.Name == "agent" {
+			agentImage = container.Image
+			break
+		}
+	}
+	if agentImage != ref {
+		t.Errorf("agent container image = %q, want %q verbatim", agentImage, ref)
+	}
+
+	// ADR-012 names both fields as the AC-10 image audit face: the version
+	// endpoint reports the same deployment reference.
+	ops := httptest.NewServer(observability.NewOpsHandler(observability.NewMetrics(), h.reg, nil,
+		observability.OpsConfig{JobImage: ref}))
+	t.Cleanup(ops.Close)
+	code, body := httpGet(t, ops.URL+"/foreman/version")
+	if code != http.StatusOK {
+		t.Fatalf("GET /foreman/version = %d (%s), want 200", code, body)
+	}
+	var version map[string]string
+	if err := json.Unmarshal(body, &version); err != nil {
+		t.Fatalf("decode version body: %v (%s)", err, body)
+	}
+	if got := version["job_image"]; got != ref {
+		t.Errorf("version job_image = %q, want the deployment reference %q verbatim", got, ref)
 	}
 }

@@ -572,11 +572,11 @@ func TestRollbackKeepsAConcurrentEnqueuesCarrier(t *testing.T) {
 	deleteRelease := make(chan struct{})
 	createInWindow := make(chan struct{})
 	var once sync.Once
-	carriers.beforeDelete = func() {
+	carriers.onDelete = func(string) {
 		close(deleteEntered)
 		<-deleteRelease
 	}
-	carriers.beforePut = func() { once.Do(func() { close(createInWindow) }) }
+	carriers.onPut = func(Carrier) { once.Do(func() { close(createInWindow) }) }
 
 	rolledBack := make(chan struct{})
 	go func() {

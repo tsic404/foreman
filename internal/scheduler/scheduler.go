@@ -35,18 +35,12 @@ const jobGoneGracePeriod = 60 * time.Second
 // is not. The metric counts every occurrence.
 const malformedClaimLogInterval = time.Minute
 
-// jobNamePollInterval is the cadence at which a claim retries a Job create
-// whose name is still held by a foreground-terminating predecessor.
-const jobNamePollInterval = 500 * time.Millisecond
-
-// jobNameWait bounds that retry. The Job controller deletes the pods first
-// and the Job object follows once they are gone, normally within the 30s
-// terminationGracePeriodSeconds of the template (§8.7).
-const jobNameWait = 45 * time.Second
-
-// errJobNameHeld reports that a Job name was still held after jobNameWait (by
-// a terminating predecessor or an object this task does not own): the claim is
-// deferred to the server's re-dispatch, never reported as this task's failure.
+// errJobNameHeld reports that a Job name is still held by a predecessor this
+// claim may not displace: the object is terminating, it belongs to another
+// task, or its deletion failed. The claim is deferred to the server's
+// re-dispatch — never reported as this task's failure, and never waited on:
+// the claim round carries a whole batch (C-3 batch = free slots), so one held
+// name must not stall the tasks behind it (§9.1 task.claim_deferred).
 var errJobNameHeld = errors.New("job name still held")
 
 // PrepareLeaseTTL is the server-side prepare lease (C-3): the claim
@@ -318,10 +312,10 @@ type Scheduler struct {
 	// identity; nil leaves entries without one (S-4 then refuses).
 	runtimeIdentity RuntimeIdentityResolver
 
-	// attributionWait is the attribution gate's wait upper bound (ADR-031):
-	// the implementation constant defaultAttributionWait. It is kept as a
-	// field only so package tests can shrink it — it is not a configuration
-	// item and no env carries it.
+	// attributionWait is the attribution gate path's budget (ADR-031): the
+	// implementation constant defaultAttributionWait. It is kept as a field
+	// only so package tests can shrink it — it is not a configuration item
+	// and no env carries it.
 	attributionWait time.Duration
 
 	// beforeJobLock is a test seam in OnJobTerminated between the Job-name
@@ -446,9 +440,7 @@ func (s *Scheduler) ClaimBudget() int {
 		if s.leaderHeld != nil && !s.leaderHeld() {
 			return 0
 		}
-		ctx, cancel := sharedDetachedCtx()
-		defer cancel()
-		used, err := s.shared.Slots(ctx, "")
+		used, err := s.shared.Slots(context.Background(), "")
 		if err != nil {
 			// A store that cannot answer stops new claims (§10 共享状态不可用).
 			return 0
@@ -479,8 +471,7 @@ func (s *Scheduler) ClaimBudgetFor(workspaceID string) int {
 		if s.leaderHeld != nil && !s.leaderHeld() {
 			return 0
 		}
-		ctx, cancel := sharedDetachedCtx()
-		defer cancel()
+		ctx := context.Background()
 		used, err := s.shared.Slots(ctx, "")
 		if err != nil {
 			return 0
@@ -555,7 +546,7 @@ func (s *Scheduler) SyncInflight() {
 	if s.shared != nil {
 		// The shared counters are the cluster-level truth (§10 两级在途上限);
 		// the local index understates another instance's load.
-		ctx, cancel := sharedDetachedCtx()
+		ctx := context.Background()
 		global, err := s.shared.Slots(ctx, "")
 		if err == nil {
 			s.metrics.InflightJobs(int(global))
@@ -568,10 +559,8 @@ func (s *Scheduler) SyncInflight() {
 					}
 				}
 			}
-			cancel()
 			return
 		}
-		cancel()
 	}
 	s.metrics.InflightJobs(s.reg.Inflight())
 	// The per-workspace series is the two-level budget's observable face
@@ -949,74 +938,63 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 	return nil
 }
 
-// createJob places the entry's Job and returns the object the apiserver
-// holds. AlreadyExists is never an adoption: adoption is the rebuild row of
-// the disposal table and needs the payload (§4.3), while this claim carries no
-// facts of any existing Job — the object is a predecessor corpse. It is
-// deleted and the create retried within jobNameWait; adopting it would burn
-// the whole boot bound and mix the pod instance domains (AC-08). A terminating
-// object holds its name until its pods are gone (bounded wait, then
-// errJobNameHeld — a deferred claim, never this task's failure).
+// createJob places the entry's Job in one bounded attempt: create, and on
+// AlreadyExists one name probe (plus at most one stale-corpse delete and one
+// retry). It never waits for the name to free — a name still held defers the
+// claim to the server's re-dispatch instead (§9.1 task.claim_deferred), so one
+// task cannot hold up the rest of the batch.
+//
+// AlreadyExists is never an adoption (§4.3, AC-08): the object is a
+// predecessor corpse, and adopting it would mix the pod instance domains and
+// burn the boot bound.
 func (s *Scheduler) createJob(ctx context.Context, e registry.TaskEntry, job *batchv1.Job) (*batchv1.Job, error) {
-	deadline := s.now().Add(jobNameWait)
-	// maxPolls backs the clock bound so the loop cannot spin on a clock the
-	// caller froze (tests) or on a view that keeps reporting the name as
-	// free while Create disagrees.
-	maxPolls := int(jobNameWait / jobNamePollInterval)
-	// staleDeleteErr keeps the last failed attempt to free the name, so a
-	// deferred claim carries its cause.
-	var staleDeleteErr error
-	for poll := 0; ; poll++ {
-		created, err := s.jobs.CreateJob(ctx, job)
-		if err == nil {
-			return created, nil
-		}
-		if !apierrors.IsAlreadyExists(err) {
-			return nil, err
-		}
-		existing, probeErr := s.jobs.GetJob(ctx, e.JobName)
-		if probeErr != nil {
-			// Truth unknown: the name may still be held, so keep polling.
-			// Transient read failures stay in Debug (cf. prepare-lease);
-			// task.claim_deferred at the bound is the alert, and the outcome
-			// here is a deferred claim, never a task failure (AC-09).
-			s.log.DebugContext(ctx, "job.probe_failed",
-				"task_id", e.TaskID, "job_name", e.JobName, "err", probeErr)
-		} else if existing != nil && existing.DeletionTimestamp == nil {
-			if !jobOwnedBy(existing, e) {
-				// The name is not a locating face for deletion (§3): an
-				// object this task does not own is never removed. Defer the
-				// claim instead; the occupied name stays visible through
-				// task.claim_deferred.
-				return nil, fmt.Errorf("%w: %s (held by an object this task does not own)", errJobNameHeld, e.JobName)
-			}
-			if derr := s.jobs.DeleteJob(ctx, e.JobName); derr != nil {
-				staleDeleteErr = derr
-				s.log.DebugContext(ctx, "job.stale_delete_failed",
-					"task_id", e.TaskID, "job_name", e.JobName, "err", derr)
-			} else {
-				staleDeleteErr = nil
-				s.log.InfoContext(ctx, "job.stale_deleted",
-					"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID)
-			}
-		}
-		if poll >= maxPolls || s.now().After(deadline) {
-			if staleDeleteErr != nil {
-				return nil, fmt.Errorf("%w: %s (delete stale job: %v)", errJobNameHeld, e.JobName, staleDeleteErr)
-			}
-			return nil, fmt.Errorf("%w: %s", errJobNameHeld, e.JobName)
-		}
-		if probeErr == nil && existing == nil {
-			// The name just freed (GetJob's nil means the object is gone):
-			// retry the create without waiting out a poll interval.
-			continue
-		}
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-time.After(jobNamePollInterval):
-		}
+	created, err := s.jobs.CreateJob(ctx, job)
+	if err == nil {
+		return created, nil
 	}
+	if !apierrors.IsAlreadyExists(err) {
+		return nil, err
+	}
+	existing, probeErr := s.jobs.GetJob(ctx, e.JobName)
+	switch {
+	case probeErr != nil:
+		// Truth unknown: the name may still be held. A deferred claim, never
+		// a task failure (AC-09); transient read failures stay in Debug and
+		// task.claim_deferred is the alert.
+		s.log.DebugContext(ctx, "job.probe_failed",
+			"task_id", e.TaskID, "job_name", e.JobName, "err", probeErr)
+		return nil, fmt.Errorf("%w: %s", errJobNameHeld, e.JobName)
+	case existing == nil:
+		// The name freed between the create and the probe: retry once.
+	case existing.DeletionTimestamp != nil:
+		// A terminating predecessor holds its name until its pods are gone.
+		return nil, fmt.Errorf("%w: %s", errJobNameHeld, e.JobName)
+	case !jobOwnedBy(existing, e):
+		// The name is not a locating face for deletion (§3): an object this
+		// task does not own is never removed. Defer the claim instead; the
+		// occupied name stays visible through task.claim_deferred.
+		return nil, fmt.Errorf("%w: %s (held by an object this task does not own)", errJobNameHeld, e.JobName)
+	default:
+		// A stale corpse of this task: delete it and retry the create in the
+		// same claim (Background deletion removes the object at once).
+		if derr := s.jobs.DeleteJob(ctx, e.JobName); derr != nil {
+			s.log.DebugContext(ctx, "job.stale_delete_failed",
+				"task_id", e.TaskID, "job_name", e.JobName, "err", derr)
+			return nil, fmt.Errorf("%w: %s (delete stale job: %v)", errJobNameHeld, e.JobName, derr)
+		}
+		s.log.InfoContext(ctx, "job.stale_deleted",
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID)
+	}
+	// One retry: the probe said the name just freed, or the stale corpse is
+	// gone.
+	created, err = s.jobs.CreateJob(ctx, job)
+	if err == nil {
+		return created, nil
+	}
+	if apierrors.IsAlreadyExists(err) {
+		return nil, fmt.Errorf("%w: %s", errJobNameHeld, e.JobName)
+	}
+	return nil, err
 }
 
 // jobOwnedBy reports whether the existing object is a Foreman task Job of this
@@ -1220,70 +1198,87 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		defer s.SyncInflight()
 		verdict := gateUndecided
 		var decision gateDecision
+		var gateDeadline time.Time
 		if !e.IsTerminal() && len(e.DecidedReport) == 0 && ep == EPFail {
 			// §4.4/ADR-031: the S14 branch's first step is the attribution
 			// gate. It faces only this shape — an undecided inbound daemon
 			// failure self-report; a decided instance and the forwards
 			// produced by a verdict (compensation, queue replay) never enter.
-			e, body, verdict, decision = s.attributionGate(ctx, e, body, sessionID)
+			// The round's one budget starts here. The gate spends its share
+			// and leaves the reserve to the terminal write below, so the
+			// exits that exhaust the gate's share still write the verdict
+			// (§10, ADR-031).
+			gateDeadline = time.Now().Add(s.attributionWait)
+			e, body, verdict, decision = s.attributionGate(ctx, e, body, sessionID, gateDeadline)
 			now = s.now()
 		}
-		// The terminal write and the decided-body registration run under the
-		// task's lock, on a fresh read: the gate's wait opens a window in
-		// which another path (the convergence compensation, a late report)
-		// can settle this instance, and §4.4 forbids rewriting a decided one.
-		// The gate's verdict distinguishes its own settlement from such a
-		// decision; both skip this report's write.
-		unlockTerminal, lockErr := s.lockTaskFor(ctx, e.TaskID)
-		if lockErr != nil {
-			return http.StatusServiceUnavailable, nil, lockErr
-		}
-		if fresh, ok := s.reg.Get(e.TaskID); ok {
+		// An exit the gate already decided writes nothing here: it settled the
+		// instance itself, or it found another path's decision. Forwarding the
+		// decided body needs no lock, and re-taking the shared lease would put
+		// the unbounded lease wait back on the S14 path after the gate's
+		// budget ran out (§10, ADR-031).
+		//
+		// Only gateUndecided leaves the terminal write to this report, and
+		// that write still runs under the task's lock on a fresh read: the
+		// gate's wait opens a window in which another path (the convergence
+		// compensation, a late report) can settle this instance, and §4.4
+		// forbids rewriting a decided one. The lock draws on the reserve the
+		// gate left unspent, so a held lease cannot extend the S14 round.
+		if verdict == gateUndecided {
+			unlockTerminal, lockErr := s.lockTaskWithin(ctx, e.TaskID, gateDeadline)
+			if lockErr != nil {
+				return http.StatusServiceUnavailable, nil, lockErr
+			}
+			if fresh, ok := s.reg.Get(e.TaskID); ok {
+				e = fresh
+			}
+			undecided = !e.IsTerminal() && len(e.DecidedReport) == 0
+			if undecided {
+				// §10 write-ahead: the report is durable before the verdict
+				// exists only in memory. Marking first and enqueueing on failure
+				// left a window where a crash lost both the verdict and the
+				// report; the rebuilt Job then read a completed task as failed.
+				s.enqueuePending(ctx, e, ep, "", body)
+				result := registry.Result(ep.TerminalResult())
+				_, first, err := s.reg.MarkTerminal(e.TaskID, result, "", now)
+				if err != nil {
+					// The verdict this entry was written ahead of never
+					// landed, so the entry must not outlive it: a replay
+					// would make a report this instance never decided the
+					// terminal source (§4.3). Withdraw this snapshot —
+					// carrier included, and only while the queue still holds
+					// it: a concurrent enqueue of the same task owns its own
+					// entry and its own carrier. The caller's retry then walks
+					// the whole order again.
+					s.pendingReports.DropIfUnchanged(ctx, e.TaskID, ep, body)
+					unlockTerminal()
+					return 0, nil, err
+				}
+				if first {
+					s.metrics.TaskTerminal(string(result))
+					s.log.InfoContext(ctx, "task.terminal",
+						"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+						"workspace_id", e.WorkspaceID,
+						"result", string(result),
+						"duration_seconds", now.Sub(e.ClaimedAt).Seconds())
+					// The decision event is emitted here, under the lock that
+					// wrote the verdict: a decision another path landed in the
+					// window between the gate's read and this write left this
+					// report undecided, so no event names a superseded decision.
+					if decision.decision != "" {
+						s.attributionDecided(ctx, e, decision.decision, decision.factSource, decision.errorSource)
+					}
+					// The instance's first terminal forward decides its body:
+					// every later terminal forward takes this one (§4.4).
+					if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body); ok {
+						e = registered
+					}
+				}
+			}
+			unlockTerminal()
+		} else if fresh, ok := s.reg.Get(e.TaskID); ok {
 			e = fresh
 		}
-		undecided = verdict == gateUndecided && !e.IsTerminal() && len(e.DecidedReport) == 0
-		if undecided {
-			// §10 write-ahead: the report is durable before the verdict
-			// exists only in memory. Marking first and enqueueing on failure
-			// left a window where a crash lost both the verdict and the
-			// report; the rebuilt Job then read a completed task as failed.
-			s.enqueuePending(ctx, e, ep, "", body)
-			result := registry.Result(ep.TerminalResult())
-			_, first, err := s.reg.MarkTerminal(e.TaskID, result, "", now)
-			if err != nil {
-				// The verdict this entry was written ahead of never landed,
-				// so the entry must not outlive it: a replay would make a
-				// report this instance never decided the terminal source
-				// (§4.3). Withdraw this snapshot — carrier included, and only
-				// while the queue still holds it: a concurrent enqueue of the
-				// same task owns its own entry and its own carrier. The
-				// caller's retry then walks the whole order again.
-				s.pendingReports.DropIfUnchanged(ctx, e.TaskID, ep, body)
-				unlockTerminal()
-				return 0, nil, err
-			}
-			if first {
-				s.metrics.TaskTerminal(string(result))
-				s.log.InfoContext(ctx, "task.terminal",
-					"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
-					"workspace_id", e.WorkspaceID,
-					"result", string(result),
-					"duration_seconds", now.Sub(e.ClaimedAt).Seconds())
-				// The decision event is emitted here, under the lock that
-				// wrote the verdict: a decision another path landed in the
-				// window between the gate's read and this write left this
-				// report undecided, so no event names a superseded decision.
-				if decision.decision != "" {
-					s.attributionDecided(ctx, e, decision.decision, decision.factSource, decision.errorSource)
-				}
-				// The instance's first terminal forward decides its body:
-				// every later terminal forward takes this one (§4.4).
-				if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body); ok {
-					e = registered
-				}
-			}
-		}
-		unlockTerminal()
 		if decided, ok := s.reg.DecidedReport(e.TaskID); ok {
 			body = decided
 		}
@@ -2432,17 +2427,21 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		if !s.workspaceConfigured(secret.Labels[registry.LabelWorkspaceID]) {
 			continue
 		}
-		if s.pendingReports.Queued(taskID) {
-			// Unsettled carriers are never swept — the retention bound does
-			// not apply to entries already queued (§6.5, §4.6).
-			continue
-		}
-		if err := s.jobs.DeleteSecret(ctx, secret.Name); err != nil {
+		// The deletion is the queue's call: the settled check and the delete
+		// must not be split by an enqueue that adopts the object as its
+		// already-landed carrier write (§6.5, ADR-046 decision 3).
+		deleted, err := s.pendingReports.SweepCarrier(ctx, taskID, secret.Name)
+		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			s.log.WarnContext(ctx, "pending.carrier_delete_failed",
 				"task_id", taskID, "secret", secret.Name, "err", err.Error())
+			continue
+		}
+		if !deleted {
+			// A live entry holds this carrier: the retention bound does not
+			// apply to entries already queued (§6.5, §4.6).
 			continue
 		}
 		s.log.InfoContext(ctx, "pending.carrier_removed",

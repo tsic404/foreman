@@ -22,7 +22,7 @@ import (
 // tcForbidden07DesignAnchor is the frozen design revision every input must
 // name; the HEAD of the checkout (or the carried bundle) is checked against
 // it before the scan.
-const tcForbidden07DesignAnchor = "d08dbe84955f94ec6c17365f79101a8f187a517b"
+const tcForbidden07DesignAnchor = "6c4be145d97c03f2405b62d43d3bc05eeb6df013"
 
 // tcForbidden07DesignDir locates the design checkout.
 func tcForbidden07DesignDir(t *testing.T) string {

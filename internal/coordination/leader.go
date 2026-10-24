@@ -128,8 +128,7 @@ type Leader struct {
 	cfg   Config
 	log   *slog.Logger
 
-	held    atomic.Bool
-	crashed atomic.Bool
+	held atomic.Bool
 	// onAcquire runs after the takeover window and before the control plane
 	// is granted; a failure releases the lease and retries (the acquire path
 	// must not serve an unreconciled state).
@@ -184,14 +183,6 @@ func New(store state.CoordStore, instanceID string, cfg Config, opts ...Option) 
 // InstanceID is this process's identity.
 func (l *Leader) InstanceID() string { return l.id }
 
-// Crash parks the instance as a dead holder: the lease is left to expire (no
-// graceful release), exactly like a killed process. It is the takeover
-// scenario's kill switch.
-func (l *Leader) Crash() {
-	l.crashed.Store(true)
-	l.held.Store(false)
-}
-
 // Held reports whether this instance owns the control plane. The control
 // loops call it every iteration; a false answer parks them without exiting.
 func (l *Leader) Held() bool { return l.held.Load() }
@@ -206,9 +197,7 @@ func (l *Leader) Run(ctx context.Context) error {
 			ok, err := l.store.AcquireLeadership(ctx, l.id, l.cfg.LeaseTTL)
 			if err == nil && ok {
 				if !l.holdThroughWindow(ctx, tick) {
-					if !l.crashed.Load() {
-						_ = l.store.ReleaseLeadership(context.WithoutCancel(ctx), l.id)
-					}
+					_ = l.store.ReleaseLeadership(context.WithoutCancel(ctx), l.id)
 					if ctx.Err() != nil {
 						return nil
 					}
@@ -276,7 +265,7 @@ func (l *Leader) Run(ctx context.Context) error {
 			}
 		}
 		if !sleep(ctx, tick) {
-			if l.held.Load() && !l.crashed.Load() {
+			if l.held.Load() {
 				_ = l.store.ReleaseLeadership(context.WithoutCancel(ctx), l.id)
 			}
 			return nil
