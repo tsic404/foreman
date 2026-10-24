@@ -105,11 +105,11 @@ func TestRecovery02PlatformDeadlineAttributionWinsOverTheDaemonSelfReport(t *tes
 	if len(decided) != 1 {
 		t.Fatalf("task.attribution_decided = %+v, want exactly one decision", decided)
 	}
-	if decided[0]["decision"] != scheduler.DecisionPlatform || decided[0]["fact_source"] != scheduler.FactSourceJob {
+	if decided[0]["decision"] != "platform" || decided[0]["fact_source"] != "job" {
 		t.Fatalf("task.attribution_decided = %+v, want decision=platform fact_source=job", decided[0])
 	}
 	for _, event := range decided {
-		if event["decision"] == scheduler.DecisionDegraded {
+		if event["decision"] == "degraded" {
 			t.Fatalf("degraded branch taken on the gate path: %+v", event)
 		}
 	}
@@ -152,7 +152,7 @@ func TestRecovery02DaemonSelfReportIsForwardedAtOnceWithoutAPlatformFact(t *test
 		t.Fatalf("entry = %+v, want the daemon's own failed verdict", settled)
 	}
 	decided := h.events("task.attribution_decided")
-	if len(decided) != 1 || decided[0]["decision"] != scheduler.DecisionDaemonSelfReport {
+	if len(decided) != 1 || decided[0]["decision"] != "daemon_self_report" {
 		t.Fatalf("task.attribution_decided = %+v, want decision=daemon_self_report", decided)
 	}
 }
@@ -321,7 +321,7 @@ func TestRecovery05ExpiredWaitReleasesTheSelfReportWithVisibleDegradation(t *tes
 	if len(decided) != 1 {
 		t.Fatalf("task.attribution_decided = %+v, want exactly one decision", decided)
 	}
-	if decided[0]["decision"] != scheduler.DecisionDegraded {
+	if decided[0]["decision"] != "degraded" {
 		t.Fatalf("task.attribution_decided = %+v, want decision=degraded", decided[0])
 	}
 	if source, present := decided[0]["fact_source"]; present && source != "" {
@@ -405,7 +405,7 @@ func TestRecovery02GateExpiresAtTheProductionWaitBound(t *testing.T) {
 		t.Fatalf("task.failed_compensated = %+v, want none on the expired wait", events)
 	}
 	decided := h.events("task.attribution_decided")
-	if len(decided) != 1 || decided[0]["decision"] != scheduler.DecisionDegraded {
+	if len(decided) != 1 || decided[0]["decision"] != "degraded" {
 		t.Fatalf("task.attribution_decided = %+v, want decision=degraded", decided)
 	}
 }
@@ -476,7 +476,7 @@ func TestRecovery02GatePathStaysInsideTheAttributionBudget(t *testing.T) {
 		t.Fatalf("S14 took %s, want it inside the start point plus the attribution bound", elapsed)
 	}
 	decided := h.events("task.attribution_decided")
-	if len(decided) != 1 || decided[0]["decision"] != scheduler.DecisionReadError || decided[0]["error_source"] != "c13" {
+	if len(decided) != 1 || decided[0]["decision"] != "read_error" || decided[0]["error_source"] != "c13" {
 		t.Fatalf("task.attribution_decided = %+v, want decision=read_error error_source=c13", decided)
 	}
 	forwards := h.server.forwarded(scheduler.EPFail)
