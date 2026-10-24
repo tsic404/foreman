@@ -2058,13 +2058,21 @@ type schedulerServerClient struct {
 	// transition inside the round trip (an S8 start whose MarkStarted must
 	// beat the caller's next deletion decision).
 	onStatus func()
+	// statusHangs holds C13 until its context ends: a control-plane answer
+	// that never arrives inside the caller's budget.
+	statusHangs bool
 }
 
-func (c *schedulerServerClient) TaskStatus(_ context.Context, taskID string) (string, error) {
+func (c *schedulerServerClient) TaskStatus(ctx context.Context, taskID string) (string, error) {
 	c.mu.Lock()
 	status, err := c.statusAnswerLocked(taskID)
 	hook := c.onStatus
+	hangs := c.statusHangs
 	c.mu.Unlock()
+	if hangs {
+		<-ctx.Done()
+		return "", ctx.Err()
+	}
 	if hook != nil {
 		hook()
 	}
@@ -2087,6 +2095,15 @@ func (c *schedulerServerClient) setStatusHook(h func()) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.onStatus = h
+}
+
+// setStatusHangs makes C13 hold until its context ends, so a scenario can
+// judge what a caller bounded by its own budget does when the answer never
+// arrives.
+func (c *schedulerServerClient) setStatusHangs(hang bool) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.statusHangs = hang
 }
 
 // setStatus programs the C13 answer for one task: once any task has one, an
@@ -3217,6 +3234,13 @@ func (h *harness) declare(d registry.Discovery) {
 
 // call performs one Job-side request against the fake server.
 func (h *harness) call(method, path, token string, body []byte) (int, []byte) {
+	return h.callWithin(0, method, path, token, body)
+}
+
+// callWithin is call under a client bound: a scenario that judges a latency
+// bound then reads a failure instead of hanging when the bound is missing.
+// A zero timeout means no client bound.
+func (h *harness) callWithin(timeout time.Duration, method, path, token string, body []byte) (int, []byte) {
 	h.t.Helper()
 	req, err := http.NewRequest(method, h.jobsHTTP.URL+path, bytes.NewReader(body))
 	if err != nil {
@@ -3225,7 +3249,11 @@ func (h *harness) call(method, path, token string, body []byte) (int, []byte) {
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	client := http.DefaultClient
+	if timeout > 0 {
+		client = &http.Client{Timeout: timeout}
+	}
+	resp, err := client.Do(req)
 	if err != nil {
 		h.t.Fatalf("%s %s: %v", method, path, err)
 	}

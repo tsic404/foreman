@@ -266,6 +266,13 @@ func TestDelivery01DeliveredEntryKeepsItsAttributionAtTheBootBound(t *testing.T)
 			settled.State, settled.Result, settled.FailureReason,
 			scheduler.FailureReasonDeliveryUnconfirmed, scheduler.FailureReasonJobBootTimeout)
 	}
+	// The verdict write and the compensation event are the same path, but the
+	// event lands just after the state is readable: read the log on a bound
+	// instead of sampling it at the instant the poll saw the terminal state —
+	// a loaded -race run can schedule the writer between the two.
+	waitFor(t, "the failed-compensation event of task-1", 2*time.Second, func() bool {
+		return len(h.events("task.failed_compensated")) >= 1
+	})
 	compensated := h.events("task.failed_compensated")
 	if len(compensated) != 1 {
 		t.Fatalf("task.failed_compensated events = %d, want 1", len(compensated))

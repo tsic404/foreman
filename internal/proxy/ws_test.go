@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -594,8 +595,20 @@ type wsGoneStub struct {
 	// (true = answer the runtime-gone 404): a test can dictate stale episodes
 	// and healthy connections instead of relying on the stub's current id.
 	dialScript []bool
-	live       int
-	peakLive   int
+	// conns records every accepted stream's observed interval, in accept
+	// order. The counts are computed from these timestamps, never pushed by
+	// the handlers: a handler that is still starting up cannot report a
+	// connection it has not observed yet.
+	conns []wsConn
+}
+
+// wsConn is one accepted stream's observed interval, half-open: openedAt is
+// stamped after the handshake, closedAt when the connection's read returns. A
+// zero closedAt is an open interval — the stream still holds its connection.
+type wsConn struct {
+	runtimeID string
+	openedAt  time.Time
+	closedAt  time.Time
 }
 
 func newWSGoneStub(t *testing.T, runtimeID string) (*httptest.Server, *wsGoneStub) {
@@ -623,12 +636,6 @@ func newWSGoneStub(t *testing.T, runtimeID string) (*httptest.Server, *wsGoneStu
 		if idx := len(stub.dials) - 1; idx < len(stub.dialScript) {
 			accept = !stub.dialScript[idx]
 		}
-		if accept {
-			stub.live++
-			if stub.live > stub.peakLive {
-				stub.peakLive = stub.live
-			}
-		}
 		stub.mu.Unlock()
 		if !accept {
 			w.WriteHeader(http.StatusNotFound)
@@ -640,11 +647,8 @@ func newWSGoneStub(t *testing.T, runtimeID string) (*httptest.Server, *wsGoneStu
 			return
 		}
 		defer conn.Close(websocket.StatusNormalClosure, "closing")
-		defer func() {
-			stub.mu.Lock()
-			stub.live--
-			stub.mu.Unlock()
-		}()
+		idx := stub.noteOpened(want)
+		defer stub.noteClosed(idx)
 		_, _, _ = conn.Read(r.Context()) // hold until the peer goes away
 	})
 	srv := httptest.NewServer(mux)
@@ -652,17 +656,104 @@ func newWSGoneStub(t *testing.T, runtimeID string) (*httptest.Server, *wsGoneStu
 	return srv, stub
 }
 
-// liveConnections / peakConnections report the observed connection counts.
+// noteOpened stamps a stream's interval start and returns its index in the
+// record, so its close lands on the same entry.
+func (s *wsGoneStub) noteOpened(runtimeID string) int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.conns = append(s.conns, wsConn{runtimeID: runtimeID, openedAt: time.Now()})
+	return len(s.conns) - 1
+}
+
+// noteClosed stamps a stream's interval end as soon as its read returns: the
+// close is observed, not waited for.
+func (s *wsGoneStub) noteClosed(idx int) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if idx < len(s.conns) {
+		s.conns[idx].closedAt = time.Now()
+	}
+}
+
+// wsCloseSettle is the observation-noise bound of the recorded intervals. The
+// client closes a retired stream before dialing its replacement (§1.2 C-20),
+// but this stub learns of that close from the retired connection's own goroutine,
+// which can run a scheduling hop after the replacement's handshake: an overlap
+// shorter than this bound is observation lag, not a client holding two streams.
+const wsCloseSettle = 250 * time.Millisecond
+
+// liveConnections reports how many streams hold their connection right now.
 func (s *wsGoneStub) liveConnections() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.live
+	now := time.Now()
+	live := 0
+	for _, c := range s.conns {
+		if c.closedAt.IsZero() || now.Before(c.closedAt) {
+			live++
+		}
+	}
+	return live
 }
 
+// peakConnections reports the largest number of streams whose intervals
+// intersect for longer than wsCloseSettle. Each interval is shrunk by half the
+// bound at both ends, so two intervals still touching afterwards overlapped past
+// the noise: a real stack stays open and keeps growing, while a close observed a
+// hop late never reaches the bound. An interval without a close runs to now.
 func (s *wsGoneStub) peakConnections() int {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.peakLive
+	now := time.Now()
+	half := wsCloseSettle / 2
+	type mark struct {
+		at    time.Time
+		delta int
+	}
+	var marks []mark
+	for _, c := range s.conns {
+		end := now
+		if !c.closedAt.IsZero() {
+			end = c.closedAt
+		}
+		open, shut := c.openedAt.Add(half), end.Add(-half)
+		if !shut.After(open) {
+			continue // too short to outlive the noise bound
+		}
+		marks = append(marks, mark{open, 1}, mark{shut, -1})
+	}
+	sort.Slice(marks, func(i, j int) bool {
+		if marks[i].at.Equal(marks[j].at) {
+			return marks[i].delta < marks[j].delta
+		}
+		return marks[i].at.Before(marks[j].at)
+	})
+	cur, peak := 0, 0
+	for _, m := range marks {
+		cur += m.delta
+		if cur > peak {
+			peak = cur
+		}
+	}
+	if peak == 0 && len(s.conns) > 0 {
+		// Nothing overlapped past the noise bound: the streams took turns, and
+		// the peak of "one at a time" is 1, not 0 — a connection shorter than
+		// the bound is still a connection.
+		return 1
+	}
+	return peak
+}
+
+// handover reports whether stream i was observed closed and stream j observed
+// opened — a move's ordering read from the intervals, not guessed from a live
+// count that cannot tell the old stream from the new one.
+func (s *wsGoneStub) handover(i, j int) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.conns) <= j {
+		return false
+	}
+	return !s.conns[i].closedAt.IsZero() && !s.conns[j].openedAt.IsZero()
 }
 
 // setAccept lets a dial for the current id succeed (the "row dialable again"
@@ -795,7 +886,8 @@ func TestWSSubscriberKeepsOneConnectionPerRuntimeOnIDMove(t *testing.T) {
 	}
 	waitFor(t, "the replacement connection", func() bool {
 		dials, _ := stub.summary()
-		return len(dials) > firstMove && client.RuntimeIDs()[0] == "rid-real-2" && stub.liveConnections() == 1
+		return len(dials) > firstMove && client.RuntimeIDs()[0] == "rid-real-2" &&
+			(stub.handover(0, 1) || stub.peakConnections() > 1)
 	})
 
 	// A second move must not stack another connection either.
@@ -806,11 +898,14 @@ func TestWSSubscriberKeepsOneConnectionPerRuntimeOnIDMove(t *testing.T) {
 	if _, err := client.rebuildRuntime(t.Context(), "rid-real-2"); err != nil {
 		t.Fatalf("rebuildRuntime: %v", err)
 	}
+	// Judged once the move's handover is recorded (old closed, replacement
+	// opened): both endpoints of that pair are then known, so its overlap is
+	// final and no settle sleep is needed. A stream a broken retire left held
+	// never closes, and its growing overlap crosses the noise bound first.
 	waitFor(t, "the second replacement connection", func() bool {
 		dials, _ := stub.summary()
-		return len(dials) > firstMove && stub.liveConnections() == 1
+		return len(dials) > firstMove && (stub.handover(1, 2) || stub.peakConnections() > 1)
 	})
-	time.Sleep(200 * time.Millisecond)
 	if live := stub.liveConnections(); live != 1 {
 		t.Fatalf("live connections = %d, want exactly one per provider (§1.2 C-20)", live)
 	}
