@@ -16,7 +16,10 @@ import (
 )
 
 func TestTechMulti02CrossInstanceDeliveryAndTerminalSingleWrite(t *testing.T) {
-	window := 300 * time.Millisecond
+	// The window only has to outlast the probe that reads it: the in-window
+	// claim runs a few milliseconds after the delivery commit, and a loaded
+	// machine must not be able to schedule it past the lease.
+	window := time.Second
 	tw := newTwoInstances(t, twoInstanceOptions{deliveryWindow: window, leaderCfg: smallLeaderCfg(2 * time.Second)})
 	tw.declareAll(t)
 	tw.a.startLeader(t)
@@ -30,7 +33,9 @@ func TestTechMulti02CrossInstanceDeliveryAndTerminalSingleWrite(t *testing.T) {
 	// create the Job (§2.1 任实例服务).
 	tw.registerVia(t, tw.b, "task-2", token)
 
-	claimed := tw.claimVia(t, tw.b, "task-2", token)
+	// The delivery is what the case judges, not the request that carried it:
+	// the daemon keeps claiming, so the batch with the payload is awaited.
+	claimed := tw.awaitDelivery(t, tw.b, "task-2", token, 10*time.Second)
 	if len(claimed) != 1 {
 		t.Fatalf("first delivery on B = %d tasks, want 1", len(claimed))
 	}
@@ -44,9 +49,11 @@ func TestTechMulti02CrossInstanceDeliveryAndTerminalSingleWrite(t *testing.T) {
 	if again := tw.claimVia(t, tw.a, "task-2", token); len(again) != 0 {
 		t.Fatalf("in-window claim on A delivered %d tasks, want none", len(again))
 	}
-	// Past the window the take lease releases the payload once.
-	time.Sleep(window + multiSharedWindowPad)
-	redelivered := tw.claimVia(t, tw.a, "task-2", token)
+	// Past the window the take lease releases the payload once. The window's
+	// end is observed through the claim it releases — an in-window claim is
+	// answered empty — instead of a fixed sleep a loaded machine can
+	// overshoot; the wait itself stays bounded by the window plus the pad.
+	redelivered := tw.awaitDelivery(t, tw.a, "task-2", token, window+multiSharedWindowPad)
 	if len(redelivered) != 1 {
 		t.Fatalf("re-delivery on A = %d tasks, want 1", len(redelivered))
 	}

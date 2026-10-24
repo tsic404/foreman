@@ -47,19 +47,28 @@ func (tw *twoInstances) startClaims(t *testing.T) {
 	startConcurrency01ClaimLoop(t, tw.b)
 }
 
-// awaitClaimedJob waits until the shared fake cluster holds the task's Job.
+// awaitClaimedJob waits until the claim is complete on both faces a later
+// step reads: the shared fake cluster holds the task's Job, and the shared row
+// records its creation. The row's job_created commit is the fact S-4's
+// registration gate reads — a registration that lands while the row is still
+// pending is answered 200 but advances nothing, and the task then never
+// becomes deliverable.
 func (tw *twoInstances) awaitClaimedJob(t *testing.T, taskID string) {
 	t.Helper()
 	name := "fm-" + taskID
 	deadline := time.Now().Add(10 * time.Second)
 	for time.Now().Before(deadline) {
 		if tw.a.jobs.jobCreated(name) {
-			return
+			if e, ok, err := tw.store.GetEntry(context.Background(), "ws-1", taskID); err == nil && ok && !e.JobCreatedAt.IsZero() {
+				return
+			}
 		}
 		time.Sleep(5 * time.Millisecond)
 	}
 	slots, _ := tw.coord.Slots(context.Background(), "")
-	t.Fatalf("Job %s was never created; slots=%d server_queue=%d queue_rows=%d", name, slots, tw.a.upstream.queuedCount(), tw.a.jobs.liveJobs())
+	e, ok, _ := tw.store.GetEntry(context.Background(), "ws-1", taskID)
+	t.Fatalf("Job %s was never created; slots=%d server_queue=%d queue_rows=%d row_ok=%v row_state=%s",
+		name, slots, tw.a.upstream.queuedCount(), tw.a.jobs.liveJobs(), ok, e.State)
 }
 
 // awaitNoClaimedJob asserts no Job appears for the task inside the window.
@@ -137,6 +146,26 @@ func (tw *twoInstances) claimCode(t *testing.T, h *harness, taskID, token string
 		t.Fatalf("marshal claim body: %v", err)
 	}
 	return h.call("POST", "/api/daemon/tasks/claim", token, body)
+}
+
+// awaitDelivery performs S-6 through h until a batch carries the task and
+// returns that batch. An empty batch is the daemon's retry face: the row is
+// not deliverable yet, or the confirmation window still holds the take. The
+// delivery is the criterion, not the request that happened to carry it.
+func (tw *twoInstances) awaitDelivery(t *testing.T, h *harness, taskID, token string, timeout time.Duration) []json.RawMessage {
+	t.Helper()
+	deadline := time.Now().Add(timeout)
+	for {
+		if got := tw.claimVia(t, h, taskID, token); len(got) > 0 {
+			return got
+		}
+		if time.Now().After(deadline) {
+			e, _ := tw.entry(t, taskID)
+			t.Fatalf("S6(%s) through %s delivered nothing within %s; row_state=%s deliveries=%d",
+				taskID, h.instanceID, timeout, e.State, e.Deliveries)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 }
 
 // registerVia performs S-4 through h's fake server (the daemon reaches the
