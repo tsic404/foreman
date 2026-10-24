@@ -740,3 +740,86 @@ func TestDeliverQueuedWithoutEntrySettlesPermanent4xx(t *testing.T) {
 		})
 	}
 }
+
+// TestDeliverQueuedPermanent4xxDropsOnlyTheReplayedSnapshot pins the queue
+// face of the permanent-rejection exit: what leaves is the snapshot the drain
+// handed over, never the task id. A late report enqueued while the replay was
+// in flight is its own forward's write-ahead entry (§10); deleting it with
+// the refused snapshot would leave that report without a queue home.
+func TestDeliverQueuedPermanent4xxDropsOnlyTheReplayedSnapshot(t *testing.T) {
+	cases := []struct {
+		name      string
+		entryGone bool
+	}{
+		{"entry present", false},
+		{"entry gone", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			p := f.withDurableReports(t)
+			e := f.claim(t, "t-dq-snap")
+			sent := []byte(`{"result":"ok"}`)
+			newer := []byte(`{"result":"failed","failure_reason":"job_failed"}`)
+			if err := p.Enqueue(context.Background(), e.TaskID, e.JobName, e.DaemonID, "", EPComplete, sent, ""); err != nil {
+				t.Fatalf("Enqueue: %v", err)
+			}
+			// The concurrent enqueue landed after the drain snapshotted
+			// `sent`, so the queued entry now belongs to another forward.
+			if err := p.Enqueue(context.Background(), e.TaskID, e.JobName, e.DaemonID, "", EPFail, newer, "job_failed"); err != nil {
+				t.Fatalf("re-Enqueue: %v", err)
+			}
+			if tc.entryGone {
+				if err := f.reg.Delete(e.TaskID); err != nil {
+					t.Fatalf("reg.Delete: %v", err)
+				}
+			}
+			f.server.forwardCode = 400
+
+			if code, _, err := f.sched.DeliverQueued(t.Context(), EPComplete, e.TaskID, "", sent, ""); err != nil || code != 400 {
+				t.Fatalf("DeliverQueued = %d, %v; want the upstream code 400", code, err)
+			}
+			if !p.Queued(e.TaskID) {
+				t.Fatal("the newer enqueue owns its own write-ahead entry; the refused snapshot must not drop it by task id")
+			}
+			// The survivor is the newer snapshot, and the next drain replays
+			// exactly that report.
+			sender := &fakeSender{code: 200}
+			if remaining, err := p.Drain(context.Background(), sender); err != nil || remaining != 0 {
+				t.Fatalf("Drain = %d, %v; want the newer report delivered", remaining, err)
+			}
+			if len(sender.sent) != 1 || !strings.HasPrefix(sender.sent[0], e.TaskID+":"+string(EPFail)+":") {
+				t.Fatalf("replayed = %v, want the newer failure report", sender.sent)
+			}
+		})
+	}
+}
+
+// TestDeliverQueuedPermanent4xxDropsTheQueuedSnapshotAfterAReplacedBody: the
+// replay forwards the instance's decided body, so the identity of the entry
+// being dropped is the queue's own snapshot — comparing the body actually sent
+// would leave the refused entry queued until the TTL.
+func TestDeliverQueuedPermanent4xxDropsTheQueuedSnapshotAfterAReplacedBody(t *testing.T) {
+	f := newFixture(t)
+	p := f.withDurableReports(t)
+	e := f.claim(t, "t-dq-decided")
+	queued := []byte(`{"result":"failed","failure_reason":"job_create_failed"}`)
+	decided := []byte(`{"result":"failed","failure_reason":"job_failed"}`)
+	if err := p.Enqueue(context.Background(), e.TaskID, e.JobName, e.DaemonID, "", EPFail, queued, "job_create_failed"); err != nil {
+		t.Fatalf("Enqueue: %v", err)
+	}
+	if _, ok := f.reg.RegisterDecidedReport(e.TaskID, decided); !ok {
+		t.Fatal("RegisterDecidedReport: entry missing")
+	}
+	f.server.forwardCode = 400
+
+	if code, _, err := f.sched.DeliverQueued(t.Context(), EPFail, e.TaskID, "", queued, "job_create_failed"); err != nil || code != 400 {
+		t.Fatalf("DeliverQueued = %d, %v; want the upstream code 400", code, err)
+	}
+	if len(f.server.forwards) != 1 || f.server.forwards[0].body != string(decided) {
+		t.Fatalf("forwarded = %+v, want the instance's decided body", f.server.forwards)
+	}
+	if p.Queued(e.TaskID) {
+		t.Fatal("the snapshot the replay sent was permanently refused; its queue entry must leave")
+	}
+}

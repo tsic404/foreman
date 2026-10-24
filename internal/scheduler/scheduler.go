@@ -2874,6 +2874,11 @@ func (s *Scheduler) RestorePendingReports(ctx context.Context) error {
 // is never an inbound report — it does not enter the attribution gate and
 // cannot emit a second attribution decision.
 func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, workspaceID string, body []byte, failureReason string) (int, []byte, error) {
+	// The queue snapshot this replay was handed. It is the entry's identity
+	// for every drop below: body may be replaced by the decided body before
+	// the forward, but an unconditional drop by task id would take a newer
+	// enqueue (§10 forbids losing that report).
+	queuedBody := body
 	e, ok := s.reg.Get(taskID)
 	if !ok {
 		// The credential was reclaimed before the report landed: the entry is
@@ -2890,8 +2895,11 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, work
 		code, resp, err := forward(ctx, ep, taskID, body)
 		if err == nil && ep.IsTerminal() && permanentTerminalRejection(code) {
 			// A replay of a permanently refused report would only be refused
-			// again: the queue entry goes now instead of at the TTL.
-			s.pendingReports.Drop(ctx, taskID)
+			// again: the queue entry goes now instead of at the TTL — but only
+			// while the queue still holds the snapshot just refused. A newer
+			// enqueue for the same task owns its own entry and its own carrier
+			// (§10).
+			s.pendingReports.DropIfUnchanged(ctx, taskID, ep, queuedBody)
 			s.log.ErrorContext(ctx, "task.forward_dropped",
 				"task_id", taskID, "endpoint", string(ep), "status", code,
 				"reason", "permanent_4xx")
@@ -2953,8 +2961,10 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, work
 		// §1.5: a permanent 4xx is never retried. The queue entry goes so the
 		// drain cannot replay it to the TTL (and SettleTerminal's Queued gate
 		// cannot keep the Job around for it); the Job is torn down like every
-		// other terminal path.
-		s.pendingReports.Drop(ctx, taskID)
+		// other terminal path. Only the snapshot just refused leaves: a newer
+		// enqueue for the same task — a late report enqueued while this replay
+		// was in flight — keeps its entry and carrier (§10).
+		s.pendingReports.DropIfUnchanged(ctx, taskID, ep, queuedBody)
 		s.log.ErrorContext(ctx, "task.forward_dropped",
 			"task_id", taskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 			"endpoint", string(ep), "status", code, "reason", "permanent_4xx")
