@@ -72,21 +72,21 @@ func TestPlatformTerminationFixedOrder(t *testing.T) {
 			name:   "job condition wins over the pod",
 			job:    deadlineJob("fm-a", since),
 			pods:   []corev1.Pod{testPod("fm-a", corev1.PodFailed)},
-			source: FactSourceJob,
+			source: "job",
 			hit:    true,
 		},
 		{
 			name:   "pod container reason is the fallback",
 			job:    jobFailedWith("fm-a", "BackoffLimitExceeded"),
 			pods:   []corev1.Pod{deadlinePod("fm-a", since)},
-			source: FactSourcePod,
+			source: "pod",
 			hit:    true,
 		},
 		{
 			name:   "a missing Job does not stop the pod read",
 			pods:   []corev1.Pod{deadlinePod("fm-a", since)},
 			hit:    true,
-			source: FactSourcePod,
+			source: "pod",
 		},
 		{name: "no objects is a miss", job: nil},
 		{
@@ -105,6 +105,32 @@ func TestPlatformTerminationFixedOrder(t *testing.T) {
 				t.Fatalf("PlatformTermination = (%q, %v), want (%q, %v)", source, hit, tt.source, tt.hit)
 			}
 		})
+	}
+}
+
+// TestAttributionEventValueLiterals pins the task.attribution_decided value
+// set to its literals (§9.1, ADR-031 observation face): consumers read
+// decision and fact_source by value, so a drifted constant would rewrite the
+// event's meaning while every branch test still compares symbol to symbol.
+func TestAttributionEventValueLiterals(t *testing.T) {
+	for want, got := range map[string]string{
+		"platform":           DecisionPlatform,
+		"degraded":           DecisionDegraded,
+		"read_error":         DecisionReadError,
+		"c13_settled":        DecisionC13Settled,
+		"daemon_self_report": DecisionDaemonSelfReport,
+	} {
+		if got != want {
+			t.Errorf("decision value = %q, want the emitted literal %q", got, want)
+		}
+	}
+	for want, got := range map[string]string{
+		"job": FactSourceJob,
+		"pod": FactSourcePod,
+	} {
+		if got != want {
+			t.Errorf("fact_source value = %q, want the emitted literal %q", got, want)
+		}
 	}
 }
 
@@ -209,7 +235,7 @@ func TestOnReportAttributionGateDecidesPlatform(t *testing.T) {
 	if len(decided) != 1 {
 		t.Fatalf("attribution_decided events = %+v, want one", decided)
 	}
-	if decided[0]["decision"] != DecisionPlatform || decided[0]["fact_source"] != FactSourceJob {
+	if decided[0]["decision"] != "platform" || decided[0]["fact_source"] != "job" {
 		t.Fatalf("attribution_decided = %+v, want decision=platform fact_source=job", decided[0])
 	}
 	if events := g.events("task.failed_compensated"); len(events) != 1 || events[0]["failure_reason"] != FailureReasonJobDeadline {
@@ -270,8 +296,8 @@ func TestOnReportAttributionGateSettlementFailureFallsBackToDaemon(t *testing.T)
 	if len(decided) != 1 {
 		t.Fatalf("attribution_decided events = %+v, want exactly one", decided)
 	}
-	if decided[0]["decision"] != DecisionDaemonSelfReport {
-		t.Fatalf("decision = %v, want %q", decided[0]["decision"], DecisionDaemonSelfReport)
+	if decided[0]["decision"] != "daemon_self_report" {
+		t.Fatalf("decision = %v, want %q", decided[0]["decision"], "daemon_self_report")
 	}
 	if _, ok := decided[0]["fact_source"]; ok {
 		t.Fatalf("attribution_decided = %+v, want no fact_source on the daemon branch", decided[0])
@@ -315,7 +341,7 @@ func TestOnReportAttributionGateWaitsForTheFact(t *testing.T) {
 		t.Fatalf("forward body = %q, want the platform attribution", got)
 	}
 	decided := g.events("task.attribution_decided")
-	if len(decided) != 1 || decided[0]["decision"] != DecisionPlatform {
+	if len(decided) != 1 || decided[0]["decision"] != "platform" {
 		t.Fatalf("attribution_decided = %+v, want decision=platform", decided)
 	}
 }
@@ -346,7 +372,7 @@ func TestOnReportAttributionGateWaitsForTheJobBudget(t *testing.T) {
 		t.Fatalf("forward body = %q, want the daemon's own body", got)
 	}
 	decided := g.events("task.attribution_decided")
-	if len(decided) != 1 || decided[0]["decision"] != DecisionDegraded {
+	if len(decided) != 1 || decided[0]["decision"] != "degraded" {
 		t.Fatalf("attribution_decided = %+v, want decision=degraded", decided)
 	}
 }
@@ -378,7 +404,7 @@ func TestOnReportAttributionGateDegraded(t *testing.T) {
 		t.Fatalf("entry = %+v, want the daemon's own failed verdict", settled)
 	}
 	decided := g.events("task.attribution_decided")
-	if len(decided) != 1 || decided[0]["decision"] != DecisionDegraded {
+	if len(decided) != 1 || decided[0]["decision"] != "degraded" {
 		t.Fatalf("attribution_decided = %+v, want decision=degraded", decided)
 	}
 }
@@ -412,7 +438,7 @@ func TestOnReportAttributionWaitBoundFollowsTheSchedulerClock(t *testing.T) {
 		t.Fatalf("forward body = %q, want the daemon's own body", got)
 	}
 	decided := g.events("task.attribution_decided")
-	if len(decided) != 1 || decided[0]["decision"] != DecisionDegraded {
+	if len(decided) != 1 || decided[0]["decision"] != "degraded" {
 		t.Fatalf("attribution_decided = %+v, want decision=degraded", decided)
 	}
 }
@@ -453,7 +479,7 @@ func TestOnReportAttributionGateDaemonSelfReport(t *testing.T) {
 		t.Fatalf("forward body = %q, want the daemon's own body", got)
 	}
 	decided := g.events("task.attribution_decided")
-	if len(decided) != 1 || decided[0]["decision"] != DecisionDaemonSelfReport {
+	if len(decided) != 1 || decided[0]["decision"] != "daemon_self_report" {
 		t.Fatalf("attribution_decided = %+v, want decision=daemon_self_report", decided)
 	}
 }
@@ -475,7 +501,7 @@ func TestOnReportAttributionGateReadError(t *testing.T) {
 		t.Fatalf("forward body = %q, want the daemon's own body", got)
 	}
 	decided := g.events("task.attribution_decided")
-	if len(decided) != 1 || decided[0]["decision"] != DecisionReadError {
+	if len(decided) != 1 || decided[0]["decision"] != "read_error" {
 		t.Fatalf("attribution_decided = %+v, want decision=read_error", decided)
 	}
 }
@@ -497,7 +523,7 @@ func TestOnReportAttributionGateC13Settled(t *testing.T) {
 		t.Fatalf("forward body = %q, want the daemon's own body", got)
 	}
 	decided := g.events("task.attribution_decided")
-	if len(decided) != 1 || decided[0]["decision"] != DecisionC13Settled {
+	if len(decided) != 1 || decided[0]["decision"] != "c13_settled" {
 		t.Fatalf("attribution_decided = %+v, want decision=c13_settled", decided)
 	}
 	if events := g.events("task.failed_compensated"); len(events) != 0 {
@@ -554,7 +580,7 @@ func TestOnReportAttributionGateC13SpendsTheRemainingBudget(t *testing.T) {
 		t.Fatalf("forward body = %q, want the daemon's own body on the undecidable branch", got)
 	}
 	decided := g.events("task.attribution_decided")
-	if len(decided) != 1 || decided[0]["decision"] != DecisionReadError || decided[0]["error_source"] != "c13" {
+	if len(decided) != 1 || decided[0]["decision"] != "read_error" || decided[0]["error_source"] != "c13" {
 		t.Fatalf("attribution_decided = %+v, want decision=read_error error_source=c13", decided)
 	}
 }
@@ -601,7 +627,7 @@ func TestOnReportAttributionGateSkipsC13WhenTheBudgetIsSpent(t *testing.T) {
 		t.Fatalf("forward body = %q, want the daemon's own body on the undecidable branch", got)
 	}
 	decided := g.events("task.attribution_decided")
-	if len(decided) != 1 || decided[0]["decision"] != DecisionReadError || decided[0]["error_source"] != "platform_fact" {
+	if len(decided) != 1 || decided[0]["decision"] != "read_error" || decided[0]["error_source"] != "platform_fact" {
 		t.Fatalf("attribution_decided = %+v, want decision=read_error error_source=platform_fact", decided)
 	}
 }
@@ -624,7 +650,7 @@ func TestOnReportAttributionGateWaitFailureMapping(t *testing.T) {
 				// budget is what ends the wait.
 				g.sched.attributionWait = 200 * time.Millisecond
 			},
-			decision: DecisionDegraded,
+			decision: "degraded",
 		},
 		{
 			name: "the re-read fails",
@@ -638,7 +664,7 @@ func TestOnReportAttributionGateWaitFailureMapping(t *testing.T) {
 					}
 				}
 			},
-			decision:    DecisionReadError,
+			decision:    "read_error",
 			errorSource: "platform_fact",
 		},
 	}
@@ -727,7 +753,7 @@ func TestOnReportAttributionGateWritesTheVerdictOnAnExpiredBudget(t *testing.T) 
 		t.Fatalf("entry = %+v, want the daemon's own failed verdict", settled)
 	}
 	decided := g.events("task.attribution_decided")
-	if len(decided) != 1 || decided[0]["decision"] != DecisionDegraded {
+	if len(decided) != 1 || decided[0]["decision"] != "degraded" {
 		t.Fatalf("attribution_decided = %+v, want decision=degraded", decided)
 	}
 	if source, present := decided[0]["fact_source"]; present && source != "" {
