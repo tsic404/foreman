@@ -279,11 +279,8 @@ func newSet(identities []Identity, getenv func(string) string) (Set, error) {
 		identity := identities[i]
 		identity.WorkspaceID = strings.TrimSpace(identity.WorkspaceID)
 		identity.DaemonID = strings.TrimSpace(identity.DaemonID)
-		token, err := resolveToken(identity, getenv)
-		if err != nil {
-			return Set{}, err
-		}
-		identity.Token, identity.TokenEnv = token, ""
+		// The id is checked before the credential: an illegal value must be
+		// named by its own rule, not by whichever error happens to run first.
 		if identity.WorkspaceID == "" {
 			return Set{}, fmt.Errorf("workspace identity %d has no workspace_id", i)
 		}
@@ -291,6 +288,11 @@ func newSet(identities []Identity, getenv func(string) string) (Set, error) {
 			return Set{}, fmt.Errorf("workspace id %q is not a legal Kubernetes label value: %s",
 				identity.WorkspaceID, strings.Join(problems, "; "))
 		}
+		token, err := resolveToken(identity, getenv)
+		if err != nil {
+			return Set{}, err
+		}
+		identity.Token, identity.TokenEnv = token, ""
 		if identity.DaemonID == "" {
 			return Set{}, fmt.Errorf("workspace %s has no daemon_id", identity.WorkspaceID)
 		}

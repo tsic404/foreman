@@ -7,6 +7,7 @@ package acceptance
 
 import (
 	"bytes"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -82,6 +83,34 @@ func TestTechMultiWS16WorkspaceIDCharset(t *testing.T) {
 		_, err := workspace.LoadDeployment(workspaceScoped(""))
 		if err == nil {
 			t.Fatal("an empty workspace id started")
+		}
+	})
+
+	// A wrong identifier and a wrong credential in the same identity must not
+	// let the credential error hide which id is refused.
+	t.Run("illegal ids with a bad credential still name the id", func(t *testing.T) {
+		shapes := map[string]string{
+			"missing credential":    `{"workspace_id":%s,"daemon_id":"foreman-main"}`,
+			"bad credential prefix": `{"workspace_id":%s,"daemon_id":"foreman-main","token":"not-a-token"}`,
+		}
+		for name, shape := range shapes {
+			for _, id := range []string{"ws id", "-", "trailing.", "../../escape"} {
+				t.Run(name+"/"+id, func(t *testing.T) {
+					identity := fmt.Sprintf(shape, strconv.Quote(id))
+					_, err := workspace.LoadDeployment(func(key string) string {
+						if key == workspace.EnvWorkspaces {
+							return "[" + identity + "]"
+						}
+						return ""
+					})
+					if err == nil {
+						t.Fatalf("workspace id %q started with a %s", id, name)
+					}
+					if !strings.Contains(err.Error(), strconv.Quote(id)) {
+						t.Errorf("error %q must name %q", err, id)
+					}
+				})
+			}
 		}
 	})
 
