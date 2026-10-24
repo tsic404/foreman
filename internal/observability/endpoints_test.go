@@ -43,10 +43,14 @@ func TestOpsHandlerWithoutMetricsAnswersNotReady(t *testing.T) {
 	}
 }
 
+// testJobImage is the deployment reference the handler fixture reports
+// (§9.3: the version endpoint echoes the configured reference verbatim).
+const testJobImage = "ghcr.io/tsic404/foreman-job@sha256:abc"
+
 func newTestHandler(reg *registry.Registry, logs PodLogReader) http.Handler {
 	return NewOpsHandler(NewMetrics(), reg, logs, OpsConfig{
 		Version:    "v0.1.0",
-		JobImage:   "ghcr.io/tsic404/foreman-job@sha256:abc",
+		JobImage:   testJobImage,
 		RuntimeIDs: func() []string { return []string{"rt-123", "rt-456"} },
 		StartedAt:  time.Now().Add(-time.Minute),
 	})
@@ -310,8 +314,10 @@ func TestVersion(t *testing.T) {
 	rec := do(t, newTestHandler(registry.New(time.Now), nil), "/foreman/version")
 	var body map[string]string
 	decodeBody(t, rec, &body)
-	if body["version"] != "v0.1.0" || body["job_image"] == "" {
-		t.Fatalf("version = %v", body)
+	// §9.3: the configured Job image reference is reported verbatim; presence
+	// alone would let an unrelated constant pass as the audit anchor.
+	if body["version"] != "v0.1.0" || body["job_image"] != testJobImage {
+		t.Fatalf("version = %v, want version v0.1.0 and job_image %q", body, testJobImage)
 	}
 }
 
