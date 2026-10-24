@@ -151,6 +151,10 @@ type PendingReportQueue interface {
 	HasQueuedEntry(taskID string) bool
 	// Drop forgets taskID's report after its direct forward settled it.
 	Drop(ctx context.Context, taskID string)
+	// DropIfUnchanged forgets taskID's report only while the queue still
+	// holds the snapshot the caller wrote ahead of a verdict that failed to
+	// land: a concurrent enqueue for the same task keeps its own entry (§10).
+	DropIfUnchanged(ctx context.Context, taskID string, ep Endpoint, body []byte)
 	// SweepCarrier deletes one listed carrier object when no queue entry
 	// holds its task. The check and the delete are one step under that
 	// task's carrier lock, so an enqueue landing in between keeps its object

@@ -616,18 +616,45 @@ func (p *PendingReports) bumpAttemptsLocked(taskID string) {
 // have replaced the body while the forward was in flight; the newer record then
 // stays queued for the next drain instead of being deleted by task id.
 func (p *PendingReports) dropIfUnchangedLocked(sent pendingReport) {
-	same := func(rep pendingReport) bool {
-		return rep.Endpoint == sent.Endpoint && bytes.Equal(rep.Body, sent.Body)
-	}
 	if validTaskID(sent.TaskID) {
-		if cur, ok := p.readLocked(sent.TaskID); ok && !same(cur) {
+		if cur, ok := p.readLocked(sent.TaskID); ok && !samePendingReport(cur, sent) {
 			return
 		}
 		p.removeLocked(sent.TaskID)
 	}
-	if cur, ok := p.staged[sent.TaskID]; ok && same(cur) {
+	if cur, ok := p.staged[sent.TaskID]; ok && samePendingReport(cur, sent) {
 		delete(p.staged, sent.TaskID)
 	}
+}
+
+// samePendingReport reports whether a queue record still holds the snapshot
+// sent. The endpoint and the body are one enqueue's identity; the task id is
+// not, because a concurrent enqueue for the same task replaces both.
+func samePendingReport(sent, cur pendingReport) bool {
+	return cur.Endpoint == sent.Endpoint && sameReportBody(cur.Body, sent.Body)
+}
+
+// sameReportBody compares two bodies as the queue encodes them. The disk face
+// stores a pendingReport through json.Marshal, which compacts the body and
+// escapes <, > and &, so a caller's raw bytes only match the encoded record by
+// luck: a body carrying whitespace or those characters would never compare
+// equal and a rollback would silently keep the entry. The fast path is the
+// queue's own copy against itself; the encoding runs only when the bytes
+// differ. A body that does not encode has no canonical form, and the two then
+// match only verbatim — never dropped on a guess (§10).
+func sameReportBody(a, b []byte) bool {
+	if bytes.Equal(a, b) {
+		return true
+	}
+	encodedA, err := json.Marshal(json.RawMessage(a))
+	if err != nil {
+		return false
+	}
+	encodedB, err := json.Marshal(json.RawMessage(b))
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(encodedA, encodedB)
 }
 
 // dropSettledLocked removes the snapshot a drain just settled and reports
@@ -871,6 +898,38 @@ func (p *PendingReports) Drop(ctx context.Context, taskID string) {
 	if wasBacked {
 		// The sweep is the retry handle: a settled carrier whose delete
 		// failed is removed on the next round (§6.5).
+		p.deleteCarrier(ctx, taskID)
+	}
+}
+
+// DropIfUnchanged forgets the report a caller wrote ahead of a verdict that
+// then failed to land, and only while the queue still holds that same
+// snapshot. A concurrent enqueue for the same task — the attribution gate's
+// compensation, a late report — has replaced the endpoint and body, and that
+// newer entry keeps its queue home and its carrier (§10): dropping it by task
+// id would leave its own forward without a write-ahead entry.
+func (p *PendingReports) DropIfUnchanged(ctx context.Context, taskID string, ep Endpoint, body []byte) {
+	sent := pendingReport{TaskID: taskID, Endpoint: string(ep), Body: body}
+	p.mu.Lock()
+	// The faces are compared one by one: a newer body on the disk never hides
+	// this snapshot in staging, and the staged copy is only the latest write
+	// that did not land.
+	if validTaskID(taskID) {
+		if cur, ok := p.readLocked(taskID); ok && samePendingReport(sent, cur) {
+			p.removeLocked(taskID)
+		}
+	}
+	if cur, ok := p.staged[taskID]; ok && samePendingReport(sent, cur) {
+		delete(p.staged, taskID)
+	}
+	wasBacked := false
+	if !p.entryPresentLocked(taskID) {
+		wasBacked = p.carrierBacked[taskID]
+		delete(p.carrierBacked, taskID)
+	}
+	p.notifyLocked()
+	p.mu.Unlock()
+	if wasBacked {
 		p.deleteCarrier(ctx, taskID)
 	}
 }

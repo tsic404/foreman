@@ -65,6 +65,21 @@ func (f *fakePendingReports) HasQueuedEntry(taskID string) bool { return f.queue
 // Drop forgets the report the direct forward settled.
 func (f *fakePendingReports) Drop(_ context.Context, taskID string) { delete(f.queued, taskID) }
 
+// DropIfUnchanged forgets the report only while the recorded snapshot is the
+// one the caller wrote: a later Enqueue for the same task keeps its entry.
+func (f *fakePendingReports) DropIfUnchanged(_ context.Context, taskID string, ep Endpoint, body []byte) {
+	for i := len(f.reports) - 1; i >= 0; i-- {
+		rep := f.reports[i]
+		if rep.taskID != taskID {
+			continue
+		}
+		if rep.ep == ep && rep.body == string(body) {
+			delete(f.queued, taskID)
+		}
+		return
+	}
+}
+
 // SweepCarrier models the queue's one-step settled check and delete: an
 // unfinished rebuild or a live entry keeps the object.
 func (f *fakePendingReports) SweepCarrier(ctx context.Context, taskID, name string) (bool, error) {
