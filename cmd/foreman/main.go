@@ -480,11 +480,15 @@ func run() error {
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
+	// The loops run on a child context so the shutdown sequence owns the same
+	// cancellation the supervisor uses on a component failure.
+	ctx, cancelLoops := context.WithCancel(ctx)
+	defer cancelLoops()
 
 	// The loops are supervised: a stop with a live context is a process-level
 	// failure (§1.5) and takes the process down for a visible restart, while
 	// the ordinary cancellation path stays a graceful shutdown.
-	sup := lifecycle.New(baseLog, health, stop)
+	sup := lifecycle.New(baseLog, health, cancelLoops)
 	run := func(component string, f func(context.Context) error) { sup.Run(ctx, component, f) }
 	runWorkspace := run
 	if workspaces.Len() > 1 {
@@ -701,39 +705,36 @@ func run() error {
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), shutdownTimeout)
 	defer cancel()
 	log.Info("foreman.stopping", "reason", reason)
-	deregister := true
+	// §4.6 优雅关闭: C14 narrows to the last live instance on a reachable
+	// shared store (lifecycle.DeregisterOnShutdown).
+	deregisterers := make([]lifecycle.Deregisterer, 0, len(served))
+	for _, c := range served {
+		deregisterers = append(deregisterers, c)
+	}
+	var gate lifecycle.LastInstanceGate
 	if leader != nil {
-		// §4.6 优雅关闭: deregistration narrows to the last live instance with
-		// a reachable shared store. Another survivor keeps the logical
-		// identity (the server's own expiry converges it), and an unreachable
-		// store cannot prove the instance count.
-		last, lerr := leader.LastInstance(shutdownCtx)
-		if lerr != nil || !last {
-			deregister = false
-			detail := "another instance is alive"
-			if lerr != nil {
-				detail = "shared state unavailable"
+		gate = leader
+	}
+	lifecycle.Shutdown(shutdownCtx, lifecycle.ShutdownOptions{
+		Cancel: cancelLoops,
+		Gate:   gate,
+		Served: deregisterers,
+		Drain: func(ctx context.Context) {
+			if err := srv.Shutdown(ctx); err != nil {
+				log.Warn("http.shutdown_failed", "err", err.Error())
 			}
-			log.Info("daemon.deregister_skipped", "reason", detail)
-		}
-	}
-	if deregister {
-		for _, c := range served {
-			if err := c.Deregister(shutdownCtx); err != nil {
-				log.Warn("daemon.deregister_failed", "workspace_id", c.WorkspaceID(), "err", err.Error())
+		},
+		Wait: func(ctx context.Context) {
+			// The loop drain shares the shutdown budget: kubelet SIGKILLs at
+			// the deployment's terminationGracePeriodSeconds (30s), and the
+			// 20s budget here stays inside it — an unbounded wait would leave
+			// no foreman.stopped line at all.
+			if !sup.Wait(ctx) {
+				log.Warn("loops.shutdown_timeout", "err", ctx.Err().Error())
 			}
-		}
-	}
-	if err := srv.Shutdown(shutdownCtx); err != nil {
-		log.Warn("http.shutdown_failed", "err", err.Error())
-	}
-	// The loop drain shares the shutdown budget: kubelet SIGKILLs at the
-	// deployment's terminationGracePeriodSeconds (30s), and the 20s budget
-	// here stays inside it — an unbounded wait would leave no
-	// foreman.stopped line at all.
-	if !sup.Wait(shutdownCtx) {
-		log.Warn("loops.shutdown_timeout", "err", shutdownCtx.Err().Error())
-	}
+		},
+		Log: log,
+	})
 	// The shared-state writes run on an ordered writer outside the registry
 	// lock; drain what is queued so the last transitions land before exit.
 	if shared != nil {

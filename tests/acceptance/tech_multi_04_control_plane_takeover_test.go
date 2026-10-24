@@ -9,6 +9,7 @@ package acceptance
 import (
 	"context"
 	"net/http"
+	"sync"
 	"testing"
 	"time"
 
@@ -123,25 +124,27 @@ func TestTechMulti04ControlPlaneTakeover(t *testing.T) {
 // startHeartbeatLoop runs the production heartbeat loop gated on the harness's
 // leader, so a follower opens no C-2 stream.
 func startHeartbeatLoop(t *testing.T, h *harness) func() {
+	cancel, wait := startHeartbeatLoopDetached(t, h)
+	var once sync.Once
+	return func() { once.Do(func() { cancel(); wait() }) }
+}
+
+// startHeartbeatLoopDetached is the loop above with its stop split into
+// cancel and wait, for scenarios that pin the exit ordering.
+func startHeartbeatLoopDetached(t *testing.T, h *harness) (cancel func(), wait func()) {
 	t.Helper()
 	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.client.CatalogSlots(), h.metrics)
 	loop := proxy.NewHeartbeatLoop(h.client, reporter)
 	loop.SetLeaderGate(h.leaderHeld)
-	ctx, cancel := context.WithCancel(t.Context())
+	ctx, cancelCtx := context.WithCancel(t.Context())
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
 		_ = loop.Run(ctx)
 	}()
-	stopped := false
-	stop := func() {
-		if stopped {
-			return
-		}
-		stopped = true
-		cancel()
-		<-done
-	}
-	t.Cleanup(stop)
-	return stop
+	var once sync.Once
+	cancel = func() { once.Do(cancelCtx) }
+	wait = func() { <-done }
+	t.Cleanup(func() { cancel(); wait() })
+	return cancel, wait
 }
