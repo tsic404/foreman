@@ -552,6 +552,9 @@ func newFixtureUnder(t *testing.T, opts []registry.Option, extra map[string]stri
 		pending: &fakePendingReports{},
 		now:     testNow,
 	}
+	// The sweep's carrier delete goes through the queue seam; in the fixture
+	// it lands on the job-client fake, as the production store does.
+	f.pending.deleteCarrier = f.jobs.DeleteSecret
 	// The registry shares the fixture clock: with the real clock its done
 	// index (TTL 24h) would expire entries stamped at testNow and the suite
 	// would rot with wall time.

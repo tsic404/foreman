@@ -2396,17 +2396,21 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		if !s.workspaceConfigured(secret.Labels[registry.LabelWorkspaceID]) {
 			continue
 		}
-		if s.pendingReports.Queued(taskID) {
-			// Unsettled carriers are never swept — the retention bound does
-			// not apply to entries already queued (§6.5, §4.6).
-			continue
-		}
-		if err := s.jobs.DeleteSecret(ctx, secret.Name); err != nil {
+		// The deletion is the queue's call: the settled check and the delete
+		// must not be split by an enqueue that adopts the object as its
+		// already-landed carrier write (§6.5, ADR-046 decision 3).
+		deleted, err := s.pendingReports.SweepCarrier(ctx, taskID, secret.Name)
+		if err != nil {
 			if firstErr == nil {
 				firstErr = err
 			}
 			s.log.WarnContext(ctx, "pending.carrier_delete_failed",
 				"task_id", taskID, "secret", secret.Name, "err", err.Error())
+			continue
+		}
+		if !deleted {
+			// A live entry holds this carrier: the retention bound does not
+			// apply to entries already queued (§6.5, §4.6).
 			continue
 		}
 		s.log.InfoContext(ctx, "pending.carrier_removed",
