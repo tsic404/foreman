@@ -7,22 +7,32 @@
 # and `verify` judges the landed pod, its prepare init container and the token
 # mount, then restores the node trees.
 #
-#   ./tech-auth-05-cluster.sh prepare [NODE=<node>]
+#   WORKSPACE_ID=<workspace_id> ./tech-auth-05-cluster.sh prepare [NODE=<node>]
 #       install both shapes (existing profile and marker are moved aside on the
-#       node, not deleted) and print the trigger instruction.
+#       node, not deleted) and print the trigger instruction. The home
+#       partition is resolved from the reference template's home volume —
+#       `hostPath: .../home/<workspace_id>` — so only the workspace under test
+#       is touched and the other partitions on a shared node stay intact.
 #   ./tech-auth-05-cluster.sh verify TASK_ID
 #       judge the task's pod, restore every prepared node, clear the state.
 #   ./tech-auth-05-cluster.sh restore
 #       restore without judging (aborted window).
 #
 # The reference-template window is a precondition: the task Job must carry the
-# prepare init container with the three-path heal and the marker `rm -rf`.
+# prepare init container with the three-path heal and the marker `rm -rf`, and
+# its home volume must mount the prepared partition.
+#
+# NODE_HOST_ROOT names where `kubectl debug node/...` mounts the node root; the
+# default /host is what the profile's sysadmin image provides. Only a debug
+# image with a different mount point needs it.
 # Exit: 0 = PASS · 1 = FAIL (raw observation printed) · 2 = blocked.
 set -eu
 
+SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
+TEMPLATE=${FOREMAN_JOB_TEMPLATE:-$SCRIPT_DIR/../../deploy/25-job-template.yaml}
+NODE_HOST_ROOT=${NODE_HOST_ROOT:-/host}
 JOB_NS=${FOREMAN_JOB_NAMESPACE:-multica-agents}
 FOREMAN_URL=${FOREMAN_URL:-http://127.0.0.1:8080}
-STATE_ROOT=${FOREMAN_STATE_ROOT:-/var/lib/foreman}
 NODE_DEBUG_IMAGE=${NODE_DEBUG_IMAGE:-debian:bookworm-slim}
 WAIT=${WAIT:-240}
 STATE_DIR=${STATE_DIR:-$HOME/.foreman-tc-auth-05}
@@ -51,34 +61,87 @@ state_nodes() {
 	cat "$STATE_DIR/nodes"
 }
 
-# restore_node <node> <meta>: undo the anomaly and put the moved-aside profile
-# and marker back. Idempotent; returns non-zero with a diagnostic instead of
-# exiting, so a partial restore keeps the remaining nodes' state.
+# template_home_pattern prints the home volume's hostPath as written in the
+# reference template. Both YAML shapes are accepted: the inline map
+# (`hostPath: { path: … }`) and the block map (`hostPath:` then `path: …`).
+# The template is the authority for the partition layout, so the carrier
+# follows its prefix instead of assuming one.
+template_home_pattern() {
+	awk '
+		function emit(v,   p) {
+			p = v
+			sub(/^.*path:[[:space:]]*/, "", p)
+			sub(/[[:space:]]*[,}].*$/, "", p)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", p)
+			if (p ~ /^\//) print p
+			else print "!unreadable"
+		}
+		$1 == "-" && $2 == "name:" && $3 == "home" { in_home = 1; next }
+		in_home && /hostPath:/ {
+			hp = $0
+			sub(/^.*hostPath:[[:space:]]*/, "", hp)
+			gsub(/^[[:space:]]+|[[:space:]]+$/, "", hp)
+			if (hp ~ /path:/) { emit(hp); exit }
+			if (hp != "" && hp !~ /^\{[[:space:]]*\}?[[:space:]]*$/) { emit(hp); exit }
+			while ((getline line) > 0) {
+				if (line ~ /^[[:space:]]*-[[:space:]]/) break
+				if (line ~ /path:/) { emit(line); exit }
+			}
+			print "!unreadable"
+			exit
+		}
+		in_home && /^[[:space:]]*-[[:space:]]/ { exit }
+	' "$TEMPLATE"
+}
+
+state_home() {
+	[ -r "$STATE_DIR/home" ] || blocked "no prepared window at $STATE_DIR — run '$0 prepare' first"
+	cat "$STATE_DIR/home"
+}
+
+state_host_root() {
+	[ -r "$STATE_DIR/host_root" ] || blocked "no prepared window at $STATE_DIR — run '$0 prepare' first"
+	cat "$STATE_DIR/host_root"
+}
+
+state_workspace() {
+	[ -r "$STATE_DIR/workspace" ] || blocked "no prepared window at $STATE_DIR — run '$0 prepare' first"
+	cat "$STATE_DIR/workspace"
+}
+
+# restore_node <node> <meta> <host_root> <home>: undo the anomaly and put the
+# moved-aside profile and marker back. <host_root> is where the debug image
+# mounts the node root; <home> is the node-side home partition written by
+# prepare. Idempotent; returns non-zero with a diagnostic instead of exiting,
+# so a partial restore keeps the remaining nodes' state.
 restore_node() {
 	_node=$1
 	_meta=$2
+	_host_root=$3
+	_home=$4
 	rest=${_meta#*|}
 	pb=${rest%%|*}
 	rest=${rest#*|}
 	mb=${rest#*|}
-	_script=$(sed -e "s|@STATE_ROOT@|$STATE_ROOT|g" -e "s|@PB@|$pb|g" -e "s|@MB@|$mb|g" <<'NODE'
+	_script=$(sed -e "s|@HOST_ROOT@|$_host_root|g" -e "s|@HOME@|$_home|g" -e "s|@PB@|$pb|g" -e "s|@MB@|$mb|g" <<'NODE'
 set -eu
-[ -d /host ] || { echo 'QA_BLOCKED: the node filesystem is not mounted at /host' >&2; exit 2; }
-R='/host@STATE_ROOT@'
-[ -d "$R" ] || R='@STATE_ROOT@'
-base="$R/home/.multica"
+[ -d '@HOST_ROOT@' ] || { echo 'QA_BLOCKED: the node filesystem is not mounted at @HOST_ROOT@' >&2; exit 2; }
+H='@HOST_ROOT@@HOME@'
+[ -d "$H" ] || H='@HOME@'
+[ -d "$H" ] || { echo 'QA_BLOCKED: the prepared home partition @HOME@ does not exist on this node' >&2; exit 2; }
+base="$H/.multica"
 prof="$base/profiles/foreman-job"
 marker="$base/daemon_task_context.json"
 rm -rf "$prof"
 if [ -n "@PB@" ]; then
-	mv "$R/home/@PB@" "$prof"
+	mv "$H/@PB@" "$prof"
 else
 	mkdir -p "$prof"
 	chown 1000:1000 "$prof"
 fi
 rm -rf "$marker"
 if [ -n "@MB@" ]; then
-	mv "$R/home/@MB@" "$marker"
+	mv "$H/@MB@" "$marker"
 fi
 echo "restored"
 NODE
@@ -95,11 +158,13 @@ NODE
 }
 
 restore_all() {
+	_host_root=$(state_host_root) || return 1
+	_home=$(state_home) || return 1
 	_fail=""
 	for _n in $(state_nodes); do
 		[ -r "$STATE_DIR/$_n.meta" ] || { _fail="$_fail $_n(no-meta)"; continue; }
 		_meta=$(cat "$STATE_DIR/$_n.meta")
-		restore_node "$_n" "$_meta" || _fail="$_fail $_n"
+		restore_node "$_n" "$_meta" "$_host_root" "$_home" || _fail="$_fail $_n"
 	done
 	[ -z "$_fail" ] || { printf 'restore failed on:%s\n' "$_fail" >&2; return 1; }
 	rm -rf "$STATE_DIR"
@@ -123,26 +188,52 @@ prepare)
 	[ -n "$nodes" ] || blocked "no schedulable Linux node — the anomaly has no target"
 	[ ! -r "$STATE_DIR/nodes" ] ||
 		blocked "a prepared window is active at $STATE_DIR — run '$0 restore' first"
+	WORKSPACE_ID=${WORKSPACE_ID:-}
+	[ -n "$WORKSPACE_ID" ] ||
+		blocked "WORKSPACE_ID is required: pass the workspace whose home partition this task uses (WORKSPACE_ID=<workspace_id> $0 prepare) — the reference template partitions the home volume as home/<workspace_id>"
+	case $WORKSPACE_ID in
+	*[!A-Za-z0-9._-]*|.|..) blocked "WORKSPACE_ID '$WORKSPACE_ID' is not a single path segment" ;;
+	esac
+	[ -r "$TEMPLATE" ] ||
+		blocked "cannot read the reference job template at $TEMPLATE — set FOREMAN_JOB_TEMPLATE to deploy/25-job-template.yaml"
+	home_pattern=$(template_home_pattern)
+	case $home_pattern in
+	'') blocked "the reference job template $TEMPLATE carries no home volume hostPath — not the reference-template window" ;;
+	'!unreadable') blocked "cannot read the home volume's hostPath from the reference job template $TEMPLATE — want an absolute path in inline (hostPath: { path: ... }) or block (hostPath: then path: ...) form" ;;
+	/*) : ;;
+	*) blocked "the reference template's home hostPath '$home_pattern' is not an absolute path — cannot expand it on the node" ;;
+	esac
+	case $home_pattern in
+	*'<workspace_id>'*) : ;;
+	*) blocked "the reference template's home hostPath '$home_pattern' is not partitioned by <workspace_id> — this carrier selects one workspace partition" ;;
+	esac
+	home_root=${home_pattern%%<workspace_id>*}${WORKSPACE_ID}${home_pattern#*<workspace_id>}
+	case $NODE_HOST_ROOT$home_root in
+	*'&'*|*'|'*|*'\'*) blocked "the rendered node paths carry a sed metacharacter — refusing to build the node script" ;;
+	esac
 	rm -rf "$STATE_DIR"
 	mkdir -p "$STATE_DIR"
 	: >"$STATE_DIR/nodes"
+	printf '%s\n' "$WORKSPACE_ID" >"$STATE_DIR/workspace"
+	printf '%s\n' "$home_root" >"$STATE_DIR/home"
+	printf '%s\n' "$NODE_HOST_ROOT" >"$STATE_DIR/host_root"
 	for n in $nodes; do
-		_script=$(sed -e "s|@STATE_ROOT@|$STATE_ROOT|g" -e "s|@RUN@|$RUN|g" <<'NODE'
+		_script=$(sed -e "s|@HOST_ROOT@|$NODE_HOST_ROOT|g" -e "s|@HOME@|$home_root|g" -e "s|@WS@|$WORKSPACE_ID|g" -e "s|@RUN@|$RUN|g" <<'NODE'
 set -eu
-[ -d /host ] || { echo 'QA_BLOCKED: the node filesystem is not mounted at /host' >&2; exit 2; }
-R='/host@STATE_ROOT@'
-[ -d "$R" ] || R='@STATE_ROOT@'
-[ -d "$R/home" ] || { echo "QA_BLOCKED: no home tree under $R" >&2; exit 2; }
-base="$R/home/.multica"
-[ -d "$base" ] || { echo 'QA_BLOCKED: .multica is not a directory on this node' >&2; exit 2; }
-[ -d "$base/profiles" ] || { echo 'QA_BLOCKED: .multica/profiles is not a directory on this node' >&2; exit 2; }
+[ -d '@HOST_ROOT@' ] || { echo 'QA_BLOCKED: the node filesystem is not mounted at @HOST_ROOT@' >&2; exit 2; }
+H='@HOST_ROOT@@HOME@'
+[ -d "$H" ] || H='@HOME@'
+[ -d "$H" ] || { echo 'QA_BLOCKED: the home partition @HOME@ for workspace @WS@ is not a directory on this node — run a task of this workspace here first (the template creates it with DirectoryOrCreate)' >&2; exit 2; }
+base="$H/.multica"
+[ -d "$base" ] || { echo 'QA_BLOCKED: @HOME@/.multica is not a directory on this node' >&2; exit 2; }
+[ -d "$base/profiles" ] || { echo 'QA_BLOCKED: @HOME@/.multica/profiles is not a directory on this node' >&2; exit 2; }
 prof="$base/profiles/foreman-job"
 pe=0
 pb=""
 if [ -e "$prof" ] || [ -L "$prof" ]; then
 	pb=".tc-auth-05-@RUN@-profile"
-	rm -rf "$R/home/$pb"
-	mv "$prof" "$R/home/$pb"
+	rm -rf "$H/$pb"
+	mv "$prof" "$H/$pb"
 	pe=1
 fi
 printf 'anomaly\n' >"$prof"
@@ -151,8 +242,8 @@ me=0
 mb=""
 if [ -e "$marker" ] || [ -L "$marker" ]; then
 	mb=".tc-auth-05-@RUN@-marker"
-	rm -rf "$R/home/$mb"
-	mv "$marker" "$R/home/$mb"
+	rm -rf "$H/$mb"
+	mv "$marker" "$H/$mb"
 	me=1
 fi
 mkdir -p "$marker/nested"
@@ -173,7 +264,7 @@ NODE
 		observe "prepared node=$n state=$meta"
 	done
 	observe "window: both shapes installed on $(wc -l <"$STATE_DIR/nodes" | tr -d ' ') node(s)"
-	echo "trigger a task now, then run: $0 verify <task id>"
+	echo "trigger a task of workspace $WORKSPACE_ID now, then run: $0 verify <task id>"
 	echo "abort: $0 restore"
 	;;
 
@@ -181,12 +272,21 @@ verify)
 	TASK=${2:-}
 	[ -n "$TASK" ] || blocked "usage: $0 verify TASK_ID"
 	state_nodes >/dev/null
-	entry=$(curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks/$TASK") ||
-		blocked "cannot read $FOREMAN_URL/foreman/tasks/$TASK (port-forward the foreman Service first)"
+	home_root=$(state_home)
+	workspace=$(state_workspace)
+	entry=$(curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks/$TASK?workspace=$workspace") ||
+		blocked "cannot read $FOREMAN_URL/foreman/tasks/$TASK?workspace=$workspace (port-forward the foreman Service first)"
+	task_workspace=$(printf '%s' "$entry" | jq -r '.workspace_id // empty')
+	[ "$task_workspace" = "$workspace" ] ||
+		blocked "task $TASK belongs to workspace '$task_workspace', but this window prepared '$workspace'"
 	job=$(printf '%s' "$entry" | jq -r '.job_name // empty')
 	[ -n "$job" ] || blocked "task $TASK has no job_name in its projection"
 	job_json=$(kubectl -n "$JOB_NS" get job "$job" -o json 2>/dev/null) ||
 		blocked "Job $job is gone — run verify while the task's pod is still alive"
+	job_home=$(printf '%s' "$job_json" | jq -r \
+		'[.spec.template.spec.volumes[]? | select(.name == "home") | .hostPath.path][0] // empty')
+	[ "$job_home" = "$home_root" ] ||
+		blocked "Job $job mounts home at '$job_home', but this window prepared '$home_root'"
 	prepare_args=$(printf '%s' "$job_json" | jq -r \
 		'[.spec.template.spec.initContainers[]? | select(.name == "prepare") | .args[0]][0] // empty')
 	[ -n "$prepare_args" ] ||
@@ -257,11 +357,14 @@ verify)
 	;;
 
 restore)
+	state_nodes >/dev/null
+	state_host_root >/dev/null
+	state_home >/dev/null
 	restore_all || blocked "the tree restore failed — the state file is kept for '$0 restore'"
 	echo "restored: $STATE_DIR removed"
 	;;
 
 *)
-	blocked "usage: $0 prepare [NODE=<node>] | verify TASK_ID | restore"
+	blocked "usage: WORKSPACE_ID=<workspace_id> $0 prepare [NODE=<node>] | $0 verify TASK_ID | $0 restore"
 	;;
 esac
