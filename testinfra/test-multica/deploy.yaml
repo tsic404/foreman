@@ -2,9 +2,12 @@
 # (see `README.md`).
 #
 # One complete multica deployment: server (backend) + its persistence
-# (postgres) + the frontend entry (web + proxy). It is isolated from
-# production by namespace, database and workspace — no production workspace,
-# token or runtime is ever reused.
+# (postgres) + the frontend entry (web + proxy). The model source is the one
+# thing this file does not decide: the keyless local backend is its own
+# manifest (model-backend.yaml), applied by ./deploy.sh only for a round whose
+# deployment supplies no endpoint. The environment is isolated from production
+# by namespace, database and workspace — no production workspace, token or
+# runtime is ever reused.
 #
 # The version anchor is absolute: every image is pinned to the
 # `v0.6.1` release (multica@2ea01ae4). Upgrade = rebuild this whole

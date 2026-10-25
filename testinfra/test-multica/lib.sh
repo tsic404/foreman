@@ -45,11 +45,34 @@ CHAT_TITLE=${TEST_MULTICA_CHAT:-foreman-test-chat}
 REPO_URL=${TEST_MULTICA_REPO:-https://github.com/tsic404/foreman}
 # Development login code (MULTICA_DEV_VERIFICATION_CODE in the Secret).
 VERIFICATION_CODE=${TEST_MULTICA_VERIFICATION_CODE:-888888}
+# The keyless local model backend (ollama) the test agent runs against: a test
+# task must produce a real result and non-zero token usage, which a model-less
+# agent cannot. No credential is involved — the engine is the test cluster's
+# own, reached only on the in-cluster network. ./deploy.sh installs it only
+# when no endpoint is configured (model-backend.yaml); with an endpoint there
+# is no such Deployment, which is why local_model_backend treats NotFound as
+# "this round has no local source".
+MODEL_BACKEND_DEPLOY=${TEST_MULTICA_MODEL_DEPLOY:-test-multica-ollama}
+# The Service is resolved from the Job pods (namespace multica-agents), so the
+# name is namespace-qualified; `svc` rather than `svc.cluster.local` keeps it
+# resolvable on a cluster whose domain is not the default one.
+MODEL_BACKEND_URL="http://$MODEL_BACKEND_DEPLOY.$NS.svc:11434"
+# The model the backend serves, rendered into model-backend.yaml by ./deploy.sh.
+# The model writer reads it back from the Deployment instead of reusing this
+# value, so the agent's selector always names what is actually served. It is a
+# full tag: an untagged name gets the implicit `latest`, which is the row the
+# backend's list reports and the gate compares.
+MODEL_NAME=${TEST_MULTICA_MODEL:-qwen2.5:0.5b}
+case $MODEL_NAME in
+*:*) ;;
+*) MODEL_NAME="$MODEL_NAME:latest" ;;
+esac
 
 # --- The model endpoint (a deployment parameter) -----------------------------
-# The test agent can only finish a task when its Job's agent CLI has a model
-# endpoint: base URL, model id and credential. The triple arrives from the
-# environment — the credential may instead come from a file named by
+# The test agent needs a model source: the deployment-supplied endpoint when
+# its triple is set (base URL, model id and credential), else the keyless local
+# backend ./deploy.sh installs. The triple arrives from the environment — the
+# credential may instead come from a file named by
 # TEST_MULTICA_MODEL_API_KEY_FILE — and nothing of it belongs in this
 # repository. The registration is written where the Job pods read provider
 # configuration from (`${FOREMAN_STATE_ROOT}/home/<workspace>`, 02-contracts
@@ -547,15 +570,60 @@ set_agent_model() {
 	wsapi PUT "/api/agents/$1" "$_body" >/dev/null
 }
 
-# register_model_endpoint: register the deployment-supplied endpoint and point
-# the test agent at it. Without one, nothing is registered and the rollback is
-# unconditional — the agent row is not evidence of a carrier (it is recreated
-# every round, and the node-local file survives the namespace), so a reset that
-# did not supply the endpoint removes whatever a previous round left and clears
-# the agent model. Tasks then converge to process_failure as they did before
-# this entry existed; no production address and no stub is ever substituted.
-# `agent_id` and `AGENT_NAME` belong to the calling entry; `model_text` is the
-# value the entry reports.
+# set_agent_env <agent-id> <base-url>: the env endpoint replaces the map
+# wholesale, so every branch states the whole map — the local engine's address
+# when it is the model source, nothing otherwise.
+set_agent_env() {
+	if [ -n "$2" ]; then
+		_body=$(jq -nc --arg url "$2" '{custom_env: {OLLAMA_BASE_URL: $url}}') ||
+			die "cannot render the agent env update"
+	else
+		_body='{"custom_env":{}}'
+	fi
+	wsapi PUT "/api/agents/$1/env" "$_body" >/dev/null
+}
+
+# local_model_backend: the keyless engine ./deploy.sh installed, as the
+# selector the agent carries. Its own pull step names the served id; the tag
+# is dropped because omp validates a tagged selector against a startup catalog
+# a fresh Job pod has not discovered yet. 0 = `local_model_text` holds the
+# selector, 1 = no backend is deployed — a NotFound is an answer — and a read
+# that fails for any other reason dies: a starved API server must not read as
+# "no backend", which would clear a working agent's model.
+local_model_backend() {
+	_err=$(mktemp) || die "cannot create a temporary file"
+	if _id=$(kubectl -n "$NS" get deploy "$MODEL_BACKEND_DEPLOY" \
+		-o jsonpath='{.spec.template.spec.initContainers[0].env[?(@.name=="OLLAMA_MODEL")].value}' 2>"$_err"); then
+		rm -f "$_err"
+	else
+		_err_text=$(cat "$_err")
+		case $_err_text in
+		*NotFound*)
+			rm -f "$_err"
+			return 1
+			;;
+		esac
+		# The retry's own error is the one to report: the first read's message
+		# may be a transient failure the retry already got past.
+		if ! _id=$(k -n "$NS" get deploy "$MODEL_BACKEND_DEPLOY" \
+			-o jsonpath='{.spec.template.spec.initContainers[0].env[?(@.name=="OLLAMA_MODEL")].value}' 2>"$_err"); then
+			_err_text=$(cat "$_err")
+			rm -f "$_err"
+			die "cannot read Deployment $NS/$MODEL_BACKEND_DEPLOY — ${_err_text:-no output}"
+		fi
+		rm -f "$_err"
+	fi
+	[ -n "$_id" ] || return 1
+	local_model_text="ollama/${_id%:*}"
+}
+
+# register_model_endpoint: the one writer of the agent's model and custom_env.
+# The precedence is explicit: the deployment-supplied endpoint wins; without it
+# the keyless local backend ./deploy.sh installed is the source; with neither
+# the model is cleared. The endpoint-less rollback is unconditional — the agent
+# row is not evidence of a carrier (it is recreated every round and the
+# node-local file survives the namespace). `agent_id` and `AGENT_NAME` belong
+# to the calling entry; `model_text` is the value the entry reports.
 register_model_endpoint() {
 	model_text=未配置
 	if model_endpoint_configured; then
@@ -564,12 +632,25 @@ register_model_endpoint() {
 		model_text=$(model_selector)
 		set_agent_model "$agent_id" "$model_text" ||
 			die "cannot point agent $AGENT_NAME at $model_text"
+		set_agent_env "$agent_id" "" ||
+			die "cannot clear agent $AGENT_NAME's model backend address"
 		info "agent $AGENT_NAME → $model_text"
 		return 0
 	fi
 	info "未配置模型端点"
 	remove_model_provider ||
 		die "cannot clear the previous model endpoint registration"
+	if local_model_backend; then
+		model_text=$local_model_text
+		set_agent_model "$agent_id" "$model_text" ||
+			die "cannot point agent $AGENT_NAME at $model_text"
+		set_agent_env "$agent_id" "$MODEL_BACKEND_URL" ||
+			die "cannot set agent $AGENT_NAME's model backend address"
+		info "agent $AGENT_NAME → $model_text ($MODEL_BACKEND_URL)"
+		return 0
+	fi
 	set_agent_model "$agent_id" "" ||
 		die "cannot clear the agent model"
+	set_agent_env "$agent_id" "" ||
+		die "cannot clear agent $AGENT_NAME's model backend address"
 }

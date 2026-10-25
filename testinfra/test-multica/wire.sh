@@ -15,7 +15,7 @@
 #      address), MULTICA_WORKSPACE_ID := the test workspace, and the
 #      Deployment's MULTICA_TOKEN := the credential the test server minted for
 #      that workspace (the profile's);
-#   3. self-check — ./selfcheck.sh, the environment gate ①②③, while the
+#   3. self-check — ./selfcheck.sh, the environment gate ①②③④, while the
 #      instance is still stopped;
 #   4. start — scale back to 1 and wait for the rollout.
 #

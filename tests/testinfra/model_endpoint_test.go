@@ -451,6 +451,13 @@ JSON
 	printf '/var/lib/foreman'
 	exit 0
 	;;
+*" get deploy test-multica-ollama -o jsonpath="*)
+	# The local backend's own pull step: empty means ./deploy.sh installed none,
+	# which is the branch an endpoint-less round falls back to only when it
+	# exists.
+	printf '%s' "${LOCAL_MODEL:-}"
+	exit 0
+	;;
 *" create secret "*)
 	name= ns= from=
 	prev=
@@ -503,14 +510,15 @@ type registerRun struct {
 	applied []string
 }
 
-// TestRegisterModelEndpointWithoutEndpointClearsTheBaseline pins the
-// missing-endpoint branch end to end: the statement is printed, no
-// registration is written, the agent model is cleared and the rollback carrier
-// runs on every schedulable node. The rollback itself creates one one-shot
-// removal Pod per node — that is the accepted cost of not guessing from the
-// agent row; "nothing applied" here means the registration plane (no Secret,
-// no write carrier).
-func TestRegisterModelEndpointWithoutEndpointClearsTheBaseline(t *testing.T) {
+// TestRegisterModelEndpointWithoutEndpointOrBackendClearsTheBaseline pins the
+// last step of the precedence chain end to end: with neither the endpoint
+// triple nor a deployed local backend, no registration is written, the agent's
+// model and env are cleared, and the rollback carrier runs on every
+// schedulable node. The rollback itself creates one one-shot removal Pod per
+// node — that is the accepted cost of not guessing from the agent row;
+// "nothing applied" here means the registration plane (no Secret, no write
+// carrier).
+func TestRegisterModelEndpointWithoutEndpointOrBackendClearsTheBaseline(t *testing.T) {
 	run := runRegisterModelEndpoint(t)
 
 	if !strings.Contains(run.output, "未配置模型端点") {
@@ -540,8 +548,66 @@ func TestRegisterModelEndpointWithoutEndpointClearsTheBaseline(t *testing.T) {
 	if !strings.Contains(run.wsapi, `PUT /api/agents/agent-1 {"model":""}`) {
 		t.Errorf("the agent model was not cleared; wsapi calls:\n%s", run.wsapi)
 	}
+	if !strings.Contains(run.wsapi, `PUT /api/agents/agent-1/env {"custom_env":{}}`) {
+		t.Errorf("the agent env was not cleared; wsapi calls:\n%s", run.wsapi)
+	}
 	if !strings.Contains(run.kubectl, "delete secret test-multica-model-provider") {
 		t.Errorf("the Secret was not deleted (with --ignore-not-found); kubectl calls:\n%s", run.kubectl)
+	}
+}
+
+// TestRegisterModelEndpointPrefersTheDeploymentEndpoint pins the first step of
+// the precedence chain: a configured triple wins, the registration is written
+// (Secret plus one write carrier per node), and the agent's env is cleared —
+// a stale local backend address must not survive a switch to an endpoint. The
+// local backend is not even read on this path.
+func TestRegisterModelEndpointPrefersTheDeploymentEndpoint(t *testing.T) {
+	run := runRegisterModelEndpoint(t,
+		"TEST_MULTICA_MODEL_BASE_URL=http://gateway.test:8000/v1",
+		"TEST_MULTICA_MODEL_ID=model-a",
+		"TEST_MULTICA_MODEL_API_KEY=sk-test",
+	)
+
+	if !strings.Contains(run.output, "agent foreman-test-agent → foreman-test/model-a") {
+		t.Errorf("the endpoint round does not report the selector it bound:\n%s", run.output)
+	}
+	if !strings.Contains(run.wsapi, `PUT /api/agents/agent-1 {"model":"foreman-test/model-a"}`) {
+		t.Errorf("the agent was not pointed at the endpoint selector; wsapi calls:\n%s", run.wsapi)
+	}
+	if !strings.Contains(run.wsapi, `PUT /api/agents/agent-1/env {"custom_env":{}}`) {
+		t.Errorf("the agent env was not cleared for the endpoint source; wsapi calls:\n%s", run.wsapi)
+	}
+	if strings.Contains(run.kubectl, "get deploy test-multica-ollama") {
+		t.Errorf("the endpoint round consulted the local backend; kubectl calls:\n%s", run.kubectl)
+	}
+	if strings.Contains(run.kubectl, "delete secret test-multica-model-provider") {
+		t.Errorf("the endpoint round rolled the registration back; kubectl calls:\n%s", run.kubectl)
+	}
+	if got := len(byKind(t, run.applied)["Secret"]); got != 1 {
+		t.Errorf("applied Secrets = %d, want the one provider registration:\n%s",
+			got, strings.Join(run.applied, "\n"))
+	}
+	pods := byKind(t, run.applied)["Pod"]
+	if len(pods) != 2 {
+		t.Fatalf("write carriers = %d, want one per ready schedulable node (2):\n%s",
+			len(pods), strings.Join(run.applied, "\n"))
+	}
+	for _, raw := range pods {
+		var pod corev1.Pod
+		decodeManifest(t, raw, &pod)
+		script := strings.Join(pod.Spec.Containers[0].Args, " ")
+		if !strings.Contains(script, "cp /provider/models.yml") {
+			t.Errorf("carrier %s does not install the registration: %q", pod.Name, script)
+		}
+		mounted := false
+		for _, volume := range pod.Spec.Volumes {
+			if volume.Secret != nil && volume.Secret.SecretName == "test-multica-model-provider" {
+				mounted = true
+			}
+		}
+		if !mounted {
+			t.Errorf("carrier %s does not mount the provider Secret:\n%s", pod.Name, raw)
+		}
 	}
 }
 
@@ -562,6 +628,9 @@ func TestRegisterModelEndpointClearsCarriersWithAnEmptyModel(t *testing.T) {
 	}
 	if !strings.Contains(run.wsapi, `PUT /api/agents/agent-1 {"model":""}`) {
 		t.Errorf("the agent model was not cleared; wsapi calls:\n%s", run.wsapi)
+	}
+	if !strings.Contains(run.wsapi, `PUT /api/agents/agent-1/env {"custom_env":{}}`) {
+		t.Errorf("the agent env was not cleared; wsapi calls:\n%s", run.wsapi)
 	}
 }
 
@@ -589,10 +658,12 @@ func assertRemovalCarriers(t *testing.T, applied []string) {
 }
 
 // runRegisterModelEndpoint drives the real entry helper with a stubbed platform
-// API (`wsapi`) and a stubbed kubectl, without supplying the endpoint triple.
-// The agent id is the one the entry derived from `ensure_agent`; the recreated
-// row's model is empty, which is exactly why the rollback cannot be gated on it.
-func runRegisterModelEndpoint(t *testing.T) registerRun {
+// API (`wsapi`) and a stubbed kubectl. The agent id is the one the entry
+// derived from `ensure_agent`; the recreated row's model is empty, which is
+// exactly why the rollback cannot be gated on it. `env` supplies the endpoint
+// triple (or leaves it unset), and LOCAL_MODEL is empty: the local backend is
+// absent unless a case says otherwise.
+func runRegisterModelEndpoint(t *testing.T, env ...string) registerRun {
 	t.Helper()
 	dir := t.TempDir()
 	binDir := filepath.Join(dir, "bin")
@@ -620,17 +691,19 @@ func runRegisterModelEndpoint(t *testing.T) registerRun {
 agent_id=agent-1
 register_model_endpoint
 `
-	out := runLib(t, body,
-		"PATH="+binDir+string(os.PathListSeparator)+os.Getenv("PATH"),
-		"HOME="+home,
+	args := []string{
+		"PATH=" + binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"HOME=" + home,
 		"TEST_MULTICA_KUBECTL_RETRIES=1",
 		"TEST_MULTICA_NS=multica-test",
 		"TEST_MULTICA_INSTANCE_NS=foreman",
 		"TEST_MULTICA_INSTANCE=foreman",
-		"APPLY_DIR="+capture,
-		"KUBECTL_LOG="+kubectlLog,
-		"WSAPI_LOG="+wsapiLog,
-	)
+		"LOCAL_MODEL=",
+		"APPLY_DIR=" + capture,
+		"KUBECTL_LOG=" + kubectlLog,
+		"WSAPI_LOG=" + wsapiLog,
+	}
+	out := runLib(t, body, append(args, env...)...)
 
 	entries, err := os.ReadDir(capture)
 	if err != nil {

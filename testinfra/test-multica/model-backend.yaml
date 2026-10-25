@@ -1,0 +1,194 @@
+# The keyless local model backend (ollama) — the model source of a round whose
+# deployment supplies no endpoint (`./deploy.sh`, `README.md` §Model endpoint).
+#
+# It is its own manifest because the two model sources are alternatives: with
+# the endpoint triple set, ./deploy.sh neither renders nor applies this file, so
+# the local backend is never a second prerequisite of the same round (nothing to
+# roll out, no model to pull). Without the triple it is applied exactly as it
+# always was, and ./reset.sh points the test agent at it.
+#
+# A hosted provider would put a credential into the test environment, so the
+# cluster serves a small model itself. Only the Job pods consume it: the base
+# URL reaches the agent process through the test agent's custom_env (./reset.sh),
+# never through the Job template — the template belongs to the instance under
+# test, not to this environment.
+#
+# The models volume caches the pull, which is the slow part of the first
+# rollout: ./deploy.sh's rollout wait budgets for it.
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: ollama-models
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: ollama
+spec:
+  accessModes: [ReadWriteOnce]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-multica-ollama
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: ollama
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: ollama
+  ports:
+    - name: http
+      port: 11434
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-multica-ollama
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: ollama
+spec:
+  replicas: 1
+  # The models volume is ReadWriteOnce: a rolling update would start the new
+  # pod while the old one still holds it.
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: multica
+      app.kubernetes.io/component: ollama
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: multica
+        app.kubernetes.io/component: ollama
+    spec:
+      # `ollama pull` needs a running server, so the init step starts one on
+      # loopback, waits for it, pulls the model (a no-op when the volume
+      # already carries it), and lets the trap stop it before the main
+      # container binds the port. Other tags of the same family are removed:
+      # the agent's selector is the untagged family (omp resolves it fuzzily
+      # after discovery), so a leftover tag would make that match ambiguous.
+      initContainers:
+        - name: pull
+          image: ollama/ollama:0.40.11
+          imagePullPolicy: IfNotPresent
+          command: ["sh", "-c"]
+          args:
+            - |
+              set -eu
+              model=$OLLAMA_MODEL
+              case $model in
+              *:*) ;;
+              *) model="$model:latest" ;;
+              esac
+              # The engine's own log is the only record of why it did not come
+              # up; it reaches the pod log instead of a bare Init timeout. The
+              # two variables default to the pod's values and exist so the
+              # script can be exercised without waiting out the real budget.
+              wait_limit=${OLLAMA_WAIT:-120}
+              serve_log=${OLLAMA_SERVE_LOG:-/tmp/ollama-serve.log}
+              ollama serve >"$serve_log" 2>&1 &
+              server=$!
+              trap 'kill "$server" 2>/dev/null || true' EXIT
+              waited=0
+              until ollama list >/dev/null 2>&1; do
+                if [ "$waited" -ge "$wait_limit" ]; then
+                  echo "ollama serve did not answer within ${wait_limit}s; its log follows" >&2
+                  cat "$serve_log" >&2
+                  exit 1
+                fi
+                waited=$((waited + 1))
+                sleep 1
+              done
+              if ollama list | awk 'NR > 1 { print $1 }' | grep -Fqx "$model"; then
+                echo "model $model already present"
+              else
+                ollama pull "$model"
+              fi
+              family=${model%:*}
+              ollama list | awk 'NR > 1 { print $1 }' | while read -r tag; do
+                if [ "$tag" = "$model" ]; then
+                  continue
+                fi
+                case $tag in
+                "$family":*) ollama rm "$tag" >/dev/null 2>&1 || true ;;
+                esac
+              done
+          env:
+            - name: OLLAMA_MODEL
+              value: "__MODEL__"
+            - name: OLLAMA_MODELS
+              value: /models
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 2Gi
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      containers:
+        - name: ollama
+          image: ollama/ollama:0.40.11
+          imagePullPolicy: IfNotPresent
+          env:
+            # 0.0.0.0 is not decoration: ollama binds loopback by default,
+            # which the Job pods (another namespace) could not reach.
+            - name: OLLAMA_HOST
+              value: "0.0.0.0:11434"
+            - name: OLLAMA_MODELS
+              value: /models
+            # omp sends long agent prompts; the engine's own default window is
+            # far smaller than the model's 32k context.
+            - name: OLLAMA_CONTEXT_LENGTH
+              value: "32768"
+            # Keep the weights resident between acceptance rounds.
+            - name: OLLAMA_KEEP_ALIVE
+              value: "24h"
+            - name: OLLAMA_MAX_LOADED_MODELS
+              value: "1"
+            - name: OLLAMA_NUM_PARALLEL
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 11434
+          startupProbe:
+            httpGet:
+              path: /api/tags
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 60
+          readinessProbe:
+            httpGet:
+              path: /api/tags
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 512Mi
+            limits:
+              cpu: "2"
+              memory: 3Gi
+          volumeMounts:
+            - name: models
+              mountPath: /models
+      volumes:
+        - name: models
+          persistentVolumeClaim:
+            claimName: ollama-models

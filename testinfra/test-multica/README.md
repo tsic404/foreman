@@ -14,15 +14,16 @@ itself, one face per consumer (see §Addresses).
 
 | File | Purpose |
 |---|---|
-| `deploy.yaml` | The whole deployment: namespace, backend config, frontend entry config, PVCs, postgres/backend/web/proxy Deployments, Services |
-| `deploy.sh` | Deployment entry: renders the entry origin, creates the Secret, applies, waits for the rollout |
-| `reset.sh` | Reset entry: stops the instance under test, wipes runtime/task rows, rebuilds the test objects, registers the model endpoint when its triple is supplied, runs the environment gate |
+| `deploy.yaml` | The multica deployment: namespace, backend config, frontend entry config, PVCs, postgres/backend/web/proxy Deployments, Services |
+| `model-backend.yaml` | The keyless local model backend (ollama PVC, Service, Deployment) — applied by `deploy.sh` only when no endpoint triple is set |
+| `deploy.sh` | Deployment entry: picks the model source, renders the entry origin, creates the Secret, applies, waits for the rollout |
+| `reset.sh` | Reset entry: stops the instance under test, wipes runtime/task rows, rebuilds the test objects, binds the test agent's model source (endpoint triple when supplied, else the local backend), runs the environment gate |
 | `wire.sh` | Wiring entry: points the instance under test at the access point and starts it |
 | `bind-agent.sh` | Binds the test agent to the runtime the instance registers (the step between "the instance is up" and "tasks can be dispatched") |
 | `recycle.sh` | Recycle entry: deletes the namespace, nothing else |
-| `selfcheck.sh` | The environment gate ①②③ — `reset.sh` and `wire.sh` run it at the pre-start moment |
+| `selfcheck.sh` | The environment gate ①②③④ — `reset.sh` and `wire.sh` run it at the pre-start moment |
 | `multica-test` | CLI wrapper — the profile, with the platform's task environment cleared |
-| `lib.sh` | Shared settings and helpers for the scripts, including the model-endpoint registration |
+| `lib.sh` | Shared settings and helpers for the scripts, including the model-source precedence and the endpoint registration |
 
 ## Addresses
 
@@ -30,6 +31,7 @@ itself, one face per consumer (see §Addresses).
 |---|---|---|
 | Access point (the server itself) | `http://test-multica-server:8080` | `http://127.0.0.1:30080` |
 | Frontend entry (web UI + `/ws`) | `http://test-multica-web` | `http://127.0.0.1:30300` |
+| Model backend (Job pods only) | `http://test-multica-ollama.multica-test.svc:11434` | — (not exposed) |
 
 The node shares the test host's network namespace, so the node ports in
 `deploy.yaml` are reachable on the host itself: loopback is the stable form of
@@ -53,12 +55,28 @@ login redirects and CORS checks use it). It is also stamped into the backend's
 pod template, so re-running `./deploy.sh` after the origin moves rolls the
 server instead of leaving it answering with the old one.
 
+The model backend exists only in the round that has no endpoint triple: it is
+not a face of the multica deployment — no host address, no NodePort, reached
+only from the Job pods (`multica-agents`) at its Service name. The test agent
+carries that base URL in its `custom_env` (`OLLAMA_BASE_URL`), which travels in
+the claim payload and is layered onto the agent process — the Job template is
+the instance under test's artifact and is not touched. The engine is keyless on
+purpose: a test environment must produce real model output without a production
+credential. `TEST_MULTICA_MODEL` overrides the served model (a full `name:tag`);
+the value is rendered into `model-backend.yaml` by `./deploy.sh`, and
+`./reset.sh` reads it back from the Deployment so the agent's selector always
+names what the backend actually serves.
+
 ## Version anchor
 
-Absolute, not drifting: `deploy.yaml` pins every image to the `v0.6.1` release
-(`multica@2ea01ae4`) — `ghcr.io/multica-ai/multica-backend:v0.6.1`,
+Absolute, not drifting: the manifests pin every image to the `v0.6.1` release
+(`multica@2ea01ae4`) — `deploy.yaml` carries the upstream images
+(`ghcr.io/multica-ai/multica-backend:v0.6.1`,
 `ghcr.io/multica-ai/multica-web:v0.6.1`, with `pgvector/pgvector:pg17` and
-`nginx:1.27-alpine` as the persistence and entry layers. The Job image is not
+`nginx:1.27-alpine` as the persistence and entry layers), and
+`model-backend.yaml` pins the local backend the same way
+(`ollama/ollama:0.40.11`); that backend's model tag is the only value that may
+follow the operator's `TEST_MULTICA_MODEL`. The Job image is not
 part of this pin: `build-foreman-job.yml` resolves upstream's newest release at
 build time and tags the image with that daemon version (`latest` follows the
 newest release), so the CLI a Job runs can be newer than the `v0.6.1` server.
@@ -81,6 +99,15 @@ kubectl -n multica-test logs deploy/backend --tail=200     # troubleshooting
 kubectl -n multica-test get pods,svc
 ```
 
+Without an endpoint triple, the first `./deploy.sh` pulls the model into the
+local backend's volume (hundreds of MB) before that Deployment reports ready;
+re-deploys reuse it. `TEST_MULTICA_MODEL` selects a different model at deploy
+time. The pull step's wait for the engine is bounded: if the engine does not
+answer within 120s, the init container fails and prints the engine's own log, so
+the pod log says why instead of leaving the pod in Init until the rollout budget
+expires. With a triple the local backend is not part of the round at all: it is
+not rendered, not applied and not waited for (§ Model endpoint).
+
 **Order matters.** `reset.sh` stops the instance under test and leaves the
 runtime list empty on purpose (gate ②), so the test agent cannot be bound yet;
 `wire.sh` starts the instance at the access point; `bind-agent.sh` binds the
@@ -88,18 +115,19 @@ agent to the `provider=omp` runtime it registers. The full round is:
 
 ```
 ./deploy.sh                    # the test cluster itself
-./reset.sh                     # stop, wipe, rebuild objects, gate ①②③
+./reset.sh                     # stop, wipe, rebuild objects, gate ①②③④
 ./wire.sh                      # MULTICA_SERVER_URL → the access point, start
 ./bind-agent.sh                # agent ← the omp runtime the instance registered
 <TC-tech cases>
 ```
 
 `reset.sh` and `wire.sh` both run `./selfcheck.sh` — the environment gate
-①②③ — while the instance is stopped: ① it points at the access point (never
+①②③④ — while the instance is stopped: ① it points at the access point (never
 the production address), ② the runtime list is empty, ③ the server reports the
-artifact anchor. Any failure is `QA_BLOCKED` (exit 2); once the instance runs,
-②'s assertion becomes "exactly one `provider=omp` runtime", which
-TC-tech-protocol-01 judges.
+artifact anchor, ④ the selected model source serves the round (the supplied
+endpoint, or the local backend and the model it serves). Any failure is
+`QA_BLOCKED` (exit 2); once the instance runs, ②'s assertion becomes "exactly
+one `provider=omp` runtime", which TC-tech-protocol-01 judges.
 
 On a fresh environment the first `reset.sh` stops at ① — the Deployment still
 carries the production address from `deploy/` — and `./wire.sh` is what fixes
@@ -115,6 +143,21 @@ provider registration below is applied in place for the same reason. The
 autopilot is `bind-agent.sh`'s, not this entry's: the server refuses one whose
 assignee has no runtime.
 
+The test agent's model configuration is reconciled on every reset, not only on
+creation, through one explicit precedence: the deployment-supplied endpoint
+(§ Model endpoint) wins; without it the deployed local backend is the source —
+`model` is set to `ollama/<family>` (the served tag without its `:tag` suffix)
+and `custom_env` carries that backend's in-cluster base URL as
+`OLLAMA_BASE_URL`; with neither, `model` is cleared and `custom_env` emptied.
+Both fields travel in the claim payload's agent section — the Job daemon passes
+`model` to the runtime and layers `custom_env` onto the agent process — so a
+task can actually reach the model. The selector is deliberately untagged: a
+fresh Job pod has no discovered local-engine catalog at startup, and a
+colon-tagged selector would be rejected before discovery; the untagged form
+resolves after discovery against the single served tag of that family (the
+backend prunes other tags). Reconciling rather than create-only is what
+repairs an agent left model-less by an earlier environment.
+
 The wipe is SQL inside the persistence pod (`kubectl exec deploy/postgres`) —
 the server has no API for deleting task history, and a runtime delete detaches
 tasks instead of removing them.
@@ -125,6 +168,7 @@ tasks instead of removing them.
 |---|---|---|
 | Workspace + loginable account | `foreman-test` (`Foreman Test`), `acceptance@test.local` | task cancellation, board, chat entry |
 | Test agent | `foreman-test-agent` | dispatch (its runtime is the one Foreman registers) |
+| Model backend (local mode only) | PVC `ollama-models`, Deployment/Service `test-multica-ollama`, model `qwen2.5:0.5b` (overridable) | the test agent's inference, token usage — absent when the endpoint triple is set |
 | Repository | `https://github.com/tsic404/foreman` | agent checkout, cache cases |
 | Autopilot (manual trigger) | `foreman-test-autopilot` | `./multica-test autopilot trigger <id>` |
 | Chat entry | chat session `foreman-test-chat` | messages to the agent |
@@ -146,7 +190,28 @@ The test agent's tasks run in Foreman's Job pods, and the agent CLI inside a
 pod can only finish a task when it has a model endpoint. The endpoint is a
 deployment parameter of this environment, never a manual UI step: every round
 rebuilds the test-multica namespace, so anything configured by hand would be
-gone by the next one.
+gone by the next one. Supplying the triple takes precedence; with no triple the
+keyless local backend `model-backend.yaml` declares is the model source (Reset
+semantics above).
+
+The two sources are alternatives for the whole round, so exactly one of them is
+a prerequisite — never both:
+
+| | Endpoint triple set | Endpoint triple unset |
+|---|---|---|
+| Objects `./deploy.sh` applies | `deploy.yaml` only | `deploy.yaml` and `model-backend.yaml` |
+| Local model backend (PVC/Service/Deployment `ollama-models` / `test-multica-ollama`) | absent — not rendered, not applied, not waited for | present; its rollout is the slow one (model pull) |
+| Objects `./reset.sh` writes | provider registration (Secret + node-local file), agent `model` = `<provider>/<model id>` | no registration; agent `model` = `ollama/<family>`, `custom_env.OLLAMA_BASE_URL` = the in-cluster address |
+| Gate ④ (`./selfcheck.sh`) | asserts the endpoint is the selected source | asserts the local backend serves the model |
+
+A half-set triple is refused by every entry (`./deploy.sh` included) with the
+missing variable named: deploying would otherwise install a model source nobody
+chose, and `./reset.sh` would reject the same environment.
+
+`./deploy.sh` applies manifests; it does not prune. A deployment switched from
+local mode to the endpoint therefore leaves the earlier backend objects behind —
+they are not prerequisites of the new round, but `./recycle.sh && ./deploy.sh` is
+the clean rebuild.
 
 | Variable | Meaning |
 |---|---|
@@ -172,22 +237,26 @@ the baseline:
   0600. The carrier Pods run a small public Alpine image (a shell and busybox
   are all they need), so the namespace admits hostPath pods (PSA `privileged`,
   see `deploy.yaml`).
-- **absent** — the entry prints 「未配置模型端点」 and registers nothing: tasks
-  keep the baseline behaviour (they converge to `process_failure` quickly), and
-  no production endpoint, staging value or credential is ever substituted. The
+- **absent** — the entry prints 「未配置模型端点」 and registers nothing, and no
+  production endpoint, staging value or credential is ever substituted. The
   rollback is unconditional — every endpoint-less reset removes the node-local
-  file, deletes the Secret (`--ignore-not-found`) and clears the agent's
-  `model`, whether or not the agent row still carries the old selector. That is
-  what keeps the guarantee when `recycle.sh` has deleted the namespace: the
-  node-local file outlives it, and the recreated agent row carries no evidence
-  of the previous registration.
+  file and deletes the Secret (`--ignore-not-found`), whether or not the agent
+  row still carries the old selector. The agent then falls to the next step of
+  the precedence: the local backend when `./deploy.sh` installed one (`model` =
+  `ollama/<family>`, `custom_env` = its in-cluster address), otherwise `model`
+  is cleared and `custom_env` emptied, so tasks keep the baseline behaviour
+  (they converge to `process_failure` quickly). That is what keeps the
+  guarantee when `recycle.sh` has deleted the namespace: the node-local file
+  outlives it, and the recreated agent row carries no evidence of the previous
+  registration.
 - **partial** — the entry fails and names the missing part instead of guessing.
 
 The credential travels only through the environment or a mounted file. It is
-in no file of this repository, not in `deploy.yaml`, and not in any example
-manifest; it reaches the carrier Pods through the Secret volume (never an
-argument), and rests afterwards only in the node-local file the Job pods read —
-the same trust level the design already gives the node home (ADR-018).
+in no file of this repository, not in `deploy.yaml` or `model-backend.yaml`, and
+not in any example manifest; it reaches the carrier Pods through the Secret
+volume (never an argument), and rests afterwards only in the node-local file the
+Job pods read — the same trust level the design already gives the node home
+(ADR-018).
 
 Idempotent: a second `./reset.sh` applies the same Secret in place, overwrites
 the same file on each node and sets the same model on the same agent — one
@@ -241,6 +310,10 @@ into the instance under test (`MULTICA_SERVER_URL` → the access point,
 - The environment is reachable from the test network only: NodePorts on the
   test cluster's node, no ingress, no public DNS. The fixed development
   verification code makes every account on it loginnable — never expose it.
+  The model backend has no host face at all: only in-cluster clients reach it.
+- No production credential ever enters this environment, and the model backend
+  is keyless for the same reason: a hosted provider would need a test key in
+  the cluster and in the agent's `custom_env`.
 - Nothing here touches production: a separate namespace, a separate database,
   a separate workspace, and a separate CLI profile. `recycle.sh` deletes the
   namespace and stops there — the `foreman` and `multica-agents` namespaces are
