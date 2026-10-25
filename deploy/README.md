@@ -492,9 +492,23 @@ container mounts it as the `MULTICA_OMP_PATH` file. A deployer's own template
 does the same job its own way — that is the template's choice, and nothing
 checks it. Consequences to size for:
 
-- every Job boot pays the download (the reference template takes the newest
-  release each time), so `FOREMAN_JOB_BOOT_TIMEOUT` (default `300s`, §4.2) must
-  cover a multi-minute fetch on a cold or slow link;
+- **the startup cost is per task, not per deployment.** `agent-bin` is the
+  pod's `emptyDir` (size limit `1Gi`), not a node or shared volume, so the
+  `omp` init container fetches the ≈200 MB asset again on every pod — N tasks
+  booting together make N fetches, and the startup probe pays one too.
+  Measured on the reference deployment at ≈5 MB/s, the download leg alone is
+  ≈40 s, while the whole cold start — schedule, image pull, download,
+  registration — is ≈262 s for a task boot (`foreman_job_boot_seconds`) and
+  ≈270 s for the startup probe (`daemon.registered` minus `probe.started`).
+  The two network legs, the image pull and the agent-backend download, both
+  halve in speed with the link, so a link at half the measured rate
+  approximately doubles the whole span: ≈540 s for the probe and ≈524 s for
+  a task. Size both windows for the whole span, not for the download alone.
+  The shipped `FOREMAN_STARTUP_PROBE_TIMEOUT` is `600s` (a missed window
+  CrashLoops the deployment), while `FOREMAN_JOB_BOOT_TIMEOUT` stays `300s`
+  (a missed bound fails that task with `job_boot_timeout`); raise it together
+  with `FOREMAN_JOB_TOKEN_TTL` if your links need the same headroom, since
+  the startup self-check refuses a TTL below boot + task + drain;
 - the Job image must keep the runtime that binary links (`libstdc++` /
   `libgcc_s`); `ADR-033` lists it as an image content;
 - a `MULTICA_OMP_PATH` that exists in neither the image nor a mounted volume
@@ -598,8 +612,9 @@ the same official daemon, rendered from the same template. The probe reports whi
 runtimes/providers the template environment really has, and that report is what
 Foreman declares to the server; it also doubles as the template preflight.
 
-- `FOREMAN_STARTUP_PROBE_TIMEOUT` (default = `FOREMAN_JOB_BOOT_TIMEOUT`) is the
-  window. **No runtime registers inside it ⇒ Foreman exits non-zero**
+- `FOREMAN_STARTUP_PROBE_TIMEOUT` (default = `FOREMAN_JOB_BOOT_TIMEOUT`; the
+  shipped manifest sets `600s`) is the window. **No runtime registers inside
+  it ⇒ Foreman exits non-zero**
   (`startup.probe_failed` carries the class: `job_create_failed` /
   `pod_not_started` / `daemon_not_registered` / `discovery_not_landed`). A
   failure to *land the catalog* is an **error-level** `startup.probe_failed`
@@ -607,6 +622,18 @@ Foreman declares to the server; it also doubles as the template preflight.
   registration (S4) is the only exit criterion. With
   `FOREMAN_MODEL_CATALOG_ENABLED=false` registration alone completes startup and
   no failure event is emitted.
+- **Why `600s`, and how to read the cost of a start.** The probe's own init
+  pays the same per-pod agent-backend download as a task (§Risk disclosure),
+  and it has to finish before the daemon can register; a missed window
+  CrashLoops the deployment, so the shipped window is twice the task boot
+  bound. On the measured cold path the probe registered 270 s after
+  `probe.started` — a ≈40 s agent-backend download plus schedule, image pull
+  and registration — and both network legs halve in speed with the link, so
+  half the measured throughput approximately doubles that whole span to
+  ≈540 s. Window and elapsed time are events, not estimates:
+  `probe.started` carries the window as `budget` (nanoseconds, e.g.
+  `600000000000` for `600s`) and `daemon.registered` its `ts`, so the two
+  lines answer both questions.
 - **Template duty**: the probe needs its own credential and profile, so a
   template must express them with the two literals Foreman rewrites —
   profile `foreman-job` → `foreman-catalog`, Secret `fm-<task_id>-cred` →

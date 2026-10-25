@@ -179,8 +179,13 @@ spec:
               value: "256Mi"
             # Startup probe window: the first probe must register within it or
             # Foreman exits non-zero (default = FOREMAN_JOB_BOOT_TIMEOUT).
+            # Twice the boot bound here: the probe's init downloads ≈200 MB
+            # of agent backend per pod (≈40s download at the measured
+            # ~5 MB/s; cold start ≈270s, ≈262s per task, roughly doubled on
+            # a half-rate link), and a missed window CrashLoops the whole
+            # deployment instead of failing one task.
             - name: FOREMAN_STARTUP_PROBE_TIMEOUT
-              value: "300s"
+              value: "600s"
             # --- node-local state (ADR-005) ---
             - name: FOREMAN_STATE_ROOT
               value: "/var/lib/foreman"
