@@ -36,8 +36,7 @@ all_logs=$(printf '%s\n%s\n' "$logs" "$previous")
 # The injected fault's evidence.
 case $FAULT in
 restart)
-	restarts=$(kubectl -n "$FOREMAN_NS" get pods -o json |
-		jq '[.items[].status.containerStatuses[]?.restartCount] | max // 0') ||
+	restarts=$(foreman_restarts) ||
 		blocked "cannot read the foreman pods' restart counts"
 	case $restarts in '' | *[!0-9]*) blocked "the restart count is not a number: '$restarts'" ;; esac
 	started_lines=$(printf '%s\n' "$logs" | grep -c '"msg":"foreman.started"' || true)

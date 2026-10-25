@@ -34,10 +34,15 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: foreman
+      app.kubernetes.io/component: scheduler
   template:
     metadata:
+      # The component key keeps this pod set disjoint from the shared-state
+      # pods (deploy/35-shared-state.yaml carries component: shared-state), so
+      # `kubectl logs deploy/foreman` and the Service below resolve only here.
       labels:
         app.kubernetes.io/name: foreman
+        app.kubernetes.io/component: scheduler
       annotations:
         prometheus.io/scrape: "true"
         prometheus.io/port: "8080"
@@ -317,6 +322,7 @@ metadata:
   namespace: foreman
   labels:
     app.kubernetes.io/name: foreman
+    app.kubernetes.io/component: scheduler
   annotations:
     prometheus.io/scrape: "true"
     prometheus.io/port: "8080"
@@ -325,6 +331,7 @@ spec:
   type: ClusterIP
   selector:
     app.kubernetes.io/name: foreman
+    app.kubernetes.io/component: scheduler
   ports:
     - name: http
       port: 8080
