@@ -16,13 +16,13 @@ itself, one face per consumer (see §Addresses).
 |---|---|
 | `deploy.yaml` | The whole deployment: namespace, backend config, frontend entry config, PVCs, postgres/backend/web/proxy Deployments, Services |
 | `deploy.sh` | Deployment entry: renders the entry origin, creates the Secret, applies, waits for the rollout |
-| `reset.sh` | Reset entry: stops the instance under test, wipes runtime/task rows, rebuilds the test objects, runs the environment gate |
+| `reset.sh` | Reset entry: stops the instance under test, wipes runtime/task rows, rebuilds the test objects, registers the model endpoint when its triple is supplied, runs the environment gate |
 | `wire.sh` | Wiring entry: points the instance under test at the access point and starts it |
 | `bind-agent.sh` | Binds the test agent to the runtime the instance registers (the step between "the instance is up" and "tasks can be dispatched") |
 | `recycle.sh` | Recycle entry: deletes the namespace, nothing else |
 | `selfcheck.sh` | The environment gate ①②③ — `reset.sh` and `wire.sh` run it at the pre-start moment |
 | `multica-test` | CLI wrapper — the profile, with the platform's task environment cleared |
-| `lib.sh` | Shared settings and helpers for the scripts |
+| `lib.sh` | Shared settings and helpers for the scripts, including the model-endpoint registration |
 
 ## Addresses
 
@@ -111,6 +111,7 @@ it; from then on the round above runs through.
 **runtime rows and task rows**, then rebuilds the test objects; the account,
 workspace, repository, agent and chat session are looked up by name and only
 created when missing. It is idempotent and safe to run between rounds. The
+provider registration below is applied in place for the same reason. The
 autopilot is `bind-agent.sh`'s, not this entry's: the server refuses one whose
 assignee has no runtime.
 
@@ -128,6 +129,7 @@ tasks instead of removing them.
 | Autopilot (manual trigger) | `foreman-test-autopilot` | `./multica-test autopilot trigger <id>` |
 | Chat entry | chat session `foreman-test-chat` | messages to the agent |
 | Task status query surface | `./multica-test runtime list` / board at the entry origin | runtime, task and cancellation state |
+| Model provider registration | `foreman-test/<model id>` in `${FOREMAN_STATE_ROOT}/home/<workspace>/.omp/agent/models.yml`; Secret `test-multica-model-provider` | the test agent's model (only when the endpoint is supplied) |
 
 The repository is the implementation repo, which the acceptance side can write
 to with its own git credentials. The autopilot is created by `bind-agent.sh`
@@ -137,6 +139,72 @@ has no runtime, and the reset entry leaves the runtime list empty on purpose.
 The login is deterministic: `APP_ENV=development` plus the fixed verification
 code in the Secret. The account is created on first login; no password is
 stored anywhere.
+
+## Model endpoint (部署参数)
+
+The test agent's tasks run in Foreman's Job pods, and the agent CLI inside a
+pod can only finish a task when it has a model endpoint. The endpoint is a
+deployment parameter of this environment, never a manual UI step: every round
+rebuilds the test-multica namespace, so anything configured by hand would be
+gone by the next one.
+
+| Variable | Meaning |
+|---|---|
+| `TEST_MULTICA_MODEL_BASE_URL` | The endpoint's API root (e.g. `https://gateway.example/v1`) |
+| `TEST_MULTICA_MODEL_ID` | The model id the endpoint serves — the bare id, not a selector |
+| `TEST_MULTICA_MODEL_API_KEY` / `TEST_MULTICA_MODEL_API_KEY_FILE` | The credential: a value, or a file the operator mounts |
+| `TEST_MULTICA_MODEL_API` | Optional: `openai-completions` (default) or `anthropic-messages` |
+| `TEST_MULTICA_MODEL_PROVIDER` | Optional provider id (default `foreman-test`) |
+| `TEST_MULTICA_STATE_ROOT` | Optional: fallback node state root when the instance Deployment cannot be read (default `/var/lib/foreman`); the Deployment's `FOREMAN_STATE_ROOT` wins |
+| `TEST_MULTICA_MODEL_WAIT` | Optional: how long one carrier Pod may take, image pull included (default 600s) |
+| `TEST_MULTICA_MODEL_IMAGE` | Optional: the shell image the carrier Pods run (default `alpine:3.20`) |
+
+`./reset.sh` registers the triple when it is present; when it is absent it
+removes any registration a previous round left behind, so the round really is
+the baseline:
+
+- **present** — one Secret (`test-multica-model-provider`) carries the
+  registration; one one-shot Pod per schedulable Linux node materialises it as
+  `<state-root>/home/<workspace>/.omp/agent/models.yml`, the node-local provider
+  configuration the Job pods mount (`02-contracts.md §8.7`). The test agent's
+  `model` then points at `<provider>/<model id>`. The file holds exactly one
+  provider with one model, is owned by the Job's agent uid (1000) and is mode
+  0600. The carrier Pods run a small public Alpine image (a shell and busybox
+  are all they need), so the namespace admits hostPath pods (PSA `privileged`,
+  see `deploy.yaml`).
+- **absent** — the entry prints 「未配置模型端点」 and registers nothing: tasks
+  keep the baseline behaviour (they converge to `process_failure` quickly), and
+  no production endpoint, staging value or credential is ever substituted. The
+  rollback is unconditional — every endpoint-less reset removes the node-local
+  file, deletes the Secret (`--ignore-not-found`) and clears the agent's
+  `model`, whether or not the agent row still carries the old selector. That is
+  what keeps the guarantee when `recycle.sh` has deleted the namespace: the
+  node-local file outlives it, and the recreated agent row carries no evidence
+  of the previous registration.
+- **partial** — the entry fails and names the missing part instead of guessing.
+
+The credential travels only through the environment or a mounted file. It is
+in no file of this repository, not in `deploy.yaml`, and not in any example
+manifest; it reaches the carrier Pods through the Secret volume (never an
+argument), and rests afterwards only in the node-local file the Job pods read —
+the same trust level the design already gives the node home (ADR-018).
+
+Idempotent: a second `./reset.sh` applies the same Secret in place, overwrites
+the same file on each node and sets the same model on the same agent — one
+provider registration and one test agent. Verify with:
+
+```bash
+kubectl -n multica-test get secret test-multica-model-provider \
+	-o jsonpath='{.data.models\.yml}' | base64 -d     # one provider, one model
+kubectl debug node/<node> --profile=sysadmin --image=debian:bookworm-slim -qi -- \
+	cat /host/var/lib/foreman/home/<workspace>/.omp/agent/models.yml
+./multica-test agent list --output json | jq '.[] | select(.name == "foreman-test-agent") | .model'
+```
+
+A stub endpoint — one that accepts a connection and never answers — only
+lengthens the agent's life (the long-window cases); it produces no completion
+terminal, so it is a diagnostic, never a default and never an acceptance
+substitute.
 
 ## CLI profile (查询面凭据)
 
@@ -180,3 +248,21 @@ into the instance under test (`MULTICA_SERVER_URL` → the access point,
 - The proxy is the frontend entry: it forwards bytes and carries no protocol
   semantics. The instance under test reaches the server directly, at the access
   point.
+- The model endpoint registration is the one thing this component writes
+  outside its own namespace: `reset.sh` puts it where the Job pods mount their
+  provider configuration (the instance under test's node-local home), because
+  that is the only face the agent CLI reads (`02-contracts.md §8.7`). The
+  credential therefore rests in that node home (the design already gives the
+  node home that trust level, ADR-018) and in the test namespace's Secret —
+  both disposable, both test-only. Never point this parameter at a production
+  endpoint or credential.
+- **Explicit acceptance — the test namespace is admitted with PSA
+  `privileged`.** The label is static in `deploy.yaml`, so it applies to every
+  round, not only to rounds that supply the endpoint. The carrier Pods mount a
+  node hostPath (the registration has to land in the Job home), which the
+  baseline and restricted profiles forbid, and the namespace is disposable and
+  reachable from the test network only. Narrowing the label to the carrier's
+  lifetime would mean re-labelling a shared namespace around every reset and
+  restoring labels this component does not own; the test environment accepts
+  the loose profile as a fixed property instead. A deployment that cannot
+  accept it must run the test environment on a dedicated cluster.
