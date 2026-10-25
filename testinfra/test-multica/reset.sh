@@ -22,12 +22,20 @@
 #      whose assignee agent has no runtime, and this entry leaves the runtime
 #      list empty on purpose — ./bind-agent.sh creates it once the agent is
 #      bound;
-#   6. gate — ./selfcheck.sh: the environment gate ①②③ (the instance points at
+#   6. model endpoint — when the deployment supplies the endpoint triple, the
+#      provider registration is written into the node-local home the Job pods
+#      mount and the test agent's model points at it. Without it the entry
+#      prints 「未配置模型端点」, clears any registration a previous round left
+#      (the node file outlives the namespace) and keeps the baseline: no
+#      synthetic endpoint, no production fallback;
+#   7. gate — ./selfcheck.sh: the environment gate ①②③ (the instance points at
 #      the access point, the runtime list is empty, the server reports the
 #      artifact anchor).
 #
 # It is idempotent: everything is looked up by name and only created when
-# missing. The agent stays unbound on purpose — ./bind-agent.sh binds it to the
+# missing; the provider registration is one Secret applied in place and one
+# file per node, overwritten (and removed unconditionally when the endpoint is
+# absent). The agent stays unbound on purpose — ./bind-agent.sh binds it to the
 # runtime the instance registers.
 
 set -eu
@@ -43,7 +51,7 @@ for arg in "$@"; do
 	case $arg in
 	--print-token) print_token=1 ;;
 	-h | --help)
-		sed -n '2,29p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
 		exit 0
 		;;
 	*) die "unknown argument: $arg" ;;
@@ -222,7 +230,14 @@ ensure_chat() {
 	info "created chat session $CHAT_TITLE ($id)"
 }
 
-# --- 6. gate and report ------------------------------------------------------
+# --- 6. the model endpoint ---------------------------------------------------
+
+# The registration itself lives in lib.sh (it is driven by the entry's
+# `agent_id`): with the triple it writes the provider and points the agent at
+# it; without it, it removes whatever a previous round left on the nodes and
+# clears the agent model (the rollback is unconditional — see the helper).
+
+# --- 7. gate and report ------------------------------------------------------
 
 info "reset target: $SERVER_URL (namespace $NS, profile $PROFILE)"
 curl -fsS -m 30 "$SERVER_URL/api/config" >/dev/null ||
@@ -234,6 +249,7 @@ wipe_rows
 ensure_repo
 ensure_agent
 ensure_chat
+register_model_endpoint
 
 # The environment gate ①②③, the gate every round opens with. Run here, with
 # the instance under test stopped, ② is the reset-time state this entry sets
@@ -246,6 +262,7 @@ printf 'profile:      %s (%s)\n' "$PROFILE" "$PROFILE_CONFIG"
 printf 'server:       %s\n' "$SERVER_URL"
 printf 'entry:        %s\n' "$ENTRY_URL"
 printf 'agent:        %s\n' "$AGENT_NAME"
+printf 'model:        %s\n' "$model_text"
 printf 'chat session: %s\n' "$CHAT_TITLE"
 printf 'next:         ./wire.sh         # points the instance at the access point and starts it\n'
 printf '              ./bind-agent.sh   # after the instance registered its runtime (creates the test autopilot %s)\n' "$AUTOPILOT_TITLE"

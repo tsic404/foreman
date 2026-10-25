@@ -22,6 +22,21 @@ metadata:
   labels:
     app.kubernetes.io/name: multica
     app.kubernetes.io/component: test-cluster
+    # The model endpoint's carrier Pods (./reset.sh) mount the node's Job home
+    # through a hostPath, which the baseline and restricted PSA profiles
+    # forbid. The label is static and therefore applies to endpoint-less rounds
+    # too: that is an explicit acceptance of the disposable, test-network-only
+    # namespace (README §Boundaries), not a per-round privilege. The Pods
+    # themselves run as root with all capabilities dropped but the ones their
+    # own script needs: the write carrier gets CHOWN, DAC_OVERRIDE and FOWNER
+    # (the registration has to be handed to the Job's agent uid, rewritten on a
+    # later reset, and chmodded after that handover — chmod needs FOWNER), the
+    # delete carrier DAC_OVERRIDE alone (it only traverses that 1000-owned
+    # directory and unlinks one file); PSA is an admission switch here, not a
+    # privilege grant.
+    pod-security.kubernetes.io/enforce: privileged
+    pod-security.kubernetes.io/audit: privileged
+    pod-security.kubernetes.io/warn: privileged
 ---
 # Backend (server) configuration. Non-secret values only — JWT_SECRET,
 # POSTGRES_PASSWORD and MULTICA_DEV_VERIFICATION_CODE live in the Secret.
