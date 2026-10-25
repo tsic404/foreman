@@ -73,7 +73,7 @@ vet:
 	go vet ./...
 
 # Acceptance matrix census: the design's TC numbers and the case names under
-# tests/acceptance must name each other. The design table travels as a
+# tests/acceptance must name each other. The design document travels as a
 # commit-pinned bundle under tests/testinfra/testdata, so no checkout is
 # needed; FOREMAN_DESIGN_DIR overrides it with a local one at the same
 # revision.

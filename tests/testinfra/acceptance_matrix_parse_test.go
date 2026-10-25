@@ -127,3 +127,96 @@ func TestAcceptanceMatrixRejectsOffAnchorCheckout(t *testing.T) {
 		t.Fatalf("a checkout whose HEAD moved past the pin was accepted: the census would judge another snapshot")
 	}
 }
+
+func TestParseDesignMatrix(t *testing.T) {
+	cases := []struct {
+		name    string
+		doc     string
+		want    map[string]string
+		wantErr bool
+	}{
+		{
+			name: "entries carry their own priority",
+			doc: "# Acceptance\n\n## 验收标准\n\n#### AC-01\n\n- **优先级**：P0\n\n" +
+				"## 用例\n\n#### TC-tech-auth-01\n\n- **AC**：AC-01\n- **优先级**：P0\n\n" +
+				"#### TC-uat-cache-01\n\n- **AC**：AC-80\n- **优先级**：P2\n",
+			want: map[string]string{"TC-tech-auth-01": "P0", "TC-uat-cache-01": "P2"},
+		},
+		{
+			name:    "an entry without a priority fails the shape",
+			doc:     "#### TC-tech-auth-01\n\n- **场景语义**\n  - 注册与心跳\n",
+			wantErr: true,
+		},
+		{
+			name:    "an unknown priority fails the shape",
+			doc:     "#### TC-tech-auth-01\n\n- **优先级**：P3\n",
+			wantErr: true,
+		},
+		{
+			name: "a repeated number fails instead of keeping the first",
+			doc: "#### TC-tech-auth-01\n\n- **优先级**：P0\n\n" +
+				"#### TC-tech-auth-01\n\n- **优先级**：P2\n",
+			wantErr: true,
+		},
+		{
+			name: "an entry with more than one priority fails",
+			doc: "#### TC-tech-auth-01\n\n- **优先级**：P0\n" +
+				"- **优先级**：P1\n",
+			wantErr: true,
+		},
+		{
+			name: "a heading that names a number in another shape fails",
+			doc: "#### TC-tech-auth-01\n\n- **优先级**：P0\n\n" +
+				"#### TC-tech-auth-02 的补充说明\n\n- **优先级**：P0\n",
+			wantErr: true,
+		},
+		{
+			name: "a heading with a short number is not dropped",
+			doc: "#### TC-tech-auth-01\n\n- **优先级**：P0\n\n" +
+				"#### TC-tech-auth-1\n\n- **优先级**：P0\n",
+			wantErr: true,
+		},
+		{
+			name: "a heading with a three-digit number is not dropped",
+			doc: "#### TC-tech-auth-01\n\n- **优先级**：P0\n\n" +
+				"#### TC-tech-auth-001\n\n- **优先级**：P0\n",
+			wantErr: true,
+		},
+		{
+			name: "a heading with upper-case letters is not dropped",
+			doc: "#### TC-tech-auth-01\n\n- **优先级**：P0\n\n" +
+				"#### TC-Tech-Auth-01\n\n- **优先级**：P0\n",
+			wantErr: true,
+		},
+		{
+			name: "text outside any entry is ignored",
+			doc:  "> intro quoting TC-tech-auth-01\n\n- **优先级**：P1\n",
+			want: map[string]string{},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got, order, err := parseDesignMatrix("acceptance.md", []byte(tc.doc))
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("parseDesignMatrix accepted a document the census cannot decide: %v", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("parseDesignMatrix: %v", err)
+			}
+			if len(got) != len(tc.want) {
+				t.Fatalf("parseDesignMatrix read %d entries, want %d: %v", len(got), len(tc.want), got)
+			}
+			for id, priority := range tc.want {
+				if got[id] != priority {
+					t.Errorf("%s priority = %q, want %q", id, got[id], priority)
+				}
+			}
+			if len(order) != len(got) {
+				t.Errorf("order has %d entries, want one per entry: %v", len(order), order)
+			}
+		})
+	}
+}

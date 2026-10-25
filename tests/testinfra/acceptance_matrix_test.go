@@ -2,9 +2,9 @@
 // number. This census walks it both ways and applies the design's gate: a P0
 // entry without evidence and any reverse drift fail the run, while a P1/P2
 // entry without evidence is recorded and the run continues. The design host
-// is LAN-only, so its table travels as a commit-pinned bundle under testdata;
-// an input whose HEAD is not the pinned revision fails, never skips, because
-// a skipped census is a green step that decides nothing.
+// is LAN-only, so its acceptance document travels as a commit-pinned bundle
+// under testdata; an input whose HEAD is not the pinned revision fails, never
+// skips, because a skipped census is a green step that decides nothing.
 package testinfra
 
 import (
@@ -26,7 +26,7 @@ const acceptanceCases = "../acceptance"
 // against. Pinning it is what makes the verdict reproducible: the same tree
 // must decide the same way. Refresh it with `make acceptance-census-refresh`
 // when the design moves and the cases follow.
-const acceptanceMatrixDesignAnchor = "471c08a5df6471dce1f840ac7ba21e89bdad9dd1"
+const acceptanceMatrixDesignAnchor = "b8892e7c9dbf07b7ab7c92c9a8294d3edbcb556c"
 
 // acceptanceFixtures are shared helpers, not cases: they build the scenarios
 // the numbered files judge and claim no TC of their own.
@@ -39,25 +39,82 @@ var acceptanceFixtures = map[string]bool{
 }
 
 var (
-	// designTCRow matches a TC table row and captures its number; the cells
-	// are split separately because the priority is the row's last cell.
-	designTCRow = regexp.MustCompile(`^\|\s*(TC-[a-z0-9]+(?:-[a-z0-9]+)*-\d{2})\s*\|`)
+	// designTCHeading matches a TC section heading and captures its number;
+	// the section body carries the entry, including the priority.
+	designTCHeading = regexp.MustCompile(`^#+\s+(TC-[a-z0-9]+(?:-[a-z0-9]+)*-\d{2})\s*$`)
+	// designTCPriority matches the priority field inside a TC section.
+	designTCPriority = regexp.MustCompile(`^-\s*\*\*优先级\*\*\s*[：:]\s*(P[0-2])\s*$`)
 	// designTCID finds a TC number in a case file's leading comment.
 	designTCID = regexp.MustCompile(`\bTC-[a-z0-9]+(?:-[a-z0-9]+)*-\d{2}\b`)
-	// designPriority matches the gate's priority column.
-	designPriority = regexp.MustCompile(`^P[0-2]$`)
 )
 
-// designCells splits one markdown table row into its trimmed cells.
-func designCells(line string) []string {
-	trimmed := strings.TrimSpace(line)
-	trimmed = strings.TrimPrefix(trimmed, "|")
-	trimmed = strings.TrimSuffix(trimmed, "|")
-	cells := strings.Split(trimmed, "|")
-	for i, cell := range cells {
-		cells[i] = strings.TrimSpace(cell)
+// parseDesignMatrix reads the design's TC entries: each entry is a section
+// headed by its number and states its priority in the body. The number set is
+// the design side of the census, so every shape the reader cannot decide
+// fails instead of dropping the entry: a heading that names a number but not
+// in the readable form, a repeated number, and an entry with anything but one
+// priority all fail, because a silently skipped entry or a softened P0 is
+// exactly what the census exists to catch.
+func parseDesignMatrix(path string, raw []byte) (map[string]string, []string, error) {
+	priorities := make(map[string]string)
+	var order []string
+	var current string
+	var body []string
+
+	closeEntry := func() error {
+		if current == "" {
+			return nil
+		}
+		var stated []string
+		for _, line := range body {
+			if match := designTCPriority.FindStringSubmatch(line); match != nil {
+				stated = append(stated, match[1])
+			}
+		}
+		switch len(stated) {
+		case 0:
+			return fmt.Errorf("%s: entry %s states no priority (P0/P1/P2): the document changed shape", path, current)
+		case 1:
+		default:
+			return fmt.Errorf("%s: entry %s states %d priorities (%s): want exactly one, so a P0 cannot be softened into a recorded gap", path, current, len(stated), strings.Join(stated, ", "))
+		}
+		priorities[current] = stated[0]
+		order = append(order, current)
+		current, body = "", nil
+		return nil
 	}
-	return cells
+
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if strings.HasPrefix(line, "#") {
+			if err := closeEntry(); err != nil {
+				return nil, nil, err
+			}
+			match := designTCHeading.FindStringSubmatch(line)
+			if match == nil {
+				// Any heading that carries `TC-` but does not read back as
+				// an entry is a number the census cannot place; letting it
+				// pass would drop that entry, and a P0 without a case has no
+				// other check to catch it.
+				if strings.Contains(line, "TC-") {
+					return nil, nil, fmt.Errorf("%s: heading %q names a TC number in a shape the census cannot read: the entry would leave the design side silently", path, line)
+				}
+				continue
+			}
+			if _, seen := priorities[match[1]]; seen {
+				return nil, nil, fmt.Errorf("%s: entry %s appears again at %q: numbers are globally unique, so a second entry is a defect, not a duplicate to keep", path, match[1], line)
+			}
+			current = match[1]
+			continue
+		}
+		if current != "" {
+			body = append(body, line)
+		}
+	}
+	if err := closeEntry(); err != nil {
+		return nil, nil, err
+	}
+	return priorities, order, nil
 }
 
 // caseTCID reads the TC number a case's filename claims: the design id with
@@ -215,30 +272,15 @@ func TestAcceptanceMatrixIsBidirectionallyClosed(t *testing.T) {
 	designPath := filepath.Join(designDir, "docs", "03-acceptance.md")
 	raw, err := os.ReadFile(designPath)
 	if err != nil {
-		t.Fatalf("read the design's TC table: %v", err)
+		t.Fatalf("read the design's TC entries: %v", err)
 	}
 
-	priorities := map[string]string{}
-	var designOrder []string
-	for _, line := range strings.Split(string(raw), "\n") {
-		match := designTCRow.FindStringSubmatch(line)
-		if match == nil {
-			continue
-		}
-		id := match[1]
-		if _, seen := priorities[id]; seen {
-			continue
-		}
-		cells := designCells(line)
-		priority := cells[len(cells)-1]
-		if !designPriority.MatchString(priority) {
-			t.Fatalf("%s: row %s ends in %q, want the priority column (P0/P1/P2): the table changed shape", designPath, id, priority)
-		}
-		priorities[id] = priority
-		designOrder = append(designOrder, id)
+	priorities, designOrder, err := parseDesignMatrix(designPath, raw)
+	if err != nil {
+		t.Fatal(err)
 	}
 	if len(priorities) == 0 {
-		t.Fatalf("no TC rows in %s: the design table changed shape", designPath)
+		t.Fatalf("no TC entries in %s: the document changed shape", designPath)
 	}
 
 	entries, err := os.ReadDir(acceptanceCases)
