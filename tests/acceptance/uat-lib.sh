@@ -42,12 +42,35 @@ deploy_env() {
 		jq -r --arg k "$1" '[.spec.template.spec.containers[]?.env[]? | select(.name == $k) | .value][0] // empty'
 }
 
+# The scheduler pods, by the labels deploy/30-foreman.yaml gives them; the
+# shared-state StatefulSet carries name=foreman too, so both keys are needed.
+FOREMAN_POD_SELECTOR='app.kubernetes.io/name=foreman,app.kubernetes.io/component=scheduler'
+
+# Naming the pods keeps the log assertions on the scheduler even while the
+# Deployment object is being recreated, and concatenating every replica's lines
+# covers a task handled by any of them.
+foreman_pods() {
+	kubectl -n "$FOREMAN_NS" get pods -l "$FOREMAN_POD_SELECTOR" -o name 2>/dev/null || true
+}
+
 foreman_logs() { # [since]
-	kubectl -n "$FOREMAN_NS" logs deploy/foreman --since="${1:-6h}" 2>/dev/null || true
+	for _pod in $(foreman_pods); do
+		kubectl -n "$FOREMAN_NS" logs "$_pod" --since="${1:-6h}" 2>/dev/null || true
+	done
 }
 
 foreman_previous_logs() { # [since]
-	kubectl -n "$FOREMAN_NS" logs deploy/foreman --previous --since="${1:-6h}" 2>/dev/null || true
+	for _pod in $(foreman_pods); do
+		kubectl -n "$FOREMAN_NS" logs "$_pod" --previous --since="${1:-6h}" 2>/dev/null || true
+	done
+}
+
+# foreman_restarts: the highest container restart count across the scheduler
+# pods. A namespace-wide read would count a shared-state pod's restart as the
+# scheduler's fault evidence.
+foreman_restarts() {
+	kubectl -n "$FOREMAN_NS" get pods -l "$FOREMAN_POD_SELECTOR" -o json 2>/dev/null |
+		jq '[.items[].status.containerStatuses[]?.restartCount] | max // 0'
 }
 
 wait_terminal() { # <task-id> [timeout-s] -> prints the terminal projection

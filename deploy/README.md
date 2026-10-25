@@ -26,6 +26,13 @@ The Service is reachable inside the cluster as
 Job by the job builder, so the Service name must stay `foreman` in namespace
 `foreman`.
 
+> Upgrading an install that shipped before the scheduler label: the Deployment
+> selector now carries `app.kubernetes.io/component: scheduler` (without it
+> `kubectl logs deploy/foreman` also matches the shared-state pod). A selector
+> is immutable, so replace the object once — `kubectl -n foreman delete deploy
+> foreman` — and apply the manifest again; the pod restarts, the Service and
+> its name stay the same.
+
 ## Secrets
 
 `10-secrets.yaml` carries **placeholders**; `kubectl apply -f deploy/` will
