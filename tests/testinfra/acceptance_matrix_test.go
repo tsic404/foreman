@@ -28,9 +28,11 @@ const acceptanceCases = "../acceptance"
 // when the design moves and the cases follow.
 const acceptanceMatrixDesignAnchor = "b8892e7c9dbf07b7ab7c92c9a8294d3edbcb556c"
 
-// acceptanceFixtures are shared helpers, not cases: they build the scenarios
-// the numbered files judge and claim no TC of their own.
+// acceptanceFixtures are shared helpers and repo-side guards, not cases: the
+// helpers build the scenarios the numbered files judge, and the guards pin
+// this repository's own artifacts; neither claims a TC of their own.
 var acceptanceFixtures = map[string]bool{
+	"deploy_manifest_probe_window_guard_test.go": true,
 	"harness_test.go":               true,
 	"multi_shared_helpers_test.go":  true,
 	"multiws_harness_test.go":       true,
