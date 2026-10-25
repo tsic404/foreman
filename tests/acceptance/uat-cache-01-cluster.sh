@@ -8,10 +8,10 @@
 #
 #   TASK1=<id> TASK2=<id> ./uat-cache-01-cluster.sh
 #
-# Both tasks' Jobs must still exist and TASK2's pod must still be present: run
-# this before the drain window deletes them. The projections are judged after
-# the technical carrier, so TASK1 may settle during the run and TASK2 may still
-# be running — neither is required to be terminal beforehand.
+# No Job is read: TASK1 has already settled and its Job is gone with the
+# terminal cleanup, so only its projection is judged here. TASK2's pod must
+# still be present — run this while the repeated task is still running. The
+# projections are judged after the technical carrier.
 # Exit: 0 = PASS · 1 = FAIL (raw observation printed) · 2 = blocked.
 set -eu
 
@@ -38,8 +38,7 @@ node2=$(printf '%s' "$two" | jq -r '.node_name // empty')
 observe "shared node=$node1"
 
 # The authoritative reuse face first: the cache object existed before the
-# second pod started, and both Jobs were still live to be read. Its
-# blocked/failed verdict is this case's verdict too.
+# second pod started. Its blocked/failed verdict is this case's verdict too.
 rc=0
 out=$(TASK1="$TASK1" TASK2="$TASK2" NODE="$node1" FOREMAN_URL="$FOREMAN_URL" \
 	FOREMAN_JOB_NAMESPACE="$JOB_NS" FOREMAN_STATE_ROOT="${FOREMAN_STATE_ROOT:-/var/lib/foreman}" \

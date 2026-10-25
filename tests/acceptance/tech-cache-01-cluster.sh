@@ -1,9 +1,14 @@
 #!/bin/sh
 # TC-tech-cache-01 — the node-side half of AC-12: the bare cache object existed
 # before the second task's pod started (both read in the node's clock domain).
-# The clone banner is not a fallback: when the creation instant is unreadable
-# the criterion is undecidable and the run is blocked. The affinity item and
-# the reverse assertion are tech_cache_01_reuse_affinity_test.go.
+# The first task settled before this runs, and a settled task's Job (with its
+# pods and Secret) is deleted, so its only surviving placement fact is the
+# task projection's node_name. The second task is still running: its pod is
+# reached by the task-id label the render writes on the pod template, never
+# through the Job's job-name label. The clone banner is not a fallback: when
+# the creation instant is unreadable the criterion is undecidable and the run
+# is blocked. The affinity item and the reverse assertion are
+# tech_cache_01_reuse_affinity_test.go.
 #
 #   TASK1=<id> TASK2=<id> [NODE=n] [REPO_GIT=p] ./tech-cache-01-cluster.sh
 # Exit: 0 = PASS · 1 = FAIL (raw observation printed) · 2 = blocked.
@@ -30,29 +35,30 @@ observe() { printf '# observation: %s\n' "$*"; }
 
 [ -n "$TASK1" ] || blocked "TASK1 is required (the first task of the same-agent pair)"
 [ -n "$TASK2" ] || blocked "TASK2 is required (the continuation task)"
-job1=$(kubectl -n "$JOB_NS" get jobs -l "foreman.tsic.top/task-id=$TASK1" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) ||
-	blocked "cannot read TASK1's Job in $JOB_NS"
-[ -n "$job1" ] || blocked "no Job carries task-id=$TASK1"
-job2=$(kubectl -n "$JOB_NS" get jobs -l "foreman.tsic.top/task-id=$TASK2" -o jsonpath='{.items[0].metadata.name}' 2>/dev/null) ||
-	blocked "cannot read TASK2's Job in $JOB_NS"
-[ -n "$job2" ] || blocked "no Job carries task-id=$TASK2"
+
+# The second pod's start is the comparison instant, and it is only readable
+# while the pod exists: settlement deletes the Job with Background
+# propagation, whose GC then removes the pods.
+pods2=$(kubectl -n "$JOB_NS" get pods -l "foreman.tsic.top/task-id=$TASK2" -o json 2>/dev/null) ||
+	blocked "cannot list TASK2's pods in $JOB_NS"
+pod2_filter='[.items[] | select(.status.startTime != null)] | sort_by(.status.startTime) | first // empty'
+pod2=$(printf '%s' "$pods2" | jq -r "$pod2_filter | .metadata.name // empty") ||
+	blocked "cannot parse TASK2's pod list"
+pod2_start=$(printf '%s' "$pods2" | jq -r "$pod2_filter | .status.startTime // empty") ||
+	blocked "cannot parse TASK2's pod list"
+pod2_node=$(printf '%s' "$pods2" | jq -r "$pod2_filter | .spec.nodeName // empty") ||
+	blocked "cannot parse TASK2's pod list"
+[ -n "$pod2_start" ] ||
+	blocked "TASK2 has no pod carrying a startTime (already deleted, or never scheduled) — run this while the second task is still running"
 
 if [ -z "$NODE" ]; then
-	NODE=$(curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks/$TASK2" | jq -r '.node_name // empty') ||
-		blocked "cannot read $FOREMAN_URL/foreman/tasks/$TASK2 (port-forward the foreman Service first)"
+	NODE=$(curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks/$TASK1" | jq -r '.node_name // empty') ||
+		blocked "cannot read $FOREMAN_URL/foreman/tasks/$TASK1 (port-forward the foreman Service first)"
 fi
-[ -n "$NODE" ] || blocked "TASK2 has no node_name — the pod placement was never observed"
-
-# The second pod's start is the comparison instant. A pod that is gone cannot
-# answer it; the design case compares against a pod that started.
-pod2_start=$(kubectl -n "$JOB_NS" get pods -l "job-name=$job2" -o json |
-	jq -r '[.items[].status.startTime | select(. != null)] | sort | first // empty') ||
-	blocked "cannot list TASK2's pods"
-[ -n "$pod2_start" ] || blocked "TASK2's pod has no startTime (already gone) — the comparison instant is unavailable"
-pod2_node=$(kubectl -n "$JOB_NS" get pods -l "job-name=$job2" -o jsonpath='{.items[0].spec.nodeName}')
+[ -n "$NODE" ] || blocked "TASK1 has no node_name — the node its cache sits on was never observed"
 [ "$pod2_node" = "$NODE" ] ||
-	blocked "TASK2's pod ran on '$pod2_node', not on the learned node '$NODE' — the same-node precondition does not hold"
-observe "task1=$TASK1 job1=$job1 task2=$TASK2 job2=$job2 node=$NODE pod2_start=$pod2_start"
+	blocked "TASK2's pod ran on '$pod2_node', not on TASK1's node '$NODE' — the same-node precondition does not hold"
+observe "task1=$TASK1 node=$NODE task2=$TASK2 pod2=$pod2 pod2_start=$pod2_start"
 
 # The node-side cache face: the bare repo's creation instant (statx birth time)
 # and, when REPO_GIT names none, the most recently written repository. The
