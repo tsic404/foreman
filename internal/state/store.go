@@ -8,6 +8,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -279,7 +280,11 @@ func WithClock(now func() time.Time) Option {
 
 // WithEventHook observes the two shared-state availability transitions
 // (§9.1 共享状态面不可用与恢复): event is "unavailable" (err carries the first
-// failure) or "recovered" (downFor is the outage duration).
+// failure) or "recovered" (downFor is the outage duration). The hook runs
+// inside the transition's critical section, which is what keeps the event
+// order equal to the transition order: it must not call back into the store
+// and must be quick, because every later transition waits for it. The
+// production hook writes its slog line there.
 func WithEventHook(fn func(event string, downFor time.Duration, err error)) Option {
 	return func(s *redisStore) { s.event = fn }
 }
@@ -292,8 +297,17 @@ type redisStore struct {
 	now func() time.Time
 	rdb *redis.Client
 	// downSince is the Unix-nano instant of the first failed operation since
-	// the last success (0 = available); the outage face of §10.
+	// the last success (0 = available); the outage face of §10. Readers take it
+	// as one word; a transition rewrites it and recoveredAt together under
+	// outageMu, so no result ever publishes a half-applied transition.
 	downSince int64
+	// recoveredAt is the Unix-nano instant of the last recovery: evidence from
+	// an operation issued before it cannot open the next interval.
+	recoveredAt int64
+	// outageMu serializes the availability transitions: the watermark reads,
+	// the interval write and the event emit of one transition are one critical
+	// section, so the next result judges against a published interval.
+	outageMu sync.Mutex
 	// resSeq numbers slot reservations within this process.
 	resSeq atomic.Int64
 	// event observes the availability transitions (§9.1 共享状态面不可用与

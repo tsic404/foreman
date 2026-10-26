@@ -225,24 +225,55 @@ func (s *redisStore) DownFor() time.Duration {
 }
 
 // mark records the outcome of one store operation for the outage face
-// (§10 共享状态不可用). The first store failure starts the outage clock and
-// emits the unavailable event; the first success after an outage clears it and
-// emits the recovered event with the outage duration (§9.1). A caller's
-// cancellation is not evidence about the store, so it neither starts nor
-// clears an outage.
-func (s *redisStore) mark(err error) {
+// (§10 共享状态不可用): the first failure opens the interval and emits
+// unavailable, the first success after it closes it and emits recovered (§9.1).
+// A caller's cancellation is not evidence. Evidence is ordered by the instant
+// its operation was issued, so a late result cannot move an interval it was
+// already in flight for (AC-106 事件零噪声). One transition is one critical
+// section — watermark reads, interval write and event — and the hook runs
+// inside it, so it must not call back into the store.
+func (s *redisStore) mark(ctx context.Context, err error) {
 	if errors.Is(err, context.Canceled) {
 		return
 	}
-	if err == nil {
-		if prev := atomic.SwapInt64(&s.downSince, 0); prev != 0 && s.event != nil {
-			s.event("recovered", s.now().Sub(time.Unix(0, prev)), nil)
+	start, ordered := issuedAt(ctx)
+	s.outageMu.Lock()
+	defer s.outageMu.Unlock()
+	if err != nil {
+		if ordered && start.Before(time.Unix(0, atomic.LoadInt64(&s.recoveredAt))) {
+			return
+		}
+		if atomic.LoadInt64(&s.downSince) != 0 {
+			return
+		}
+		now := s.now()
+		atomic.StoreInt64(&s.downSince, now.UnixNano())
+		if s.event != nil {
+			s.event("unavailable", 0, err)
 		}
 		return
 	}
-	if atomic.CompareAndSwapInt64(&s.downSince, 0, s.now().UnixNano()) && s.event != nil {
-		s.event("unavailable", 0, err)
+	prev := atomic.LoadInt64(&s.downSince)
+	if prev == 0 || ordered && start.Before(time.Unix(0, prev)) {
+		return
 	}
+	now := s.now()
+	atomic.StoreInt64(&s.downSince, 0)
+	atomic.StoreInt64(&s.recoveredAt, now.UnixNano())
+	if s.event != nil {
+		s.event("recovered", now.Sub(time.Unix(0, prev)), nil)
+	}
+}
+
+// issuedAt reports the instant the operation behind ctx was issued. An
+// operation runs under a bound context; the store's own construction does not,
+// and what it observes orders by completion.
+func issuedAt(ctx context.Context) (time.Time, bool) {
+	if ctx == nil {
+		return time.Time{}, false
+	}
+	b, ok := ctx.Value(opBoundKey{}).(opBound)
+	return b.start, ok
 }
 
 // Stage-two Lua scripts. Every multi-step write is one script so a concurrent
@@ -490,21 +521,21 @@ func (s *redisStore) casUpdate(ctx context.Context, key string, mutate func(regi
 	for range casRetries {
 		raw, err := s.rdb.Get(ctx, key).Bytes()
 		if errors.Is(err, redis.Nil) {
-			s.mark(nil)
+			s.mark(ctx, nil)
 			return registry.TaskEntry{}, false, nil
 		}
 		if err != nil {
-			s.mark(err)
+			s.mark(ctx, err)
 			return registry.TaskEntry{}, false, err
 		}
 		cur, err := s.unmarshal(raw)
 		if err != nil {
-			s.mark(err)
+			s.mark(ctx, err)
 			return registry.TaskEntry{}, false, err
 		}
 		next, write, err := mutate(cur)
 		if err != nil || !write {
-			s.mark(err)
+			s.mark(ctx, err)
 			return next, false, err
 		}
 		nextRaw, err := s.marshal(next)
@@ -513,12 +544,12 @@ func (s *redisStore) casUpdate(ctx context.Context, key string, mutate func(regi
 		}
 		code, err := scriptCASSet.Run(ctx, s.rdb, []string{key}, raw, nextRaw, s.entryTTL().Milliseconds()).Int()
 		if err != nil {
-			s.mark(err)
+			s.mark(ctx, err)
 			return registry.TaskEntry{}, false, err
 		}
 		switch code {
 		case 1:
-			s.mark(nil)
+			s.mark(ctx, nil)
 			return next, true, nil
 		case -1:
 			return registry.TaskEntry{}, false, nil
@@ -549,7 +580,7 @@ func (s *redisStore) setEntry(ctx context.Context, ws, taskID string, e registry
 	}
 	err = scriptSetIndexed.Run(ctx, s.rdb, keys,
 		raw, index, s.entryTTL().Milliseconds(), indexed).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
@@ -610,7 +641,7 @@ func (s *redisStore) enqueueEntry(ctx context.Context, ws, taskID string, e regi
 	n, err := scriptEnqueue.Run(ctx, s.rdb,
 		[]string{s.queueKey(ws, taskID), s.entryKey(ws, taskID)},
 		raw, marker, s.entryTTL().Milliseconds()).Int()
-	s.mark(err)
+	s.mark(ctx, err)
 	if err != nil {
 		return false, err
 	}
@@ -685,16 +716,16 @@ func (s *redisStore) confirmStart(ctx context.Context, ws, taskID string, at tim
 	for range casRetries {
 		raw, err := s.rdb.Get(ctx, key).Bytes()
 		if errors.Is(err, redis.Nil) {
-			s.mark(nil)
+			s.mark(ctx, nil)
 			return registry.TaskEntry{}, false, nil
 		}
 		if err != nil {
-			s.mark(err)
+			s.mark(ctx, err)
 			return registry.TaskEntry{}, false, err
 		}
 		cur, err := s.unmarshal(raw)
 		if err != nil {
-			s.mark(err)
+			s.mark(ctx, err)
 			return registry.TaskEntry{}, false, err
 		}
 		if cur.State == registry.StateTerminal {
@@ -721,12 +752,12 @@ func (s *redisStore) confirmStart(ctx context.Context, ws, taskID string, at tim
 			[]string{key, s.queueKey(ws, taskID)},
 			raw, nextRaw, s.entryTTL().Milliseconds()).Int()
 		if err != nil {
-			s.mark(err)
+			s.mark(ctx, err)
 			return registry.TaskEntry{}, false, err
 		}
 		switch code {
 		case 1:
-			s.mark(nil)
+			s.mark(ctx, nil)
 			return cur, first, nil
 		case -1:
 			return registry.TaskEntry{}, false, nil
@@ -791,16 +822,16 @@ func (s *redisStore) commitTerminal(ctx context.Context, ws, taskID string, resu
 	for range casRetries {
 		raw, err := s.rdb.Get(ctx, key).Bytes()
 		if errors.Is(err, redis.Nil) {
-			s.mark(nil)
+			s.mark(ctx, nil)
 			return registry.TaskEntry{}, false, nil
 		}
 		if err != nil {
-			s.mark(err)
+			s.mark(ctx, err)
 			return registry.TaskEntry{}, false, err
 		}
 		cur, err := s.unmarshal(raw)
 		if err != nil {
-			s.mark(err)
+			s.mark(ctx, err)
 			return registry.TaskEntry{}, false, err
 		}
 		if cur.State == registry.StateTerminal {
@@ -830,12 +861,12 @@ func (s *redisStore) commitTerminal(ctx context.Context, ws, taskID string, resu
 			[]string{key, s.doneKey(ws, taskID), s.queueKey(ws, taskID)},
 			raw, nextRaw, settledRaw, s.entryTTL().Milliseconds()).Int()
 		if err != nil {
-			s.mark(err)
+			s.mark(ctx, err)
 			return registry.TaskEntry{}, false, err
 		}
 		switch code {
 		case 1:
-			s.mark(nil)
+			s.mark(ctx, nil)
 			return cur, true, nil
 		case -1:
 			return registry.TaskEntry{}, false, nil
@@ -863,16 +894,16 @@ func (s *redisStore) settleNoResult(ctx context.Context, ws, taskID string, expe
 	for range casRetries {
 		raw, err := s.rdb.Get(ctx, key).Bytes()
 		if errors.Is(err, redis.Nil) {
-			s.mark(nil)
+			s.mark(ctx, nil)
 			return registry.TaskEntry{}, false, nil
 		}
 		if err != nil {
-			s.mark(err)
+			s.mark(ctx, err)
 			return registry.TaskEntry{}, false, err
 		}
 		cur, err := s.unmarshal(raw)
 		if err != nil {
-			s.mark(err)
+			s.mark(ctx, err)
 			return registry.TaskEntry{}, false, err
 		}
 		if cur.State != registry.StateTerminal || cur.Result != expected {
@@ -896,12 +927,12 @@ func (s *redisStore) settleNoResult(ctx context.Context, ws, taskID string, expe
 			[]string{key, s.doneKey(ws, taskID), s.queueKey(ws, taskID)},
 			raw, nextRaw, settledRaw, s.entryTTL().Milliseconds()).Int()
 		if err != nil {
-			s.mark(err)
+			s.mark(ctx, err)
 			return registry.TaskEntry{}, false, err
 		}
 		switch code {
 		case 1:
-			s.mark(nil)
+			s.mark(ctx, nil)
 			return cur, true, nil
 		case -1:
 			return registry.TaskEntry{}, false, nil
@@ -918,14 +949,14 @@ func (s *redisStore) deleteEntry(ctx context.Context, ws, taskID string) error {
 	}
 	keys := []string{s.entryKey(ws, taskID), s.queueKey(ws, taskID), s.jobIndexKey(jobName)}
 	err := scriptDeleteFull.Run(ctx, s.rdb, keys).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
 // DropQueue removes the queue marker only.
 func (s *redisStore) dropQueue(ctx context.Context, ws, taskID string) error {
 	err := s.rdb.Del(ctx, s.queueKey(ws, taskID)).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
@@ -937,7 +968,7 @@ func (s *redisStore) queueDepth(ctx context.Context) (int64, error) {
 		n++
 	}
 	err := iter.Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return n, err
 }
 
@@ -945,11 +976,11 @@ func (s *redisStore) queueDepth(ctx context.Context) (int64, error) {
 func (s *redisStore) getEntryByJob(ctx context.Context, jobName string) (registry.TaskEntry, bool, error) {
 	raw, err := s.rdb.Get(ctx, s.jobIndexKey(jobName)).Bytes()
 	if errors.Is(err, redis.Nil) {
-		s.mark(nil)
+		s.mark(ctx, nil)
 		return registry.TaskEntry{}, false, nil
 	}
 	if err != nil {
-		s.mark(err)
+		s.mark(ctx, err)
 		return registry.TaskEntry{}, false, err
 	}
 	idx := strings.LastIndexByte(string(raw), 0)
@@ -966,7 +997,7 @@ func (s *redisStore) getEntryByJob(ctx context.Context, jobName string) (registr
 func (s *redisStore) lockTask(ctx context.Context, ws, taskID, owner string, ttl time.Duration) (bool, error) {
 	n, err := scriptLockAcquire.Run(ctx, s.rdb, []string{s.lockKey(ws, taskID)},
 		owner, ttl.Milliseconds()).Int()
-	s.mark(err)
+	s.mark(ctx, err)
 	if err != nil {
 		return false, err
 	}
@@ -976,7 +1007,7 @@ func (s *redisStore) lockTask(ctx context.Context, ws, taskID, owner string, ttl
 // UnlockTask releases the lock only when owner still holds it.
 func (s *redisStore) unlockTask(ctx context.Context, ws, taskID, owner string) error {
 	err := scriptLockRelease.Run(ctx, s.rdb, []string{s.lockKey(ws, taskID)}, owner).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
@@ -1002,7 +1033,7 @@ func (s *redisStore) reserveSlot(ctx context.Context, ws string, limit int) (str
 	id := strconv.FormatInt(s.now().UnixNano(), 36) + "-" + strconv.FormatInt(s.resSeq.Add(1), 36)
 	n, err := scriptSlotReserve.Run(ctx, s.rdb, []string{counter, reservations},
 		limit, reservationTTL.Milliseconds(), id).Int()
-	s.mark(err)
+	s.mark(ctx, err)
 	if err != nil {
 		return "", false, err
 	}
@@ -1017,7 +1048,7 @@ func (s *redisStore) reserveSlot(ctx context.Context, ws string, limit int) (str
 func (s *redisStore) consumeSlotReservation(ctx context.Context, ws, id string) error {
 	_, reservations := slotKeys(ws)
 	err := scriptSlotConsume.Run(ctx, s.rdb, []string{reservations}, id).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
@@ -1025,7 +1056,7 @@ func (s *redisStore) consumeSlotReservation(ctx context.Context, ws, id string) 
 func (s *redisStore) releaseSlot(ctx context.Context, ws, id string) error {
 	counter, reservations := slotKeys(ws)
 	err := scriptSlotRelease.Run(ctx, s.rdb, []string{counter, reservations}, id).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
@@ -1033,7 +1064,7 @@ func (s *redisStore) releaseSlot(ctx context.Context, ws, id string) error {
 func (s *redisStore) releaseEntry(ctx context.Context, ws string) error {
 	counter, _ := slotKeys(ws)
 	err := scriptSlotReleaseEntry.Run(ctx, s.rdb, []string{counter}).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
@@ -1042,7 +1073,7 @@ func (s *redisStore) releaseEntry(ctx context.Context, ws string) error {
 func (s *redisStore) slotSnapshot(ctx context.Context, ws string) (int64, int64, error) {
 	counter, reservations := slotKeys(ws)
 	values, err := scriptSlotSnapshot.Run(ctx, s.rdb, []string{counter, reservations}).Int64Slice()
-	s.mark(err)
+	s.mark(ctx, err)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -1056,7 +1087,7 @@ func (s *redisStore) slotSnapshot(ctx context.Context, ws string) (int64, int64,
 func (s *redisStore) compareAndSetSlots(ctx context.Context, ws string, expected, next int64) (bool, error) {
 	counter, _ := slotKeys(ws)
 	n, err := scriptSlotCAS.Run(ctx, s.rdb, []string{counter}, expected, next).Int()
-	s.mark(err)
+	s.mark(ctx, err)
 	if err != nil {
 		return false, err
 	}
@@ -1069,7 +1100,7 @@ func (s *redisStore) compareAndSetSlots(ctx context.Context, ws string, expected
 func (s *redisStore) resetSlots(ctx context.Context, ws string, n int64) (int64, int64, error) {
 	counter, reservations := slotKeys(ws)
 	values, err := scriptSlotReset.Run(ctx, s.rdb, []string{counter, reservations}, n).Int64Slice()
-	s.mark(err)
+	s.mark(ctx, err)
 	if err != nil {
 		return 0, 0, err
 	}
@@ -1087,18 +1118,18 @@ func (s *redisStore) slots(ctx context.Context, ws string) (int64, error) {
 	}
 	raw, err := s.rdb.Get(ctx, key).Result()
 	if errors.Is(err, redis.Nil) {
-		s.mark(nil)
+		s.mark(ctx, nil)
 		return 0, nil
 	}
 	if err != nil {
-		s.mark(err)
+		s.mark(ctx, err)
 		return 0, err
 	}
 	n, err := strconv.ParseInt(raw, 10, 64)
 	if err != nil {
 		return 0, fmt.Errorf("shared state: corrupt slot counter %s: %w", key, err)
 	}
-	s.mark(nil)
+	s.mark(ctx, nil)
 	return n, nil
 }
 
@@ -1107,7 +1138,7 @@ func (s *redisStore) slots(ctx context.Context, ws string) (int64, error) {
 func (s *redisStore) acquireLeadership(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
 	n, err := scriptLeaderAcquire.Run(ctx, s.rdb, []string{keyLeader},
 		owner, ttl.Milliseconds()).Int()
-	s.mark(err)
+	s.mark(ctx, err)
 	if err != nil {
 		return false, err
 	}
@@ -1118,7 +1149,7 @@ func (s *redisStore) acquireLeadership(ctx context.Context, owner string, ttl ti
 func (s *redisStore) renewLeadership(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
 	n, err := scriptLeaderRenew.Run(ctx, s.rdb, []string{keyLeader},
 		owner, ttl.Milliseconds()).Int()
-	s.mark(err)
+	s.mark(ctx, err)
 	if err != nil {
 		return false, err
 	}
@@ -1128,7 +1159,7 @@ func (s *redisStore) renewLeadership(ctx context.Context, owner string, ttl time
 // ReleaseLeadership drops the lease when owner still holds it.
 func (s *redisStore) releaseLeadership(ctx context.Context, owner string) error {
 	err := scriptLockRelease.Run(ctx, s.rdb, []string{keyLeader}, owner).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
@@ -1136,11 +1167,11 @@ func (s *redisStore) releaseLeadership(ctx context.Context, owner string) error 
 func (s *redisStore) leadershipHolder(ctx context.Context) (string, error) {
 	raw, err := s.rdb.Get(ctx, keyLeader).Result()
 	if errors.Is(err, redis.Nil) {
-		s.mark(nil)
+		s.mark(ctx, nil)
 		return "", nil
 	}
 	if err != nil {
-		s.mark(err)
+		s.mark(ctx, err)
 		return "", err
 	}
 	return svcOwner(raw), nil
@@ -1149,7 +1180,7 @@ func (s *redisStore) leadershipHolder(ctx context.Context) (string, error) {
 // HeartbeatInstance refreshes one instance's liveness row.
 func (s *redisStore) heartbeatInstance(ctx context.Context, id string, ttl time.Duration) error {
 	err := s.rdb.Set(ctx, keyInstance+id, s.now().Unix(), ttl).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
@@ -1161,14 +1192,14 @@ func (s *redisStore) listInstances(ctx context.Context) ([]string, error) {
 		out = append(out, strings.TrimPrefix(iter.Val(), keyInstance))
 	}
 	err := iter.Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return out, err
 }
 
 // PutDeclaration stores the registration identity of one workspace.
 func (s *redisStore) putDeclaration(ctx context.Context, ws string, raw []byte) error {
 	err := s.rdb.Set(ctx, keyDecl+ws, raw, 0).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
@@ -1176,11 +1207,11 @@ func (s *redisStore) putDeclaration(ctx context.Context, ws string, raw []byte) 
 func (s *redisStore) getDeclaration(ctx context.Context, ws string) ([]byte, bool, error) {
 	raw, err := s.rdb.Get(ctx, keyDecl+ws).Bytes()
 	if errors.Is(err, redis.Nil) {
-		s.mark(nil)
+		s.mark(ctx, nil)
 		return nil, false, nil
 	}
 	if err != nil {
-		s.mark(err)
+		s.mark(ctx, err)
 		return nil, false, err
 	}
 	return raw, true, nil
@@ -1192,7 +1223,7 @@ func (s *redisStore) putCatalogSlot(ctx context.Context, runtimeID string, raw [
 		ttl = s.entryTTL()
 	}
 	err := s.rdb.Set(ctx, keyCatalog+runtimeID, raw, ttl).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
@@ -1200,11 +1231,11 @@ func (s *redisStore) putCatalogSlot(ctx context.Context, runtimeID string, raw [
 func (s *redisStore) getCatalogSlot(ctx context.Context, runtimeID string) ([]byte, bool, error) {
 	raw, err := s.rdb.Get(ctx, keyCatalog+runtimeID).Bytes()
 	if errors.Is(err, redis.Nil) {
-		s.mark(nil)
+		s.mark(ctx, nil)
 		return nil, false, nil
 	}
 	if err != nil {
-		s.mark(err)
+		s.mark(ctx, err)
 		return nil, false, err
 	}
 	return raw, true, nil
@@ -1213,7 +1244,7 @@ func (s *redisStore) getCatalogSlot(ctx context.Context, runtimeID string) ([]by
 // DeleteCatalogSlot removes one catalog slot.
 func (s *redisStore) deleteCatalogSlot(ctx context.Context, runtimeID string) error {
 	err := s.rdb.Del(ctx, keyCatalog+runtimeID).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
@@ -1223,7 +1254,7 @@ func (s *redisStore) putSessionNode(ctx context.Context, ws, key string, raw []b
 		ttl = s.entryTTL()
 	}
 	err := s.rdb.Set(ctx, keySession+ws+":"+key, raw, ttl).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
@@ -1232,7 +1263,7 @@ func (s *redisStore) putSessionNode(ctx context.Context, ws, key string, raw []b
 // (PTTL), not to the instance that wrote it.
 func (s *redisStore) getSessionNode(ctx context.Context, ws, key string) (registry.SharedSessionNode, bool, error) {
 	values, err := scriptSessionGet.Run(ctx, s.rdb, []string{keySession + ws + ":" + key}).Slice()
-	s.mark(err)
+	s.mark(ctx, err)
 	if err != nil {
 		return registry.SharedSessionNode{}, false, err
 	}
@@ -1256,7 +1287,7 @@ func (s *redisStore) putProbeSession(ctx context.Context, jobName string, raw []
 		ttl = s.entryTTL()
 	}
 	err := s.rdb.Set(ctx, keyProbe+jobName, raw, ttl).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
@@ -1264,11 +1295,11 @@ func (s *redisStore) putProbeSession(ctx context.Context, jobName string, raw []
 func (s *redisStore) getProbeSession(ctx context.Context, jobName string) ([]byte, bool, error) {
 	raw, err := s.rdb.Get(ctx, keyProbe+jobName).Bytes()
 	if errors.Is(err, redis.Nil) {
-		s.mark(nil)
+		s.mark(ctx, nil)
 		return nil, false, nil
 	}
 	if err != nil {
-		s.mark(err)
+		s.mark(ctx, err)
 		return nil, false, err
 	}
 	return raw, true, nil
@@ -1280,7 +1311,7 @@ func (s *redisStore) casProbeSession(ctx context.Context, jobName string, expect
 		ttl = s.entryTTL()
 	}
 	code, err := scriptCASSet.Run(ctx, s.rdb, []string{keyProbe + jobName}, expected, next, ttl.Milliseconds()).Int()
-	s.mark(err)
+	s.mark(ctx, err)
 	if err != nil {
 		return false, err
 	}
@@ -1290,7 +1321,7 @@ func (s *redisStore) casProbeSession(ctx context.Context, jobName string, expect
 // DeleteProbeSession removes one probe session row.
 func (s *redisStore) deleteProbeSession(ctx context.Context, jobName string) error {
 	err := s.rdb.Del(ctx, keyProbe+jobName).Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return err
 }
 
@@ -1306,6 +1337,6 @@ func (s *redisStore) listProbeSessions(ctx context.Context) (map[string][]byte, 
 		out[strings.TrimPrefix(iter.Val(), keyProbe)] = raw
 	}
 	err := iter.Err()
-	s.mark(err)
+	s.mark(ctx, err)
 	return out, err
 }
