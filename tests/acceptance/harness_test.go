@@ -2864,9 +2864,17 @@ type harness struct {
 	// stops the lease from the test goroutine.
 	leaderMu    sync.Mutex
 	leader      *coordination.Leader
-	leaderLease *killedLease
+	leaderLease *leaseSeam
 	leaderStop  context.CancelFunc
 	leaderDone  chan struct{}
+	// leaseExpiresNotBefore is the earliest expiry of this instance's last
+	// successful grant. It outlives the handles cancelLeader clears, because a
+	// takeover scenario reads it after crashLeader.
+	leaseExpiresNotBefore time.Time
+	// leaseAcquiredObservedAt is the instant after this instance's first
+	// successful lease acquisition returned: the takeover instant, usable as a
+	// lower bound on the real grant.
+	leaseAcquiredObservedAt time.Time
 	// revoker is the scheduler's credential-revocation seam. Nil leaves it
 	// inert (noRevoker): a scenario that judges the revocation set wires the
 	// shared issuer here and rebuilds the scheduler, as a deployment wires it.
@@ -3652,7 +3660,7 @@ func (h *harness) runLeader(t *testing.T) {
 	}
 	// The scenario owns the kill switch: a loop stopped this way must leave
 	// its lease to expire, so the store's release call is suppressed below.
-	lease := &killedLease{CoordStore: h.coord}
+	lease := &leaseSeam{CoordStore: h.coord, onGrant: h.recordLeaseGrant}
 	leader := coordination.New(lease, instanceID, cfg,
 		coordination.WithLogger(slog.New(slog.NewJSONHandler(h.logs, nil))),
 		coordination.WithOnAcquire(h.sched.OnTakeover))
@@ -3683,21 +3691,96 @@ func (h *harness) crashLeader(t *testing.T) {
 	h.stopLeader(t)
 }
 
-// killedLease is the crash scenario's test-side kill switch: once killed, the
-// lease loop's exit release is swallowed and the lease expires on its own,
-// which is the state a killed process leaves behind.
-type killedLease struct {
+// leaseSeam is the test-side store seam of this instance's lease loop. It
+// pins every successful grant: the store sets the PX TTL when the call lands,
+// so the lease expires no earlier than the instant observed just before the
+// call plus the TTL. A takeover lower bound measured against that instant is
+// exact, instead of assuming the holder's last renewal happened at the kill
+// (it lands up to one renewal tick earlier, so the lease expires up to a tick
+// before killedAt + TTL).
+type leaseSeam struct {
 	state.CoordStore
+	// killed swallows the loop's exit release, so a crashed instance's lease
+	// lasts to its TTL the way a real process death leaves it (§10 控制面接管有界).
 	killed atomic.Bool
+	// onGrant receives every successful grant; the harness keeps the pinned
+	// expiry across the handle clearing crashLeader performs.
+	onGrant func(grant leaseGrant)
+}
+
+// leaseGrant is one successful grant as the seam observed it.
+type leaseGrant struct {
+	// callStarted is read before the store call: the PX lands after it, so the
+	// lease cannot expire before callStarted + ttl.
+	callStarted time.Time
+	// callReturned is read after the store call: the real grant is at or
+	// before it, so it is a safe observation of the grant instant.
+	callReturned time.Time
+	ttl          time.Duration
+	// acquired is set by AcquireLeadership (a fresh grant) rather than a renewal.
+	acquired bool
+}
+
+// AcquireLeadership pins the expiry and the instant of a granted takeover.
+func (s *leaseSeam) AcquireLeadership(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
+	started := time.Now()
+	ok, err := s.CoordStore.AcquireLeadership(ctx, owner, ttl)
+	s.noteGrant(leaseGrant{callStarted: started, callReturned: time.Now(), ttl: ttl, acquired: true}, ok, err)
+	return ok, err
+}
+
+// RenewLeadership pins the expiry of an extended hold.
+func (s *leaseSeam) RenewLeadership(ctx context.Context, owner string, ttl time.Duration) (bool, error) {
+	started := time.Now()
+	ok, err := s.CoordStore.RenewLeadership(ctx, owner, ttl)
+	s.noteGrant(leaseGrant{callStarted: started, callReturned: time.Now(), ttl: ttl}, ok, err)
+	return ok, err
 }
 
 // ReleaseLeadership drops a killed instance's release, so its lease lasts to
 // the TTL the survivor is waiting out.
-func (s *killedLease) ReleaseLeadership(ctx context.Context, owner string) error {
+func (s *leaseSeam) ReleaseLeadership(ctx context.Context, owner string) error {
 	if s.killed.Load() {
 		return nil
 	}
 	return s.CoordStore.ReleaseLeadership(ctx, owner)
+}
+
+func (s *leaseSeam) noteGrant(grant leaseGrant, ok bool, err error) {
+	if err != nil || !ok || s.onGrant == nil {
+		return
+	}
+	s.onGrant(grant)
+}
+
+// recordLeaseGrant pins both faces of one successful grant: the instant before
+// the store call bounds the lease expiry from below, the instant after it is
+// the first safe observation of the grant itself.
+func (h *harness) recordLeaseGrant(grant leaseGrant) {
+	h.leaderMu.Lock()
+	defer h.leaderMu.Unlock()
+	h.leaseExpiresNotBefore = grant.callStarted.Add(grant.ttl)
+	if grant.acquired && h.leaseAcquiredObservedAt.IsZero() {
+		h.leaseAcquiredObservedAt = grant.callReturned
+	}
+}
+
+// leaseExpiryLower returns the earliest instant this instance's last lease can
+// expire (zero when it never held the control plane). The store's own expiry is
+// at or after it: the PX is set after the recorded instant, never before.
+func (h *harness) leaseExpiryLower() time.Time {
+	h.leaderMu.Lock()
+	defer h.leaderMu.Unlock()
+	return h.leaseExpiresNotBefore
+}
+
+// leaseAcquiredAt returns when this instance first acquired the lease (zero
+// when it never did). The store granted no later than that instant returned, so
+// it never understates the real grant.
+func (h *harness) leaseAcquiredAt() time.Time {
+	h.leaderMu.Lock()
+	defer h.leaderMu.Unlock()
+	return h.leaseAcquiredObservedAt
 }
 
 // stopLeader releases the lease and parks this instance's control plane.

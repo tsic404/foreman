@@ -61,11 +61,16 @@ func TestTechMulti04ControlPlaneTakeover(t *testing.T) {
 		t.Fatalf("daemon face through B = %d, want 200", code)
 	}
 
-	// Kill the holder: its lease loop and its control loops stop. The
-	// survivor must not claim before the lease expires plus the takeover
-	// window.
+	// Kill the holder: its lease loop and its control loops stop. The takeover
+	// lower bound is the lease the store actually held, not the kill instant:
+	// the holder's last renewal lands up to one renewal tick before the kill,
+	// so its lease expires up to a tick before killedAt + leaseTTL.
 	killedAt := time.Now()
 	tw.a.crashLeader(t)
+	leaseExpiresAt := tw.a.leaseExpiryLower()
+	if leaseExpiresAt.IsZero() {
+		t.Fatal("the killed holder recorded no lease grant")
+	}
 	stopClaimA()
 	stopHB()
 	tw.a.upstream.enqueueTask("task-after-takeover")
@@ -78,7 +83,10 @@ func TestTechMulti04ControlPlaneTakeover(t *testing.T) {
 		t.Fatalf("daemon face during takeover = %d, want 200", code)
 	}
 
-	// The survivor takes over and claims the queued task.
+	// The survivor takes over: its lease grant is the takeover instant, and it
+	// must not precede the dead holder's expiry. The seam records the instant
+	// after that grant's store call, so the value never understates the real
+	// grant and the claim loop + Job creation stay outside the measurement.
 	deadline = time.Now().Add(10 * time.Second)
 	for !tw.b.leaderHeld() {
 		if time.Now().After(deadline) {
@@ -87,10 +95,15 @@ func TestTechMulti04ControlPlaneTakeover(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
-	tw.waitForTaskJob(t, "task-after-takeover", 10*time.Second)
-	if elapsed := time.Since(killedAt); elapsed < leaseTTL {
-		t.Fatalf("takeover after %s, want no earlier than the %s lease", elapsed, leaseTTL)
+	takeoverAt := tw.b.leaseAcquiredAt()
+	if takeoverAt.IsZero() {
+		t.Fatal("the survivor recorded no lease acquisition")
 	}
+	if takeoverAt.Before(leaseExpiresAt) {
+		t.Fatalf("survivor acquired the lease at %s, earlier than the dead holder's expiry %s (killed at %s)",
+			takeoverAt.Format(time.RFC3339Nano), leaseExpiresAt.Format(time.RFC3339Nano), killedAt.Format(time.RFC3339Nano))
+	}
+	tw.waitForTaskJob(t, "task-after-takeover", 10*time.Second)
 
 	// Identity continuity: no re-registration, and the heartbeats resume with
 	// the same real runtime ids.
