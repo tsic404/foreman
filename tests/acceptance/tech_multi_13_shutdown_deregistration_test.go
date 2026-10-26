@@ -83,8 +83,9 @@ func TestTechMulti13SingleInstanceDeregistersEveryIdentity(t *testing.T) {
 		},
 		Log: log,
 	})
-	if !started.Before(cancelAt) {
-		t.Fatalf("shutdown marker %v was not taken before the loops were cancelled %v", started, cancelAt)
+	// Same-tick equality is legal; only a cancel before the marker is inversion.
+	if cancelAt.Before(started) {
+		t.Fatalf("loops were cancelled %v before the shutdown marker %v: exit order inverted", cancelAt, started)
 	}
 
 	// One C14 per identity, carrying that identity's full real runtime set.
