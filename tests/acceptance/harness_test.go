@@ -260,6 +260,11 @@ type upstreamStub struct {
 	// heartbeats maps a real runtime id to the status the heartbeat answers
 	// with (default 200).
 	heartbeats map[string]int
+	// firstHeartbeatCh holds one channel per runtime id, closed when the stub
+	// records that runtime's first heartbeat; heartbeatSeen lets a late waiter
+	// get the closed channel instead of blocking forever.
+	firstHeartbeatCh map[string]chan struct{}
+	heartbeatSeen    map[string]bool
 	// rows is the server-side real runtime row state: C-1 creates the row
 	// online, C-14 (graceful exit) flips the carried ids offline. The row is
 	// retained after going offline; the server's no-heartbeat expiry scan is
@@ -327,6 +332,8 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 		registerRepos:        json.RawMessage(`[]`),
 		registerReposVersion: "",
 		heartbeats:           map[string]int{},
+		firstHeartbeatCh:     map[string]chan struct{}{},
+		heartbeatSeen:        map[string]bool{},
 		rows:                 map[string]string{},
 		modelsStatus:         200,
 		models:               map[string]*modelCommand{},
@@ -398,6 +405,7 @@ func newUpstreamStub(t *testing.T) *upstreamStub {
 			RuntimeID string `json:"runtime_id"`
 		}
 		_ = json.Unmarshal(body, &req)
+		stub.markHeartbeat(req.RuntimeID)
 		status := stub.statusFor(req.RuntimeID)
 		if status == http.StatusNotFound {
 			w.WriteHeader(status)
@@ -1659,6 +1667,60 @@ func (s *upstreamStub) heartbeatRuntimeIDs() map[string]int {
 		}
 	}
 	return out
+}
+
+// markHeartbeat releases runtimeID's first-heartbeat waiters. The request is
+// already recorded, so a waiter that wakes reads the observation.
+func (s *upstreamStub) markHeartbeat(runtimeID string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if runtimeID == "" || s.heartbeatSeen[runtimeID] {
+		return
+	}
+	s.heartbeatSeen[runtimeID] = true
+	if ch, ok := s.firstHeartbeatCh[runtimeID]; ok {
+		close(ch)
+	}
+}
+
+// firstHeartbeat returns a channel closed once runtimeID has heartbeated; an id
+// already seen yields a closed channel, so the barrier is safe to arm late.
+func (s *upstreamStub) firstHeartbeat(runtimeID string) <-chan struct{} {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	ch, ok := s.firstHeartbeatCh[runtimeID]
+	if !ok {
+		ch = make(chan struct{})
+		if s.heartbeatSeen[runtimeID] {
+			close(ch)
+		}
+		s.firstHeartbeatCh[runtimeID] = ch
+	}
+	return ch
+}
+
+// awaitFirstHeartbeats blocks until every declared runtime id has heartbeated.
+// A takeover scenario takes it before sampling the pre-kill identity baseline:
+// a timer-based sample can miss a stream whose first send is still pending, and
+// the post-takeover check would then read that stream as a new identity.
+func (s *upstreamStub) awaitFirstHeartbeats(t *testing.T, ids []string) {
+	t.Helper()
+	if len(ids) == 0 {
+		t.Fatal("no declared runtime to await a heartbeat for")
+	}
+	pending := make([]<-chan struct{}, len(ids))
+	for i, id := range ids {
+		pending[i] = s.firstHeartbeat(id)
+	}
+	deadline := time.NewTimer(10 * time.Second)
+	defer deadline.Stop()
+	for i, ch := range pending {
+		select {
+		case <-ch:
+		case <-deadline.C:
+			t.Fatalf("runtime %s never heartbeated; declared set %v", ids[i], ids)
+		}
+	}
 }
 
 // liveJobCount counts the Job objects currently held for name.
