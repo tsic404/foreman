@@ -31,6 +31,14 @@ func TestTechMulti03GlobalInflightLimitAndSlotReconciliation(t *testing.T) {
 	// Phase 1: the holder claims up to the cluster cap, and the counter never
 	// exceeds it while the loop runs.
 	stopA := startConcurrency01ClaimLoop(t, tw.a)
+	// The counter is reserved before C3, so reaching the cap says the batch
+	// holds its slots — not that its claims have landed. Stopping the loop on
+	// the counter alone cancels a batch still in flight: the server has
+	// already dispatched those tasks, yet their rows never appear, and the
+	// later phases would address entries that do not exist.
+	for i := range limit {
+		tw.awaitClaimedJob(t, fmt.Sprintf("task-%d", i))
+	}
 	tw.waitSlots(t, limit)
 	maxSeen := tw.sampleSlots(t, 600*time.Millisecond)
 	stopA()
@@ -114,9 +122,12 @@ func TestTechMulti03TakeoverResetDropsAReservationInFlight(t *testing.T) {
 		tw.a.upstream.enqueueTask(fmt.Sprintf("task-%d", i))
 	}
 	stopA := startConcurrency01ClaimLoop(t, tw.a)
-	waitFor(t, "the holder's two claimed Jobs", 10*time.Second, func() bool {
-		return tw.a.jobs.liveJobs() == limit
-	})
+	// The Job object is not the batch's last fact: the row's job_created
+	// commit follows it, and a stop in between leaves a pending row that a
+	// later S-4 registration only answers without advancing.
+	for i := range limit {
+		tw.awaitClaimedJob(t, fmt.Sprintf("task-%d", i))
+	}
 	tw.waitSlots(t, limit)
 	stopA()
 	ctx := context.Background()
