@@ -415,8 +415,9 @@ func (r *Reconciler) round(ctx context.Context) error {
 		firstErr = listErr
 	}
 	// §10 两级在途上限: the leader round repairs a leaked counter (a dead
-	// reserver's unexplained increment) within one round. Downward-only on the
-	// live path; the absolute write happens on takeover.
+	// reserver's unexplained increment) within one round. Each level is
+	// written to its live rows plus its live reservations; the takeover round
+	// drops the markers outright instead.
 	if serr := r.settler.ReconcileSlots(ctx); serr != nil {
 		r.log.WarnContext(ctx, "coordination.slots_reconcile_failed", "err", serr)
 	}

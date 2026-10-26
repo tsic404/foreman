@@ -20,7 +20,8 @@ type Settler interface {
 	// error only when the continuation must be retried.
 	ContinueClaim(ctx context.Context, taskID string) error
 	// ReconcileSlots runs the leader round's two-level counter repair
-	// (§10 计数按条目周期对账); it only lowers a counter.
+	// (§10 计数按条目周期对账): each level is written to its live rows plus
+	// its live reservations.
 	ReconcileSlots(ctx context.Context) error
 	// OnJobGone compensates a Job object that disappeared (§4.6); the
 	// freshly-created grace period is included.
