@@ -35,17 +35,17 @@ func TestTechMulti04ControlPlaneTakeover(t *testing.T) {
 	defer stopClaimB()
 
 	// The holder's heartbeats reach the server under the declared identities.
-	// Wait for every registered runtime, not the first stream to land: a stream
-	// whose first send comes later would read as a new identity after takeover.
+	// The barrier is each runtime's first heartbeat, not a timer: a stream whose
+	// first send is still pending would be sampled away and then read as a new
+	// identity after takeover.
 	registered := tw.a.client.RuntimeIDs()
-	deadline := time.Now().Add(10 * time.Second)
+	tw.a.upstream.awaitFirstHeartbeats(t, registered)
 	idsBefore := tw.a.upstream.heartbeatRuntimeIDs()
-	for !heartbeatsCover(idsBefore, registered) {
-		if time.Now().After(deadline) {
-			t.Fatalf("the holder heartbeated %v, want every registered runtime %v", idsBefore, registered)
-		}
-		time.Sleep(10 * time.Millisecond)
-		idsBefore = tw.a.upstream.heartbeatRuntimeIDs()
+	// The baseline is exactly the declared identity set. An id outside it means
+	// a re-registration already happened before the kill; absorbing it as
+	// "known" would disarm the continuity check below.
+	if !heartbeatsAreDeclared(idsBefore, registered) {
+		t.Fatalf("pre-kill heartbeat ids = %v, want exactly the declared %v", idsBefore, registered)
 	}
 	c1Before := len(tw.a.upstream.calls("POST", "/api/daemon/register"))
 
@@ -87,7 +87,7 @@ func TestTechMulti04ControlPlaneTakeover(t *testing.T) {
 	// must not precede the dead holder's expiry. The seam records the instant
 	// after that grant's store call, so the value never understates the real
 	// grant and the claim loop + Job creation stay outside the measurement.
-	deadline = time.Now().Add(10 * time.Second)
+	deadline := time.Now().Add(10 * time.Second)
 	for !tw.b.leaderHeld() {
 		if time.Now().After(deadline) {
 			holder, _ := tw.coord.LeadershipHolder(context.Background())
@@ -105,9 +105,18 @@ func TestTechMulti04ControlPlaneTakeover(t *testing.T) {
 	}
 	tw.waitForTaskJob(t, "task-after-takeover", 10*time.Second)
 
-	// Identity continuity: no re-registration, and the heartbeats resume with
-	// the same real runtime ids.
-	time.Sleep(300 * time.Millisecond)
+	// Identity continuity: no re-registration, and every runtime resumes its
+	// heartbeat under the baseline identity. Wait for every baseline id's count
+	// to advance before reading the ids: a stream that starts later would be
+	// sampled out, and a new identity on it would go unseen.
+	deadline = time.Now().Add(10 * time.Second)
+	for !heartbeatsAdvanced(tw.a.upstream.heartbeatRuntimeIDs(), idsBefore) {
+		if time.Now().After(deadline) {
+			t.Fatalf("the survivor's heartbeats never resumed for every runtime; before=%v now=%v",
+				idsBefore, tw.a.upstream.heartbeatRuntimeIDs())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
 	if c1After := len(tw.a.upstream.calls("POST", "/api/daemon/register")); c1After != c1Before {
 		t.Fatalf("C1 calls after takeover = %d, want the pre-kill %d (no re-registration)", c1After, c1Before)
 	}
@@ -116,14 +125,6 @@ func TestTechMulti04ControlPlaneTakeover(t *testing.T) {
 		if _, known := idsBefore[id]; !known {
 			t.Fatalf("heartbeat resumed under a new runtime id %s; registered=%v before=%v after=%v", id, registered, idsBefore, idsAfter)
 		}
-	}
-	before := idsBefore["rid-omp"]
-	deadline = time.Now().Add(5 * time.Second)
-	for tw.a.upstream.heartbeatRuntimeIDs()["rid-omp"] <= before {
-		if time.Now().After(deadline) {
-			t.Fatal("the survivor's heartbeats never resumed")
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 
 	// No duplicate execution or lost terminal: the pre-kill task settles
@@ -138,14 +139,32 @@ func TestTechMulti04ControlPlaneTakeover(t *testing.T) {
 	}
 }
 
-// heartbeatsCover reports whether every registered runtime id heartbeated; an
-// empty registration never covers.
-func heartbeatsCover(counts map[string]int, ids []string) bool {
-	if len(ids) == 0 {
+// heartbeatsAreDeclared reports whether the observed heartbeat ids are exactly
+// the declared runtime set: no stream missing and none outside the declaration.
+func heartbeatsAreDeclared(counts map[string]int, ids []string) bool {
+	declared := make(map[string]struct{}, len(ids))
+	for _, id := range ids {
+		declared[id] = struct{}{}
+	}
+	if len(declared) == 0 || len(counts) != len(declared) {
 		return false
 	}
-	for _, id := range ids {
-		if counts[id] == 0 {
+	for id := range counts {
+		if _, ok := declared[id]; !ok {
+			return false
+		}
+	}
+	return true
+}
+
+// heartbeatsAdvanced reports whether every baseline runtime was heartbeated at
+// least once more; false when the baseline is empty.
+func heartbeatsAdvanced(counts, baseline map[string]int) bool {
+	if len(baseline) == 0 {
+		return false
+	}
+	for id, n := range baseline {
+		if counts[id] <= n {
 			return false
 		}
 	}
