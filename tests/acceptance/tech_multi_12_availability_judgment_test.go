@@ -29,9 +29,12 @@ func TestTechMulti12CancellationKeepsTheAvailabilityVerdict(t *testing.T) {
 	stopClaim := startConcurrency01ClaimLoop(t, tw.a)
 	defer stopClaim()
 
-	// One delivered task gives the issuance gate a token to adjudicate.
+	// One delivered task gives the issuance gate a token to adjudicate. The
+	// registration below advances only from the row's job_created state, so
+	// the carrier waits for that commit: the Job object alone can precede it,
+	// and a registration in that window leaves every delivery an empty batch.
 	tw.a.upstream.enqueueTask("task-cancel")
-	tw.waitForTaskJob(t, "task-cancel", 10*time.Second)
+	tw.awaitClaimedJob(t, "task-cancel")
 	token := tw.token(t, tw.a, "task-cancel")
 	tw.registerVia(t, tw.b, "task-cancel", token)
 	if got := tw.claimVia(t, tw.b, "task-cancel", token); len(got) != 1 {
