@@ -14,6 +14,7 @@ Everything is plain YAML — `kubectl apply -f deploy/` installs it in one pass.
 | `35-shared-state.yaml` | `StatefulSet foreman-redis` + `Service foreman-redis` — the shared state store (ADR-046 阶段一); **baseline only** — a deployment swaps in its own persistent Redis (or a managed service) and points `FOREMAN_STATE_URL` at it |
 | `40-foreman-gc.yaml` | `DaemonSet foreman-gc` (ns multica-agents) |
 | `optional/servicemonitor.yaml` | `ServiceMonitor foreman` — needs the Prometheus Operator CRDs |
+| `optional/agent-backend-mirror.sh` | no objects — renders the template ConfigMap with the `omp` origin repointed at a deployer mirror (§Agent backend origin) |
 
 ```bash
 kubectl apply -f deploy/                             # namespaces → secrets → rbac → workload
@@ -508,7 +509,10 @@ checks it. Consequences to size for:
   CrashLoops the deployment), while `FOREMAN_JOB_BOOT_TIMEOUT` stays `300s`
   (a missed bound fails that task with `job_boot_timeout`); raise it together
   with `FOREMAN_JOB_TOKEN_TTL` if your links need the same headroom, since
-  the startup self-check refuses a TTL below boot + task + drain;
+  the startup self-check refuses a TTL below boot + task + drain. Raising a
+  bound is not a substitute for an origin the Job pod cannot download from at
+  window scale: give such a deployment a cluster-reachable mirror instead
+  (§Agent backend origin);
 - the Job image must keep the runtime that binary links (`libstdc++` /
   `libgcc_s`); `ADR-033` lists it as an image content;
 - a `MULTICA_OMP_PATH` that exists in neither the image nor a mounted volume
@@ -524,6 +528,55 @@ checks it. Consequences to size for:
   silently dropped), or a missing/mismatched `apiVersion`/`kind` — and a
   `metadata.name` that is not a legal name format. Nothing else is checked.
   There is no env switch and no fallback.
+
+### Agent backend origin (deployer override)
+
+The reference template's origin is a default, not a hard-coded deployment
+decision: a deployer points the same template at a cluster-reachable mirror
+without forking it. `optional/agent-backend-mirror.sh` reads the shipped
+ConfigMap, rewrites exactly the `omp` init step's `base=` line and writes the
+resulting ConfigMap:
+
+```bash
+# The mirror serves a release download directory's layout:
+#   <base>/SHA256SUMS.txt  <base>/omp-linux-musl-x64  <base>/omp-linux-musl-arm64
+FOREMAN_AGENT_BACKEND_BASE=http://ompmirror.multica-agents.svc:8080 \
+  ./deploy/optional/agent-backend-mirror.sh | kubectl apply -f -
+kubectl -n foreman rollout restart deploy/foreman
+```
+
+Everything else in the template — the checksum gate, the arch asset choice,
+the install path and mode — stays the reference template's bytes. The script
+refuses an empty origin, an origin carrying shell syntax, and a template whose
+reference line has moved, so a mistyped or stale invocation installs nothing
+instead of silently keeping the upstream origin.
+
+- **The shipped file does not change.** `25-job-template.yaml` remains
+  byte-identical to the AC-20 baseline; only the ConfigMap a deployment applies
+  is rewritten. The override therefore leaves the reference-template window
+  (AC-20's byte comparison no longer describes the deployment) — that window is
+  the shipped template's, not a promise about a customized one.
+- **The mirror is the deployment's own source.** The init step still verifies
+  the asset against the manifest from the same base, so a mirror pins the
+  release it serves — the rollback anchor the upstream origin lacks — at the
+  cost of becoming the deployment's trust anchor (§8.7). Foreman still does not
+  review, pin or record either.
+- A later `kubectl apply -f deploy/` restores the shipped ConfigMap; re-apply
+  the override (and restart Foreman) when that happens.
+
+**Size the origin against the boot window.** The default
+`FOREMAN_JOB_BOOT_TIMEOUT` is `300s`; at the 206 KB/s measured from a
+slow-egress cluster node's Job pod, that window buys `300s × 206 KB/s ≈ 60 MiB`
+of agent backend. The reference asset is 204 MiB — ≈17 min at that rate, 3.4×
+the window before schedule, image pull and registration are counted — so the
+Job ends `job_boot_timeout` before the init step installs anything. Served from
+an in-cluster mirror the same 204 MiB asset was measured at ≈5 s and the Job
+booted inside the window. A deployment whose Job pods cannot reach a fast
+origin **must** provide a cluster-reachable artifact source with the release
+manifest and both architecture assets preloaded, or accept that its tasks fail
+at boot; raising the bound only stretches the wait. There is no node-level
+cache to warm — `agent-bin` is each pod's `emptyDir`, so every pod still
+fetches its own copy (§8.7, ADR-033).
 
 ### Name format (`metadata.name`)
 
@@ -548,10 +601,11 @@ ownership), never by name, so a custom format changes nothing but what
 
 The template is a required deployment artifact, so the ConfigMap moves first:
 
-- **Upgrade**: create/update the ConfigMap (the shipped reference template, or
-  the deployer's own) **before** rolling out the new Foreman. A Foreman whose
-  template is absent refuses to start — and with the ConfigMap object itself
-  missing, kubelet blocks the pod before that.
+- **Upgrade**: create/update the ConfigMap (the shipped reference template, its
+  mirror-rendered copy (§Agent backend origin), or the deployer's own) **before**
+  rolling out the new Foreman. A Foreman whose template is absent refuses to start
+  — and with the ConfigMap object itself missing, kubelet blocks the pod before
+  that.
 - **Rollback**: roll the image back; the ConfigMap can stay. An older Foreman
   reads the same complete template, so no ConfigMap change is needed.
 
@@ -585,25 +639,30 @@ before copying the reference template:
   producing an id-less daemon — the identity no longer depends on the Job
   controller's `job-name` label.
 
-**The agent backend's source is a registered trade-off, not an oversight.** The
-reference template resolves `omp` from upstream's newest release at every Job
-boot and verifies it against that same release's manifest (`ADR-033`), and
-Foreman neither reviews, pins nor records the version it receives. A deployment
-that copies the reference template accepts:
+**The agent backend's source is a registered trade-off, not an oversight.** By
+default the reference template resolves `omp` from upstream's newest release at
+every Job boot and verifies it against that same release's manifest (`ADR-033`),
+and Foreman neither reviews, pins nor records the version it receives. A
+deployment can repoint the shipped template at its own mirror (§Agent backend
+origin) — that moves the source, not the responsibility: the mirror becomes the
+deployment's trust anchor and the pin. Either way it accepts:
 
-- **no review and no rollback anchor on the Foreman side** — a new upstream
+- **no review and no rollback anchor on the Foreman side** — upstream's newest
   release reaches every Job created afterwards without a deploy change; rolling
-  the backend back means editing the template, and a deployment that needs a
-  fixed version writes its own template, which nothing checks (§8.1);
+  the backend back means editing the template or repointing it at a pinned
+  mirror, and either way the deployment leaves the reference-template window,
+  which nothing checks (§8.1);
 - **a same-origin checksum, not an independent trust anchor** — manifest and
-  asset come from the same release, so verification catches a corrupted download
+  asset come from the same origin, so verification catches a corrupted download
   but not a release replaced in place; template content is not a security
   boundary (§8.7);
 - **`github.com` as a Job-start prerequisite beside the registry** — an
   unreachable origin makes the init container exit non-zero (pod `Failed` →
   task `failed`, `failure_reason=job_failed`), and an origin that stalls spends
   the boot window (`job_boot_timeout`); nothing falls back to an image-carried
-  backend.
+  backend. An origin slower than that window's arithmetic is a deployment
+  defect, not a tuning problem: provide a cluster-reachable mirror and size the
+  two together (§Agent backend origin).
 
 ### Catalog probe and model catalog (startup)
 
