@@ -98,6 +98,10 @@ func TestTechMulti15EmptyWorkspaceCountsGloballyOnly(t *testing.T) {
 		tw.waitLiveJob(t, taskID, 10*time.Second)
 	}
 	tw.waitSlots(t, 2)
+	// The setup claims are done. An idle loop with a free slot still cycles a
+	// reservation on both levels every interval, so the counters below are only
+	// the settled state after the loop has exited and released what it took.
+	stopClaim()
 
 	if err := tw.a.reg.Put(registry.TaskEntry{
 		TaskID:       "task-nos",
