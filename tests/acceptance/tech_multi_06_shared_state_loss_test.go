@@ -25,7 +25,7 @@ func TestTechMulti06SharedStateDataLoss(t *testing.T) {
 
 	// task-live: fully running; its Job is the K8s truth the rebuild reads.
 	tw.a.upstream.enqueueTask("task-live")
-	tw.waitForTaskJob(t, "task-live", 10*time.Second)
+	tw.awaitClaimedJob(t, "task-live")
 	liveToken := tw.token(t, tw.a, "task-live")
 	tw.registerVia(t, tw.b, "task-live", liveToken)
 	if got := tw.claimVia(t, tw.b, "task-live", liveToken); len(got) != 1 {
@@ -125,11 +125,12 @@ func TestTechMulti06SharedStateDataLoss(t *testing.T) {
 	tw.a.upstream.enqueueTask("task-queue")
 	startClaimAgain := startConcurrency01ClaimLoop(t, tw.a)
 	defer startClaimAgain()
-	tw.waitLiveJob(t, "task-queue", 10*time.Second)
+	tw.awaitClaimedJob(t, "task-queue")
 	if n := tw.a.jobs.liveJobCount("fm-task-queue"); n != 1 {
 		t.Fatalf("live Jobs for the redispatch = %d, want exactly one", n)
 	}
-	// The re-dispatched task runs end to end once.
+	// The Job object is not the registration gate; the row's job_created commit
+	// is (a registration read while the row is still pending advances nothing).
 	tw.registerVia(t, tw.b, "task-queue", queueToken)
 	if got := tw.claimVia(t, tw.b, "task-queue", queueToken); len(got) != 1 {
 		t.Fatalf("redispatch delivery = %d, want 1", len(got))
