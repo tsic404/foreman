@@ -35,14 +35,18 @@ func TestTechMulti04ControlPlaneTakeover(t *testing.T) {
 	defer stopClaimB()
 
 	// The holder's heartbeats reach the server under the declared identities.
+	// Wait for every registered runtime, not the first stream to land: a stream
+	// whose first send comes later would read as a new identity after takeover.
+	registered := tw.a.client.RuntimeIDs()
 	deadline := time.Now().Add(10 * time.Second)
-	for len(tw.a.upstream.heartbeatRuntimeIDs()) == 0 {
+	idsBefore := tw.a.upstream.heartbeatRuntimeIDs()
+	for !heartbeatsCover(idsBefore, registered) {
 		if time.Now().After(deadline) {
-			t.Fatal("the holder never heartbeated")
+			t.Fatalf("the holder heartbeated %v, want every registered runtime %v", idsBefore, registered)
 		}
 		time.Sleep(10 * time.Millisecond)
+		idsBefore = tw.a.upstream.heartbeatRuntimeIDs()
 	}
-	idsBefore := tw.a.upstream.heartbeatRuntimeIDs()
 	c1Before := len(tw.a.upstream.calls("POST", "/api/daemon/register"))
 
 	tw.a.upstream.enqueueTask("task-takeover")
@@ -97,7 +101,7 @@ func TestTechMulti04ControlPlaneTakeover(t *testing.T) {
 	idsAfter := tw.a.upstream.heartbeatRuntimeIDs()
 	for id := range idsAfter {
 		if _, known := idsBefore[id]; !known {
-			t.Fatalf("heartbeat resumed under a new runtime id %s", id)
+			t.Fatalf("heartbeat resumed under a new runtime id %s; registered=%v before=%v after=%v", id, registered, idsBefore, idsAfter)
 		}
 	}
 	before := idsBefore["rid-omp"]
@@ -119,6 +123,20 @@ func TestTechMulti04ControlPlaneTakeover(t *testing.T) {
 	if n := tw.a.jobs.deletedCount("fm-task-takeover"); n != 1 {
 		t.Fatalf("Job deletions = %d, want exactly one", n)
 	}
+}
+
+// heartbeatsCover reports whether every registered runtime id heartbeated; an
+// empty registration never covers.
+func heartbeatsCover(counts map[string]int, ids []string) bool {
+	if len(ids) == 0 {
+		return false
+	}
+	for _, id := range ids {
+		if counts[id] == 0 {
+			return false
+		}
+	}
+	return true
 }
 
 // startHeartbeatLoop runs the production heartbeat loop gated on the harness's
