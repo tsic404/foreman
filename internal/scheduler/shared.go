@@ -241,8 +241,9 @@ func (s *Scheduler) OnClaimReserved(ctx context.Context, task json.RawMessage, r
 }
 
 // ReconcileSlots is the leader's periodic two-level reconciliation (§10 计数按
-// 条目周期对账): it only lowers a counter, because a claim's reservation is
-// taken before its row lands and must never be read as a leak.
+// 条目周期对账): every level is written to its live rows plus its live
+// reservations, so a claim's reservation — taken before its row lands — is
+// never read as a leak, and a slot no row accounts for is not lost either.
 func (s *Scheduler) ReconcileSlots(ctx context.Context) error {
 	return s.reconcileSlots(ctx, false)
 }
@@ -478,19 +479,19 @@ func (s *Scheduler) syncQueueDepth(ctx context.Context) {
 // reservation land in between, keep its marker, and later have that marker
 // purged as a second decrement of a slot it never owned.
 //
-// exact=false is the periodic leader-round repair:
-//
-//   - a counter above the truth is a leak and is lowered;
-//   - a counter below the live-row count is a lost decrement (a failed
-//     reservation consume) and is raised to the row lower bound — a live row
-//     always owns a slot, so the rows alone are a safe floor;
-//   - the write is a compare-and-set against the atomic counter snapshot, so
-//     a claim reservation taken between the read and the write makes the CAS
-//     decline that round instead of losing its +1.
+// exact=false is the periodic leader-round repair: every level is written to
+// the rows plus that level's live reservations. Both are part of the counter a
+// claim keeps — the reservation holds its slot before its row exists — so a
+// level whose counter differs is a leak (above) or a lost slot (below), and
+// either is repaired in the same round. The write is a compare-and-set against
+// the atomic counter snapshot, so a claim landing between the read and the
+// write makes the attempt recompute instead of losing its +1 or writing a
+// value the store has already overtaken.
 //
 // Every level's snapshot is taken atomically (purge + counter + reservations)
-// before the single rows traversal, so a reservation converted in between is
-// counted twice — the periodic repair only needs that direction to be safe.
+// before the rows traversal, so a reservation converted in between is counted
+// twice — the direction that withholds a claim for at most one round, never
+// the one that lets a live row run outside the cap.
 // Every configured workspace is reconciled, including one with no live row: a
 // reservation left by a dead holder must not survive as a permanent budget
 // loss (AC-76). An empty workspace id is not a level — such a row counts in
@@ -543,66 +544,76 @@ func (s *Scheduler) resetSlots(ctx context.Context, levels []string) error {
 	return nil
 }
 
-// repairSlots is the periodic downward/floor repair: the snapshot and the
-// CAS in each direction keep it from losing a concurrent claim's reservation.
+// repairSlotAttempts bounds how often one level is re-read inside a round: a
+// claim that lands between the read and the write makes the compare-and-set
+// decline, and the round recomputes instead of leaving the level short until
+// the next one.
+const repairSlotAttempts = 3
+
+// repairSlots is the periodic two-level repair. Each level's counter is
+// rewritten to the store's own invariant: the live rows plus that level's live
+// reservations. A reservation holds its slot before its row exists, so the
+// rows alone are not the truth — treating them as the floor left a level one
+// slot short whenever a live reservation masked a row whose slot was missing,
+// and that reservation's later release then took the counter below the live
+// rows.
 func (s *Scheduler) repairSlots(ctx context.Context, levels []string) error {
-	type levelSnapshot struct {
-		count        int64
-		reservations int64
-	}
-	snapshots := make(map[string]levelSnapshot, len(levels))
 	for _, ws := range levels {
+		if err := s.repairLevel(ctx, ws); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// repairLevel converges one level. Its snapshot is atomic (purge + counter +
+// live reservations) and is taken before the rows traversal, so a reservation
+// converted in between is counted twice: that direction withholds one claim
+// for at most one round, while under-counting would let a live row run outside
+// the cap. A declined compare-and-set means a claim moved the level, so the
+// attempt recomputes from a fresh snapshot rather than writing a value the
+// store has already overtaken.
+func (s *Scheduler) repairLevel(ctx context.Context, ws string) error {
+	for range repairSlotAttempts {
 		count, reservations, err := s.shared.SlotSnapshot(ctx, ws)
 		if err != nil {
 			s.metrics.StateError("read_slots")
 			return fmt.Errorf("%w: read slot snapshot: %v", ErrStoreUnavailable, err)
 		}
-		snapshots[ws] = levelSnapshot{count: count, reservations: reservations}
 		s.metrics.SharedSlots(ws, int(count))
-	}
-
-	// One traversal: rows are read after every level's snapshot (see above).
-	total, perWS := s.liveRows()
-	for _, ws := range levels {
-		rows := total
-		if ws != "" {
-			rows = perWS[ws]
+		next := s.liveRowCount(ws) + reservations
+		if count == next {
+			return nil
 		}
-		snap := snapshots[ws]
-		next := int64(0)
-		write := false
-		switch {
-		case snap.count > rows+snap.reservations:
-			// A leak: lower to the row + live-reservation truth.
-			next = rows + snap.reservations
-			write = true
-		case snap.count < rows:
-			// A lost decrement (e.g. a failed reservation consume): a live
-			// row always owns a slot, so the row count is a safe floor.
-			next = rows
-			write = true
-		}
-		if !write {
-			continue
-		}
-		swapped, err := s.shared.CompareAndSetSlots(ctx, ws, snap.count, next)
+		swapped, err := s.shared.CompareAndSetSlots(ctx, ws, count, next)
 		if err != nil {
 			s.metrics.StateError("reconcile_slots")
 			return fmt.Errorf("%w: reconcile slots: %v", ErrStoreUnavailable, err)
 		}
 		if !swapped {
-			// A claim moved the counter after the snapshot: this round has
-			// no safe value to write (the next round recomputes).
 			continue
 		}
-		fields := []any{"level", "workspace", "workspace_id", ws, "before", snap.count, "after", next}
+		fields := []any{"level", "workspace", "workspace_id", ws, "before", count, "after", next}
 		if ws == "" {
-			fields = []any{"level", "global", "before", snap.count, "after", next}
+			fields = []any{"level", "global", "before", count, "after", next}
 		}
 		s.log.WarnContext(ctx, "coordination.slots_reconciled", fields...)
 		s.metrics.SharedSlots(ws, int(next))
+		return nil
 	}
+	// Every attempt raced a claim: the next periodic round recomputes.
 	return nil
+}
+
+// liveRowCount counts one level's live rows: the global total, or the
+// workspace's own. An empty workspace id is not a level of its own — such a
+// row counts in the global total only, never as a workspace key.
+func (s *Scheduler) liveRowCount(ws string) int64 {
+	total, perWS := s.liveRows()
+	if ws == "" {
+		return total
+	}
+	return perWS[ws]
 }
 
 // liveRows counts the non-terminal rows once: the global total and the

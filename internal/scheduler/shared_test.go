@@ -24,9 +24,12 @@ type fakeCoordStore struct {
 	// pending lists each level's reservation ids. A consume removes the id it
 	// names, like the store's targeted delete, so a test can tell whose marker
 	// went away.
-	pending      map[string][]string
-	nextID       int
-	snapshotErr  error
+	pending     map[string][]string
+	nextID      int
+	snapshotErr error
+	// snapshotHook runs once, after a snapshot read and before its caller sees
+	// the value, so a test can land a claim in that window.
+	snapshotHook func(ws string)
 	consumeFails int
 	// consumeFailsAfterApply models a delete that landed while its response
 	// was lost: the named member is gone and the caller saw an error.
@@ -151,11 +154,20 @@ func (f *fakeCoordStore) pendingLen(ws string) int {
 
 func (f *fakeCoordStore) SlotSnapshot(_ context.Context, ws string) (int64, int64, error) {
 	f.mu.Lock()
-	defer f.mu.Unlock()
-	if f.snapshotErr != nil {
-		return 0, 0, f.snapshotErr
+	count, reservations := f.counts[ws], int64(len(f.pending[ws]))
+	err := f.snapshotErr
+	hook := f.snapshotHook
+	f.snapshotHook = nil
+	f.mu.Unlock()
+	if err != nil {
+		return 0, 0, err
 	}
-	return f.counts[ws], int64(len(f.pending[ws])), nil
+	// The hook runs after the read and before the caller sees it, the way a
+	// claim reservation landing between the read and the write does.
+	if hook != nil {
+		hook(ws)
+	}
+	return count, reservations, nil
 }
 
 func (f *fakeCoordStore) ResetSlots(_ context.Context, ws string, n int64) (int64, int64, error) {
@@ -464,6 +476,103 @@ func TestReconcileSlotsEmptyWorkspaceCountsGloballyOnly(t *testing.T) {
 	}
 	if len(store.casCalls) != 1 || store.casCalls[0].ws != "" || store.casCalls[0].next != 1 {
 		t.Fatalf("cas calls = %+v, want only the global level raised to 1", store.casCalls)
+	}
+}
+
+// TestReconcileSlotsCountsALiveReservationWithTheRows pins the counter's own
+// invariant: a level is its live rows plus its live reservations. A
+// reservation holds its slot before its row exists, so a level whose counter
+// merely equals its rows is one slot short, and the reservation's release is
+// what exposes that as a counter below the live rows.
+func TestReconcileSlotsCountsALiveReservationWithTheRows(t *testing.T) {
+	store := &fakeCoordStore{
+		counts:  map[string]int64{"": 3, "ws-a": 2},
+		pending: map[string][]string{"": {"g-live"}},
+	}
+	s, _ := newSlotTestScheduler(t, store, "ws-a")
+	for _, e := range []registry.TaskEntry{
+		{TaskID: "t-1", WorkspaceID: "ws-a", DaemonID: "d-1", State: registry.StateRunning},
+		{TaskID: "t-2", WorkspaceID: "ws-a", DaemonID: "d-2", State: registry.StateRunning},
+		{TaskID: "t-nos", DaemonID: "d-3", State: registry.StateDaemonRegistered},
+	} {
+		if err := s.reg.Put(e); err != nil {
+			t.Fatalf("put %s: %v", e.TaskID, err)
+		}
+	}
+	if err := s.ReconcileSlots(context.Background()); err != nil {
+		t.Fatalf("ReconcileSlots: %v", err)
+	}
+	if got := store.counts[""]; got != 4 {
+		t.Fatalf("global counter = %d, want 4 (three live rows plus the live reservation)", got)
+	}
+	if got := store.counts["ws-a"]; got != 2 {
+		t.Fatalf("workspace counter = %d, want 2 (its rows already own its slots)", got)
+	}
+	// The reservation returns and the counter lands on the live rows exactly,
+	// instead of one below them.
+	if err := store.ReleaseSlot(context.Background(), "", "g-live"); err != nil {
+		t.Fatalf("release the live reservation: %v", err)
+	}
+	if got := store.counts[""]; got != 3 {
+		t.Fatalf("global counter after the reservation returned = %d, want 3 (the live rows)", got)
+	}
+	// Converged: the next round has nothing to write.
+	store.mu.Lock()
+	store.casCalls = nil
+	store.mu.Unlock()
+	if err := s.ReconcileSlots(context.Background()); err != nil {
+		t.Fatalf("second ReconcileSlots: %v", err)
+	}
+	if len(store.casCalls) != 0 {
+		t.Fatalf("a converged round wrote again: %+v", store.casCalls)
+	}
+}
+
+// TestReconcileSlotsRetriesWhenAClaimLandsInTheWindow pins the round's other
+// half: a claim that lands between the read and the write declines the
+// compare-and-set, and the round recomputes rather than leaving the level
+// short until the next interval.
+func TestReconcileSlotsRetriesWhenAClaimLandsInTheWindow(t *testing.T) {
+	store := &fakeCoordStore{
+		counts:  map[string]int64{"": 2, "ws-a": 2},
+		pending: map[string][]string{},
+	}
+	s, _ := newSlotTestScheduler(t, store, "ws-a")
+	for _, e := range []registry.TaskEntry{
+		{TaskID: "t-1", WorkspaceID: "ws-a", DaemonID: "d-1", State: registry.StateRunning},
+		{TaskID: "t-2", WorkspaceID: "ws-a", DaemonID: "d-2", State: registry.StateRunning},
+		{TaskID: "t-nos", DaemonID: "d-3", State: registry.StateDaemonRegistered},
+	} {
+		if err := s.reg.Put(e); err != nil {
+			t.Fatalf("put %s: %v", e.TaskID, err)
+		}
+	}
+	// A claim reserves right after the first global read: the counter becomes
+	// 3 with a live marker, so the write the round had computed (2 -> 3) must
+	// not land.
+	store.snapshotHook = func(ws string) {
+		if ws != "" {
+			return
+		}
+		store.mu.Lock()
+		store.counts[""]++
+		store.pending[""] = append(store.pending[""], "g-claim")
+		store.mu.Unlock()
+	}
+	if err := s.ReconcileSlots(context.Background()); err != nil {
+		t.Fatalf("ReconcileSlots: %v", err)
+	}
+	if got := store.counts[""]; got != 4 {
+		t.Fatalf("global counter = %d, want 4 (three live rows plus the claim's reservation)", got)
+	}
+	if len(store.casCalls) != 1 || store.casCalls[0].ws != "" || store.casCalls[0].expected != 3 || store.casCalls[0].next != 4 {
+		t.Fatalf("cas calls = %+v, want one global write 3 -> 4 after the declined attempt", store.casCalls)
+	}
+	if err := store.ReleaseSlot(context.Background(), "", "g-claim"); err != nil {
+		t.Fatalf("release the claim's reservation: %v", err)
+	}
+	if got := store.counts[""]; got != 3 {
+		t.Fatalf("global counter after the claim's reservation returned = %d, want 3 (the live rows)", got)
 	}
 }
 
