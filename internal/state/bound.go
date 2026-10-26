@@ -21,6 +21,10 @@ import (
 // second full one.
 type opBoundKey struct{}
 
+// opBound carries the instant its operation was issued: the availability face
+// orders evidence by it rather than by the order results come back (§10).
+type opBound struct{ start time.Time }
+
 // opTracker counts the operations still running after the caller that started
 // them stopped waiting. Such an operation keeps forming its conclusion (§10
 // 判定: a caller's exit does not void it), so a test that asserts on that
@@ -78,7 +82,7 @@ func (s *redisStore) boundCtx(ctx context.Context) (context.Context, context.Can
 	if ctx != nil {
 		base = context.WithoutCancel(ctx)
 	}
-	return context.WithTimeout(context.WithValue(base, opBoundKey{}, struct{}{}), s.callBudget())
+	return context.WithTimeout(context.WithValue(base, opBoundKey{}, opBound{start: s.now()}), s.callBudget())
 }
 
 // storeCall runs one store operation on the store's own bound. The caller's
@@ -88,7 +92,7 @@ func (s *redisStore) boundCtx(ctx context.Context) (context.Context, context.Can
 func storeCall[T any](s *redisStore, ctx context.Context, op func(context.Context) (T, error)) (T, error) {
 	var zero T
 	if ctx != nil {
-		if _, ok := ctx.Value(opBoundKey{}).(struct{}); ok {
+		if _, ok := ctx.Value(opBoundKey{}).(opBound); ok {
 			return op(ctx)
 		}
 		// A caller that is already done never started this operation, so
