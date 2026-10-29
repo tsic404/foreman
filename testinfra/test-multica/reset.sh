@@ -209,9 +209,10 @@ ensure_agent() {
 		return 0
 	fi
 	rt=$(seed_runtime) || die "seed runtime registration failed"
-	agent_id=$(wsapi POST /api/agents \
-		"{\"name\":\"$AGENT_NAME\",\"description\":\"Foreman acceptance test agent\",\"instructions\":\"Reply with a short acknowledgement. Do not modify any repository.\",\"runtime_id\":\"$rt\",\"max_concurrent_tasks\":6}" |
-		jq -er .id) || die "agent creation failed"
+	body=$(jq -nc --arg name "$AGENT_NAME" --arg ins "$AGENT_INSTRUCTIONS" --arg rt "$rt" \
+		'{name:$name, description:"Foreman acceptance test agent", instructions:$ins, runtime_id:$rt, max_concurrent_tasks:6}') ||
+		die "could not encode the agent body"
+	agent_id=$(wsapi POST /api/agents "$body" | jq -er .id) || die "agent creation failed"
 	mcli runtime delete "$rt" --cascade >/dev/null ||
 		die "could not unbind and delete the seed runtime"
 	info "created agent $AGENT_NAME ($agent_id), unbound"

@@ -170,7 +170,7 @@ tasks instead of removing them.
 | Test agent | `foreman-test-agent` | dispatch (its runtime is the one Foreman registers) |
 | Model backend (local mode only) | PVC `ollama-models`, Deployment/Service `test-multica-ollama`, model `qwen2.5:0.5b` (overridable) | the test agent's inference, token usage — absent when the endpoint triple is set |
 | Repository | `https://github.com/tsic404/foreman` | agent checkout, cache cases |
-| Autopilot (manual trigger) | `foreman-test-autopilot` | `./multica-test autopilot trigger <id>` |
+| Autopilot (manual trigger) | `foreman-test-autopilot` (short), `foreman-test-autopilot-long` (long) | `./multica-test autopilot trigger <id>` |
 | Chat entry | chat session `foreman-test-chat` | messages to the agent |
 | Task status query surface | `./multica-test runtime list` / board at the entry origin | runtime, task and cancellation state |
 | Model provider registration | `foreman-test/<model id>` in `${FOREMAN_STATE_ROOT}/home/<workspace>/.omp/agent/models.yml`; Secret `test-multica-model-provider` | the test agent's model (only when the endpoint is supplied) |
@@ -183,6 +183,70 @@ has no runtime, and the reset entry leaves the runtime list empty on purpose.
 The login is deterministic: `APP_ENV=development` plus the fixed verification
 code in the Secret. The account is created on first login; no password is
 stored anywhere.
+
+## Task shapes (用例前置)
+
+Every TC-uat carrier judges a task an operator triggered; none of them creates
+one. `bind-agent.sh` therefore provisions two manual autopilots whose
+`description` is the run prompt — the only entrance that has a CLI:
+
+| Shape | Autopilot | Prompt |
+|---|---|---|
+| short | `foreman-test-autopilot` | one `multica issue list` call, then `OK` |
+| long | `foreman-test-autopilot-long` | `sleep ${TEST_MULTICA_LONG_TASK_SLEEP:-900}`, then `DONE` |
+
+```bash
+./multica-test autopilot list --output json       # the two autopilot ids and titles
+./multica-test agent list --output json           # the test agent id (`foreman-test-agent`)
+./multica-test autopilot trigger <autopilot-id>   # then: ./multica-test agent tasks <agent-id>
+```
+
+Every id below comes from those two listings; `reset.sh` prints the agent's name
+only, and only when it creates it.
+
+The short prompt carries the `multica issue list` call for one reason beyond
+the reply: the agent's own Multica API call is the only traffic that reaches
+Foreman's S29 passthrough, so it is what moves
+`foreman_forward_total{endpoint="agent-api"}`. A task that only answers never
+produces it, and G2's passthrough leg has no other observable face.
+
+The four terminal classes of the lifecycle case are constructible from these
+two shapes without touching the repository:
+
+- **completed** — trigger the short autopilot.
+- **cancelled** — trigger the long autopilot and cancel it while it sleeps:
+
+  ```bash
+  ./multica-test autopilot trigger <long-autopilot-id>   # task id from: ./multica-test agent tasks <agent-id>
+  ./multica-test issue cancel-task <task-id>
+  ```
+
+  Cancellation is server-side only; Foreman never initiates one, it discovers
+  it on the daemon's next status poll.
+- **timeout** — the Job's budget is the template's `spec.activeDeadlineSeconds`
+  (`deploy/25-job-template.yaml`, 86400 shipped), read by Foreman at startup.
+  Lower that value in the `foreman-job-template` ConfigMap, roll the
+  Deployment, then trigger the long autopilot and let the Job outlive the
+  budget: the Job ends with `DeadlineExceeded` and the projection carries
+  `failure_reason=job_deadline_exceeded`.
+- **failed** — point the agent at a model the endpoint does not serve, trigger
+  the short autopilot, and let the run end; then restore the source, because
+  every other case of the round uses it:
+
+  ```bash
+  ./multica-test agent update <agent-id> --model foreman-test/not-served
+  ./multica-test autopilot trigger <short-autopilot-id>
+  # the projection's result is failed once the run settles
+  ./reset.sh && ./wire.sh && ./bind-agent.sh     # re-registers the endpoint, re-points the agent
+  ```
+
+  `reset.sh` rewrites the agent's model from the endpoint triple (or clears it
+  when no endpoint is configured), and `bind-agent.sh` rewrites the binding and
+  the instructions, so the round continues on the restored source.
+
+The long shape is also the in-flight set of the recovery case: trigger N long
+tasks, inject the fault (`kubectl -n foreman rollout restart` or a Job pod
+deletion), then judge the tasks that were live across the window.
 
 ## Model endpoint (部署参数)
 
