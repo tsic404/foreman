@@ -45,13 +45,21 @@ snapshot)
 esac
 
 # ---- Upstream unmodified: the running images are the pinned manifest's -----
+# Every image deploy.yaml pins must be running. The local model backend lives in
+# its own manifest because it is only the model source of a round without an
+# endpoint: its images are admitted, not required — an endpoint round never
+# deploys them. Nothing outside the two pinned manifests may run.
 manifest="$TEST_MULTICA_DIR/deploy.yaml"
+model_manifest="$TEST_MULTICA_DIR/model-backend.yaml"
 [ -r "$manifest" ] || blocked "no test-infra manifest at $manifest"
+[ -r "$model_manifest" ] || blocked "no test-infra model backend manifest at $model_manifest"
 kubectl get namespace "$TEST_MULTICA_NS" >/dev/null 2>&1 ||
 	blocked "namespace $TEST_MULTICA_NS does not exist — deploy the test environment first"
 pods_json=$(kubectl -n "$TEST_MULTICA_NS" get pods -o json) ||
 	blocked "cannot list pods in $TEST_MULTICA_NS"
 expected=$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "$manifest" | tr -d '"' | sort -u)
+admitted=$(cat "$manifest" "$model_manifest" |
+	sed -n 's/^[[:space:]]*image:[[:space:]]*//p' | tr -d '"' | sort -u)
 running=$(printf '%s' "$pods_json" |
 	jq -r '.items[] | (.spec.containers[]?.image, .spec.initContainers[]?.image)' | sort -u)
 observe "manifest images: $(printf '%s' "$expected" | tr '\n' ' ')"
@@ -59,11 +67,12 @@ observe "running images: $(printf '%s' "$running" | tr '\n' ' ')"
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT INT TERM
 printf '%s\n' "$expected" >"$tmp/expected"
+printf '%s\n' "$admitted" >"$tmp/admitted"
 printf '%s\n' "$running" >"$tmp/running"
 missing=$(comm -23 "$tmp/expected" "$tmp/running")
-extra=$(comm -13 "$tmp/expected" "$tmp/running")
+extra=$(comm -13 "$tmp/admitted" "$tmp/running")
 [ -z "$missing" ] || fail "manifest images not running (upstream was changed): $missing"
-[ -z "$extra" ] || fail "running images not in the pinned manifest (upstream was changed): $extra"
+[ -z "$extra" ] || fail "running images not in the pinned manifests (upstream was changed): $extra"
 
 config=$(curl -fsS -m 30 "$TEST_MULTICA_SERVER_URL/api/config") ||
 	blocked "cannot read $TEST_MULTICA_SERVER_URL/api/config"

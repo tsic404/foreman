@@ -1,5 +1,5 @@
 #!/bin/sh
-# The environment gate — the three checks every acceptance round opens with.
+# The environment gate — the four checks every acceptance round opens with.
 #
 #   ./selfcheck.sh
 #
@@ -10,9 +10,13 @@
 #      "exactly one provider=omp runtime", judged by TC-tech-protocol-01);
 #   ③ the test server reports the artifact anchor v0.6.1 — two stages, because
 #      the field is `omitempty`: a missing `server_version` is a data-surface
-#      mismatch, not a version mismatch.
+#      mismatch, not a version mismatch;
+#   ④ the selected model source serves the round — the deployment-supplied
+#      endpoint when its triple is set, else the local backend and the model
+#      its pull step installed. The premise of a real task result and a
+#      non-zero token count, not something to discover at the inference step.
 #
-# Exit codes: 0 = all three hold; 2 = the environment is blocked — fix it,
+# Exit codes: 0 = all four hold; 2 = the environment is blocked — fix it,
 # never run a case against an unknown one. ② only holds before the instance
 # under test starts: ./reset.sh and ./wire.sh run this at that moment.
 
@@ -30,7 +34,7 @@ anchor=${TEST_MULTICA_VERSION_ANCHOR:-v0.6.1}
 case ${1:-} in
 '') ;;
 -h | --help)
-	sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
 	exit 0
 	;;
 *) die "unknown argument: $1" ;;
@@ -74,4 +78,27 @@ version=$(printf '%s' "$config" | jq -r .server_version)
 	blocked "③ the server reports $version, the artifact anchor is $anchor"
 info "③ ok: server_version $version"
 
-info "self-check passed: ①②③ (access point $ACCESS_URL)"
+# --- ④ the selected model source serves the round ----------------------------
+
+# The agent must produce a real task result and a non-zero token count, so the
+# source ./reset.sh selected is part of the environment the gate asserts. The
+# deployment-supplied endpoint wins; the keyless local backend is the source
+# otherwise, and its pull step must have completed.
+if model_endpoint_configured; then
+	model_source="endpoint $(model_selector)"
+	info "④ ok: the deployment supplies the model endpoint ($model_source)"
+else
+	model=$(kubectl -n "$NS" get deploy "$MODEL_BACKEND_DEPLOY" \
+		-o jsonpath='{.spec.template.spec.initContainers[0].env[?(@.name=="OLLAMA_MODEL")].value}' 2>/dev/null) ||
+		blocked "④ cannot read Deployment $NS/$MODEL_BACKEND_DEPLOY — run ./deploy.sh (the model backend is part of the test cluster)"
+	[ -n "$model" ] ||
+		blocked "④ $NS/$MODEL_BACKEND_DEPLOY carries no OLLAMA_MODEL — re-run ./deploy.sh"
+	served=$(kubectl -n "$NS" exec deploy/"$MODEL_BACKEND_DEPLOY" -- ollama list 2>/dev/null) ||
+		blocked "④ the model backend is not serving — kubectl -n $NS logs deploy/$MODEL_BACKEND_DEPLOY, then re-run ./deploy.sh"
+	printf '%s\n' "$served" | awk 'NR > 1 { print $1 }' | grep -Fqx "$model" ||
+		blocked "④ the model backend does not serve $model — re-run ./deploy.sh (its pull step fills the models volume)"
+	model_source="local backend $model"
+	info "④ ok: model backend serves $model"
+fi
+
+info "self-check passed: ①②③④ (access point $ACCESS_URL, model source $model_source)"

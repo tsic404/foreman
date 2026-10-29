@@ -22,15 +22,15 @@
 #      whose assignee agent has no runtime, and this entry leaves the runtime
 #      list empty on purpose — ./bind-agent.sh creates it once the agent is
 #      bound;
-#   6. model endpoint — when the deployment supplies the endpoint triple, the
-#      provider registration is written into the node-local home the Job pods
-#      mount and the test agent's model points at it. Without it the entry
-#      prints 「未配置模型端点」, clears any registration a previous round left
-#      (the node file outlives the namespace) and keeps the baseline: no
-#      synthetic endpoint, no production fallback;
-#   7. gate — ./selfcheck.sh: the environment gate ①②③ (the instance points at
+#   6. model — one writer, one precedence: the deployment-supplied endpoint
+#      triple wins; without it the keyless local backend ./deploy.sh installed
+#      is the source (its family selector plus its in-cluster address); with
+#      neither, the agent's model is cleared and any registration a previous
+#      round left on the nodes is removed (the node file outlives the
+#      namespace);
+#   7. gate — ./selfcheck.sh: the environment gate ①②③④ (the instance points at
 #      the access point, the runtime list is empty, the server reports the
-#      artifact anchor).
+#      artifact anchor, the selected model source serves the round).
 #
 # It is idempotent: everything is looked up by name and only created when
 # missing; the provider registration is one Secret applied in place and one
@@ -230,12 +230,12 @@ ensure_chat() {
 	info "created chat session $CHAT_TITLE ($id)"
 }
 
-# --- 6. the model endpoint ---------------------------------------------------
+# --- 6. the model ------------------------------------------------------------
 
-# The registration itself lives in lib.sh (it is driven by the entry's
-# `agent_id`): with the triple it writes the provider and points the agent at
-# it; without it, it removes whatever a previous round left on the nodes and
-# clears the agent model (the rollback is unconditional — see the helper).
+# One writer, one precedence (lib.sh's register_model_endpoint): the
+# deployment-supplied endpoint, else the keyless local backend ./deploy.sh
+# installed, else no model. The entry only decides when to call it — the
+# agent id it needs comes from ensure_agent below.
 
 # --- 7. gate and report ------------------------------------------------------
 
@@ -251,7 +251,7 @@ ensure_agent
 ensure_chat
 register_model_endpoint
 
-# The environment gate ①②③, the gate every round opens with. Run here, with
+# The environment gate ①②③④, the gate every round opens with. Run here, with
 # the instance under test stopped, ② is the reset-time state this entry sets
 # up; a blocked environment exits 2 through this call.
 "$TEST_MULTICA_DIR/selfcheck.sh"
