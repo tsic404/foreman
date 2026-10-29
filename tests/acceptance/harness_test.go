@@ -3051,6 +3051,10 @@ type harnessOptions struct {
 	// this clock, not wall time.
 	clock     func() time.Time
 	leaderCfg coordination.Config
+	// forwardMetrics, when set, receives the proxy client's forward calls in
+	// place of the fixture's recorder, so a scenario can read the counter from
+	// the exposition a scrape returns. Every other seam keeps the recorder.
+	forwardMetrics proxy.Metrics
 }
 
 func buildHarness(t *testing.T, catalogEnabled bool, window time.Duration, skill func(*proxy.Config), realServer, wsEnabled bool) *harness {
@@ -3098,12 +3102,16 @@ func buildHarnessWith(t *testing.T, catalogEnabled bool, window time.Duration, s
 	}
 	probeRunner := &lateProbeRunner{}
 	metrics := &recordingMetrics{}
+	forwardMetrics := proxy.Metrics(metrics)
+	if opts.forwardMetrics != nil {
+		forwardMetrics = opts.forwardMetrics
+	}
 	client := proxy.NewClient(cfg, "mdt_test",
 		append([]proxy.Option{
 			proxy.WithStartupCatalog(startup),
 			proxy.WithCatalogSlots(slots),
 			proxy.WithDiscoveryProbe(probeRunner),
-			proxy.WithMetrics(metrics),
+			proxy.WithMetrics(forwardMetrics),
 			proxy.WithLogger(slog.New(slog.NewJSONHandler(io.Discard, nil))),
 			proxy.WithTaskRuntime(func(taskID string) string {
 				entry, ok := reg.Get(taskID)
