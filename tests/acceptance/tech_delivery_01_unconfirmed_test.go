@@ -382,6 +382,22 @@ func newDeliveryHarnessWith(t *testing.T, boot, window time.Duration) *harness {
 	return h
 }
 
+// newDeliveryHarnessWithForwardMetrics is newDeliveryHarness with m receiving
+// the proxy client's forward calls: the scenario reads the counter from the
+// exposition a scrape of m returns instead of the fixture's recorder.
+func newDeliveryHarnessWithForwardMetrics(t *testing.T, m proxy.Metrics) *harness {
+	t.Helper()
+	h := buildHarnessWith(t, false, deliveryConfirmWindow, nil, false, false,
+		harnessOptions{forwardMetrics: m})
+	h.rebuildScheduler(t, func(c *scheduler.Config) {
+		c.JobBootTimeout = 300 * time.Second
+		c.DeliveryConfirmTimeout = deliveryConfirmWindow
+	})
+	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+	h.declare(declaredRuntimes())
+	return h
+}
+
 // deliveryPayload is the claim payload the scenarios dispatch: the runtime id
 // picks the provider, so the Job's daemon has to declare that provider's type.
 func deliveryPayload(taskID string) json.RawMessage {
