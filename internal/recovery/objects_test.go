@@ -133,7 +133,22 @@ func TestJobEndReason(t *testing.T) {
 			ended:  true,
 		},
 		{
-			// The fixed order (§4.4, ADR-031): the Job's Failed condition is
+			// The kill's condition surface stops at FailureTarget: the
+			// controller publishes it before the pods terminate, and this
+			// instance's pod is already gone, so neither the Failed condition
+			// nor the pod fallback carries the fact.
+			name: "failure target only, pod gone",
+			job: &batchv1.Job{
+				ObjectMeta: metav1.ObjectMeta{Name: "fm-a"},
+				Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+					Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, Reason: "DeadlineExceeded",
+				}}},
+			},
+			reason: scheduler.FailureReasonJobDeadline,
+			ended:  true,
+		},
+		{
+			// The fixed order (§4.4, ADR-031): the Job's deadline condition is
 			// read first, so a deadline-killed Job whose pod also lost its
 			// node is still the platform's deadline, never an eviction.
 			name:   "job condition wins over a lost pod",

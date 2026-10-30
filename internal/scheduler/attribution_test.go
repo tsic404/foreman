@@ -37,6 +37,18 @@ func jobFailedWith(name, reason string) *batchv1.Job {
 	}
 }
 
+// failureTargetJob is the kill's earlier condition surface: the controller
+// publishes FailureTarget when it decides to fail the overdue Job, and the
+// Failed condition follows only after the pods terminate.
+func failureTargetJob(name, reason string) *batchv1.Job {
+	return &batchv1.Job{
+		ObjectMeta: metav1.ObjectMeta{Name: name},
+		Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+			Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, Reason: reason,
+		}}},
+	}
+}
+
 // budgetJob is a Job that declares a deadline budget without a termination
 // condition yet: the overdue wait signal's shape.
 func budgetJob(name string, created time.Time, budget int64) *batchv1.Job {
@@ -56,9 +68,12 @@ func deadlinePod(name string, created time.Time) corev1.Pod {
 }
 
 // TestPlatformTerminationFixedOrder pins §4.4's fixed judgement order: the
-// Job's Failed condition first, the pod's container termination only on a
-// miss. A nil Job is a miss, never an error, and the instance filter drops a
-// reused name's predecessor pod.
+// Job's deadline condition first, the pod's container termination only on a
+// miss. The deadline condition is not one type: the controller publishes
+// FailureTarget when it decides to fail the overdue Job and replaces it with
+// Failed once the pods are gone, so both carry the same fact. A nil Job is a
+// miss, never an error, and the instance filter drops a reused name's
+// predecessor pod.
 func TestPlatformTerminationFixedOrder(t *testing.T) {
 	since := testNow.Add(-time.Hour)
 	tests := []struct {
@@ -74,6 +89,18 @@ func TestPlatformTerminationFixedOrder(t *testing.T) {
 			pods:   []corev1.Pod{testPod("fm-a", corev1.PodFailed)},
 			source: "job",
 			hit:    true,
+		},
+		{
+			// The kill whose pod was collected before the Failed condition
+			// appeared: only FailureTarget carries the fact.
+			name:   "failure target carries the deadline fact",
+			job:    failureTargetJob("fm-a", "DeadlineExceeded"),
+			source: "job",
+			hit:    true,
+		},
+		{
+			name: "a failure target with another reason is a miss",
+			job:  failureTargetJob("fm-a", "BackoffLimitExceeded"),
 		},
 		{
 			name:   "pod container reason is the fallback",

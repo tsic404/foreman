@@ -71,24 +71,34 @@ const (
 	DecisionReadError        = "read_error"
 )
 
-// jobDeadlineExceededReason is the Job Failed condition reason the k8s Job
+// jobDeadlineExceededReason is the Job condition reason the k8s Job
 // controller stamps when activeDeadlineSeconds terminated the Job, and the
 // container-termination reason a deadline kill can carry.
 const jobDeadlineExceededReason = "DeadlineExceeded"
 
+// deadlineCondition reports the Job condition that carries the deadline
+// termination fact: the controller publishes FailureTarget when it decides to
+// fail the overdue Job and replaces it with Failed once the pods are gone, so
+// only Failed misses the kill whose pod was collected first (§4.4).
+func deadlineCondition(cond batchv1.JobCondition) bool {
+	if cond.Status != corev1.ConditionTrue || cond.Reason != jobDeadlineExceededReason {
+		return false
+	}
+	return cond.Type == batchv1.JobFailureTarget || cond.Type == batchv1.JobFailed
+}
+
 // PlatformTermination applies §4.4's single judgement of the platform-forced
 // termination fact in the fixed order ADR-031 pins: ① the instance Job's
-// Failed condition carries the deadline reason; ② only on a miss, the
-// instance pod's container termination reason. A nil Job or a missing pod is
-// a miss, never an error — the reader either produced objects or failed on
-// its own. since filters the pods to the current Job instance (the jobPods
-// filter's basis), so a reused name's predecessor pod cannot decide this
-// instance's fact.
+// deadline condition (FailureTarget or Failed) carries the deadline reason;
+// ② only on a miss, the instance pod's container termination reason. A nil
+// Job or a missing pod is a miss, never an error — the reader either produced
+// objects or failed on its own. since filters the pods to the current Job
+// instance (the jobPods filter's basis), so a reused name's predecessor pod
+// cannot decide this instance's fact.
 func PlatformTermination(job *batchv1.Job, pods []corev1.Pod, since time.Time) (source string, hit bool) {
 	if job != nil {
 		for _, cond := range job.Status.Conditions {
-			if cond.Type == batchv1.JobFailed && cond.Status == corev1.ConditionTrue &&
-				cond.Reason == jobDeadlineExceededReason {
+			if deadlineCondition(cond) {
 				return FactSourceJob, true
 			}
 		}

@@ -90,9 +90,10 @@ func podNodeName(pods []corev1.Pod) string {
 //
 // The platform-forced termination fact comes from the single judgement
 // (scheduler.PlatformTermination, ADR-031) — the same function the S14
-// attribution gate calls — with its fixed order: the Job's Failed condition
-// first, the pod's container termination reason only on a miss. Node losses
-// (§4.6) are named from the pod; anything else is job_failed (§4.6).
+// attribution gate calls — with its fixed order: the Job's deadline condition
+// (FailureTarget or Failed) first, the pod's container termination reason
+// only on a miss. Node losses (§4.6) are named from the pod; anything else is
+// job_failed (§4.6).
 func jobEndReason(job *batchv1.Job, pods []corev1.Pod, since time.Time) (string, bool) {
 	if job == nil {
 		return "", false
