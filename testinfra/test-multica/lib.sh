@@ -40,6 +40,11 @@ WORKSPACE_NAME=${TEST_MULTICA_WORKSPACE_NAME:-Foreman Test}
 WORKSPACE_SLUG=${TEST_MULTICA_WORKSPACE_SLUG:-foreman-test}
 ACCOUNT_EMAIL=${TEST_MULTICA_EMAIL:-acceptance@test.local}
 AGENT_NAME=${TEST_MULTICA_AGENT:-foreman-test-agent}
+# The failure agent: the same runtime as the test agent, deliberately without a
+# model source, so every task dispatched to it ends in a failed terminal. It is
+# the fixture's deterministic way to build the failure side of the lifecycle
+# and observability cases (README §The failure agent).
+FAULT_AGENT_NAME=${TEST_MULTICA_FAULT_AGENT:-foreman-test-agent-failing}
 AUTOPILOT_TITLE=${TEST_MULTICA_AUTOPILOT:-foreman-test-autopilot}
 CHAT_TITLE=${TEST_MULTICA_CHAT:-foreman-test-chat}
 # What the test agent is told to do. A task makes one Multica API call of its

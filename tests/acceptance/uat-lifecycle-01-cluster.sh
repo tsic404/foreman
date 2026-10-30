@@ -5,6 +5,12 @@
 # server-side run and the post-terminal object cleanup (Job and credential
 # Secret gone), which is the lifecycle's product face.
 #
+#   ./uat-scenarios.sh prepare        # builds the four tasks, records the window
+#   ./uat-lifecycle-01-cluster.sh
+#
+# The ids default to that window ($SCENARIOS_STATE); naming them explicitly
+# still works for a hand-built run:
+#
 #   COMPLETED=<id> FAILED=<id> CANCELLED=<id> TIMEOUT=<id> \
 #     ./uat-lifecycle-01-cluster.sh
 #
@@ -15,20 +21,28 @@ set -eu
 
 . "$(dirname "$0")/uat-lib.sh"
 
-COMPLETED=${COMPLETED:-}
-FAILED=${FAILED:-}
-CANCELLED=${CANCELLED:-}
-TIMEOUT=${TIMEOUT:-}
 CLEANUP_WAIT=${CLEANUP_WAIT:-240}
 
 need kubectl
 need curl
 need jq
 
-[ -n "$COMPLETED" ] || blocked "COMPLETED is required"
-[ -n "$FAILED" ] || blocked "FAILED is required"
-[ -n "$CANCELLED" ] || blocked "CANCELLED is required"
-[ -n "$TIMEOUT" ] || blocked "TIMEOUT is required"
+# A window only answers when a successful prepare wrote it: the partial
+# placeholder a failed prepare leaves behind is refused, so last round's ids
+# and baselines cannot make this round green.
+if [ -z "${COMPLETED:-}" ] || [ -z "${FAILED:-}" ] || [ -z "${CANCELLED:-}" ] || [ -z "${TIMEOUT:-}" ]; then
+	scenario_window_ready ||
+		blocked "no complete window at $SCENARIOS_STATE — run ./uat-scenarios.sh prepare (or pass the four ids)"
+fi
+COMPLETED=$(scenario_value "${COMPLETED:-}" COMPLETED)
+FAILED=$(scenario_value "${FAILED:-}" FAILED)
+CANCELLED=$(scenario_value "${CANCELLED:-}" CANCELLED)
+TIMEOUT=$(scenario_value "${TIMEOUT:-}" TIMEOUT)
+
+[ -n "$COMPLETED" ] || blocked "COMPLETED is required — run ./uat-scenarios.sh prepare, or pass the four ids"
+[ -n "$FAILED" ] || blocked "FAILED is required — run ./uat-scenarios.sh prepare, or pass the four ids"
+[ -n "$CANCELLED" ] || blocked "CANCELLED is required — run ./uat-scenarios.sh prepare, or pass the four ids"
+[ -n "$TIMEOUT" ] || blocked "TIMEOUT is required — run ./uat-scenarios.sh prepare, or pass the four ids"
 
 check_one() { # <task-id> <class> <result> [reason]
 	_id=$1
@@ -46,15 +60,14 @@ check_one() { # <task-id> <class> <result> [reason]
 		[ "$reason" = "$_want_reason" ] ||
 			fail "$_class task $_id failure_reason=$reason, want $_want_reason"
 	fi
+	# Every class must show the start fact. For the cancelled class this is the
+	# §4.6 face itself: the cancellation is confirmed by the daemon's status
+	# poll, so a task that never started was never cancelled that way and is
+	# not this class's sample.
 	registered=$(printf '%s' "$body" | jq -r '.daemon_registered_at // empty')
 	started=$(printf '%s' "$body" | jq -r '.started_at // empty')
-	case $_class in
-	cancelled) : ;; # a cancel before start is a legal lifecycle branch
-	*)
-		[ -n "$registered" ] || fail "$_class task $_id has no daemon_registered_at (no start)"
-		[ -n "$started" ] || fail "$_class task $_id has no started_at (no process)"
-		;;
-	esac
+	[ -n "$registered" ] || fail "$_class task $_id has no daemon_registered_at (no start)"
+	[ -n "$started" ] || fail "$_class task $_id has no started_at (no process)"
 
 	# The lifecycle product: the Job and its credential Secret are gone once
 	# the drain window has run. The token outlives the verdict by design, so
