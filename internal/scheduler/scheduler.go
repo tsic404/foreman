@@ -312,6 +312,11 @@ type Scheduler struct {
 	// identity; nil leaves entries without one (S-4 then refuses).
 	runtimeIdentity RuntimeIdentityResolver
 
+	// probeEndpointWait gates probe-Job creation on the deployment's own
+	// Job-side address having a ready instance (WithProbeEndpointWait). Nil
+	// means no gate.
+	probeEndpointWait func(ctx context.Context, budget time.Duration) error
+
 	// attributionWait is the attribution gate path's budget (ADR-031): the
 	// implementation constant defaultAttributionWait. It is kept as a field
 	// only so package tests can shrink it — it is not a configuration item

@@ -344,7 +344,8 @@ var tcPayloadLogKeys = []string{
 	"step", "task_dir_ttl", "task_dirs", "task_id",
 	"template", "template_written_faces", "time", "trigger",
 	"ts", "ttl", "ttl_seconds", "type",
-	"unregistered", "version", "visible_workspaces", "window_seconds",
+	"unregistered", "version", "visible_workspaces", "waited_s",
+	"window_seconds",
 	"workspace_id", "workspace_name", "workspaces", "ws_enabled",
 }
 

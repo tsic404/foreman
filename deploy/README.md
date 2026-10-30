@@ -144,6 +144,16 @@ is the workspace-scoped form with one pair.
   a discovery-set member the probe never registered is not served, logs one
   `workspace.probe_registration_absent` warn and appears in the
   `workspace.serving` event.
+- The probe Job is created only after the Job-side address
+  (`FOREMAN_JOB_SERVER_URL`, the Service every Job pod dials) answers the health
+  endpoint: on a cold start the pod is not Ready yet, the Service has no
+  endpoint, and the probe's daemon — which does not retry, and whose Job ships
+  `backoffLimit: 0` — would die on `connection refused` before it could
+  register. The wait is one tenth of `FOREMAN_STARTUP_PROBE_TIMEOUT` and
+  visible (`probe.endpoint_ready` / `probe.endpoint_wait_timeout`); if it runs
+  out, the probe is created anyway and the probe's own window decides. A probe
+  Job that reaches a terminal condition (failed or completed) decides the
+  startup verdict at once instead of at the window's horizon.
 - `workspace.discovery` (once) names the source (visible set / manifest /
   workspace-scoped pairs), the discovery set and the manifest-excluded
   workspaces. `workspace.discovery_failed` names the reason and the credential

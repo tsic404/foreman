@@ -258,7 +258,7 @@ func (b *Builder) placeholderValues(name, daemonID string, e TaskEntry) placehol
 // kinds a template passthrough allows (§8.2 A1.1/A1.2): the env keys on
 // containers[0], the per-task metadata, and the per-side key set.
 func (b *Builder) applyWrites(job *batchv1.Job, name, daemonID string, e TaskEntry) {
-	injectContainerEnv(job, b.cfg.serverURL())
+	injectContainerEnv(job, b.cfg.JobServerURL())
 
 	job.Name = name
 	job.Namespace = b.cfg.JobNamespace

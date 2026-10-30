@@ -38,9 +38,17 @@ func newProbeFixture(t *testing.T, cfg Config) *probeFixture {
 	return newProbeFixtureWithClock(t, cfg, time.Now)
 }
 
+// newProbeFixtureWithOptions builds the fixture with extra scheduler options,
+// so a test can install seams (the probe endpoint gate) the production
+// assembly wires.
+func newProbeFixtureWithOptions(t *testing.T, cfg Config, opts ...Option) *probeFixture {
+	t.Helper()
+	return newProbeFixtureWithClock(t, cfg, time.Now, opts...)
+}
+
 // newProbeFixtureWithClock is newProbeFixture with an injectable clock, so the
 // startup window's boundary can be driven deterministically.
-func newProbeFixtureWithClock(t *testing.T, cfg Config, now func() time.Time) *probeFixture {
+func newProbeFixtureWithClock(t *testing.T, cfg Config, now func() time.Time, opts ...Option) *probeFixture {
 	t.Helper()
 	logs := &bytes.Buffer{}
 	p := &probeFixture{
@@ -54,13 +62,14 @@ func newProbeFixtureWithClock(t *testing.T, cfg Config, now func() time.Time) *p
 		logs:    logs,
 		cfg:     cfg,
 	}
-	sched, err := New(cfg, p.reg, p.jobs, p.builder, p.server, p.metrics,
+	base := []Option{
 		WithClock(now),
 		WithPendingReports(&fakePendingReports{}),
 		WithRevoker(p.revoker),
 		WithProbeRegistry(p.probes),
 		WithLogger(slog.New(slog.NewJSONHandler(logs, nil))),
-	)
+	}
+	sched, err := New(cfg, p.reg, p.jobs, p.builder, p.server, p.metrics, append(base, opts...)...)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
@@ -625,5 +634,175 @@ func waitUntil(t *testing.T, what string, cond func() bool) {
 			t.Fatalf("timed out waiting for %s", what)
 		}
 		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestRunStartupProbeTerminalJobDecidesTheWindow pins the fast failure face:
+// a Job that reached its terminal failure can never produce another pod, so
+// no registration can still arrive and Foreman must not keep a half-configured
+// process serving until the window's horizon (§1.1 failure face, §10).
+func TestRunStartupProbeTerminalJobDecidesTheWindow(t *testing.T) {
+	cfg := probeConfig(t)
+	cfg.StartupProbeTimeout = 30 * time.Second
+	p := newProbeFixture(t, cfg)
+	p.jobs.onCreateJob = func() {
+		p.jobs.pods = []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{
+			Name:   "probe-pod",
+			Labels: map[string]string{"job-name": "fm-catalog-" + p.builder.probeRequestID},
+		}, Status: corev1.PodStatus{Phase: corev1.PodFailed}}}
+	}
+	// The Job object the API server shows after creation carries the terminal
+	// condition; CreateJob itself must stay a plain create, so the failed
+	// state is seeded on the first read.
+	p.jobs.onGetJob = func() {
+		if len(p.jobs.createdJobs) == 0 {
+			return
+		}
+		name := p.jobs.createdJobs[0].Name
+		if p.jobs.existingJobs == nil {
+			p.jobs.existingJobs = map[string]*batchv1.Job{}
+		}
+		if _, seeded := p.jobs.existingJobs[name]; seeded {
+			return
+		}
+		p.jobs.existingJobs[name] = &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+				Type: batchv1.JobFailed, Status: corev1.ConditionTrue, Reason: "BackoffLimitExceeded",
+			}}},
+		}
+	}
+
+	start := time.Now()
+	_, err := p.sched.RunStartupProbe(t.Context())
+	if !errors.Is(err, ErrStartupProbeUnregistered) {
+		t.Fatalf("err = %v, want the fatal verdict", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("the verdict took %s, want it at the Job's terminal event, not at the %s window", elapsed, cfg.StartupProbeTimeout)
+	}
+	var failure *StartupProbeFailure
+	if !errors.As(err, &failure) || failure.Reason != ProbeFailureDaemonNotRegistered {
+		t.Fatalf("failure = %+v, want the daemon-not-registered class (the pod ran and exited)", failure)
+	}
+	events := p.events("startup.probe_failed")
+	if len(events) != 1 {
+		t.Fatalf("startup.probe_failed events = %d, want 1", len(events))
+	}
+	if events[0]["job_event"] != "Failed/BackoffLimitExceeded" {
+		t.Errorf("job_event = %v, want the Job's own terminal condition", events[0]["job_event"])
+	}
+	if events[0]["pod_status"] != "Failed" {
+		t.Errorf("pod_status = %v, want the observed phase", events[0]["pod_status"])
+	}
+	if len(p.jobs.deletedJobs) != 1 || !strings.HasPrefix(p.jobs.deletedJobs[0], "fm-catalog-startup-") {
+		t.Errorf("the failed probe must still be torn down: %v", p.jobs.deletedJobs)
+	}
+}
+
+// TestStartupProbeWaitsForItsOwnEndpointBeforeCreatingTheJob pins the cold
+// start ordering: the probe Job is created only after the address its daemon
+// dials answers, so the daemon cannot meet a Service with no ready endpoint.
+func TestStartupProbeWaitsForItsOwnEndpointBeforeCreatingTheJob(t *testing.T) {
+	cfg := probeConfig(t)
+	cfg.StartupProbeTimeout = 2 * time.Second
+	var order []string
+	var budget time.Duration
+	p := newProbeFixtureWithOptions(t, cfg, WithProbeEndpointWait(func(_ context.Context, got time.Duration) error {
+		order = append(order, "wait")
+		budget = got
+		return nil
+	}))
+	p.jobs.onCreateJob = func() {
+		order = append(order, "create")
+		name := "fm-catalog-" + p.builder.probeRequestID
+		p.registerProbe(t, name)
+		p.probes.UpdateProbe(name, func(session *registry.ProbeSession) {
+			session.RelayedAt = time.Now()
+		})
+	}
+
+	if _, err := p.sched.RunStartupProbe(t.Context()); err != nil {
+		t.Fatalf("RunStartupProbe: %v", err)
+	}
+	if len(order) != 2 || order[0] != "wait" || order[1] != "create" {
+		t.Fatalf("order = %v, want the endpoint gate before the Job", order)
+	}
+	if want := ProbeEndpointWait(cfg.StartupProbeTimeout); budget != want {
+		t.Errorf("gate budget = %s, want %s (derived from the startup window)", budget, want)
+	}
+}
+
+// TestStartupProbeEndpointWaitErrorSkipsTheJob pins that a gate error is a
+// startup abort, not a probe failure: no Job exists, so none of the probe's
+// four failure classes applies to it.
+func TestStartupProbeEndpointWaitErrorSkipsTheJob(t *testing.T) {
+	cfg := probeConfig(t)
+	p := newProbeFixtureWithOptions(t, cfg, WithProbeEndpointWait(func(context.Context, time.Duration) error {
+		return errors.New("job-side address never answered")
+	}))
+
+	_, err := p.sched.RunStartupProbe(t.Context())
+	if err == nil || !strings.Contains(err.Error(), "job-side address never answered") {
+		t.Fatalf("err = %v, want the gate's error", err)
+	}
+	if len(p.jobs.createdJobs) != 0 {
+		t.Fatalf("probe Jobs created = %d, want none before the endpoint answers", len(p.jobs.createdJobs))
+	}
+	if probes := p.probes.ListProbes(); len(probes) != 0 {
+		t.Fatalf("probe sessions = %+v, want none", probes)
+	}
+	if events := p.events("startup.probe_failed"); len(events) != 0 {
+		t.Fatalf("no probe failure class applies to a probe that never existed: %+v", events)
+	}
+}
+
+// TestRunStartupProbeCompletedJobDecidesTheWindow covers the other terminal
+// condition: a Job whose pod finished successfully but never registered can
+// also never produce another pod, so the verdict is decided at once.
+func TestRunStartupProbeCompletedJobDecidesTheWindow(t *testing.T) {
+	cfg := probeConfig(t)
+	cfg.StartupProbeTimeout = 30 * time.Second
+	p := newProbeFixture(t, cfg)
+	p.jobs.onCreateJob = func() {
+		p.jobs.pods = []corev1.Pod{{ObjectMeta: metav1.ObjectMeta{
+			Name:   "probe-pod",
+			Labels: map[string]string{"job-name": "fm-catalog-" + p.builder.probeRequestID},
+		}, Status: corev1.PodStatus{Phase: corev1.PodSucceeded}}}
+	}
+	p.jobs.onGetJob = func() {
+		if len(p.jobs.createdJobs) == 0 {
+			return
+		}
+		name := p.jobs.createdJobs[0].Name
+		if p.jobs.existingJobs == nil {
+			p.jobs.existingJobs = map[string]*batchv1.Job{}
+		}
+		if _, seeded := p.jobs.existingJobs[name]; seeded {
+			return
+		}
+		p.jobs.existingJobs[name] = &batchv1.Job{
+			ObjectMeta: metav1.ObjectMeta{Name: name},
+			Status: batchv1.JobStatus{Conditions: []batchv1.JobCondition{{
+				Type: batchv1.JobComplete, Status: corev1.ConditionTrue,
+			}}},
+		}
+	}
+
+	start := time.Now()
+	_, err := p.sched.RunStartupProbe(t.Context())
+	if !errors.Is(err, ErrStartupProbeUnregistered) {
+		t.Fatalf("err = %v, want the fatal verdict", err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("the verdict took %s, want it at the Job's terminal event, not at the %s window", elapsed, cfg.StartupProbeTimeout)
+	}
+	var failure *StartupProbeFailure
+	if !errors.As(err, &failure) || failure.Reason != ProbeFailureDaemonNotRegistered {
+		t.Fatalf("failure = %+v, want the daemon-not-registered class (the pod ran)", failure)
+	}
+	events := p.events("startup.probe_failed")
+	if len(events) != 1 || events[0]["job_event"] != "Complete" {
+		t.Fatalf("events = %+v, want one failure carrying the Complete condition", events)
 	}
 }
