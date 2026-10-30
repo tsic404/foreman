@@ -113,9 +113,15 @@ server_run() {
 			'[.. | objects | select(((.id? // "") == $t) or ((.task_id? // "") == $t))][0] // empty'
 }
 
-# run_status <run-json>: the server-side terminal class, lower-cased.
+# run_status <run-json>: the server-side terminal class, lower-cased. The run
+# object carries the task output in `result` and the class in `status`; a
+# structured `result` is never a class, so only a string one may stand in.
 run_status() {
-	printf '%s' "$1" | jq -r '(.result // .status // .state // "") | tostring' | tr '[:upper:]' '[:lower:]'
+	printf '%s' "$1" | jq -r '
+		[.status?, .result?, .state?]
+		| map(select(type == "string" and . != ""))
+		| .[0] // ""
+		| tostring' | tr '[:upper:]' '[:lower:]'
 }
 
 # metric_value <name> [label-substring]: the sum of one metric's samples whose
