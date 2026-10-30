@@ -114,6 +114,83 @@ func TestRecovery02PlatformDeadlineAttributionWinsOverTheDaemonSelfReport(t *tes
 	}
 }
 
+// TestRecovery02FailureTargetOnlyConditionWins is the kill shape the Failed
+// condition never reaches: the Job controller publishes FailureTarget when it
+// decides to fail the overdue Job, this instance's pod is already gone, and
+// Failed follows only after the pods terminate. The platform fact must win
+// from that condition alone — a reader that only knows Failed misses it and
+// lets the daemon's own body decide the attribution.
+func TestRecovery02FailureTargetOnlyConditionWins(t *testing.T) {
+	h := newDeliveryHarness(t)
+	if err := h.sched.OnClaim(t.Context(), deliveryPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	token := issueJobToken(t, h, "task-1")
+	registerTaskDaemon(t, h, "task-1", token)
+	claimTask(t, h, "task-1", token)
+	if code, body := h.call("POST", "/api/daemon/tasks/task-1/start", token, []byte(`{}`)); code != 200 {
+		t.Fatalf("S8 = %d (%s), want 200", code, body)
+	}
+	entry, ok := h.reg.Get("task-1")
+	if !ok || entry.State != registry.StateRunning {
+		t.Fatalf("entry = %+v, want a running task before the kill", entry)
+	}
+
+	// The only visible fact is the controller's FailureTarget, and the pod is
+	// gone (the fixture holds no pods): the Failed condition never appeared
+	// and the pod fallback has nothing to read. The server still holds the
+	// task as running (C13 non-terminal).
+	killed := h.createdJob(t, entry.JobName).DeepCopy()
+	killed.Status.Conditions = []batchv1.JobCondition{{
+		Type: batchv1.JobFailureTarget, Status: corev1.ConditionTrue, Reason: "DeadlineExceeded",
+	}}
+	h.jobs.programGetJob(killed)
+	h.server.setStatus("task-1", "running")
+
+	// The daemon self-reports its own failure inside the grace window.
+	code, body := h.call("POST", "/api/daemon/tasks/task-1/fail", token,
+		[]byte(`{"error":"agent died","failure_reason":"agent_error","session_id":"sess-42"}`))
+	if code != 200 {
+		t.Fatalf("S14 = %d (%s), want 200", code, body)
+	}
+
+	forwards := h.server.forwarded(scheduler.EPFail)
+	if len(forwards) != 1 {
+		t.Fatalf("fail forwards = %d, want 1", len(forwards))
+	}
+	var forwarded map[string]string
+	if err := json.Unmarshal(forwards[0].Body, &forwarded); err != nil {
+		t.Fatalf("forward body: %v", err)
+	}
+	if forwarded["failure_reason"] != scheduler.FailureReasonJobDeadline {
+		t.Fatalf("failure_reason = %q, want %q: the failure target carries the platform fact",
+			forwarded["failure_reason"], scheduler.FailureReasonJobDeadline)
+	}
+	if forwarded["session_id"] != "sess-42" {
+		t.Fatalf("session_id = %q, want the self-report's session value carried back", forwarded["session_id"])
+	}
+
+	// Foreman side: the platform verdict and its two event faces.
+	settled, ok := h.reg.Get("task-1")
+	if !ok || !settled.IsTerminal() || settled.Result != registry.ResultFailed {
+		t.Fatalf("entry = %+v, want a terminal failed verdict", settled)
+	}
+	if settled.FailureReason != scheduler.FailureReasonJobDeadline {
+		t.Fatalf("failure_reason = %q, want %q", settled.FailureReason, scheduler.FailureReasonJobDeadline)
+	}
+	if !h.jobs.jobDeleted(entry.JobName) {
+		t.Fatal("the Job must be deleted once the compensation body landed")
+	}
+	if events := h.events("task.failed_compensated"); len(events) != 1 ||
+		events[0]["failure_reason"] != scheduler.FailureReasonJobDeadline {
+		t.Fatalf("task.failed_compensated = %+v, want one event with the deadline reason", events)
+	}
+	decided := h.events("task.attribution_decided")
+	if len(decided) != 1 || decided[0]["decision"] != "platform" || decided[0]["fact_source"] != "job" {
+		t.Fatalf("task.attribution_decided = %+v, want decision=platform fact_source=job", decided)
+	}
+}
+
 // TestRecovery02DaemonSelfReportIsForwardedAtOnceWithoutAPlatformFact is the
 // gate's negative boundary: no platform fact, no wait signal, so the
 // self-report decides the task — verbatim, without waiting out
