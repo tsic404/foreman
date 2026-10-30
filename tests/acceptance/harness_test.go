@@ -2209,6 +2209,17 @@ func (c *schedulerServerClient) setStatus(taskID, status string) {
 	c.statuses[taskID] = status
 }
 
+// setStatusDeleted programs C13 to report the task as deleted: the map has to
+// exist (a nil one answers "dispatched"), so the task is left unprogrammed.
+func (c *schedulerServerClient) setStatusDeleted(taskID string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.statuses == nil {
+		c.statuses = map[string]string{}
+	}
+	delete(c.statuses, taskID)
+}
+
 func (c *schedulerServerClient) Forward(_ context.Context, ep scheduler.Endpoint, taskID string, body []byte) (int, []byte, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
