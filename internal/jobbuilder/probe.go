@@ -130,7 +130,7 @@ func writeProbeDeadline(job *batchv1.Job, budget time.Duration) {
 // that domain: a probe maps no task, so it carries none of the task
 // annotations (§4.3).
 func (b *Builder) applyProbeWrites(job *batchv1.Job, name, workspaceID string) {
-	injectContainerEnv(job, b.cfg.serverURL())
+	injectContainerEnv(job, b.cfg.JobServerURL())
 
 	job.Name = name
 	job.Namespace = b.cfg.JobNamespace

@@ -172,9 +172,9 @@ func (c Config) logger() *slog.Logger {
 	return slog.Default()
 }
 
-// serverURL is the injected server address, with the reference deployment's
-// value standing in for a Config built without LoadConfig.
-func (c Config) serverURL() string {
+// JobServerURL is the injected Job-side address, with the reference
+// deployment's value standing in for a Config built without LoadConfig.
+func (c Config) JobServerURL() string {
 	if c.ServerURL != "" {
 		return c.ServerURL
 	}

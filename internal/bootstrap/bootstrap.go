@@ -43,7 +43,7 @@ func StartupDiscoveries(
 	probeWindow time.Duration,
 	log *slog.Logger,
 ) (map[string]registry.Discovery, error) {
-	wait := probeWindow + 30*time.Second
+	wait := probeWindow + scheduler.ProbeEndpointWait(probeWindow) + 30*time.Second
 	if wait < time.Minute {
 		wait = time.Minute
 	}

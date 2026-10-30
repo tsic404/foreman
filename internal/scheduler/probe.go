@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
 
 	"github.com/tsic404/foreman/internal/jobbuilder"
@@ -75,6 +76,25 @@ const probePodPollInterval = time.Second
 // command delivery and result routing all read it.
 func WithProbeRegistry(probes *registry.ProbeRegistry) Option {
 	return func(s *Scheduler) { s.probes = probes }
+}
+
+// ProbeEndpointWait is the pre-probe gate's budget for one startup window:
+// one tenth of it. The window is sized for a cold probe (image pull plus the
+// template's init — hundreds of seconds), while the readiness answer lands
+// within the readiness input's initial delay plus a couple of periods, i.e.
+// tens of seconds; a tenth covers that cadence with margin, and keeps the
+// escape an order of magnitude below the window that still decides failure.
+func ProbeEndpointWait(window time.Duration) time.Duration {
+	return window / 10
+}
+
+// WithProbeEndpointWait installs the pre-probe gate: it runs before every
+// startup probe Job is created, so the daemon inside the pod cannot start
+// before the address it dials has a ready instance behind it. The duration
+// argument is the gate's budget. Nil skips the gate (tests and deployments
+// whose Job-side address is always reachable).
+func WithProbeEndpointWait(wait func(ctx context.Context, budget time.Duration) error) Option {
+	return func(s *Scheduler) { s.probeEndpointWait = wait }
 }
 
 // StartProbe builds one catalog-probe Job: it mints the job runtime id, issues
@@ -397,6 +417,17 @@ func (s *Scheduler) probeTokenWorkspace() string {
 // silently served. Entries outside the set are never returned; when nothing in
 // the set registered, each of them is also reported.
 func (s *Scheduler) runProbe(ctx context.Context, waitCatalog bool, kind string) (map[string]registry.Discovery, error) {
+	// The startup probe's daemon dials the deployment's own Job-side address.
+	// A cold start reaches this point before the Service has a ready endpoint,
+	// and that daemon does not retry: the Job (backoffLimit 0) is terminal on
+	// the first connection refusal. Gate creation on the address answering
+	// first; the wait does not consume the probe window. Runtime probes run in
+	// an already-serving process, so they take the address as it is.
+	if waitCatalog && s.probeEndpointWait != nil {
+		if err := s.probeEndpointWait(ctx, ProbeEndpointWait(s.cfg.StartupProbeTimeout)); err != nil {
+			return nil, fmt.Errorf("%s probe: wait for the job-side endpoint: %w", kind, err)
+		}
+	}
 	window := s.cfg.StartupProbeTimeout
 	minted, err := mintedProbeID()
 	if err != nil {
@@ -428,9 +459,17 @@ func (s *Scheduler) runProbe(ctx context.Context, waitCatalog bool, kind string)
 			registered, session = true, found
 			break
 		}
-		status, started, event := s.probeObservation(ctx, handle.JobName)
+		status, started, event, terminal := s.probeObservation(ctx, handle.JobName)
 		podStatus, jobEvent = status, event
 		podStarted = podStarted || started
+		if terminal {
+			// A Job that failed or completed cannot produce another pod, so no
+			// registration can still arrive: the window's verdict is already
+			// decided. Waiting out the window would keep a half-configured
+			// process serving for its whole span (§1.1 失败面) while the
+			// failure event and the non-zero exit stay the same.
+			break
+		}
 		select {
 		case <-ctx.Done():
 			s.teardownStartupProbe(ctx, handle)
@@ -566,8 +605,10 @@ func (s *Scheduler) reportProbeFailure(ctx context.Context, kind, jobName, reaso
 
 // probeObservation summarizes the probe's pod and Job state for the failure
 // event: the pod's phase (with a container waiting reason when present), whether
-// the pod ever ran a container, and the Job's own failure condition.
-func (s *Scheduler) probeObservation(ctx context.Context, jobName string) (podStatus string, started bool, jobEvent string) {
+// the pod ever ran a container, the Job's own failure condition, and whether
+// the Job is terminal — a terminal Job cannot run another pod, so no
+// registration can still arrive and the window's verdict is decided.
+func (s *Scheduler) probeObservation(ctx context.Context, jobName string) (podStatus string, started bool, jobEvent string, terminal bool) {
 	if pods, err := s.jobs.ListPods(ctx, jobNameSelector(jobName)); err == nil && len(pods) > 0 {
 		pod := pods[0]
 		for i := range pods {
@@ -586,10 +627,10 @@ func (s *Scheduler) probeObservation(ctx context.Context, jobName string) (podSt
 	}
 	job, err := s.jobs.GetJob(ctx, jobName)
 	if err != nil {
-		return podStatus, started, "job lookup failed"
+		return podStatus, started, "job lookup failed", false
 	}
 	if job == nil {
-		return podStatus, started, "job not found"
+		return podStatus, started, "job not found", false
 	}
 	for _, condition := range job.Status.Conditions {
 		if condition.Status != corev1.ConditionTrue {
@@ -599,8 +640,11 @@ func (s *Scheduler) probeObservation(ctx context.Context, jobName string) (podSt
 		if condition.Reason != "" {
 			jobEvent += "/" + condition.Reason
 		}
+		if condition.Type == batchv1.JobFailed || condition.Type == batchv1.JobComplete {
+			terminal = true
+		}
 	}
-	return podStatus, started, jobEvent
+	return podStatus, started, jobEvent, terminal
 }
 
 // podStarted reports whether the probe pod ever ran a container: a pod that

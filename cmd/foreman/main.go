@@ -393,6 +393,14 @@ func run() error {
 		scheduler.WithRevoker(issuer),
 		scheduler.WithProbeRegistry(probes),
 		scheduler.WithLogger(baseLog),
+		// The probe's daemon dials the Job-side address below; creating the
+		// probe Job before that address has a ready instance makes the daemon
+		// die on connection refused, and the Job (backoffLimit 0) never
+		// retries. Gate creation on the address answering (§1.2 probe truth
+		// source).
+		scheduler.WithProbeEndpointWait(func(ctx context.Context, budget time.Duration) error {
+			return startup.WaitForProbeEndpoint(ctx, jbCfg.JobServerURL(), budget, baseLog)
+		}),
 		// The claim-time dispatch record S-4 matches on: ids move on a rebuild,
 		// identities do not (§2.3).
 		scheduler.WithRuntimeIdentity(clientSet.RuntimeIdentity),
