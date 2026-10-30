@@ -27,11 +27,6 @@ entry() {
 		blocked "cannot read $FOREMAN_URL/foreman/tasks/$1 (port-forward the foreman Service first)"
 }
 
-task_list() {
-	curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks" ||
-		blocked "cannot read $FOREMAN_URL/foreman/tasks (port-forward the foreman Service first)"
-}
-
 metrics() {
 	curl -fsS -m 30 "$FOREMAN_URL/metrics" ||
 		blocked "cannot read $FOREMAN_URL/metrics (port-forward the foreman Service first)"
@@ -113,9 +108,15 @@ server_run() {
 			'[.. | objects | select(((.id? // "") == $t) or ((.task_id? // "") == $t))][0] // empty'
 }
 
-# run_status <run-json>: the server-side terminal class, lower-cased.
+# run_status <run-json>: the server-side terminal class, lower-cased. The class
+# is a status field (`status`, else `state`); `result` is the run's output and
+# is read only when it is a bare string, never as object text — a run whose
+# output merely says "completed" must not pass for a completed one.
 run_status() {
-	printf '%s' "$1" | jq -r '(.result // .status // .state // "") | tostring' | tr '[:upper:]' '[:lower:]'
+	printf '%s' "$1" | jq -r '
+		[.status, .state, .result]
+		| map(select(type == "string") | select(length > 0))
+		| .[0] // ""' | tr '[:upper:]' '[:lower:]'
 }
 
 # metric_value <name> [label-substring]: the sum of one metric's samples whose

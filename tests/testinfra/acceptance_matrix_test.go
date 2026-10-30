@@ -38,6 +38,7 @@ var acceptanceFixtures = map[string]bool{
 	"multiws_harness_test.go":       true,
 	"probe_session_helpers_test.go": true,
 	"uat-lib.sh":                    true,
+	"uat_run_status_guard_test.go":  true,
 }
 
 var (
