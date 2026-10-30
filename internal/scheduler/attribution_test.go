@@ -84,9 +84,11 @@ func TestPlatformTerminationFixedOrder(t *testing.T) {
 		hit    bool
 	}{
 		{
+			// Both faces carry the deadline fact, so only the judgement
+			// order can decide the source.
 			name:   "job condition wins over the pod",
 			job:    deadlineJob("fm-a", since),
-			pods:   []corev1.Pod{testPod("fm-a", corev1.PodFailed)},
+			pods:   []corev1.Pod{deadlinePod("fm-a", since)},
 			source: "job",
 			hit:    true,
 		},
