@@ -65,24 +65,54 @@ done
 runtime=$(printf '%s' "$runtimes" | jq -r '[.[] | select(.provider == "omp")][0].id')
 name=$(printf '%s' "$runtimes" | jq -r '[.[] | select(.provider == "omp")][0].name')
 
-wsapi PUT "/api/agents/$agent" "{\"runtime_id\":\"$runtime\"}" >/dev/null
+# The binding and the fixture's instructions travel in one update: an agent
+# that survived an earlier round keeps whatever text it was created with, and
+# that text is what the task process reads. A stale "reply with a short
+# acknowledgement, do not modify any repository" contradicts the run prompt,
+# and the passthrough leg then never gets its call — the reset entry only
+# writes the instructions of an agent it creates.
+body=$(jq -nc --arg rt "$runtime" --arg ins "$AGENT_INSTRUCTIONS" \
+	'{runtime_id:$rt, instructions:$ins}') ||
+	die "cannot render the agent update"
+wsapi PUT "/api/agents/$agent" "$body" >/dev/null ||
+	die "cannot update agent $AGENT_NAME"
 
-bound=$(wsapi GET "/api/agents/$agent" | jq -r '.runtime_id // ""')
+written=$(wsapi GET "/api/agents/$agent") || die "cannot read agent $AGENT_NAME back"
+bound=$(printf '%s' "$written" | jq -r '.runtime_id // ""')
 [ "$bound" = "$runtime" ] || die "binding did not take effect (agent runtime_id=$bound)"
-info "bound agent $AGENT_NAME ($agent) to runtime $name ($runtime)"
+text=$(printf '%s' "$written" | jq -r '.instructions // ""')
+[ "$text" = "$AGENT_INSTRUCTIONS" ] ||
+	die "agent instructions did not take effect on $AGENT_NAME (read back: $text)"
+info "bound agent $AGENT_NAME ($agent) to runtime $name ($runtime), instructions converged"
 
-# The 可手动触发的 autopilot (`./multica-test autopilot trigger <id>`).
-# Created now that the assignee has a runtime; an autopilot left over from an
-# earlier round is re-pointed at the current agent and re-activated.
-id=$(wsapi GET /api/autopilots |
-	jq -r --arg title "$AUTOPILOT_TITLE" '[.autopilots[] | select(.title == $title)][0].id // ""')
-if [ -z "$id" ]; then
-	id=$(wsapi POST /api/autopilots \
-		"{\"title\":\"$AUTOPILOT_TITLE\",\"description\":\"Reply with OK only.\",\"assignee_id\":\"$agent\",\"execution_mode\":\"run_only\"}" |
-		jq -er .id) || die "autopilot creation failed"
-	info "created autopilot $AUTOPILOT_TITLE ($id)"
-else
-	wsapi PATCH "/api/autopilots/$id" "{\"assignee_id\":\"$agent\",\"status\":\"active\"}" >/dev/null ||
-		die "could not re-activate autopilot $id"
-	info "autopilot $AUTOPILOT_TITLE ($id), active"
-fi
+# The 可手动触发的 autopilots (`./multica-test autopilot trigger <id>`), one
+# per task shape. Both are created now that the assignee has a runtime; one
+# left over from an earlier round is re-pointed at the current agent,
+# re-activated and given the current prompt — the prompt is the fixture's own
+# text, so a surviving autopilot must not keep an older one.
+ensure_autopilot() { # <title> <description>
+	_title=$1
+	_desc=$2
+	# The list comes back as {"autopilots":[…]}; a bare array is accepted too so
+	# the lookup does not depend on which shape the server answers with.
+	_id=$(wsapi GET /api/autopilots |
+		jq -r --arg title "$_title" '[(if type == "object" then .autopilots else . end)[] | select(.title == $title)][0].id // ""') ||
+		die "cannot read the autopilot list"
+	if [ -z "$_id" ]; then
+		_body=$(jq -nc --arg title "$_title" --arg desc "$_desc" --arg agent "$agent" \
+			'{title:$title, description:$desc, assignee_id:$agent, execution_mode:"run_only"}') ||
+			die "could not encode the autopilot body"
+		_id=$(wsapi POST /api/autopilots "$_body" | jq -er .id) || die "autopilot creation failed"
+		info "created autopilot $_title ($_id)"
+	else
+		_body=$(jq -nc --arg desc "$_desc" --arg agent "$agent" \
+			'{assignee_id:$agent, status:"active", description:$desc}') ||
+			die "could not encode the autopilot patch"
+		wsapi PATCH "/api/autopilots/$_id" "$_body" >/dev/null ||
+			die "could not re-activate autopilot $_id"
+		info "autopilot $_title ($_id), active"
+	fi
+}
+
+ensure_autopilot "$AUTOPILOT_TITLE" "$TASK_PROMPT"
+ensure_autopilot "$LONG_AUTOPILOT_TITLE" "$TASK_PROMPT_LONG"

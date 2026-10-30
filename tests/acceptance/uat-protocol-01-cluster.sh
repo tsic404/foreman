@@ -10,6 +10,10 @@
 # The passthrough judgement is the agent-api 2xx counter's delta across the
 # task window (the counter carries no task label by design), so the snapshot
 # must be taken before the task is triggered. FORWARD_BEFORE overrides it.
+# The delta needs a task whose agent calls the server itself: the fixture
+# prompt (`testinfra/test-multica`, `TASK_PROMPT`) makes the agent run one
+# `multica issue list`, and that call is what travels the S29 passthrough. A
+# task that only answers moves no agent-api sample.
 # Exit: 0 = PASS · 1 = FAIL (raw observation printed) · 2 = blocked.
 set -eu
 

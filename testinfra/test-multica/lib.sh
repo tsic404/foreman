@@ -42,6 +42,18 @@ ACCOUNT_EMAIL=${TEST_MULTICA_EMAIL:-acceptance@test.local}
 AGENT_NAME=${TEST_MULTICA_AGENT:-foreman-test-agent}
 AUTOPILOT_TITLE=${TEST_MULTICA_AUTOPILOT:-foreman-test-autopilot}
 CHAT_TITLE=${TEST_MULTICA_CHAT:-foreman-test-chat}
+# What the test agent is told to do. A task makes one Multica API call of its
+# own (the CLI resolves MULTICA_SERVER_URL / MULTICA_TOKEN from the task
+# environment), because the agent-api passthrough counter only moves when the
+# Job's tenant calls the server — G2's "透传" leg has no other observable face.
+AGENT_INSTRUCTIONS=${TEST_MULTICA_AGENT_INSTRUCTIONS:-"Run this shell command exactly once, then reply with OK only: multica issue list --output json. Do not modify any repository."}
+TASK_PROMPT=${TEST_MULTICA_TASK_PROMPT:-"Run this shell command exactly once, then reply with OK only: multica issue list --output json"}
+# The long shape: a task whose agent stays alive until the command ends, so
+# the window it occupies is the operator's (`sleep` length), not the model's.
+# It is what the deadline, cancel and in-flight-fault cases need — a task that
+# settles in seconds cannot be cancelled mid-flight or outlive a budget.
+LONG_AUTOPILOT_TITLE=${TEST_MULTICA_LONG_AUTOPILOT:-foreman-test-autopilot-long}
+TASK_PROMPT_LONG=${TEST_MULTICA_LONG_TASK_PROMPT:-"Run this shell command and wait for it to finish, then reply with DONE only: sleep ${TEST_MULTICA_LONG_TASK_SLEEP:-900}"}
 REPO_URL=${TEST_MULTICA_REPO:-https://github.com/tsic404/foreman}
 # Development login code (MULTICA_DEV_VERIFICATION_CODE in the Secret).
 VERIFICATION_CODE=${TEST_MULTICA_VERIFICATION_CODE:-888888}
