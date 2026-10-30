@@ -168,6 +168,7 @@ tasks instead of removing them.
 |---|---|---|
 | Workspace + loginable account | `foreman-test` (`Foreman Test`), `acceptance@test.local` | task cancellation, board, chat entry |
 | Test agent | `foreman-test-agent` | dispatch (its runtime is the one Foreman registers) |
+| Failure agent | `foreman-test-agent-failing` | the failed terminal class: same runtime, deliberately no model source, so every task it runs ends failed |
 | Model backend (local mode only) | PVC `ollama-models`, Deployment/Service `test-multica-ollama`, model `qwen2.5:0.5b` (overridable) | the test agent's inference, token usage — absent when the endpoint triple is set |
 | Repository | `https://github.com/tsic404/foreman` | agent checkout, cache cases |
 | Autopilot (manual trigger) | `foreman-test-autopilot` (short), `foreman-test-autopilot-long` (long) | `./multica-test autopilot trigger <id>` |
@@ -180,15 +181,38 @@ to with its own git credentials. The autopilot is created by `bind-agent.sh`
 rather than by `reset.sh`: the server refuses an autopilot whose assignee agent
 has no runtime, and the reset entry leaves the runtime list empty on purpose.
 
+### The failure agent
+
+A task only ends failed if something actually fails it, and a test
+environment must not depend on an operator improvising that by hand. The
+failure agent is the declared way to build one: it is bound to the same
+`provider=omp` runtime as the test agent, and `reset.sh` clears its `model`
+and `custom_env` on every round — no selector, no backend address, whatever
+the round's model source is. A dispatched task therefore reaches the Job's
+daemon (the lifecycle face is real: claim, Job, registration, start) and the
+agent process cannot run, so the task converges to a failed terminal and
+Foreman reports it like any other failure.
+
+That is the path the test environment already documents for a model-less
+agent (`reset.sh`'s endpoint-less floor converges tasks to `process_failure`
+quickly); the failure agent makes it a first-class object instead of a
+side effect of an unconfigured round. `reset.sh` recreates it and clears it,
+`bind-agent.sh` binds it, and nothing else configures it.
+
+The user-perspective cases consume it through `tests/acceptance/uat-scenarios.sh`,
+which also builds the cancelled and platform-timeout classes and records the
+window the two terminal-class carriers judge.
+
 The login is deterministic: `APP_ENV=development` plus the fixed verification
 code in the Secret. The account is created on first login; no password is
 stored anywhere.
 
 ## Task shapes (用例前置)
 
-Every TC-uat carrier judges a task an operator triggered; none of them creates
-one. `bind-agent.sh` therefore provisions two manual autopilots whose
-`description` is the run prompt — the only entrance that has a CLI:
+The carriers that read their tasks from the environment (cache, protocol,
+recovery) judge a task triggered outside them; none of them creates one.
+`bind-agent.sh` therefore provisions two manual autopilots whose `description`
+is the run prompt:
 
 | Shape | Autopilot | Prompt |
 |---|---|---|
@@ -211,7 +235,7 @@ Foreman's S29 passthrough, so it is what moves
 produces it, and G2's passthrough leg has no other observable face.
 
 The four terminal classes of the lifecycle case are constructible from these
-two shapes without touching the repository:
+two shapes and the failure agent, without touching the repository:
 
 - **completed** — trigger the short autopilot.
 - **cancelled** — trigger the long autopilot and cancel it while it sleeps:
@@ -229,20 +253,32 @@ two shapes without touching the repository:
   Deployment, then trigger the long autopilot and let the Job outlive the
   budget: the Job ends with `DeadlineExceeded` and the projection carries
   `failure_reason=job_deadline_exceeded`.
-- **failed** — point the agent at a model the endpoint does not serve, trigger
-  the short autopilot, and let the run end; then restore the source, because
-  every other case of the round uses it:
+- **failed** — dispatch the task to the failure agent (`foreman-test-agent-failing`,
+  above): it carries no model source in every round, so the run reaches the Job
+  daemon and then cannot start the agent process, and the task converges to
+  `failed` with no `failure_reason` (a daemon self-report, not a Foreman-decided
+  fault). `tests/acceptance/uat-scenarios.sh` does it by assigning an issue to
+  that agent:
 
   ```bash
-  ./multica-test agent update <agent-id> --model foreman-test/not-served
-  ./multica-test autopilot trigger <short-autopilot-id>
-  # the projection's result is failed once the run settles
-  ./reset.sh && ./wire.sh && ./bind-agent.sh     # re-registers the endpoint, re-points the agent
+  ./multica-test issue assign <issue-id> --to <failure-agent-id>   # id from: ./multica-test agent list --output json
   ```
 
-  `reset.sh` rewrites the agent's model from the endpoint triple (or clears it
-  when no endpoint is configured), and `bind-agent.sh` rewrites the binding and
-  the instructions, so the round continues on the restored source.
+  No round mutates the test agent's model for this class any more: the failure
+  is the fixture's guarantee, not a race with a reconfigured source.
+
+`tests/acceptance/uat-scenarios.sh prepare` performs the same four
+constructions itself — one issue per class, assigned to the test agent, or to
+the failure agent for `failed` — and records the window the lifecycle and
+observability carriers judge; the recipes above are the manual equivalent.
+
+It is re-runnable in one workspace: each round builds its own issues and its
+create waives the CLI's duplicate guard, because the round's issues stay active
+after it (nothing in this fixture completes them) and the guard would otherwise
+refuse the next round's first issue. The window is replaced atomically and
+carries a `STATUS` marker — `partial` while a round is being built, `complete`
+only once all four tasks exist — so a second `prepare` builds a fresh set, a
+failed one leaves no readable window, and the next run heals it.
 
 The long shape is also the in-flight set of the recovery case: trigger N long
 tasks, inject the fault (`kubectl -n foreman rollout restart` or a Job pod

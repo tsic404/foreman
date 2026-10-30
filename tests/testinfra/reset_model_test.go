@@ -106,20 +106,20 @@ case "$method $path" in
 "GET api/workspaces/$STUB_WORKSPACE_ID")
 	printf '{"id":"%s","repos":[{"url":"%s"}]}' "$STUB_WORKSPACE_ID" "$STUB_REPO_URL"
 	;;
-"GET api/agents")
-	printf '[{"id":"%s","name":"%s","archived_at":null}]' "$STUB_AGENT_ID" "$STUB_AGENT_NAME"
-	;;
-"GET api/agents/$STUB_AGENT_ID") cat "$STUB_STATE/model" ;;
-"GET api/agents/$STUB_AGENT_ID/env") cat "$STUB_STATE/env" ;;
+"GET api/agents") cat "$STUB_AGENTS" ;;
 "GET api/chat/sessions")
 	printf '[{"id":"chat-1","title":"%s"}]' "$STUB_CHAT_TITLE"
 	;;
-"PUT api/agents/$STUB_AGENT_ID")
-	printf '%s' "$body" >"$STUB_STATE/model"
-	printf '{}'
+"POST api/agents")
+	# One more agent row, keyed by the name the entry asked for.
+	printf '{"id":"agent-%s"}' "$(printf '%s' "$body" | jq -r .name)"
 	;;
-"PUT api/agents/$STUB_AGENT_ID/env")
-	printf '%s' "$body" >"$STUB_STATE/env"
+"POST api/daemon/register")
+	printf '{"runtimes":[{"id":"seed-runtime"}]}'
+	;;
+"PUT api/agents/"*)
+	# The agent id follows the path; the body is what the entry wrote.
+	printf '%s' "$body" >"$STUB_STATE/put.$(printf '%s' "$path" | sed 's|api/agents/||; s|/env$||; s|/|_|g')"
 	printf '{}'
 	;;
 *)
@@ -263,6 +263,9 @@ type resetOptions struct {
 	// modelReadError, when set, makes every read of the model backend fail
 	// with this message instead of answering.
 	modelReadError string
+	// agents, when set, is the agent list GET /api/agents answers; empty means
+	// the test agent alone, which is the state a first round sees.
+	agents string
 }
 
 // resetCall is one request the stubbed test server received.
@@ -326,12 +329,24 @@ func runReset(t *testing.T, opts resetOptions) resetRun {
 		writeExecutable(t, filepath.Join(entryDir, name), string(body))
 	}
 	writeExecutable(t, filepath.Join(entryDir, "selfcheck.sh"), "#!/bin/sh\nexit 0\n")
+	// The CLI is outside what the entry writes under test, but creating an
+	// agent runs its seed-runtime cleanup through it.
+	writeExecutable(t, filepath.Join(entryDir, "multica-test"),
+		"#!/bin/sh\nprintf '%s\\n' \"$*\" >>\"$STUB_STATE/mcli.calls\"\nexit 0\n")
 	profile := `{"server_url":"` + resetServerURL + `","app_url":"` + resetServerURL +
 		`","token":"test-token","workspace_id":"` + resetWorkspaceID + `"}`
 	if err := os.WriteFile(profileConfig, []byte(profile+"\n"), 0o600); err != nil {
 		t.Fatalf("write the CLI profile: %v", err)
 	}
 
+	agents := opts.agents
+	if agents == "" {
+		agents = `[{"id":"` + resetAgentID + `","name":"` + resetAgentName + `","archived_at":null}]`
+	}
+	agentsPath := filepath.Join(dir, "agents.json")
+	if err := os.WriteFile(agentsPath, []byte(agents), 0o644); err != nil {
+		t.Fatalf("seed the agent list: %v", err)
+	}
 	callsPath := filepath.Join(dir, "curl.calls")
 	cmd := exec.Command("sh", filepath.Join(entryDir, "reset.sh"))
 	cmd.Dir = dir
@@ -349,6 +364,7 @@ func runReset(t *testing.T, opts resetOptions) resetRun {
 			"STUB_MODEL_READ_ERROR": opts.modelReadError,
 			"STUB_AGENT_ID":         resetAgentID,
 			"STUB_AGENT_NAME":       resetAgentName,
+			"STUB_AGENTS":           agentsPath,
 			"STUB_WORKSPACE_ID":     resetWorkspaceID,
 			"STUB_REPO_URL":         resetRepoURL,
 			"STUB_CHAT_TITLE":       resetChatTitle,

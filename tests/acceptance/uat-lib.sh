@@ -14,6 +14,13 @@ TEST_MULTICA_NS=${TEST_MULTICA_NS:-multica-test}
 TEST_MULTICA_SERVER_URL=${TEST_MULTICA_SERVER_URL:-http://127.0.0.1:30080}
 TEST_MULTICA_VERSION_ANCHOR=${TEST_MULTICA_VERSION_ANCHOR:-v0.6.1}
 TEST_AGENT_NAME=${TEST_AGENT_NAME:-foreman-test-agent}
+# The failure agent the test environment creates (testinfra/test-multica
+# README §The failure agent): same runtime, no model source, so a task
+# dispatched to it always ends failed.
+FAULT_AGENT_NAME=${TEST_MULTICA_FAULT_AGENT:-foreman-test-agent-failing}
+# The window uat-scenarios.sh builds and the two terminal-class carriers read:
+# four task ids and the terminal counters taken before the first of them.
+SCENARIOS_STATE=${SCENARIOS_STATE:-$HOME/.foreman-uat-scenarios}
 UAT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TEST_MULTICA_DIR=${TEST_MULTICA_DIR:-$(CDPATH= cd -- "$UAT_DIR/../../testinfra/test-multica" && pwd)}
 
@@ -99,13 +106,57 @@ agent_id() {
 		jq -r --arg n "$TEST_AGENT_NAME" '[.[] | select(.name == $n and (.archived_at == null))][0].id // empty'
 }
 
-# server_run <task-id>: the server-side run object for the task, or empty.
+# agent_named <name>: the live agent row's id, or empty.
+agent_named() {
+	mcli agent list --output json |
+		jq -r --arg n "$1" '[.[] | select(.name == $n and (.archived_at == null))][0].id // empty'
+}
+
+# scenario_state <KEY>: one value of the window uat-scenarios.sh recorded, or
+# empty when no window was built (an operator-triggered run says so itself).
+scenario_state() {
+	[ -r "$SCENARIOS_STATE" ] || return 1
+	sed -n "s/^$1=//p" "$SCENARIOS_STATE" | head -1
+}
+
+# scenario_window_ready: 0 only for a window a successful prepare wrote. A
+# missing file and the partial placeholder a failed prepare leaves behind both
+# read as "no window": the previous round's ids and baselines must never answer
+# for this one, so a carrier that would fall back to them blocks instead.
+scenario_window_ready() {
+	[ -r "$SCENARIOS_STATE" ] || return 1
+	[ "$(scenario_state STATUS)" = complete ] || return 1
+	[ -n "$(scenario_state PREPARED_AT)" ] || return 1
+	return 0
+}
+
+# scenario_value <explicit-value> <KEY>: the caller's value wins over the
+# recorded window, so an operator can still name the tasks by hand.
+scenario_value() {
+	if [ -n "$1" ]; then
+		printf '%s' "$1"
+		return 0
+	fi
+	scenario_state "$2" || true
+}
+
+# server_run <task-id>: the server-side run object for the task, or empty. A
+# task can belong to either test agent (the failure class runs on the failure
+# agent), so both are searched; a read failure of one agent's list is a
+# blocked face, never "no run".
 server_run() {
-	_agent=$(agent_id) || return 1
-	[ -n "$_agent" ] || return 1
-	mcli agent tasks "$_agent" --output json 2>/dev/null |
-		jq -c --arg t "$1" \
-			'[.. | objects | select(((.id? // "") == $t) or ((.task_id? // "") == $t))][0] // empty'
+	for _name in "$TEST_AGENT_NAME" "$FAULT_AGENT_NAME"; do
+		_agent=$(agent_named "$_name") || return 1
+		[ -n "$_agent" ] || continue
+		_run=$(mcli agent tasks "$_agent" --output json 2>/dev/null |
+			jq -c --arg t "$1" \
+				'[.. | objects | select(((.id? // "") == $t) or ((.task_id? // "") == $t))][0] // empty') || return 1
+		if [ -n "$_run" ]; then
+			printf '%s' "$_run"
+			return 0
+		fi
+	done
+	return 0
 }
 
 # run_status <run-json>: the server-side terminal class, lower-cased. The class

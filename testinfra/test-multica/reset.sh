@@ -17,17 +17,18 @@
 #   3. workspace — ensure the test workspace exists and is selected;
 #   4. wipe — delete every runtime row and task row of the test workspace
 #      (可重置). The agent rows survive, unbound;
-#   5. rebuild the test objects — writable repository, test agent (unbound),
-#      chat entry. The autopilot is not here: the server refuses an autopilot
-#      whose assignee agent has no runtime, and this entry leaves the runtime
-#      list empty on purpose — ./bind-agent.sh creates it once the agent is
-#      bound;
+#   5. rebuild the test objects — writable repository, test agent and failure
+#      agent (both unbound), chat entry. The autopilot is not here: the server
+#      refuses an autopilot whose assignee agent has no runtime, and this entry
+#      leaves the runtime list empty on purpose — ./bind-agent.sh creates it
+#      once the agent is bound;
 #   6. model — one writer, one precedence: the deployment-supplied endpoint
 #      triple wins; without it the keyless local backend ./deploy.sh installed
 #      is the source (its family selector plus its in-cluster address); with
 #      neither, the agent's model is cleared and any registration a previous
 #      round left on the nodes is removed (the node file outlives the
-#      namespace);
+#      namespace). The failure agent is cleared unconditionally: its missing
+#      model source is the fixture's failure guarantee;
 #   7. gate — ./selfcheck.sh: the environment gate ①②③④ (the instance points at
 #      the access point, the runtime list is empty, the server reports the
 #      artifact anchor, the selected model source serves the round).
@@ -201,21 +202,36 @@ seed_runtime() {
 }
 
 agent_id=""
+fault_agent_id=""
+
+# ensure_agent <name> <description> -> the agent's id, created on the seed
+# runtime when the row is missing. The lookup is by name over the live rows so
+# a round that already ran reuses its agents.
 ensure_agent() {
-	agent_id=$(wsapi GET /api/agents |
-		jq -r --arg name "$AGENT_NAME" '[.[] | select(.name == $name and (.archived_at == null))][0].id // ""')
-	if [ -n "$agent_id" ]; then
-		info "agent $AGENT_NAME ($agent_id)"
+	_id=$(wsapi GET /api/agents |
+		jq -r --arg name "$1" '[.[] | select(.name == $name and (.archived_at == null))][0].id // ""')
+	if [ -n "$_id" ]; then
+		info "agent $1 ($_id)"
+		printf '%s' "$_id"
 		return 0
 	fi
 	rt=$(seed_runtime) || die "seed runtime registration failed"
-	body=$(jq -nc --arg name "$AGENT_NAME" --arg ins "$AGENT_INSTRUCTIONS" --arg rt "$rt" \
-		'{name:$name, description:"Foreman acceptance test agent", instructions:$ins, runtime_id:$rt, max_concurrent_tasks:6}') ||
+	body=$(jq -nc --arg name "$1" --arg desc "$2" --arg ins "$AGENT_INSTRUCTIONS" --arg rt "$rt" \
+		'{name:$name, description:$desc, instructions:$ins, runtime_id:$rt, max_concurrent_tasks:6}') ||
 		die "could not encode the agent body"
-	agent_id=$(wsapi POST /api/agents "$body" | jq -er .id) || die "agent creation failed"
+	_id=$(wsapi POST /api/agents "$body" | jq -er .id) || die "agent creation failed"
 	mcli runtime delete "$rt" --cascade >/dev/null ||
 		die "could not unbind and delete the seed runtime"
-	info "created agent $AGENT_NAME ($agent_id), unbound"
+	info "created agent $1 ($_id), unbound"
+	printf '%s' "$_id"
+}
+
+ensure_agents() {
+	agent_id=$(ensure_agent "$AGENT_NAME" "Foreman acceptance test agent") ||
+		die "agent $AGENT_NAME is missing"
+	fault_agent_id=$(ensure_agent "$FAULT_AGENT_NAME" \
+		"Foreman acceptance failure fixture: no model source, every task ends failed") ||
+		die "agent $FAULT_AGENT_NAME is missing"
 }
 
 ensure_chat() {
@@ -236,7 +252,20 @@ ensure_chat() {
 # One writer, one precedence (lib.sh's register_model_endpoint): the
 # deployment-supplied endpoint, else the keyless local backend ./deploy.sh
 # installed, else no model. The entry only decides when to call it — the
-# agent id it needs comes from ensure_agent below.
+# agent id it needs comes from ensure_agents above.
+
+# The failure agent is the fixture's deterministic failure: it must carry no
+# model source in any round, whatever the round's model precedence chose. A
+# selector left by an earlier round (the row survives the wipe) would quietly
+# turn it into a second working agent and take the failure scenario with it, so
+# this is an unconditional write, not a create-time default.
+clear_fault_agent_model() {
+	set_agent_model "$fault_agent_id" "" ||
+		die "cannot clear agent $FAULT_AGENT_NAME's model"
+	set_agent_env "$fault_agent_id" "" ||
+		die "cannot clear agent $FAULT_AGENT_NAME's model backend address"
+	info "agent $FAULT_AGENT_NAME → (no model source: every task fails)"
+}
 
 # --- 7. gate and report ------------------------------------------------------
 
@@ -248,9 +277,10 @@ ensure_credentials
 ensure_workspace
 wipe_rows
 ensure_repo
-ensure_agent
+ensure_agents
 ensure_chat
 register_model_endpoint
+clear_fault_agent_model
 
 # The environment gate ①②③④, the gate every round opens with. Run here, with
 # the instance under test stopped, ② is the reset-time state this entry sets
@@ -263,6 +293,7 @@ printf 'profile:      %s (%s)\n' "$PROFILE" "$PROFILE_CONFIG"
 printf 'server:       %s\n' "$SERVER_URL"
 printf 'entry:        %s\n' "$ENTRY_URL"
 printf 'agent:        %s\n' "$AGENT_NAME"
+printf 'failure agent: %s (no model source)\n' "$FAULT_AGENT_NAME"
 printf 'model:        %s\n' "$model_text"
 printf 'chat session: %s\n' "$CHAT_TITLE"
 printf 'next:         ./wire.sh         # points the instance at the access point and starts it\n'
