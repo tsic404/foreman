@@ -553,3 +553,63 @@ func TestBuildCatalogProbeTemplateCopy(t *testing.T) {
 		t.Errorf("probe cred-src = %q, want %q", got, testProbeName+"-cred")
 	}
 }
+
+// probeTemplateWithoutJobLabels is a legal deployment template whose Job-level
+// metadata writes no labels: §8.1 takes every shape outside the four refusal
+// classes, and §8.4's label face still lands the probe block there.
+const probeTemplateWithoutJobLabels = `
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fm-<task_id>
+spec:
+  template:
+    metadata:
+      labels:
+        cost-center: platform
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: agent
+          image: <job-image>
+          command: ["/usr/bin/dumb-init", "--", "/usr/local/bin/multica"]
+          args: ["daemon", "start", "--foreground", "--profile", "foreman-job"]
+          env: []
+          volumeMounts:
+            - { name: cred, mountPath: /home/agent/.multica/profiles/foreman-job/config.json, subPath: config.json, readOnly: true }
+      volumes:
+        - name: cred-src
+          secret: { secretName: fm-<task_id>-cred, defaultMode: 0400 }
+`
+
+// TestBuildCatalogProbeWithoutJobLabels: the label face is Foreman's own
+// write, so a template that declares no Job labels must render rather than
+// panic on a nil map — Foreman allocates the map, exactly as the pod side
+// does, instead of writing into the template's absent one.
+func TestBuildCatalogProbeWithoutJobLabels(t *testing.T) {
+	cfg, _ := templateConfig(t, probeTemplateWithoutJobLabels)
+	cfg.JobImage = testProbeImage
+	job, _, _, _ := mustBuildProbe(t, cfg, testRequestID, testProbeRuntime, testWorkspaceID, time.Minute)
+
+	wantLabels := map[string]string{
+		labelAppName:     jobAppName,
+		labelManagedBy:   managedByForeman,
+		labelRole:        probeRole,
+		labelDaemonID:    testProbeName,
+		labelWorkspaceID: testWorkspaceID,
+	}
+	if len(job.Labels) != len(wantLabels) {
+		t.Fatalf("job labels = %v, want exactly %v", job.Labels, wantLabels)
+	}
+	for key, want := range wantLabels {
+		if job.Labels[key] != want {
+			t.Errorf("label %q = %q, want %q", key, job.Labels[key], want)
+		}
+	}
+	if _, hasTask := job.Labels[labelTaskID]; hasTask {
+		t.Error("probe Job carries a task id label")
+	}
+	if got := job.Spec.Template.Labels["cost-center"]; got != "platform" {
+		t.Errorf("pod labels = %v, want the template's own label kept", job.Spec.Template.Labels)
+	}
+}

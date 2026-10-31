@@ -141,7 +141,12 @@ func (b *Builder) applyProbeWrites(job *batchv1.Job, name, workspaceID string) {
 	clearForemanDomain(job.Spec.Template.Annotations)
 	if workspaceID != "" {
 		// The probe's workspace identity is the credential's, and it is what
-		// partitions the probe domain's sweep and its labels (§3).
+		// partitions the probe domain's sweep and its labels (§3). The label
+		// face is Foreman's own write (§8.4), so a template that declares no
+		// labels is accepted (§8.1) and the map is allocated here, per side.
+		if job.Labels == nil {
+			job.Labels = map[string]string{}
+		}
 		job.Labels[labelWorkspaceID] = workspaceID
 		if job.Spec.Template.Labels == nil {
 			job.Spec.Template.Labels = map[string]string{}
