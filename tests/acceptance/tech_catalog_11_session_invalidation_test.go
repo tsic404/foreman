@@ -114,6 +114,13 @@ func TestCatalog11ProbeTokenDiesWithItsSession(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			h := newHarness(t, true)
+			// The probe serves a declared runtime: its S4 body names that
+			// runtime's identity, so the control face needs the declaration
+			// the probe was started for (§2.3 探针 Job 的选条).
+			h.upstream.registerIDs = map[string]string{"omp": catalog11RealRuntime}
+			h.declare(registry.Discovery{CLIVersion: "1.0.0", Runtimes: []registry.DiscoveredRuntime{
+				{Name: "foreman-omp", Type: "omp", Version: "1.0.0"},
+			}})
 			token, _ := seedCatalogProbe(t, h)
 			faces := probeFaces()
 

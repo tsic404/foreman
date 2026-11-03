@@ -164,32 +164,150 @@ func TestProbeHeartbeatRejectsForeignRuntime(t *testing.T) {
 	}
 }
 
-func TestProbeStartupSlotUsesDeclarationOrder(t *testing.T) {
+func TestProbeStartupSlotFollowsTheServedRuntime(t *testing.T) {
 	r := newTestRig(t)
 	token, session := startProbeToken(t, r, "startup-order", "")
+	// Declaration order puts the builtin entry first while a name sort puts the
+	// profile entry first — the entry S4 answers with (§2.3).
 	code, body := r.call(t, "POST", "/api/daemon/register", token, []byte(`{
 		"daemon_id": "fm-catalog-startup-order",
 		"runtimes": [
 			{"name": "zz-omp", "type": "omp", "version": "1.0.0"},
-			{"name": "aa-claude", "type": "claude", "version": "1.0.0"}
+			{"name": "aa-omp-prof", "type": "omp", "version": "1.0.0", "profile_id": "pf-1"}
 		]
 	}`))
 	if code != 200 {
 		t.Fatalf("probe register = %d: %s", code, body)
 	}
+	var answer struct {
+		Runtimes []struct {
+			Name      string  `json:"name"`
+			ProfileID *string `json:"profile_id"`
+		} `json:"runtimes"`
+	}
+	if err := json.Unmarshal(body, &answer); err != nil || len(answer.Runtimes) != 1 {
+		t.Fatalf("probe S4 answer = %s (%v), want exactly one runtime", body, err)
+	}
+	if answer.Runtimes[0].Name != "aa-omp-prof" {
+		t.Fatalf("S4 answered %q, want the name-first entry the probe serves", answer.Runtimes[0].Name)
+	}
+	if answer.Runtimes[0].ProfileID == nil || *answer.Runtimes[0].ProfileID != "pf-1" {
+		t.Fatalf("S4 profile_id = %v, want the served entry's identity", answer.Runtimes[0].ProfileID)
+	}
+
 	discovery := []byte(`{"status":"completed","models":[{"id":"m1"}]}`)
 	code, body = r.call(t, "POST",
 		"/api/daemon/runtimes/"+session.JobRuntime+"/models/"+session.SelfMintedID+"/result", token, discovery)
 	if code != 200 {
 		t.Fatalf("startup absorb = %d: %s", code, body)
 	}
-	// §1.3: the startup slot is the declaration's first entry, not the
-	// name-first one (aa-claude would win a name sort).
-	if staged, ok := r.client.startup.Take("omp", ""); !ok || string(staged) != string(discovery) {
-		t.Fatalf("omp slot = %q (ok=%v), want the discovery body", staged, ok)
+	// §1.3: the startup slot is the runtime the probe's discovery ran for, not
+	// the declaration's first entry.
+	if staged, ok := r.client.startup.Take("omp", "pf-1"); !ok || string(staged) != string(discovery) {
+		t.Fatalf("profile slot = %q (ok=%v), want the discovery body", staged, ok)
 	}
-	if _, ok := r.client.startup.Take("claude", ""); ok {
-		t.Error("the name-first entry got the startup slot; the declaration order is the rule")
+	if _, ok := r.client.startup.Take("omp", ""); ok {
+		t.Error("the declaration-first runtime got the startup slot; the served entry is the rule")
+	}
+}
+
+// newProbeDeclaredRig builds a rig whose real runtimes cover both a builtin and
+// a profile identity, so a command-driven probe's own runtime resolves (§2.3).
+func newProbeDeclaredRig(t *testing.T) *testRig {
+	t.Helper()
+	return newTestRigWith(t, func(stub *stubUpstream) {
+		stub.on("POST", "/api/daemon/register", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+			writeJSONStub(w, 200, map[string]any{
+				"runtimes": []map[string]any{
+					{"id": "rid-prof", "name": "aa-omp-prof", "provider": "omp", "status": "online", "profile_id": "pf-1"},
+					{"id": "rid-builtin", "name": "zz-omp", "provider": "omp", "status": "online"},
+				},
+				"repos": []any{}, "repos_version": "",
+			})
+		})
+	}, registry.Discovery{
+		CLIVersion: "1.0.0",
+		Runtimes: []registry.DiscoveredRuntime{
+			{Name: "aa-omp-prof", Type: "omp", Version: "1.0.0", ProfileID: "pf-1"},
+			{Name: "zz-omp", Type: "omp", Version: "1.0.0"},
+		},
+	})
+}
+
+// A command-driven probe serves one real runtime: its S4 answer must name that
+// runtime's identity, because that identity is where the result is relayed.
+func TestProbeCommandDrivenRegisterAnswersTheRequestedRuntime(t *testing.T) {
+	r := newProbeDeclaredRig(t)
+	// The requested runtime is the builtin entry, which a name sort ranks last.
+	token, _ := startProbeToken(t, r, "cmd-served", "rid-builtin")
+	code, body := r.call(t, "POST", "/api/daemon/register", token, []byte(`{
+		"daemon_id": "fm-catalog-cmd-served",
+		"runtimes": [
+			{"name": "aa-omp-prof", "type": "omp", "version": "1.0.0", "profile_id": "pf-1"},
+			{"name": "zz-omp", "type": "omp", "version": "1.0.0"}
+		]
+	}`))
+	if code != 200 {
+		t.Fatalf("probe register = %d: %s", code, body)
+	}
+	var answer struct {
+		Runtimes []struct {
+			Name      string  `json:"name"`
+			ProfileID *string `json:"profile_id"`
+		} `json:"runtimes"`
+	}
+	if err := json.Unmarshal(body, &answer); err != nil || len(answer.Runtimes) != 1 {
+		t.Fatalf("probe S4 answer = %s (%v), want exactly one runtime", body, err)
+	}
+	if answer.Runtimes[0].Name != "zz-omp" || answer.Runtimes[0].ProfileID != nil {
+		t.Fatalf("S4 answered %+v, want the requested builtin runtime", answer.Runtimes[0])
+	}
+
+	// The same probe declared without its runtime: zero hit means the startup
+	// command of another runtime would discover the wrong catalog, so the
+	// registration is refused instead.
+	otherToken, _ := startProbeToken(t, r, "cmd-served-miss", "rid-builtin")
+	code, body = r.call(t, "POST", "/api/daemon/register", otherToken, []byte(`{
+		"daemon_id": "fm-catalog-cmd-served-miss",
+		"runtimes": [{"name": "aa-omp-prof", "type": "omp", "version": "1.0.0", "profile_id": "pf-1"}]
+	}`))
+	if code != http.StatusConflict {
+		t.Fatalf("probe register without its runtime = %d: %s, want 409", code, body)
+	}
+	if !strings.Contains(string(body), "does not declare this probe's runtime") {
+		t.Errorf("zero-hit refusal = %s, want the declaration-mismatch message", body)
+	}
+}
+
+// The two registration refusals are different conditions: an empty declaration
+// is "this probe declared nothing", a zero hit is "the declaration does not
+// carry the runtime this probe serves". The daemon only reads the body, so the
+// two must not be interchangeable (§2.3 daemon 得到明确错误).
+func TestProbeRegisterRefusalsAreDistinguishable(t *testing.T) {
+	r := newProbeDeclaredRig(t)
+	emptyToken, _ := startProbeToken(t, r, "cmd-refusal-empty", "rid-builtin")
+	emptyCode, emptyBody := r.call(t, "POST", "/api/daemon/register", emptyToken, []byte(`{
+		"daemon_id": "fm-catalog-cmd-refusal-empty",
+		"runtimes": []
+	}`))
+
+	zeroToken, _ := startProbeToken(t, r, "cmd-refusal-zero", "rid-builtin")
+	zeroCode, zeroBody := r.call(t, "POST", "/api/daemon/register", zeroToken, []byte(`{
+		"daemon_id": "fm-catalog-cmd-refusal-zero",
+		"runtimes": [{"name": "aa-omp-prof", "type": "omp", "version": "1.0.0", "profile_id": "pf-1"}]
+	}`))
+
+	if emptyCode != http.StatusConflict || zeroCode != http.StatusConflict {
+		t.Fatalf("refusals = %d / %d: %s / %s, want 409 on both", emptyCode, zeroCode, emptyBody, zeroBody)
+	}
+	if string(emptyBody) == string(zeroBody) {
+		t.Fatalf("both refusals answer %s; the daemon cannot tell an empty declaration from a missing identity", emptyBody)
+	}
+	if !strings.Contains(string(emptyBody), "no runtime declared") {
+		t.Errorf("empty-declaration refusal = %s, want the empty-declaration message", emptyBody)
+	}
+	if strings.Contains(string(zeroBody), "no runtime declared") {
+		t.Errorf("zero-hit refusal = %s, want a message distinct from the empty declaration", zeroBody)
 	}
 }
 
@@ -217,6 +335,68 @@ func TestProbeModelResultAbsorbsStartupDiscovery(t *testing.T) {
 	updated, _ := r.probes.ProbeByJob(session.JobName)
 	if updated.RelayedAt.IsZero() || updated.RelayedCode != 200 {
 		t.Errorf("the absorb must set the completion signal: %+v", updated)
+	}
+}
+
+// A session written by an instance that predates the recorded S-4 answer carries
+// the declaration but no served entry (rolling upgrade over a shared session
+// store). The answer that instance gave was the declaration's name-first entry,
+// so the result still lands — on that entry's slot — instead of being dropped
+// and costing the runtime its startup catalog.
+func TestProbeStartupAbsorbRecoversTheDeclaredEntry(t *testing.T) {
+	// Declaration order puts the builtin first; a name sort puts the profile
+	// entry first, which is the entry the older S-4 answered with.
+	declaration := []registry.DiscoveredRuntime{
+		{Name: "zz-omp", Type: "omp", Version: "1.0.0"},
+		{Name: "aa-omp-prof", Type: "omp", Version: "1.0.0", ProfileID: "pf-1"},
+	}
+	cases := []struct {
+		name string
+		seed func(*registry.ProbeSession)
+	}{
+		{
+			name: "per-workspace registration",
+			seed: func(s *registry.ProbeSession) {
+				s.Registrations = map[string]registry.ProbeRegistration{
+					"ws-1": {Runtimes: declaration},
+				}
+				s.Runtimes = declaration
+			},
+		},
+		{
+			name: "legacy single-registration mirror",
+			seed: func(s *registry.ProbeSession) {
+				s.Registrations = nil
+				s.Runtimes = declaration
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := newTestRig(t)
+			token, session := startProbeToken(t, r, "startup-upgrade", "")
+			if _, ok := r.probes.UpdateProbe(session.JobName, tc.seed); !ok {
+				t.Fatalf("seed probe session %s", session.JobName)
+			}
+			discoveryBody := []byte(`{"status":"completed","models":[{"id":"m-upgrade"}]}`)
+			code, body := r.call(t, "POST",
+				"/api/daemon/runtimes/"+session.JobRuntime+"/models/"+session.SelfMintedID+"/result",
+				token, discoveryBody)
+			if code != 200 {
+				t.Fatalf("startup absorb without a served entry = %d: %s, want the recovered landing", code, body)
+			}
+			staged, ok := r.client.startup.Take("omp", "pf-1")
+			if !ok || string(staged) != string(discoveryBody) {
+				t.Fatalf("profile slot = %q (ok=%v), want the discovery body", staged, ok)
+			}
+			if _, ok := r.client.startup.Take("omp", ""); ok {
+				t.Error("the declaration-first runtime got the startup slot; the recovered answer is the name-first entry")
+			}
+			updated, _ := r.probes.ProbeByJob(session.JobName)
+			if updated.RelayedAt.IsZero() || updated.RelayedCode != 200 {
+				t.Errorf("the recovered absorb must set the completion signal: %+v", updated)
+			}
+		})
 	}
 }
 

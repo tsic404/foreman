@@ -59,7 +59,6 @@ func (s *FakeServer) registerProbe(w http.ResponseWriter, r *http.Request, claim
 		writeError(w, http.StatusConflict, "no runtime declared")
 		return
 	}
-	first := probeServedRuntime(req.Runtimes)
 	workspaceID := req.WorkspaceID
 	if workspaceID == "" {
 		workspaceID = claims.WorkspaceID
@@ -77,7 +76,32 @@ func (s *FakeServer) registerProbe(w http.ResponseWriter, r *http.Request, claim
 		return
 	}
 	now := time.Now()
+	var served registerRuntime
+	var selected bool
 	_, applied := s.probes.UpdateProbe(claims.JobName, func(session *registry.ProbeSession) {
+		// The answer is picked off the session's own mode: a command-driven
+		// probe serves one real runtime, a declaration probe the name-first
+		// entry (§2.3). A reaped session decides nothing — its update below is
+		// what fails, so the 401 keeps precedence over the identity verdict.
+		served, selected = probeAnswerRuntime(client, *session, req.Runtimes)
+		if !selected {
+			return
+		}
+		// The S4 answer is the entry the probe's own discovery runs against, so
+		// the session keeps it: a startup result lands on that entry's slot
+		// (§1.3), never on another ordering of the same declaration.
+		//
+		// The key is the workspace the result arrives on — the Job Token's own —
+		// because S-27 carries no workspace and is authenticated by that same
+		// token. Keying by the registration's declared workspace instead would
+		// store the answer where the absorb cannot read it (§1.2: every
+		// workspace declares the same runtime list, so the answer is the same).
+		if session.Served == nil {
+			session.Served = map[string]registry.DiscoveredRuntime{}
+		}
+		session.Served[claims.WorkspaceID] = registry.DiscoveredRuntime{
+			Name: served.Name, Type: served.Type, Version: served.Version, ProfileID: served.ProfileID,
+		}
 		if !session.CapturesRegistration() {
 			return
 		}
@@ -110,6 +134,17 @@ func (s *FakeServer) registerProbe(w http.ResponseWriter, r *http.Request, claim
 		writeError(w, http.StatusUnauthorized, "unknown probe session")
 		return
 	}
+	if !selected {
+		// The command-driven probe's own runtime is not in its declaration, so
+		// no entry would run the startup command of the runtime the result is
+		// relayed to (§2.3 零命中即拒绝). The daemon only sees the body, and
+		// this is a different condition from an empty declaration: it declared
+		// runtimes, just not the one this probe serves.
+		s.log.Error("probe registration names no runtime for the requested runtime",
+			"job_name", claims.JobName, "runtime_id", session.RealRuntimeID)
+		writeError(w, http.StatusConflict, "registration does not declare this probe's runtime")
+		return
+	}
 	s.log.Info("daemon.registered",
 		"job_name", claims.JobName, "daemon_id", claims.JobName,
 		"workspace_id", workspaceID, "job_runtime_id", session.JobRuntime, "probe", true,
@@ -119,13 +154,13 @@ func (s *FakeServer) registerProbe(w http.ResponseWriter, r *http.Request, claim
 	respBody := workspaceStateResponse(repos)
 	answer := map[string]any{
 		"id":         session.JobRuntime,
-		"name":       first.Name,
-		"provider":   first.Type,
+		"name":       served.Name,
+		"provider":   served.Type,
 		"status":     "online",
 		"profile_id": nil,
 	}
-	if first.ProfileID != "" {
-		answer["profile_id"] = first.ProfileID
+	if served.ProfileID != "" {
+		answer["profile_id"] = served.ProfileID
 	}
 	respBody["runtimes"] = []map[string]any{answer}
 	writeRaw(w, http.StatusOK, mustMarshal(respBody))
@@ -152,12 +187,56 @@ func selectDeclaredRuntime(runtimes []registerRuntime, identity string) (registe
 	return candidates[0], true
 }
 
-// probeServedRuntime picks the runtime a probe serves: the first entry by name,
-// the same stable ordering C1 declares (C-1 的取值来源与声明域).
+// probeAnswerRuntime picks the entry S4 answers with (§2.3 探针 Job 的选条). A
+// command-driven probe serves the one real runtime it was started for: its
+// answer must name that runtime's identity, because the result is relayed to it
+// and any other entry's startup command would discover a different catalog. The
+// declaration probes carry no runtime and answer the name-first entry, which is
+// therefore also the entry their discovery runs against.
+func probeAnswerRuntime(client *Client, session registry.ProbeSession, runtimes []registerRuntime) (registerRuntime, bool) {
+	if session.Mode != registry.ProbeCommandDriven {
+		return probeServedRuntime(runtimes), true
+	}
+	ref, ok := client.RefForRuntime(session.RealRuntimeID)
+	if !ok {
+		return registerRuntime{}, false
+	}
+	return selectDeclaredRuntime(runtimes, ref.Key())
+}
+
+// probeServedRuntime picks a declaration probe's answer: the first entry by name
+// (§2.3 探针 Job 的选条, the stable payload ordering).
 func probeServedRuntime(runtimes []registerRuntime) registerRuntime {
 	ordered := append([]registerRuntime(nil), runtimes...)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Name < ordered[j].Name })
 	return ordered[0]
+}
+
+// declaredServedRuntime recovers the entry a session's S4 answer pointed at when
+// the session carries no recorded answer: an instance that predates the record
+// answered with the declaration's name-first entry (§2.3), and that declaration
+// is still in the session. A session that captured no declaration for this
+// workspace has nothing to recover from.
+func declaredServedRuntime(session registry.ProbeSession, workspaceID string) (registry.DiscoveredRuntime, bool) {
+	declared, ok := session.Registrations[workspaceID]
+	if !ok {
+		if len(session.Registrations) > 0 {
+			return registry.DiscoveredRuntime{}, false
+		}
+		// A session written before per-workspace registrations keeps only the
+		// first declaration's mirror (§1.2).
+		declared = registry.ProbeRegistration{Runtimes: session.Runtimes}
+	}
+	if len(declared.Runtimes) == 0 {
+		return registry.DiscoveredRuntime{}, false
+	}
+	first := declared.Runtimes[0]
+	for _, runtime := range declared.Runtimes[1:] {
+		if runtime.Name < first.Name {
+			first = runtime
+		}
+	}
+	return first, true
 }
 
 func discoveredRuntimes(runtimes []registerRuntime) []registry.DiscoveredRuntime {
@@ -222,22 +301,12 @@ func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 	case session.SelfMintedID != "" && req == session.SelfMintedID:
 		// Startup discovery: no server request exists, so the result is
 		// absorbed locally and the daemon gets the C21 success shape back.
-		// The slot is filled for the declaration's first entry (§1.3: 按声明
-		// 顺序), never a name-sorted pick — sorting would also mutate the
-		// slice the probe session shares.
-		provider, profileID := "", ""
-		if len(session.Runtimes) > 0 {
-			provider, profileID = session.Runtimes[0].Type, session.Runtimes[0].ProfileID
-		}
-		if provider == "" {
-			s.log.Error("startup discovery landed without a declared runtime", "job_name", claims.JobName)
-			writeError(w, http.StatusConflict, "no runtime declared")
-			return
-		}
-		workspaceID := session.WorkspaceID
-		if workspaceID == "" {
-			workspaceID = claims.WorkspaceID
-		}
+		// The slot is the one the probe's own discovery ran for — the entry S4
+		// answered with (§1.3), never another order of the same declaration.
+		// The absorb belongs to the workspace the Job Token names: S-27 carries
+		// no workspace of its own, and Verify has already refused a token whose
+		// workspace contradicts a pinned session, so this is the one source.
+		workspaceID := claims.WorkspaceID
 		client := s.clientFor(workspaceID)
 		if client == nil {
 			// Without a configured workspace there is no slot to fill; the
@@ -248,6 +317,23 @@ func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "workspace is not configured")
 			return
 		}
+		served, servedOK := session.Served[workspaceID]
+		if !servedOK || served.Type == "" {
+			// A session written by an instance that predates the recorded answer
+			// (rolling upgrade, shared session store) carries the declaration but
+			// no served entry. That instance answered S4 with the declaration's
+			// name-first entry (§2.3), so the entry its discovery ran for is
+			// recoverable — dropping the result would cost the runtime its
+			// startup slot, not protect it (§1.3 无槽回落).
+			served, servedOK = declaredServedRuntime(session, workspaceID)
+		}
+		if !servedOK || served.Type == "" {
+			s.log.Error("startup discovery landed without a served runtime",
+				"job_name", claims.JobName, "workspace_id", workspaceID)
+			writeError(w, http.StatusConflict, "probe session carries no served runtime")
+			return
+		}
+		provider, profileID := served.Type, served.ProfileID
 		// The write-back is the only authority, and it lands before the slot:
 		// a reap between the lookup above and here must leave neither a staged
 		// body nor the success shape behind (§6.3 会话不存在 ⇒ 恒 401).

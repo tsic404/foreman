@@ -53,6 +53,13 @@ type ProbeSession struct {
 	RelayedCode int
 	NodeName    string
 
+	// Served is the entry S4 answered with, keyed by the workspace the probe's
+	// result arrives on (the Job Token's): the runtime whose startup command the
+	// probe's own discovery runs (§2.3 探针 Job 的选条). A startup result lands
+	// on this entry's slot (§1.3) — the declaration's order is not the answer's
+	// order.
+	Served map[string]DiscoveredRuntime
+
 	// Registration face: written by the fake server's S4 probe branch for the
 	// modes whose registration body is a declaration (CapturesRegistration).
 	// Registrations is the per-workspace truth; the four fields below mirror
@@ -130,6 +137,12 @@ func (s ProbeSession) clone() ProbeSession {
 	out := s
 	out.Runtimes = slices.Clone(s.Runtimes)
 	out.FailedProfiles = cloneRawMessages(s.FailedProfiles)
+	if s.Served != nil {
+		out.Served = make(map[string]DiscoveredRuntime, len(s.Served))
+		for workspaceID, runtime := range s.Served {
+			out.Served[workspaceID] = runtime
+		}
+	}
 	if s.Registrations != nil {
 		out.Registrations = make(map[string]ProbeRegistration, len(s.Registrations))
 		for workspaceID, registration := range s.Registrations {
