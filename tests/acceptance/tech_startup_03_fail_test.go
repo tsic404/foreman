@@ -1,9 +1,10 @@
 // TC-tech-startup-03-fail implements the failure (negative) branch of
 // AC-38 / TC-tech-startup-03: the S4 zero-hit refusal and the per-runtime
-// failure granularity of the declared runtime set. The positive multi-runtime
-// scenarios of TC-tech-startup-03 (declaration counts, claim attribution,
-// N WS connections) need a constructible N ≥ 2 cluster and are registered as
-// QA_BLOCKED in the issue.
+// failure granularity of the declared runtime set. The attribution face of the
+// positive scenario (N ≥ 2 directories, one slot per identity) is
+// tech_startup_03_attribution_test.go; the cluster-level faces (claim
+// attribution, N WS connections) need a constructible N ≥ 2 cluster and are
+// registered as QA_BLOCKED in the issue.
 package acceptance
 
 import (
