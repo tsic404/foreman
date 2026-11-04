@@ -238,6 +238,18 @@ func New(now func() time.Time, opts ...Option) *Registry {
 // Put inserts or replaces e, keyed by TaskID, and maintains the secondary
 // indexes. A terminal entry can only be overwritten by a terminal one.
 func (r *Registry) Put(e TaskEntry) error {
+	return r.put(e, nil)
+}
+
+// PutTakingSlots is the claim's write: the row and the retirement of the
+// reservations that own its slots land in one store step, so the conversion
+// "reservation becomes row" never leaves the same in-flight slot counted on
+// both sides.
+func (r *Registry) PutTakingSlots(e TaskEntry, retire []SlotRetirement) error {
+	return r.put(e, retire)
+}
+
+func (r *Registry) put(e TaskEntry, retire []SlotRetirement) error {
 	if e.TaskID == "" {
 		return errors.New("task_id is required")
 	}
@@ -252,7 +264,7 @@ func (r *Registry) Put(e TaskEntry) error {
 	r.live[e.TaskID] = e
 	r.indexLocked(e)
 	if r.shared != nil {
-		return r.writeShared(e)
+		return r.writeShared(e, retire)
 	}
 	r.persist(e.TaskID, e)
 	return nil

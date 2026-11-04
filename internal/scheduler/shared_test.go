@@ -21,22 +21,19 @@ type fakeCoordStore struct {
 
 	mu     sync.Mutex
 	counts map[string]int64
-	// pending lists each level's reservation ids. A consume removes the id it
+	// pending lists each level's reservation ids. A release removes the id it
 	// names, like the store's targeted delete, so a test can tell whose marker
 	// went away.
-	pending     map[string][]string
+	pending map[string][]string
+	// rows is the shared state's live-row set: the reconciliation's row face.
+	rows        []registry.TaskEntry
 	nextID      int
 	snapshotErr error
 	// snapshotHook runs once, after a snapshot read and before its caller sees
 	// the value, so a test can land a claim in that window.
 	snapshotHook func(ws string)
-	consumeFails int
-	// consumeFailsAfterApply models a delete that landed while its response
-	// was lost: the named member is gone and the caller saw an error.
-	consumeFailsAfterApply int
-	consumeCalls           int
-	resetCalls             []slotWrite
-	casCalls               []slotWrite
+	resetCalls   []slotWrite
+	casCalls     []slotWrite
 	// workspaceReserveHook models the call that spends the last of a call
 	// budget: it runs inside the workspace reservation and leaves the caller's
 	// context dead, the way an exhausted store call does.
@@ -53,23 +50,6 @@ type slotWrite struct {
 	next     int64
 	before   int64
 	cleared  int64
-}
-
-func (f *fakeCoordStore) ConsumeSlotReservation(_ context.Context, ws, id string) error {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.consumeCalls++
-	if f.consumeFailsAfterApply > 0 {
-		f.consumeFailsAfterApply--
-		f.removeReservation(ws, id)
-		return errors.New("consume response lost")
-	}
-	if f.consumeFails > 0 {
-		f.consumeFails--
-		return errors.New("consume down")
-	}
-	f.removeReservation(ws, id)
-	return nil
 }
 
 // ReserveSlot mints the reservation id the store keeps as the zset member and
@@ -181,15 +161,23 @@ func (f *fakeCoordStore) ResetSlots(_ context.Context, ws string, n int64) (int6
 	return before, cleared, nil
 }
 
-func (f *fakeCoordStore) CompareAndSetSlots(_ context.Context, ws string, expected, next int64) (bool, error) {
+func (f *fakeCoordStore) CompareAndSetSlots(_ context.Context, ws string, expected, expectedReservations, next int64) (bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if f.counts[ws] != expected {
+	if f.counts[ws] != expected || int64(len(f.pending[ws])) != expectedReservations {
 		return false, nil
 	}
 	f.casCalls = append(f.casCalls, slotWrite{ws: ws, expected: expected, next: next})
 	f.counts[ws] = next
 	return true, nil
+}
+
+// ListEntries is the reconciliation's row face: the store's rows, not the
+// process-local index.
+func (f *fakeCoordStore) ListEntries(context.Context) ([]registry.TaskEntry, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]registry.TaskEntry(nil), f.rows...), nil
 }
 
 type recMetrics struct {
@@ -226,82 +214,6 @@ func newSlotTestScheduler(t *testing.T, store *fakeCoordStore, ws ...string) (*S
 		log:     slog.New(slog.NewJSONHandler(io.Discard, nil)),
 		now:     time.Now,
 	}, m
-}
-
-// slotPair is the reservation handle one claim call takes: the workspace
-// level and the global level.
-func slotPair(ws, globalID, levelID string) SlotReservation {
-	return SlotReservation{workspaceID: ws, globalID: globalID, levelID: levelID}
-}
-
-// TestConsumeSlotsRetiresOnlyTheHandlesOwnMarkers pins that the pair handed in
-// is the pair that goes away: another claim's pending marker at the same levels
-// stays untouched, and the failed response is not retried.
-func TestConsumeSlotsRetiresOnlyTheHandlesOwnMarkers(t *testing.T) {
-	store := &fakeCoordStore{
-		consumeFailsAfterApply: 1,
-		pending: map[string][]string{
-			"ws-a": {"w-mine", "w-other"},
-			"":     {"g-mine", "g-other"},
-		},
-	}
-	s, m := newSlotTestScheduler(t, store, "ws-a")
-	s.consumeSlots(context.Background(), slotPair("ws-a", "g-mine", "w-mine"))
-
-	if store.consumeCalls != 2 {
-		t.Fatalf("consume calls = %d, want 2 (one attempt per level, no retry)", store.consumeCalls)
-	}
-	for _, tc := range []struct{ ws, gone, kept string }{
-		{"ws-a", "w-mine", "w-other"},
-		{"", "g-mine", "g-other"},
-	} {
-		if store.hasPending(tc.ws, tc.gone) {
-			t.Fatalf("level %q still holds the retired marker %q", tc.ws, tc.gone)
-		}
-		if !store.hasPending(tc.ws, tc.kept) {
-			t.Fatalf("level %q lost the other claim's marker %q", tc.ws, tc.kept)
-		}
-	}
-	if len(m.errors) != 1 || m.errors[0] != "consume_slot" {
-		t.Fatalf("state errors = %v, want one consume_slot", m.errors)
-	}
-}
-
-// TestConsumeSlotsReportsFailureWithoutRetry pins that a failed consume is
-// visible but attempted once: the marker keeps its lease, and the expiry purge
-// plus the periodic reconciliation repair the counter.
-func TestConsumeSlotsReportsFailureWithoutRetry(t *testing.T) {
-	store := &fakeCoordStore{
-		consumeFails: 1,
-		pending:      map[string][]string{"ws-a": {"w-mine"}},
-	}
-	s, m := newSlotTestScheduler(t, store, "ws-a")
-	s.consumeSlots(context.Background(), slotPair("ws-a", "g-mine", "w-mine"))
-
-	if store.consumeCalls != 2 {
-		t.Fatalf("consume calls = %d, want 2 (one attempt per level, no retry)", store.consumeCalls)
-	}
-	if !store.hasPending("ws-a", "w-mine") {
-		t.Fatal("the failed level dropped its marker")
-	}
-	if len(m.errors) != 1 || m.errors[0] != "consume_slot" {
-		t.Fatalf("state errors = %v, want one consume_slot", m.errors)
-	}
-}
-
-// TestConsumeSlotsFailureOnBothLevelsNeverRetries pins the single-attempt
-// bound per level even when both levels fail.
-func TestConsumeSlotsFailureOnBothLevelsNeverRetries(t *testing.T) {
-	store := &fakeCoordStore{consumeFails: 2}
-	s, m := newSlotTestScheduler(t, store, "ws-a")
-	s.consumeSlots(context.Background(), slotPair("ws-a", "g-mine", "w-mine"))
-
-	if store.consumeCalls != 2 {
-		t.Fatalf("consume calls = %d, want 2 (one attempt per level)", store.consumeCalls)
-	}
-	if len(m.errors) != 2 {
-		t.Fatalf("state errors = %v, want two consume_slot", m.errors)
-	}
 }
 
 // TestReserveSlotsCompensationSurvivesAnExhaustedCall pins that the global slot
@@ -357,11 +269,11 @@ func TestReserveSlotsRefusedWorkspaceReturnsTheGlobalSlot(t *testing.T) {
 // decrement: a live row below the counter is a slot the row owns, so the
 // periodic round raises the counter to the row count instead of only lowering.
 func TestReconcileSlotsRaisesToTheRowFloor(t *testing.T) {
-	store := &fakeCoordStore{counts: map[string]int64{"": 0, "ws-a": 0}}
-	s, m := newSlotTestScheduler(t, store, "ws-a")
-	if err := s.reg.Put(registry.TaskEntry{TaskID: "t-1", WorkspaceID: "ws-a", DaemonID: "d-1", State: registry.StateRunning}); err != nil {
-		t.Fatalf("put: %v", err)
+	store := &fakeCoordStore{
+		counts: map[string]int64{"": 0, "ws-a": 0},
+		rows:   []registry.TaskEntry{{TaskID: "t-1", WorkspaceID: "ws-a", DaemonID: "d-1", State: registry.StateRunning}},
 	}
+	s, m := newSlotTestScheduler(t, store, "ws-a")
 
 	if err := s.ReconcileSlots(context.Background()); err != nil {
 		t.Fatalf("ReconcileSlots: %v", err)
@@ -399,11 +311,9 @@ func TestReconcileSlotsExactResetsEachLevelInOneStep(t *testing.T) {
 	store := &fakeCoordStore{
 		counts:  map[string]int64{"": 2, "ws-a": 2},
 		pending: map[string][]string{"": {"g-dead"}, "ws-a": {"w-dead"}},
+		rows:    []registry.TaskEntry{{TaskID: "t-1", WorkspaceID: "ws-a", DaemonID: "d-1", State: registry.StateRunning}},
 	}
 	s, _ := newSlotTestScheduler(t, store, "ws-a")
-	if err := s.reg.Put(registry.TaskEntry{TaskID: "t-1", WorkspaceID: "ws-a", DaemonID: "d-1", State: registry.StateRunning}); err != nil {
-		t.Fatalf("put: %v", err)
-	}
 	if err := s.reconcileSlots(context.Background(), true); err != nil {
 		t.Fatalf("reconcileSlots(exact): %v", err)
 	}
@@ -447,11 +357,11 @@ func TestReconcileSlotsExactResetsEachLevelInOneStep(t *testing.T) {
 // TestReconcileSlotsStillLowersALeak pins the other periodic direction: a
 // counter above the rows plus live reservations is lowered.
 func TestReconcileSlotsStillLowersALeak(t *testing.T) {
-	store := &fakeCoordStore{counts: map[string]int64{"": 5, "ws-a": 5}}
-	s, _ := newSlotTestScheduler(t, store, "ws-a")
-	if err := s.reg.Put(registry.TaskEntry{TaskID: "t-1", WorkspaceID: "ws-a", DaemonID: "d-1", State: registry.StateRunning}); err != nil {
-		t.Fatalf("put: %v", err)
+	store := &fakeCoordStore{
+		counts: map[string]int64{"": 5, "ws-a": 5},
+		rows:   []registry.TaskEntry{{TaskID: "t-1", WorkspaceID: "ws-a", DaemonID: "d-1", State: registry.StateRunning}},
 	}
+	s, _ := newSlotTestScheduler(t, store, "ws-a")
 	if err := s.ReconcileSlots(context.Background()); err != nil {
 		t.Fatalf("ReconcileSlots: %v", err)
 	}
@@ -466,11 +376,11 @@ func TestReconcileSlotsStillLowersALeak(t *testing.T) {
 // row with no workspace id raises the global counter but never becomes a
 // workspace key that could overwrite it.
 func TestReconcileSlotsEmptyWorkspaceCountsGloballyOnly(t *testing.T) {
-	store := &fakeCoordStore{counts: map[string]int64{"": 0, "ws-a": 0}}
-	s, _ := newSlotTestScheduler(t, store, "ws-a")
-	if err := s.reg.Put(registry.TaskEntry{TaskID: "t-1", WorkspaceID: "", DaemonID: "d-1", State: registry.StateRunning}); err != nil {
-		t.Fatalf("put: %v", err)
+	store := &fakeCoordStore{
+		counts: map[string]int64{"": 0, "ws-a": 0},
+		rows:   []registry.TaskEntry{{TaskID: "t-1", WorkspaceID: "", DaemonID: "d-1", State: registry.StateRunning}},
 	}
+	s, _ := newSlotTestScheduler(t, store, "ws-a")
 	if err := s.ReconcileSlots(context.Background()); err != nil {
 		t.Fatalf("ReconcileSlots: %v", err)
 	}
@@ -488,17 +398,13 @@ func TestReconcileSlotsCountsALiveReservationWithTheRows(t *testing.T) {
 	store := &fakeCoordStore{
 		counts:  map[string]int64{"": 3, "ws-a": 2},
 		pending: map[string][]string{"": {"g-live"}},
+		rows: []registry.TaskEntry{
+			{TaskID: "t-1", WorkspaceID: "ws-a", DaemonID: "d-1", State: registry.StateRunning},
+			{TaskID: "t-2", WorkspaceID: "ws-a", DaemonID: "d-2", State: registry.StateRunning},
+			{TaskID: "t-nos", DaemonID: "d-3", State: registry.StateDaemonRegistered},
+		},
 	}
 	s, _ := newSlotTestScheduler(t, store, "ws-a")
-	for _, e := range []registry.TaskEntry{
-		{TaskID: "t-1", WorkspaceID: "ws-a", DaemonID: "d-1", State: registry.StateRunning},
-		{TaskID: "t-2", WorkspaceID: "ws-a", DaemonID: "d-2", State: registry.StateRunning},
-		{TaskID: "t-nos", DaemonID: "d-3", State: registry.StateDaemonRegistered},
-	} {
-		if err := s.reg.Put(e); err != nil {
-			t.Fatalf("put %s: %v", e.TaskID, err)
-		}
-	}
 	if err := s.ReconcileSlots(context.Background()); err != nil {
 		t.Fatalf("ReconcileSlots: %v", err)
 	}
@@ -528,6 +434,40 @@ func TestReconcileSlotsCountsALiveReservationWithTheRows(t *testing.T) {
 	}
 }
 
+// TestReconcileSlotsDoesNotDoubleCountAConvertedReservation pins the claim's
+// slot conversion: the row retires its reservation marker in the same store
+// step, so a round whose snapshot predates that step must recompute instead of
+// writing the rows plus a marker the row already paid for. Without the guard
+// the level would settle one above its live rows and keep that extra slot out
+// of the budget for good — the shape AC-100's shared form hit.
+func TestReconcileSlotsDoesNotDoubleCountAConvertedReservation(t *testing.T) {
+	store := &fakeCoordStore{
+		counts:  map[string]int64{"ws-a": 1},
+		pending: map[string][]string{"ws-a": {"w-claim"}},
+	}
+	s, _ := newSlotTestScheduler(t, store, "ws-a")
+	// The conversion lands between the snapshot and the rows read: the row
+	// becomes visible and the marker goes away, the counter untouched (the
+	// reservation's +1 is the row's slot now).
+	store.snapshotHook = func(ws string) {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		store.rows = append(store.rows, registry.TaskEntry{
+			TaskID: "t-1", WorkspaceID: "ws-a", DaemonID: "d-1", State: registry.StateRunning,
+		})
+		store.removeReservation(ws, "w-claim")
+	}
+	if err := s.repairLevel(context.Background(), "ws-a"); err != nil {
+		t.Fatalf("repairLevel: %v", err)
+	}
+	if got := store.counts["ws-a"]; got != 1 {
+		t.Fatalf("workspace counter = %d, want 1 (the row owns the slot the marker held)", got)
+	}
+	if len(store.casCalls) != 0 {
+		t.Fatalf("the round wrote again after the conversion: %+v", store.casCalls)
+	}
+}
+
 // TestReconcileSlotsRetriesWhenAClaimLandsInTheWindow pins the round's other
 // half: a claim that lands between the read and the write declines the
 // compare-and-set, and the round recomputes rather than leaving the level
@@ -536,17 +476,13 @@ func TestReconcileSlotsRetriesWhenAClaimLandsInTheWindow(t *testing.T) {
 	store := &fakeCoordStore{
 		counts:  map[string]int64{"": 2, "ws-a": 2},
 		pending: map[string][]string{},
+		rows: []registry.TaskEntry{
+			{TaskID: "t-1", WorkspaceID: "ws-a", DaemonID: "d-1", State: registry.StateRunning},
+			{TaskID: "t-2", WorkspaceID: "ws-a", DaemonID: "d-2", State: registry.StateRunning},
+			{TaskID: "t-nos", DaemonID: "d-3", State: registry.StateDaemonRegistered},
+		},
 	}
 	s, _ := newSlotTestScheduler(t, store, "ws-a")
-	for _, e := range []registry.TaskEntry{
-		{TaskID: "t-1", WorkspaceID: "ws-a", DaemonID: "d-1", State: registry.StateRunning},
-		{TaskID: "t-2", WorkspaceID: "ws-a", DaemonID: "d-2", State: registry.StateRunning},
-		{TaskID: "t-nos", DaemonID: "d-3", State: registry.StateDaemonRegistered},
-	} {
-		if err := s.reg.Put(e); err != nil {
-			t.Fatalf("put %s: %v", e.TaskID, err)
-		}
-	}
 	// A claim reserves right after the first global read: the counter becomes
 	// 3 with a live marker, so the write the round had computed (2 -> 3) must
 	// not land.

@@ -184,8 +184,8 @@ func TestCoordMergeCannotRevertAGateField(t *testing.T) {
 }
 
 // TestCoordSlotRetireOnlyTouchesItsOwnReservation pins the reservation id as an
-// identity: consume and release delete the marker they name, never the oldest
-// pending one that another claim still owns.
+// identity: the claim's row write and a release delete the marker they name,
+// never the oldest pending one that another claim still owns.
 func TestCoordSlotRetireOnlyTouchesItsOwnReservation(t *testing.T) {
 	ctx := context.Background()
 	_, store, _, mr := coordTestStore(t)
@@ -201,20 +201,22 @@ func TestCoordSlotRetireOnlyTouchesItsOwnReservation(t *testing.T) {
 		t.Fatalf("two reservations share the id %q", mine)
 	}
 
-	// The consume retires only the caller's marker; the counter keeps counting
-	// the row that now owns the slot.
-	if err := store.ConsumeSlotReservation(ctx, "", mine); err != nil {
-		t.Fatalf("consume mine: %v", err)
+	// The claim's row retires only the caller's marker; the counter keeps
+	// counting the row that now owns the slot.
+	row := coordTestEntry("t-1", `{"id":"t-1"}`)
+	row.JobName = "fm-t-1"
+	if err := store.SetEntryRetiringSlots(ctx, "ws-1", "t-1", row, []registry.SlotRetirement{{ID: mine}}); err != nil {
+		t.Fatalf("retire mine: %v", err)
 	}
 	assertReservations(t, mr, keySlotResAll, other)
 	if n, live, err := store.SlotSnapshot(ctx, ""); err != nil || n != 2 || live != 1 {
-		t.Fatalf("after consume: counter=%d live=%d err=%v, want (2,1)", n, live, err)
+		t.Fatalf("after the conversion: counter=%d live=%d err=%v, want (2,1)", n, live, err)
 	}
 
 	// Retiring a marker that is already gone leaves the counter alone: a
 	// repeated release must not decrement a live row's slot.
 	if err := store.ReleaseSlot(ctx, "", mine); err != nil {
-		t.Fatalf("release consumed marker: %v", err)
+		t.Fatalf("release retired marker: %v", err)
 	}
 	if n, live, err := store.SlotSnapshot(ctx, ""); err != nil || n != 2 || live != 1 {
 		t.Fatalf("after repeated release: counter=%d live=%d err=%v, want (2,1)", n, live, err)
@@ -238,8 +240,10 @@ func TestCoordSlotRetireOnlyTouchesItsOwnReservation(t *testing.T) {
 	if _, live, err := store.SlotSnapshot(ctx, ""); err != nil || live != 0 {
 		t.Fatalf("live reservations after expiry = %d (err %v), want 0", live, err)
 	}
-	if err := store.ConsumeSlotReservation(ctx, "", stale); err != nil {
-		t.Fatalf("consume stale: %v", err)
+	staleRow := coordTestEntry("t-2", `{"id":"t-2"}`)
+	staleRow.JobName = "fm-t-2"
+	if err := store.SetEntryRetiringSlots(ctx, "ws-1", "t-2", staleRow, []registry.SlotRetirement{{ID: stale}}); err != nil {
+		t.Fatalf("retire stale: %v", err)
 	}
 	if err := store.ReleaseSlot(ctx, "", stale); err != nil {
 		t.Fatalf("release stale: %v", err)
@@ -394,8 +398,9 @@ func TestCoordSessionIndex(t *testing.T) {
 }
 
 // TestCoordSlotSnapshotCAS pins the reconciliation's atomic read + conditional
-// write: a reservation taken between the snapshot and the write must make the
-// CAS decline (never lose the +1), and an unchanged counter must be writable.
+// write: a reservation taken between the snapshot and the write, or a
+// conversion that retired a marker after it, must make the CAS decline, and
+// an unchanged pair must be writable.
 func TestCoordSlotSnapshotCAS(t *testing.T) {
 	ctx := context.Background()
 	_, store, _, mr := coordTestStore(t)
@@ -411,7 +416,7 @@ func TestCoordSlotSnapshotCAS(t *testing.T) {
 	if _, ok, err := store.ReserveSlot(ctx, "", 10); err != nil || !ok {
 		t.Fatalf("second reserve: ok=%v err=%v", ok, err)
 	}
-	swapped, err := store.CompareAndSetSlots(ctx, "", count, 0)
+	swapped, err := store.CompareAndSetSlots(ctx, "", count, reservations, 0)
 	if err != nil {
 		t.Fatalf("cas: %v", err)
 	}
@@ -423,13 +428,16 @@ func TestCoordSlotSnapshotCAS(t *testing.T) {
 	}
 
 	// No concurrent change: the CAS lands.
-	count, _, _ = store.SlotSnapshot(ctx, "")
-	swapped, err = store.CompareAndSetSlots(ctx, "", count, 1)
+	count, reservations, err = store.SlotSnapshot(ctx, "")
+	if err != nil || count != 2 || reservations != 2 {
+		t.Fatalf("fresh snapshot = (%d,%d) err=%v, want (2,2)", count, reservations, err)
+	}
+	swapped, err = store.CompareAndSetSlots(ctx, "", count, reservations, count)
 	if err != nil || !swapped {
 		t.Fatalf("cas unchanged: swapped=%v err=%v", swapped, err)
 	}
-	if got, _ := store.Slots(ctx, ""); got != 1 {
-		t.Fatalf("counter after the CAS = %d, want 1", got)
+	if got, _ := store.Slots(ctx, ""); got != 2 {
+		t.Fatalf("counter after the CAS = %d, want 2", got)
 	}
 
 	// Expiry is part of the snapshot: past the reservation TTL (store clock)
@@ -439,6 +447,94 @@ func TestCoordSlotSnapshotCAS(t *testing.T) {
 	count, reservations, err = store.SlotSnapshot(ctx, "")
 	if err != nil || count != 0 || reservations != 0 {
 		t.Fatalf("snapshot after expiry = (%d,%d) err=%v, want (0,0)", count, reservations, err)
+	}
+}
+
+// TestCoordSlotCASGuardsTheMarkerCount pins the conversion guard: a claim's row
+// retires its reservation marker without moving the counter, so a round whose
+// snapshot predates that step still sees the marker. The guard must decline the
+// write the stale snapshot produced — the row now owns the slot the marker
+// counted, and writing the doubled value would keep one slot out of the budget
+// for good.
+func TestCoordSlotCASGuardsTheMarkerCount(t *testing.T) {
+	ctx := context.Background()
+	_, store, _, _ := coordTestStore(t)
+	id, ok, err := store.ReserveSlot(ctx, "", 10)
+	if err != nil || !ok {
+		t.Fatalf("reserve: ok=%v err=%v", ok, err)
+	}
+	count, reservations, err := store.SlotSnapshot(ctx, "")
+	if err != nil || count != 1 || reservations != 1 {
+		t.Fatalf("snapshot = (%d,%d) err=%v, want (1,1)", count, reservations, err)
+	}
+	// The claim's row lands with the marker retired; the counter is untouched
+	// because the reservation's +1 is the row's slot now.
+	row := coordTestEntry("t-1", `{"id":"t-1"}`)
+	row.JobName = "fm-t-1"
+	if err := store.SetEntryRetiringSlots(ctx, "ws-1", "t-1", row, []registry.SlotRetirement{{ID: id}}); err != nil {
+		t.Fatalf("retire: %v", err)
+	}
+	swapped, err := store.CompareAndSetSlots(ctx, "", count, reservations, 0)
+	if err != nil {
+		t.Fatalf("cas: %v", err)
+	}
+	if swapped {
+		t.Fatal("CAS succeeded after the marker retired, writing a counter below the live row")
+	}
+	if got, _ := store.Slots(ctx, ""); got != 1 {
+		t.Fatalf("counter after the declined CAS = %d, want 1", got)
+	}
+	// The recomputed round sees the conversion and finds the level exact.
+	count, reservations, err = store.SlotSnapshot(ctx, "")
+	if err != nil || count != 1 || reservations != 0 {
+		t.Fatalf("fresh snapshot = (%d,%d) err=%v, want (1,0)", count, reservations, err)
+	}
+	if swapped, err := store.CompareAndSetSlots(ctx, "", count, reservations, count); err != nil || !swapped {
+		t.Fatalf("cas on the fresh pair: swapped=%v err=%v", swapped, err)
+	}
+}
+
+// TestCoordSetEntryRetiringSlotsConvertsInOneStep pins the claim's conversion:
+// the row (with its Job index) and the retirement of its reservation markers
+// are one store step, so a reader of the counter, the markers and the rows can
+// never find the same in-flight slot on both sides of the handoff. Retiring a
+// marker also survives the reservation TTL: the row owns the slot, so the
+// expiry purge has nothing left to return.
+func TestCoordSetEntryRetiringSlotsConvertsInOneStep(t *testing.T) {
+	ctx := context.Background()
+	_, store, _, mr := coordTestStore(t)
+	globalID, ok, err := store.ReserveSlot(ctx, "", 4)
+	if err != nil || !ok {
+		t.Fatalf("global reserve: ok=%v err=%v", ok, err)
+	}
+	levelID, ok, err := store.ReserveSlot(ctx, "ws-1", 4)
+	if err != nil || !ok {
+		t.Fatalf("workspace reserve: ok=%v err=%v", ok, err)
+	}
+	e := coordTestEntry("t-1", `{"id":"t-1"}`)
+	e.JobName = "fm-t-1"
+	if err := store.SetEntryRetiringSlots(ctx, "ws-1", "t-1", e, []registry.SlotRetirement{
+		{WorkspaceID: "ws-1", ID: levelID},
+		{ID: globalID},
+	}); err != nil {
+		t.Fatalf("SetEntryRetiringSlots: %v", err)
+	}
+	for _, ws := range []string{"", "ws-1"} {
+		count, reservations, err := store.SlotSnapshot(ctx, ws)
+		if err != nil || count != 1 || reservations != 0 {
+			t.Fatalf("level %q snapshot = (%d,%d) err=%v, want (1,0)", ws, count, reservations, err)
+		}
+	}
+	if got, ok, err := store.GetEntry(ctx, "ws-1", "t-1"); err != nil || !ok || got.TaskID != "t-1" {
+		t.Fatalf("row = %+v (ok=%v err=%v), want t-1", got, ok, err)
+	}
+	if byJob, ok, err := store.GetEntryByJob(ctx, "fm-t-1"); err != nil || !ok || byJob.TaskID != "t-1" {
+		t.Fatalf("row by Job = %+v (ok=%v err=%v), want t-1", byJob, ok, err)
+	}
+	// The retired markers cannot come back through the lease purge.
+	mr.SetTime(time.Now().Add(reservationTTL + time.Minute))
+	if count, reservations, err := store.SlotSnapshot(ctx, ""); err != nil || count != 1 || reservations != 0 {
+		t.Fatalf("snapshot after the TTL = (%d,%d) err=%v, want (1,0)", count, reservations, err)
 	}
 }
 

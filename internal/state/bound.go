@@ -205,6 +205,12 @@ func (s *redisStore) SetEntry(ctx context.Context, ws, taskID string, e registry
 	return storeCall0(s, ctx, func(ctx context.Context) error { return s.setEntry(ctx, ws, taskID, e) })
 }
 
+func (s *redisStore) SetEntryRetiringSlots(ctx context.Context, ws, taskID string, e registry.TaskEntry, retire []registry.SlotRetirement) error {
+	return storeCall0(s, ctx, func(ctx context.Context) error {
+		return s.setEntryRetiringSlots(ctx, ws, taskID, e, retire)
+	})
+}
+
 func (s *redisStore) MergeEntry(ctx context.Context, ws, taskID string, p registry.EntryPatch) error {
 	return storeCall0(s, ctx, func(ctx context.Context) error { return s.mergeEntry(ctx, ws, taskID, p) })
 }
@@ -295,10 +301,6 @@ func (s *redisStore) ReserveSlot(ctx context.Context, ws string, limit int) (str
 	})
 }
 
-func (s *redisStore) ConsumeSlotReservation(ctx context.Context, ws, id string) error {
-	return storeCall0(s, ctx, func(ctx context.Context) error { return s.consumeSlotReservation(ctx, ws, id) })
-}
-
 func (s *redisStore) ReleaseSlot(ctx context.Context, ws, id string) error {
 	return storeCall0(s, ctx, func(ctx context.Context) error { return s.releaseSlot(ctx, ws, id) })
 }
@@ -313,9 +315,9 @@ func (s *redisStore) SlotSnapshot(ctx context.Context, ws string) (int64, int64,
 	})
 }
 
-func (s *redisStore) CompareAndSetSlots(ctx context.Context, ws string, expected, next int64) (bool, error) {
+func (s *redisStore) CompareAndSetSlots(ctx context.Context, ws string, expected, expectedReservations, next int64) (bool, error) {
 	return storeCall(s, ctx, func(ctx context.Context) (bool, error) {
-		return s.compareAndSetSlots(ctx, ws, expected, next)
+		return s.compareAndSetSlots(ctx, ws, expected, expectedReservations, next)
 	})
 }
 

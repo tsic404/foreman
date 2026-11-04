@@ -38,11 +38,19 @@ func (r *Registry) releaseSlotsShared(ws string) {
 
 // writeShared persists a full row through the stage-two face. It is the claim
 // time path (the caller holds the task write lock), so it is synchronous: the
-// row must be visible to the instance that will serve the Job's daemon.
-func (r *Registry) writeShared(e TaskEntry) error {
+// row must be visible to the instance that will serve the Job's daemon. A
+// claim's reservations retire in the same store step as the row, so a
+// reconciliation never reads a row and its reservation marker together.
+func (r *Registry) writeShared(e TaskEntry, retire []SlotRetirement) error {
 	ctx, cancel := r.sharedCtx()
 	defer cancel()
-	if err := r.shared.SetEntry(ctx, e.WorkspaceID, e.TaskID, e); err != nil {
+	var err error
+	if len(retire) == 0 {
+		err = r.shared.SetEntry(ctx, e.WorkspaceID, e.TaskID, e)
+	} else {
+		err = r.shared.SetEntryRetiringSlots(ctx, e.WorkspaceID, e.TaskID, e, retire)
+	}
+	if err != nil {
 		r.stateFailure("put_entry", e.TaskID, err)
 		return err
 	}

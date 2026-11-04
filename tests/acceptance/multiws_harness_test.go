@@ -271,7 +271,15 @@ func newMultiWSFromIdentitiesWithCoord(t *testing.T, identities []wsIdentity, ur
 	clientList := make([]*proxy.Client, 0, len(identities))
 	logs := &syncBuffer{}
 	metrics := &recordingMetrics{}
-	reg := registry.New(time.Now, registry.WithDeliveryConfirmTimeout(300*time.Millisecond))
+	regOpts := []registry.Option{registry.WithDeliveryConfirmTimeout(300 * time.Millisecond)}
+	if shared, ok := coord.(registry.StateStore); ok {
+		// The shared form persists its rows through the same store the
+		// scheduler reads its counters from, exactly as the deployment wires
+		// them: the claim's row and its reservation markers then share one
+		// store step.
+		regOpts = append(regOpts, registry.WithStateStore(shared))
+	}
+	reg := registry.New(time.Now, regOpts...)
 	probes := registry.NewProbeRegistry()
 
 	ids := make([]string, 0, len(identities))

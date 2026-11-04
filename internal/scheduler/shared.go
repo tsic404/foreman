@@ -90,9 +90,9 @@ func (s *Scheduler) lockTaskIn(ctx context.Context, ws, taskID string) (func(), 
 
 // SlotReservation is one reservation pair: the ids the shared store returned
 // for the global level and, when the workspace level applies, for that
-// workspace's level. Consume and release take the handle, so a claim only ever
-// retires the pending markers it took itself and never another claim's
-// (AC-76: 预留与 claim 按身份逐套).
+// workspace's level. The claim's row write retires the pair (the row takes the
+// slots over) and release returns it, so a claim only ever touches the pending
+// markers it took itself and never another claim's (AC-76: 预留与 claim 按身份逐套).
 type SlotReservation struct {
 	// workspaceID names the workspace level; levelID is that level's
 	// reservation id and is empty when the pair has no workspace level.
@@ -104,6 +104,22 @@ type SlotReservation struct {
 // isZero reports that no reservation id is held: a stage-one deployment has no
 // shared store, so its slot pairs are empty and every slot write is a no-op.
 func (r SlotReservation) isZero() bool { return r.globalID == "" && r.levelID == "" }
+
+// retirements names the markers this pair owns, for the claim row's write: the
+// row takes the slots over in the same store step that retires them.
+func (r SlotReservation) retirements() []registry.SlotRetirement {
+	if r.isZero() {
+		return nil
+	}
+	out := make([]registry.SlotRetirement, 0, 2)
+	if r.levelID != "" {
+		out = append(out, registry.SlotRetirement{WorkspaceID: r.workspaceID, ID: r.levelID})
+	}
+	if r.globalID != "" {
+		out = append(out, registry.SlotRetirement{ID: r.globalID})
+	}
+	return out
+}
 
 // reserveSlots takes one slot on both levels (AC-76) and returns their ids. A
 // refused workspace reservation returns the global one it already took.
@@ -144,35 +160,6 @@ func (s *Scheduler) reserveSlots(ctx context.Context, ws string) (SlotReservatio
 // compensation would leak the reservation until the TTL/reconcile edge.
 func (s *Scheduler) releaseGlobalReservation(globalID string) {
 	_ = s.shared.ReleaseSlot(context.Background(), "", globalID)
-}
-
-// consumeSlots turns the caller's own reservations into entry ownership on
-// both levels. The writes use a detached context: a cancelled claim loop must
-// still retire its markers.
-//
-// A failed consume is reported but not retried: only the named ids go away, so
-// a lost attempt leaves its own marker pending, and the lease purge plus the
-// periodic reconciliation repair the counter without touching any other claim.
-func (s *Scheduler) consumeSlots(ctx context.Context, res SlotReservation) {
-	if s.shared == nil || res.isZero() {
-		return
-	}
-	if res.levelID != "" {
-		s.consumeSlotLevel(res.workspaceID, res.levelID)
-	}
-	s.consumeSlotLevel("", res.globalID)
-}
-
-// consumeSlotLevel retires one reservation id on one level, single attempt
-// (see consumeSlots). The failure is still visible (§9.1 共享状态错误;
-// §10 两级在途上限).
-func (s *Scheduler) consumeSlotLevel(ws, id string) {
-	err := s.shared.ConsumeSlotReservation(context.Background(), ws, id)
-	if err != nil {
-		s.metrics.StateError("consume_slot")
-		s.log.Warn("coordination.consume_slot_failed",
-			"workspace_id", ws, "err", err.Error())
-	}
 }
 
 // releaseSlots abandons the caller's own reservations on both levels. The
@@ -480,18 +467,20 @@ func (s *Scheduler) syncQueueDepth(ctx context.Context) {
 // purged as a second decrement of a slot it never owned.
 //
 // exact=false is the periodic leader-round repair: every level is written to
-// the rows plus that level's live reservations. Both are part of the counter a
-// claim keeps — the reservation holds its slot before its row exists — so a
-// level whose counter differs is a leak (above) or a lost slot (below), and
-// either is repaired in the same round. The write is a compare-and-set against
-// the atomic counter snapshot, so a claim landing between the read and the
-// write makes the attempt recompute instead of losing its +1 or writing a
-// value the store has already overtaken.
+// the shared state's rows plus that level's live reservations. Both are part
+// of the counter a claim keeps — the reservation holds its slot before its row
+// exists — so a level whose counter differs is a leak (above) or a lost slot
+// (below), and either is repaired in the same round. The rows come from the
+// shared state itself, never from a process-local index: another instance's
+// settle is invisible locally, and a raised counter would keep a slot no row
+// owns.
 //
-// Every level's snapshot is taken atomically (purge + counter + reservations)
-// before the rows traversal, so a reservation converted in between is counted
-// twice — the direction that withholds a claim for at most one round, never
-// the one that lets a live row run outside the cap.
+// The write is a compare-and-set on both the counter and the level's live
+// marker count. A claim's row retires its marker in the same store step, so
+// the only way the same in-flight slot could be counted twice is a conversion
+// landing between the snapshot and the rows read; the marker guard makes that
+// attempt recompute instead of writing the doubled value (§10 两级在途上限：
+// 计数与预留: 泄漏在一轮收敛内归零).
 // Every configured workspace is reconciled, including one with no live row: a
 // reservation left by a dead holder must not survive as a permanent budget
 // loss (AC-76). An empty workspace id is not a level — such a row counts in
@@ -517,7 +506,11 @@ func (s *Scheduler) reconcileSlots(ctx context.Context, exact bool) error {
 // resetSlots is the exact write: every level's counter becomes its live-row
 // count and that level's pending markers go away in the same store step.
 func (s *Scheduler) resetSlots(ctx context.Context, levels []string) error {
-	total, perWS := s.liveRows()
+	total, perWS, err := s.sharedRows(ctx)
+	if err != nil {
+		s.metrics.StateError("read_slots")
+		return fmt.Errorf("%w: list rows: %v", ErrStoreUnavailable, err)
+	}
 	for _, ws := range levels {
 		rows := total
 		if ws != "" {
@@ -566,13 +559,12 @@ func (s *Scheduler) repairSlots(ctx context.Context, levels []string) error {
 	return nil
 }
 
-// repairLevel converges one level. Its snapshot is atomic (purge + counter +
-// live reservations) and is taken before the rows traversal, so a reservation
-// converted in between is counted twice: that direction withholds one claim
-// for at most one round, while under-counting would let a live row run outside
-// the cap. A declined compare-and-set means a claim moved the level, so the
-// attempt recomputes from a fresh snapshot rather than writing a value the
-// store has already overtaken.
+// repairLevel converges one level: the snapshot is atomic (purge + counter +
+// live reservations) and the rows are read from the shared state after it, so
+// the only overlap left is a conversion landing between the two reads. The
+// compare-and-set then declines (the marker went away without moving the
+// counter) and the attempt recomputes, instead of writing a value in which the
+// converted slot is counted both as a row and as a pending reservation.
 func (s *Scheduler) repairLevel(ctx context.Context, ws string) error {
 	for range repairSlotAttempts {
 		count, reservations, err := s.shared.SlotSnapshot(ctx, ws)
@@ -581,11 +573,20 @@ func (s *Scheduler) repairLevel(ctx context.Context, ws string) error {
 			return fmt.Errorf("%w: read slot snapshot: %v", ErrStoreUnavailable, err)
 		}
 		s.metrics.SharedSlots(ws, int(count))
-		next := s.liveRowCount(ws) + reservations
+		total, perWS, err := s.sharedRows(ctx)
+		if err != nil {
+			s.metrics.StateError("read_slots")
+			return fmt.Errorf("%w: list rows: %v", ErrStoreUnavailable, err)
+		}
+		next := total
+		if ws != "" {
+			next = perWS[ws]
+		}
+		next += reservations
 		if count == next {
 			return nil
 		}
-		swapped, err := s.shared.CompareAndSetSlots(ctx, ws, count, next)
+		swapped, err := s.shared.CompareAndSetSlots(ctx, ws, count, reservations, next)
 		if err != nil {
 			s.metrics.StateError("reconcile_slots")
 			return fmt.Errorf("%w: reconcile slots: %v", ErrStoreUnavailable, err)
@@ -605,22 +606,18 @@ func (s *Scheduler) repairLevel(ctx context.Context, ws string) error {
 	return nil
 }
 
-// liveRowCount counts one level's live rows: the global total, or the
-// workspace's own. An empty workspace id is not a level of its own — such a
-// row counts in the global total only, never as a workspace key.
-func (s *Scheduler) liveRowCount(ws string) int64 {
-	total, perWS := s.liveRows()
-	if ws == "" {
-		return total
+// sharedRows counts the shared state's non-terminal rows once: the global
+// total and the per-workspace totals the two counter levels need. The counter
+// lives in the shared state, so its reconciliation reads the rows from there
+// too — a process-local index would miss another instance's claim and keep a
+// row it already settled (§10 计数存共享状态面).
+func (s *Scheduler) sharedRows(ctx context.Context) (total int64, perWS map[string]int64, err error) {
+	rows, err := s.shared.ListEntries(ctx)
+	if err != nil {
+		return 0, nil, err
 	}
-	return perWS[ws]
-}
-
-// liveRows counts the non-terminal rows once: the global total and the
-// per-workspace totals the two counter levels need.
-func (s *Scheduler) liveRows() (total int64, perWS map[string]int64) {
 	perWS = make(map[string]int64)
-	for _, e := range s.reg.List() {
+	for _, e := range rows {
 		if e.State == registry.StateTerminal {
 			continue
 		}
@@ -629,7 +626,7 @@ func (s *Scheduler) liveRows() (total int64, perWS map[string]int64) {
 			perWS[e.WorkspaceID]++
 		}
 	}
-	return total, perWS
+	return total, perWS, nil
 }
 
 // AttachShared attaches a follower instance to the shared state: it restores
