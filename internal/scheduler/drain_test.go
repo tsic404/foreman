@@ -734,8 +734,7 @@ func (l *lockStore) ReserveSlot(_ context.Context, ws string, limit int) (string
 	return fmt.Sprintf("%s#%d", ws, l.nextID), true, nil
 }
 
-func (l *lockStore) ConsumeSlotReservation(context.Context, string, string) error { return nil }
-func (l *lockStore) ReleaseSlot(context.Context, string, string) error            { return nil }
+func (l *lockStore) ReleaseSlot(context.Context, string, string) error { return nil }
 
 func (l *lockStore) EnqueueEntry(context.Context, string, string, registry.TaskEntry) (bool, error) {
 	return true, nil

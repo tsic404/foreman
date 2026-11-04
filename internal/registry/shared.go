@@ -19,6 +19,13 @@ type EntryPatch struct {
 	TokenHash      *string
 }
 
+// SlotRetirement names one reservation marker whose in-flight slot a claim's
+// row takes over. The empty workspace is the cluster level.
+type SlotRetirement struct {
+	WorkspaceID string
+	ID          string
+}
+
 // SharedSessionNode is one soft-affinity row read from the shared store: the
 // raw body plus the lifetime the store still holds on it (zero when the row
 // has no expiry). The lifetime comes from the store's clock — the reader turns
@@ -38,6 +45,12 @@ type SharedStore interface {
 	// SetEntry writes the full row (claim time; the caller holds the task
 	// write lock).
 	SetEntry(ctx context.Context, ws, taskID string, e TaskEntry) error
+	// SetEntryRetiringSlots writes the full row and retires the named
+	// reservation markers in one store step. The claim path uses it so the
+	// conversion "reservation becomes row" has no window: a reconciliation
+	// that compares the shared rows with the shared counters can never count
+	// the same in-flight slot twice (02-contracts.md §10 两级在途上限：计数与预留).
+	SetEntryRetiringSlots(ctx context.Context, ws, taskID string, e TaskEntry, retire []SlotRetirement) error
 	// MergeEntry applies the patch to the stored row in place.
 	MergeEntry(ctx context.Context, ws, taskID string, p EntryPatch) error
 	// ConfirmStart writes the once-only start fact; advance moves the state to

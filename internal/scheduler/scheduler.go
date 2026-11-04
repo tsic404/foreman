@@ -683,8 +683,9 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 	defer s.SyncInflight()
 	workspace := workspaceID
 	owned := false
-	// The caller's reservation (or the one this call takes below) is consumed
-	// by the entry only when reg.Put lands; every other exit returns it.
+	// The caller's reservation (or the one this call takes below) becomes the
+	// row's slot only when the combined write lands; every other exit returns
+	// it.
 	defer func() {
 		if reserved && !owned {
 			s.releaseSlots(ctx, res)
@@ -814,15 +815,14 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 		}
 		reserved = true
 	}
-	if err := s.reg.Put(e); err != nil {
+	// The row takes the caller's reserved slots over in the same store step
+	// that retires their markers: the conversion has no window in which the
+	// same in-flight slot is counted both as a row and as a pending
+	// reservation (§10 计数存共享状态面，泄漏在一轮收敛内归零).
+	if err := s.reg.PutTakingSlots(e, res.retirements()); err != nil {
 		return fmt.Errorf("register task %s: %w", e.TaskID, err)
 	}
 	owned = true
-	if reserved {
-		// The reservations become the entry's in-flight slot (counter
-		// unchanged, pending markers gone).
-		s.consumeSlots(ctx, res)
-	}
 	// The claim is enqueued once, before any object exists: the queue row and
 	// the mapping row are the delivery face any instance reads (§5 单次入队).
 	if err := s.enqueueShared(ctx, e); err != nil {
@@ -2796,12 +2796,12 @@ func (s *Scheduler) settleMalformedClaim(ctx context.Context, id string, task js
 			return err
 		}
 	}
-	if err := s.reg.Put(e); err != nil {
+	// The row takes the reservation over in the same store step (see
+	// onClaimFor); the terminal write returns its slot.
+	if err := s.reg.PutTakingSlots(e, res.retirements()); err != nil {
 		s.releaseSlots(ctx, res)
 		return err
 	}
-	// The reservation is the row's slot now; the terminal write returns it.
-	s.consumeSlots(ctx, res)
 	s.failClaim(ctx, e, cause)
 	return nil
 }

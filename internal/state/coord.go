@@ -77,6 +77,12 @@ type CoordStore interface {
 
 	// SetEntry writes the full mapping row (claim time) and its Job index.
 	SetEntry(ctx context.Context, ws, taskID string, e registry.TaskEntry) error
+	// SetEntryRetiringSlots writes the row and the Job index and retires the
+	// named reservation markers in one step: the claim's in-flight slot passes
+	// from the marker to the row with no instant in which both hold it, so a
+	// counter reconciliation can never count it twice (§10 两级在途上限：
+	// 计数与预留).
+	SetEntryRetiringSlots(ctx context.Context, ws, taskID string, e registry.TaskEntry, retire []registry.SlotRetirement) error
 	// MergeEntry applies the in-place patch to the stored row.
 	MergeEntry(ctx context.Context, ws, taskID string, p registry.EntryPatch) error
 	// EnqueueEntry performs the single enqueue: a task keeps one queue row and
@@ -130,12 +136,9 @@ type CoordStore interface {
 	// a non-positive limit means that level is uncapped, not a zero budget.
 	// It returns the reservation's id on success. The reservation is tracked with
 	// a lease, so the reconciliation can tell a pending claim apart from a
-	// leaked count; the id is the handle that consumes or releases exactly
-	// this reservation and never another caller's.
+	// leaked count; the id is the handle a claim's row retires or a release
+	// returns, and it never touches another caller's.
 	ReserveSlot(ctx context.Context, ws string, limit int) (id string, ok bool, err error)
-	// ConsumeSlotReservation converts the reservation id into entry ownership:
-	// the counter is unchanged, only that pending marker goes away.
-	ConsumeSlotReservation(ctx context.Context, ws, id string) error
 	// ReleaseSlot abandons the reservation id and returns its slot.
 	ReleaseSlot(ctx context.Context, ws, id string) error
 	// ReleaseEntry returns an entry's in-flight slot (terminal or reclaimed
@@ -146,8 +149,10 @@ type CoordStore interface {
 	// snapshot: the reconciliation's read face.
 	SlotSnapshot(ctx context.Context, ws string) (count, reservations int64, err error)
 	// CompareAndSetSlots writes next only when the counter still equals
-	// expected, so a concurrent claim's reservation can never be lost.
-	CompareAndSetSlots(ctx context.Context, ws string, expected, next int64) (bool, error)
+	// expected and the level still holds expectedReservations live markers, so
+	// a concurrent claim's reservation can never be lost nor a conversion that
+	// retired a marker after the snapshot be counted twice.
+	CompareAndSetSlots(ctx context.Context, ws string, expected, expectedReservations, next int64) (bool, error)
 	// ResetSlots is the takeover's exact write: it drops every pending
 	// reservation of one level and writes the counter in one step. The
 	// previous holder is gone, so none of its reservations can still become a
@@ -310,12 +315,21 @@ redis.call('SET', KEYS[2], ARGV[3], 'PX', ARGV[4])
 redis.call('DEL', KEYS[3])
 return 1`)
 
-	// setIndexed: KEYS[1]=row, KEYS[2]=job index; ARGV[1]=row raw,
-	// ARGV[2]=index value, ARGV[3]=ttl ms.
-	scriptSetIndexed = redis.NewScript(`
+	// setEntryRetiringSlots: KEYS[1]=row, KEYS[2]=job index, KEYS[3..]=reservation
+	// zsets; ARGV[1]=row raw, ARGV[2]=index value, ARGV[3]=ttl ms, ARGV[4]="1"
+	// when the row is indexed, ARGV[5..]=reservation ids aligned with KEYS[3..].
+	// The claim's row becomes visible in the same step that retires the markers
+	// owning its slots, so no reader can see the row and its marker together.
+	// Only the named ids go away (another claim's marker stays), and a marker
+	// the lease purge already reclaimed is a no-op: the purge returned its slot
+	// already, and the periodic reconciliation raises a counter below the rows.
+	scriptSetEntryRetiringSlots = redis.NewScript(`
 redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[3])
 if ARGV[4] == '1' then
   redis.call('SET', KEYS[2], ARGV[2])
+end
+for i = 3, #KEYS do
+  redis.call('ZREM', KEYS[i], ARGV[i + 2])
 end
 return 1`)
 
@@ -359,15 +373,6 @@ if limit > 0 and n >= limit then
 end
 redis.call('SET', KEYS[1], n + 1)
 redis.call('ZADD', KEYS[2], now + tonumber(ARGV[2]), ARGV[3])
-return 1`)
-
-	// slotConsume: KEYS[1]=reservation zset, ARGV[1]=reservation id. Only the
-	// caller's own marker goes away and the counter is untouched (the row
-	// owns the slot). A marker the expiry purge already reclaimed is a no-op:
-	// that purge already returned its slot, and the periodic reconciliation
-	// raises a counter that fell below the live rows.
-	scriptSlotConsume = redis.NewScript(`
-redis.call('ZREM', KEYS[1], ARGV[1])
 return 1`)
 
 	// slotRelease (reservation): KEYS[1]=counter, KEYS[2]=reservation zset,
@@ -415,11 +420,17 @@ redis.call('DEL', KEYS[2])
 redis.call('SET', KEYS[1], ARGV[1])
 return {before, cleared}`)
 
-	// slotCAS: write next only when the counter still equals expected.
+	// slotCAS: KEYS[1]=counter, KEYS[2]=reservation zset; ARGV[1]=expected
+	// counter, ARGV[2]=expected live reservations, ARGV[3]=next. The marker
+	// count is part of the guard because a claim's conversion retires its
+	// marker without moving the counter: a round whose snapshot predates that
+	// conversion must recompute instead of writing a value computed from rows
+	// the old marker already paid for.
 	scriptSlotCAS = redis.NewScript(`
 local cur = tonumber(redis.call('GET', KEYS[1]) or '0')
 if cur ~= tonumber(ARGV[1]) then return 0 end
-redis.call('SET', KEYS[1], ARGV[2])
+if redis.call('ZCARD', KEYS[2]) ~= tonumber(ARGV[2]) then return 0 end
+redis.call('SET', KEYS[1], ARGV[3])
 return 1`)
 
 	// sessionGet: KEYS[1]=row. Returns {value, pttl ms}, or an empty array on
@@ -560,6 +571,15 @@ func (s *redisStore) casUpdate(ctx context.Context, key string, mutate func(regi
 
 // SetEntry writes the full mapping row and its Job index.
 func (s *redisStore) setEntry(ctx context.Context, ws, taskID string, e registry.TaskEntry) error {
+	return s.setEntryRetiringSlots(ctx, ws, taskID, e, nil)
+}
+
+// setEntryRetiringSlots writes the row and its Job index and retires the given
+// reservation markers in one step: the claim's in-flight slot passes from the
+// marker to the row with no instant in which both hold it. A failed write
+// leaves the row absent and the markers live, so the caller's release returns
+// the slots exactly once.
+func (s *redisStore) setEntryRetiringSlots(ctx context.Context, ws, taskID string, e registry.TaskEntry, retire []registry.SlotRetirement) error {
 	raw, err := s.marshal(e)
 	if err != nil {
 		return err
@@ -570,16 +590,24 @@ func (s *redisStore) setEntry(ctx context.Context, ws, taskID string, e registry
 		_ = s.rdb.Del(ctx, s.jobIndexKey(old.JobName)).Err()
 	}
 	index := ws + "\x00" + taskID
-	// A row without a Job name has no name to index. Writing it anyway would
-	// put every such row on one shared, meaningless key.
-	keys := []string{s.entryKey(ws, taskID)}
+	// A row without a Job name has no name to index: the second key is then the
+	// row key itself, which the script leaves untouched, and the index flag is
+	// off.
+	row := s.entryKey(ws, taskID)
+	keys := []string{row, row}
 	indexed := "0"
 	if e.JobName != "" {
-		keys = append(keys, s.jobIndexKey(e.JobName))
+		keys[1] = s.jobIndexKey(e.JobName)
 		indexed = "1"
 	}
-	err = scriptSetIndexed.Run(ctx, s.rdb, keys,
-		raw, index, s.entryTTL().Milliseconds(), indexed).Err()
+	args := make([]any, 0, 4+len(retire))
+	args = append(args, raw, index, s.entryTTL().Milliseconds(), indexed)
+	for _, r := range retire {
+		_, reservations := slotKeys(r.WorkspaceID)
+		keys = append(keys, reservations)
+		args = append(args, r.ID)
+	}
+	err = scriptSetEntryRetiringSlots.Run(ctx, s.rdb, keys, args...).Err()
 	s.mark(ctx, err)
 	return err
 }
@@ -1043,15 +1071,6 @@ func (s *redisStore) reserveSlot(ctx context.Context, ws string, limit int) (str
 	return id, true, nil
 }
 
-// ConsumeSlotReservation converts the caller's own reservation into entry
-// ownership; another claim's pending marker is never touched.
-func (s *redisStore) consumeSlotReservation(ctx context.Context, ws, id string) error {
-	_, reservations := slotKeys(ws)
-	err := scriptSlotConsume.Run(ctx, s.rdb, []string{reservations}, id).Err()
-	s.mark(ctx, err)
-	return err
-}
-
 // ReleaseSlot abandons the caller's own reservation and returns its slot.
 func (s *redisStore) releaseSlot(ctx context.Context, ws, id string) error {
 	counter, reservations := slotKeys(ws)
@@ -1083,10 +1102,11 @@ func (s *redisStore) slotSnapshot(ctx context.Context, ws string) (int64, int64,
 	return values[0], values[1], nil
 }
 
-// CompareAndSetSlots writes next only when the counter still equals expected.
-func (s *redisStore) compareAndSetSlots(ctx context.Context, ws string, expected, next int64) (bool, error) {
-	counter, _ := slotKeys(ws)
-	n, err := scriptSlotCAS.Run(ctx, s.rdb, []string{counter}, expected, next).Int()
+// CompareAndSetSlots writes next only when the counter and the level's live
+// reservation count still equal expected and expectedReservations.
+func (s *redisStore) compareAndSetSlots(ctx context.Context, ws string, expected, expectedReservations, next int64) (bool, error) {
+	counter, reservations := slotKeys(ws)
+	n, err := scriptSlotCAS.Run(ctx, s.rdb, []string{counter, reservations}, expected, expectedReservations, next).Int()
 	s.mark(ctx, err)
 	if err != nil {
 		return false, err
