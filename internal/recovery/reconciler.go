@@ -464,22 +464,18 @@ func (r *Reconciler) reconcileOne(ctx context.Context, e registry.TaskEntry, pod
 	}
 	if job == nil {
 		// §4.3 未完成创建的接续: a pre-delivery entry whose payload is in the
-		// shared row and whose Job was never created is continued, not
-		// failed — the task never ran and the claim is still ours.
+		// shared row and whose Job was never created belongs to the
+		// continuation, never to the missing-Job compensation — the claim is
+		// still ours and the task's only outcomes are the continued create or
+		// the create-failure attribution. A round that cannot land it (the
+		// digest did not reach the row, a terminating predecessor still holds
+		// the name, a transient object read failed) keeps the entry for the
+		// next round and is never recorded as "the Job is gone"; the window
+		// started here could otherwise fail a task that never ran.
 		if !e.IsTerminal() && !e.IsDraining() && e.State == registry.StatePending &&
 			e.StartedAt.IsZero() && e.DeliveredAt.IsZero() && len(e.Payload) != 0 {
-			if err := r.settler.ContinueClaim(ctx, e.TaskID); err == nil {
-				delete(r.missing, e.JobName)
-				return nil
-			} else if errors.Is(err, scheduler.ErrStoreUnavailable) {
-				// The row cannot carry the token digest, so the continuation
-				// created nothing (ADR-046 决策 7). That is not a Job-missing
-				// observation: the compensation below would settle a task that
-				// never ran as job_missing. Keep the entry; the next round
-				// retries once the shared state answers.
-				delete(r.missing, e.JobName)
-				return err
-			}
+			delete(r.missing, e.JobName)
+			return r.settler.ContinueClaim(ctx, e.TaskID)
 		}
 		// §4.3/§4.6: the Job vanished (deleted, TTL-collected, or never
 		// created). The compensation waits out jobGoneWindow measured from

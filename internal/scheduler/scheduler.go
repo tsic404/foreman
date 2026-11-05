@@ -94,8 +94,10 @@ const (
 )
 
 // job.create_failed phase values: the step whose failure settled the claim —
-// the credential Secret was never created, or the Job object was not placed.
+// the rendered name disagreed with the entry's, the credential Secret was
+// never created, or the Job object was not placed.
 const (
+	createPhaseName   = "name"
 	createPhaseSecret = "secret"
 	createPhaseJob    = "job"
 )
@@ -847,12 +849,73 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 	// refresh marks the nodes at their cap so the affinity below skips them.
 	s.RefreshNodeSaturation(ctx)
 
+	// The create path is the continuation's too: one render, one name check,
+	// one rollback (§4.3 未完成创建的接续).
+	marked, job, err := s.createClaim(ctx, e)
+	if err != nil {
+		// Two failures create nothing and write no verdict: the digest did not
+		// reach the shared row (no instance could adjudicate the credential,
+		// ADR-046 决策 7), or a terminating predecessor still holds the name
+		// (§4.3, AC-09). Both defer the claim — the entry goes and the server
+		// re-dispatches the task once the prepare lease lapses.
+		if errors.Is(err, ErrStoreUnavailable) || errors.Is(err, errJobNameHeld) {
+			if delErr := s.reg.Delete(e.TaskID); delErr != nil {
+				s.log.WarnContext(ctx, "task.claim_drop_failed",
+					"task_id", e.TaskID, "job_name", e.JobName, "err", delErr)
+			}
+			s.metrics.InflightJobs(s.reg.Inflight())
+		}
+		return err
+	}
+	s.metrics.TaskClaimed()
+	// The create latency stays on one clock: claimed_at and the observation
+	// are Foreman's, while job_created_at is the apiserver's.
+	s.metrics.JobCreateSeconds(s.now().Sub(marked.ClaimedAt).Seconds())
+	s.log.InfoContext(ctx, "job.created",
+		"task_id", marked.TaskID, "job_name", marked.JobName, "daemon_id", marked.DaemonID,
+		"workspace_id", marked.WorkspaceID,
+		"node_name", marked.NodeName, "image", jobImage(job))
+	return nil
+}
+
+// createClaim renders the entry's credential Secret and Job and places them —
+// the one create path the claim and the convergence continuation share
+// (§4.3 未完成创建的接续). Both callers hand it an entry carrying its claim
+// identity, because the entry's job_name is what every later round looks the
+// object up by (missing-Job compensation, deletion, delivery): the rendered
+// name is checked against it before the first object is placed, and a render
+// that disagrees comes from a row without its identity — placing it would
+// create a Job no row manages and leave the recorded name missing
+// (AC-75 至多一个活跃 Job).
+//
+// The token digest is recorded on the entry before the first object appears
+// (ADR-017): the reclaim path's only handle on the credential. The returned
+// entry is the job_created transition; the returned Job feeds the created
+// event's image field.
+//
+// A failed create settles the claim with the existing attribution (create
+// failure, or invalid task id for the name face) and returns that error. Two
+// recoverable failures create nothing and write no verdict — the digest could
+// not reach the shared row (ErrStoreUnavailable) or a terminating predecessor
+// still holds the name (errJobNameHeld) — and each caller decides whether its
+// entry stays.
+func (s *Scheduler) createClaim(ctx context.Context, e registry.TaskEntry) (registry.TaskEntry, *batchv1.Job, error) {
 	trace := s.createSteps(ctx, e)
 	job, secret, tokenHash, err := s.builder.Build(jobbuilderEntry(e))
 	trace(createStepBuild)
 	if err != nil {
 		s.failClaim(ctx, e, err)
-		return err
+		return e, nil, err
+	}
+	// Build composes the display name through the same ResolveName the claim
+	// indexed the row with (ADR-034). A row restored without its claim
+	// identity renders the fallback segments, so the two disagree — and
+	// neither object may be placed under a name the row does not hold.
+	if job.Name != e.JobName {
+		cause := fmt.Errorf("rendered job name %q does not match the entry's recorded %q", job.Name, e.JobName)
+		s.logJobCreateFailed(ctx, e, createPhaseName, cause)
+		s.failClaim(ctx, e, cause)
+		return e, nil, cause
 	}
 	// token_hash 的唯一写入点 (ADR-017): the digest is recorded on the live
 	// entry while the token is still in this process's hands, so the reclaim
@@ -862,22 +925,18 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 	// rebuilt entry cannot restore it and degrades visibly instead
 	// (cred.revoke_unavailable).
 	if err := s.reg.SetTokenHash(e.TaskID, tokenHash); err != nil {
-		// The shared row does not carry the digest, so no other instance can
-		// adjudicate the credential: this claim issues nothing (ADR-046 决策 7).
-		// No object exists yet — dropping the entry is the deferral path the
-		// server re-dispatches from once the prepare lease lapses.
-		if delErr := s.reg.Delete(e.TaskID); delErr != nil {
-			s.log.WarnContext(ctx, "task.claim_drop_failed",
-				"task_id", e.TaskID, "job_name", e.JobName, "err", delErr)
-		}
-		return fmt.Errorf("%w: record token digest: %v", ErrStoreUnavailable, err)
+		// Without the digest on the shared row no instance could adjudicate or
+		// revoke the credential, so it is never placed (ADR-046 决策 7).
+		return e, nil, fmt.Errorf("%w: record token digest: %v", ErrStoreUnavailable, err)
 	}
 	e.TokenHash = tokenHash
-	// An idempotent retry may have left the Secret behind: delete-then-create
-	// (NotFound counts as success inside the JobClient). The clear is
-	// best-effort and does not settle the claim — the CreateSecret below
-	// surfaces residue or a denied permission as a phase=secret failure.
-	_ = s.jobs.DeleteSecret(ctx, jobbuilder.CredentialSecretName(daemonID))
+	// An idempotent retry — or a continuation of a claim that died after the
+	// Secret and before the Job — may have left the Secret behind:
+	// delete-then-create (NotFound counts as success inside the JobClient).
+	// The clear is best-effort and does not settle the claim — the
+	// CreateSecret below surfaces residue or a denied permission as a
+	// phase=secret failure.
+	_ = s.jobs.DeleteSecret(ctx, jobbuilder.CredentialSecretName(e.DaemonID))
 	trace(createStepClearStaleSecret)
 	err = s.jobs.CreateSecret(ctx, secret)
 	trace(createStepCreateSecret)
@@ -885,32 +944,25 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 		cause := fmt.Errorf("create credential secret: %w", err)
 		s.logJobCreateFailed(ctx, e, createPhaseSecret, cause)
 		s.failClaim(ctx, e, cause)
-		return err
+		return e, nil, err
 	}
 	created, err := s.createJob(ctx, e, job)
 	trace(createStepCreateJob)
 	if err != nil {
 		// Nothing of this claim is left in the cluster: drop the credential
-		// Secret again. A name still held by a terminating predecessor is
-		// not this task's failure — the entry goes and the server
-		// re-dispatches the task once the lease lapses, the same recovery
-		// as an undeliverable claim (§4.3).
-		_ = s.jobs.DeleteSecret(ctx, jobbuilder.CredentialSecretName(daemonID))
+		// Secret again.
+		_ = s.jobs.DeleteSecret(ctx, jobbuilder.CredentialSecretName(e.DaemonID))
 		if errors.Is(err, errJobNameHeld) {
-			_ = s.reg.Delete(e.TaskID)
-			s.metrics.InflightJobs(s.reg.Inflight())
 			s.log.WarnContext(ctx, "task.claim_deferred",
 				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 				"err", err.Error())
-			return err
+			return e, nil, err
 		}
 		cause := fmt.Errorf("create job: %w", err)
 		s.logJobCreateFailed(ctx, e, createPhaseJob, cause)
 		s.failClaim(ctx, e, cause)
-		return err
+		return e, nil, err
 	}
-
-	placedAt := s.now()
 	// job_created_at is the apiserver's creationTimestamp, never a local
 	// clock reading: it is the instance-filter basis that separates this
 	// Job's pods from a previous instance's when the name is reused
@@ -927,20 +979,11 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 		// that still exists and ListJobs is read only by the startup rebuild
 		// (TaskEntryFromJob), so the objects are rolled back here. The
 		// snapshot still carries the identity those rollbacks need.
-		return errors.Join(
+		return e, nil, errors.Join(
 			fmt.Errorf("task %s settled or vanished before job_created was recorded", e.TaskID),
 			s.deleteObjects(ctx, e))
 	}
-	e = marked
-	s.metrics.TaskClaimed()
-	// The create latency stays on one clock: claimed_at and the observation
-	// are Foreman's, while job_created_at is the apiserver's.
-	s.metrics.JobCreateSeconds(placedAt.Sub(e.ClaimedAt).Seconds())
-	s.log.InfoContext(ctx, "job.created",
-		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
-		"workspace_id", e.WorkspaceID,
-		"node_name", e.NodeName, "image", jobImage(job))
-	return nil
+	return marked, job, nil
 }
 
 // createJob places the entry's Job in one bounded attempt: create, and on

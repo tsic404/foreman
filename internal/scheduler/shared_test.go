@@ -10,6 +10,9 @@ import (
 	"testing"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+
 	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/state"
 )
@@ -526,5 +529,49 @@ func TestReconcileSlotsReportsSnapshotFailure(t *testing.T) {
 	}
 	if len(store.casCalls) != 0 || len(store.resetCalls) != 0 {
 		t.Fatalf("wrote after a failed read: cas=%v reset=%v", store.casCalls, store.resetCalls)
+	}
+}
+
+// TestContinueClaimRefusesANameThatDisagreesWithTheRow pins the continuation's
+// name identity: the entry's job_name is the key every later round uses
+// (missing-Job compensation, deletion, delivery), so a render that composes a
+// different one — a row restored without the claim identity, the pre-upgrade
+// shape — is refused before any object is placed and converges on the existing
+// create-failure attribution (§4.3 未完成创建的接续, AC-75 至多一个活跃 Job).
+// Placing it would leave a Job no row manages and fail the running task as
+// job_missing once the recorded name's window passed.
+func TestContinueClaimRefusesANameThatDisagreesWithTheRow(t *testing.T) {
+	f := newFixture(t)
+	f.builder.job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "fm-agent-task-1"}}
+	if err := f.reg.Put(registry.TaskEntry{
+		TaskID:      "task-1",
+		WorkspaceID: "ws-1",
+		JobName:     "fm-task-1",
+		DaemonID:    "fm-task-1",
+		State:       registry.StatePending,
+		ClaimedAt:   testNow,
+		Attempt:     1,
+		Payload:     claimPayload("task-1"),
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+
+	err := f.sched.ContinueClaim(context.Background(), "task-1")
+	if err == nil {
+		t.Fatal("ContinueClaim placed a Job under a name the row does not hold")
+	}
+	if len(f.jobs.createdJobs) != 0 || len(f.jobs.createdSecrets) != 0 {
+		t.Fatalf("objects created for the refused name: jobs=%v secrets=%v",
+			f.jobs.createdJobs, f.jobs.createdSecrets)
+	}
+	e, ok := f.reg.Get("task-1")
+	if !ok || !e.IsTerminal() || e.Result != registry.ResultFailed {
+		t.Fatalf("entry = %+v (ok=%v), want the create-failure verdict", e, ok)
+	}
+	if e.FailureReason != FailureReasonJobCreateFailed {
+		t.Fatalf("failure reason = %q, want %q", e.FailureReason, FailureReasonJobCreateFailed)
+	}
+	if e.JobName != "fm-task-1" {
+		t.Fatalf("entry job name = %q, want the recorded name kept", e.JobName)
 	}
 }

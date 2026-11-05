@@ -218,15 +218,19 @@ var tcPayloadProjectionKeys = []string{
 // keep delivering. The verdict body also lands on the pending-report carrier
 // Secret while a report is queued (§3, §4.6); token_hash is pinned as the
 // snapshot's current shape, not as a design requirement (§6.1 puts the digest
-// in the revocation set; ADR-017 makes OnClaim its only writer).
+// in the revocation set; ADR-017 makes OnClaim its only writer). The claim's
+// identity inputs (agent_name / project_id / project_source /
+// prior_session_id) are the rows a continuation renders from (§4.3
+// 未完成创建的接续): the render must reproduce the row's job_name.
 var tcPayloadSnapshotKeys = []string{
-	"agent_id", "attempt", "autopilot_run_id", "boot_deadline",
+	"agent_id", "agent_name", "attempt", "autopilot_run_id", "boot_deadline",
 	"chat_session_id", "claims_after_delivery", "claimed_at",
 	"completed_at", "daemon_id", "daemon_registered_at", "decided_report",
 	"delivered_at", "deliveries", "delivery_deadline", "drain_deadline",
 	"failure_reason", "issue_id", "issue_identifier", "job_created_at",
 	"job_name", "job_namespace", "job_phase", "job_runtime_id",
 	"last_status_seen", "lease_keep_until", "node_name", "payload",
+	"prior_session_id", "project_id", "project_source",
 	"real_runtime_id", "result", "runtime_identity", "started_at", "state",
 	"task_id", "token_hash", "workspace_id",
 }

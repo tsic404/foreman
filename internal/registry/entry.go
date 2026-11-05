@@ -141,26 +141,30 @@ type TaskEntry struct {
 
 	// PriorSessionID is the claim payload's prior_session_id: where the
 	// resuming session's file lives, hence the soft-affinity key source
-	// (ADR-015). Payload-derived and build-only: not annotated, not projected
-	// and not persisted, because it is consumed once at Build and a rebuilt or
-	// restored entry's Job already exists and never goes through Build.
+	// (ADR-015). Not annotated and not projected; persisted only in the shared
+	// state snapshot, because a pre-delivery entry a convergence round
+	// continues is rendered again and its Build reads this key (§4.3
+	// 未完成创建的接续). A path on the member's node, never a credential.
 	PriorSessionID string `json:"-"`
 
 	// AgentName is the claim payload's agent.name — the policy keyspace's
 	// agent side (ADR-035) and the <agent-name> / <agent-segment> source.
-	// Build-only like PriorSessionID (not persisted); empty means the identity
-	// is unavailable, which degrades the axes rather than failing the task.
+	// Empty means the identity is unavailable, which degrades the axes rather
+	// than failing the task. Persisted only in the shared state snapshot: the
+	// continued render must reproduce the row's job_name and the agent-id
+	// label.
 	AgentName string `json:"-"`
 
 	// ProjectID is the task's project identity (§4.1 项目身份): the
 	// platform's opaque project identifier, read at claim time from the
 	// payload's top-level project_id, or from the read-only reverse lookup by
 	// issue id. It is matched against the startup name → identifier index.
-	// Never annotated, never projected, never persisted: it is read once at
-	// claim time for the policy axes.
+	// Never annotated, never projected; persisted only in the shared state
+	// snapshot so a continued render keeps the policy axes' project side.
 	ProjectID string `json:"-"`
 	// ProjectSource records where ProjectID came from (payload / api /
-	// none); policy.applied projects it, nothing else reads it.
+	// none); policy.applied projects it, nothing else reads it. Persisted with
+	// ProjectID in the shared state snapshot.
 	ProjectSource string `json:"-"`
 
 	// RealRuntimeID is the real runtime the claim was dispatched under: the
