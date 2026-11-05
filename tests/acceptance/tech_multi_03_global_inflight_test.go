@@ -6,6 +6,7 @@ package acceptance
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"sync"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/scheduler"
 	"github.com/tsic404/foreman/internal/state"
 )
 
@@ -410,4 +412,85 @@ func reconcileLogLines(raw string) string {
 		}
 	}
 	return strings.Join(out, "\n")
+}
+
+// lockRecordingStore records the task-lock keys the scheduler takes.
+type lockRecordingStore struct {
+	state.CoordStore
+	mu    sync.Mutex
+	locks []lockKeyCall
+}
+
+type lockKeyCall struct {
+	workspaceID, taskID string
+}
+
+func (s *lockRecordingStore) LockTask(ctx context.Context, ws, taskID, owner string, ttl time.Duration) (bool, error) {
+	s.mu.Lock()
+	s.locks = append(s.locks, lockKeyCall{workspaceID: ws, taskID: taskID})
+	s.mu.Unlock()
+	return s.CoordStore.LockTask(ctx, ws, taskID, owner, ttl)
+}
+
+func (s *lockRecordingStore) workspaceOf(taskID string) (string, bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, call := range s.locks {
+		if call.taskID == taskID {
+			return call.workspaceID, true
+		}
+	}
+	return "", false
+}
+
+// TestTechMulti03MalformedClaimKeepsTheCallersSlotAndWorkspaceLock is AC-76's
+// negative face for a claim whose body is unreadable but whose id is not: the
+// dead-letter row must take over the slot the claim loop already reserved (a
+// second reservation against an exhausted budget would leave the task to the
+// server's lease expiry), and the write lock must be the task's workspace key —
+// the same hold every other path of that task takes.
+func TestTechMulti03MalformedClaimKeepsTheCallersSlotAndWorkspaceLock(t *testing.T) {
+	var recorder *lockRecordingStore
+	tw := newTwoInstances(t, twoInstanceOptions{
+		maxInflight: 1,
+		leaderCfg:   smallLeaderCfg(2 * time.Second),
+		wrap: func(store state.Store, coord state.CoordStore) (state.Store, state.CoordStore) {
+			recorder = &lockRecordingStore{CoordStore: coord}
+			return store, recorder
+		},
+	})
+	ctx := context.Background()
+
+	// The loop's pre-C3 reservation is the only in-flight slot this claim may
+	// use.
+	reserved, err := tw.a.sched.ReserveClaimSlots(ctx, "ws-1", 1)
+	if err != nil || len(reserved) != 1 {
+		t.Fatalf("ReserveClaimSlots = %d pairs (err %v), want one", len(reserved), err)
+	}
+	payload := json.RawMessage(`{"id":"task-malformed","workspace_id":"ws-1","agent_id":42}`)
+	if err := tw.a.sched.OnClaimReservedFor(ctx, "ws-1", payload, reserved[0]); err != nil {
+		t.Fatalf("OnClaimReservedFor: %v (an exhausted budget must not strand the claim)", err)
+	}
+
+	// The dead-letter row lives in the task's workspace partition and is
+	// settled with the documented attribution.
+	e, ok, err := tw.store.GetEntry(ctx, "ws-1", "task-malformed")
+	if err != nil || !ok {
+		t.Fatalf("row in the task workspace: ok=%v err=%v", ok, err)
+	}
+	if !e.IsTerminal() || e.Result != registry.ResultFailed {
+		t.Fatalf("row = %+v, want terminal/failed", e)
+	}
+	if e.FailureReason != scheduler.FailureReasonInvalidTaskID {
+		t.Errorf("failure_reason = %q, want %q", e.FailureReason, scheduler.FailureReasonInvalidTaskID)
+	}
+	if ws, ok := recorder.workspaceOf("task-malformed"); !ok || ws != "ws-1" {
+		t.Fatalf("task lock workspace = %q (found %v), want ws-1", ws, ok)
+	}
+
+	// The slot the row took over is returned exactly once by its terminal
+	// write: the caller's release is not a second decrement.
+	if got, err := tw.coord.Slots(ctx, ""); err != nil || got != 0 {
+		t.Fatalf("global counter = %d (err %v), want 0", got, err)
+	}
 }

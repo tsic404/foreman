@@ -96,8 +96,9 @@ type CoordStore interface {
 	// ConfirmStart writes the once-only start fact and drops the queue marker.
 	ConfirmStart(ctx context.Context, ws, taskID string, at time.Time, advance bool) (registry.TaskEntry, bool, error)
 	// CommitDelivering records one delivery commit on the shared row (the
-	// stage-one direct path; stage two takes through the queue).
-	CommitDelivering(ctx context.Context, ws, taskID string, at time.Time, payload []byte, window time.Duration) (registry.TaskEntry, bool, error)
+	// stage-one direct path; stage two takes through the queue). The store's
+	// clock stamps the commit and its confirmation window.
+	CommitDelivering(ctx context.Context, ws, taskID string, payload []byte, window time.Duration) (registry.TaskEntry, bool, error)
 	// CommitJobCreated records the Job creation timestamp.
 	CommitJobCreated(ctx context.Context, ws, taskID string, at time.Time) (registry.TaskEntry, bool, error)
 	// CommitDaemonRegistered records the S-4 registration.
@@ -212,6 +213,18 @@ type CoordStore interface {
 
 var _ CoordStore = (*redisStore)(nil)
 
+// TaskLockRenewer is the lease-extension face of the per-task write lock. It
+// stays outside CoordStore on purpose: a shared store that only acquires with
+// a TTL still satisfies the contract (an expired hold is taken over by the
+// convergence round), while the caller renews only when the store can extend
+// the lease it granted (§5 写锁自带租约上界).
+type TaskLockRenewer interface {
+	// RenewTaskLock extends the lock's TTL when owner still holds it.
+	RenewTaskLock(ctx context.Context, ws, taskID, owner string, ttl time.Duration) (bool, error)
+}
+
+var _ TaskLockRenewer = (*redisStore)(nil)
+
 // Shared marks the Redis implementation as the coordination face.
 func (s *redisStore) Shared() bool { return true }
 
@@ -286,6 +299,17 @@ func issuedAt(ctx context.Context) (time.Time, bool) {
 // scripts compare the exact raw value read by the Go caller, which is the
 // optimistic concurrency the cross-instance single-write needs.
 var (
+	// readWithTime: KEYS[1]=row. Returns {raw, now ms}; raw is empty on a
+	// miss. The instant comes from the server clock and travels with the row,
+	// so a time window stored on the row and judged against it are read on the
+	// same clock regardless of which instance does which (§5 交付确认窗).
+	scriptReadWithTime = redis.NewScript(`
+local v = redis.call('GET', KEYS[1])
+local t = redis.call('TIME')
+local now = tonumber(t[1]) * 1000 + math.floor(tonumber(t[2]) / 1000)
+if not v then return {'', tostring(now)} end
+return {v, tostring(now)}`)
+
 	// casSet: KEYS[1]=row, ARGV[1]=expected raw, ARGV[2]=new raw, ARGV[3]=ttl ms.
 	// Returns 1 applied, 0 changed since read, -1 row missing.
 	scriptCASSet = redis.NewScript(`
@@ -462,6 +486,19 @@ if owner == ARGV[1] then
 end
 return 0`)
 
+	// lockRenew: extend the lock only when the owner still holds it. The PX
+	// TTL stays the expiry authority (the server clock), so a renewal can
+	// neither shorten nor outlive the lease the store granted.
+	// ARGV: owner, ttl ms.
+	scriptLockRenew = redis.NewScript(`
+local cur = redis.call('GET', KEYS[1])
+if not cur then return 0 end
+local sep = string.find(cur, '\0', 1, true)
+local owner = string.sub(cur, 1, (sep or 0) - 1)
+if owner ~= ARGV[1] then return 0 end
+redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[2])
+return 1`)
+
 	// leaderAcquire: take the lease only when its key is absent — the PX TTL
 	// is the only expiry authority, exactly as for the task lock. ARGV:
 	// owner, ttl ms.
@@ -567,6 +604,96 @@ func (s *redisStore) casUpdate(ctx context.Context, key string, mutate func(regi
 		}
 	}
 	return registry.TaskEntry{}, false, errSharedConflict
+}
+
+// casUpdateAt is casUpdate on the store's clock: the row and the instant it
+// was read come back from one script, and mutate receives that instant. A
+// window written by this read-modify-write and judged by the same call is
+// therefore coherent across instances whose clocks disagree (§5 交付确认窗).
+func (s *redisStore) casUpdateAt(ctx context.Context, key string, mutate func(registry.TaskEntry, time.Time) (registry.TaskEntry, bool, error)) (registry.TaskEntry, bool, error) {
+	for range casRetries {
+		raw, now, ok, err := s.readWithTime(ctx, key)
+		if err != nil {
+			return registry.TaskEntry{}, false, err
+		}
+		if !ok {
+			return registry.TaskEntry{}, false, nil
+		}
+		cur, err := s.unmarshal(raw)
+		if err != nil {
+			s.mark(ctx, err)
+			return registry.TaskEntry{}, false, err
+		}
+		next, write, err := mutate(cur, now)
+		if err != nil || !write {
+			s.mark(ctx, err)
+			return next, false, err
+		}
+		nextRaw, err := s.marshal(next)
+		if err != nil {
+			return registry.TaskEntry{}, false, err
+		}
+		code, err := scriptCASSet.Run(ctx, s.rdb, []string{key}, raw, nextRaw, s.entryTTL().Milliseconds()).Int()
+		if err != nil {
+			s.mark(ctx, err)
+			return registry.TaskEntry{}, false, err
+		}
+		switch code {
+		case 1:
+			s.mark(ctx, nil)
+			return next, true, nil
+		case -1:
+			return registry.TaskEntry{}, false, nil
+		}
+	}
+	return registry.TaskEntry{}, false, errSharedConflict
+}
+
+// readWithTime reads one row and the server instant it was read at.
+func (s *redisStore) readWithTime(ctx context.Context, key string) ([]byte, time.Time, bool, error) {
+	values, err := scriptReadWithTime.Run(ctx, s.rdb, []string{key}).Result()
+	if err != nil {
+		s.mark(ctx, err)
+		return nil, time.Time{}, false, err
+	}
+	pair, ok := values.([]any)
+	if !ok || len(pair) != 2 {
+		s.mark(ctx, nil)
+		return nil, time.Time{}, false, fmt.Errorf("shared state: read with time returned %T", values)
+	}
+	raw, err := rawString(pair[0])
+	if err != nil {
+		s.mark(ctx, nil)
+		return nil, time.Time{}, false, err
+	}
+	nowRaw, err := rawString(pair[1])
+	if err != nil {
+		s.mark(ctx, nil)
+		return nil, time.Time{}, false, err
+	}
+	millis, err := strconv.ParseInt(nowRaw, 10, 64)
+	if err != nil {
+		s.mark(ctx, nil)
+		return nil, time.Time{}, false, fmt.Errorf("shared state: read with time: %w", err)
+	}
+	s.mark(ctx, nil)
+	now := time.UnixMilli(millis).UTC()
+	if raw == "" {
+		return nil, now, false, nil
+	}
+	return []byte(raw), now, true, nil
+}
+
+// rawString converts one Lua bulk reply into the row's bytes.
+func rawString(v any) (string, error) {
+	switch value := v.(type) {
+	case string:
+		return value, nil
+	case []byte:
+		return string(value), nil
+	default:
+		return "", fmt.Errorf("shared state: unexpected reply element %T", v)
+	}
 }
 
 // SetEntry writes the full mapping row and its Job index.
@@ -678,12 +805,14 @@ func (s *redisStore) enqueueEntry(ctx context.Context, ws, taskID string, e regi
 
 // PickupDelivery is the atomic S-6 take (§5 单次派发). The delivery body and
 // the accounting are read and written in one CAS step, so two instances
-// claiming the same Job can never both win.
+// claiming the same Job can never both win. The confirmation window is stamped
+// and judged on the store's clock: the window is one lease shared by whichever
+// instance serves the next claim, so no instance's clock may open or close it
+// early (ADR-032, the lease face of §5).
 func (s *redisStore) pickupDelivery(ctx context.Context, ws, taskID string, window time.Duration) (Pickup, error) {
 	key := s.entryKey(ws, taskID)
-	now := s.now()
 	var out Pickup
-	entry, _, err := s.casUpdate(ctx, key, func(e registry.TaskEntry) (registry.TaskEntry, bool, error) {
+	entry, _, err := s.casUpdateAt(ctx, key, func(e registry.TaskEntry, now time.Time) (registry.TaskEntry, bool, error) {
 		out = Pickup{Entry: e}
 		if e.State == registry.StateTerminal {
 			return e, false, nil
@@ -794,9 +923,12 @@ func (s *redisStore) confirmStart(ctx context.Context, ws, taskID string, at tim
 	return registry.TaskEntry{}, false, errSharedConflict
 }
 
-// CommitDelivering records one delivery commit under the S6 gate (§5).
-func (s *redisStore) commitDelivering(ctx context.Context, ws, taskID string, at time.Time, payload []byte, window time.Duration) (registry.TaskEntry, bool, error) {
-	entry, ok, err := s.casUpdate(ctx, s.entryKey(ws, taskID), func(e registry.TaskEntry) (registry.TaskEntry, bool, error) {
+// CommitDelivering records one delivery commit under the S6 gate (§5). The
+// commit and its confirmation window are stamped on the store's clock: the
+// row is read by instances other than this one, so the window's two ends must
+// come from the clock that judges it (ADR-032).
+func (s *redisStore) commitDelivering(ctx context.Context, ws, taskID string, payload []byte, window time.Duration) (registry.TaskEntry, bool, error) {
+	entry, ok, err := s.casUpdateAt(ctx, s.entryKey(ws, taskID), func(e registry.TaskEntry, at time.Time) (registry.TaskEntry, bool, error) {
 		if !registry.Deliverable(e, at) {
 			return e, false, nil
 		}
@@ -1037,6 +1169,19 @@ func (s *redisStore) unlockTask(ctx context.Context, ws, taskID, owner string) e
 	err := scriptLockRelease.Run(ctx, s.rdb, []string{s.lockKey(ws, taskID)}, owner).Err()
 	s.mark(ctx, err)
 	return err
+}
+
+// renewTaskLock extends the lease only while owner still holds the lock. The
+// PX TTL remains the expiry authority, so a holder that disappeared can never
+// keep the lock alive past the TTL it last asked for.
+func (s *redisStore) renewTaskLock(ctx context.Context, ws, taskID, owner string, ttl time.Duration) (bool, error) {
+	n, err := scriptLockRenew.Run(ctx, s.rdb, []string{s.lockKey(ws, taskID)},
+		owner, ttl.Milliseconds()).Int()
+	s.mark(ctx, err)
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 // slotKeys names the counter and reservation set of one level.

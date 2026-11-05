@@ -59,8 +59,9 @@ type SharedStore interface {
 	// CommitJobCreated records the apiserver creation timestamp.
 	CommitJobCreated(ctx context.Context, ws, taskID string, at time.Time) (TaskEntry, bool, error)
 	// CommitDelivering records one delivery commit (the stage-one direct path;
-	// stage two delivers through the queue pickup).
-	CommitDelivering(ctx context.Context, ws, taskID string, at time.Time, payload []byte, window time.Duration) (TaskEntry, bool, error)
+	// stage two delivers through the queue pickup). The shared store stamps
+	// the commit and its confirmation window on its own clock.
+	CommitDelivering(ctx context.Context, ws, taskID string, payload []byte, window time.Duration) (TaskEntry, bool, error)
 	// CommitDaemonRegistered records the S-4 registration.
 	CommitDaemonRegistered(ctx context.Context, ws, taskID string, at time.Time) (TaskEntry, bool, error)
 	// CommitTerminal writes the terminal verdict, the settled record and drops

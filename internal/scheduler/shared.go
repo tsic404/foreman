@@ -5,9 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"strconv"
+	"sync"
 	"time"
 
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/state"
 )
 
 // ErrNoSlot reports a claim refused because the shared two-level counters had
@@ -43,15 +46,27 @@ func (s *Scheduler) lockTaskFor(ctx context.Context, taskID string) (func(), err
 	return s.lockTaskIn(ctx, ws, taskID)
 }
 
+// lockOwner names one acquisition. The instance id alone is process-wide, so a
+// lock released late — after the same process re-acquired the task — would
+// still match the store's value. The per-acquisition suffix makes every unlock
+// name exactly the hold it ends; the store deletes only that hold
+// (02-contracts.md §4.2 跨实例单写).
+func (s *Scheduler) lockOwner() string {
+	return s.instanceID + "/" + strconv.FormatUint(s.lockSeq.Add(1), 36)
+}
+
 // lockTaskIn takes the per-task write lock: the local keyed mutex serializes
 // this process's paths, the shared lease serializes the same task across
 // instances (key contains the workspace; ADR-046 决策 6, 02-contracts.md
-// §4.2 跨实例单写). A store failure fails the action closed.
+// §4.2 跨实例单写). A store failure fails the action closed. While the caller
+// holds the lease this process renews it at a third of its TTL: the guarded
+// paths (C13 probe, terminal forward retry) can outlive one TTL, and a lease
+// that lapsed under them would let another instance take the same task.
 func (s *Scheduler) lockTaskIn(ctx context.Context, ws, taskID string) (func(), error) {
 	if s.shared == nil {
 		return s.taskMu.Lock(taskID), nil
 	}
-	owner := s.instanceID
+	owner := s.lockOwner()
 	ttl := s.taskLockTTL
 	if ttl <= 0 {
 		ttl = defaultTaskLockTTL
@@ -78,13 +93,64 @@ func (s *Scheduler) lockTaskIn(ctx context.Context, ws, taskID string) (func(), 
 	if waited := time.Since(started); waited > time.Millisecond {
 		s.metrics.TaskLockWait(waited.Seconds())
 	}
+	stopRenew := s.holdTaskLockRenewal(ws, taskID, owner, ttl)
 	unlockLocal := s.taskMu.Lock(taskID)
 	return func() {
+		stopRenew()
 		unlockLocal()
 		if s.shared != nil {
 			_ = s.shared.UnlockTask(context.Background(), ws, taskID, owner)
 		}
 	}, nil
+}
+
+// holdTaskLockRenewal keeps the lease this acquisition holds alive and returns
+// the stop that waits for the renewer to leave. A renewal that reports the lock
+// gone (owner mismatch or the key expired) ends the loop; a store error does
+// not: it is reported and retried, since the hold may still be live.
+func (s *Scheduler) holdTaskLockRenewal(ws, taskID, owner string, ttl time.Duration) func() {
+	renewer, ok := s.shared.(state.TaskLockRenewer)
+	if !ok {
+		return func() {}
+	}
+	interval := ttl / 3
+	if interval <= 0 {
+		return func() {}
+	}
+	stop := make(chan struct{})
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-stop:
+				return
+			case <-ticker.C:
+				renewed, err := renewer.RenewTaskLock(context.Background(), ws, taskID, owner, ttl)
+				if err != nil {
+					s.metrics.StateError("renew_task_lock")
+					s.log.Warn("task.lock_renew_failed",
+						"task_id", taskID, "workspace_id", ws, "err", err.Error())
+					continue
+				}
+				if !renewed {
+					s.log.Warn("task.lock_lost",
+						"task_id", taskID, "workspace_id", ws,
+						"note", "the lease expired before the renewal")
+					return
+				}
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			close(stop)
+			<-done
+		})
+	}
 }
 
 // SlotReservation is one reservation pair: the ids the shared store returned
@@ -425,6 +491,7 @@ func (s *Scheduler) OnTakeover(ctx context.Context) error {
 	// in both directions (a data loss leaves them at zero while the rebuilt
 	// rows are live — AC-76/AC-78).
 	if err := s.reconcileSlots(ctx, true); err != nil {
+		result = "failed"
 		return err
 	}
 	for _, e := range s.reg.List() {

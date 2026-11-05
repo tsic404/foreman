@@ -421,6 +421,7 @@ type fakeMetrics struct {
 	claimErrors       []string
 	jobDeleteFailures []string
 	tokenUsage        []tokenUsageSample
+	reconcile         []string
 }
 
 type tokenUsageSample struct {
@@ -432,12 +433,17 @@ type tokenUsageSample struct {
 	cacheWrite int64
 }
 
-func (f *fakeMetrics) QueueOp(string)                  {}
-func (f *fakeMetrics) QueueDepth(int)                  {}
-func (f *fakeMetrics) SharedSlots(string, int)         {}
-func (f *fakeMetrics) TaskLockWait(float64)            {}
-func (f *fakeMetrics) ReconcileResult(string, float64) {}
-func (f *fakeMetrics) StateError(string)               {}
+func (f *fakeMetrics) QueueOp(string)          {}
+func (f *fakeMetrics) QueueDepth(int)          {}
+func (f *fakeMetrics) SharedSlots(string, int) {}
+func (f *fakeMetrics) TaskLockWait(float64)    {}
+func (f *fakeMetrics) StateError(string)       {}
+
+func (f *fakeMetrics) ReconcileResult(result string, _ float64) {
+	f.mu.Lock()
+	f.reconcile = append(f.reconcile, result)
+	f.mu.Unlock()
+}
 
 func (f *fakeMetrics) ClaimError(reason string) {
 	f.mu.Lock()

@@ -70,7 +70,7 @@ func TestCoordEnqueueIsSingleAndKeepsThePayload(t *testing.T) {
 
 func TestCoordPickupIsSingleFlightAndRearms(t *testing.T) {
 	ctx := context.Background()
-	_, store, now, _ := coordTestStore(t)
+	_, store, now, mr := coordTestStore(t)
 	if _, err := store.EnqueueEntry(ctx, "ws-1", "task-1", coordTestEntry("task-1", `{"body":"x"}`)); err != nil {
 		t.Fatalf("enqueue: %v", err)
 	}
@@ -110,8 +110,9 @@ func TestCoordPickupIsSingleFlightAndRearms(t *testing.T) {
 	if held.Delivered || !held.Held {
 		t.Fatalf("in-window pickup = %+v, want held and not delivered", held)
 	}
-	// Past the window: the row returns to the takeable state.
-	*now = now.Add(window + time.Millisecond)
+	// Past the window: the row returns to the takeable state. The window is a
+	// lease on the store's clock, so the probe advances that clock.
+	mr.SetTime(time.Now().Add(window + time.Second))
 	again, err := store.PickupDelivery(ctx, "ws-1", "task-1", window)
 	if err != nil {
 		t.Fatalf("post-window pickup: %v", err)
@@ -688,6 +689,127 @@ func TestCoordSlotsIgnoreClientClockSkew(t *testing.T) {
 	mr.SetTime(time.Now().Add(reservationTTL + time.Minute))
 	if _, ok, err := ahead.ReserveSlot(ctx, "", 1); err != nil || !ok {
 		t.Fatalf("expired reservation was not returned: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestCoordLockRenewExtendsTheLease pins the holder's side of the lease: a
+// hold that keeps renewing must not lapse at its original TTL, while a
+// renewal from any other owner is refused and leaves the holder's lease
+// untouched. The clock is the store's (the PX expiry), so the case runs on
+// real time.
+func TestCoordLockRenewExtendsTheLease(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	// TTLs follow the wall clock, or the original lease never lapses.
+	mr.ClockTTL(true)
+	store := coordStoreAt(t, mr, time.Now)
+	renewer := store.(TaskLockRenewer)
+
+	ttl := 200 * time.Millisecond
+	if ok, err := store.LockTask(ctx, "ws-1", "task-1", "owner-a", ttl); err != nil || !ok {
+		t.Fatalf("lock: ok=%v err=%v", ok, err)
+	}
+	// A different owner cannot extend a lease it does not hold.
+	if ok, err := renewer.RenewTaskLock(ctx, "ws-1", "task-1", "owner-b", ttl); err != nil || ok {
+		t.Fatalf("foreign renewal: ok=%v err=%v, want refused", ok, err)
+	}
+	// Renew past the original deadline: each renewal re-arms the full TTL.
+	deadline := time.Now().Add(ttl)
+	for time.Now().Before(deadline.Add(50 * time.Millisecond)) {
+		if ok, err := renewer.RenewTaskLock(ctx, "ws-1", "task-1", "owner-a", ttl); err != nil || !ok {
+			t.Fatalf("renewal: ok=%v err=%v", ok, err)
+		}
+		time.Sleep(ttl / 4)
+	}
+	// The original lease would have lapsed by now; the renewed one is live.
+	if ok, err := store.LockTask(ctx, "ws-1", "task-1", "owner-b", ttl); err != nil || ok {
+		t.Fatalf("a renewed lease was preempted: ok=%v err=%v", ok, err)
+	}
+	if err := store.UnlockTask(ctx, "ws-1", "task-1", "owner-a"); err != nil {
+		t.Fatalf("unlock: %v", err)
+	}
+	if ok, err := store.LockTask(ctx, "ws-1", "task-1", "owner-b", ttl); err != nil || !ok {
+		t.Fatalf("the released lock is not free: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestCoordStaleUnlockCannotReleaseANewerHold pins the owner check against the
+// same-process race: an unlock that arrives after the lease was re-acquired
+// names the previous acquisition and must leave the current hold alone. A
+// constant per-process owner would delete the newer holder's lock here.
+func TestCoordStaleUnlockCannotReleaseANewerHold(t *testing.T) {
+	ctx := context.Background()
+	_, store, _, _ := coordTestStore(t)
+	ttl := time.Minute
+	if ok, err := store.LockTask(ctx, "ws-1", "task-1", "inst-1/1", ttl); err != nil || !ok {
+		t.Fatalf("first lock: ok=%v err=%v", ok, err)
+	}
+	if err := store.UnlockTask(ctx, "ws-1", "task-1", "inst-1/1"); err != nil {
+		t.Fatalf("first unlock: %v", err)
+	}
+	if ok, err := store.LockTask(ctx, "ws-1", "task-1", "inst-1/2", ttl); err != nil || !ok {
+		t.Fatalf("second lock: ok=%v err=%v", ok, err)
+	}
+	// The first acquisition's unlock arrives late.
+	if err := store.UnlockTask(ctx, "ws-1", "task-1", "inst-1/1"); err != nil {
+		t.Fatalf("stale unlock: %v", err)
+	}
+	if ok, err := store.LockTask(ctx, "ws-1", "task-1", "inst-1/3", ttl); err != nil || ok {
+		t.Fatalf("a stale unlock released the current hold: ok=%v err=%v", ok, err)
+	}
+	// The current owner still releases its own hold.
+	if err := store.UnlockTask(ctx, "ws-1", "task-1", "inst-1/2"); err != nil {
+		t.Fatalf("second unlock: %v", err)
+	}
+	if ok, err := store.LockTask(ctx, "ws-1", "task-1", "inst-1/3", ttl); err != nil || !ok {
+		t.Fatalf("the current owner could not release: ok=%v err=%v", ok, err)
+	}
+}
+
+// TestCoordDeliveryWindowIgnoresClientClockSkew pins the confirmation window's
+// clock: the window is written and judged on the store's clock, so a writer
+// whose clock runs an hour slow does not hand the payload out a second time
+// immediately, and a writer an hour fast does not hold it past the window.
+func TestCoordDeliveryWindowIgnoresClientClockSkew(t *testing.T) {
+	ctx := context.Background()
+	mr := miniredis.RunT(t)
+	onTime := coordStoreAt(t, mr, time.Now)
+	slow := coordStoreAt(t, mr, func() time.Time { return time.Now().Add(-time.Hour) })
+	fast := coordStoreAt(t, mr, func() time.Time { return time.Now().Add(time.Hour) })
+
+	window := time.Minute
+	for _, taskID := range []string{"task-slow", "task-fast"} {
+		if _, err := onTime.EnqueueEntry(ctx, "ws-1", taskID, coordTestEntry(taskID, `{"body":"x"}`)); err != nil {
+			t.Fatalf("enqueue %s: %v", taskID, err)
+		}
+	}
+
+	// The slow writer commits the delivery; the window is still open for a
+	// reader on the right clock.
+	pickup, err := slow.PickupDelivery(ctx, "ws-1", "task-slow", window)
+	if err != nil || !pickup.Delivered {
+		t.Fatalf("slow-clock delivery: delivered=%v err=%v", pickup.Delivered, err)
+	}
+	held, err := onTime.PickupDelivery(ctx, "ws-1", "task-slow", window)
+	if err != nil {
+		t.Fatalf("in-window pickup: %v", err)
+	}
+	if held.Delivered || !held.Held {
+		t.Fatalf("a slow writer's clock shortened the window: %+v", held)
+	}
+
+	// The fast writer commits; the window ends on the store's clock, not an
+	// hour from the writer's now.
+	if fastPickup, err := fast.PickupDelivery(ctx, "ws-1", "task-fast", window); err != nil || !fastPickup.Delivered {
+		t.Fatalf("fast-clock delivery: delivered=%v err=%v", fastPickup.Delivered, err)
+	}
+	mr.SetTime(time.Now().Add(window + time.Second))
+	again, err := onTime.PickupDelivery(ctx, "ws-1", "task-fast", window)
+	if err != nil {
+		t.Fatalf("post-window pickup: %v", err)
+	}
+	if !again.Delivered {
+		t.Fatalf("a fast writer's clock extended the window past its end: %+v", again)
 	}
 }
 

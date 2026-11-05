@@ -19,6 +19,7 @@ import (
 	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
+	"github.com/tsic404/foreman/internal/state"
 )
 
 func TestTechMulti02CrossInstanceDeliveryAndTerminalSingleWrite(t *testing.T) {
@@ -172,6 +173,25 @@ func (b *multi02CrashBuilder) BuildCatalogProbe(requestID, jobRuntimeID, workspa
 
 func (b *multi02CrashBuilder) probeToken(jobName string) string { return b.inner.probeToken(jobName) }
 
+// deadProcessStore stops the dead instance's renewals once the crash is
+// signalled: a process that is gone never reaches the store again, so the
+// write lock it held lapses on its TTL as a real crash leaves it (§5 写锁自带
+// 租约上界). Every other command still goes to the shared store.
+type deadProcessStore struct {
+	state.CoordStore
+	renewer state.TaskLockRenewer
+	crashed <-chan struct{}
+}
+
+func (s *deadProcessStore) RenewTaskLock(ctx context.Context, ws, taskID, owner string, ttl time.Duration) (bool, error) {
+	select {
+	case <-s.crashed:
+		return false, nil
+	default:
+	}
+	return s.renewer.RenewTaskLock(ctx, ws, taskID, owner, ttl)
+}
+
 // TestTechMulti02ClaimContinuesAfterInstanceDeath covers the injected
 // "instance killed before creating the Job" through the production claim path:
 // the claim persists the row and its queue entry, the process dies inside the
@@ -195,6 +215,13 @@ func TestTechMulti02ClaimContinuesAfterInstanceDeath(t *testing.T) {
 	// render it dies in is the next thing that would touch anything.
 	crashed := make(chan struct{})
 	tw.a.builder = &multi02CrashBuilder{inner: tw.a.builder, taskID: taskID, crashed: crashed}
+	// The dead instance never renews again: its lease lapses on its TTL and
+	// the survivor can take the task over.
+	tw.a.coord = &deadProcessStore{
+		CoordStore: tw.a.coord,
+		renewer:    tw.a.coord.(state.TaskLockRenewer),
+		crashed:    crashed,
+	}
 	tw.a.rebuildScheduler(t, func(*scheduler.Config) {})
 	go func() { _ = tw.a.sched.OnClaimFor(context.Background(), "ws-1", payload) }()
 	select {
@@ -225,8 +252,8 @@ func TestTechMulti02ClaimContinuesAfterInstanceDeath(t *testing.T) {
 
 	// The survivor takes over (the dead instance never held a lease in this
 	// scenario): its takeover resync sees the row, and the convergence round
-	// continues the creation exactly once — the write lock the dead claim held
-	// lapses on its own.
+	// continues the creation exactly once — the dead instance stopped renewing,
+	// so the write lock it held lapses on its TTL.
 	tw.b.startLeader(t)
 	deadline := time.Now().Add(20 * time.Second)
 	for !tw.b.jobs.jobCreated(wantName) {
