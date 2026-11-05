@@ -393,14 +393,62 @@ func TestRestart01OverlappingRebuildKeepsLiveClaim(t *testing.T) {
 	}
 }
 
-// TestRestart01RebuiltEntryLeaseSkipsC4 covers the S7 half of AC-09: a
-// rebuilt entry carries no dispatch record, so a forward would address
-// /api/daemon/runtimes//tasks/{tid}/prepare-lease, whose bare 404 reads as
-// "the task was deleted" and settles a live task as vanished. The renewal is
-// answered locally and the entry stays for the startup convergence (ADR-026).
-func TestRestart01RebuiltEntryLeaseSkipsC4(t *testing.T) {
+// TestRestart01RebuiltEntryLeaseUsesRestoredRuntime is the same S7 face once
+// the Job carries the dispatch record: the rebuilt entry addresses the real
+// runtime its claim was leased under, so the renewal reaches the server instead
+// of being answered locally, and a stale row id is healed by C-1 rather than
+// read as a vanished task.
+func TestRestart01RebuiltEntryLeaseUsesRestoredRuntime(t *testing.T) {
 	h := newHarness(t, false)
 	h.useRealBuilder(t)
+
+	if err := h.sched.OnClaim(t.Context(), claimPayload("task-1")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	if err := h.reg.Delete("task-1"); err != nil {
+		t.Fatalf("drop entry: %v", err)
+	}
+	if err := h.sched.Rebuild(t.Context()); err != nil {
+		t.Fatalf("Rebuild: %v", err)
+	}
+	rebuilt, ok := h.reg.Get("task-1")
+	if !ok || rebuilt.RealRuntimeID != "rt-1" {
+		t.Fatalf("rebuilt entry = %+v, %v; want the restored dispatch record rt-1", rebuilt, ok)
+	}
+
+	token := issueJobToken(t, h, "task-1")
+	code, body := h.call("POST",
+		"/api/daemon/runtimes/"+rebuilt.JobRuntimeID+"/tasks/task-1/prepare-lease",
+		token, []byte(`{}`))
+	if code != http.StatusOK || string(body) != `{"status":"ok"}` {
+		t.Fatalf("S7 = %d %s, want 200 {\"status\":\"ok\"}", code, body)
+	}
+	var forwarded []string
+	for _, req := range h.upstream.pathCalls("/api/daemon/runtimes/") {
+		if strings.HasSuffix(req.Path, "/prepare-lease") {
+			forwarded = append(forwarded, req.Path)
+		}
+	}
+	if len(forwarded) != 1 || !strings.Contains(forwarded[0], "/runtimes/rt-1/") {
+		t.Fatalf("C4 forwards = %v, want one addressed to rt-1", forwarded)
+	}
+	after, ok := h.reg.Get("task-1")
+	if !ok || after.IsTerminal() {
+		t.Fatalf("entry = %+v, %v; want the live entry after the renewal", after, ok)
+	}
+	if !after.LeaseKeepUntil.After(rebuilt.LeaseKeepUntil) {
+		t.Errorf("lease_keep_until = %v, want it advanced past %v", after.LeaseKeepUntil, rebuilt.LeaseKeepUntil)
+	}
+}
+
+// TestRestart01RebuiltEntryLeaseSkipsC4 covers the S7 half of AC-09 for a Job
+// that carries no dispatch record (rendered before the record was annotated):
+// forwarding would address /api/daemon/runtimes//tasks/{tid}/prepare-lease,
+// whose bare 404 reads as "the task was deleted" and settles a live task as
+// vanished. The renewal is answered locally and the entry stays for the
+// startup convergence (ADR-026).
+func TestRestart01RebuiltEntryLeaseSkipsC4(t *testing.T) {
+	h := newHarness(t, false)
 
 	if err := h.sched.OnClaim(t.Context(), claimPayload("task-1")); err != nil {
 		t.Fatalf("OnClaim: %v", err)

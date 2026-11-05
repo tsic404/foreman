@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strings"
 	"sync"
 	"time"
 )
@@ -431,6 +432,21 @@ func (r *ProbeRegistry) dropRuntimeIndexLocked(jobRuntimeID, jobName string) {
 // (ADR-043; §0 real runtime).
 func RuntimeIdentityKey(provider, profileID string) string {
 	return provider + "\x00" + profileID
+}
+
+// SplitRuntimeIdentity is RuntimeIdentityKey's inverse: it recovers the two
+// components so a durable carrier can store them without the NUL separator.
+// An empty key names no identity (ok=false); an empty provider is not an
+// identity either, since every declared runtime has a type.
+func SplitRuntimeIdentity(key string) (provider, profileID string, ok bool) {
+	if key == "" {
+		return "", "", false
+	}
+	provider, profileID, found := strings.Cut(key, "\x00")
+	if !found || provider == "" {
+		return "", "", false
+	}
+	return provider, profileID, true
 }
 
 // StartupCatalog stages the startup discovery result by real runtime identity

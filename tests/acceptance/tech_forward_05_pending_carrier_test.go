@@ -328,11 +328,12 @@ func TestForward05ReplayedFailureKeepsItsAttribution(t *testing.T) {
 	}
 }
 
-// TestForward05RegistrationRefusedDuringCarrierListFailureSettlesNothing: the
-// proxy's refused-registration path calls FailJob outside any recovery round.
-// After a restart whose carrier list fails, that path must not settle a task
-// whose carrier holds a completed report — the exact shape AC-16/§4.3
-// eliminate. Once the list recovers, the queued report is the only verdict.
+// TestForward05RegistrationRefusedDuringCarrierListFailureSettlesNothing: a
+// refused registration answers 409 and settles nothing (§2.3), so it cannot
+// race a task whose carrier holds a completed report. The test restarts over a
+// failing carrier list and then refuses the daemon's registration: the entry
+// stays live, the Job and its carrier survive, no synthetic terminal appears,
+// and once the list recovers the queued report is the only verdict.
 func TestForward05RegistrationRefusedDuringCarrierListFailureSettlesNothing(t *testing.T) {
 	h := newDeliveryHarness(t)
 	h.useRealBuilder(t)
@@ -349,8 +350,9 @@ func TestForward05RegistrationRefusedDuringCarrierListFailureSettlesNothing(t *t
 	}
 
 	// The daemon registers against the restarted scheduler with a runtime set
-	// its rebuilt identity cannot match; the handler refuses and compensates
-	// through FailJob.
+	// its rebuilt identity cannot match. The refusal only answers 409: it
+	// settles nothing and calls no FailJob, so the pending report keeps the
+	// verdict.
 	issuer, err := proxy.JobTokenIssuer(testKey, reg, h.probes, auth.DefaultJobTokenTTL, nil)
 	if err != nil {
 		t.Fatalf("JobTokenIssuer: %v", err)
@@ -368,7 +370,7 @@ func TestForward05RegistrationRefusedDuringCarrierListFailureSettlesNothing(t *t
 
 	req, err := http.NewRequest(http.MethodPost, srv.URL+"/api/daemon/register", bytes.NewReader([]byte(`{
 		"daemon_id": "fm-task-1",
-		"runtimes": [{"name": "foreman-zz", "type": "zz", "version": "3.1.4"}]
+		"runtimes": [{"name": "foreman-omp", "type": "omp", "version": "0.6.1"}]
 	}`)))
 	if err != nil {
 		t.Fatalf("NewRequest: %v", err)

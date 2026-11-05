@@ -1540,12 +1540,16 @@ func TestRegisterRefusesAJobThatDroppedItsIdentity(t *testing.T) {
 	if code != 409 {
 		t.Fatalf("S-4 without the dispatched identity = %d: %s, want 409 (no builtin substitution)", code, body)
 	}
-	// The answer comes first and the settlement follows it, so the convergence
-	// is awaited rather than read off the response instant.
-	waitFor(t, "the refused task to settle", func() bool {
-		settled, ok := rig.reg.Get("t-left")
-		return ok && settled.IsTerminal() && settled.Result == registry.ResultFailed
+	// The refusal is the daemon's whole answer: the entry stays where it was,
+	// the builtin never answers for it, and no verdict is synthesized — the
+	// boot bound or the daemon's next round owns the convergence (§2.3).
+	waitFor(t, "the refusal to leave the entry untouched", func() bool {
+		entry, ok := rig.reg.Get("t-left")
+		return ok && !entry.IsTerminal() && entry.State == registry.StateJobCreated
 	})
+	if rt, ok := rig.reg.RuntimeByDaemon("fm-t-left"); ok {
+		t.Fatalf("refused registration seeded runtime %+v, want no builtin substitution", rt)
+	}
 }
 
 // TestRegisterRefusesAnEntryWithoutADispatchRecord: a rebuilt entry carries no
@@ -1571,67 +1575,6 @@ func TestRegisterRefusesAnEntryWithoutADispatchRecord(t *testing.T) {
 	if code != 409 {
 		t.Fatalf("S-4 without a dispatch record = %d: %s, want 409", code, body)
 	}
-}
-
-// The refused registration answers the daemon before its settlement round
-// starts: C13 can wait on the upstream status and the C10 report, and the
-// daemon must not be charged for that wait. The round is detached from the
-// request context, so the handler's return (which cancels it) cannot abort the
-// settlement half-way and leave the write-ahead entry behind.
-func TestRefusedRegistrationAnswersBeforeItsSettlement(t *testing.T) {
-	rig := newTestRig(t)
-	rig.claimTask(t, "t-late")
-	e, ok := rig.reg.Get("t-late")
-	if !ok {
-		t.Fatal("entry missing")
-	}
-	rig.reg.Put(registry.TaskEntry{
-		TaskID: e.TaskID, DaemonID: e.DaemonID, JobName: e.JobName,
-		WorkspaceID:  e.WorkspaceID,
-		JobRuntimeID: e.JobRuntimeID, State: registry.StateJobCreated,
-	})
-
-	var settleOnce sync.Once
-	settling := make(chan struct{})
-	release := make(chan struct{})
-	var releaseOnce sync.Once
-	openGate := func() { releaseOnce.Do(func() { close(release) }) }
-	t.Cleanup(openGate)
-	rig.stub.on("GET", "/api/daemon/tasks/t-late/status", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
-		settleOnce.Do(func() { close(settling) })
-		<-release
-		writeJSONStub(w, 200, map[string]string{"status": "dispatched"})
-	})
-
-	tok := rig.token(t, "t-late")
-	answered := callOffTest(rig.server.URL, "POST", "/api/daemon/register", tok,
-		[]byte(`{"daemon_id":"fm-t-late","runtimes":[{"name":"foreman-job","type":"omp"}]}`))
-
-	select {
-	case <-settling:
-	case <-time.After(5 * time.Second):
-		t.Fatal("the refused registration never reached the settlement round")
-	}
-	var got callResult
-	select {
-	case got = <-answered:
-	case <-time.After(2 * time.Second): // the round is still blocked upstream
-		t.Fatal("the 409 waited for the settlement round to finish")
-	}
-	if got.err != nil {
-		t.Fatalf("register: %v", got.err)
-	}
-	if got.code != http.StatusConflict {
-		t.Fatalf("refused registration = %d %s, want 409", got.code, got.body)
-	}
-
-	// The handler has returned by now, so its request context is cancelled;
-	// the settlement must still converge on the upstream's answer.
-	openGate()
-	waitFor(t, "the refused task to settle", func() bool {
-		settled, ok := rig.reg.Get("t-late")
-		return ok && settled.IsTerminal() && settled.Result == registry.ResultFailed
-	})
 }
 
 // The local daemon face's body bound is announced, not disguised: a body past

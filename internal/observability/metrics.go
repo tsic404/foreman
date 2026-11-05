@@ -38,15 +38,20 @@ const (
 	metricForwardTotal             = "foreman_forward_total"
 	metricForwardLatency           = "foreman_forward_latency_seconds"
 	metricAuthFailuresTotal        = "foreman_auth_failures_total"
-	metricTokenUsageTotal          = "foreman_token_usage_total"
-	metricDuplicateDispatch        = "foreman_duplicate_dispatch_total"
-	metricPendingReports           = "foreman_pending_reports"
-	metricWSConnected              = "foreman_ws_connected"
-	metricWSReconnectsTotal        = "foreman_ws_reconnects_total"
-	metricHeartbeatSuspect         = "foreman_heartbeat_suspect"
-	metricCredReclaimTotal         = "foreman_cred_reclaim_total"
-	metricJobDrainSeconds          = "foreman_job_drain_seconds"
-	metricJobDeleteFailed          = "foreman_job_delete_failed_total"
+	// S-4 registration refusals by stage (§9.2): "first" is a Job that never
+	// registered (it converges at its boot bound, never on the refusal),
+	// "re_register" is an already-registered Job whose declaration degraded
+	// (refused, task kept).
+	metricS4RefusalsTotal   = "foreman_s4_refusals_total"
+	metricTokenUsageTotal   = "foreman_token_usage_total"
+	metricDuplicateDispatch = "foreman_duplicate_dispatch_total"
+	metricPendingReports    = "foreman_pending_reports"
+	metricWSConnected       = "foreman_ws_connected"
+	metricWSReconnectsTotal = "foreman_ws_reconnects_total"
+	metricHeartbeatSuspect  = "foreman_heartbeat_suspect"
+	metricCredReclaimTotal  = "foreman_cred_reclaim_total"
+	metricJobDrainSeconds   = "foreman_job_drain_seconds"
+	metricJobDeleteFailed   = "foreman_job_delete_failed_total"
 	// Catalog relay metrics (ADR-019 / ADR-025): the relay outcome by C21
 	// status code ("none" = abandoned) and the consumption-to-answer span.
 	metricModelCatalogRelays = "foreman_model_catalog_relays_total"
@@ -111,6 +116,19 @@ var deliveryClaimResults = []string{
 // "revoked" is the same-name reuse face: the entry reappeared with a
 // predecessor's token (ADR-017).
 var authFailureReasons = []string{"malformed", "signature", "expired", "scope", "unknown_job", "revoked"}
+
+// S4RefusalStage values are the foreman_s4_refusals_total stage label: first =
+// neither a registration instant nor a startup fact; re_register = either one
+// exists (a rebuilt adopted entry has only the startup fact). Neither stage
+// settles on the refusal itself.
+const (
+	S4RefusalFirst      = "first"
+	S4RefusalReRegister = "re_register"
+)
+
+// s4RefusalStages pre-initializes the refusal series so both stages are
+// visible from boot.
+var s4RefusalStages = []string{S4RefusalFirst, S4RefusalReRegister}
 
 // credReclaimReasons is the foreman_cred_reclaim_total label vocabulary
 // (ADR-017): the drain window closed on the Job's termination, or on the
@@ -181,6 +199,7 @@ type Metrics struct {
 	forwardTotal       *prometheus.CounterVec
 	forwardLatency     *prometheus.HistogramVec
 	authFailures       *prometheus.CounterVec
+	s4Refusals         *prometheus.CounterVec
 	tokenUsage         *prometheus.CounterVec
 	duplicateDispatch  prometheus.Counter
 	pendingReports     prometheus.Gauge
@@ -314,6 +333,10 @@ func NewMetrics() *Metrics {
 		Name: metricAuthFailuresTotal,
 		Help: "Job Token verification failures by reason.",
 	}, []string{"reason"})
+	m.s4Refusals = prometheus.NewCounterVec(prometheus.CounterOpts{
+		Name: metricS4RefusalsTotal,
+		Help: "S-4 registration refusals by stage (first|re_register).",
+	}, []string{"stage"})
 	m.tokenUsage = prometheus.NewCounterVec(prometheus.CounterOpts{
 		Name: metricTokenUsageTotal,
 		Help: "Token usage from forwarded usage reports.",
@@ -399,7 +422,7 @@ func NewMetrics() *Metrics {
 		m.tasksTotal, m.taskClaims, m.claimErrors, m.jobBootSeconds,
 		m.deliveryClaims, m.deliveryLatency, m.deliveryUnconfirm,
 		m.jobCreateSeconds, m.inflightJobs, m.inflightWorkspace, m.forwardTotal, m.forwardLatency,
-		m.authFailures, m.tokenUsage, m.duplicateDispatch, m.pendingReports,
+		m.authFailures, m.s4Refusals, m.tokenUsage, m.duplicateDispatch, m.pendingReports,
 		m.wsConnected, m.wsReconnects, m.heartbeatSuspect,
 		m.credReclaims, m.jobDrainSeconds, m.jobDeleteFailures, m.catalogRelays, m.catalogSeconds,
 		m.skillResolves, m.skillEntries, m.skillBytes, m.skillEvictions,
@@ -431,6 +454,9 @@ func NewMetrics() *Metrics {
 	}
 	for _, reason := range authFailureReasons {
 		m.authFailures.WithLabelValues(reason)
+	}
+	for _, stage := range s4RefusalStages {
+		m.s4Refusals.WithLabelValues(stage)
 	}
 	for _, code := range modelCatalogCodes {
 		m.catalogRelays.WithLabelValues(code)
@@ -539,6 +565,11 @@ func (m *Metrics) DuplicateDispatch() { m.duplicateDispatch.Inc() }
 
 // AuthFailure counts a Job Token verification failure by reason.
 func (m *Metrics) AuthFailure(reason string) { m.authFailures.WithLabelValues(reason).Inc() }
+
+// S4Refusal counts one S-4 registration refusal by stage: "first" for a Job
+// that never registered, "re_register" for one whose declaration degraded
+// after a successful registration (task kept, §2.3).
+func (m *Metrics) S4Refusal(stage string) { m.s4Refusals.WithLabelValues(stage).Inc() }
 
 // PendingReports sets the terminal-report retry queue depth.
 func (m *Metrics) PendingReports(n int) { m.pendingReports.Set(float64(n)) }

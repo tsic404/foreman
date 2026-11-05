@@ -343,9 +343,10 @@ func (c *Client) ForwardInWorkspace(ctx context.Context, ep scheduler.Endpoint, 
 // verbatim, the daemon's identity reads as a claim the server no longer
 // holds, and the start is refused (409 状态不允许, S-8 +
 // §2.2) — so the field is translated like S7's {rid}.
-// The id comes from the task's own dispatch record; a task without one (a
-// rebuilt entry) falls back to the only declared runtime, and a set that is
-// not registered yet leaves the body verbatim. Every other field keeps its
+// The id comes from the task's own dispatch record, which a rebuilt entry
+// restores from its Job annotations (§4.3); a task without one (a Job
+// rendered before that annotation) falls back to the only declared runtime,
+// and a set that is not registered yet leaves the body verbatim. Every other field keeps its
 // value: the re-marshal may reorder keys and HTML-escape, which §2.4 excludes
 // from the fidelity face (key order has no HTTP or JSON semantics), and a body
 // naming no runtime is forwarded byte-for-byte.
@@ -598,9 +599,10 @@ func (c *Client) ResolveSkillBundles(ctx context.Context, taskID string, body []
 }
 
 // runtimeForTask resolves the real runtime id a task was dispatched under. A
-// rebuilt entry carries no dispatch record (the Job is the authority store,
-// ADR-002), so the first declared runtime is the best available answer; exact
-// reports which of the two paths produced the id.
+// rebuilt entry restores the record from its Job annotations (§4.3); only a
+// Job rendered before that annotation carries none, and then the first
+// declared runtime is the best available answer; exact reports which of the
+// two paths produced the id.
 func (c *Client) runtimeForTask(taskID string) (runtimeID string, exact bool) {
 	if c.taskRuntime != nil {
 		if rid := c.taskRuntime(taskID); rid != "" {

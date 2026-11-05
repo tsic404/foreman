@@ -250,6 +250,8 @@ func canonicalJob(job *batchv1.Job) string {
 	for _, key := range []string{
 		registry.AnnoIssueID, registry.AnnoIssueIdentifier,
 		registry.AnnoAutopilotRunID, registry.AnnoChatSessionID,
+		registry.AnnoRealRuntimeID, registry.AnnoRuntimeProvider,
+		registry.AnnoRuntimeProfileID,
 	} {
 		delete(annotations, key)
 	}
