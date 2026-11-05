@@ -359,6 +359,9 @@ type Scheduler struct {
 	// so the space is bounded rather than trusted.
 	usageMu    sync.Mutex
 	usagePairs map[usageLabelPair]struct{}
+	// usageNegativeOnce bounds the negative-counter warning: the S-12 body is
+	// task-controlled, so the first bad report warns and the rest stay silent.
+	usageNegativeOnce sync.Once
 
 	// Stage-two coordination face (ADR-046 决策 1-9). shared is nil without a
 	// shared store (the stage-one process-local form); when set, decisive
@@ -1122,16 +1125,40 @@ type usageLabelPair struct {
 // token metric (§9.2 / ADR-009 decision 4). A body that does not decode
 // contributes nothing: the upstream owns its validation, and a metric must
 // never change the forward's outcome.
-func (s *Scheduler) recordTokenUsage(body []byte) {
+//
+// The counters are the Job's own report, so they are task-controlled: a
+// negative value would panic Counter.Add and drop the daemon's connection, so
+// it is recorded as zero (the entry's other fields still count) and the first
+// occurrence warns once per process.
+func (s *Scheduler) recordTokenUsage(ctx context.Context, body []byte) {
 	var report usageReport
 	if err := json.Unmarshal(body, &report); err != nil {
 		return
 	}
 	for _, u := range report.Usage {
 		provider, model := s.usageLabels(u.Provider, u.Model)
-		s.metrics.TokenUsage(provider, model,
-			u.InputTokens, u.OutputTokens, u.CacheReadTokens, u.CacheWriteTokens)
+		input, inputNegative := nonNegativeUsage(u.InputTokens)
+		output, outputNegative := nonNegativeUsage(u.OutputTokens)
+		cacheRead, cacheReadNegative := nonNegativeUsage(u.CacheReadTokens)
+		cacheWrite, cacheWriteNegative := nonNegativeUsage(u.CacheWriteTokens)
+		if inputNegative || outputNegative || cacheReadNegative || cacheWriteNegative {
+			s.usageNegativeOnce.Do(func() {
+				s.log.WarnContext(ctx, "usage.negative_counters",
+					"note", "negative token counters are recorded as zero; the counter only moves up")
+			})
+		}
+		s.metrics.TokenUsage(provider, model, input, output, cacheRead, cacheWrite)
 	}
+}
+
+// nonNegativeUsage clamps one task-controlled S-12 counter and reports whether
+// it had to: a counter cannot go down, and a negative reading would panic the
+// metric instead of surfacing the bad report.
+func nonNegativeUsage(v int64) (int64, bool) {
+	if v < 0 {
+		return 0, true
+	}
+	return v, false
 }
 
 // usageLabels admits one report entry's provider and model into the token
@@ -1315,7 +1342,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		// twice when the daemon re-sends it after a failed forward. The body
 		// stays opaque everywhere else; only the metric's two label values and
 		// the four token counters are read.
-		s.recordTokenUsage(body)
+		s.recordTokenUsage(ctx, body)
 	}
 	if ep.IsTerminal() {
 		switch {
@@ -2486,18 +2513,22 @@ func (s *Scheduler) credentialOwner(ctx context.Context, workspaceID, taskID str
 func (s *Scheduler) Reconcile(ctx context.Context) error {
 	s.RefreshNodeSaturation(ctx)
 	s.SyncInflight()
-	// Round-level action, independent of the entry list (§6.5: the probe
-	// residual sweep): probe remnants are found by their labels, not by the
-	// session table, which is empty after a restart.
-	if err := s.SweepStaleProbes(ctx); err != nil {
-		s.log.WarnContext(ctx, "probe sweep failed", "err", err)
-	}
 	if s.reconciler != nil {
+		// The recovery round owns both round-level sweeps (§6.5): it runs
+		// SweepStaleProbes next to SweepOrphanSecrets every round, so the
+		// startup call here would be a second sweep of the same round.
 		return s.reconciler.Reconcile(ctx)
 	}
-	// Without the recovery loop this path is the only convergence driver:
-	// the queue must be rebuilt before any entry is settled, or a failed
-	// carrier list would read as an empty queue (§4.3).
+	// Without the recovery loop this path is the only convergence driver: it
+	// carries both round-level sweeps itself (§6.5 — the orphan credential and
+	// the probe remnant), then rebuilds the queue before any entry is settled,
+	// or a failed carrier list would read as an empty queue (§4.3).
+	if err := s.SweepOrphanSecrets(ctx); err != nil {
+		s.log.WarnContext(ctx, "cred.orphan_sweep_failed", "err", err)
+	}
+	if err := s.SweepStaleProbes(ctx); err != nil {
+		s.log.WarnContext(ctx, "catalog.probe_sweep_failed", "err", err)
+	}
 	if err := s.pendingReports.Restore(ctx); err != nil {
 		return err
 	}

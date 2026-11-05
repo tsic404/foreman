@@ -371,6 +371,39 @@ func TestSweepOrphanSecretsCriterion(t *testing.T) {
 	}
 }
 
+// TestReconcileFallbackRunsBothRoundSweeps pins the no-recovery-loop path's
+// claim: in that mode this method is the only convergence driver, so it must
+// carry both round-level sweeps (§6.5) — the orphan credential and the probe
+// remnant — exactly as the recovery round does.
+func TestReconcileFallbackRunsBothRoundSweeps(t *testing.T) {
+	f := newFixture(t)
+	// An orphan credential: no registry entry, no Job.
+	f.jobs.secrets = []corev1.Secret{secretObject("fm-task-orphan-cred", "task-orphan")}
+	// A stale probe Job and its Secret: the probe remnant face.
+	stale := metav1.NewTime(f.now.Add(-2 * f.sched.staleProbeGrace()))
+	probeLabels := map[string]string{registry.LabelRole: registry.RoleCatalogProbe}
+	f.jobs.jobs = []batchv1.Job{{ObjectMeta: metav1.ObjectMeta{
+		Name: "fm-catalog-remnant", Labels: probeLabels, CreationTimestamp: stale,
+	}}}
+	f.jobs.secrets = append(f.jobs.secrets, corev1.Secret{ObjectMeta: metav1.ObjectMeta{
+		Name: "fm-catalog-remnant-cred", Labels: probeLabels, CreationTimestamp: stale,
+	}})
+
+	if err := f.sched.Reconcile(context.Background()); err != nil {
+		t.Fatalf("Reconcile: %v", err)
+	}
+
+	if !f.jobs.secretDeleted("fm-task-orphan-cred") {
+		t.Errorf("the orphan credential survived the fallback round: deleted=%v", f.jobs.deletedSecrets)
+	}
+	if !f.jobs.deleted("fm-catalog-remnant") {
+		t.Errorf("the stale probe Job survived the fallback round: deleted=%v", f.jobs.deletedJobs)
+	}
+	if !f.jobs.secretDeleted("fm-catalog-remnant-cred") {
+		t.Errorf("the stale probe Secret survived the fallback round: deleted=%v", f.jobs.deletedSecrets)
+	}
+}
+
 // The criterion must hold at the moment of deletion (§6.5): the sweep
 // re-reads both halves under the task's write lock, and that lock key must be
 // the one the claim takes — workspace included. The fake shared store records

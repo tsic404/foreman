@@ -89,9 +89,13 @@ type fakeSettler struct {
 	continued []string
 	vanished  []string
 	sweeps    int
-	reclaims  []reclaimCall
-	syncs     int
-	err       error
+	// probeSweeps counts the probe-remnant sweep, which is a separate face
+	// from the orphan-Secret sweep (§6.5).
+	probeSweeps   int
+	probeSweepErr error
+	reclaims      []reclaimCall
+	syncs         int
+	err           error
 	// discardErrs is consumed one error per DiscardTask call; an empty queue
 	// falls back to err.
 	discardErrs []error
@@ -176,6 +180,13 @@ func (f *fakeSettler) SweepOrphanSecrets(context.Context) error {
 	defer f.mu.Unlock()
 	f.sweeps++
 	return f.sweepErr
+}
+
+func (f *fakeSettler) SweepStaleProbes(context.Context) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.probeSweeps++
+	return f.probeSweepErr
 }
 
 func (f *fakeSettler) JobTerminationEvidence(context.Context, string, time.Time) (scheduler.TerminationEvidence, error) {
@@ -1029,6 +1040,25 @@ func TestReconcileDrainsPendingReports(t *testing.T) {
 	}
 	if set.drainCalls != 1 {
 		t.Fatalf("drain calls = %d, want 1", set.drainCalls)
+	}
+}
+
+// TestReconcileSweepsProbeRemnantsEveryRound pins §6.5's round-level probe
+// sweep: it runs once per round and an index with no entries must not skip it
+// — the probe domain is found by labels, and a teardown that failed during the
+// run leaves objects the index never held.
+func TestReconcileSweepsProbeRemnantsEveryRound(t *testing.T) {
+	reg := newRegistry(t)
+	set := &fakeSettler{}
+	r := newTestReconciler(t, reg, &fakeObjects{}, &fakeStatus{}, set)
+
+	for round := 1; round <= 2; round++ {
+		if err := r.Reconcile(context.Background()); err != nil {
+			t.Fatalf("Reconcile round %d: %v", round, err)
+		}
+		if set.probeSweeps != round {
+			t.Fatalf("probe sweeps after round %d = %d, want one per round", round, set.probeSweeps)
+		}
 	}
 }
 

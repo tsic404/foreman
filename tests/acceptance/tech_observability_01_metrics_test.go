@@ -425,6 +425,33 @@ func TestTechObservability01RefreshFamilies(t *testing.T) {
 	}
 }
 
+// observability01PostUsage drives one claimed task to S-12 with body and
+// returns the harness whose seam recorded the outcome.
+func observability01PostUsage(t *testing.T, body []byte) *harness {
+	t.Helper()
+	h := newHarnessWithRealServer(t, false)
+	const taskID = "task-usage-labels"
+	payload, err := json.Marshal(map[string]any{
+		"id": taskID, "agent_id": "agent-1", "workspace_id": "ws-1",
+		"runtime_id": "rid-zz", "issue_id": "issue-1", "issue_identifier": "TSI-1",
+		"agent": map[string]any{"name": "agent-a"},
+	})
+	if err != nil {
+		t.Fatalf("marshal claim: %v", err)
+	}
+	tcPolicyAxisClaimRaw(t, h, payload)
+	token := issueJobToken(t, h, taskID)
+	registerTaskDaemon(t, h, taskID, token)
+	claimTask(t, h, taskID, token)
+	if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/start", token, []byte(`{}`)); code != http.StatusOK {
+		t.Fatalf("S8 = %d: %s", code, answer)
+	}
+	if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/usage", token, body); code != http.StatusOK {
+		t.Fatalf("S12 = %d: %s", code, answer)
+	}
+	return h
+}
+
 // TestTechObservability01UsageLabelSpaceBounded: the S-12 body is the Job
 // daemon's own report, so its provider and model strings are task-controlled.
 // The two bounds are judged separately, and the counts stay complete under both.
@@ -437,37 +464,10 @@ func TestTechObservability01UsageLabelSpaceBounded(t *testing.T) {
 		seriesEntries     = 4096
 	)
 
-	// postUsage drives one claimed task to S-12 with body and returns the
-	// harness whose seam recorded the outcome.
-	postUsage := func(t *testing.T, body []byte) *harness {
-		t.Helper()
-		h := newHarnessWithRealServer(t, false)
-		const taskID = "task-usage-labels"
-		payload, err := json.Marshal(map[string]any{
-			"id": taskID, "agent_id": "agent-1", "workspace_id": "ws-1",
-			"runtime_id": "rid-zz", "issue_id": "issue-1", "issue_identifier": "TSI-1",
-			"agent": map[string]any{"name": "agent-a"},
-		})
-		if err != nil {
-			t.Fatalf("marshal claim: %v", err)
-		}
-		tcPolicyAxisClaimRaw(t, h, payload)
-		token := issueJobToken(t, h, taskID)
-		registerTaskDaemon(t, h, taskID, token)
-		claimTask(t, h, taskID, token)
-		if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/start", token, []byte(`{}`)); code != http.StatusOK {
-			t.Fatalf("S8 = %d: %s", code, answer)
-		}
-		if code, answer := h.call("POST", "/api/daemon/tasks/"+taskID+"/usage", token, body); code != http.StatusOK {
-			t.Fatalf("S12 = %d: %s", code, answer)
-		}
-		return h
-	}
-
 	t.Run("an overlong value is cut to the bound", func(t *testing.T) {
 		// Three bytes per rune: the cut must not leave half a rune behind.
 		long := strings.Repeat("中", 200)
-		h := postUsage(t, []byte(fmt.Sprintf(
+		h := observability01PostUsage(t, []byte(fmt.Sprintf(
 			`{"usage":[{"provider":%q,"model":%q,"input_tokens":1}]}`, long, long)))
 
 		got := h.metrics.tokenUsageSnapshot()
@@ -499,7 +499,7 @@ func TestTechObservability01UsageLabelSpaceBounded(t *testing.T) {
 		for i := range seriesEntries {
 			reports = append(reports, fmt.Sprintf(`{"provider":"provider-%d","model":"model-%d","input_tokens":1}`, i, i))
 		}
-		h := postUsage(t, []byte(`{"usage":[`+strings.Join(reports, ",")+`]}`))
+		h := observability01PostUsage(t, []byte(`{"usage":[`+strings.Join(reports, ",")+`]}`))
 
 		pairs := make(map[string]struct{})
 		var total int64
@@ -514,6 +514,48 @@ func TestTechObservability01UsageLabelSpaceBounded(t *testing.T) {
 			t.Errorf("distinct (provider, model) pairs = %d, want at most %d", len(pairs), usageLabelCeiling)
 		}
 	})
+}
+
+// TestTechObservability01UsageNegativeCountersClamped: the four counters come
+// from the Job's own S-12 body, so they are task-controlled. A Prometheus
+// counter only moves up — a negative Add panics the handler, which drops the
+// daemon's connection and invites a re-send — so a negative field is recorded
+// as zero while the entry's other fields still count (§9.2: the label values
+// and counters are task-controlled input, and the metric must not grow past
+// what the upstream accepted).
+func TestTechObservability01UsageNegativeCountersClamped(t *testing.T) {
+	body := []byte(`{"usage":[` +
+		`{"provider":"omp","model":"kimi","input_tokens":-1,"output_tokens":7,` +
+		`"cache_read_tokens":-5,"cache_write_tokens":3},` +
+		`{"provider":"zz","model":"glm","input_tokens":-2}]}`)
+
+	h := observability01PostUsage(t, body)
+
+	got := h.metrics.tokenUsageSnapshot()
+	if len(got) != 2 {
+		t.Fatalf("usage entries = %d, want 2: a bad counter must not drop a report", len(got))
+	}
+	first := got[0]
+	if first.provider != "omp" || first.model != "kimi" {
+		t.Errorf("first entry labels = %q/%q, want omp/kimi", first.provider, first.model)
+	}
+	for _, field := range []struct {
+		name string
+		got  int64
+		want int64
+	}{
+		{"input", first.input, 0},
+		{"output", first.output, 7},
+		{"cache_read", first.cacheRead, 0},
+		{"cache_write", first.cacheWrite, 3},
+	} {
+		if field.got != field.want {
+			t.Errorf("first entry %s = %d, want %d", field.name, field.got, field.want)
+		}
+	}
+	if got[1].input != 0 {
+		t.Errorf("second entry input = %d, want a negative value clamped to zero", got[1].input)
+	}
 }
 
 // TestTechObservability01UsageCountsAcceptedReportOnly drives S-12 through the
