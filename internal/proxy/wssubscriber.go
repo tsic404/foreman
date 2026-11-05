@@ -45,6 +45,11 @@ type WSSubscriber struct {
 	leader func() bool
 	// now is the clock (overridable in tests).
 	now func() time.Time
+	// pingInterval/pingTimeout are the C-20 keepalive: a silent peer is
+	// detected and dropped so the backoff reconnect takes over. Overridable
+	// in tests, which cannot wait out the 30s production cadence.
+	pingInterval time.Duration
+	pingTimeout  time.Duration
 }
 
 // WSSubscriberOption customizes a WSSubscriber.
@@ -94,13 +99,15 @@ func (s *WSSubscriber) newReconnectBackoff() reconnectBackoff {
 // NewWSSubscriber builds the subscriber. wake is ClaimLoop.Wake.
 func NewWSSubscriber(client *Client, wake func(), metrics Metrics, opts ...WSSubscriberOption) *WSSubscriber {
 	s := &WSSubscriber{
-		client:      client,
-		wake:        wake,
-		metrics:     orNoopMetrics(metrics),
-		log:         slog.Default().With("component", "ws-subscriber"),
-		dialTimeout: controlTimeout,
-		parkRetry:   parkRetryInterval,
-		now:         time.Now,
+		client:       client,
+		wake:         wake,
+		metrics:      orNoopMetrics(metrics),
+		log:          slog.Default().With("component", "ws-subscriber"),
+		dialTimeout:  controlTimeout,
+		parkRetry:    parkRetryInterval,
+		now:          time.Now,
+		pingInterval: wsPingInterval,
+		pingTimeout:  wsPingTimeout,
 	}
 	for _, opt := range opts {
 		opt(s)
@@ -192,6 +199,21 @@ type streamResult struct {
 	outcome   streamOutcome
 }
 
+// stopStreams cancels every live stream and forgets it. The keys leave the
+// live set, so the retirement marks of those same identities leave with them:
+// an identity left marked as "replacement in flight" would never cancel its
+// stream again — the next id move would wait forever for a close that already
+// happened.
+func stopStreams(connections map[string]wsSubscription, retiring map[string]bool) {
+	for key, sub := range connections {
+		sub.cancel()
+		delete(connections, key)
+	}
+	for key := range retiring {
+		delete(retiring, key)
+	}
+}
+
 // Run keeps one connection per declared real runtime until ctx ends. A runtime
 // whose id moved is reconnected on its own; the other connections stay up
 // (§1.4 多 runtime 的失败面按 runtime 粒度). It is never started when
@@ -221,12 +243,7 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 	// closed, so the replacement starts without waiting for the stream's
 	// bookkeeping (metrics, outcome) to finish.
 	closedEvents := make(chan struct{}, 8)
-	stopAll := func() {
-		for key, sub := range connections {
-			sub.cancel()
-			delete(connections, key)
-		}
-	}
+	stopAll := func() { stopStreams(connections, retiring) }
 	defer stopAll()
 	outcomes := make(chan streamResult, 8)
 	reconcile := func() {
@@ -437,7 +454,13 @@ func (s *WSSubscriber) iterate(ctx context.Context, ref RuntimeRef, state *runti
 	state.rearm()
 	s.metrics.WSConnect(WSSideServer)
 	s.log.Info("ws.connected", "side", WSSideServer, "runtime_id", runtimeID)
+	// A peer that stops answering pings is a dead connection, not an idle
+	// one: the keepalive drops it so the read loop returns and the §1.5
+	// reconnect runs (C-20: 断开后退避重连).
+	pingCtx, stopPings := context.WithCancel(ctx)
+	go keepAlive(pingCtx, conn, s.pingInterval, s.pingTimeout, s.log, WSSideServer)
 	s.readLoop(ctx, conn)
+	stopPings()
 	_ = conn.Close(websocket.StatusNormalClosure, "closing")
 	if ctx.Err() != nil {
 		// A cancelled stream's connection is closed: its replacement may dial

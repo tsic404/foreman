@@ -1,6 +1,7 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -206,9 +207,19 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		s.log.Error("job declared no runtime for its identity; refusing registration",
 			"task_id", e.TaskID, "job_name", e.JobName, "identity", identity)
 		writeError(w, http.StatusConflict, "runtime identity not declared by this job")
-		if err := s.sched.FailJob(r.Context(), e.JobName, scheduler.FailureReasonDaemonNotRegistered); err != nil {
-			s.log.Error("settle refused registration failed", "task_id", e.TaskID, "err", err)
-		}
+		flushResponse(w)
+		// The 409 is the daemon's whole answer and does not depend on the
+		// settlement behind it: C13 may wait on the upstream status and the
+		// C10 report (~124s of forward budget), and a daemon that times out
+		// must not abort that round half-way — an interrupted settlement
+		// leaves the write-ahead entry behind. Detached from the request
+		// context for exactly that reason; a failed round still leaves the
+		// report in the pending queue (§10).
+		go func(ctx context.Context) {
+			if err := s.sched.FailJob(ctx, e.JobName, scheduler.FailureReasonDaemonNotRegistered); err != nil {
+				s.log.Error("settle refused registration failed", "task_id", e.TaskID, "err", err)
+			}
+		}(context.WithoutCancel(r.Context()))
 		return
 	}
 	name, provider := declared.Name, declared.Type
@@ -301,15 +312,12 @@ func (s *FakeServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "runtime not found")
 		return
 	}
-	s.reg.PutRuntime(registry.JobRuntime{
-		JobRuntimeID:    e.JobRuntimeID,
-		DaemonID:        e.DaemonID,
-		TaskID:          e.TaskID,
-		Provider:        "omp",
-		Name:            "foreman-job",
-		Online:          true,
-		LastHeartbeatAt: time.Now(),
-	})
+	// The heartbeat's only write is the heartbeat clock. The identity
+	// (provider/name) and the delivery record belong to the registration and
+	// delivery setters (§1.2: the identities in the C-1 answer are the real
+	// runtimes every later heartbeat uses; a full-row write here would reset
+	// what those wrote). The row itself is seeded from the entry by the
+	// registry's cache/rebuild paths, so touching it is enough.
 	s.reg.TouchHeartbeat(req.RuntimeID, time.Now())
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "runtime_id": req.RuntimeID})
 }
@@ -599,11 +607,13 @@ func (s *FakeServer) reportHandler(ep scheduler.Endpoint) http.HandlerFunc {
 			writeError(w, http.StatusBadGateway, "upstream unavailable")
 			return
 		}
+		// The daemon's answer goes out first (S30: the connection closes on
+		// terminal, but the caller must not wait for a close handshake that
+		// waits on the peer).
+		writeRaw(w, code, resp)
 		if ep.IsTerminal() && code >= 200 && code < 300 && s.ws != nil {
-			// S30: the connection closes when the task is terminal.
 			s.ws.CloseJob(claims.JobName)
 		}
-		writeRaw(w, code, resp)
 	}
 }
 

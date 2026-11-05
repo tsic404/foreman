@@ -1,9 +1,55 @@
 package proxy
 
 import (
+	"context"
 	"encoding/json"
+	"log/slog"
 	"strings"
+	"time"
+
+	"github.com/coder/websocket"
 )
+
+// Keepalive of the WS control channel (C-20, S-30). A NAT or a silently half-
+// closed peer leaves a connection that looks established but delivers
+// nothing: the subscriber would stop receiving task_available / profile
+// changes, and a Job daemon's heartbeat would never be acked again. Each side
+// therefore pings on an interval and treats a pong that does not arrive within
+// the timeout as a dead connection — the read loop then ends and the
+// reconnect (or the daemon's own) takes over.
+const (
+	wsPingInterval = 30 * time.Second
+	wsPingTimeout  = 10 * time.Second
+)
+
+// keepAlive pings conn every interval and closes it when a pong does not
+// arrive within timeout. The caller must have a concurrent Reader (both read
+// loops are); Ping does not read the connection itself.
+func keepAlive(ctx context.Context, conn *websocket.Conn, interval, timeout time.Duration, log *slog.Logger, side string) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			pingCtx, cancel := context.WithTimeout(ctx, timeout)
+			err := conn.Ping(pingCtx)
+			cancel()
+			if err == nil {
+				continue
+			}
+			if ctx.Err() == nil {
+				log.Warn("ws peer unresponsive; dropping the connection", "side", side, "err", err)
+			}
+			// CloseNow, not Close: a peer that does not answer a ping will not
+			// answer a close handshake either, and waiting 5s for it only
+			// delays the reconnect.
+			_ = conn.CloseNow()
+			return
+		}
+	}
+}
 
 // WS frame types of the daemon control channel (ADR-010; the {type,payload}
 // envelope and the frame set mirror the upstream daemon WS path). Foreman

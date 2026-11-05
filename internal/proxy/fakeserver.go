@@ -20,6 +20,14 @@ import (
 // carries control-plane JSON, not agent payloads, so a body past this bound is
 // an anomaly the caller is told about; S29 passthrough does not use it (its
 // bodies stream through unread).
+//
+// Budget: the bound is per request and each accepted body is materialized in
+// memory (this face does not stream), so the face's worst case is one bound per
+// concurrent daemon call — a few tens of MiB, while payload-sized bodies never
+// land here. The reader stops at the bound instead of draining, and the server
+// closes a connection it had to cut off, which is the backpressure: a refused
+// body costs at most the bound once and buys its caller no retry-friendly
+// keep-alive.
 const maxLocalBodyBytes = 32 << 20
 
 // TaskScheduler is the fake server's scheduling surface (§2.1):
@@ -349,6 +357,17 @@ func writeRaw(w http.ResponseWriter, code int, body []byte) {
 func writeError(w http.ResponseWriter, code int, msg string) {
 	raw, _ := json.Marshal(map[string]string{"error": msg})
 	writeRaw(w, code, raw)
+}
+
+// flushResponse pushes the bytes written so far to the client. It is for
+// answers that must not carry the cost of work the handler starts before it
+// returns: without the flush the response only leaves with the handler's
+// return, and a close handshake or settlement behind it would be charged to
+// the caller.
+func flushResponse(w http.ResponseWriter) {
+	if f, ok := w.(http.Flusher); ok {
+		f.Flush()
+	}
 }
 
 // entryFor re-reads the token's mapping entry; it may have been deleted

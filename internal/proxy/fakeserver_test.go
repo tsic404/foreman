@@ -679,6 +679,47 @@ func TestS5HeartbeatSemantics(t *testing.T) {
 	}
 }
 
+// The heartbeat writes the heartbeat clock only (§1.2: the identities the C-1
+// answer handed out are the ones every later heartbeat uses). A full-row write
+// here would reset the registered provider/name and the delivery record to the
+// hardcoded fallbacks — a latent defect now, a data loss for the first reader
+// that trusts those fields.
+func TestHeartbeatKeepsTheRegisteredRuntimeFields(t *testing.T) {
+	rig := newTestRig(t)
+	rig.claimTask(t, "t-hb-fields")
+	tok := rig.token(t, "t-hb-fields")
+	// The declared name differs from the fallback the old heartbeat wrote.
+	code, body := rig.call(t, "POST", "/api/daemon/register", tok, []byte(`{
+		"daemon_id": "fm-t-hb-fields",
+		"runtimes": [{"name": "foreman-omp", "type": "omp"}]
+	}`))
+	if code != 200 {
+		t.Fatalf("S4 = %d: %s", code, body)
+	}
+	e, _ := rig.reg.Get("t-hb-fields")
+	rig.reg.SetRuntimeDeliveredTask(e.JobRuntimeID, "t-earlier")
+
+	code, body = rig.call(t, "POST", "/api/daemon/heartbeat", tok,
+		[]byte(`{"runtime_id":"`+e.JobRuntimeID+`"}`))
+	if code != 200 {
+		t.Fatalf("S5 = %d: %s", code, body)
+	}
+
+	rt, ok := rig.reg.RuntimeByID(e.JobRuntimeID)
+	if !ok {
+		t.Fatal("runtime row missing")
+	}
+	if rt.Name != "foreman-omp" || rt.Provider != "omp" {
+		t.Errorf("the heartbeat rewrote the registered identity: name=%q provider=%q", rt.Name, rt.Provider)
+	}
+	if rt.DeliveredTaskID != "t-earlier" {
+		t.Errorf("the heartbeat cleared the delivery record: %q", rt.DeliveredTaskID)
+	}
+	if rt.LastHeartbeatAt.IsZero() {
+		t.Error("the heartbeat clock was not refreshed")
+	}
+}
+
 func TestS4ResponseShape(t *testing.T) {
 	rig := newTestRig(t)
 	rig.claimTask(t, "t-reg")
@@ -1499,10 +1540,12 @@ func TestRegisterRefusesAJobThatDroppedItsIdentity(t *testing.T) {
 	if code != 409 {
 		t.Fatalf("S-4 without the dispatched identity = %d: %s, want 409 (no builtin substitution)", code, body)
 	}
-	settled, ok := rig.reg.Get("t-left")
-	if !ok || !settled.IsTerminal() || settled.Result != registry.ResultFailed {
-		t.Errorf("the refused task did not settle: %+v (ok=%v)", settled, ok)
-	}
+	// The answer comes first and the settlement follows it, so the convergence
+	// is awaited rather than read off the response instant.
+	waitFor(t, "the refused task to settle", func() bool {
+		settled, ok := rig.reg.Get("t-left")
+		return ok && settled.IsTerminal() && settled.Result == registry.ResultFailed
+	})
 }
 
 // TestRegisterRefusesAnEntryWithoutADispatchRecord: a rebuilt entry carries no
@@ -1530,6 +1573,67 @@ func TestRegisterRefusesAnEntryWithoutADispatchRecord(t *testing.T) {
 	}
 }
 
+// The refused registration answers the daemon before its settlement round
+// starts: C13 can wait on the upstream status and the C10 report, and the
+// daemon must not be charged for that wait. The round is detached from the
+// request context, so the handler's return (which cancels it) cannot abort the
+// settlement half-way and leave the write-ahead entry behind.
+func TestRefusedRegistrationAnswersBeforeItsSettlement(t *testing.T) {
+	rig := newTestRig(t)
+	rig.claimTask(t, "t-late")
+	e, ok := rig.reg.Get("t-late")
+	if !ok {
+		t.Fatal("entry missing")
+	}
+	rig.reg.Put(registry.TaskEntry{
+		TaskID: e.TaskID, DaemonID: e.DaemonID, JobName: e.JobName,
+		WorkspaceID:  e.WorkspaceID,
+		JobRuntimeID: e.JobRuntimeID, State: registry.StateJobCreated,
+	})
+
+	var settleOnce sync.Once
+	settling := make(chan struct{})
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	openGate := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(openGate)
+	rig.stub.on("GET", "/api/daemon/tasks/t-late/status", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		settleOnce.Do(func() { close(settling) })
+		<-release
+		writeJSONStub(w, 200, map[string]string{"status": "dispatched"})
+	})
+
+	tok := rig.token(t, "t-late")
+	answered := callOffTest(rig.server.URL, "POST", "/api/daemon/register", tok,
+		[]byte(`{"daemon_id":"fm-t-late","runtimes":[{"name":"foreman-job","type":"omp"}]}`))
+
+	select {
+	case <-settling:
+	case <-time.After(5 * time.Second):
+		t.Fatal("the refused registration never reached the settlement round")
+	}
+	var got callResult
+	select {
+	case got = <-answered:
+	case <-time.After(2 * time.Second): // the round is still blocked upstream
+		t.Fatal("the 409 waited for the settlement round to finish")
+	}
+	if got.err != nil {
+		t.Fatalf("register: %v", got.err)
+	}
+	if got.code != http.StatusConflict {
+		t.Fatalf("refused registration = %d %s, want 409", got.code, got.body)
+	}
+
+	// The handler has returned by now, so its request context is cancelled;
+	// the settlement must still converge on the upstream's answer.
+	openGate()
+	waitFor(t, "the refused task to settle", func() bool {
+		settled, ok := rig.reg.Get("t-late")
+		return ok && settled.IsTerminal() && settled.Result == registry.ResultFailed
+	})
+}
+
 // The local daemon face's body bound is announced, not disguised: a body past
 // it gets 413 with the bound and how much was read, so the caller can tell the
 // proxy's refusal from a malformed request, and the handler never runs on
@@ -1543,8 +1647,20 @@ func TestLocalFaceOversizeBodyAnswers413WithFacts(t *testing.T) {
 	rig := newTestRig(t)
 	rig.claimTask(t, "t-oversize")
 	tok := rig.token(t, "t-oversize")
+	// Seed the runtime row through a real S4 first: the row is what makes the
+	// refusal observable, because a handler that ran on truncated bytes would
+	// find it and refresh its heartbeat clock.
+	runtimeID := rig.registerDaemon(t, "t-oversize", tok)
+	seeded, ok := rig.reg.RuntimeByID(runtimeID)
+	if !ok {
+		t.Fatalf("S4 left no runtime row for %s", runtimeID)
+	}
 
-	body := bytes.Repeat([]byte("a"), maxLocalBodyBytes+1)
+	// A well-formed heartbeat followed by whitespace padding: an
+	// implementation that parses the truncated prefix still sees a valid
+	// heartbeat and would run the endpoint's side effect.
+	body := append([]byte(`{"runtime_id":"`+runtimeID+`"}`),
+		bytes.Repeat([]byte(" "), maxLocalBodyBytes)...)
 	code, raw := rig.call(t, "POST", "/api/daemon/heartbeat", tok, body)
 	if code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversize local body = %d %s, want 413", code, raw)
@@ -1570,6 +1686,16 @@ func TestLocalFaceOversizeBodyAnswers413WithFacts(t *testing.T) {
 	}
 	if !strings.Contains(logs.String(), `"limit_bytes":33554432`) {
 		t.Errorf("event lacks the bound fact: %s", logs.String())
+	}
+	// The handler never ran on truncated bytes: the heartbeat clock is the
+	// endpoint's only side effect, and it must not move.
+	rt, ok := rig.reg.RuntimeByID(runtimeID)
+	if !ok {
+		t.Fatalf("runtime row %s disappeared", runtimeID)
+	}
+	if !rt.LastHeartbeatAt.Equal(seeded.LastHeartbeatAt) {
+		t.Errorf("the refused body still reached the handler: heartbeat clock %v → %v",
+			seeded.LastHeartbeatAt, rt.LastHeartbeatAt)
 	}
 }
 
