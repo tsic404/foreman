@@ -25,7 +25,7 @@ set -eu
 
 JOB_NS=${FOREMAN_JOB_NAMESPACE:-multica-agents}
 FOREMAN_NS=${FOREMAN_NAMESPACE:-foreman}
-FOREMAN_URL=${FOREMAN_URL:-http://127.0.0.1:8080}
+FOREMAN_URL=${FOREMAN_URL:-http://127.0.0.1:8081}
 LOG_SINCE=${LOG_SINCE:-6h}
 ACTION=${1:-}
 
@@ -35,17 +35,25 @@ need curl
 need jq
 
 blocked() { echo "QA_BLOCKED: $*" >&2; exit 2; }
+
+# The ops surface is a separate, credential-gated listener (contract S-25):
+# these scripts read it, so every ops request carries FOREMAN_OPS_TOKEN.
+FOREMAN_OPS_TOKEN=${FOREMAN_OPS_TOKEN:-}
+ops_curl() {
+	[ -n "$FOREMAN_OPS_TOKEN" ] || blocked "FOREMAN_OPS_TOKEN is required for the ops surface (kubectl -n foreman get secret foreman-secret -o jsonpath='{.data.FOREMAN_OPS_TOKEN}' | base64 -d)"
+	curl -fsS -m 30 -H "Authorization: Bearer $FOREMAN_OPS_TOKEN" "$@"
+}
 fail() { echo "FAIL: $*" >&2; exit 1; }
 observe() { printf '# observation: %s\n' "$*"; }
 
 entry() {
-	curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks/$1" ||
-		blocked "cannot read $FOREMAN_URL/foreman/tasks/$1 (port-forward the foreman Service first)"
+	ops_curl "$FOREMAN_URL/foreman/tasks/$1" ||
+		blocked "cannot read $FOREMAN_URL/foreman/tasks/$1 (port-forward svc/foreman-ops 8081:8081 first)"
 }
 
 task_list() {
-	curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks" ||
-		blocked "cannot read $FOREMAN_URL/foreman/tasks (port-forward the foreman Service first)"
+	ops_curl "$FOREMAN_URL/foreman/tasks" ||
+		blocked "cannot read $FOREMAN_URL/foreman/tasks (port-forward svc/foreman-ops 8081:8081 first)"
 }
 
 live_job() {
@@ -107,7 +115,7 @@ same_issue() { # <a> <b>
 # payload (it is memory-only by design); a 404 means the entry is not live and
 # delivered, which is a block rather than a judgement.
 payload_prior_session() {
-	_p=$(curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks/$1/payload-preview") ||
+	_p=$(ops_curl "$FOREMAN_URL/foreman/tasks/$1/payload-preview") ||
 		blocked "cannot read $1's delivered payload — run while the entry is live and delivered"
 	printf '%s' "$_p" | jq -r '.prior_session_id // empty'
 }

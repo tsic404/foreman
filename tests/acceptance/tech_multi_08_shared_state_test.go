@@ -98,7 +98,7 @@ func TestMulti08RestartPersistsTokensAndMapping(t *testing.T) {
 	h := newHarnessWithSharedState(t, false, store)
 	// The upstream stub is per-harness; the restarted harness gets its own
 	// stub, and the shared store is what must carry the state across.
-	ops := httptest.NewServer(observability.NewOpsHandler(
+	ops := httptest.NewServer(newOpsHandler(t,
 		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
 	t.Cleanup(ops.Close)
 
@@ -176,7 +176,7 @@ func TestMulti08RestartPersistsTokensAndMapping(t *testing.T) {
 func TestMulti08SettledRecordSurvivesRestart(t *testing.T) {
 	store, _ := multi08Store(t)
 	h := newHarnessWithSharedState(t, false, store)
-	ops := httptest.NewServer(observability.NewOpsHandler(
+	ops := httptest.NewServer(newOpsHandler(t,
 		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
 	t.Cleanup(ops.Close)
 
@@ -231,7 +231,7 @@ func TestMulti08SettledRecordSurvivesRestart(t *testing.T) {
 	// The post-reclaim answer face is that record (the live row is gone, so
 	// the endpoint falls through to the retention window): it must serve the
 	// verdict, not an empty row.
-	code, raw := httpGet(t, ops.URL+"/foreman/tasks/task-1")
+	code, raw := opsRead(t, ops.URL+"/foreman/tasks/task-1")
 	if code != http.StatusOK {
 		t.Errorf("post-reclaim GET /foreman/tasks/task-1 = %d (%s), want 200", code, raw)
 	} else {

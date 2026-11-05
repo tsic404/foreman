@@ -9,7 +9,6 @@ package acceptance
 
 import (
 	"encoding/json"
-	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -38,7 +37,7 @@ func TestCatalog05ProbeCredentialAndIsolationFaces(t *testing.T) {
 	if got := h.reg.Inflight(); got != 1 {
 		t.Fatalf("Inflight before the probe = %d, want the single claimed task", got)
 	}
-	ops := httptest.NewServer(observability.NewOpsHandler(
+	ops := httptest.NewServer(newOpsHandler(t,
 		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
 	t.Cleanup(ops.Close)
 
@@ -141,8 +140,8 @@ func TestCatalog05ProbeCredentialAndIsolationFaces(t *testing.T) {
 			t.Errorf("the task projection carries the probe: %v", entry)
 		}
 	}
-	if got := opsInflight(t, ops.URL); got != 1 {
-		t.Errorf("/foreman/healthz inflight = %d, want the single task", got)
+	if got := h.reg.Inflight(); got != 1 {
+		t.Errorf("inflight after the probe = %d, want the single claimed task (the probe is not a task)", got)
 	}
 
 	// The profile literal's judgement point is the rendered mount-path face
@@ -202,21 +201,4 @@ func probeCredentialToken(t *testing.T, secret *corev1.Secret) (string, []string
 		t.Fatal("the probe credential Secret carries no token")
 	}
 	return payload.Token, keys
-}
-
-// opsInflight reads the operator-visible in-flight count.
-func opsInflight(t *testing.T, base string) int {
-	t.Helper()
-	resp, err := http.Get(base + "/foreman/healthz")
-	if err != nil {
-		t.Fatalf("GET /foreman/healthz: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	var health struct {
-		Inflight int `json:"inflight"`
-	}
-	if err := json.NewDecoder(resp.Body).Decode(&health); err != nil {
-		t.Fatalf("decode /foreman/healthz: %v", err)
-	}
-	return health.Inflight
 }

@@ -129,6 +129,7 @@ func tcCache03CarrierRun(t *testing.T, bin, state string, overrides map[string]s
 	}
 	env := map[string]string{
 		"FOREMAN_URL":                    "http://foreman",
+		"FOREMAN_OPS_TOKEN":              opsTestToken,
 		"FOREMAN_JOB_NAMESPACE":          "multica-agents",
 		"FOREMAN_STATE_ROOT":             "/var/lib/foreman",
 		"NODE_DEBUG_IMAGE":               "fake",

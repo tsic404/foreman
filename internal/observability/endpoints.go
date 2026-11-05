@@ -36,21 +36,20 @@ type TaskIndex interface {
 	// ListInWorkspace lists the workspace's live rows ("" = every row, the
 	// legacy single-workspace shape).
 	ListInWorkspace(workspaceID string) []registry.TaskEntry
-	// Inflight is the shared two-level counter's cluster value in stage two
-	// and the local index count otherwise (§10 两级在途上限).
-	Inflight() int
 }
 
-// OpsConfig carries the static or late-bound values the ops endpoints
-// report. RuntimeIDs resolves the declared real runtime ids at request time —
-// empty until C1 answered. RegisterSource resolves the startup discovery view
-// (S31); a nil one keeps the route and answers 404. Logger defaults to
-// slog.Default.
+// OpsConfig carries the values the ops endpoints report. RegisterSource
+// resolves the startup discovery view (S31), cropped per request to the
+// caller's grant; a nil one keeps the route and answers 404. Logger defaults
+// to slog.Default.
 type OpsConfig struct {
 	Version        string
 	JobImage       string
-	RuntimeIDs     func() []string
-	RegisterSource func() any
+	RegisterSource func() map[string]any
+	// Credentials are the bearer credentials every ops request must present
+	// (§2.2 S-25). Empty refuses every request: the surface never answers
+	// without a configured credential.
+	Credentials []OpsCredential
 	// Health is the liveness view of the process's critical loops; nil keeps
 	// the endpoint's always-ok shape (a handler mounted without loops, as in
 	// the ops tests).
@@ -73,16 +72,23 @@ type OpsConfig struct {
 // range variable, a reassigned name, an escaped mount method and a second
 // route table fail it. It does not follow a pattern mutated through a pointer.
 type OpsHandler struct {
-	// dispatch is the mux's ServeHTTP method value. The mux does not leave
-	// NewOpsHandler: no field or method hands it out, and the census fails on
-	// any other mux use in this function or construction in this package.
-	dispatch   http.HandlerFunc
-	registered []string
+	// dispatch is the mux's ServeHTTP method value. ServeHTTP admits the
+	// credential before calling it, so no route is reachable without one; the
+	// mux itself does not leave NewOpsHandler: no field or method hands it
+	// out, and the census fails on any other mux use in this function or
+	// construction in this package.
+	dispatch http.HandlerFunc
+	// auth is the credential face every request passes before dispatch.
+	auth *opsAuth
+	// workspaceIDs is the deployment's served set (§0, ADR-047); the
+	// credential's grant is resolved against it.
+	workspaceIDs []string
+	registered   []string
 }
 
-// ServeHTTP dispatches to the mounted routes.
+// ServeHTTP authenticates the request and dispatches to the mounted routes.
 func (h *OpsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	h.dispatch(w, r)
+	h.auth.serve(h.dispatch, w, r)
 }
 
 // RegisteredPatterns returns the patterns the surface registered, in order.
@@ -90,10 +96,12 @@ func (h *OpsHandler) RegisteredPatterns() []string {
 	return append([]string(nil), h.registered...)
 }
 
-// NewOpsHandler mounts the cluster-internal ops surface (§2.2 S-25): /metrics
-// plus /foreman/*. No Job Token check — these endpoints are
-// reachable only inside the cluster and never exposed via Ingress. A nil
-// logs reader keeps the route but answers 404 (optional endpoint).
+// NewOpsHandler mounts the ops surface (§2.2 S-25): /metrics plus /foreman/*,
+// served on its own listener (the Job face mounts only /api). Every request
+// must present one of cfg.Credentials as a bearer token; without one the
+// answer is 401 and no route is reached, so a Job Token — a credential of the
+// other face — never opens this surface. A nil logs reader keeps the route but
+// answers 404 (optional endpoint).
 func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg OpsConfig) *OpsHandler {
 	if cfg.StartedAt.IsZero() {
 		cfg.StartedAt = time.Now()
@@ -103,7 +111,10 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 		log = slog.Default()
 	}
 	log = log.With("component", "observability")
-	handler := &OpsHandler{}
+	handler := &OpsHandler{
+		auth:         newOpsAuth(cfg.Credentials),
+		workspaceIDs: append([]string(nil), cfg.WorkspaceIDs...),
+	}
 	mux := http.NewServeMux()
 	// register is the single mount point: the pattern is recorded by the same
 	// call that mounts it, and the census requires every mount in this closure
@@ -124,55 +135,48 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 			writeError(w, http.StatusServiceUnavailable, "metrics are not wired")
 		})
 	} else {
-		register("GET /metrics", metrics.Handler())
+		metricsHandler := metrics.Handler()
+		register("GET /metrics", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			// The metric set carries deployment-wide series with a
+			// per-workspace label (§9.2 多 workspace 面): only the deployment
+			// credential is trusted with it, never a workspace-bound one. A
+			// request that reached this handler without an admitted identity
+			// is no deployment credential either — fail closed like the rest
+			// of the surface instead of answering every workspace.
+			if identity, ok := opsIdentityFrom(r.Context()); !ok || identity.workspaces != nil {
+				writeError(w, http.StatusForbidden, "deployment credential required")
+				return
+			}
+			metricsHandler.ServeHTTP(w, r)
+		}))
 	}
 	registerFn("GET /foreman/healthz", func(w http.ResponseWriter, _ *http.Request) {
-		runtimeIDs := []string{}
-		if cfg.RuntimeIDs != nil {
-			if ids := cfg.RuntimeIDs(); ids != nil {
-				runtimeIDs = ids
-			}
-		}
-		body := map[string]any{
-			"status":      "ok",
-			"inflight":    index.Inflight(),
-			"runtime_ids": runtimeIDs,
-			"uptime_s":    int64(time.Since(cfg.StartedAt).Seconds()),
-		}
-		// §9.3: this endpoint feeds the liveness probe. A critical loop that
-		// stopped while the process kept serving is exactly the half-dead
-		// state the probe exists to end, so it must not answer ok (§1.5: a
-		// config error is logged and alarmed, not silently absorbed).
-		status := http.StatusOK
-		if stopped := cfg.Health.Stopped(); len(stopped) > 0 {
-			status = http.StatusServiceUnavailable
-			body["status"] = "failed"
-			body["stopped_components"] = stopped
-		}
-		writeJSON(w, status, body)
+		serveHealthz(w, cfg.Health, cfg.StartedAt)
 	})
 	registerFn("GET /foreman/tasks", func(w http.ResponseWriter, r *http.Request) {
 		// TaskEntry.Payload is json:"-" — the list never leaks payloads (F3).
-		workspaceID, ok := workspaceScope(r, cfg.WorkspaceIDs)
-		if !ok {
-			// §4.1: the list is partitioned by workspace; a deployment with
-			// more than one workspace has no default dimension, and answering
-			// every workspace's entries would cross the partition.
-			writeError(w, http.StatusBadRequest, "workspace is required")
+		scope := handler.scope(r)
+		if scope.status != 0 {
+			// §4.1: the list is partitioned by the caller's workspace grant; a
+			// deployment with more than one visible workspace has no default
+			// dimension, and answering every workspace would cross the
+			// partition.
+			writeError(w, scope.status, scope.message)
 			return
 		}
-		entries := index.ListInWorkspace(workspaceID)
+		entries := index.ListInWorkspace(scope.workspaceID)
 		if entries == nil {
 			entries = []registry.TaskEntry{}
 		}
 		writeJSON(w, http.StatusOK, entries)
 	})
 	registerFn("GET /foreman/tasks/{taskID}", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID, scoped := workspaceScope(r, cfg.WorkspaceIDs)
-		if !scoped {
-			writeError(w, http.StatusBadRequest, "workspace is required")
+		scope := handler.scope(r)
+		if scope.status != 0 {
+			writeError(w, scope.status, scope.message)
 			return
 		}
+		workspaceID := scope.workspaceID
 		taskID := r.PathValue("taskID")
 		e, ok := index.GetInWorkspace(workspaceID, taskID)
 		if !ok {
@@ -196,23 +200,24 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 		writeJSON(w, http.StatusOK, e)
 	})
 	registerFn("GET /foreman/tasks/{taskID}/logs", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID, scoped := workspaceScope(r, cfg.WorkspaceIDs)
-		if !scoped {
-			writeError(w, http.StatusBadRequest, "workspace is required")
+		scope := handler.scope(r)
+		if scope.status != 0 {
+			writeError(w, scope.status, scope.message)
 			return
 		}
-		if !workspaceVisible(index, r.PathValue("taskID"), workspaceID) {
+		if !workspaceVisible(index, r.PathValue("taskID"), scope.workspaceID) {
 			writeError(w, http.StatusNotFound, "task not found")
 			return
 		}
-		serveJobLogs(w, r, index, workspaceID, logs, log)
+		serveJobLogs(w, r, index, scope.workspaceID, logs, log)
 	})
 	registerFn("GET /foreman/tasks/{taskID}/payload-preview", func(w http.ResponseWriter, r *http.Request) {
-		workspaceID, scoped := workspaceScope(r, cfg.WorkspaceIDs)
-		if !scoped {
-			writeError(w, http.StatusBadRequest, "workspace is required")
+		scope := handler.scope(r)
+		if scope.status != 0 {
+			writeError(w, scope.status, scope.message)
 			return
 		}
+		workspaceID := scope.workspaceID
 		e, ok := index.GetInWorkspace(workspaceID, r.PathValue("taskID"))
 		if ok && !workspaceVisible(index, e.TaskID, workspaceID) {
 			ok = false
@@ -239,13 +244,14 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 	})
 	// S31 is read-only by design: it reports the startup discovery, the C1
 	// declaration and the catalog slots, and can never trigger a discovery or
-	// a refresh (ADR-025).
-	registerFn("GET /foreman/register-source", func(w http.ResponseWriter, _ *http.Request) {
+	// a refresh (ADR-025). The answer is cropped to the caller's grant: a
+	// workspace the credential cannot read is absent, not rendered empty.
+	registerFn("GET /foreman/register-source", func(w http.ResponseWriter, r *http.Request) {
 		if cfg.RegisterSource == nil {
 			writeError(w, http.StatusNotFound, "register source unavailable")
 			return
 		}
-		writeJSON(w, http.StatusOK, cfg.RegisterSource())
+		writeJSON(w, http.StatusOK, handler.cropToGrant(r, cfg.RegisterSource()))
 	})
 	registerFn("GET /foreman/version", func(w http.ResponseWriter, _ *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]string{
@@ -309,27 +315,106 @@ func parseTail(raw string) (int64, error) {
 	return n, nil
 }
 
-// workspaceScope resolves the workspace dimension of an ops request (§4.1).
-// An explicit workspace must be one the deployment serves. Without one, a
-// single configured workspace is the dimension; a multi-workspace deployment
-// has none (the caller must say which), and an empty set keeps the
-// pre-ADR-047 single-workspace shape.
-func workspaceScope(r *http.Request, configured []string) (string, bool) {
-	workspaceID := strings.TrimSpace(r.URL.Query().Get("workspace"))
-	if workspaceID != "" {
-		if len(configured) > 0 && !slices.Contains(configured, workspaceID) {
-			return "", false
+// opsScope is the workspace dimension an ops request resolves to: either the
+// id, or the refusal the handler answers with (status 0 = resolved).
+type opsScope struct {
+	workspaceID string
+	status      int
+	message     string
+}
+
+// scope resolves the request's workspace dimension from the caller's
+// credential, never from the query alone (§2.2 S-25). A request naming a
+// workspace outside the grant is answered like a workspace that does not
+// exist, so the query parameter cannot widen the partition.
+func (h *OpsHandler) scope(r *http.Request) opsScope {
+	visible := h.visibleWorkspaces(r)
+	if requested := strings.TrimSpace(r.URL.Query().Get("workspace")); requested != "" {
+		if visible != nil && !slices.Contains(visible, requested) {
+			return opsScope{status: http.StatusNotFound, message: "workspace not found"}
 		}
-		return workspaceID, true
+		return opsScope{workspaceID: requested}
 	}
-	switch len(configured) {
-	case 0:
-		return "", true
-	case 1:
-		return configured[0], true
-	default:
-		return "", false
+	if len(visible) == 1 {
+		return opsScope{workspaceID: visible[0]}
 	}
+	if visible == nil {
+		// The pre-ADR-047 single-workspace shape: the deployment has no
+		// workspace dimension to choose from.
+		return opsScope{}
+	}
+	return opsScope{status: http.StatusBadRequest, message: "workspace is required"}
+}
+
+// visibleWorkspaces is the credential's grant intersected with the deployment's
+// served set. A nil result is the pre-ADR-047 shape (no configured dimension);
+// an empty one grants nothing — the fail-closed answer for an identity the
+// middleware could not resolve.
+func (h *OpsHandler) visibleWorkspaces(r *http.Request) []string {
+	identity, ok := opsIdentityFrom(r.Context())
+	if !ok {
+		return []string{}
+	}
+	if identity.workspaces == nil {
+		return h.workspaceIDs
+	}
+	if len(h.workspaceIDs) == 0 {
+		return identity.workspaces
+	}
+	visible := make([]string, 0, len(identity.workspaces))
+	for _, workspaceID := range h.workspaceIDs {
+		if slices.Contains(identity.workspaces, workspaceID) {
+			visible = append(visible, workspaceID)
+		}
+	}
+	return visible
+}
+
+// cropToGrant keeps only the workspaces the caller's credential may read. A
+// deployment-wide credential keeps the view untouched.
+func (h *OpsHandler) cropToGrant(r *http.Request, view map[string]any) map[string]any {
+	visible := h.visibleWorkspaces(r)
+	if visible == nil {
+		return view
+	}
+	cropped := make(map[string]any, len(visible))
+	for _, workspaceID := range visible {
+		if entry, ok := view[workspaceID]; ok {
+			cropped[workspaceID] = entry
+		}
+	}
+	return cropped
+}
+
+// NewHealthHandler serves the Job face's liveness probe input: the liveness
+// verdict alone, with no task, workspace or runtime identity field, so a Job
+// pod reading it learns nothing about another workspace (§2.2 S-25). The ops
+// surface answers the same shape behind its credential.
+func NewHealthHandler(health *Health, startedAt time.Time) http.Handler {
+	if startedAt.IsZero() {
+		startedAt = time.Now()
+	}
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		serveHealthz(w, health, startedAt)
+	})
+}
+
+// serveHealthz is the single liveness answer both faces mount. §9.3: a
+// critical loop that stopped while the process kept serving is exactly the
+// half-dead state the probe exists to end, so it must not answer ok (§1.5: a
+// config error is logged and alarmed, not silently absorbed).
+func serveHealthz(w http.ResponseWriter, health *Health, startedAt time.Time) {
+	body := map[string]any{
+		"status":   "ok",
+		"uptime_s": int64(time.Since(startedAt).Seconds()),
+	}
+	status := http.StatusOK
+	if stopped := health.Stopped(); len(stopped) > 0 {
+		status = http.StatusServiceUnavailable
+		body["status"] = "failed"
+		body["stopped_components"] = stopped
+	}
+	writeJSON(w, status, body)
 }
 
 // workspaceVisible applies the projection's workspace partition to the

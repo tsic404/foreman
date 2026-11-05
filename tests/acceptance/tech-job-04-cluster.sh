@@ -14,7 +14,7 @@ set -eu
 
 JOB_NS=${FOREMAN_JOB_NAMESPACE:-multica-agents}
 FOREMAN_NS=${FOREMAN_NAMESPACE:-foreman}
-FOREMAN_URL=${FOREMAN_URL:-http://127.0.0.1:8080}
+FOREMAN_URL=${FOREMAN_URL:-http://127.0.0.1:8081}
 LOG_SINCE=${LOG_SINCE:-1h}
 TASK=${TASK:-${1:-}}
 ENTRY=${ENTRY:-}
@@ -26,6 +26,14 @@ need curl
 need jq
 
 blocked() { echo "QA_BLOCKED: $*" >&2; exit 2; }
+
+# The ops surface is a separate, credential-gated listener (contract S-25):
+# these scripts read it, so every ops request carries FOREMAN_OPS_TOKEN.
+FOREMAN_OPS_TOKEN=${FOREMAN_OPS_TOKEN:-}
+ops_curl() {
+	[ -n "$FOREMAN_OPS_TOKEN" ] || blocked "FOREMAN_OPS_TOKEN is required for the ops surface (kubectl -n foreman get secret foreman-secret -o jsonpath='{.data.FOREMAN_OPS_TOKEN}' | base64 -d)"
+	curl -fsS -m 30 -H "Authorization: Bearer $FOREMAN_OPS_TOKEN" "$@"
+}
 fail() { echo "FAIL: $*" >&2; exit 1; }
 observe() { printf '# observation: %s\n' "$*"; }
 
@@ -63,8 +71,8 @@ jq -en --argjson d "$delta" '($d >= 0) and ($d <= 5)' >/dev/null ||
 job_json=$(kubectl -n "$JOB_NS" get job "$JOB_NAME" -o json) ||
 	blocked "cannot read Job $JOB_NAME"
 observe "annotations: $(printf '%s' "$job_json" | jq -c '.metadata.annotations')"
-entry=$(curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks/$TASK") ||
-	blocked "cannot read $FOREMAN_URL/foreman/tasks/$TASK (port-forward the foreman Service first)"
+entry=$(ops_curl "$FOREMAN_URL/foreman/tasks/$TASK") ||
+	blocked "cannot read $FOREMAN_URL/foreman/tasks/$TASK (port-forward svc/foreman-ops 8081:8081 first)"
 observe "projection: $entry"
 printf '%s' "$entry" | jq -e '.issue_id == "" and .issue_identifier == ""' >/dev/null ||
 	fail "the task carries an issue context: $(printf '%s' "$entry" | jq -c '{issue_id,issue_identifier}')"

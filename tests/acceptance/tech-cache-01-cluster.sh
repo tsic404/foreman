@@ -15,7 +15,7 @@
 set -eu
 
 JOB_NS=${FOREMAN_JOB_NAMESPACE:-multica-agents}
-FOREMAN_URL=${FOREMAN_URL:-http://127.0.0.1:8080}
+FOREMAN_URL=${FOREMAN_URL:-http://127.0.0.1:8081}
 STATE_ROOT=${FOREMAN_STATE_ROOT:-/var/lib/foreman}
 # GNU coreutils inside the node-debug container: stat %W (birth time), du, find.
 NODE_DEBUG_IMAGE=${NODE_DEBUG_IMAGE:-debian:bookworm-slim}
@@ -30,6 +30,14 @@ need curl
 need jq
 
 blocked() { echo "QA_BLOCKED: $*" >&2; exit 2; }
+
+# The ops surface is a separate, credential-gated listener (contract S-25):
+# these scripts read it, so every ops request carries FOREMAN_OPS_TOKEN.
+FOREMAN_OPS_TOKEN=${FOREMAN_OPS_TOKEN:-}
+ops_curl() {
+	[ -n "$FOREMAN_OPS_TOKEN" ] || blocked "FOREMAN_OPS_TOKEN is required for the ops surface (kubectl -n foreman get secret foreman-secret -o jsonpath='{.data.FOREMAN_OPS_TOKEN}' | base64 -d)"
+	curl -fsS -m 30 -H "Authorization: Bearer $FOREMAN_OPS_TOKEN" "$@"
+}
 fail() { echo "FAIL: $*" >&2; exit 1; }
 observe() { printf '# observation: %s\n' "$*"; }
 
@@ -52,8 +60,8 @@ pod2_node=$(printf '%s' "$pods2" | jq -r "$pod2_filter | .spec.nodeName // empty
 	blocked "TASK2 has no pod carrying a startTime (already deleted, or never scheduled) — run this while the second task is still running"
 
 if [ -z "$NODE" ]; then
-	NODE=$(curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks/$TASK1" | jq -r '.node_name // empty') ||
-		blocked "cannot read $FOREMAN_URL/foreman/tasks/$TASK1 (port-forward the foreman Service first)"
+	NODE=$(ops_curl "$FOREMAN_URL/foreman/tasks/$TASK1" | jq -r '.node_name // empty') ||
+		blocked "cannot read $FOREMAN_URL/foreman/tasks/$TASK1 (port-forward svc/foreman-ops 8081:8081 first)"
 fi
 [ -n "$NODE" ] || blocked "TASK1 has no node_name — the node its cache sits on was never observed"
 [ "$pod2_node" = "$NODE" ] ||

@@ -87,13 +87,18 @@ func TestTechMultiWS01ParallelChainsDoNotCross(t *testing.T) {
 
 	// Projection partition: the list answers one workspace's entries and the
 	// single-task route treats another workspace's id as absent (§4.1).
-	ops := observability.NewOpsHandler(observability.NewMetrics(), m.reg, nil, observability.OpsConfig{
+	ops := newOpsHandler(t, observability.NewMetrics(), m.reg, nil, observability.OpsConfig{
 		WorkspaceIDs: []string{"ws-a", "ws-b"},
 	})
-	for _, workspaceID := range []string{"ws-a", "ws-b"} {
-		req := httptest.NewRequest(http.MethodGet, "/foreman/tasks?workspace="+workspaceID, nil)
+	opsGet := func(path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+opsTestToken)
 		rec := httptest.NewRecorder()
 		ops.ServeHTTP(rec, req)
+		return rec
+	}
+	for _, workspaceID := range []string{"ws-a", "ws-b"} {
+		rec := opsGet("/foreman/tasks?workspace=" + workspaceID)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("list %s = %d: %s", workspaceID, rec.Code, rec.Body)
 		}
@@ -113,17 +118,10 @@ func TestTechMultiWS01ParallelChainsDoNotCross(t *testing.T) {
 
 	// A multi-workspace deployment has no default dimension: an unscoped
 	// projection would answer across the partition (§4.1).
-	req := httptest.NewRequest(http.MethodGet, "/foreman/tasks", nil)
-	rec := httptest.NewRecorder()
-	ops.ServeHTTP(rec, req)
-	if rec.Code != http.StatusBadRequest {
+	if rec := opsGet("/foreman/tasks"); rec.Code != http.StatusBadRequest {
 		t.Errorf("unscoped list = %d, want 400", rec.Code)
 	}
-
-	req = httptest.NewRequest(http.MethodGet, "/foreman/tasks/task-b1?workspace=ws-a", nil)
-	rec = httptest.NewRecorder()
-	ops.ServeHTTP(rec, req)
-	if rec.Code != http.StatusNotFound {
+	if rec := opsGet("/foreman/tasks/task-b1?workspace=ws-a"); rec.Code != http.StatusNotFound {
 		t.Errorf("cross-workspace single-task = %d, want 404", rec.Code)
 	}
 }

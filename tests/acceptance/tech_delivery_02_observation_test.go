@@ -9,7 +9,6 @@ package acceptance
 import (
 	"bytes"
 	"encoding/json"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -138,10 +137,10 @@ func TestDelivery02LostResponseLeavesMetricsEventsAndRetainedRecord(t *testing.T
 		t.Errorf("the retained record must carry neither the payload nor the token digest: %+v", record)
 	}
 
-	ops := httptest.NewServer(observability.NewOpsHandler(observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
+	ops := httptest.NewServer(newOpsHandler(t, observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
 	t.Cleanup(ops.Close)
 
-	code, body := httpGet(t, ops.URL+"/foreman/tasks/task-1")
+	code, body := opsRead(t, ops.URL+"/foreman/tasks/task-1")
 	if code != http.StatusOK {
 		t.Fatalf("GET /foreman/tasks/task-1 = %d (%s), want 200 from the retained record", code, body)
 	}
@@ -163,15 +162,15 @@ func TestDelivery02LostResponseLeavesMetricsEventsAndRetainedRecord(t *testing.T
 	}
 
 	// The list endpoint is the live index: a reclaimed task is not in it.
-	if code, list := httpGet(t, ops.URL+"/foreman/tasks"); code != http.StatusOK || bytes.Contains(list, []byte(`"task-1"`)) {
+	if code, list := opsRead(t, ops.URL+"/foreman/tasks"); code != http.StatusOK || bytes.Contains(list, []byte(`"task-1"`)) {
 		t.Errorf("GET /foreman/tasks = %d %s, want the live index without the reclaimed task", code, list)
 	}
 	// The payload is not part of the retained record, so the preview stays 404.
-	if code, _ := httpGet(t, ops.URL+"/foreman/tasks/task-1/payload-preview"); code != http.StatusNotFound {
+	if code, _ := opsRead(t, ops.URL+"/foreman/tasks/task-1/payload-preview"); code != http.StatusNotFound {
 		t.Errorf("payload-preview = %d, want 404 (the record drops the body)", code)
 	}
 	// A task that never existed has no record either.
-	if code, _ := httpGet(t, ops.URL+"/foreman/tasks/nope"); code != http.StatusNotFound {
+	if code, _ := opsRead(t, ops.URL+"/foreman/tasks/nope"); code != http.StatusNotFound {
 		t.Errorf("unknown task = %d, want 404", code)
 	}
 }
@@ -255,20 +254,6 @@ func TestDelivery02ClaimsAfterDeliveryResetAcrossRearms(t *testing.T) {
 	if n := h.metrics.deliveryClaimCount(proxy.DeliveryClaimRedelivered); n != 2 {
 		t.Errorf("redelivered claim count = %d, want 2", n)
 	}
-}
-
-func httpGet(t *testing.T, url string) (int, []byte) {
-	t.Helper()
-	resp, err := http.Get(url)
-	if err != nil {
-		t.Fatalf("GET %s: %v", url, err)
-	}
-	defer resp.Body.Close()
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read %s: %v", url, err)
-	}
-	return resp.StatusCode, body
 }
 
 // newDelivery02LatencyHarness is the fixture the latency scenarios use: two

@@ -36,7 +36,7 @@ func (f *fakeLogReader) ReadLogs(_ context.Context, namespace, jobName string, t
 // A handler mounted without a metrics registry answers the readiness face
 // with 503 instead of dereferencing nil at construction time.
 func TestOpsHandlerWithoutMetricsAnswersNotReady(t *testing.T) {
-	h := NewOpsHandler(nil, registry.New(time.Now), nil, OpsConfig{})
+	h := NewOpsHandler(nil, registry.New(time.Now), nil, OpsConfig{Credentials: testOpsCredentials()})
 	rec := do(t, h, "/metrics")
 	if rec.Code != http.StatusServiceUnavailable {
 		t.Fatalf("/metrics = %d, want 503", rec.Code)
@@ -47,21 +47,33 @@ func TestOpsHandlerWithoutMetricsAnswersNotReady(t *testing.T) {
 // (§9.3: the version endpoint echoes the configured reference verbatim).
 const testJobImage = "ghcr.io/tsic404/foreman-job@sha256:abc"
 
+// testOpsToken is the bearer credential the unit fixtures mount on the ops
+// surface (§2.2 S-25: every ops request presents one).
+const testOpsToken = "ops-test-token"
+
+// testOpsCredentials is the deployment-wide credential the fixtures use.
+func testOpsCredentials() []OpsCredential {
+	return []OpsCredential{{Token: testOpsToken}}
+}
+
+// newTestHandler mounts the ops surface with the fixture credential.
 func newTestHandler(reg *registry.Registry, logs PodLogReader) http.Handler {
 	return NewOpsHandler(NewMetrics(), reg, logs, OpsConfig{
-		Version:    "v0.1.0",
-		JobImage:   testJobImage,
-		RuntimeIDs: func() []string { return []string{"rt-123", "rt-456"} },
-		StartedAt:  time.Now().Add(-time.Minute),
+		Version:     "v0.1.0",
+		JobImage:    testJobImage,
+		Credentials: testOpsCredentials(),
+		StartedAt:   time.Now().Add(-time.Minute),
 	})
 }
 
 func do(t *testing.T, h http.Handler, path string) *httptest.ResponseRecorder {
 	t.Helper()
 	rec := httptest.NewRecorder()
-	// Ops endpoints take no Job Token (S-25); requests go out
-	// without Authorization on purpose.
-	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+	// Ops requests carry the deployment's bearer credential; nothing else is
+	// admitted (a Job Token is deliberately not accepted).
+	req := httptest.NewRequest(http.MethodGet, path, nil)
+	req.Header.Set("Authorization", "Bearer "+testOpsToken)
+	h.ServeHTTP(rec, req)
 	return rec
 }
 
@@ -79,15 +91,17 @@ func TestHealthz(t *testing.T) {
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status = %d", rec.Code)
 	}
-	var body struct {
-		Status     string   `json:"status"`
-		Inflight   int      `json:"inflight"`
-		RuntimeIDs []string `json:"runtime_ids"`
-		UptimeS    int64    `json:"uptime_s"`
-	}
+	var body map[string]any
 	decodeBody(t, rec, &body)
-	if body.Status != "ok" || body.Inflight != 1 || len(body.RuntimeIDs) != 2 || body.RuntimeIDs[0] != "rt-123" || body.UptimeS < 59 {
+	if body["status"] != "ok" || body["uptime_s"].(float64) < 59 {
 		t.Fatalf("healthz = %+v", body)
+	}
+	// The liveness answer carries no task, workspace or runtime identity
+	// field: it is the same answer the Job face serves without a credential.
+	for _, key := range []string{"inflight", "runtime_ids", "tasks", "workspace_id"} {
+		if _, present := body[key]; present {
+			t.Errorf("healthz carries %q: %+v", key, body)
+		}
 	}
 }
 
@@ -99,7 +113,10 @@ func TestHealthzReflectsCriticalLoopLiveness(t *testing.T) {
 	health := NewHealth()
 	stopClaim := health.Running("claim")
 	health.Running("heartbeat")
-	h := NewOpsHandler(NewMetrics(), registry.New(time.Now), nil, OpsConfig{Health: health})
+	h := NewOpsHandler(NewMetrics(), registry.New(time.Now), nil, OpsConfig{
+		Health:      health,
+		Credentials: testOpsCredentials(),
+	})
 
 	rec := do(t, h, "/foreman/healthz")
 	if rec.Code != http.StatusOK {
@@ -397,6 +414,7 @@ func TestJobLogsForbidden(t *testing.T) {
 	var logBuf bytes.Buffer
 	h := NewOpsHandler(NewMetrics(), reg, forbidden, OpsConfig{
 		Version: "v", Logger: slog.New(slog.NewJSONHandler(&logBuf, nil)),
+		Credentials: testOpsCredentials(),
 	})
 	rec := do(t, h, "/foreman/tasks/t-1/logs")
 	if rec.Code != http.StatusForbidden {
@@ -426,7 +444,8 @@ func TestRegisterSourceEndpoint(t *testing.T) {
 	}
 	h := NewOpsHandler(NewMetrics(), reg, nil, OpsConfig{
 		Version:        "v0.1.0",
-		RegisterSource: func() any { return view },
+		RegisterSource: func() map[string]any { return view },
+		Credentials:    testOpsCredentials(),
 	})
 	rec := do(t, h, "/foreman/register-source")
 	if rec.Code != http.StatusOK {
@@ -445,7 +464,7 @@ func TestRegisterSourceEndpoint(t *testing.T) {
 // TestRegisterSourceUnavailableWithoutSeam keeps the route honest when the
 // ops handler was built without a register-source view.
 func TestRegisterSourceUnavailableWithoutSeam(t *testing.T) {
-	h := NewOpsHandler(NewMetrics(), registry.New(time.Now), nil, OpsConfig{Version: "v0.1.0"})
+	h := NewOpsHandler(NewMetrics(), registry.New(time.Now), nil, OpsConfig{Version: "v0.1.0", Credentials: testOpsCredentials()})
 	if rec := do(t, h, "/foreman/register-source"); rec.Code != http.StatusNotFound {
 		t.Fatalf("status = %d, want 404", rec.Code)
 	}
@@ -468,11 +487,10 @@ func TestOpsWorkspaceDimensionIsRequiredAcrossWorkspaces(t *testing.T) {
 	}
 	h := NewOpsHandler(NewMetrics(), reg, nil, OpsConfig{
 		WorkspaceIDs: []string{"ws-a", "ws-b"},
+		Credentials:  testOpsCredentials(),
 	})
 	get := func(path string) *httptest.ResponseRecorder {
-		rec := httptest.NewRecorder()
-		h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
-		return rec
+		return do(t, h, path)
 	}
 
 	for _, path := range []string{
@@ -502,8 +520,10 @@ func TestOpsWorkspaceDimensionIsRequiredAcrossWorkspaces(t *testing.T) {
 	if rec := get("/foreman/tasks/task-b?workspace=ws-a"); rec.Code != http.StatusNotFound {
 		t.Errorf("cross-workspace single task = %d, want 404", rec.Code)
 	}
-	if rec := get("/foreman/tasks/task-b?workspace=ws-z"); rec.Code != http.StatusBadRequest {
-		t.Errorf("unknown workspace = %d, want 400", rec.Code)
+	// A workspace outside the caller's visible set is answered like a
+	// workspace that does not exist: the query cannot widen the partition.
+	if rec := get("/foreman/tasks/task-b?workspace=ws-z"); rec.Code != http.StatusNotFound {
+		t.Errorf("workspace outside the grant = %d, want 404", rec.Code)
 	}
 }
 
@@ -517,7 +537,7 @@ func TestOpsSingleWorkspaceIsTheDefaultDimension(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}
-	h := NewOpsHandler(NewMetrics(), reg, nil, OpsConfig{WorkspaceIDs: []string{"ws-a"}})
+	h := NewOpsHandler(NewMetrics(), reg, nil, OpsConfig{WorkspaceIDs: []string{"ws-a"}, Credentials: testOpsCredentials()})
 
 	rec := do(t, h, "/foreman/tasks")
 	if rec.Code != http.StatusOK {
@@ -532,5 +552,289 @@ func TestOpsSingleWorkspaceIsTheDefaultDimension(t *testing.T) {
 	}
 	if rec := do(t, h, "/foreman/tasks/task-a"); rec.Code != http.StatusOK {
 		t.Fatalf("single task = %d, want 200", rec.Code)
+	}
+}
+
+// TestOpsSurfaceRefusesEveryRouteWithoutCredential pins the credential face:
+// no route answers without an admitted credential, and a Job Token — a
+// credential of the Job face — never authenticates here (§2.2 S-25).
+func TestOpsSurfaceRefusesEveryRouteWithoutCredential(t *testing.T) {
+	ops := NewOpsHandler(NewMetrics(), registry.New(time.Now), nil, OpsConfig{
+		Version:     "v0.1.0",
+		Credentials: testOpsCredentials(),
+	})
+	headers := []struct {
+		name   string
+		header string
+	}{
+		{"no credential", ""},
+		{"job token", "Bearer fmj_00000000000000000000000000000000"},
+		{"wrong credential", "Bearer another-deployment-token"},
+		{"not a bearer scheme", "Basic b3BzLXRlc3QtdG9rZW4="},
+	}
+	for _, pattern := range ops.RegisteredPatterns() {
+		path := strings.ReplaceAll(strings.TrimPrefix(pattern, http.MethodGet+" "), "{taskID}", "t-1")
+		for _, tc := range headers {
+			req := httptest.NewRequest(http.MethodGet, path, nil)
+			if tc.header != "" {
+				req.Header.Set("Authorization", tc.header)
+			}
+			rec := httptest.NewRecorder()
+			ops.ServeHTTP(rec, req)
+			if rec.Code != http.StatusUnauthorized {
+				t.Errorf("%s with %s = %d, want 401", pattern, tc.name, rec.Code)
+			}
+			if rec.Header().Get("WWW-Authenticate") == "" {
+				t.Errorf("%s with %s carries no WWW-Authenticate", pattern, tc.name)
+			}
+		}
+	}
+
+	// A surface mounted without a credential refuses everything: forgetting the
+	// deployment value must close the surface, never open it.
+	unwired := NewOpsHandler(NewMetrics(), registry.New(time.Now), nil, OpsConfig{})
+	req := httptest.NewRequest(http.MethodGet, "/foreman/tasks", nil)
+	req.Header.Set("Authorization", "Bearer "+testOpsToken)
+	rec := httptest.NewRecorder()
+	unwired.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("uncredentialed surface = %d, want 401", rec.Code)
+	}
+}
+
+// TestOpsScopedCredentialCropsWorkspace pins the workspace dimension's source:
+// the credential's grant, not the query parameter. A credential bound to ws-a
+// cannot name ws-b, and the register-source view carries only its workspace.
+func TestOpsScopedCredentialCropsWorkspace(t *testing.T) {
+	reg := registry.New(time.Now)
+	for _, e := range []registry.TaskEntry{
+		{TaskID: "task-a", JobName: "fm-task-a", WorkspaceID: "ws-a", State: registry.StateRunning},
+		{TaskID: "task-b", JobName: "fm-task-b", WorkspaceID: "ws-b", State: registry.StateRunning},
+	} {
+		if err := reg.Put(e); err != nil {
+			t.Fatalf("Put %s: %v", e.TaskID, err)
+		}
+	}
+	view := func() map[string]any {
+		return map[string]any{
+			"ws-a": map[string]any{"declaration": "a"},
+			"ws-b": map[string]any{"declaration": "b"},
+		}
+	}
+	newHandler := func(workspaces []string) *OpsHandler {
+		return NewOpsHandler(NewMetrics(), reg, nil, OpsConfig{
+			WorkspaceIDs:   []string{"ws-a", "ws-b"},
+			RegisterSource: view,
+			Credentials: []OpsCredential{
+				{Token: "ops-a", Workspaces: workspaces},
+				{Token: testOpsToken},
+			},
+		})
+	}
+	call := func(h *OpsHandler, token, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	scoped := newHandler([]string{"ws-a"})
+	// The single visible workspace is the default dimension; the other
+	// workspace's id in the query is answered like one that does not exist.
+	rec := call(scoped, "ops-a", "/foreman/tasks")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scoped list = %d: %s", rec.Code, rec.Body)
+	}
+	var entries []struct {
+		TaskID      string `json:"task_id"`
+		WorkspaceID string `json:"workspace_id"`
+	}
+	decodeBody(t, rec, &entries)
+	if len(entries) != 1 || entries[0].TaskID != "task-a" || entries[0].WorkspaceID != "ws-a" {
+		t.Fatalf("scoped list = %+v, want exactly task-a", entries)
+	}
+	if rec := call(scoped, "ops-a", "/foreman/tasks?workspace=ws-b"); rec.Code != http.StatusNotFound {
+		t.Errorf("scoped list naming ws-b = %d, want 404", rec.Code)
+	}
+	if rec := call(scoped, "ops-a", "/foreman/tasks/task-b"); rec.Code != http.StatusNotFound {
+		t.Errorf("scoped single task of ws-b = %d, want 404", rec.Code)
+	}
+	rec = call(scoped, "ops-a", "/foreman/register-source")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scoped register-source = %d", rec.Code)
+	}
+	var cropped map[string]any
+	decodeBody(t, rec, &cropped)
+	if len(cropped) != 1 || cropped["ws-a"] == nil {
+		t.Fatalf("scoped register-source = %v, want only ws-a", cropped)
+	}
+
+	// The deployment-wide credential keeps both workspaces but still has no
+	// default dimension: the caller must name one (§4.1).
+	wide := newHandler(nil)
+	if rec := call(wide, testOpsToken, "/foreman/tasks"); rec.Code != http.StatusBadRequest {
+		t.Errorf("wide unscoped list = %d, want 400", rec.Code)
+	}
+	rec = call(wide, testOpsToken, "/foreman/register-source")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("wide register-source = %d", rec.Code)
+	}
+	var full map[string]any
+	decodeBody(t, rec, &full)
+	if len(full) != 2 || full["ws-b"] == nil {
+		t.Fatalf("wide register-source = %v, want both workspaces", full)
+	}
+}
+
+// TestNewHealthHandlerCarriesOnlyLiveness keeps the Job face's probe input
+// data-free: the verdict and its stopped components, never a task, workspace
+// or runtime identity field (§2.2 S-25).
+func TestNewHealthHandlerCarriesOnlyLiveness(t *testing.T) {
+	health := NewHealth()
+	stopClaim := health.Running("claim")
+	h := NewHealthHandler(health, time.Now().Add(-time.Minute))
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/foreman/healthz", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	var body map[string]any
+	decodeBody(t, rec, &body)
+	if len(body) != 2 || body["status"] != "ok" {
+		t.Fatalf("health body = %v, want only status and uptime_s", body)
+	}
+
+	stopClaim()
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/foreman/healthz", nil))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("status after a loop stopped = %d, want 503", rec.Code)
+	}
+	var failed map[string]any
+	decodeBody(t, rec, &failed)
+	if failed["status"] != "failed" || failed["stopped_components"] == nil {
+		t.Fatalf("failed health body = %v", failed)
+	}
+}
+
+// TestLoadOpsCredentials pins the deployment value's parsing and its
+// fail-fast edges: an empty or placeholder credential, a malformed pair, and a
+// token or workspace bound twice all refuse startup.
+func TestLoadOpsCredentials(t *testing.T) {
+	env := func(values map[string]string) func(string) string {
+		return func(key string) string { return values[key] }
+	}
+	credentials, err := LoadOpsCredentials(env(map[string]string{
+		EnvOpsToken:           "wide-token",
+		EnvOpsWorkspaceTokens: "ws-a=token-a,ws-b=token=b",
+	}))
+	if err != nil {
+		t.Fatalf("LoadOpsCredentials: %v", err)
+	}
+	if len(credentials) != 3 {
+		t.Fatalf("credentials = %+v, want 3", credentials)
+	}
+	if credentials[0].Token != "wide-token" || credentials[0].Workspaces != nil {
+		t.Errorf("wide credential = %+v", credentials[0])
+	}
+	if len(credentials[1].Workspaces) != 1 || credentials[1].Workspaces[0] != "ws-a" || credentials[1].Token != "token-a" {
+		t.Errorf("workspace credential = %+v", credentials[1])
+	}
+	if credentials[2].Token != "token=b" {
+		t.Errorf("token containing '=' = %q", credentials[2].Token)
+	}
+
+	for name, values := range map[string]map[string]string{
+		"placeholder":        {EnvOpsToken: "REPLACE_ME"},
+		"malformed pair":     {EnvOpsWorkspaceTokens: "ws-a"},
+		"empty token":        {EnvOpsWorkspaceTokens: "ws-a="},
+		"duplicate token":    {EnvOpsToken: "shared", EnvOpsWorkspaceTokens: "ws-a=shared"},
+		"duplicate ws":       {EnvOpsWorkspaceTokens: "ws-a=one,ws-a=two"},
+		"placeholder scoped": {EnvOpsWorkspaceTokens: "ws-a=REPLACE_ME"},
+	} {
+		if _, err := LoadOpsCredentials(env(values)); err == nil {
+			t.Errorf("%s: LoadOpsCredentials accepted %v", name, values)
+		}
+	}
+
+	if err := ValidateOpsCredentials(credentials, []string{"ws-a"}); err == nil {
+		t.Error("ValidateOpsCredentials accepted a credential bound to an unserved workspace")
+	}
+	if err := ValidateOpsCredentials(credentials, []string{"ws-a", "ws-b"}); err != nil {
+		t.Errorf("ValidateOpsCredentials: %v", err)
+	}
+}
+
+// TestLoadOpsCredentialsErrorOmitsCredential pins the rejection path's text:
+// a malformed entry can be the bearer token itself (without a separator it
+// stays whole), and the startup error reaches the container log, so the
+// message names the entry's position and never its content.
+func TestLoadOpsCredentialsErrorOmitsCredential(t *testing.T) {
+	env := func(values map[string]string) func(string) string {
+		return func(key string) string { return values[key] }
+	}
+	const credential = "s3cr3t-ops-credential"
+	for name, value := range map[string]string{
+		"no separator":    credential,
+		"no workspace":    "=" + credential,
+		"empty workspace": " =\t" + credential,
+	} {
+		_, err := LoadOpsCredentials(env(map[string]string{EnvOpsWorkspaceTokens: value}))
+		if err == nil {
+			t.Fatalf("%s: LoadOpsCredentials accepted %q", name, value)
+		}
+		if strings.Contains(err.Error(), credential) {
+			t.Errorf("%s: error %q echoes the credential", name, err)
+		}
+	}
+
+	_, err := LoadOpsCredentials(env(map[string]string{EnvOpsWorkspaceTokens: "ws-a=tok-a,ws-b"}))
+	if err == nil {
+		t.Fatal("LoadOpsCredentials accepted a pair without a token")
+	}
+	if !strings.Contains(err.Error(), "entry 2") {
+		t.Errorf("error %q does not name the malformed entry's position", err)
+	}
+}
+
+// TestOpsMetricsRequiresDeploymentCredential pins the metric set's audience:
+// its series carry a per-workspace label, so a workspace-bound credential must
+// not read it (§9.2 多 workspace 面). The deployment credential still does.
+func TestOpsMetricsRequiresDeploymentCredential(t *testing.T) {
+	h := NewOpsHandler(NewMetrics(), registry.New(time.Now), nil, OpsConfig{
+		WorkspaceIDs: []string{"ws-a", "ws-b"},
+		Credentials: []OpsCredential{
+			{Token: testOpsToken},
+			{Token: "ops-a", Workspaces: []string{"ws-a"}},
+		},
+	})
+	call := func(token string) int {
+		req := httptest.NewRequest(http.MethodGet, "/metrics", nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if code := call(testOpsToken); code != http.StatusOK {
+		t.Errorf("deployment credential on /metrics = %d, want 200", code)
+	}
+	if code := call("ops-a"); code != http.StatusForbidden {
+		t.Errorf("workspace credential on /metrics = %d, want 403", code)
+	}
+}
+
+// TestOpsMetricsWithoutAdmittedIdentityIsForbidden keeps the metric route's
+// fail-closed reading of the identity: a request that reached it without the
+// credential face holds no grant at all, never the deployment-wide one.
+func TestOpsMetricsWithoutAdmittedIdentityIsForbidden(t *testing.T) {
+	h := NewOpsHandler(NewMetrics(), registry.New(time.Now), nil, OpsConfig{
+		WorkspaceIDs: []string{"ws-a"},
+		Credentials:  testOpsCredentials(),
+	})
+	rec := httptest.NewRecorder()
+	h.dispatch(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("metrics without an admitted identity = %d, want 403", rec.Code)
 	}
 }

@@ -237,6 +237,11 @@ func tcAuth05Env(bin string, overrides map[string]string) []string {
 
 func tcAuth05RunCarrier(t *testing.T, script, bin string, env map[string]string, args ...string) (string, int) {
 	t.Helper()
+	// The carrier reads the ops surface, which requires the credential; the
+	// gate must fire on the carrier's own precondition, not on this one.
+	if _, ok := env["FOREMAN_OPS_TOKEN"]; !ok {
+		env["FOREMAN_OPS_TOKEN"] = opsTestToken
+	}
 	cmd := exec.Command("sh", append([]string{script}, args...)...)
 	cmd.Env = tcAuth05Env(bin, env)
 	out, err := cmd.CombinedOutput()
@@ -345,6 +350,8 @@ func tcAuth05CarrierBaseEnv(t *testing.T, template, stateDir, hostRoot, nodes st
 		"STATE_DIR":            stateDir,
 		"NODE_HOST_ROOT":       hostRoot,
 		"FAKE_NODES":           nodes,
+		// The carrier reads the ops surface, which requires the credential.
+		"FOREMAN_OPS_TOKEN": opsTestToken,
 	}
 }
 

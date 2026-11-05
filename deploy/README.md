@@ -10,10 +10,11 @@ Everything is plain YAML — `kubectl apply -f deploy/` installs it in one pass.
 | `20-rbac.yaml` | `ServiceAccount foreman` + `Role`/`RoleBinding` (ns multica-agents), `ServiceAccount multica-omp`, `ServiceAccount foreman-gc` |
 | `25-job-template.yaml` | `ConfigMap foreman-job-template` (ns foreman) — the required Job template, mounted by the Deployment |
 | `26-job-policy.yaml` | `ConfigMap foreman-job-policy` (ns foreman) — the **optional** three-axis job policy, mounted by the Deployment |
-| `30-foreman.yaml` | `Deployment foreman` (1 replica) + `Service foreman` (ClusterIP :8080) |
+| `30-foreman.yaml` | `Deployment foreman` (1 replica) + `Service foreman` (ClusterIP :8080, the Job face only) + `Service foreman-ops` (ClusterIP :8081, the credential-gated ops surface) |
 | `35-shared-state.yaml` | `StatefulSet foreman-redis` + `Service foreman-redis` — the shared state store (ADR-046 阶段一); **baseline only** — a deployment swaps in its own persistent Redis (or a managed service) and points `FOREMAN_STATE_URL` at it |
 | `40-foreman-gc.yaml` | `DaemonSet foreman-gc` (ns multica-agents) |
-| `optional/servicemonitor.yaml` | `ServiceMonitor foreman` — needs the Prometheus Operator CRDs |
+| `optional/servicemonitor.yaml` | `ServiceMonitor foreman` — needs the Prometheus Operator CRDs; scrapes `Service foreman-ops` with the bearer credential |
+| `optional/ops-networkpolicy.yaml` | `NetworkPolicy foreman-ops-ingress` — optional second fence: the ops port admits the `foreman` namespace only |
 | `optional/agent-backend-mirror.sh` | no objects — renders the template ConfigMap with the `omp` origin repointed at a deployer mirror (§Agent backend origin) |
 
 ```bash
@@ -26,6 +27,58 @@ The Service is reachable inside the cluster as
 `foreman.foreman.svc.cluster.local:8080` — that hostname is baked into every
 Job by the job builder, so the Service name must stay `foreman` in namespace
 `foreman`.
+
+## Operations surface
+
+Foreman serves two listeners, and they are not interchangeable:
+
+| Listener | Address | Content |
+|---|---|---|
+| Job face | `:8080` (Service `foreman`) | `/api/*` for the Job daemon, plus `/foreman/healthz` (the liveness probe input) |
+| ops surface | `:8081` (Service `foreman-ops`) | `/metrics`, `/foreman/tasks*`, `/foreman/register-source`, `/foreman/version` |
+
+The Job-facing Service publishes only `:8080`, and the Job face mounts only the
+daemon API plus the liveness answer — a Job pod dialing its own server address
+with its Job Token reaches no projection, payload preview, Job log or register
+source (02-contracts.md S-25). `/foreman/healthz` carries the liveness verdict
+alone (status, uptime, stopped component names): no task, workspace or runtime
+identity field, so it is safe on the probe face a kubelet cannot authenticate.
+
+Every ops request must present a bearer credential:
+
+```bash
+TOKEN=$(kubectl -n foreman get secret foreman-secret -o jsonpath='{.data.FOREMAN_OPS_TOKEN}' | base64 -d)
+kubectl -n foreman port-forward svc/foreman-ops 8081:8081 &
+curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/foreman/tasks?workspace=<workspace-id>
+curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/metrics | grep -cE '^foreman_'
+```
+
+Without a credential (or with a Job Token, which is a credential of the other
+face) every route answers `401`. `FOREMAN_OPS_TOKEN` is the deployment-wide
+credential. Optional workspace-bound credentials narrow the task-facing routes
+to one workspace and are refused on `/metrics` (its series carry a
+per-workspace label):
+
+```yaml
+- name: FOREMAN_OPS_WORKSPACE_TOKENS
+  value: "f311e8ff-…-…=<token>,<workspace-id>=<token>"
+```
+
+A workspace-bound credential naming a workspace the deployment does not serve
+refuses startup. The workspace dimension of a request is resolved from the
+credential's grant: a `?workspace=` value outside it is answered like a
+workspace that does not exist (`404`), and a single-workspace grant is the
+default dimension.
+
+A Prometheus scraper must send the same bearer credential (e.g. the Prometheus
+Operator `authorization.credentials` Secret reference); the `prometheus.io/*`
+annotations on the Deployment and `Service foreman-ops` only locate the port
+and path. `deploy/optional/servicemonitor.yaml` is the Operator form.
+
+`deploy/optional/ops-networkpolicy.yaml` is an optional second fence: a
+NetworkPolicy that admits the ops port only from the `foreman` namespace. Apply
+it where the CNI enforces policies and the scraper can be placed there; the
+credential face does not depend on it.
 
 > Upgrading an install that shipped before the scheduler label: the Deployment
 > selector now carries `app.kubernetes.io/component: scheduler` (without it
@@ -44,7 +97,10 @@ overwrite live values with them, so pick one of:
 
 The shipped `FOREMAN_JOB_TOKEN_KEY` placeholder is deliberately not valid hex:
 an un-replaced copy makes Foreman fail its startup self-check and CrashLoop,
-rather than serve with a key anyone can read from the repository.
+rather than serve with a key anyone can read from the repository. The
+`FOREMAN_OPS_TOKEN` placeholder (`REPLACE_ME`) is refused the same way: an
+un-replaced copy CrashLoops instead of exposing the ops surface with a token
+published in the repository.
 
 ```bash
 # Server credential: mdt_/mul_ token. Workspace-scoped form: bound to
@@ -53,6 +109,7 @@ rather than serve with a key anyone can read from the repository.
 kubectl -n foreman create secret generic foreman-secret \
   --from-literal=MULTICA_TOKEN='mdt_...' \
   --from-literal=FOREMAN_JOB_TOKEN_KEY="$(head -c 32 /dev/urandom | xxd -p -c 64)" \
+  --from-literal=FOREMAN_OPS_TOKEN="$(head -c 32 /dev/urandom | xxd -p -c 64)" \
   --from-literal=FOREMAN_STATE_PASSWORD='<redis password, or empty for none>' \
   --dry-run=client -o yaml | kubectl apply -f -
 
@@ -426,6 +483,7 @@ The ones a staging/test cluster usually overrides:
 | `FOREMAN_MAX_INFLIGHT_JOBS` | `2` | concurrency assertions |
 | `FOREMAN_JOB_BOOT_TIMEOUT` | `60s` | boot-timeout assertions |
 | `FOREMAN_LOG_LEVEL` | `debug` | heartbeat / WS assertions |
+| `FOREMAN_OPS_TOKEN` | a throwaway value | the ops surface answers `401` without it; `-ops-listen=""` disables the surface instead |
 | `FOREMAN_POLICY_NAME_RESOLUTION_TIMEOUT` | `2s` | bounds the startup resolution of the policy file's keys (default `5s`); a window that runs out reads as `unavailable` |
 | `FOREMAN_PROJECT_LOOKUP_TIMEOUT` | `1s` | bounds one read-only project lookup by issue id (default `2s`), keeping the claim → Job budget |
 
@@ -724,10 +782,11 @@ Foreman declares to the server; it also doubles as the template preflight.
   provider configuration under `${FOREMAN_STATE_ROOT}/home`; otherwise the
   directory you advertise describes a different environment than the task Jobs
   run in.
-- Operations view: `curl -s localhost:8080/foreman/register-source` prints the
-  discovered list, the declared runtimes, each runtime's catalog slot state and
-  the current runtime-profile replay source (read-only — it never triggers a
-  discovery).
+- Operations view: `curl -s -H "Authorization: Bearer $FOREMAN_OPS_TOKEN"
+  localhost:8081/foreman/register-source` prints the discovered list, the
+  declared runtimes, each runtime's catalog slot state and the current
+  runtime-profile replay source (read-only — it never triggers a discovery).
+  The answer is cropped to the credential's workspaces.
 
 ### Runtime profiles and workspace state (ADR-043 / ADR-044)
 
@@ -889,10 +948,11 @@ kubectl -n multica-agents get sa multica-omp
 kubectl -n multica-agents get secret registry-tsic
 kubectl -n foreman get secret foreman-secret
 kubectl -n foreman get configmap foreman-job-template foreman-job-policy
-kubectl -n foreman port-forward deploy/foreman 8080:8080 &
-curl -s localhost:8080/foreman/healthz
-curl -s localhost:8080/foreman/register-source
-curl -s localhost:8080/metrics | grep -cE '^foreman_'
+kubectl -n foreman port-forward deploy/foreman 8080:8080 8081:8081 &
+curl -s localhost:8080/foreman/healthz            # liveness only, no credential
+TOKEN=$(kubectl -n foreman get secret foreman-secret -o jsonpath='{.data.FOREMAN_OPS_TOKEN}' | base64 -d)
+curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/foreman/register-source
+curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/metrics | grep -cE '^foreman_'
 ```
 
 `/foreman/healthz` is the input of both probes: it answers `503` (and names the

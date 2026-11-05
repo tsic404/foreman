@@ -39,6 +39,7 @@ import (
 	"github.com/tsic404/foreman/internal/auth"
 	"github.com/tsic404/foreman/internal/coordination"
 	"github.com/tsic404/foreman/internal/jobbuilder"
+	"github.com/tsic404/foreman/internal/observability"
 	"github.com/tsic404/foreman/internal/proxy"
 	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
@@ -46,6 +47,42 @@ import (
 )
 
 var testKey = bytes.Repeat([]byte{0x24}, 32)
+
+// opsTestToken is the deployment-wide bearer credential the ops fixtures
+// mount: the surface refuses every request without one (§2.2 S-25), so a
+// fixture that forgets it reads 401 rather than a cross-workspace answer.
+const opsTestToken = "ops-acceptance-token"
+
+// opsRead reads an ops fixture with the fixture credential (§2.2 S-25: the
+// surface answers 401 without one).
+func opsRead(t *testing.T, url string) (int, []byte) {
+	t.Helper()
+	req, err := http.NewRequest(http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("build GET %s: %v", url, err)
+	}
+	req.Header.Set("Authorization", "Bearer "+opsTestToken)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", url, err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read %s: %v", url, err)
+	}
+	return resp.StatusCode, body
+}
+
+// newOpsHandler mounts the ops surface with the fixture credential (the
+// deployment-wide form unless the scenario supplies its own credential set).
+func newOpsHandler(t *testing.T, metrics *observability.Metrics, index observability.TaskIndex, logs observability.PodLogReader, cfg observability.OpsConfig) *observability.OpsHandler {
+	t.Helper()
+	if cfg.Credentials == nil {
+		cfg.Credentials = []observability.OpsCredential{{Token: opsTestToken}}
+	}
+	return observability.NewOpsHandler(metrics, index, logs, cfg)
+}
 
 // harnessJobImage is the image reference the real builder renders into a Job:
 // the <job-image> placeholder's value in this suite.

@@ -28,7 +28,6 @@ import (
 	"github.com/tsic404/foreman/internal/lifecycle"
 	"github.com/tsic404/foreman/internal/observability"
 	"github.com/tsic404/foreman/internal/proxy"
-	"github.com/tsic404/foreman/internal/registry"
 )
 
 // ops01Healthz reads the liveness endpoint and decodes its body.
@@ -65,9 +64,10 @@ func TestTechOps01ConfigErrorFailsTheProcessAndHealthReportsIt(t *testing.T) {
 	}, "mdt_ws-1")
 
 	health := observability.NewHealth()
-	ops := observability.NewOpsHandler(observability.NewMetrics(), registry.New(time.Now), nil,
-		observability.OpsConfig{Health: health})
-	opsSrv := httptest.NewServer(ops)
+	// The probe face the deployment mounts on the Job listener: the liveness
+	// verdict alone, readable without the ops credential a kubelet probe
+	// cannot carry (§2.2 S-25).
+	opsSrv := httptest.NewServer(observability.NewHealthHandler(health, time.Now()))
 	t.Cleanup(opsSrv.Close)
 
 	logs := &syncBuffer{}

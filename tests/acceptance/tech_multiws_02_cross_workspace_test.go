@@ -4,11 +4,15 @@
 package acceptance
 
 import (
+	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"testing"
 	"time"
 
 	"github.com/tsic404/foreman/internal/auth"
+	"github.com/tsic404/foreman/internal/observability"
 	"github.com/tsic404/foreman/internal/proxy"
 	"github.com/tsic404/foreman/internal/registry"
 )
@@ -165,5 +169,108 @@ func TestTechMultiWS02RevocationRestoreStaysPartitioned(t *testing.T) {
 	}
 	if _, err := controlled.Verify(tokenB, auth.RequestScope{}); !errors.Is(err, auth.ErrRevoked) {
 		t.Fatalf("restored ws-b revocation: Verify err = %v, want ErrRevoked", err)
+	}
+}
+
+// TestTechMultiWS02OpsSurfaceRejectsJobIdentity implements AC-82's negative
+// face for the ops surface: a Job Token never opens it — the projection, the
+// payload preview, the logs, the metrics and the register source all answer 401
+// and no view is even built — and the workspace dimension comes from the ops
+// credential, not from the query parameter.
+func TestTechMultiWS02OpsSurfaceRejectsJobIdentity(t *testing.T) {
+	m := newMultiWS(t, "ws-a", "ws-b")
+	entryA := m.claim("ws-a", "task-a1", "rid-a")
+	entryB := m.claim("ws-b", "task-b1", "rid-b")
+	tokenA := m.builder.tokenFor(entryA.JobName)
+	if tokenA == "" {
+		t.Fatal("missing A's Job Token")
+	}
+
+	registerSourceCalls := 0
+	ops := observability.NewOpsHandler(observability.NewMetrics(), m.reg, nil, observability.OpsConfig{
+		WorkspaceIDs: []string{"ws-a", "ws-b"},
+		RegisterSource: func() map[string]any {
+			registerSourceCalls++
+			return map[string]any{
+				"ws-a": map[string]any{"declaration": "a"},
+				"ws-b": map[string]any{"declaration": "b"},
+			}
+		},
+		Credentials: []observability.OpsCredential{
+			{Token: "ops-wide"},
+			{Token: "ops-a", Workspaces: []string{"ws-a"}},
+		},
+	})
+	get := func(path, token string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		rec := httptest.NewRecorder()
+		ops.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// A's Job identity on every ops data route: refused before the handler, so
+	// B's projection, payload and logs are never read — and the register-source
+	// view is never even built.
+	for _, path := range []string{
+		"/foreman/tasks?workspace=ws-b",
+		"/foreman/tasks/" + entryB.TaskID + "?workspace=ws-b",
+		"/foreman/tasks/" + entryB.TaskID + "/payload-preview?workspace=ws-b",
+		"/foreman/tasks/" + entryB.TaskID + "/logs?workspace=ws-b",
+		"/foreman/register-source",
+		"/foreman/version",
+		"/metrics",
+	} {
+		if rec := get(path, tokenA); rec.Code != http.StatusUnauthorized {
+			t.Errorf("A's Job Token on %s = %d, want 401", path, rec.Code)
+		}
+		if rec := get(path, ""); rec.Code != http.StatusUnauthorized {
+			t.Errorf("no credential on %s = %d, want 401", path, rec.Code)
+		}
+	}
+	if registerSourceCalls != 0 {
+		t.Fatalf("the register-source view was built %d times for rejected requests", registerSourceCalls)
+	}
+
+	// The workspace-bound ops credential cannot widen its grant through the
+	// query: B's workspace is answered like one that does not exist.
+	if rec := get("/foreman/tasks?workspace=ws-b", "ops-a"); rec.Code != http.StatusNotFound {
+		t.Errorf("scoped credential naming ws-b = %d, want 404", rec.Code)
+	}
+	if rec := get("/foreman/tasks/"+entryB.TaskID, "ops-a"); rec.Code != http.StatusNotFound {
+		t.Errorf("scoped credential reading a ws-b task = %d, want 404", rec.Code)
+	}
+	rec := get("/foreman/tasks", "ops-a")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scoped list = %d: %s", rec.Code, rec.Body)
+	}
+	var entries []struct {
+		TaskID      string `json:"task_id"`
+		WorkspaceID string `json:"workspace_id"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &entries); err != nil {
+		t.Fatalf("decode scoped list: %v", err)
+	}
+	if len(entries) != 1 || entries[0].TaskID != entryA.TaskID || entries[0].WorkspaceID != "ws-a" {
+		t.Errorf("scoped list = %+v, want exactly %s", entries, entryA.TaskID)
+	}
+	rec = get("/foreman/register-source", "ops-a")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scoped register-source = %d", rec.Code)
+	}
+	var cropped map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &cropped); err != nil {
+		t.Fatalf("decode scoped register-source: %v", err)
+	}
+	if len(cropped) != 1 || cropped["ws-a"] == nil {
+		t.Errorf("scoped register-source = %v, want only ws-a", cropped)
+	}
+
+	// The deployment-wide credential reads both workspaces: the boundary is
+	// the credential, not the query.
+	if rec := get("/foreman/tasks?workspace=ws-b", "ops-wide"); rec.Code != http.StatusOK {
+		t.Errorf("wide credential naming ws-b = %d, want 200", rec.Code)
 	}
 }

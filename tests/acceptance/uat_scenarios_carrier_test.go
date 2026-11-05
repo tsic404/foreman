@@ -417,6 +417,7 @@ func uatScenarioEnv(box uatScenarioSandbox, overrides map[string]string) []strin
 		"FAKE_STATE":               box.state,
 		"FAKE_FAULT_AGENT":         uatScenarioFaultAgent,
 		"FOREMAN_URL":              uatScenarioForemanURL,
+		"FOREMAN_OPS_TOKEN":        opsTestToken,
 		"FOREMAN_JOB_NAMESPACE":    uatScenarioJobNS,
 		"TEST_MULTICA_DIR":         box.mcli,
 		"TEST_MULTICA_AGENT":       uatScenarioMainAgent,

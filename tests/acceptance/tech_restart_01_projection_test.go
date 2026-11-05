@@ -11,7 +11,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -31,7 +30,7 @@ func TestRestart01AbsentStartFactsProjectEmptyThenAdopt(t *testing.T) {
 	// The rebuild reads the Job objects back, so the scenario needs the
 	// production Job (labels + annotations), not the canned one.
 	h.useRealBuilder(t)
-	ops := httptest.NewServer(observability.NewOpsHandler(
+	ops := httptest.NewServer(newOpsHandler(t,
 		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
 	t.Cleanup(ops.Close)
 
@@ -84,7 +83,7 @@ func TestRestart01AbsentStartFactsProjectEmptyThenAdopt(t *testing.T) {
 func TestRestart01AdoptedEntryIgnoresStatusFallback(t *testing.T) {
 	h := newHarness(t, false)
 	h.useRealBuilder(t)
-	ops := httptest.NewServer(observability.NewOpsHandler(
+	ops := httptest.NewServer(newOpsHandler(t,
 		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
 	t.Cleanup(ops.Close)
 
@@ -136,7 +135,7 @@ func TestRestart01AdoptedEntryIgnoresStatusFallback(t *testing.T) {
 func TestRestart01StartFactWinsOverRoundSnapshot(t *testing.T) {
 	h := newHarness(t, false)
 	h.useRealBuilder(t)
-	ops := httptest.NewServer(observability.NewOpsHandler(
+	ops := httptest.NewServer(newOpsHandler(t,
 		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
 	t.Cleanup(ops.Close)
 
@@ -221,7 +220,7 @@ func TestRestart01UnboundedBootProjectsEmpty(t *testing.T) {
 	h := newHarness(t, false)
 	h.useRealBuilder(t)
 	h.rebuildScheduler(t, func(c *scheduler.Config) { c.JobBootTimeout = 0 })
-	ops := httptest.NewServer(observability.NewOpsHandler(
+	ops := httptest.NewServer(newOpsHandler(t,
 		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
 	t.Cleanup(ops.Close)
 
@@ -242,7 +241,7 @@ func TestRestart01UnboundedBootProjectsEmpty(t *testing.T) {
 func TestRestart01DeletedJobLeavesNoGhostEntry(t *testing.T) {
 	h := newHarness(t, false)
 	h.useRealBuilder(t)
-	ops := httptest.NewServer(observability.NewOpsHandler(
+	ops := httptest.NewServer(newOpsHandler(t,
 		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
 	t.Cleanup(ops.Close)
 
@@ -348,7 +347,7 @@ func TestRestart01OverlappingRebuildKeepsLiveClaim(t *testing.T) {
 	h.useRealBuilder(t)
 	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
 	h.declare(declaredRuntimes())
-	ops := httptest.NewServer(observability.NewOpsHandler(
+	ops := httptest.NewServer(newOpsHandler(t,
 		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
 	t.Cleanup(ops.Close)
 
@@ -477,17 +476,9 @@ func claimPayload(taskID string) json.RawMessage {
 // projectedList reads the whole task list back through the ops endpoint.
 func projectedList(t *testing.T, base string) []map[string]any {
 	t.Helper()
-	resp, err := http.Get(base + "/foreman/tasks")
-	if err != nil {
-		t.Fatalf("GET /foreman/tasks: %v", err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read /foreman/tasks: %v", err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /foreman/tasks = %d: %s", resp.StatusCode, raw)
+	code, raw := opsRead(t, base+"/foreman/tasks")
+	if code != http.StatusOK {
+		t.Fatalf("GET /foreman/tasks = %d: %s", code, raw)
 	}
 	var entries []map[string]any
 	if err := json.Unmarshal(raw, &entries); err != nil {
@@ -499,17 +490,9 @@ func projectedList(t *testing.T, base string) []map[string]any {
 // projectedEntry reads one task back through the ops endpoint.
 func projectedEntry(t *testing.T, base, taskID string) map[string]any {
 	t.Helper()
-	resp, err := http.Get(base + "/foreman/tasks/" + taskID)
-	if err != nil {
-		t.Fatalf("GET /foreman/tasks/%s: %v", taskID, err)
-	}
-	defer func() { _ = resp.Body.Close() }()
-	raw, err := io.ReadAll(resp.Body)
-	if err != nil {
-		t.Fatalf("read /foreman/tasks/%s: %v", taskID, err)
-	}
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("GET /foreman/tasks/%s = %d: %s", taskID, resp.StatusCode, raw)
+	code, raw := opsRead(t, base+"/foreman/tasks/"+taskID)
+	if code != http.StatusOK {
+		t.Fatalf("GET /foreman/tasks/%s = %d: %s", taskID, code, raw)
 	}
 	var projected map[string]any
 	if err := json.Unmarshal(raw, &projected); err != nil {
