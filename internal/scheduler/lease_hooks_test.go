@@ -823,3 +823,39 @@ func TestDeliverQueuedPermanent4xxDropsTheQueuedSnapshotAfterAReplacedBody(t *te
 		t.Fatal("the snapshot the replay sent was permanently refused; its queue entry must leave")
 	}
 }
+
+// TestConvergeLeaseRefusedHoldsTheJobForTheQueue pins AC-16 on the C13 path: a
+// terminal verdict observed while the task's report is still undelivered (or
+// the carrier list is not complete) must not delete the Job — the queue owns
+// that cleanup, and deleting the Job would take the task's objects with a
+// report the server never received.
+func TestConvergeLeaseRefusedHoldsTheJobForTheQueue(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		queued     bool
+		notRebuilt bool
+	}{
+		{name: "the report is queued", queued: true},
+		{name: "the carrier list is not complete", notRebuilt: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			f.claim(t, "t-lq")
+			f.server.status = "completed"
+			if tc.queued {
+				f.pending.queued = map[string]bool{"t-lq": true}
+			}
+			f.pending.notRebuilt = tc.notRebuilt
+
+			if err := f.sched.ConvergeLeaseRefused(context.Background(), "t-lq"); err != nil {
+				t.Fatalf("ConvergeLeaseRefused: %v", err)
+			}
+			if !f.hasJob("fm-t-lq") {
+				t.Error("the Job was deleted while its terminal report is undelivered")
+			}
+			if e, ok := f.reg.Get("t-lq"); !ok || e.IsTerminal() {
+				t.Errorf("entry = %+v, %v; want the verdict left to the report", e, ok)
+			}
+		})
+	}
+}

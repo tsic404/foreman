@@ -13,6 +13,7 @@ import (
 	"net/http"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
@@ -367,6 +368,9 @@ type Scheduler struct {
 	shared      state.CoordStore
 	instanceID  string
 	taskLockTTL time.Duration
+	// lockSeq numbers this process's task-lock acquisitions, so each one names
+	// its own hold and a late unlock cannot end a newer one.
+	lockSeq atomic.Uint64
 	// leaderHeld gates the claim budget: only the control-plane holder claims
 	// (02-contracts.md §1.1 发出者口径). Nil leaves the gate open (stage one
 	// and direct scheduler tests).
@@ -695,9 +699,19 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 	if err := json.Unmarshal(task, &head); err != nil {
 		// The full head parse failed. A tolerant id read is the difference
 		// between a dead letter (the task can be settled on the server) and an
-		// unnameable claim (only the lease/expiry converges).
+		// unnameable claim (only the lease/expiry converges). The workspace
+		// follows the same rule as the valid path: the claim identity first,
+		// the payload when the caller speaks for the legacy single workspace.
 		if id := claimID(task); id != "" {
-			return s.settleMalformedClaim(ctx, id, task, err)
+			ws := workspaceID
+			if ws == "" {
+				ws = claimWorkspace(task)
+			}
+			took, settleErr := s.settleMalformedClaim(ctx, ws, id, task, res, reserved, err)
+			if took {
+				owned = true
+			}
+			return settleErr
 		}
 		s.noteUnnameableClaim(ctx, err, len(task))
 		return fmt.Errorf("%w: %v", ErrUnnameableClaim, err)
@@ -1631,19 +1645,11 @@ func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) err
 		s.reg.MarkStartFact(taskID, s.now())
 		return nil
 	case registry.IsTerminalResult(st):
-		_, first, err := s.reg.MarkTerminal(taskID, registry.Result(st), "", s.now())
-		if err != nil {
-			return err
-		}
-		if first {
-			// C13 is this verdict's only writer: an uncounted, unlogged
-			// settle leaves the result invisible on both observation faces.
-			s.metrics.TaskTerminal(st)
-			s.log.InfoContext(ctx, "task.terminal",
-				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
-				"workspace_id", e.WorkspaceID, "result", st)
-		}
-		return s.deleteJob(ctx, e)
+		// The verdict is C13's, but the cleanup is the settlement path's: an
+		// undelivered report and an uncompleted carrier list both hold the Job
+		// back, exactly as they do for every other terminal writer (§10,
+		// AC-16). Deleting here would drop a report the queue still owns.
+		return s.settleTerminalLocked(ctx, taskID, st)
 	case st == "queued" || st == "dispatched":
 		// Pre-start: no decisive fact — retry next round.
 		return nil
@@ -2816,15 +2822,38 @@ func claimID(task json.RawMessage) string {
 	return head.ID
 }
 
+// claimWorkspace reads just the workspace from a claim payload whose full head
+// parse failed. An unreadable value keeps the legacy empty workspace.
+func claimWorkspace(task json.RawMessage) string {
+	var head struct {
+		WorkspaceID string `json:"workspace_id"`
+	}
+	if err := json.Unmarshal(task, &head); err != nil {
+		return ""
+	}
+	return head.WorkspaceID
+}
+
 // settleMalformedClaim dead-letters a claim whose id is readable but whose
 // rest is not: the entry is registered without any object and settled with the
 // documented invalid-task-id attribution, so the server stops re-dispatching
 // it. Without this the same claim would be re-delivered on every lease expiry
 // forever, since no entry exists for any other path to converge it.
-func (s *Scheduler) settleMalformedClaim(ctx context.Context, id string, task json.RawMessage, parseErr error) error {
-	unlock, err := s.lockTaskFor(ctx, id)
+//
+// The entry takes over the caller's in-flight reservation (reserved) instead
+// of reserving again: the claim loop already holds that slot, and a second
+// take against a full budget would fail here and leave the task to the
+// server's lease expiry (AC-76). The lock key is the task's workspace, the same
+// key every other path of that task takes (§4.2 写锁键含 workspace). It reports
+// whether the row took the caller's reservation over.
+func (s *Scheduler) settleMalformedClaim(ctx context.Context, workspaceID, id string, task json.RawMessage, res SlotReservation, reserved bool, parseErr error) (bool, error) {
+	lockWorkspace := workspaceID
+	if existing, ok := s.reg.Get(id); ok && existing.WorkspaceID != "" {
+		lockWorkspace = existing.WorkspaceID
+	}
+	unlock, err := s.lockTaskIn(ctx, lockWorkspace, id)
 	if err != nil {
-		return err
+		return false, err
 	}
 	defer unlock()
 	cause := fmt.Errorf("%w: malformed claim payload: %v", jobbuilder.ErrInvalidTaskID, parseErr)
@@ -2832,17 +2861,26 @@ func (s *Scheduler) settleMalformedClaim(ctx context.Context, id string, task js
 		if !existing.IsTerminal() {
 			s.failClaim(ctx, existing, cause)
 		}
-		return nil
+		return false, nil
 	}
 	if s.reg.IsDoneAny(id) {
 		s.metrics.DuplicateDispatch()
 		s.log.WarnContext(ctx, "duplicate_dispatch",
 			"task_id", id, "old_job_name", "", "action", "drop_terminal_done")
-		return nil
+		return false, nil
+	}
+	selfReserved := !reserved
+	if selfReserved && s.shared != nil {
+		var err error
+		res, err = s.reserveSlots(ctx, workspaceID)
+		if err != nil {
+			return false, err
+		}
 	}
 	daemonID := jobbuilder.DaemonIDFor(id)
 	e := registry.TaskEntry{
 		TaskID:       id,
+		WorkspaceID:  workspaceID,
 		JobNamespace: s.cfg.JobNamespace,
 		// No object exists (or ever will); the identity name is the key the
 		// reclaim path's Job-name lookup needs.
@@ -2855,24 +2893,16 @@ func (s *Scheduler) settleMalformedClaim(ctx context.Context, id string, task js
 		Payload:      append(json.RawMessage(nil), task...),
 	}
 	// The malformed claim still occupies an in-flight slot until its terminal
-	// write releases it, so the accounting stays balanced (the workspace is
-	// unknown here: the global level alone applies).
-	var res SlotReservation
-	if s.shared != nil {
-		var err error
-		res, err = s.reserveSlots(ctx, "")
-		if err != nil {
-			return err
-		}
-	}
-	// The row takes the reservation over in the same store step (see
-	// onClaimFor); the terminal write returns its slot.
+	// write releases it, so the accounting stays balanced; the row takes the
+	// caller's (or this call's) reservation over in the same store step.
 	if err := s.reg.PutTakingSlots(e, res.retirements()); err != nil {
-		s.releaseSlots(ctx, res)
-		return err
+		if selfReserved {
+			s.releaseSlots(ctx, res)
+		}
+		return false, err
 	}
 	s.failClaim(ctx, e, cause)
-	return nil
+	return true, nil
 }
 
 // noteUnnameableClaim counts a claim with no readable id and logs it at a

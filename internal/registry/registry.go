@@ -1083,7 +1083,7 @@ func (r *Registry) MarkDelivering(daemonID string, at time.Time, delivered json.
 		// commits directly).
 		r.mu.Unlock()
 		ctx, cancel := r.sharedCtx()
-		entry, first, err := r.shared.CommitDelivering(ctx, e.WorkspaceID, e.TaskID, at, delivered, r.deliveryConfirm)
+		entry, first, err := r.shared.CommitDelivering(ctx, e.WorkspaceID, e.TaskID, delivered, r.deliveryConfirm)
 		cancel()
 		r.mu.Lock()
 		if err != nil {

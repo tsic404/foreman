@@ -231,9 +231,9 @@ func (s *redisStore) ConfirmStart(ctx context.Context, ws, taskID string, at tim
 	})
 }
 
-func (s *redisStore) CommitDelivering(ctx context.Context, ws, taskID string, at time.Time, payload []byte, window time.Duration) (registry.TaskEntry, bool, error) {
+func (s *redisStore) CommitDelivering(ctx context.Context, ws, taskID string, payload []byte, window time.Duration) (registry.TaskEntry, bool, error) {
 	return storeCall2(s, ctx, func(ctx context.Context) (registry.TaskEntry, bool, error) {
-		return s.commitDelivering(ctx, ws, taskID, at, payload, window)
+		return s.commitDelivering(ctx, ws, taskID, payload, window)
 	})
 }
 
@@ -293,6 +293,12 @@ func (s *redisStore) LockTask(ctx context.Context, ws, taskID, owner string, ttl
 
 func (s *redisStore) UnlockTask(ctx context.Context, ws, taskID, owner string) error {
 	return storeCall0(s, ctx, func(ctx context.Context) error { return s.unlockTask(ctx, ws, taskID, owner) })
+}
+
+func (s *redisStore) RenewTaskLock(ctx context.Context, ws, taskID, owner string, ttl time.Duration) (bool, error) {
+	return storeCall(s, ctx, func(ctx context.Context) (bool, error) {
+		return s.renewTaskLock(ctx, ws, taskID, owner, ttl)
+	})
 }
 
 func (s *redisStore) ReserveSlot(ctx context.Context, ws string, limit int) (string, bool, error) {
