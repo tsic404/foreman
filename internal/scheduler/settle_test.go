@@ -255,7 +255,7 @@ func TestSettlementWaitsForTheQueueRebuild(t *testing.T) {
 	f.pending.notRebuilt = true
 	f.claim(t, "task-1")
 
-	if err := f.sched.FailJob(context.Background(), "fm-task-1", FailureReasonJobBootTimeout); err != nil {
+	if err := f.sched.FailJob(context.Background(), "fm-task-1", FailureReasonJobBootTimeout, ""); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	if err := f.sched.SettleTerminal(context.Background(), "task-1", "completed"); err != nil {

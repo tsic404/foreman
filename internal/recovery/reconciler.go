@@ -503,8 +503,8 @@ func (r *Reconciler) reconcileOne(ctx context.Context, e registry.TaskEntry, pod
 		return r.settler.OnJobGone(ctx, e.JobName)
 	}
 	delete(r.missing, e.JobName)
-	if reason, ended := jobEndReason(job, pods, e.JobCreatedAt); ended {
-		return r.settleEnded(ctx, e, reason)
+	if reason, detail, ended := jobEndReason(job, pods, e.JobCreatedAt); ended {
+		return r.settleEnded(ctx, e, reason, detail)
 	}
 	delete(r.ended, e.JobName)
 	return r.settleFromServer(ctx, e)
@@ -611,7 +611,7 @@ func (r *Reconciler) reclaimIfDue(ctx context.Context, e registry.TaskEntry) err
 // recheckWindow to land its own terminal report — the daemon's report wins
 // whenever it arrives (判据模型), which the C13 recheck inside the
 // compensation confirms.
-func (r *Reconciler) settleEnded(ctx context.Context, e registry.TaskEntry, reason string) error {
+func (r *Reconciler) settleEnded(ctx context.Context, e registry.TaskEntry, reason, detail string) error {
 	if reason != scheduler.FailureReasonJobDeadline {
 		first, ok := r.ended[e.JobName]
 		if !ok {
@@ -629,7 +629,7 @@ func (r *Reconciler) settleEnded(ctx context.Context, e registry.TaskEntry, reas
 		}
 	}
 	delete(r.ended, e.JobName)
-	return r.comp.Fail(ctx, e, reason)
+	return r.comp.Fail(ctx, e, reason, detail)
 }
 
 // settleFromServer applies the C13 facts. A healthy

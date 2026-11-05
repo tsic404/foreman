@@ -1691,19 +1691,18 @@ func (s *Scheduler) OnJobGone(ctx context.Context, jobName string) error {
 		// Freshly created: tolerate the first-visibility delay.
 		return nil
 	}
-	return s.FailJob(ctx, jobName, FailureReasonJobMissing)
+	return s.FailJob(ctx, jobName, FailureReasonJobMissing, "")
 }
 
 // FailJob compensates a Job whose container ended without the daemon
-// reporting a terminal state (§4.6 Job failure/eviction, §4.4 platform
-// termination, and the missing-Job path via OnJobGone). reason is the
-// failure_reason reported to the server; C13 decides first what to report
-// (§4.2): a terminal server status is settled as-is, a task the server
-// deleted settles terminal with an empty result (the drain starts either
-// way), and only a still-active task gets the synthesized fail.
-// Idempotent: an already-terminal entry only retries its Job deletion
-// (§4.2).
-func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
+// reporting a terminal state (§4.6, §4.4; the missing-Job path via OnJobGone).
+// reason is the reported failure_reason; detail is the termination facts the
+// caller read from the same Job/Pod objects, joined into the C10 error text
+// (empty keeps the fixed sentence). C13 decides first what to report (§4.2):
+// a terminal server status settles as-is, a deleted task settles with an empty
+// result, and only a still-active task gets the synthesized fail. Idempotent:
+// an already-terminal entry only retries its Job deletion.
+func (s *Scheduler) FailJob(ctx context.Context, jobName, reason, detail string) error {
 	defer s.SyncInflight()
 	// §4.3: the carrier list is the premise of "this task has no pending
 	// report". Until it completes, a rebuilt entry may hold a queued terminal
@@ -1758,8 +1757,20 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason string) error {
 	}
 	return s.failEntry(ctx, e, failReport{
 		reason:  reason,
-		message: "container ended without a terminal report",
+		message: synthesizedFailMessage(detail),
 	})
+}
+
+// synthesizedFailMessage is the C10 error of a synthesized failure: the fixed
+// verdict, refined by the termination facts when the caller read them. The
+// facts ride the text instead of new keys — the C10 key set is the contract's
+// and stays untouched.
+func synthesizedFailMessage(detail string) string {
+	const verdict = "container ended without a terminal report"
+	if detail == "" {
+		return verdict
+	}
+	return verdict + ": " + detail
 }
 
 // failEntry settles a task as failed on the daemon's behalf: the write-ahead

@@ -49,15 +49,15 @@ func TestCompensatorFailDelegatesAndSurfacesErrors(t *testing.T) {
 	c := NewCompensator(set, nil)
 	e := testEntry("t1")
 
-	if err := c.Fail(context.Background(), e, "job_failed"); err != nil {
+	if err := c.Fail(context.Background(), e, "job_failed", ""); err != nil {
 		t.Fatalf("Fail: %v", err)
 	}
-	if len(set.failJobs) != 1 || set.failJobs[0] != (failCall{"fm-t1", "job_failed"}) {
+	if len(set.failJobs) != 1 || set.failJobs[0] != (failCall{"fm-t1", "job_failed", ""}) {
 		t.Fatalf("failJobs = %+v, want [fm-t1 job_failed]", set.failJobs)
 	}
 
 	set.err = errors.New("server down")
-	if err := c.Fail(context.Background(), e, "job_failed"); err == nil {
+	if err := c.Fail(context.Background(), e, "job_failed", ""); err == nil {
 		t.Fatal("Fail: want the settlement error surfaced for the next round")
 	}
 }
@@ -69,7 +69,7 @@ func TestCompensatorFailSettlesTerminalEntryOnly(t *testing.T) {
 	e.State = registry.StateTerminal
 	e.Result = registry.ResultFailed
 
-	if err := c.Fail(context.Background(), e, "job_failed"); err != nil {
+	if err := c.Fail(context.Background(), e, "job_failed", ""); err != nil {
 		t.Fatalf("Fail: %v", err)
 	}
 	if len(set.failJobs) != 0 {

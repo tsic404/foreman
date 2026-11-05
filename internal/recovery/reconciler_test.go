@@ -66,7 +66,7 @@ func (f *fakeStatus) TaskStatus(context.Context, string) (string, error) {
 	return f.status, f.err
 }
 
-type failCall struct{ jobName, reason string }
+type failCall struct{ jobName, reason, detail string }
 type settleCall struct{ taskID, result string }
 type adoptCall struct{ taskID, status string }
 type reclaimCall struct {
@@ -133,10 +133,10 @@ func (f *fakeSettler) OnJobGone(_ context.Context, jobName string) error {
 	return f.err
 }
 
-func (f *fakeSettler) FailJob(_ context.Context, jobName, reason string) error {
+func (f *fakeSettler) FailJob(_ context.Context, jobName, reason, detail string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.failJobs = append(f.failJobs, failCall{jobName, reason})
+	f.failJobs = append(f.failJobs, failCall{jobName, reason, detail})
 	return f.err
 }
 
@@ -671,9 +671,19 @@ func TestReconcileDeletedTaskVanishes(t *testing.T) {
 func TestReconcileJobEndedWaitsThenFails(t *testing.T) {
 	reg := newRegistry(t, testEntry("t1"))
 	set := &fakeSettler{}
+	finished := time.Date(2026, 11, 5, 13, 14, 4, 0, time.UTC)
 	objs := &fakeObjects{
-		job:  failedJob("fm-t1", "BackoffLimitExceeded"),
-		pods: []corev1.Pod{podFor("fm-t1", func(p *corev1.Pod) { p.Status.Phase = corev1.PodFailed })},
+		job: failedJob("fm-t1", "BackoffLimitExceeded"),
+		pods: []corev1.Pod{podFor("fm-t1", func(p *corev1.Pod) {
+			p.Spec.NodeName = "company-01"
+			p.Status.Phase = corev1.PodFailed
+			p.Status.ContainerStatuses = []corev1.ContainerStatus{{
+				Name: "agent",
+				State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+					ExitCode: 1, Reason: "Error", FinishedAt: metav1.NewTime(finished),
+				}},
+			}}
+		})},
 	}
 	status := &fakeStatus{status: "running"}
 	r := newTestReconciler(t, reg, objs, status, set)
@@ -698,8 +708,9 @@ func TestReconcileJobEndedWaitsThenFails(t *testing.T) {
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if len(set.failJobs) != 1 || set.failJobs[0] != (failCall{"fm-t1", scheduler.FailureReasonJobFailed}) {
-		t.Fatalf("failJobs = %+v, want job_failed", set.failJobs)
+	wantDetail := "container=agent exit=1 reason=Error node=company-01 pod=fm-t1-x finished=2026-11-05T13:14:04Z job_reason=BackoffLimitExceeded"
+	if len(set.failJobs) != 1 || set.failJobs[0] != (failCall{"fm-t1", scheduler.FailureReasonJobFailed, wantDetail}) {
+		t.Fatalf("failJobs = %+v, want job_failed with the pod's termination facts", set.failJobs)
 	}
 }
 
@@ -741,7 +752,7 @@ func TestReconcileDeadlineExceededIsImmediate(t *testing.T) {
 	if err := r.Reconcile(context.Background()); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
-	if len(set.failJobs) != 1 || set.failJobs[0] != (failCall{"fm-t1", scheduler.FailureReasonJobDeadline}) {
+	if len(set.failJobs) != 1 || set.failJobs[0] != (failCall{"fm-t1", scheduler.FailureReasonJobDeadline, "job_reason=DeadlineExceeded"}) {
 		t.Fatalf("failJobs = %+v, want job_deadline_exceeded with no window", set.failJobs)
 	}
 }
