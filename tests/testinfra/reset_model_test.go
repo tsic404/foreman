@@ -2,9 +2,8 @@
 // could otherwise notice were wrong: the model selector and the model
 // backend's in-cluster address. Neither is observable without a cluster, so
 // reset.sh runs here against stubs that answer every call up to the writes and
-// keep the request bodies for judgement: the selector must be the untagged
-// family omp resolves after discovery, and custom_env must carry the backend
-// address and nothing else.
+// keep the request bodies for judgement: the selector must name the served tag
+// in full, and custom_env must carry the backend address and nothing else.
 package testinfra
 
 import (
@@ -129,13 +128,14 @@ case "$method $path" in
 esac
 `
 
-// TestResetPinsTheUntaggedModelFamilyAndTheBackendAddress judges the agent
-// writes reset.sh sends when no endpoint is configured. A tagged selector is
-// the regression the live path cannot catch: omp validates it against a
-// startup catalog a fresh Job pod does not have, so the failure only shows up
-// as a dead task. The last case is the chain's floor: neither the endpoint
-// triple nor a deployed local backend, so both fields are cleared.
-func TestResetPinsTheUntaggedModelFamilyAndTheBackendAddress(t *testing.T) {
+// TestResetPinsTheServedModelSelectorAndTheBackendAddress judges the agent
+// writes reset.sh sends when no endpoint is configured. A family-form selector
+// (the served tag stripped) is the regression the live path cannot catch: omp
+// resolves a provided selector against the catalog it reports at startup, so
+// the failure only shows up as a dead task. The last case is the chain's floor:
+// neither the endpoint triple nor a deployed local backend, so both fields are
+// cleared.
+func TestResetPinsTheServedModelSelectorAndTheBackendAddress(t *testing.T) {
 	for _, tc := range []struct {
 		name, served, wantModel, wantInfo string
 		wantEnv                           map[string]string
@@ -143,15 +143,15 @@ func TestResetPinsTheUntaggedModelFamilyAndTheBackendAddress(t *testing.T) {
 		{
 			name:      "tagged model",
 			served:    "qwen2.5:0.5b",
-			wantModel: "ollama/qwen2.5",
-			wantInfo:  "test-multica: agent foreman-test-agent → ollama/qwen2.5 (" + resetBackendURL + ")",
+			wantModel: "ollama/qwen2.5:0.5b",
+			wantInfo:  "test-multica: agent foreman-test-agent → ollama/qwen2.5:0.5b (" + resetBackendURL + ")",
 			wantEnv:   map[string]string{"OLLAMA_BASE_URL": resetBackendURL},
 		},
 		{
 			name:      "latest tag",
 			served:    "some-model:latest",
-			wantModel: "ollama/some-model",
-			wantInfo:  "test-multica: agent foreman-test-agent → ollama/some-model (" + resetBackendURL + ")",
+			wantModel: "ollama/some-model:latest",
+			wantInfo:  "test-multica: agent foreman-test-agent → ollama/some-model:latest (" + resetBackendURL + ")",
 			wantEnv:   map[string]string{"OLLAMA_BASE_URL": resetBackendURL},
 		},
 		{

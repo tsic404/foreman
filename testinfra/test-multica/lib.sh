@@ -601,12 +601,14 @@ set_agent_env() {
 }
 
 # local_model_backend: the keyless engine ./deploy.sh installed, as the
-# selector the agent carries. Its own pull step names the served id; the tag
-# is dropped because omp validates a tagged selector against a startup catalog
-# a fresh Job pod has not discovered yet. 0 = `local_model_text` holds the
-# selector, 1 = no backend is deployed — a NotFound is an answer — and a read
-# that fails for any other reason dies: a starved API server must not read as
-# "no backend", which would clear a working agent's model.
+# selector the agent carries. Its own pull step names the served id, and the
+# selector names that tag in full (`ollama/<id>:<tag>`): omp resolves a
+# provided selector against the catalog it discovers at startup, which lists
+# served tags, so the untagged family has no row to match and is refused before
+# any task starts. 0 = `local_model_text` holds the selector, 1 = no backend is
+# deployed — a NotFound is an answer — and a read that fails for any other
+# reason dies: a starved API server must not read as "no backend", which would
+# clear a working agent's model.
 local_model_backend() {
 	_err=$(mktemp) || die "cannot create a temporary file"
 	if _id=$(kubectl -n "$NS" get deploy "$MODEL_BACKEND_DEPLOY" \
@@ -631,7 +633,7 @@ local_model_backend() {
 		rm -f "$_err"
 	fi
 	[ -n "$_id" ] || return 1
-	local_model_text="ollama/${_id%:*}"
+	local_model_text="ollama/${_id}"
 }
 
 # register_model_endpoint: the one writer of the agent's model and custom_env.
