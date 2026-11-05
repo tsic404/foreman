@@ -141,11 +141,9 @@ func WithSharedHealth(health StateHealth, grace time.Duration) Option {
 // internal/state.Store.
 type RevocationStore interface {
 	Revoke(ctx context.Context, ws, hash string, validUntil time.Time) error
-	// IsRevoked is the cross-instance read. Stage one does not call it: the
-	// in-process set is the complete view (seeded at startup, written
-	// through on every revoke), so a per-request store read would only add
-	// latency. It is the seam stage two's bounded positive cache runs
-	// against (§6.1 跨实例一致).
+	// IsRevoked is the cross-instance read Verify consults for every request
+	// that reached a live entry: a digest revoked on another instance must be
+	// seen here inside the bounded window (§6.1 跨实例一致, AC-74).
 	IsRevoked(ctx context.Context, ws, hash string) (bool, error)
 	// ListRevoked lists the live revocations grouped by workspace so a
 	// restart can seed the in-process cache without losing the partition
@@ -389,14 +387,12 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 	}
 	// 5. Revocation set — reachable only while the entry exists, which is
 	// exactly the same-name reuse face (a re-dispatched task or a rebuilt Job
-	// brought the entry back): the predecessor's token must never be
-	// accepted again (ADR-017). The in-process set is the complete stage-one
-	// view: it is seeded from the shared store at startup
-	// (RestoreRevocations) and every Revoke writes through, so the hot path
-	// needs no store round trip. The cross-instance read (bounded positive
-	// cache with the revocation window) is stage two's contract (§6.1
-	// 跨实例一致); doing it here would put a store call on every daemon
-	// request for no stage-one gain.
+	// brought the entry back): the predecessor's token must never be accepted
+	// again (ADR-017). The digest names the token's canonical form, not one
+	// spelling of it (Hash). The in-process set is the same-instance read
+	// (seeded at startup, written through on every Revoke); the shared read
+	// below is the cross-instance face (§6.1 跨实例一致), so a local miss is
+	// never the whole answer.
 	digest := i.Hash(token)
 	if i.revocations.IsRevoked(payload.WorkspaceID, digest) {
 		return revocationVerdict(entry, payload, req, claims)
@@ -434,11 +430,14 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 	return claims, nil
 }
 
-// Hash returns the hex SHA-256 digest of a Job Token. It is the value the
-// entry carries in token_hash and the revocation set is keyed by (ADR-017):
-// the digest travels from the builder to the reclaim path, never the token.
+// Hash returns the hex SHA-256 digest of a Job Token's canonical wire form. It
+// is the value the entry carries in token_hash and the revocation set is keyed
+// by (ADR-017, §6.1): the digest travels from the builder to the reclaim path,
+// never the token, so the writer and the reader must agree on it for every
+// spelling that decodes to the same signature. Re-spellings of the padding
+// bits hash equal here; Verify rejects them instead of accepting them.
 func (i *Issuer) Hash(token string) string {
-	sum := sha256.Sum256([]byte(token))
+	sum := sha256.Sum256([]byte(canonicalToken(token)))
 	return hex.EncodeToString(sum[:])
 }
 

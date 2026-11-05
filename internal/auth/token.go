@@ -10,6 +10,14 @@ import (
 // verification from server passthrough (S29).
 const TokenPrefix = "fmj_"
 
+// tokenSegmentEncoding is the strict raw-url decoder for both token segments.
+// Strict rejects a non-zero trailing padding bit, so a segment has exactly one
+// accepted spelling: without it a rewritten final character decodes to the
+// same signature bytes and passes the HMAC compare while hashing differently,
+// and the revocation lookup would then miss the digest the reclaim wrote
+// (§6.1).
+var tokenSegmentEncoding = base64.RawURLEncoding.Strict()
+
 // HasJobTokenPrefix reports whether token carries the Job Token prefix.
 func HasJobTokenPrefix(token string) bool {
 	return strings.HasPrefix(token, TokenPrefix)
@@ -46,6 +54,33 @@ func encodePayload(p tokenPayload) (string, error) {
 	return base64.RawURLEncoding.EncodeToString(raw), nil
 }
 
+// canonicalToken returns the wire form of token rebuilt from the decoded bytes
+// of its two segments, or token itself when it is not a well-formed Job Token.
+// base64url spells the same bytes several ways (the trailing padding bits are
+// not part of the value), so a digest over the received spelling is not a key
+// the writer and the reader can both compute. Verify rejects every
+// non-canonical spelling, which keeps this function the identity on accepted
+// tokens.
+func canonicalToken(token string) string {
+	if !HasJobTokenPrefix(token) {
+		return token
+	}
+	payloadSegment, sigSegment, found := strings.Cut(strings.TrimPrefix(token, TokenPrefix), ".")
+	if !found {
+		return token
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(payloadSegment)
+	if err != nil {
+		return token
+	}
+	signature, err := base64.RawURLEncoding.DecodeString(sigSegment)
+	if err != nil {
+		return token
+	}
+	return TokenPrefix + base64.RawURLEncoding.EncodeToString(payload) + "." +
+		base64.RawURLEncoding.EncodeToString(signature)
+}
+
 // parseToken splits token into payload and signature segments and decodes
 // them. Any format violation maps to ErrMalformedToken.
 func parseToken(token string) (payload tokenPayload, payloadSegment string, signature []byte, err error) {
@@ -56,14 +91,14 @@ func parseToken(token string) (payload tokenPayload, payloadSegment string, sign
 	if !found || payloadSegment == "" || sigSegment == "" {
 		return tokenPayload{}, "", nil, ErrMalformedToken
 	}
-	raw, decErr := base64.RawURLEncoding.DecodeString(payloadSegment)
+	raw, decErr := tokenSegmentEncoding.DecodeString(payloadSegment)
 	if decErr != nil {
 		return tokenPayload{}, "", nil, ErrMalformedToken
 	}
 	if jsonErr := json.Unmarshal(raw, &payload); jsonErr != nil || !payload.valid() {
 		return tokenPayload{}, "", nil, ErrMalformedToken
 	}
-	signature, sigErr := base64.RawURLEncoding.DecodeString(sigSegment)
+	signature, sigErr := tokenSegmentEncoding.DecodeString(sigSegment)
 	if sigErr != nil {
 		return tokenPayload{}, "", nil, ErrMalformedToken
 	}

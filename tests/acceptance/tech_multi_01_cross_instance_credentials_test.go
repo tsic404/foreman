@@ -7,9 +7,24 @@ package acceptance
 
 import (
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 )
+
+// repadJobToken rewrites the final character of a Job Token's signature
+// segment into another character of the same six-bit group. The trailing
+// padding bits are not part of the decoded signature, so the two strings carry
+// the same token in two spellings.
+func repadJobToken(t *testing.T, token string) string {
+	t.Helper()
+	const alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+	i := strings.IndexByte(alphabet, token[len(token)-1])
+	if i < 0 {
+		t.Fatalf("token %q does not end in a base64url character", token)
+	}
+	return token[:len(token)-1] + string(alphabet[i^1])
+}
 
 func TestTechMulti01CrossInstanceCredentials(t *testing.T) {
 	tw := newTwoInstances(t, twoInstanceOptions{})
@@ -53,6 +68,14 @@ func TestTechMulti01CrossInstanceCredentials(t *testing.T) {
 	// non-terminal endpoint.
 	if code := tw.statusVia(t, tw.b, "task-1", token); code != http.StatusUnauthorized {
 		t.Fatalf("B status after A's revocation = %d, want 401", code)
+	}
+	// The key names the token, not one spelling of it: the signature's
+	// trailing padding bits are not data, so a rewritten final character
+	// decodes to the same signature. Keyed by the received string, the lookup
+	// would miss the digest A wrote and answer the rewritten token on the
+	// still-live drain entry (§6.1: 写入摘要 == 校验摘要).
+	if code := tw.statusVia(t, tw.b, "task-1", repadJobToken(t, token)); code != http.StatusUnauthorized {
+		t.Fatalf("B status with a re-spelled signature = %d, want 401", code)
 	}
 	// The terminal endpoint replay of the token's own task is idempotent and
 	// still succeeds.
