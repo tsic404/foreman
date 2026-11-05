@@ -36,6 +36,12 @@ type ProjectIdentity interface {
 // face).
 const projectCacheTTL = 60 * time.Second
 
+// projectCacheLimit bounds the number of cached (workspace, issue) pairs.
+// The TTL alone does not bound the map: one claim burst can touch more issues
+// than a TTL window of work usually does, and the key space is every issue the
+// process ever met (01-scope `state`: 进程内只保留有界正缓存).
+const projectCacheLimit = 1024
+
 // projectCache memoizes the reverse lookup per issue id, negative answers
 // included, so a burst of tasks from one issue does not query the platform
 // once per task.
@@ -52,12 +58,18 @@ type projectCacheEntry struct {
 // get returns the cached identifier and whether the entry is still fresh. A
 // cached empty identifier is a fresh negative answer, not a miss. The key
 // carries the workspace: the same issue id resolves independently per
-// workspace (§4.1).
+// workspace (§4.1). An expired entry is removed on read, so the map does not
+// keep dead pairs until a capacity eviction happens to pass over them.
 func (c *projectCache) get(workspaceID, issueID string, now time.Time) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	entry, ok := c.entries[projectCacheKey(workspaceID, issueID)]
-	if !ok || now.Sub(entry.cachedAt) > projectCacheTTL {
+	key := projectCacheKey(workspaceID, issueID)
+	entry, ok := c.entries[key]
+	if !ok {
+		return "", false
+	}
+	if now.Sub(entry.cachedAt) > projectCacheTTL {
+		delete(c.entries, key)
 		return "", false
 	}
 	return entry.projectID, true
@@ -69,7 +81,37 @@ func (c *projectCache) put(workspaceID, issueID, projectID string, now time.Time
 	if c.entries == nil {
 		c.entries = map[string]projectCacheEntry{}
 	}
-	c.entries[projectCacheKey(workspaceID, issueID)] = projectCacheEntry{projectID: projectID, cachedAt: now}
+	key := projectCacheKey(workspaceID, issueID)
+	if _, ok := c.entries[key]; !ok && len(c.entries) >= projectCacheLimit {
+		c.evictLocked(now)
+	}
+	c.entries[key] = projectCacheEntry{projectID: projectID, cachedAt: now}
+}
+
+// evictLocked frees at least one slot: expired entries first, then the oldest
+// live entries. A cache hit is not re-stamped, so "oldest cachedAt" is the
+// closest cheap reading of least-recently-used; the cache's only job is to
+// absorb a burst, and a miss costs one read-only lookup.
+func (c *projectCache) evictLocked(now time.Time) {
+	for key, entry := range c.entries {
+		if now.Sub(entry.cachedAt) > projectCacheTTL {
+			delete(c.entries, key)
+		}
+	}
+	for len(c.entries) >= projectCacheLimit {
+		oldestKey := ""
+		var oldest time.Time
+		for key, entry := range c.entries {
+			if oldestKey == "" || entry.cachedAt.Before(oldest) ||
+				(entry.cachedAt.Equal(oldest) && key < oldestKey) {
+				oldestKey, oldest = key, entry.cachedAt
+			}
+		}
+		if oldestKey == "" {
+			return
+		}
+		delete(c.entries, oldestKey)
+	}
 }
 
 // projectCacheKey partitions the reverse-lookup cache by workspace.

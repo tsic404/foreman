@@ -19,7 +19,9 @@ const tokenRenewInterval = 72 * time.Hour
 
 // ClaimScheduler is the scheduler's claim surface.
 type ClaimScheduler interface {
-	// ClaimBudget is how many tasks may be claimed right now.
+	// ClaimBudget is how many tasks may be claimed right now. It is a
+	// read-only query: the loop reads it once per round and once for its
+	// cadence, and only ReserveSlots consumes a slot.
 	ClaimBudget() int
 	// ReserveSlots reserves up to want in-flight slots before the C3 call and
 	// returns the reservation pairs actually taken (empty when the cap is
@@ -191,7 +193,10 @@ func (l *ClaimLoop) iterate(ctx context.Context) error {
 }
 
 // interval picks the poll cadence: the idle interval when no claim slot is
-// free, the active interval otherwise.
+// free, the active interval otherwise. This is the round's second read of the
+// same budget, and reading is not consuming — iterate is the only caller that
+// reserves, so the two calls per round cannot count a claim twice (§10
+// 两级在途上限, AC-76).
 func (l *ClaimLoop) interval() time.Duration {
 	if l.sched.ClaimBudget() == 0 {
 		return l.cfg.ClaimIntervalIdle

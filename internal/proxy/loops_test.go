@@ -16,23 +16,27 @@ import (
 
 // fakeClaimScheduler records claimed tasks and reports a fixed budget.
 type fakeClaimScheduler struct {
-	mu         sync.Mutex
-	budget     int
-	reserved   int
-	released   int
-	claimed    []json.RawMessage
-	onClaimErr error
+	mu           sync.Mutex
+	budget       int
+	budgetReads  int
+	reserveCalls int
+	reserved     int
+	released     int
+	claimed      []json.RawMessage
+	onClaimErr   error
 }
 
 func (f *fakeClaimScheduler) ClaimBudget() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.budgetReads++
 	return f.budget
 }
 
 func (f *fakeClaimScheduler) ReserveSlots(_ context.Context, want int) ([]scheduler.SlotReservation, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	f.reserveCalls++
 	granted := want
 	if f.budget < want {
 		granted = f.budget
@@ -51,6 +55,15 @@ func (f *fakeClaimScheduler) reservedCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return f.reserved
+}
+
+// callsSeen reports the two reads and the one reservation a whole round
+// makes: a reservation count above one means the cadence read consumed a
+// slot.
+func (f *fakeClaimScheduler) callsSeen() (budgetReads, reserveCalls int) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.budgetReads, f.reserveCalls
 }
 
 func (f *fakeClaimScheduler) releasedCount() int {
@@ -135,6 +148,40 @@ func TestClaimLoopIterateClaimsUpToBudget(t *testing.T) {
 	_ = json.Unmarshal(calls[0].Body, &body)
 	if body["max_tasks"] != float64(2) {
 		t.Errorf("max_tasks = %v, want the budget", body["max_tasks"])
+	}
+}
+
+// TestClaimLoopBudgetReadsReserveOnce pins the round's reservation count: the
+// budget is read twice (the batch size and the cadence) but only the batch
+// path reserves. A second reservation would double-count the claim against
+// the two-level in-flight cap (§10, AC-76).
+func TestClaimLoopBudgetReadsReserveOnce(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stubRegister(stub, "rid-1")
+	stub.on("POST", "/api/daemon/tasks/claim", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]any{"tasks": []json.RawMessage{
+			json.RawMessage(`{"id":"t1"}`), json.RawMessage(`{"id":"t2"}`),
+		}})
+	})
+	sched := &fakeClaimScheduler{budget: 2}
+	client := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, client)
+	loop := NewClaimLoop(testConfig(srv.URL), client, sched)
+
+	if err := loop.iterate(t.Context()); err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	_ = loop.interval()
+
+	reads, reserves := sched.callsSeen()
+	if reads != 2 {
+		t.Errorf("budget reads = %d, want the round's read and the cadence's read", reads)
+	}
+	if reserves != 1 {
+		t.Errorf("reservations = %d, want one batch per round", reserves)
+	}
+	if got := sched.reservedCount(); got != 2 {
+		t.Errorf("slots reserved = %d, want one batch of 2", got)
 	}
 }
 

@@ -57,6 +57,11 @@ type Settler interface {
 	// SweepOrphanSecrets deletes credential Secrets whose task has no
 	// registry entry (any state) and no Job object (§6.5).
 	SweepOrphanSecrets(ctx context.Context) error
+	// SweepStaleProbes deletes residual catalog-probe Jobs and Secrets by
+	// their labels (§6.5 探针残留清扫). It is a round-level action, idempotent,
+	// and independent of the entry list: the probe domain is found by
+	// labels, not by the task index.
+	SweepStaleProbes(ctx context.Context) error
 	// DrainPendingReports re-delivers the durable terminal-report queue
 	// through the single terminal face and returns how many reports are
 	// still undelivered (§10). The queue is the scheduler's (ADR-031), so the

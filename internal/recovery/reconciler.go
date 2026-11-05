@@ -352,9 +352,10 @@ func (r *Reconciler) Reconcile(ctx context.Context) error {
 }
 
 // round settles every live entry, collecting the first error so one broken
-// task does not hide the rest of the round. The orphan-Secret sweep runs once
-// per round, before the entries (§6.5): it covers the
-// credentials a reclaim left behind when this process restarted.
+// task does not hide the rest of the round. The two round-level sweeps (the
+// orphan-Secret face and the probe-remnant face) run once per round, before
+// the entries and regardless of the entry list (§6.5): they cover what a
+// reclaim or a failed teardown left behind during this process's life.
 func (r *Reconciler) round(ctx context.Context) error {
 	// The session index expires on this loop alone (ADR-015): its entries are
 	// learned from terminal reports, so this sweep sits ahead of the round's
@@ -365,6 +366,13 @@ func (r *Reconciler) round(ctx context.Context) error {
 	}
 	if err := r.settler.SweepOrphanSecrets(ctx); err != nil {
 		r.log.WarnContext(ctx, "cred.orphan_sweep_failed", "err", err)
+	}
+	// Probe remnants are the second round-level sweep (§6.5 探针残留清扫):
+	// after a teardown failed during the run, the next round clears the Job
+	// and its Secret — waiting for a restart would leave them for the process
+	// lifetime.
+	if err := r.settler.SweepStaleProbes(ctx); err != nil {
+		r.log.WarnContext(ctx, "catalog.probe_sweep_failed", "err", err)
 	}
 	entries := r.reg.List()
 	if len(entries) == 0 {
