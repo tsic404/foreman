@@ -45,6 +45,11 @@ func tcForbidden05Deployment(t *testing.T) (map[string]string, corev1.Service) {
 				env[entry.Name] = entry.Value
 			}
 		case "Service":
+			// The file's first Service is the Job-facing entry point; later
+			// ones (the ops surface) are not what a Job daemon dials.
+			if foundService {
+				continue
+			}
 			if err := json.Unmarshal(jsonBytes, &service); err != nil {
 				t.Fatalf("decode Service: %v", err)
 			}

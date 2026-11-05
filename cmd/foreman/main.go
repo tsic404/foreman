@@ -59,7 +59,9 @@ func main() {
 }
 
 func run() error {
-	listen := flag.String("listen", ":8080", "HTTP address for the Job daemon face and the ops endpoints")
+	listen := flag.String("listen", ":8080", "HTTP address for the Job daemon face")
+	opsListen := flag.String("ops-listen", ":8081",
+		"HTTP address for the ops surface (metrics, task projections, register source); every request needs a bearer credential. Empty disables the surface")
 	flag.Parse()
 
 	getenv := os.Getenv
@@ -456,8 +458,9 @@ func run() error {
 		reconciler.SetLeaderGate(func() bool { return leader.Held() })
 	}
 
-	// Fake server: S1–S30 for the Job daemons, plus the cluster-internal
-	// ops surface (S25). Both share one listener on :8080.
+	// Fake server: S1–S30 for the Job daemons. It is mounted on the Job face
+	// alone — the ops surface lives on its own listener and is never reachable
+	// through this one (§2.2 S-25).
 	var ws *proxy.WSHandler
 	if proxyCfg.WSEnabled {
 		ws = proxy.NewWSHandler(issuer, reg, metrics)
@@ -470,20 +473,43 @@ func run() error {
 	ops := observability.NewOpsHandler(metrics, reg, observability.NewK8sPodLogReader(clientset), observability.OpsConfig{
 		Version:        version,
 		JobImage:       jbCfg.JobImage,
-		RuntimeIDs:     clientSet.RuntimeIDs,
 		RegisterSource: registerSourceView(clientSet, slotsByWorkspace),
+		Credentials:    obsCfg.OpsCredentials,
 		Health:         health,
 		WorkspaceIDs:   clientSet.IDs(),
 		StartedAt:      started,
 		Logger:         baseLog,
 	})
-	mux := http.NewServeMux()
-	mux.Handle("/api/", fakeServer)
-	mux.Handle("/", ops)
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           mux,
+		Handler:           newJobFaceMux(fakeServer, health, started),
 		ReadHeaderTimeout: readHeaderTimeout,
+	}
+	// The ops surface is a second listener: the Job-facing Service publishes
+	// only the Job face, and every ops route requires a bearer credential the
+	// Job pods never hold. An empty -ops-listen disables the surface
+	// explicitly; a set one without a credential refuses startup rather than
+	// serving an unauthenticated read face.
+	var opsSrv *http.Server
+	if *opsListen != "" {
+		if len(obsCfg.OpsCredentials) == 0 {
+			return fmt.Errorf("an ops credential (%s or %s) is required when -ops-listen is set",
+				observability.EnvOpsToken, observability.EnvOpsWorkspaceTokens)
+		}
+		// A workspace-bound credential naming a workspace this deployment does
+		// not serve could never read anything; refuse the deployment mistake
+		// instead of answering 404 for it.
+		if err := observability.ValidateOpsCredentials(obsCfg.OpsCredentials, clientSet.IDs()); err != nil {
+			return err
+		}
+		opsSrv = &http.Server{
+			Addr:              *opsListen,
+			Handler:           ops,
+			ReadHeaderTimeout: readHeaderTimeout,
+		}
+	} else {
+		baseLog.Warn("foreman.ops_disabled",
+			"detail", "no ops listener is started (-ops-listen is empty); metrics and task projections are unavailable")
 	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
@@ -526,8 +552,15 @@ func run() error {
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", *listen, err)
 	}
-	serveErr := make(chan error, 1)
+	serveErr := make(chan error, 2)
 	go func() { serveErr <- srv.Serve(listener) }()
+	if opsSrv != nil {
+		opsListener, err := net.Listen("tcp", *opsListen)
+		if err != nil {
+			return fmt.Errorf("ops listen %s: %w", *opsListen, err)
+		}
+		go func() { serveErr <- opsSrv.Serve(opsListener) }()
+	}
 
 	// §1.6 startup order: the profile snapshot is fetched before the startup
 	// probe, so the probe's daemon reads S-3 as the truth for the profiles it
@@ -681,6 +714,7 @@ func run() error {
 	log.Info("foreman.started",
 		"version", version,
 		"listen", *listen,
+		"ops_listen", *opsListen,
 		"server_url", proxyCfg.ServerURL,
 		"workspaces", workspaces.IDs(),
 		"job_namespace", schedCfg.JobNamespace,
@@ -731,6 +765,11 @@ func run() error {
 			if err := srv.Shutdown(ctx); err != nil {
 				log.Warn("http.shutdown_failed", "err", err.Error())
 			}
+			if opsSrv != nil {
+				if err := opsSrv.Shutdown(ctx); err != nil {
+					log.Warn("ops.http.shutdown_failed", "err", err.Error())
+				}
+			}
 		},
 		Wait: func(ctx context.Context) {
 			// The loop drain shares the shutdown budget: kubelet SIGKILLs at
@@ -761,6 +800,18 @@ func run() error {
 		return fatalErr
 	}
 	return nil
+}
+
+// newJobFaceMux is the Job daemon face: /api for the Job's daemon, plus the
+// liveness probe input. The ops data surface is deliberately not mounted here
+// — a Job pod dialing this listener with its own Job Token reaches no ops
+// route (§2.2 S-25) — and the health route answers the liveness verdict alone,
+// never a task, workspace or runtime identity field.
+func newJobFaceMux(fakeServer http.Handler, health *observability.Health, startedAt time.Time) *http.ServeMux {
+	mux := http.NewServeMux()
+	mux.Handle("/api/", fakeServer)
+	mux.Handle("GET /foreman/healthz", observability.NewHealthHandler(health, startedAt))
+	return mux
 }
 
 // workspaceRetryDelay is the isolation loop's backoff. Every runtime failure
@@ -933,8 +984,8 @@ func (w *workspaceServer) ForwardInWorkspace(ctx context.Context, ep scheduler.E
 // keyed by (provider, profile_id), every real runtime's catalog slot state,
 // and the current S-3 replay source with its state (§9.3). It never triggers a
 // discovery or a refresh.
-func registerSourceView(clients *proxy.ClientSet, slots map[string]*proxy.CatalogSlots) func() any {
-	return func() any {
+func registerSourceView(clients *proxy.ClientSet, slots map[string]*proxy.CatalogSlots) func() map[string]any {
+	return func() map[string]any {
 		views := make(map[string]any, len(clients.All()))
 		for _, client := range clients.All() {
 			views[client.WorkspaceID()] = registerSourceViewOne(client, slots[client.WorkspaceID()])

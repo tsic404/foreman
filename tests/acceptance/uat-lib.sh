@@ -9,7 +9,7 @@
 
 JOB_NS=${FOREMAN_JOB_NAMESPACE:-multica-agents}
 FOREMAN_NS=${FOREMAN_NAMESPACE:-foreman}
-FOREMAN_URL=${FOREMAN_URL:-http://127.0.0.1:8080}
+FOREMAN_URL=${FOREMAN_URL:-http://127.0.0.1:8081}
 TEST_MULTICA_NS=${TEST_MULTICA_NS:-multica-test}
 TEST_MULTICA_SERVER_URL=${TEST_MULTICA_SERVER_URL:-http://127.0.0.1:30080}
 TEST_MULTICA_VERSION_ANCHOR=${TEST_MULTICA_VERSION_ANCHOR:-v0.6.1}
@@ -26,17 +26,25 @@ TEST_MULTICA_DIR=${TEST_MULTICA_DIR:-$(CDPATH= cd -- "$UAT_DIR/../../testinfra/t
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing required command: $1" >&2; exit 2; }; }
 blocked() { echo "QA_BLOCKED: $*" >&2; exit 2; }
+
+# The ops surface is a separate, credential-gated listener (contract S-25):
+# these scripts read it, so every ops request carries FOREMAN_OPS_TOKEN.
+FOREMAN_OPS_TOKEN=${FOREMAN_OPS_TOKEN:-}
+ops_curl() {
+	[ -n "$FOREMAN_OPS_TOKEN" ] || blocked "FOREMAN_OPS_TOKEN is required for the ops surface (kubectl -n foreman get secret foreman-secret -o jsonpath='{.data.FOREMAN_OPS_TOKEN}' | base64 -d)"
+	curl -fsS -m 30 -H "Authorization: Bearer $FOREMAN_OPS_TOKEN" "$@"
+}
 fail() { echo "FAIL: $*" >&2; exit 1; }
 observe() { printf '# observation: %s\n' "$*"; }
 
 entry() {
-	curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks/$1" ||
-		blocked "cannot read $FOREMAN_URL/foreman/tasks/$1 (port-forward the foreman Service first)"
+	ops_curl "$FOREMAN_URL/foreman/tasks/$1" ||
+		blocked "cannot read $FOREMAN_URL/foreman/tasks/$1 (port-forward svc/foreman-ops 8081:8081 first)"
 }
 
 metrics() {
-	curl -fsS -m 30 "$FOREMAN_URL/metrics" ||
-		blocked "cannot read $FOREMAN_URL/metrics (port-forward the foreman Service first)"
+	ops_curl "$FOREMAN_URL/metrics" ||
+		blocked "cannot read $FOREMAN_URL/metrics (port-forward svc/foreman-ops 8081:8081 first)"
 }
 
 deploy_env() {
@@ -78,7 +86,7 @@ foreman_restarts() {
 wait_terminal() { # <task-id> [timeout-s] -> prints the terminal projection
 	_deadline=$(( $(date +%s) + ${2:-300} ))
 	while :; do
-		_body=$(curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks/$1" 2>/dev/null || true)
+		_body=$(ops_curl "$FOREMAN_URL/foreman/tasks/$1" 2>/dev/null || true)
 		if [ -n "$_body" ] && printf '%s' "$_body" | jq -e '.state == "terminal"' >/dev/null 2>&1; then
 			printf '%s' "$_body"
 			return 0

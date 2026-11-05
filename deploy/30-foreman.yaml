@@ -44,8 +44,12 @@ spec:
         app.kubernetes.io/name: foreman
         app.kubernetes.io/component: scheduler
       annotations:
+        # The metric endpoint is on the ops listener (02-contracts.md S-25),
+        # not the Job-facing port. Every ops request needs the bearer
+        # credential below, so a scraper must send it too (see deploy/README.md
+        # §Operations surface) — these annotations only locate the port.
         prometheus.io/scrape: "true"
-        prometheus.io/port: "8080"
+        prometheus.io/port: "8081"
         prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: foreman
@@ -66,10 +70,15 @@ spec:
           # A moving tag: always pull so a rollout restart picks up the release
           # the build-foreman workflow just published.
           imagePullPolicy: Always
-          args: ["-listen=:8080"]
+          # Two listeners: the Job daemon face (:8080, the only port the Job
+          # Service publishes) and the ops surface (:8081, credential-gated).
+          args: ["-listen=:8080", "-ops-listen=:8081"]
           ports:
             - name: http
               containerPort: 8080
+              protocol: TCP
+            - name: ops
+              containerPort: 8081
               protocol: TCP
           env:
             # --- server identity / credentials ---
@@ -212,6 +221,18 @@ spec:
             # --- observability ---
             - name: FOREMAN_LOG_LEVEL
               value: "info"
+            # Bearer credential of the ops surface (02-contracts.md S-25):
+            # /metrics, the task projections, the payload preview, the Job log
+            # proxy, the version endpoint and /foreman/register-source all
+            # require it. Job pods never hold it, and the Job-facing Service
+            # publishes only :8080. Optional workspace-scoped credentials:
+            # FOREMAN_OPS_WORKSPACE_TOKENS="<workspace-id>=<token>,…", each
+            # reading one workspace (deploy/README.md §Operations surface).
+            - name: FOREMAN_OPS_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: foreman-secret
+                  key: FOREMAN_OPS_TOKEN
             - name: FOREMAN_WS_ENABLED
               value: "true"
             # --- shared state (ADR-046 阶段一) ---
@@ -319,7 +340,10 @@ spec:
             optional: true
 ---
 # Job-side entry point: the Job daemon's MULTICA_SERVER_URL resolves to
-# foreman.foreman.svc.cluster.local:8080 (contract §8.2 A1.1).
+# foreman.foreman.svc.cluster.local:8080 (contract §8.2 A1.1). This Service
+# publishes the Job face only (02-contracts.md S-25): the ops listener is not a
+# port of this Service, so a Job pod that resolves this name reaches no ops
+# route.
 apiVersion: v1
 kind: Service
 metadata:
@@ -328,10 +352,6 @@ metadata:
   labels:
     app.kubernetes.io/name: foreman
     app.kubernetes.io/component: scheduler
-  annotations:
-    prometheus.io/scrape: "true"
-    prometheus.io/port: "8080"
-    prometheus.io/path: "/metrics"
 spec:
   type: ClusterIP
   selector:
@@ -341,4 +361,35 @@ spec:
     - name: http
       port: 8080
       targetPort: http
+      protocol: TCP
+---
+# Ops surface entry point (02-contracts.md S-25): metrics, task projections,
+# the payload preview, the Job log proxy, the version endpoint and
+# /foreman/register-source. Every request must carry the bearer credential in
+# FOREMAN_OPS_TOKEN; the port is deliberately not part of the Job Service
+# above. Scrape/port-forward this Service, not the Job one.
+apiVersion: v1
+kind: Service
+metadata:
+  name: foreman-ops
+  namespace: foreman
+  labels:
+    app.kubernetes.io/name: foreman
+    app.kubernetes.io/component: scheduler
+    # Service-only label: the scrape object selects this Service (the metric
+    # port lives here), not the Job-facing one. It is not a pod label.
+    foreman.tsic.top/surface: ops
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "8081"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: foreman
+    app.kubernetes.io/component: scheduler
+  ports:
+    - name: ops
+      port: 8081
+      targetPort: ops
       protocol: TCP

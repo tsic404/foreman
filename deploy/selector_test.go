@@ -101,8 +101,10 @@ func TestServiceSelectorsRouteToOneWorkload(t *testing.T) {
 }
 
 // TestServiceMonitorSelectsOnlyTheSchedulerService holds the optional scrape
-// object to the scheduler Service. Sharing name=foreman with the shared-state
-// Service makes Prometheus target a Service that carries no http port.
+// object to the one scheduler Service that publishes the metric port — the ops
+// Service. Sharing name=foreman with the shared-state Service makes Prometheus
+// target a Service that carries no metric port, and the Job-facing Service
+// carries none either.
 func TestServiceMonitorSelectsOnlyTheSchedulerService(t *testing.T) {
 	_, services := deployedObjects(t)
 	selector := serviceMonitorSelector(t)
@@ -113,8 +115,8 @@ func TestServiceMonitorSelectsOnlyTheSchedulerService(t *testing.T) {
 			matched = append(matched, svc.name)
 		}
 	}
-	if len(matched) != 1 || matched[0] != "foreman" {
-		t.Fatalf("ServiceMonitor selector %s matches Services %v, want only foreman",
+	if len(matched) != 1 || matched[0] != "foreman-ops" {
+		t.Fatalf("ServiceMonitor selector %s matches Services %v, want only foreman-ops",
 			formatLabels(selector), matched)
 	}
 }

@@ -95,13 +95,10 @@ func TestTechOps02HealthEndpointStaysAvailableWhileServing(t *testing.T) {
 		}
 	})
 
-	opsSrv := httptest.NewServer(observability.NewOpsHandler(
-		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{
-			Health:       health,
-			RuntimeIDs:   h.client.RuntimeIDs,
-			WorkspaceIDs: []string{"ws-1"},
-			StartedAt:    time.Now(),
-		}))
+	// The probe face the deployment mounts on the Job listener: the liveness
+	// verdict alone, readable without the ops credential a kubelet probe
+	// cannot carry (§2.2 S-25).
+	opsSrv := httptest.NewServer(observability.NewHealthHandler(health, time.Now()))
 	t.Cleanup(opsSrv.Close)
 
 	// Precondition: the controlled upstream observes the instance's four
@@ -124,9 +121,6 @@ func TestTechOps02HealthEndpointStaysAvailableWhileServing(t *testing.T) {
 	status, body := ops02Healthz(t, opsSrv.URL)
 	if status != http.StatusOK || body["status"] != "ok" {
 		t.Fatalf("healthz with every loop running = %d %+v, want 200 ok", status, body)
-	}
-	if ids, _ := body["runtime_ids"].([]any); len(ids) != 1 || ids[0] != "rid-omp" {
-		t.Errorf("healthz runtime_ids = %v, want the declared [rid-omp]", body["runtime_ids"])
 	}
 
 	// The judgment window: the same four families must keep arriving, and

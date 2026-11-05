@@ -55,9 +55,9 @@ func TestMapping01TerminalClassificationIsIrreversible(t *testing.T) {
 		t.Fatalf("entry = %s/%q reason=%q, want terminal/completed", entry.State, entry.Result, entry.FailureReason)
 	}
 
-	ops := httptest.NewServer(observability.NewOpsHandler(observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
+	ops := httptest.NewServer(newOpsHandler(t, observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
 	t.Cleanup(ops.Close)
-	code, raw := httpGet(t, ops.URL+"/foreman/tasks/task-1")
+	code, raw := opsRead(t, ops.URL+"/foreman/tasks/task-1")
 	if code != http.StatusOK {
 		t.Fatalf("GET /foreman/tasks/task-1 = %d (%s), want 200", code, raw)
 	}
@@ -110,7 +110,7 @@ func TestMapping01TerminalClassificationIsIrreversible(t *testing.T) {
 	if !ok || raced.State != registry.StateTerminal || raced.Result != registry.ResultCompleted {
 		t.Fatalf("task-2 = %+v, %v; want the verdict decided during the round trip", raced, ok)
 	}
-	code, raw = httpGet(t, ops.URL+"/foreman/tasks/task-2")
+	code, raw = opsRead(t, ops.URL+"/foreman/tasks/task-2")
 	if code != http.StatusOK {
 		t.Fatalf("GET /foreman/tasks/task-2 = %d (%s), want 200", code, raw)
 	}

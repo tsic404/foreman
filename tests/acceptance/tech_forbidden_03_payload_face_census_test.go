@@ -193,7 +193,7 @@ func tcPayloadOpsMarkerHits(t *testing.T, baseURL string, paths []string, needle
 	t.Helper()
 	var hits []string
 	for _, path := range paths {
-		if _, answer := httpGet(t, baseURL+path); bytes.Contains(answer, []byte(needle)) {
+		if _, answer := opsRead(t, baseURL+path); bytes.Contains(answer, []byte(needle)) {
 			hits = append(hits, path)
 		}
 	}
@@ -324,6 +324,7 @@ var tcPayloadLogKeys = []string{
 	"job_name", "job_namespace", "job_runtime_id", "jobs",
 	"key", "kind", "last_heartbeat_age_seconds", "lease_keep_until",
 	"level", "limit_bytes", "listen", "max_bytes",
+	"ops_listen",
 	"max_jobs_per_node", "missing", "msg", "name",
 	"name_source", "node", "node_name", "node_selector_policy",
 	"node_selector_source", "note", "old_job_name", "op",
@@ -419,7 +420,7 @@ func tcPayloadObjectKeys(t *testing.T, raw []byte) []string {
 // census workspace configured.
 func tcPayloadMountOps(t *testing.T, h *harness) *httptest.Server {
 	t.Helper()
-	ops := httptest.NewServer(observability.NewOpsHandler(
+	ops := httptest.NewServer(newOpsHandler(t,
 		observability.NewMetrics(), h.reg, nil,
 		observability.OpsConfig{WorkspaceIDs: []string{tcPayloadWSID}}))
 	t.Cleanup(ops.Close)
@@ -431,14 +432,14 @@ func tcPayloadMountOps(t *testing.T, h *harness) *httptest.Server {
 // route the surface no longer mounts.
 func TestPayloadCensusOpsRouteSetIsDeclared(t *testing.T) {
 	h := newHarness(t, false)
-	ops := observability.NewOpsHandler(observability.NewMetrics(), h.reg, nil,
+	ops := newOpsHandler(t, observability.NewMetrics(), h.reg, nil,
 		observability.OpsConfig{WorkspaceIDs: []string{tcPayloadWSID}})
 	tcPayloadSameSet(t, "the ops surface", ops.RegisteredPatterns(), tcPayloadOpsRoutes)
 
 	// A nil metrics registry swaps /metrics for the 503 readiness answer, but
 	// the route still exists: a branch mounted outside the shared registration
 	// entry point would drop it from the set and hide a real route.
-	unwired := observability.NewOpsHandler(nil, h.reg, nil,
+	unwired := newOpsHandler(t, nil, h.reg, nil,
 		observability.OpsConfig{WorkspaceIDs: []string{tcPayloadWSID}})
 	tcPayloadSameSet(t, "the ops surface without a metrics registry", unwired.RegisteredPatterns(), tcPayloadOpsRoutes)
 
@@ -450,7 +451,7 @@ func TestPayloadCensusOpsRouteSetIsDeclared(t *testing.T) {
 	t.Cleanup(server.Close)
 	paths := tcPayloadOpsPaths(t, tcPayloadOpsRoutes)
 	for i, route := range tcPayloadOpsRoutes {
-		code, body := httpGet(t, server.URL+paths[i])
+		code, body := opsRead(t, server.URL+paths[i])
 		if code == http.StatusOK {
 			continue
 		}
@@ -480,12 +481,12 @@ func TestPayloadCensusOpsBodiesCarryNoPayload(t *testing.T) {
 
 	// Before delivery the preview answers 404: the claim-time payload is not
 	// the delivery body (§9.3).
-	if code, body := httpGet(t, ops.URL+"/foreman/tasks/"+tcPayloadTaskID+"/payload-preview"); code != http.StatusNotFound {
+	if code, body := opsRead(t, ops.URL+"/foreman/tasks/"+tcPayloadTaskID+"/payload-preview"); code != http.StatusNotFound {
 		t.Errorf("preview before delivery = %d (%s), want 404", code, body)
 	}
 
 	// The projection is the declared key set, and the list endpoint agrees.
-	code, body := httpGet(t, ops.URL+"/foreman/tasks/"+tcPayloadTaskID)
+	code, body := opsRead(t, ops.URL+"/foreman/tasks/"+tcPayloadTaskID)
 	if code != http.StatusOK {
 		t.Fatalf("GET /foreman/tasks/%s = %d (%s), want 200", tcPayloadTaskID, code, body)
 	}
@@ -498,7 +499,7 @@ func TestPayloadCensusOpsBodiesCarryNoPayload(t *testing.T) {
 	}
 
 	// The delivered body is served by the preview alone, byte for byte.
-	code, preview := httpGet(t, ops.URL+"/foreman/tasks/"+tcPayloadTaskID+"/payload-preview")
+	code, preview := opsRead(t, ops.URL+"/foreman/tasks/"+tcPayloadTaskID+"/payload-preview")
 	if code != http.StatusOK || !bytes.Equal(preview, entry.Payload) {
 		t.Errorf("preview = %d %s, want the delivery body %s", code, preview, entry.Payload)
 	}

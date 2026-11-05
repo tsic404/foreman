@@ -12,7 +12,7 @@ set -eu
 
 JOB_NS=${FOREMAN_JOB_NAMESPACE:-multica-agents}
 FOREMAN_NS=${FOREMAN_NAMESPACE:-foreman}
-FOREMAN_URL=${FOREMAN_URL:-http://127.0.0.1:8080}
+FOREMAN_URL=${FOREMAN_URL:-http://127.0.0.1:8081}
 JOB_IMAGE=${JOB_IMAGE:-}
 UPSTREAM_VERSION=${UPSTREAM_VERSION:-}
 UPSTREAM_REPO=${UPSTREAM_REPO:-multica-ai/multica}
@@ -28,6 +28,14 @@ need sha256sum
 need tar
 
 blocked() { echo "QA_BLOCKED: $*" >&2; exit 2; }
+
+# The ops surface is a separate, credential-gated listener (contract S-25):
+# these scripts read it, so every ops request carries FOREMAN_OPS_TOKEN.
+FOREMAN_OPS_TOKEN=${FOREMAN_OPS_TOKEN:-}
+ops_curl() {
+	[ -n "$FOREMAN_OPS_TOKEN" ] || blocked "FOREMAN_OPS_TOKEN is required for the ops surface (kubectl -n foreman get secret foreman-secret -o jsonpath='{.data.FOREMAN_OPS_TOKEN}' | base64 -d)"
+	curl -fsS -m 30 -H "Authorization: Bearer $FOREMAN_OPS_TOKEN" "$@"
+}
 fail() { echo "FAIL: $*" >&2; exit 1; }
 observe() { printf '# observation: %s\n' "$*"; }
 
@@ -35,7 +43,7 @@ observe() { printf '# observation: %s\n' "$*"; }
 # reports the effective value; the Deployment env is the fallback when the ops
 # endpoint is not port-forwarded.
 if [ -z "$JOB_IMAGE" ]; then
-	JOB_IMAGE=$(curl -fsS -m 30 "$FOREMAN_URL/foreman/version" 2>/dev/null |
+	JOB_IMAGE=$(ops_curl "$FOREMAN_URL/foreman/version" 2>/dev/null |
 		jq -r '.job_image // empty' 2>/dev/null || true)
 fi
 if [ -z "$JOB_IMAGE" ]; then
@@ -44,7 +52,7 @@ if [ -z "$JOB_IMAGE" ]; then
 		true)
 fi
 [ -n "$JOB_IMAGE" ] ||
-	blocked "cannot resolve the Job image (port-forward the foreman Service or set JOB_IMAGE)"
+	blocked "cannot resolve the Job image (port-forward svc/foreman-ops 8081:8081 or set JOB_IMAGE)"
 observe "job image=$JOB_IMAGE"
 
 tmp=$(mktemp -d)

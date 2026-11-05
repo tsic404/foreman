@@ -1,0 +1,41 @@
+# Optional fence around the ops listener (02-contracts.md S-25).
+#
+# The credential face is what closes the ops surface: every request must carry
+# FOREMAN_OPS_TOKEN, and the Job-facing Service publishes only :8080. This
+# NetworkPolicy is a second, independent fence for clusters whose CNI enforces
+# policies: the ops port admits the `foreman` namespace only, while the Job
+# face stays open to the Job pods in `multica-agents`.
+#
+# Apply it only when the scraper/operator that reads /metrics runs in the
+# `foreman` namespace (or extend the namespaceSelector below); with no policy
+# in force a Job pod can still open a TCP connection to :8081, and only the
+# credential keeps it out.
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: foreman-ops-ingress
+  namespace: foreman
+  labels:
+    app.kubernetes.io/name: foreman
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: foreman
+      app.kubernetes.io/component: scheduler
+  policyTypes:
+    - Ingress
+  ingress:
+    # Ops surface: same-namespace callers only.
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: foreman
+      ports:
+        - port: 8081
+          protocol: TCP
+    # Job face: every source, because Job pods live in multica-agents and the
+    # kubelet probes from the node.
+    - ports:
+        - port: 8080
+          protocol: TCP

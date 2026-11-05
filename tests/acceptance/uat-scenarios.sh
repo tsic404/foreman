@@ -100,7 +100,7 @@ issue_run() {
 wait_started() {
 	_deadline=$(( $(date +%s) + ${2:-300} ))
 	while :; do
-		_body=$(curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks/$1" 2>/dev/null || true)
+		_body=$(ops_curl "$FOREMAN_URL/foreman/tasks/$1" 2>/dev/null || true)
 		if [ -n "$_body" ]; then
 			printf '%s' "$_body" | jq -e '.started_at // empty | length > 0' >/dev/null 2>&1 && return 0
 			printf '%s' "$_body" | jq -e '.state == "terminal"' >/dev/null 2>&1 && return 1
@@ -132,7 +132,7 @@ terminal_reason() { printf '%s' "$1" | jq -r '.failure_reason // empty'; }
 # slot when the observability case reads the gauge. A run the projection never
 # saw never reached Foreman; the server-side cancel is all there is to do.
 settle_abandoned() {
-	_body=$(curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks/$1" 2>/dev/null || true)
+	_body=$(ops_curl "$FOREMAN_URL/foreman/tasks/$1" 2>/dev/null || true)
 	if [ -z "$_body" ]; then
 		mcli issue cancel-task "$1" --issue "$2" --output json >/dev/null 2>&1 ||
 			observe "$3: abandoned run $1 is unknown to Foreman and was not cancellable"
@@ -229,7 +229,7 @@ scenario_cancelled() {
 		fi
 		observe "cancelled attempt $_attempt: task $_id started; cancelling the in-flight run"
 		if ! mcli issue cancel-task "$_id" --issue "$_issue" --output json >/dev/null; then
-			_body=$(curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks/$_id" 2>/dev/null || true)
+			_body=$(ops_curl "$FOREMAN_URL/foreman/tasks/$_id" 2>/dev/null || true)
 			if printf '%s' "$_body" | jq -e '.state == "terminal"' >/dev/null 2>&1; then
 				observe "cancelled attempt $_attempt: task $_id settled before the cancel landed — rebuilding"
 				continue

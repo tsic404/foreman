@@ -234,10 +234,10 @@ func TestObservability02ImageAuditMatchesTheDeploymentReference(t *testing.T) {
 
 	// ADR-012 names both fields as the AC-10 image audit face: the version
 	// endpoint reports the same deployment reference.
-	ops := httptest.NewServer(observability.NewOpsHandler(observability.NewMetrics(), h.reg, nil,
+	ops := httptest.NewServer(newOpsHandler(t, observability.NewMetrics(), h.reg, nil,
 		observability.OpsConfig{JobImage: ref}))
 	t.Cleanup(ops.Close)
-	code, body := httpGet(t, ops.URL+"/foreman/version")
+	code, body := opsRead(t, ops.URL+"/foreman/version")
 	if code != http.StatusOK {
 		t.Fatalf("GET /foreman/version = %d (%s), want 200", code, body)
 	}

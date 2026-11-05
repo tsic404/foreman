@@ -29,18 +29,14 @@ const tcMapping01DaemonLabel = "foreman.tsic.top/daemon-id"
 // tcMapping01Projection reads one task from the ops endpoint.
 func tcMapping01Projection(t *testing.T, base, taskID string) (int, map[string]any) {
 	t.Helper()
-	resp, err := http.Get(base + "/foreman/tasks/" + taskID)
-	if err != nil {
-		t.Fatalf("GET /foreman/tasks/%s: %v", taskID, err)
-	}
-	defer resp.Body.Close()
+	code, raw := opsRead(t, base+"/foreman/tasks/"+taskID)
 	var fields map[string]any
-	if resp.StatusCode == http.StatusOK {
-		if err := json.NewDecoder(resp.Body).Decode(&fields); err != nil {
+	if code == http.StatusOK {
+		if err := json.Unmarshal(raw, &fields); err != nil {
 			t.Fatalf("decode projection: %v", err)
 		}
 	}
-	return resp.StatusCode, fields
+	return code, fields
 }
 
 // tcMapping01JobByLabel finds the Job through the task-id label — the
@@ -78,7 +74,7 @@ func TestMapping01ProjectionMatchesJobAnnotations(t *testing.T) {
 	}
 	h.reg.SetNode("task-1", "node-a")
 
-	ops := observability.NewOpsHandler(observability.NewMetrics(), h.reg, nil, observability.OpsConfig{})
+	ops := newOpsHandler(t, observability.NewMetrics(), h.reg, nil, observability.OpsConfig{})
 	server := httptest.NewServer(ops)
 	t.Cleanup(server.Close)
 
@@ -186,7 +182,7 @@ func TestMapping01ProjectionFollowsTheRebuiltPod(t *testing.T) {
 	if err != nil {
 		t.Fatalf("recovery.New: %v", err)
 	}
-	ops := observability.NewOpsHandler(observability.NewMetrics(), h.reg, nil, observability.OpsConfig{})
+	ops := newOpsHandler(t, observability.NewMetrics(), h.reg, nil, observability.OpsConfig{})
 	server := httptest.NewServer(ops)
 	t.Cleanup(server.Close)
 

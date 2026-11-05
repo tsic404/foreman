@@ -47,7 +47,7 @@ SCRIPT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TEMPLATE=${FOREMAN_JOB_TEMPLATE:-$SCRIPT_DIR/../../deploy/25-job-template.yaml}
 NODE_HOST_ROOT=${NODE_HOST_ROOT:-/host}
 JOB_NS=${FOREMAN_JOB_NAMESPACE:-multica-agents}
-FOREMAN_URL=${FOREMAN_URL:-http://127.0.0.1:8080}
+FOREMAN_URL=${FOREMAN_URL:-http://127.0.0.1:8081}
 NODE_DEBUG_IMAGE=${NODE_DEBUG_IMAGE:-debian:bookworm-slim}
 DEBUG_NS=${DEBUG_NS:-}
 NODE_WAIT=${NODE_WAIT:-180}
@@ -71,6 +71,14 @@ if [ -z "$DEBUG_NS" ]; then
 fi
 
 blocked() { echo "QA_BLOCKED: $*" >&2; exit 2; }
+
+# The ops surface is a separate, credential-gated listener (contract S-25):
+# these scripts read it, so every ops request carries FOREMAN_OPS_TOKEN.
+FOREMAN_OPS_TOKEN=${FOREMAN_OPS_TOKEN:-}
+ops_curl() {
+	[ -n "$FOREMAN_OPS_TOKEN" ] || blocked "FOREMAN_OPS_TOKEN is required for the ops surface (kubectl -n foreman get secret foreman-secret -o jsonpath='{.data.FOREMAN_OPS_TOKEN}' | base64 -d)"
+	curl -fsS -m 30 -H "Authorization: Bearer $FOREMAN_OPS_TOKEN" "$@"
+}
 fail() { echo "FAIL: $*" >&2; exit 1; }
 observe() { printf '# observation: %s\n' "$*"; }
 
@@ -394,8 +402,8 @@ verify)
 	home_root=$(state_home)
 	host_root=$(state_host_root)
 	workspace=$(state_workspace)
-	entry=$(curl -fsS -m 30 "$FOREMAN_URL/foreman/tasks/$TASK?workspace=$workspace") ||
-		blocked "cannot read $FOREMAN_URL/foreman/tasks/$TASK?workspace=$workspace (port-forward the foreman Service first)"
+	entry=$(ops_curl "$FOREMAN_URL/foreman/tasks/$TASK?workspace=$workspace") ||
+		blocked "cannot read $FOREMAN_URL/foreman/tasks/$TASK?workspace=$workspace (port-forward svc/foreman-ops 8081:8081 first)"
 	task_workspace=$(printf '%s' "$entry" | jq -r '.workspace_id // empty')
 	[ "$task_workspace" = "$workspace" ] ||
 		blocked "task $TASK belongs to workspace '$task_workspace', but this window prepared '$workspace'"

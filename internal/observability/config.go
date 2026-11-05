@@ -20,6 +20,11 @@ const (
 // Config is the observability module's runtime configuration.
 type Config struct {
 	LogLevel slog.Level
+	// OpsCredentials are the bearer credentials of the ops surface (§2.2
+	// S-25). Empty refuses every ops request: the surface never answers
+	// without a configured credential, so a deployment cannot expose it by
+	// forgetting one.
+	OpsCredentials []OpsCredential
 }
 
 // LoadConfig reads the observability configuration from env (os.Getenv when
@@ -37,6 +42,11 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		}
 		cfg.LogLevel = level
 	}
+	credentials, err := LoadOpsCredentials(getenv)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.OpsCredentials = credentials
 	return cfg, nil
 }
 

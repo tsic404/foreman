@@ -23,7 +23,7 @@ const restart01Waiting = "waiting_local_directory"
 // newRestartOps mounts the read face the adoption is judged on.
 func newRestartOps(t *testing.T, h *harness) *httptest.Server {
 	t.Helper()
-	ops := httptest.NewServer(observability.NewOpsHandler(
+	ops := httptest.NewServer(newOpsHandler(t,
 		observability.NewMetrics(), h.reg, nil, observability.OpsConfig{}))
 	t.Cleanup(ops.Close)
 	return ops

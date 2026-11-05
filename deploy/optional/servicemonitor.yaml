@@ -20,11 +20,22 @@ spec:
     matchLabels:
       app.kubernetes.io/name: foreman
       app.kubernetes.io/component: scheduler
+      # The ops Service is the one publishing the metric port; the Job-facing
+      # Service carries the same workload labels but no /metrics.
+      foreman.tsic.top/surface: ops
   namespaceSelector:
     matchNames:
       - foreman
   endpoints:
-    - port: http
+    # The metric endpoint is on the ops listener (Service foreman-ops,
+    # 02-contracts.md S-25), which requires the deployment's bearer credential.
+    # The Operator form reads it from the same Secret the Deployment mounts.
+    - port: ops
       path: /metrics
       interval: 30s
       scrapeTimeout: 10s
+      authorization:
+        type: Bearer
+        credentials:
+          name: foreman-secret
+          key: FOREMAN_OPS_TOKEN
