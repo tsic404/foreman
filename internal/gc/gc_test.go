@@ -230,7 +230,8 @@ func TestRunOnceQuiesce(t *testing.T) {
 		"workspaces/ws-1/task-old/workdir/file.txt": "old",
 	})
 	ageTree(t, root, 1000*time.Hour)
-	// A single recent write anywhere under the state root skips the round.
+	// A recent write inside the workspace's tree skips that workspace for the
+	// round; the rest of the node is still cleaned.
 	agePath(t, filepath.Join(root, "workspaces/ws-1/task-old/workdir/file.txt"), time.Minute)
 
 	c := newTestCollector(t, testConfig(root))
@@ -605,8 +606,9 @@ func TestRunOnceAgentTTLDisabled(t *testing.T) {
 	}
 }
 
-// A recent write under /state/home skips the whole round: the quiesce face
-// covers the agent state, so a running Job's stores are never raced.
+// A recent write under /state/home skips the home unit for the round: a
+// running Job's stores are never raced, and the workspaces tree is still
+// judged on its own.
 func TestRunOnceQuiesceAgentState(t *testing.T) {
 	root := t.TempDir()
 	const profile = "home/.multica/profiles/foreman-job"
@@ -634,6 +636,176 @@ func TestRunOnceQuiesceAgentState(t *testing.T) {
 		if !exists(filepath.Join(root, kept)) {
 			t.Errorf("%s was reclaimed during a quiesced round", kept)
 		}
+	}
+}
+
+// A symbolic link on a fixed path segment must not redirect a reclaim into
+// another workspace's tree (§8.8: 不跨 workspace 清删). ws-a's session store
+// links at ws-b's task directory: the state rule would judge that tree by its
+// own retention and remove it, while the task rule keeps it. Nothing is
+// reclaimed through the link, in either TTL state.
+func TestRunOnceSymlinkNotFollowed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		age  time.Duration
+	}{
+		{"stale target", 400 * time.Hour},
+		{"fresh target", time.Hour},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			makeTree(t, root, map[string]string{
+				"workspaces/ws-b/task-old/work/file.txt": "x",
+			})
+			ageTree(t, filepath.Join(root, "workspaces/ws-b/task-old"), tc.age)
+
+			link := filepath.Join(root, "home/ws-a/.multica/profiles/p/hermes-sessions")
+			if err := os.MkdirAll(filepath.Dir(link), 0o755); err != nil {
+				t.Fatalf("mkdir link parent: %v", err)
+			}
+			target, err := filepath.Rel(filepath.Dir(link), filepath.Join(root, "workspaces/ws-b/task-old"))
+			if err != nil {
+				t.Fatalf("relative link target: %v", err)
+			}
+			if err := os.Symlink(target, link); err != nil {
+				t.Fatalf("symlink: %v", err)
+			}
+
+			cfg := testConfig(root)
+			cfg.TaskDirTTL = 720 * time.Hour
+			cfg.AgentStateTTL = 336 * time.Hour
+			cfg.Quiesce = 0
+			st, err := newTestCollector(t, cfg).RunOnce(context.Background())
+			if err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+			if !exists(filepath.Join(root, "workspaces/ws-b/task-old/work/file.txt")) {
+				t.Fatal("ws-b's tree was reclaimed through ws-a's link")
+			}
+			if st.AgentState != 0 {
+				t.Errorf("agent_state = %d, want nothing reclaimed through the link", st.AgentState)
+			}
+		})
+	}
+}
+
+// The quiesce window is judged per workspace: a write in one workspace must
+// not stall another workspace's reclamation (§8.8).
+func TestRunOnceQuiescePerWorkspace(t *testing.T) {
+	root := t.TempDir()
+	makeTree(t, root, map[string]string{
+		"workspaces/ws-busy/task-old/work/file.txt":  "old",
+		"workspaces/ws-quiet/task-old/work/file.txt": "old",
+	})
+	ageTree(t, root, 400*time.Hour)
+	// The busy workspace keeps writing inside the window.
+	makeTree(t, root, map[string]string{
+		"workspaces/ws-busy/task-live/work/file.txt": "live",
+	})
+
+	st, err := newTestCollector(t, testConfig(root)).RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if !st.Skipped {
+		t.Errorf("stats = %+v, want the busy workspace reported as skipped", st)
+	}
+	if !exists(filepath.Join(root, "workspaces/ws-busy/task-old")) {
+		t.Error("the busy workspace's task dir was reclaimed inside the window")
+	}
+	if exists(filepath.Join(root, "workspaces/ws-quiet/task-old")) {
+		t.Error("the quiet workspace's expired task dir survived the round")
+	}
+}
+
+// One workspace's write keeps its whole set of rules out of the round, not
+// just the tree that was written: a task writing its working directory also
+// keeps a bare cache it is reading — reads do not refresh mtime — from being
+// reclaimed underneath it (§8.8).
+func TestRunOnceQuiesceCoversEveryTreeOfTheWorkspace(t *testing.T) {
+	root := t.TempDir()
+	makeTree(t, root, map[string]string{
+		"workspaces/ws-a/task-old/work/file.txt":   "old",
+		"workspaces/.repos/ws-a/repo-old.git/HEAD": "old",
+		"workspaces/ws-b/task-old/work/file.txt":   "old",
+		"workspaces/.repos/ws-b/repo-old.git/HEAD": "old",
+	})
+	ageTree(t, root, 1000*time.Hour)
+	// The running task writes its working directory only.
+	makeTree(t, root, map[string]string{
+		"workspaces/ws-a/task-live/work/file.txt": "live",
+	})
+
+	st, err := newTestCollector(t, testConfig(root)).RunOnce(context.Background())
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if st.BareRepos != 1 {
+		t.Errorf("BareRepos = %d, want only ws-b's expired cache reclaimed", st.BareRepos)
+	}
+	if !exists(filepath.Join(root, "workspaces/.repos/ws-a/repo-old.git")) {
+		t.Error("ws-a's cache was reclaimed although ws-a is inside the window")
+	}
+	if exists(filepath.Join(root, "workspaces/.repos/ws-b/repo-old.git")) {
+		t.Error("ws-b's expired cache survived; ws-a's write stalled the round")
+	}
+	if st.CacheMeasured {
+		t.Error("CacheMeasured = true, want the skipped workspace read as unmeasured")
+	}
+}
+
+// removeWithin resolves every component inside the root, so a link that
+// leaves it fails the removal instead of acting on its target. The pre-check
+// in delete names the skip; this is what holds if the link appears after it.
+func TestRemoveWithinRefusesEscapingLink(t *testing.T) {
+	parent := t.TempDir()
+	unit := filepath.Join(parent, "ws-a")
+	victim := filepath.Join(parent, "ws-b")
+	makeTree(t, victim, map[string]string{"store/state.db": "x"})
+	if err := os.MkdirAll(filepath.Join(unit, "profiles"), 0o755); err != nil {
+		t.Fatalf("mkdir unit: %v", err)
+	}
+	if err := os.Symlink(victim, filepath.Join(unit, "profiles", "sessions")); err != nil {
+		t.Fatalf("symlink: %v", err)
+	}
+
+	if err := removeWithin(unit, "profiles/sessions/store"); err == nil {
+		t.Fatal("removeWithin removed a path whose component leaves the root")
+	}
+	if !exists(filepath.Join(victim, "store/state.db")) {
+		t.Fatal("the link target was removed through the root boundary")
+	}
+
+	makeTree(t, unit, map[string]string{"own/state.db": "x"})
+	if err := removeWithin(unit, "own"); err != nil {
+		t.Fatalf("removeWithin inside the root: %v", err)
+	}
+	if exists(filepath.Join(unit, "own")) {
+		t.Error("own/ survived, want it removed")
+	}
+}
+
+// removeWithin refuses a unit that is itself a symbolic link: the opened root
+// follows the final component, so only the fd's identity check keeps the
+// removal from landing in the linked tree.
+func TestRemoveWithinRefusesLinkedUnit(t *testing.T) {
+	parent := t.TempDir()
+	victim := filepath.Join(parent, "ws-b")
+	makeTree(t, victim, map[string]string{"hash/state.db": "x"})
+	unit := filepath.Join(parent, "ws-a")
+	if err := os.Symlink(victim, unit); err != nil {
+		t.Fatalf("symlink unit: %v", err)
+	}
+
+	err := removeWithin(unit, "hash")
+	if err == nil {
+		t.Fatal("removeWithin removed through a linked unit")
+	}
+	if !isSymlinkSkip(err) {
+		t.Fatalf("err = %v, want the removal reported as a symlink skip", err)
+	}
+	if !exists(filepath.Join(victim, "hash/state.db")) {
+		t.Fatal("the linked tree was removed through the unit")
 	}
 }
 

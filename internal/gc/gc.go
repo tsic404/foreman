@@ -49,9 +49,12 @@ const (
 )
 
 // Stats is one round's outcome; byte counts are FreedBytes (reclaimed) and
-// CacheBytes (the .repos total left behind). CacheMeasured tells whether the
-// total came from a completed scan: a skipped or interrupted round leaves it
-// false, so its zero value is never read as an empty cache.
+// CacheBytes (the .repos total left behind). Skipped reports that at least one
+// unit was left untouched because its tree was written inside the quiesce
+// window; the rest of the round still runs (§8.8 judges the window per
+// workspace). CacheMeasured tells whether the total came from a scan of the
+// whole cache tree: a skipped or interrupted scan leaves it false, so its zero
+// value is never read as an empty cache.
 type Stats struct {
 	Skipped       bool  `json:"skipped"`
 	TaskDirs      int   `json:"task_dirs"`
@@ -74,6 +77,14 @@ type Collector struct {
 	// remeasure re-reads a bare cache right before the LRU pass deletes it.
 	// It is a field so a test can simulate a fetch landing after the scan.
 	remeasure func(context.Context, string) (time.Time, int64, error)
+	// skippedUnits counts this round's units left untouched by the quiesce
+	// window; RunOnce folds it into Stats.Skipped.
+	skippedUnits int
+	// busyByWorkspace is this round's quiesce verdict per workspace id. §8.8
+	// skips a workspace's whole set of rules, so a task writing its
+	// directories also keeps the bare caches it reads — reads do not refresh
+	// mtime — from being reclaimed underneath it.
+	busyByWorkspace map[string]bool
 }
 
 // New builds a Collector; a nil logger falls back to slog.Default.
@@ -105,13 +116,17 @@ func (c *Collector) Run(ctx context.Context) error {
 	}
 }
 
-// RunOnce applies the rules in order: quiesce check, TTL reclamation of
-// task directories / bare caches / orphan task roots, the .repos size cap by
-// LRU, the per-workspace skill bundle cache rules (TTL and size cap), then the
-// node-local agent state and memory rules. Every deletion is best-effort: one
-// failing path must not abort the round.
+// RunOnce applies the rules in order: TTL reclamation of task directories /
+// bare caches / orphan task roots, the .repos size cap by LRU, the per-
+// workspace skill bundle cache rules (TTL and size cap), then the node-local
+// agent state and memory rules. The quiesce window is probed once per
+// workspace and shared by all of its rules, so one busy workspace never
+// stalls another. Every deletion is best-effort: one failing path must not
+// abort the round.
 func (c *Collector) RunOnce(ctx context.Context) (Stats, error) {
 	var st Stats
+	c.skippedUnits = 0
+	c.busyByWorkspace = nil
 	root, err := filepath.Abs(c.cfg.StateRoot)
 	if err != nil {
 		return st, fmt.Errorf("resolve state root %q: %w", c.cfg.StateRoot, err)
@@ -124,17 +139,12 @@ func (c *Collector) RunOnce(ctx context.Context) (Stats, error) {
 		return st, fmt.Errorf("stat state root %q: %w", root, err)
 	}
 
-	skipped, err := c.quiesced(ctx, root)
-	if err != nil {
-		return st, err
-	}
-	if skipped {
-		st.Skipped = true
-		c.report(st)
-		return st, nil
-	}
-
 	var errs []error
+	busy, err := c.probeWorkspaces(ctx, root)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	c.busyByWorkspace = busy
 	workspaces := filepath.Join(root, workspacesDir)
 
 	// Task directories: <root>/workspaces/<workspace>/<task-dir>.
@@ -145,25 +155,33 @@ func (c *Collector) RunOnce(ctx context.Context) (Stats, error) {
 	}
 
 	// Bare caches: <root>/workspaces/.repos/<workspace>/<repo>.git.
-	caches, freed, scanErr := c.expireRepos(ctx, root, filepath.Join(workspaces, reposDir))
+	caches, freed, unscanned, scanErr := c.expireRepos(ctx, root, filepath.Join(workspaces, reposDir))
 	st.BareRepos, st.FreedBytes = caches.expired, st.FreedBytes+freed
 	if scanErr != nil {
 		errs = append(errs, scanErr)
 	}
 	// The total is only a measurement when the whole tree was walked: a
-	// failed or cancelled scan leaves entries out, so the count would read
-	// low rather than unknown.
-	scanComplete := scanErr == nil && ctx.Err() == nil
+	// failed or cancelled scan, and a cache unit skipped for the quiesce
+	// window, leave entries out — so the count would read low rather than
+	// unknown.
+	scanComplete := scanErr == nil && ctx.Err() == nil && unscanned == 0
 
-	// Orphan task roots: <root>/workspaces/.task_roots/<hash>.
-	if n, freed, err := c.expireDirs(ctx, root, filepath.Join(workspaces, taskRootsDir), c.cfg.TaskDirTTL); err != nil {
+	// Orphan task roots: <root>/workspaces/.task_roots/<hash>. The unit is
+	// not partitioned by workspace, so it passes the literal-path gate on its
+	// own; a link here belongs to no workspace and is never walked.
+	taskRoots := filepath.Join(workspaces, taskRootsDir)
+	if literal, err := c.literalPath(root, taskRoots); err != nil {
 		errs = append(errs, err)
-	} else {
-		st.TaskRoots, st.FreedBytes = n, st.FreedBytes+freed
+	} else if literal {
+		if n, freed, err := c.expireDirs(ctx, taskRoots, c.cfg.TaskDirTTL); err != nil {
+			errs = append(errs, err)
+		} else {
+			st.TaskRoots, st.FreedBytes = n, st.FreedBytes+freed
+		}
 	}
 
 	// .repos size cap: reclaim oldest-first until the total fits.
-	reclaimed, freed, remaining, err := c.enforceCacheLimit(ctx, root, caches.entries)
+	reclaimed, freed, remaining, err := c.enforceCacheLimit(ctx, caches.entries)
 	st.BareRepos += reclaimed
 	st.FreedBytes += freed
 	st.CacheBytes = remaining
@@ -183,40 +201,183 @@ func (c *Collector) RunOnce(ctx context.Context) (Stats, error) {
 	}
 
 	// Node-local agent state: profile-relative stores, pi-sessions and the
-	// codex session stores (<root>/home), then hermes memory.
-	states, stateFreed, err := c.expireAgentState(ctx, root)
+	// codex session stores (<root>/home), then hermes memory. Both rules
+	// judge the same home roots, so the round picks them once.
+	homes, err := c.homeRootsForRound(ctx, root)
+	if err != nil {
+		errs = append(errs, err)
+	}
+	states, stateFreed, err := c.expireAgentState(ctx, homes)
 	st.AgentState, st.FreedBytes = states, st.FreedBytes+stateFreed
 	if err != nil {
 		errs = append(errs, err)
 	}
 	c.log.Info("gc.agent_state", "node", c.cfg.Node, "removed_count", states, "freed_bytes", stateFreed)
 
-	memories, memoryFreed, err := c.expireAgentMemory(ctx, root)
+	memories, memoryFreed, err := c.expireAgentMemory(ctx, homes)
 	st.AgentMemory, st.FreedBytes = memories, st.FreedBytes+memoryFreed
 	if err != nil {
 		errs = append(errs, err)
 	}
 	c.log.Info("gc.agent_memory", "node", c.cfg.Node, "removed_count", memories, "freed_bytes", memoryFreed)
 
+	st.Skipped = c.skippedUnits > 0
 	c.report(st)
 	return st, errors.Join(errs...)
 }
 
-// quiesced reports whether the state root was written within the quiesce
-// window; such a round is skipped so a running Job's directories are never
-// raced (§8.8).
-func (c *Collector) quiesced(ctx context.Context, root string) (bool, error) {
+// busy reports whether the tree at path was written within the quiesce
+// window.
+func (c *Collector) busy(ctx context.Context, path string) (bool, error) {
 	if c.cfg.Quiesce <= 0 {
 		return false, nil
 	}
-	newest, err := newestMtime(ctx, root, c.now().Add(-c.cfg.Quiesce))
+	newest, err := newestMtime(ctx, path, c.now().Add(-c.cfg.Quiesce))
 	if err != nil {
-		return false, fmt.Errorf("scan state root %q: %w", root, err)
+		if errors.Is(err, fs.ErrNotExist) {
+			return false, nil
+		}
+		return false, fmt.Errorf("scan %q: %w", path, err)
 	}
-	if newest.IsZero() {
-		return false, nil
+	return !newest.IsZero() && c.now().Sub(newest) < c.cfg.Quiesce, nil
+}
+
+// probeWorkspaces reports, per workspace id, whether any of that workspace's
+// state trees was written inside the quiesce window. §8.8 skips a workspace's
+// whole set of rules, not one tree of it: a task writing its task directory
+// also keeps its bare caches — read without refreshing mtime — from being
+// reclaimed in the same round. A tree that cannot be read counts as busy, so
+// an unreadable one is never cleaned.
+func (c *Collector) probeWorkspaces(ctx context.Context, root string) (map[string]bool, error) {
+	if c.cfg.Quiesce <= 0 {
+		return nil, nil
 	}
-	return c.now().Sub(newest) < c.cfg.Quiesce, nil
+	trees, err := workspaceTrees(root)
+	busy := make(map[string]bool, len(trees))
+	var errs []error
+	errs = append(errs, err)
+	for id, paths := range trees {
+		for _, path := range paths {
+			written, probeErr := c.busy(ctx, path)
+			if probeErr != nil {
+				errs = append(errs, probeErr)
+				written = true
+			}
+			if written {
+				busy[id] = true
+				break
+			}
+		}
+	}
+	return busy, errors.Join(errs...)
+}
+
+// workspaceTrees lists each workspace's state trees under root, keyed by
+// workspace id: its task directory, bare caches, skill bundle caches and
+// partitioned home root.
+func workspaceTrees(root string) (map[string][]string, error) {
+	trees := make(map[string][]string)
+	var errs []error
+	collect := func(dir string, skip func(string) bool) {
+		entries, err := readDirs(dir)
+		if err != nil {
+			if !errors.Is(err, fs.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("scan %q: %w", dir, err))
+			}
+			return
+		}
+		for _, entry := range entries {
+			if skip != nil && skip(entry.Name()) {
+				continue
+			}
+			id := entry.Name()
+			trees[id] = append(trees[id], filepath.Join(dir, id))
+		}
+	}
+	workspaces := filepath.Join(root, workspacesDir)
+	collect(workspaces, isBookkeeping)
+	collect(filepath.Join(workspaces, reposDir), nil)
+	collect(filepath.Join(root, homeDir), hiddenEntry)
+	versions, err := readDirs(filepath.Join(workspaces, skillCacheDir))
+	if err != nil && !errors.Is(err, fs.ErrNotExist) {
+		errs = append(errs, fmt.Errorf("scan %q: %w", filepath.Join(workspaces, skillCacheDir), err))
+	}
+	for _, version := range versions {
+		collect(filepath.Join(workspaces, skillCacheDir, version.Name()), nil)
+	}
+	return trees, errors.Join(errs...)
+}
+
+// hiddenEntry reports whether name is a dot entry, which the walk of a home
+// root skips.
+func hiddenEntry(name string) bool { return strings.HasPrefix(name, ".") }
+
+// workspaceBusy reports whether workspace id is inside the quiesce window.
+func (c *Collector) workspaceBusy(id string) bool {
+	return c.busyByWorkspace[id]
+}
+
+// skipUnit applies the gates a workspace unit must pass before a rule walks
+// it. A unit reached through a symbolic link is left alone: the link
+// redirects the walk into another workspace's tree (§8.8: 不跨 workspace
+// 清删). A unit of a busy workspace is deferred to a later round.
+func (c *Collector) skipUnit(ctx context.Context, root, unit, workspace string) (bool, error) {
+	literal, err := c.literalPath(root, unit)
+	if err != nil {
+		return true, err
+	}
+	if !literal {
+		return true, nil
+	}
+	if c.workspaceBusy(workspace) {
+		c.skippedUnits++
+		return true, nil
+	}
+	return false, nil
+}
+
+// literalPath reports whether path is reached from root without a symbolic
+// link on any component, logging the skip when one is found: the link would
+// redirect the walk and a later delete would act on its target, possibly
+// another workspace's tree (§8.8: 不跨 workspace 清删).
+func (c *Collector) literalPath(root, path string) (bool, error) {
+	link, err := linkedSegment(root, path)
+	if err != nil {
+		return false, fmt.Errorf("inspect %q: %w", path, err)
+	}
+	if link == "" {
+		return true, nil
+	}
+	c.log.Warn("cache.gc.symlink_skipped", "node", c.cfg.Node, "path", path, "segment", link)
+	return false, nil
+}
+
+// linkedSegment returns the first component of path below root that is a
+// symbolic link, or "" when the path is literal all the way down. A missing
+// component ends the walk: there is nothing left to follow.
+func linkedSegment(root, path string) (string, error) {
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return "", err
+	}
+	if rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return "", nil // outside the root; delete reports that on its own
+	}
+	current := root
+	for _, segment := range strings.Split(rel, string(filepath.Separator)) {
+		current = filepath.Join(current, segment)
+		info, err := os.Lstat(current)
+		if err != nil {
+			if errors.Is(err, fs.ErrNotExist) {
+				return "", nil
+			}
+			return "", err
+		}
+		if info.Mode()&fs.ModeSymlink != 0 {
+			return current, nil
+		}
+	}
+	return "", nil
 }
 
 // expireChildren deletes every <workspaces>/<workspace>/<child> older than
@@ -242,14 +403,22 @@ func (c *Collector) expireChildren(ctx context.Context, root, workspaces string,
 		if isBookkeeping(space.Name()) {
 			continue
 		}
-		children, err := readDirs(filepath.Join(workspaces, space.Name()))
+		unit := filepath.Join(workspaces, space.Name())
+		skip, err := c.skipUnit(ctx, root, unit, space.Name())
+		if err != nil {
+			errs = append(errs, fmt.Errorf("scan %q: %w", space.Name(), err))
+		}
+		if skip {
+			continue
+		}
+		children, err := readDirs(unit)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("scan %q: %w", space.Name(), err))
 			continue
 		}
 		for _, child := range children {
-			path := filepath.Join(workspaces, space.Name(), child.Name())
-			n, ok := c.expire(ctx, root, path, child.Name(), ttl)
+			path := filepath.Join(unit, child.Name())
+			n, ok := c.expire(ctx, unit, path, child.Name(), ttl)
 			if !ok {
 				continue
 			}
@@ -260,8 +429,9 @@ func (c *Collector) expireChildren(ctx context.Context, root, workspaces string,
 	return deleted, freed, errors.Join(errs...)
 }
 
-// expireDirs deletes every direct child of dir older than ttl.
-func (c *Collector) expireDirs(ctx context.Context, root, dir string, ttl time.Duration) (int, int64, error) {
+// expireDirs deletes every direct child of dir older than ttl. dir is also
+// the root every deletion stays within.
+func (c *Collector) expireDirs(ctx context.Context, dir string, ttl time.Duration) (int, int64, error) {
 	entries, err := readDirs(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -277,7 +447,7 @@ func (c *Collector) expireDirs(ctx context.Context, root, dir string, ttl time.D
 		if ctx.Err() != nil {
 			break
 		}
-		n, ok := c.expire(ctx, root, filepath.Join(dir, e.Name()), e.Name(), ttl)
+		n, ok := c.expire(ctx, dir, filepath.Join(dir, e.Name()), e.Name(), ttl)
 		if !ok {
 			continue
 		}
@@ -288,9 +458,11 @@ func (c *Collector) expireDirs(ctx context.Context, root, dir string, ttl time.D
 }
 
 // cacheEntry is one reclaimable cache tree (a bare repository or a skill
-// bundle entry) measured during the scan and reused for the LRU pass.
+// bundle entry) measured during the scan and reused for the LRU pass. unit is
+// the tree the entry belongs to and the root its deletion stays within.
 type cacheEntry struct {
 	path   string
+	unit   string
 	usedAt time.Time
 	bytes  int64
 	gone   bool
@@ -302,25 +474,37 @@ type cacheScan struct {
 }
 
 // expireRepos reclaims bare caches by TTL and returns the survivors for the
-// size cap (<root>/workspaces/.repos/<workspace>/<repo>.git).
-func (c *Collector) expireRepos(ctx context.Context, root, repos string) (cacheScan, int64, error) {
+// size cap (<root>/workspaces/.repos/<workspace>/<repo>.git). The skipped
+// count covers the workspace units this round did not walk, so the caller can
+// mark the byte total unmeasured.
+func (c *Collector) expireRepos(ctx context.Context, root, repos string) (cacheScan, int64, int, error) {
 	var (
-		scan  cacheScan
-		freed int64
-		errs  []error
+		scan      cacheScan
+		freed     int64
+		unscanned int
+		errs      []error
 	)
 	spaces, err := readDirs(repos)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
-			return scan, 0, nil
+			return scan, 0, 0, nil
 		}
-		return scan, 0, fmt.Errorf("scan %q: %w", repos, err)
+		return scan, 0, 0, fmt.Errorf("scan %q: %w", repos, err)
 	}
 	for _, space := range spaces {
 		if ctx.Err() != nil {
 			break
 		}
-		reposOfSpace, err := readDirs(filepath.Join(repos, space.Name()))
+		unit := filepath.Join(repos, space.Name())
+		skip, err := c.skipUnit(ctx, root, unit, space.Name())
+		if err != nil {
+			errs = append(errs, fmt.Errorf("scan %q: %w", space.Name(), err))
+		}
+		if skip {
+			unscanned++
+			continue
+		}
+		reposOfSpace, err := readDirs(unit)
 		if err != nil {
 			errs = append(errs, fmt.Errorf("scan %q: %w", space.Name(), err))
 			continue
@@ -329,39 +513,43 @@ func (c *Collector) expireRepos(ctx context.Context, root, repos string) (cacheS
 			if ctx.Err() != nil {
 				break
 			}
-			path := filepath.Join(repos, space.Name(), repo.Name())
+			path := filepath.Join(unit, repo.Name())
 			usedAt, bytes, err := measure(ctx, path)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("measure %q: %w", path, err))
 				continue
 			}
 			if c.expired(usedAt, c.cfg.CacheTTL) {
-				n, err := c.delete(root, path, repo.Name(), "bare-cache")
+				n, err := c.delete(unit, path, repo.Name(), "bare-cache")
+				if isSymlinkSkip(err) {
+					scan.entries = append(scan.entries, cacheEntry{path: path, unit: unit, usedAt: usedAt, bytes: bytes})
+					continue
+				}
 				if err != nil {
 					errs = append(errs, err)
 					continue
 				}
 				freed += n
 				scan.expired++
-				scan.entries = append(scan.entries, cacheEntry{path: path, usedAt: usedAt, bytes: bytes, gone: true})
+				scan.entries = append(scan.entries, cacheEntry{path: path, unit: unit, usedAt: usedAt, bytes: bytes, gone: true})
 				continue
 			}
-			scan.entries = append(scan.entries, cacheEntry{path: path, usedAt: usedAt, bytes: bytes})
+			scan.entries = append(scan.entries, cacheEntry{path: path, unit: unit, usedAt: usedAt, bytes: bytes})
 		}
 	}
-	return scan, freed, errors.Join(errs...)
+	return scan, freed, unscanned, errors.Join(errs...)
 }
 
 // enforceCacheLimit deletes the least recently used bare caches until the
 // total size of .repos is within FOREMAN_CACHE_MAX_BYTES.
-func (c *Collector) enforceCacheLimit(ctx context.Context, root string, entries []cacheEntry) (int, int64, int64, error) {
+func (c *Collector) enforceCacheLimit(ctx context.Context, entries []cacheEntry) (int, int64, int64, error) {
 	live := make([]cacheEntry, 0, len(entries))
 	for _, e := range entries {
 		if !e.gone {
 			live = append(live, e)
 		}
 	}
-	return c.reclaimToLimit(ctx, root, live, c.cfg.CacheMaxBytes, "cache-lru")
+	return c.reclaimToLimit(ctx, live, c.cfg.CacheMaxBytes, "cache-lru")
 }
 
 // reclaimToLimit deletes the least recently used entries until their total
@@ -372,7 +560,7 @@ func (c *Collector) enforceCacheLimit(ctx context.Context, root string, entries 
 // landing between re-measure and delete, or one that leaves the mtime at the
 // scanned value (strict After below), still has its entry deleted this round —
 // an accepted residual window, not eliminable while deletion stays lock-free.
-func (c *Collector) reclaimToLimit(ctx context.Context, root string, live []cacheEntry, limit int64, reason string) (int, int64, int64, error) {
+func (c *Collector) reclaimToLimit(ctx context.Context, live []cacheEntry, limit int64, reason string) (int, int64, int64, error) {
 	var total int64
 	for _, e := range live {
 		total += e.bytes
@@ -418,9 +606,11 @@ func (c *Collector) reclaimToLimit(ctx context.Context, root string, live []cach
 			c.log.Debug("cache.gc.lru_skip", "node", c.cfg.Node, "path", e.path, "reason", "cache refreshed since scan")
 			continue
 		}
-		n, err := c.delete(root, e.path, filepath.Base(e.path), reason)
+		n, err := c.delete(e.unit, e.path, filepath.Base(e.path), reason)
 		if err != nil {
-			errs = append(errs, err)
+			if !isSymlinkSkip(err) {
+				errs = append(errs, err)
+			}
 			e.gone = true // do not retry the same path in this round
 			continue
 		}
@@ -462,16 +652,26 @@ func (c *Collector) expireSkillCache(ctx context.Context, root string) (int, int
 			if ctx.Err() != nil {
 				return removed, freed, errors.Join(errs...)
 			}
-			entries, err := c.scanSkillEntries(ctx, filepath.Join(base, version.Name(), space.Name()))
+			unit := filepath.Join(base, version.Name(), space.Name())
+			skip, err := c.skipUnit(ctx, root, unit, space.Name())
+			if err != nil {
+				errs = append(errs, fmt.Errorf("scan %q: %w", space.Name(), err))
+			}
+			if skip {
+				continue
+			}
+			entries, err := c.scanSkillEntries(ctx, unit)
 			if err != nil {
 				errs = append(errs, fmt.Errorf("scan %q: %w", space.Name(), err))
 				continue
 			}
 			for _, e := range entries {
 				if c.expired(e.usedAt, c.cfg.SkillCacheTTL) {
-					n, err := c.delete(root, e.path, filepath.Base(e.path), "skill-cache")
+					n, err := c.delete(unit, e.path, filepath.Base(e.path), "skill-cache")
 					if err != nil {
-						errs = append(errs, err)
+						if !isSymlinkSkip(err) {
+							errs = append(errs, err)
+						}
 						continue
 					}
 					removed++
@@ -485,7 +685,7 @@ func (c *Collector) expireSkillCache(ctx context.Context, root string) (int, int
 		}
 	}
 	for _, entries := range live {
-		n, f, _, err := c.reclaimToLimit(ctx, root, entries, c.cfg.SkillCacheMaxBytes, "skill-cache-lru")
+		n, f, _, err := c.reclaimToLimit(ctx, entries, c.cfg.SkillCacheMaxBytes, "skill-cache-lru")
 		removed, freed = removed+n, freed+f
 		if err != nil {
 			errs = append(errs, err)
@@ -533,7 +733,7 @@ func (c *Collector) scanSkillEntries(ctx context.Context, spaceRoot string) ([]c
 		if err != nil {
 			return err
 		}
-		entries = append(entries, cacheEntry{path: path, usedAt: usedAt, bytes: bytes})
+		entries = append(entries, cacheEntry{path: path, unit: spaceRoot, usedAt: usedAt, bytes: bytes})
 		return fs.SkipDir
 	})
 	if err != nil {
@@ -547,7 +747,7 @@ func (c *Collector) scanSkillEntries(ctx context.Context, spaceRoot string) ([]c
 // <root>/home/.multica/profiles/*/{hermes-sessions,dsh-sessions,reasonix-state},
 // the <root>/home/.multica/pi-sessions/*.jsonl files and the files under
 // <root>/home/.codex/multica-sessions. A zero TTL turns the rule off.
-func (c *Collector) expireAgentState(ctx context.Context, root string) (int, int64, error) {
+func (c *Collector) expireAgentState(ctx context.Context, homes []agentTrees) (int, int64, error) {
 	if c.cfg.AgentStateTTL <= 0 {
 		return 0, 0, nil
 	}
@@ -557,47 +757,56 @@ func (c *Collector) expireAgentState(ctx context.Context, root string) (int, int
 		freed   int64
 		errs    []error
 	)
-	for _, home := range homeRoots(root) {
-		profiles, err := readDirs(filepath.Join(home, multicaDir, profilesDir))
-		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			errs = append(errs, fmt.Errorf("scan profiles under %q: %w", home, err))
-		}
-		for _, profile := range profiles {
-			for _, store := range []string{hermesSessionsDir, dshSessionsDir, reasonixStateDir} {
-				dir := filepath.Join(home, multicaDir, profilesDir, profile.Name(), store)
-				n, f, err := c.expireStores(ctx, root, dir, ttl)
-				removed, freed = removed+n, freed+f
-				if err != nil {
-					errs = append(errs, err)
+	for _, home := range homes {
+		if home.multica != "" {
+			profiles, err := readDirs(filepath.Join(home.multica, profilesDir))
+			if err != nil && !errors.Is(err, fs.ErrNotExist) {
+				errs = append(errs, fmt.Errorf("scan profiles under %q: %w", home.multica, err))
+			}
+			for _, profile := range profiles {
+				for _, store := range []string{hermesSessionsDir, dshSessionsDir, reasonixStateDir} {
+					dir := filepath.Join(home.multica, profilesDir, profile.Name(), store)
+					n, f, err := c.expireStores(ctx, home.multica, dir, ttl)
+					removed, freed = removed+n, freed+f
+					if err != nil {
+						errs = append(errs, err)
+					}
 				}
 			}
+			// pi-sessions is a flat *.jsonl directory.
+			n, f, err := c.expireFiles(ctx, home.multica, filepath.Join(home.multica, piSessionsDir), ".jsonl", ttl, false)
+			removed, freed = removed+n, freed+f
+			if err != nil {
+				errs = append(errs, err)
+			}
 		}
-		// pi-sessions is a flat *.jsonl directory; the codex session stores hold
-		// their files at any depth beneath the store namespace.
-		pi := filepath.Join(home, multicaDir, piSessionsDir)
-		n, f, err := c.expireFiles(ctx, root, pi, ".jsonl", ttl, false)
-		removed, freed = removed+n, freed+f
-		if err != nil {
-			errs = append(errs, err)
-		}
-		codex := filepath.Join(home, codexDir, codexSessionsDir)
-		n, f, err = c.expireFiles(ctx, root, codex, "", ttl, true)
-		removed, freed = removed+n, freed+f
-		if err != nil {
-			errs = append(errs, err)
+		if home.codex != "" {
+			// The codex session stores hold their files at any depth beneath
+			// the store namespace.
+			codex := filepath.Join(home.codex, codexSessionsDir)
+			n, f, err := c.expireFiles(ctx, home.codex, codex, "", ttl, true)
+			removed, freed = removed+n, freed+f
+			if err != nil {
+				errs = append(errs, err)
+			}
 		}
 	}
 	return removed, freed, errors.Join(errs...)
 }
 
-// homeRoots lists the home roots to walk for agent state: the legacy shared
-// root (<root>/home) and every workspace-partitioned root the template wrote
-// (<root>/home/<workspace_id>, expressed through the workspace placeholder,
-// §8.8). Each root is judged independently, so a round never reaches across
-// workspaces.
-func homeRoots(root string) []string {
+// homeRoot is one home root to walk: the legacy shared root (ws == "") and
+// every workspace-partitioned root the template wrote (<root>/home/<ws>,
+// expressed through the workspace placeholder, §8.8).
+type homeRoot struct {
+	path string
+	ws   string
+}
+
+// homeRoots lists the home roots a round may walk. Each root is judged
+// independently, so a round never reaches across workspaces.
+func homeRoots(root string) []homeRoot {
 	home := filepath.Join(root, homeDir)
-	roots := []string{home}
+	roots := []homeRoot{{path: home}}
 	entries, err := readDirs(home)
 	if err != nil {
 		return roots
@@ -607,14 +816,68 @@ func homeRoots(root string) []string {
 		if strings.HasPrefix(name, ".") {
 			continue
 		}
-		roots = append(roots, filepath.Join(home, name))
+		roots = append(roots, homeRoot{path: filepath.Join(home, name), ws: name})
 	}
 	return roots
 }
 
+// agentTrees is one home root this round may reclaim. multica and codex are
+// the two state trees the rules below it walk, and the roots their deletions
+// stay within; "" means the tree is absent or reached through a symbolic link,
+// which the rules never follow.
+type agentTrees struct {
+	multica string
+	codex   string
+}
+
+// homeRootsForRound drops the home roots this round must not touch — reached
+// through a symbolic link, or inside the quiesce window — and settles the two
+// state trees of the surviving roots. A partitioned root follows its
+// workspace's verdict; the legacy shared root has no workspace and is probed
+// on its own.
+func (c *Collector) homeRootsForRound(ctx context.Context, root string) ([]agentTrees, error) {
+	var (
+		trees []agentTrees
+		errs  []error
+	)
+	for _, home := range homeRoots(root) {
+		if literal, err := c.literalPath(root, home.path); err != nil {
+			errs = append(errs, err)
+			continue
+		} else if !literal {
+			continue
+		}
+		busy := c.workspaceBusy(home.ws)
+		if home.ws == "" {
+			written, err := c.busy(ctx, home.path)
+			if err != nil {
+				errs = append(errs, err)
+			}
+			busy = written
+		}
+		if busy {
+			c.skippedUnits++
+			continue
+		}
+		var t agentTrees
+		if literal, err := c.literalPath(root, filepath.Join(home.path, multicaDir)); err != nil {
+			errs = append(errs, err)
+		} else if literal {
+			t.multica = filepath.Join(home.path, multicaDir)
+		}
+		if literal, err := c.literalPath(root, filepath.Join(home.path, codexDir)); err != nil {
+			errs = append(errs, err)
+		} else if literal {
+			t.codex = filepath.Join(home.path, codexDir)
+		}
+		trees = append(trees, t)
+	}
+	return trees, errors.Join(errs...)
+}
+
 // expireAgentMemory reclaims node-local agent memory (hermes-state) with
 // FOREMAN_AGENT_MEMORY_TTL; a zero TTL turns the rule off.
-func (c *Collector) expireAgentMemory(ctx context.Context, root string) (int, int64, error) {
+func (c *Collector) expireAgentMemory(ctx context.Context, homes []agentTrees) (int, int64, error) {
 	if c.cfg.AgentMemoryTTL <= 0 {
 		return 0, 0, nil
 	}
@@ -623,14 +886,17 @@ func (c *Collector) expireAgentMemory(ctx context.Context, root string) (int, in
 		freed   int64
 		errs    []error
 	)
-	for _, home := range homeRoots(root) {
-		profiles, err := readDirs(filepath.Join(home, multicaDir, profilesDir))
+	for _, home := range homes {
+		if home.multica == "" {
+			continue
+		}
+		profiles, err := readDirs(filepath.Join(home.multica, profilesDir))
 		if err != nil && !errors.Is(err, fs.ErrNotExist) {
-			errs = append(errs, fmt.Errorf("scan profiles under %q: %w", home, err))
+			errs = append(errs, fmt.Errorf("scan profiles under %q: %w", home.multica, err))
 		}
 		for _, profile := range profiles {
-			dir := filepath.Join(home, multicaDir, profilesDir, profile.Name(), hermesStateDir)
-			n, f, err := c.expireStores(ctx, root, dir, c.cfg.AgentMemoryTTL)
+			dir := filepath.Join(home.multica, profilesDir, profile.Name(), hermesStateDir)
+			n, f, err := c.expireStores(ctx, home.multica, dir, c.cfg.AgentMemoryTTL)
 			removed, freed = removed+n, freed+f
 			if err != nil {
 				errs = append(errs, err)
@@ -646,7 +912,7 @@ func (c *Collector) expireAgentMemory(ctx context.Context, root string) (int, in
 // while a directory holding only subdirectories is a container and is
 // descended into. The store roots and the profile roots themselves are never
 // entries, so a profile emptied by the rule keeps its root.
-func (c *Collector) expireStores(ctx context.Context, root, dir string, ttl time.Duration) (int, int64, error) {
+func (c *Collector) expireStores(ctx context.Context, unit, dir string, ttl time.Duration) (int, int64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -654,12 +920,12 @@ func (c *Collector) expireStores(ctx context.Context, root, dir string, ttl time
 		}
 		return 0, 0, fmt.Errorf("scan %q: %w", dir, err)
 	}
-	return c.expireStoreChildren(ctx, root, dir, entries, ttl)
+	return c.expireStoreChildren(ctx, unit, dir, entries, ttl)
 }
 
 // expireStoreChildren applies the store-entry rule to one already-read
 // directory level.
-func (c *Collector) expireStoreChildren(ctx context.Context, root, dir string, entries []fs.DirEntry, ttl time.Duration) (int, int64, error) {
+func (c *Collector) expireStoreChildren(ctx context.Context, unit, dir string, entries []fs.DirEntry, ttl time.Duration) (int, int64, error) {
 	var (
 		removed int
 		freed   int64
@@ -679,14 +945,14 @@ func (c *Collector) expireStoreChildren(ctx context.Context, root, dir string, e
 			continue
 		}
 		if isContainer(children) {
-			n, f, err := c.expireStoreChildren(ctx, root, store, children, ttl)
+			n, f, err := c.expireStoreChildren(ctx, unit, store, children, ttl)
 			removed, freed = removed+n, freed+f
 			if err != nil {
 				errs = append(errs, err)
 			}
 			continue
 		}
-		n, ok := c.expire(ctx, root, store, e.Name(), ttl)
+		n, ok := c.expire(ctx, unit, store, e.Name(), ttl)
 		if !ok {
 			continue
 		}
@@ -715,7 +981,7 @@ func isContainer(entries []fs.DirEntry) bool {
 // expireFiles deletes regular files under dir whose own mtime is older than
 // ttl. ext narrows the rule to one suffix ("" = every file) and deep also
 // walks subdirectories.
-func (c *Collector) expireFiles(ctx context.Context, root, dir, ext string, ttl time.Duration, deep bool) (int, int64, error) {
+func (c *Collector) expireFiles(ctx context.Context, unit, dir, ext string, ttl time.Duration, deep bool) (int, int64, error) {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -737,12 +1003,12 @@ func (c *Collector) expireFiles(ctx context.Context, root, dir, ext string, ttl 
 			if !deep {
 				continue
 			}
-			n, f, err := c.expireFiles(ctx, root, path, ext, ttl, deep)
+			n, f, err := c.expireFiles(ctx, unit, path, ext, ttl, deep)
 			removed, freed = removed+n, freed+f
 			if err != nil {
 				errs = append(errs, err)
 			}
-			c.reapEmptyDir(ctx, root, path, ttl)
+			c.reapEmptyDir(ctx, unit, path, ttl)
 			continue
 		}
 		if !e.Type().IsRegular() || (ext != "" && filepath.Ext(e.Name()) != ext) {
@@ -756,9 +1022,11 @@ func (c *Collector) expireFiles(ctx context.Context, root, dir, ext string, ttl 
 		if !c.expired(info.ModTime(), ttl) {
 			continue
 		}
-		n, err := c.delete(root, path, e.Name(), "agent-state")
+		n, err := c.delete(unit, path, e.Name(), "agent-state")
 		if err != nil {
-			errs = append(errs, err)
+			if !isSymlinkSkip(err) {
+				errs = append(errs, err)
+			}
 			continue
 		}
 		removed++
@@ -770,7 +1038,7 @@ func (c *Collector) expireFiles(ctx context.Context, root, dir, ext string, ttl 
 // reapEmptyDir removes dir when this round left it empty and its own mtime is
 // past ttl. The mtime gate keeps a directory another process just created or
 // wrote: only shells the rule can prove stale are removed.
-func (c *Collector) reapEmptyDir(ctx context.Context, root, dir string, ttl time.Duration) bool {
+func (c *Collector) reapEmptyDir(ctx context.Context, unit, dir string, ttl time.Duration) bool {
 	if ctx.Err() != nil {
 		return false
 	}
@@ -782,16 +1050,19 @@ func (c *Collector) reapEmptyDir(ctx context.Context, root, dir string, ttl time
 	if err != nil || !c.expired(info.ModTime(), ttl) {
 		return false
 	}
-	if _, err := c.delete(root, dir, filepath.Base(dir), "agent-state"); err != nil {
-		c.log.Warn("cache.gc.delete_failed", "node", c.cfg.Node, "path", dir, "err", err.Error())
+	if _, err := c.delete(unit, dir, filepath.Base(dir), "agent-state"); err != nil {
+		if !isSymlinkSkip(err) {
+			c.log.Warn("cache.gc.delete_failed", "node", c.cfg.Node, "path", dir, "err", err.Error())
+		}
 		return false
 	}
 	return true
 }
 
 // expire deletes path when its newest write is older than ttl, reporting
-// whether it was removed.
-func (c *Collector) expire(ctx context.Context, root, path, name string, ttl time.Duration) (int64, bool) {
+// whether it was removed. unit is the tree the path belongs to and the root
+// the removal stays within.
+func (c *Collector) expire(ctx context.Context, unit, path, name string, ttl time.Duration) (int64, bool) {
 	usedAt, _, err := measure(ctx, path)
 	if err != nil {
 		c.log.Warn("cache.gc.measure_failed", "node", c.cfg.Node, "path", path, "err", err.Error())
@@ -800,9 +1071,11 @@ func (c *Collector) expire(ctx context.Context, root, path, name string, ttl tim
 	if !c.expired(usedAt, ttl) {
 		return 0, false
 	}
-	n, err := c.delete(root, path, name, "ttl")
+	n, err := c.delete(unit, path, name, "ttl")
 	if err != nil {
-		c.log.Warn("cache.gc.delete_failed", "node", c.cfg.Node, "path", path, "err", err.Error())
+		if !isSymlinkSkip(err) {
+			c.log.Warn("cache.gc.delete_failed", "node", c.cfg.Node, "path", path, "err", err.Error())
+		}
 		return 0, false
 	}
 	return n, true
@@ -815,18 +1088,66 @@ func (c *Collector) expired(usedAt time.Time, ttl time.Duration) bool {
 	return c.now().Sub(usedAt) > ttl
 }
 
-// delete removes path, refusing anything outside root.
-func (c *Collector) delete(root, path, name, reason string) (int64, error) {
-	rel, err := filepath.Rel(root, path)
+// errSymlinkSegment marks a path whose deletion was refused because a
+// component of the path is a symbolic link.
+var errSymlinkSegment = errors.New("symbolic link on the path")
+
+// isSymlinkSkip reports whether err is a refusal to follow a symbolic link,
+// which is a designed skip rather than a failed deletion.
+func isSymlinkSkip(err error) bool {
+	return errors.Is(err, errSymlinkSegment)
+}
+
+// delete removes path, which must stay inside unit — the state tree of the
+// workspace that owns it. The removal goes through os.Root, whose fd is
+// checked against unit's own lstat first, so a unit that is a link or was
+// replaced after the scan is refused rather than handed another workspace's
+// tree (§8.8: 不跨 workspace 清删). The literal-path pre-check only names the
+// skip for the log; the confinement is the root's.
+func (c *Collector) delete(unit, path, name, reason string) (int64, error) {
+	rel, err := filepath.Rel(unit, path)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
-		return 0, fmt.Errorf("refusing to delete %q outside state root %q", path, root)
+		return 0, fmt.Errorf("refusing to delete %q outside %q", path, unit)
+	}
+	if link, err := linkedSegment(unit, path); err != nil {
+		return 0, fmt.Errorf("inspect %q: %w", path, err)
+	} else if link != "" {
+		c.log.Warn("cache.gc.symlink_skipped", "node", c.cfg.Node, "path", path, "segment", link, "reason", reason)
+		return 0, fmt.Errorf("%w: %q", errSymlinkSegment, link)
 	}
 	bytes := dirBytes(path)
-	if err := os.RemoveAll(path); err != nil {
+	if err := removeWithin(unit, rel); err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return 0, nil // the tree is already gone
+		}
 		return 0, fmt.Errorf("remove %q: %w", path, err)
 	}
 	c.log.Debug("cache.gc.delete", "node", c.cfg.Node, "path", path, "name", name, "reason", reason, "freed_bytes", bytes)
 	return bytes, nil
+}
+
+// removeWithin removes rel below unit. Every component is resolved inside the
+// opened root, and the root is only used when its fd is the directory unit
+// names: os.OpenRoot follows a link on the final component, so without the
+// identity check a linked unit would hand the removal another tree.
+func removeWithin(unit, rel string) error {
+	root, err := os.OpenRoot(unit)
+	if err != nil {
+		return err
+	}
+	defer root.Close()
+	opened, err := root.Stat(".")
+	if err != nil {
+		return err
+	}
+	named, err := os.Lstat(unit)
+	if err != nil {
+		return err
+	}
+	if !os.SameFile(opened, named) {
+		return fmt.Errorf("%w: %q", errSymlinkSegment, unit)
+	}
+	return root.RemoveAll(rel)
 }
 
 func (c *Collector) report(st Stats) {
