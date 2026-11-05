@@ -402,6 +402,49 @@ func TestBuildInvalidTaskID(t *testing.T) {
 	}
 }
 
+// TestBuildInvalidAgentID: the claim's agent id becomes the Job's agent-id
+// label, so it must be a legal label value (§4.3: 标签携带任务、agent、
+// workspace 身份; the legal form is the one §8.3 fixes for label values).
+// Refusing it here keeps the claim from reaching the apiserver, where the same
+// fault would surface only as an opaque create failure.
+func TestBuildInvalidAgentID(t *testing.T) {
+	for _, agentID := range []string{
+		"has space",
+		"-leading-dash",
+		strings.Repeat("a", 64),
+		"bad/slash",
+	} {
+		entry := testEntry()
+		entry.AgentID = agentID
+		cfg := testConfig()
+		issuer := &fakeIssuer{token: "fmj_test.sig"}
+		cfg.Issuer = issuer
+		job, secret, tokenHash, err := newTestBuilder(t, cfg).Build(entry)
+		if err == nil {
+			t.Errorf("agent id %q: expected an error, got job=%v", agentID, job != nil)
+			continue
+		}
+		if !strings.Contains(err.Error(), `"`+agentID+`"`) || !strings.Contains(err.Error(), "label value") {
+			t.Errorf("agent id %q: error must name the value and the label form, got %v", agentID, err)
+		}
+		if job != nil || secret != nil || tokenHash != "" {
+			t.Errorf("agent id %q: objects and digest must be zero on error", agentID)
+		}
+		// The refusal precedes the token: nothing was issued for a Job that
+		// cannot exist.
+		if issuer.jobName != "" {
+			t.Errorf("agent id %q: a Job Token was issued for %q", agentID, issuer.jobName)
+		}
+	}
+	// An empty agent id stays legal: a label value may be empty, and an
+	// unavailable identity degrades the policy axes rather than failing.
+	entry := testEntry()
+	entry.AgentID = ""
+	if job, _ := mustBuild(t, testConfig(), entry); job.Labels[labelAgentID] != "" {
+		t.Errorf("agent-id label = %q, want the empty value kept", job.Labels[labelAgentID])
+	}
+}
+
 func TestBuildIssuerError(t *testing.T) {
 	cfg := testConfig()
 	cfg.Issuer = &fakeIssuer{err: errors.New("boom")}

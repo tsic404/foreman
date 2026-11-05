@@ -136,6 +136,25 @@ type Snapshot struct {
 	// the mapping record is what the restart continues from.
 	RealRuntimeID   string `json:"real_runtime_id,omitempty"`
 	RuntimeIdentity string `json:"runtime_identity,omitempty"`
+
+	// The claim's identity inputs (§4.1 项目身份, §8.3 名字合成, §8.5 身份输入,
+	// §4.5 软亲和). A restored pre-delivery entry is continued by a
+	// convergence round that renders its Job again, and the render must
+	// reproduce the row's job_name: the agent segment, the object's agent-id
+	// label, the policy axes and the soft-affinity key all read these. Without
+	// them the continuation renders a different name, which creates a Job no
+	// row manages and leaves the recorded name missing (§4.3 未完成创建的接续).
+	// They are identity values, not credentials — none of them authenticates
+	// anything (F3 judges the credentials written into a Job pod) — and they
+	// stay out of the projection and out of every K8s object like the fields
+	// above. The keys are always present, empty when the claim has no such
+	// identity: the row's shape is one shape.
+	AgentName     string `json:"agent_name"`
+	ProjectID     string `json:"project_id"`
+	ProjectSource string `json:"project_source"`
+	// PriorSessionID is a path on the member's node, not a secret; it is the
+	// soft-affinity key source the continued Job's Build consumes.
+	PriorSessionID string `json:"prior_session_id"`
 }
 
 // FromEntry serializes a live row into its shared-store snapshot.
@@ -176,6 +195,10 @@ func FromEntry(e registry.TaskEntry) Snapshot {
 		TokenHash:           e.TokenHash,
 		RealRuntimeID:       e.RealRuntimeID,
 		RuntimeIdentity:     e.RuntimeIdentity,
+		AgentName:           e.AgentName,
+		ProjectID:           e.ProjectID,
+		ProjectSource:       e.ProjectSource,
+		PriorSessionID:      e.PriorSessionID,
 	}
 }
 
@@ -220,6 +243,10 @@ func (s Snapshot) ToEntry() registry.TaskEntry {
 		TokenHash:           s.TokenHash,
 		RealRuntimeID:       s.RealRuntimeID,
 		RuntimeIdentity:     s.RuntimeIdentity,
+		AgentName:           s.AgentName,
+		ProjectID:           s.ProjectID,
+		ProjectSource:       s.ProjectSource,
+		PriorSessionID:      s.PriorSessionID,
 	}
 }
 

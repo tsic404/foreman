@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/registry"
 )
 
@@ -653,6 +652,12 @@ func (s *Scheduler) AttachShared(ctx context.Context) error {
 // convergence round recreates both idempotently (§4.3 未完成创建的接续). It
 // returns nil when there is nothing to continue or the continuation landed;
 // an error keeps the entry for the next round.
+//
+// The create itself is the claim's own path (createClaim): the row the dead
+// claim persisted carries the identity the render reads, so the continued Job
+// is the one the row names — a continuation that composed a different name
+// would leave an object no row manages and the recorded name missing
+// (AC-75 至多一个活跃 Job).
 func (s *Scheduler) ContinueClaim(ctx context.Context, taskID string) error {
 	unlock, err := s.lockTaskFor(ctx, taskID)
 	if err != nil {
@@ -684,35 +689,6 @@ func (s *Scheduler) ContinueClaim(ctx context.Context, taskID string) error {
 	s.log.InfoContext(ctx, "task.claim_continued",
 		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 		"workspace_id", e.WorkspaceID)
-	built, secret, tokenHash, err := s.builder.Build(jobbuilderEntry(e))
-	if err != nil {
-		s.failClaim(ctx, e, err)
-		return err
-	}
-	if err := s.reg.SetTokenHash(e.TaskID, tokenHash); err != nil {
-		// The row cannot carry the digest, so issuing the credential would
-		// leave no instance able to adjudicate or revoke it (ADR-046 决策 7).
-		// Nothing has been created yet; the next round retries the continuation.
-		return fmt.Errorf("%w: record token digest: %v", ErrStoreUnavailable, err)
-	}
-	_ = s.jobs.DeleteSecret(ctx, jobbuilder.CredentialSecretName(e.DaemonID))
-	if err := s.jobs.CreateSecret(ctx, secret); err != nil {
-		s.failClaim(ctx, e, fmt.Errorf("create credential secret: %w", err))
-		return err
-	}
-	created, err := s.createJob(ctx, e, built)
-	if err != nil {
-		_ = s.jobs.DeleteSecret(ctx, jobbuilder.CredentialSecretName(e.DaemonID))
-		if errors.Is(err, errJobNameHeld) {
-			// A terminating predecessor still holds the name: the next round
-			// continues, never a failure (the claim-deferral face).
-			return err
-		}
-		s.failClaim(ctx, e, fmt.Errorf("create job: %w", err))
-		return err
-	}
-	if _, ok := s.reg.MarkJobCreated(e.TaskID, created.CreationTimestamp.Time); !ok {
-		return s.deleteObjects(ctx, e)
-	}
-	return nil
+	_, _, err = s.createClaim(ctx, e)
+	return err
 }

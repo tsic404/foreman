@@ -202,3 +202,45 @@ func TestContinuationKeepsTheEntryThroughASustainedDigestOutage(t *testing.T) {
 		t.Fatalf("shared row = %+v (ok=%v, err=%v), want the token digest", row, ok, err)
 	}
 }
+
+// TestContinuationFailureIsNotAMissingJobObservation pins the other half of
+// §4.3 未完成创建的接续: a pre-delivery entry's Job legitimately does not exist
+// yet, so a continuation that does not land (a name a terminating predecessor
+// still holds, a transient object read) must not start the missing-Job window.
+// Entering it would end in job_missing for a task that never ran, one full
+// window after the failure that caused it (AC-75).
+func TestContinuationFailureIsNotAMissingJobObservation(t *testing.T) {
+	const taskID = "task-1"
+	reg := newRegistry(t, registry.TaskEntry{
+		TaskID:      taskID,
+		WorkspaceID: "w1",
+		JobName:     fakeJobName(taskID),
+		DaemonID:    fakeJobName(taskID),
+		State:       registry.StatePending,
+		ClaimedAt:   time.Now().Add(-time.Hour),
+		Attempt:     1,
+		Payload:     []byte(`{"id":"task-1","workspace_id":"w1"}`),
+	})
+	objs := &fakeObjects{} // no Job: the continuation's own window
+	server := newFakeServerClient(map[string]string{taskID: "dispatched"})
+	set := &fakeSettler{err: errors.New("job name still held by a terminating predecessor")}
+	rec := newTestReconciler(t, reg, objs, server, set)
+	// Zero: every round after the first observation is past the window, so an
+	// entry that entered it would be settled as job_missing by the next one.
+	rec.jobGoneWindow = 0
+
+	for round := 1; round <= 3; round++ {
+		if err := rec.Reconcile(context.Background()); err == nil {
+			t.Fatalf("round %d: error = nil, want the continuation's failure surfaced", round)
+		}
+	}
+	if len(set.continued) != 3 {
+		t.Fatalf("continuation calls = %v, want one per round", set.continued)
+	}
+	if len(set.onJobGone) != 0 || len(set.failJobs) != 0 {
+		t.Fatalf("compensation ran for a task that never ran: gone=%v fail=%v", set.onJobGone, set.failJobs)
+	}
+	if e, ok := reg.Get(taskID); !ok || e.State != registry.StatePending {
+		t.Fatalf("entry = %+v (ok=%v), want the pending row kept for the next round", e, ok)
+	}
+}

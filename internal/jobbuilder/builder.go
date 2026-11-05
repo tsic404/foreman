@@ -19,6 +19,7 @@ import (
 
 	batchv1 "k8s.io/api/batch/v1"
 	corev1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/util/validation"
 
 	"github.com/tsic404/foreman/internal/registry"
 )
@@ -131,6 +132,16 @@ func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, string, erro
 	daemonID := DaemonIDFor(e.TaskID)
 	if len(daemonID) > maxJobNameLength || !dns1123Label.MatchString(daemonID) {
 		return nil, nil, "", fmt.Errorf("%w: %q does not yield a valid daemon id %q", ErrInvalidTaskID, e.TaskID, daemonID)
+	}
+	// The claim's agent id becomes the Job's agent-id label, so it must be a
+	// legal label value before it is written (§4.3 标签携带任务、agent、
+	// workspace 身份). Refusing it here keeps the claim from reaching the
+	// apiserver, where the same fault surfaces only as an opaque create
+	// failure; an empty value stays legal (a label value may be empty, §8.3's
+	// legal-form rule).
+	if problems := validation.IsValidLabelValue(e.AgentID); len(problems) > 0 {
+		return nil, nil, "", fmt.Errorf("agent id %q is not a legal label value: %s",
+			e.AgentID, strings.Join(problems, "; "))
 	}
 	if b.cfg.Issuer == nil {
 		return nil, nil, "", fmt.Errorf("Config.Issuer is required")

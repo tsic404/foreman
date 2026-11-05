@@ -46,6 +46,7 @@ func TestSnapshotRoundTripKeepsProjectedFieldsAndDropsSecrets(t *testing.T) {
 		PriorSessionID:  "sess",
 		AgentName:       "agent-1",
 		ProjectID:       "pid-1",
+		ProjectSource:   "payload",
 		RealRuntimeID:   "rid-1",
 		RuntimeIdentity: "omp\x00",
 	}
@@ -80,8 +81,19 @@ func TestSnapshotRoundTripKeepsProjectedFieldsAndDropsSecrets(t *testing.T) {
 	if got.RealRuntimeID != e.RealRuntimeID || got.RuntimeIdentity != e.RuntimeIdentity {
 		t.Fatal("claim-time dispatch record was not persisted")
 	}
-	if got.PriorSessionID != "" {
-		t.Fatal("build-only identity fields should not be persisted")
+	// The claim's identity inputs travel with the mapping record: a
+	// convergence round that continues a pre-delivery claim renders its Job
+	// again from the restored row, and the render must reproduce the row's
+	// job_name and the policy axes (§4.3 未完成创建的接续). They stay out of
+	// the projection, and none of them is a credential.
+	if got.PriorSessionID != e.PriorSessionID || got.AgentName != e.AgentName ||
+		got.ProjectID != e.ProjectID || got.ProjectSource != e.ProjectSource {
+		t.Fatalf("claim identity inputs were not persisted: %+v", got)
+	}
+	for _, key := range []string{"prior_session_id", "agent_name", "project_id", "project_source"} {
+		if strings.Contains(string(projected), key) {
+			t.Fatalf("projection leaked the mapping-only key %q: %s", key, projected)
+		}
 	}
 }
 

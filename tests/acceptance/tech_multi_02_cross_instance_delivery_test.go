@@ -8,11 +8,17 @@ package acceptance
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"testing"
 	"time"
 
+	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
+
+	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/scheduler"
 )
 
 func TestTechMulti02CrossInstanceDeliveryAndTerminalSingleWrite(t *testing.T) {
@@ -104,66 +110,157 @@ func TestTechMulti02CrossInstanceDeliveryAndTerminalSingleWrite(t *testing.T) {
 	}
 }
 
+// multi02NameTemplate names the Job after the claim's agent segment and task
+// key, so the continuation can only reproduce the row's job_name when the row
+// carried the claim's identity (the fallback segment is "agent").
+const multi02NameTemplate = `
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: fm-<agent-segment>-<task-key>
+spec:
+  template:
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: agent
+          image: <job-image>
+`
+
+// multi02ClaimPayload is the claim whose agent name and session path have to
+// survive the row: the agent segment of the Job's name, the agent-id label and
+// the soft-affinity key all read them.
+func multi02ClaimPayload(taskID string) json.RawMessage {
+	return json.RawMessage(`{
+		"id": "` + taskID + `", "agent_id": "agent-1", "workspace_id": "ws-1",
+		"issue_id": "issue-1", "issue_identifier": "TSI 4592",
+		"runtime_id": "rid-omp", "prior_session_id": "/state/home/.multica/pi-sessions/sess-1.jsonl",
+		"agent": {"name": "OMP Bot", "model": "k3"}
+	}`)
+}
+
+// multi02CrashBuilder stops one instance's claim inside its create window: the
+// shared row and its queue entry are written, the render never returns, and no
+// object exists. The goroutine is never released — that instance is dead for
+// the rest of the scenario, and the survivor is what continues the claim
+// (§4.3 未完成创建的接续).
+type multi02CrashBuilder struct {
+	inner   probeBuilder
+	taskID  string
+	crashed chan struct{}
+}
+
+func (b *multi02CrashBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
+	if e.TaskID == b.taskID {
+		close(b.crashed)
+		select {}
+	}
+	return b.inner.Build(e)
+}
+
+func (b *multi02CrashBuilder) ResolveName(e jobbuilder.TaskEntry) (string, error) {
+	return b.inner.ResolveName(e)
+}
+
+func (b *multi02CrashBuilder) RequiresProjectIdentity(e jobbuilder.TaskEntry) bool {
+	return b.inner.RequiresProjectIdentity(e)
+}
+
+func (b *multi02CrashBuilder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
+	return b.inner.BuildCatalogProbe(requestID, jobRuntimeID, workspaceID, budget)
+}
+
+func (b *multi02CrashBuilder) probeToken(jobName string) string { return b.inner.probeToken(jobName) }
+
 // TestTechMulti02ClaimContinuesAfterInstanceDeath covers the injected
-// "instance killed before creating the Job": the claim row and its queue entry
-// survive, and the takeover's convergence round continues the creation instead
-// of failing a task that never ran (§4.3 未完成创建的接续).
+// "instance killed before creating the Job" through the production claim path:
+// the claim persists the row and its queue entry, the process dies inside the
+// render, and the takeover's convergence round continues the creation. The
+// continued Job must be the one the row names — the same name the dead claim
+// composed — with no second object behind it and no failure for the task
+// (§4.3 未完成创建的接续, AC-75 至多一个活跃 Job).
 func TestTechMulti02ClaimContinuesAfterInstanceDeath(t *testing.T) {
 	tw := newTwoInstances(t, twoInstanceOptions{
 		deliveryWindow: 300 * time.Millisecond,
 		leaderCfg:      smallLeaderCfg(time.Second),
 	})
 	tw.declareAll(t)
+	template := writeTemplateFile(t, multi02NameTemplate)
+	tw.a.useRealBuilderWithTemplate(t, template)
+	tw.b.useRealBuilderWithTemplate(t, template)
 
-	// The dead instance had persisted the claim (row + queue entry) and
-	// enqueued it, then died before the Job object existed. The shared state
-	// is exactly what the claim path writes up to that point.
-	dead := registry.TaskEntry{
-		TaskID:         "task-dead",
-		AgentID:        "agent-1",
-		WorkspaceID:    "ws-1",
-		JobNamespace:   "multica-agents",
-		JobName:        "fm-task-dead",
-		DaemonID:       "fm-task-dead",
-		JobRuntimeID:   "rt-dead",
-		State:          registry.StatePending,
-		Attempt:        1,
-		ClaimedAt:      time.Now(),
-		BootDeadline:   time.Now().Add(time.Minute),
-		LeaseKeepUntil: time.Now().Add(45 * time.Second),
-		Payload:        deliveryPayload("task-dead"),
+	const taskID = "task-crash"
+	payload := multi02ClaimPayload(taskID)
+	// The crash window: the claim has written its row and queue entry, and the
+	// render it dies in is the next thing that would touch anything.
+	crashed := make(chan struct{})
+	tw.a.builder = &multi02CrashBuilder{inner: tw.a.builder, taskID: taskID, crashed: crashed}
+	tw.a.rebuildScheduler(t, func(*scheduler.Config) {})
+	go func() { _ = tw.a.sched.OnClaimFor(context.Background(), "ws-1", payload) }()
+	select {
+	case <-crashed:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the claim never reached the crash window")
 	}
-	if _, err := tw.coord.EnqueueEntry(context.Background(), "ws-1", "task-dead", dead); err != nil {
-		t.Fatalf("persist the pre-crash claim: %v", err)
+
+	// The row is what the continuation renders from: it must carry the claim's
+	// identity, or the render falls back to the "agent" segment.
+	row, ok := tw.entry(t, taskID)
+	if !ok {
+		t.Fatal("the dead claim left no shared row")
 	}
-	tw.a.upstream.setTaskStatus("task-dead", "dispatched")
+	const wantName = "fm-omp-bot-taskcrash"
+	if row.JobName != wantName {
+		t.Fatalf("row job_name = %q, want the claim's composed name %q", row.JobName, wantName)
+	}
+	if row.AgentName != "OMP Bot" || row.PriorSessionID != "/state/home/.multica/pi-sessions/sess-1.jsonl" {
+		t.Fatalf("row identity = agent %q / session %q, want the claim's values",
+			row.AgentName, row.PriorSessionID)
+	}
+	// The crash landed before any object: nothing was placed under the
+	// recorded name or under the name a row without the identity would render.
+	if tw.a.jobs.jobCreated(wantName) || tw.a.jobs.jobCreated("fm-agent-taskcrash") {
+		t.Fatal("the dead claim placed an object before it died")
+	}
 
 	// The survivor takes over (the dead instance never held a lease in this
 	// scenario): its takeover resync sees the row, and the convergence round
-	// continues the creation exactly once.
+	// continues the creation exactly once — the write lock the dead claim held
+	// lapses on its own.
 	tw.b.startLeader(t)
-	if err := tw.b.sched.Reconcile(context.Background()); err != nil {
-		t.Fatalf("takeover reconcile: %v", err)
-	}
-	deadline := time.Now().Add(10 * time.Second)
-	for !tw.b.jobs.jobCreated("fm-task-dead") {
+	deadline := time.Now().Add(20 * time.Second)
+	for !tw.b.jobs.jobCreated(wantName) {
 		if time.Now().After(deadline) {
-			t.Fatal("the continued claim never created the Job")
+			e, _ := tw.entry(t, taskID)
+			t.Fatalf("the continued claim never created %s; row=%s/%s", wantName, e.State, e.FailureReason)
 		}
-		time.Sleep(10 * time.Millisecond)
+		_ = tw.b.sched.Reconcile(context.Background())
+		time.Sleep(20 * time.Millisecond)
 	}
-	if n := tw.b.jobs.liveJobCount("fm-task-dead"); n != 1 {
-		t.Fatalf("live Jobs for fm-task-dead = %d, want exactly one", n)
+	if n := tw.b.jobs.liveJobCount(wantName); n != 1 {
+		t.Fatalf("live Jobs named %s = %d, want exactly one", wantName, n)
 	}
-	if e, ok := tw.entry(t, "task-dead"); !ok || e.State != registry.StateJobCreated {
-		t.Fatalf("shared row = %+v, want job_created after the continuation", e)
+	if n := tw.b.jobs.liveJobCount("fm-agent-taskcrash"); n != 0 {
+		t.Fatalf("orphan Jobs under the fallback name = %d, want none", n)
 	}
-	// A second convergence round is idempotent: no second Job, no duplicate
-	// write.
+	continued, ok := tw.entry(t, taskID)
+	if !ok || continued.State != registry.StateJobCreated {
+		t.Fatalf("shared row = %+v (ok=%v), want job_created after the continuation", continued, ok)
+	}
+
+	// A second convergence round is idempotent: no second Job, and no verdict
+	// for a task that never ran (the recorded name is what the missing-Job
+	// compensation looks up, and that object exists).
 	if err := tw.b.sched.Reconcile(context.Background()); err != nil {
 		t.Fatalf("second reconcile: %v", err)
 	}
-	if n := tw.b.jobs.jobCreatedCount("fm-task-dead"); n != 1 {
+	if n := tw.b.jobs.jobCreatedCount(wantName); n != 1 {
 		t.Fatalf("Job create calls = %d, want exactly one", n)
+	}
+	if fails := tw.b.server.forwarded(scheduler.EPFail); len(fails) != 0 {
+		t.Fatalf("failure reports through B = %+v, want none for a continued claim", fails)
+	}
+	if e, _ := tw.entry(t, taskID); e.IsTerminal() {
+		t.Fatalf("row settled %s/%s, want the continued claim left running", e.State, e.FailureReason)
 	}
 }
