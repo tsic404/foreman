@@ -53,8 +53,13 @@ func TestStartup03FailRegisterRefusedOnProviderMiss(t *testing.T) {
 		t.Fatalf("register with a foreign provider = %d (%s), want 409", code, body)
 	}
 
-	// The entry converges to terminal/failed immediately — no boot deadline
-	// wait — and the compensation report reaches the server.
+	// The entry converges to terminal/failed without waiting out the boot
+	// deadline, and the compensation report reaches the server. The daemon's
+	// 409 is answered first and the settlement follows it, so the convergence
+	// is awaited rather than read off the response instant.
+	waitFor(t, "the refused task's compensation report", 5*time.Second, func() bool {
+		return len(h.server.forwarded(scheduler.EPFail)) == 1
+	})
 	settled, ok := h.reg.Get("task-1")
 	if !ok {
 		t.Fatal("the entry must still be visible (it drains)")

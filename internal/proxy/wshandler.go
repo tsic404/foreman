@@ -31,6 +31,12 @@ type WSHandler struct {
 
 	mu    sync.Mutex
 	conns map[string]*jobConn // daemonID → live connection
+
+	// pingInterval/pingTimeout are the S-30 keepalive: a daemon whose host
+	// disappeared without a close frame would otherwise stay "connected"
+	// (and its heartbeats would go unacked) forever. Overridable in tests.
+	pingInterval time.Duration
+	pingTimeout  time.Duration
 }
 
 // jobConn is one Job daemon's WS connection; writes are serialized.
@@ -49,6 +55,9 @@ func NewWSHandler(issuer *auth.Issuer, reg *registry.Registry, metrics Metrics) 
 		metrics: orNoopMetrics(metrics),
 		log:     slog.Default().With("component", "ws-handler"),
 		conns:   make(map[string]*jobConn),
+
+		pingInterval: wsPingInterval,
+		pingTimeout:  wsPingTimeout,
 	}
 }
 
@@ -96,12 +105,16 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	jc := &jobConn{daemonID: claims.JobName, conn: conn}
 	h.mu.Lock()
-	if old := h.conns[claims.JobName]; old != nil {
-		// A daemon reconnect supersedes its previous connection.
-		_ = old.conn.Close(websocket.StatusNormalClosure, "replaced")
-	}
+	old := h.conns[claims.JobName]
 	h.conns[claims.JobName] = jc
 	h.mu.Unlock()
+	if old != nil {
+		// A daemon reconnect supersedes its previous connection. The close
+		// handshake waits for the peer (up to 5s), so it runs off the lock and
+		// off this goroutine: one half-open Job must not queue the pushes,
+		// closes and handshakes of every other Job behind it.
+		go func() { _ = old.conn.Close(websocket.StatusNormalClosure, "replaced") }()
+	}
 	h.metrics.WSConnect(WSSideJob)
 	h.log.Info("ws.connected",
 		"side", WSSideJob, "task_id", entry.TaskID, "job_name", entry.JobName,
@@ -114,7 +127,10 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		jc.write(taskAvailableFrame(entry.TaskID))
 	}
 
+	pingCtx, stopPings := context.WithCancel(r.Context())
+	go keepAlive(pingCtx, conn, h.pingInterval, h.pingTimeout, h.log, WSSideJob)
 	h.readLoop(r.Context(), jc, entry.JobRuntimeID)
+	stopPings()
 
 	h.mu.Lock()
 	if h.conns[claims.JobName] == jc {
@@ -188,12 +204,19 @@ func (h *WSHandler) NotifyTaskAvailable(daemonID, taskID string) {
 
 // CloseJob closes the Job's WS connection (terminal state or teardown,
 // S30). The daemon falls back to HTTP polling until its Job is deleted.
+//
+// The connection leaves the live set before the close starts, so it is off the
+// caller's path (the terminal report's answer) and off the lock; the close
+// handshake itself can wait up to 5s for a peer that never answers. A daemon
+// that reconnects in that window registers a new connection and is not
+// touched: only the captured one is closed.
 func (h *WSHandler) CloseJob(daemonID string) {
 	h.mu.Lock()
 	jc := h.conns[daemonID]
 	delete(h.conns, daemonID)
 	h.mu.Unlock()
-	if jc != nil {
-		_ = jc.conn.Close(websocket.StatusNormalClosure, "job done")
+	if jc == nil {
+		return
 	}
+	go func() { _ = jc.conn.Close(websocket.StatusNormalClosure, "job done") }()
 }

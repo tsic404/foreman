@@ -1,8 +1,10 @@
 package proxy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -1206,5 +1208,221 @@ func TestWSProfileChangeFrameLiteral(t *testing.T) {
 	case <-notified:
 	case <-time.After(5 * time.Second):
 		t.Fatal("the literal frame name did not trigger the refresh")
+	}
+}
+
+type callResult struct {
+	code int
+	body []byte
+	err  error
+}
+
+// callOffTest performs one request off the test goroutine, so a handler that
+// blocks (a close handshake, a settlement round) can be observed without
+// wedging the test.
+func callOffTest(serverURL, method, path, token string, body []byte) <-chan callResult {
+	ch := make(chan callResult, 1)
+	go func() {
+		req, err := http.NewRequest(method, serverURL+path, bytes.NewReader(body))
+		if err != nil {
+			ch <- callResult{err: err}
+			return
+		}
+		if token != "" {
+			req.Header.Set("Authorization", "Bearer "+token)
+		}
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			ch <- callResult{err: err}
+			return
+		}
+		defer resp.Body.Close()
+		raw, err := io.ReadAll(resp.Body)
+		ch <- callResult{code: resp.StatusCode, body: raw, err: err}
+	}()
+	return ch
+}
+
+// A daemon reconnect supersedes its previous connection, and the superseded
+// one's close handshake waits for its peer (up to 5s). That wait must not run
+// under the handler's lock: another Job's push has to go out while it is
+// still pending.
+func TestWSReplacementCloseDoesNotBlockAnotherJobsPush(t *testing.T) {
+	rig, h := newTestRigWS(t)
+	// The keepalive must not be what ends the half-open connection here.
+	h.pingInterval = time.Hour
+	h.pingTimeout = time.Hour
+
+	rig.claimTask(t, "t-superseded")
+	rig.claimTask(t, "t-other")
+	tokA := rig.token(t, "t-superseded")
+	tokB := rig.token(t, "t-other")
+	ridA := rig.registerDaemon(t, "t-superseded", tokA)
+	ridB := rig.registerDaemon(t, "t-other", tokB)
+
+	connB, _, err := wsDial(t, rig.server.URL, tokB, []string{ridB})
+	if err != nil {
+		t.Fatalf("dial the other job: %v", err)
+	}
+	defer connB.CloseNow()
+	_ = readFrame(t, connB) // catch-up push
+
+	oldA, _, err := wsDial(t, rig.server.URL, tokA, []string{ridA})
+	if err != nil {
+		t.Fatalf("dial the superseded job: %v", err)
+	}
+	defer oldA.CloseNow()
+	// oldA never reads again: its close handshake cannot complete, so the
+	// close stays pending for the whole check below.
+	replacement, _, err := wsDial(t, rig.server.URL, tokA, []string{ridA})
+	if err != nil {
+		t.Fatalf("dial the replacement: %v", err)
+	}
+	defer replacement.CloseNow()
+	// The accepting goroutine is a few instructions past the handshake
+	// response; give it the moment it needs to enter the close handshake.
+	time.Sleep(100 * time.Millisecond)
+
+	pushed := make(chan struct{})
+	go func() {
+		h.NotifyTaskAvailable("fm-t-other", "t-other")
+		close(pushed)
+	}()
+	select {
+	case <-pushed:
+	case <-time.After(2 * time.Second): // well inside the 5s close handshake
+		t.Fatal("another job's push queued behind the replaced connection's close")
+	}
+	if frame := readFrame(t, connB); frame.Type != FrameDaemonTaskAvailable {
+		t.Fatalf("the other job's push = %s, want %s", frame.Type, FrameDaemonTaskAvailable)
+	}
+}
+
+// The terminal report's answer goes out before the S-30 close: the close
+// handshake waits for the daemon (up to 5s), and the report response must not.
+func TestTerminalReportAnswersBeforeTheWSClose(t *testing.T) {
+	rig, h := newTestRigWS(t)
+	h.pingInterval = time.Hour
+	h.pingTimeout = time.Hour
+	rig.stub.on("POST", "/api/daemon/tasks/t-terminal/complete", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]string{"id": "t-terminal", "status": "completed"})
+	})
+	rig.claimTask(t, "t-terminal")
+	tok := rig.token(t, "t-terminal")
+	jobRID := rig.registerDaemon(t, "t-terminal", tok)
+
+	conn, _, err := wsDial(t, rig.server.URL, tok, []string{jobRID})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+	_ = readFrame(t, conn) // catch-up push
+
+	// The daemon stops reading here: the close handshake cannot complete until
+	// the test reads again.
+	answered := callOffTest(rig.server.URL, "POST", "/api/daemon/tasks/t-terminal/complete", tok,
+		[]byte(`{"result":"completed"}`))
+	select {
+	case got := <-answered:
+		if got.err != nil {
+			t.Fatalf("complete: %v", got.err)
+		}
+		if got.code != http.StatusOK {
+			t.Fatalf("complete = %d: %s", got.code, got.body)
+		}
+	case <-time.After(2 * time.Second): // well inside the 5s close handshake
+		t.Fatal("the terminal answer waited for the WS close handshake")
+	}
+	// S-30 still closes the connection; reading it now completes the handshake.
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, _, err := conn.Read(ctx); err == nil {
+		t.Error("the Job WS connection must close on a terminal report")
+	}
+}
+
+// S-30 keepalive: a daemon whose host vanished without a close frame must be
+// dropped, or its channel would look connected while no heartbeat is acked.
+func TestWSHandlerDropsASilentPeer(t *testing.T) {
+	rig, h := newTestRigWS(t)
+	h.pingInterval = 20 * time.Millisecond
+	h.pingTimeout = 50 * time.Millisecond
+	rig.claimTask(t, "t-silent")
+	tok := rig.token(t, "t-silent")
+	jobRID := rig.registerDaemon(t, "t-silent", tok)
+
+	conn, _, err := wsDial(t, rig.server.URL, tok, []string{jobRID})
+	if err != nil {
+		t.Fatalf("dial: %v", err)
+	}
+	defer conn.CloseNow()
+	// Never read: every ping goes unanswered.
+
+	waitFor(t, "the handler to drop the silent peer", func() bool {
+		return rig.metrics.wsCount(WSSideJob) == 0
+	})
+}
+
+// C-20 keepalive: a peer that stops answering pings is a dead control channel.
+// The subscriber must drop it and take the §1.5 reconnect, instead of holding a
+// subscription that looks connected and delivers nothing.
+func TestWSSubscriberReconnectsAfterASilentPeer(t *testing.T) {
+	var dials atomic.Int32
+	mux := http.NewServeMux()
+	mux.HandleFunc("/api/daemon/ws", func(w http.ResponseWriter, r *http.Request) {
+		dials.Add(1)
+		conn, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		// Accept and never read: the pings are never answered.
+		<-r.Context().Done()
+		_ = conn.CloseNow()
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+
+	client := NewClient(testConfig(srv.URL), "mdt_test")
+	client.refs = []RuntimeRef{{ID: "rid-real", Provider: "omp", Name: "foreman-omp"}}
+	sub := NewWSSubscriber(client, func() {}, nil)
+	sub.dialTimeout = 50 * time.Millisecond
+	sub.waitSteps = []time.Duration{time.Millisecond}
+	sub.pingInterval = 20 * time.Millisecond
+	sub.pingTimeout = 50 * time.Millisecond
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	go func() { _ = sub.Run(ctx) }()
+
+	waitFor(t, "the silent peer to be dropped and the runtime redialed", func() bool {
+		return dials.Load() >= 2
+	})
+}
+
+// Losing the control-plane lease stops every stream; the retirement marks
+// belong to those same streams and must leave with them. A mark left behind
+// reads as "this identity already has its replacement in flight", so the next
+// id move would never cancel its stream — the connection would live on under a
+// stale id until it ended by itself. (The window between the mark and the
+// stream's own close signal cannot be driven end to end: cancelling a read
+// context makes the websocket library tear the connection down immediately,
+// so the mark lives for microseconds unless the lease is lost inside it.)
+func TestStopStreamsDropsTheRetirementMarks(t *testing.T) {
+	canceled := 0
+	connections := map[string]wsSubscription{
+		"omp\x00": {runtimeID: "rid-a", cancel: func() { canceled++ }},
+	}
+	retiring := map[string]bool{"omp\x00": true, "omp\x00prof-a": true}
+
+	stopStreams(connections, retiring)
+
+	if canceled != 1 {
+		t.Errorf("canceled = %d streams, want the live one", canceled)
+	}
+	if len(connections) != 0 {
+		t.Errorf("connections = %v, want every stream forgotten", connections)
+	}
+	if len(retiring) != 0 {
+		t.Errorf("retiring = %v, want no stale retirement mark", retiring)
 	}
 }

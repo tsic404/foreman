@@ -166,9 +166,12 @@ func TestTechRuntimeProfile01DeclarationAndThreeStateReplay(t *testing.T) {
 	if code != 409 {
 		t.Fatalf("zero-hit S-4 = %d: %s, want 409", code, body)
 	}
-	if entry, ok := h.reg.Get("task-3"); !ok || !entry.IsTerminal() {
-		t.Errorf("the refused task did not settle: %+v (ok=%v)", entry, ok)
-	}
+	// The refusal still settles the entry; the daemon's answer comes first and
+	// the settlement runs behind it, so the convergence is awaited.
+	waitFor(t, "the refused task to settle", 5*time.Second, func() bool {
+		entry, ok := h.reg.Get("task-3")
+		return ok && entry.IsTerminal()
+	})
 }
 
 func TestTechRuntimeProfile01RefreshSequence(t *testing.T) {

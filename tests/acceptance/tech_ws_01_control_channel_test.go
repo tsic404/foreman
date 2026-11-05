@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -337,5 +338,135 @@ func TestWS01Handshake403BacksOff(t *testing.T) {
 		}
 	case <-time.After(2 * time.Second):
 		t.Fatal("Run did not stop after cancel")
+	}
+}
+
+// ws01DialJob opens one S-30 connection for a claimed task. The context bounds
+// the handshake; the returned connection is independent of it.
+func ws01DialJob(t *testing.T, h *harness, entry registry.TaskEntry, token string) *websocket.Conn {
+	t.Helper()
+	wsURL := "ws" + strings.TrimPrefix(h.jobsHTTP.URL, "http") +
+		"/api/daemon/ws?runtime_ids=" + url.QueryEscape(entry.JobRuntimeID)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	conn, resp, err := websocket.Dial(ctx, wsURL, &websocket.DialOptions{
+		HTTPHeader: http.Header{"Authorization": []string{"Bearer " + token}},
+	})
+	if err != nil {
+		t.Fatalf("S-30 handshake for %s: %v (status %v)", entry.JobName, err, resp)
+	}
+	return conn
+}
+
+// TestWS01ReplacedConnectionDoesNotBlockAnotherJobsPush pins the S-30 close
+// side of AC-17: a daemon reconnect supersedes its previous connection, and a
+// superseded peer that never answers the close handshake keeps that close
+// pending. Another Job's registration — whose answer ends in a task_available
+// push — must still go through while it is pending.
+func TestWS01ReplacedConnectionDoesNotBlockAnotherJobsPush(t *testing.T) {
+	h := newHarnessWithWS(t, false)
+	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+	h.declare(declaredRuntimes())
+	for _, taskID := range []string{"task-superseded", "task-other"} {
+		if err := h.sched.OnClaim(t.Context(), deliveryPayload(taskID)); err != nil {
+			t.Fatalf("OnClaim(%s): %v", taskID, err)
+		}
+	}
+	entryA, ok := h.reg.Get("task-superseded")
+	if !ok {
+		t.Fatal("task-superseded entry missing")
+	}
+	entryB, ok := h.reg.Get("task-other")
+	if !ok {
+		t.Fatal("task-other entry missing")
+	}
+	tokenA := issueJobToken(t, h, "task-superseded")
+	tokenB := issueJobToken(t, h, "task-other")
+
+	// A's first connection stops reading here, so the replacement's close
+	// handshake for it cannot complete.
+	oldA := ws01DialJob(t, h, entryA, tokenA)
+	defer oldA.CloseNow()
+	replacementA := ws01DialJob(t, h, entryA, tokenA)
+	defer replacementA.CloseNow()
+	// The accepting goroutine reaches the close handshake a few instructions
+	// past the handshake response.
+	time.Sleep(100 * time.Millisecond)
+
+	// B's connection is already up; its registration is what pushes.
+	connB := ws01DialJob(t, h, entryB, tokenB)
+	defer connB.CloseNow()
+
+	// B's registration must be answered and push to B while A's superseded
+	// connection is still closing (the close handshake waits 5s for a silent
+	// peer, so 2s is inside it).
+	code, body := h.callWithin(2*time.Second, "POST", "/api/daemon/register", tokenB, []byte(`{
+		"daemon_id": "fm-task-other",
+		"runtimes": [{"name": "foreman-zz", "type": "zz", "version": "3.1.4"}]
+	}`))
+	if code != http.StatusOK {
+		t.Fatalf("the other Job's registration = %d (%s), want 200 while a replaced connection closes", code, body)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	_, raw, err := connB.Read(ctx)
+	if err != nil {
+		t.Fatalf("the other Job's push: %v", err)
+	}
+	var frame struct {
+		Type    string `json:"type"`
+		Payload struct {
+			TaskID string `json:"task_id"`
+		} `json:"payload"`
+	}
+	if err := json.Unmarshal(raw, &frame); err != nil {
+		t.Fatalf("push frame %s: %v", raw, err)
+	}
+	if frame.Type != "daemon:task_available" || frame.Payload.TaskID != "task-other" {
+		t.Fatalf("the other Job's push = %s, want daemon:task_available for task-other", raw)
+	}
+}
+
+// TestWS01TerminalAnswerIsNotHeldByTheClose pins the other half of the S-30
+// close rule: the terminal report's answer is the daemon's, and the close
+// that follows it (which waits for the peer) must not hold that answer.
+func TestWS01TerminalAnswerIsNotHeldByTheClose(t *testing.T) {
+	h := newHarnessWithWS(t, false)
+	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
+	h.declare(declaredRuntimes())
+	if err := h.sched.OnClaim(t.Context(), deliveryPayload("task-terminal")); err != nil {
+		t.Fatalf("OnClaim: %v", err)
+	}
+	entry, ok := h.reg.Get("task-terminal")
+	if !ok {
+		t.Fatal("task-terminal entry missing")
+	}
+	token := issueJobToken(t, h, "task-terminal")
+	registerTaskDaemon(t, h, "task-terminal", token)
+
+	conn := ws01DialJob(t, h, entry, token)
+	defer conn.CloseNow()
+	// The daemon stops reading here: the close handshake cannot complete until
+	// the reads below drain what is buffered.
+
+	code, body := h.callWithin(2*time.Second, "POST", "/api/daemon/tasks/task-terminal/complete", token,
+		[]byte(`{"result":"completed"}`))
+	if code != http.StatusOK {
+		t.Fatalf("S13 = %d (%s), want the answer while the close is pending", code, body)
+	}
+
+	// S-30 still closes the connection on a terminal report.
+	for {
+		readCtx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		_, _, err := conn.Read(readCtx)
+		cancel()
+		if err == nil {
+			continue // the buffered catch-up push, then the close
+		}
+		if errors.Is(err, context.DeadlineExceeded) {
+			t.Fatal("the Job WS connection stayed open after the terminal report")
+		}
+		break
 	}
 }
