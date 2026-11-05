@@ -23,15 +23,17 @@
 #      leaves the runtime list empty on purpose — ./bind-agent.sh creates it
 #      once the agent is bound;
 #   6. model — one writer, one precedence: the deployment-supplied endpoint
-#      triple wins; without it the keyless local backend ./deploy.sh installed
-#      is the source (its family selector plus its in-cluster address); with
-#      neither, the agent's model is cleared and any registration a previous
-#      round left on the nodes is removed (the node file outlives the
-#      namespace). The failure agent is cleared unconditionally: its missing
-#      model source is the fixture's failure guarantee;
-#   7. gate — ./selfcheck.sh: the environment gate ①②③④ (the instance points at
-#      the access point, the runtime list is empty, the server reports the
-#      artifact anchor, the selected model source serves the round).
+#      triple wins; without it the selected local source (the scripted fixture
+#      backend by default, the keyless ollama engine when the round asks for
+#      it) is registered through the same installer; with neither, the agent's
+#      model is cleared and any registration a previous round left on the
+#      nodes is removed (the node file outlives the namespace). The failure
+#      agent is cleared unconditionally: its missing model source is the
+#      fixture's failure guarantee;
+#   7. gate — ./selfcheck.sh: the environment gate ①②③④⑤ (the instance points
+#      at the access point, the runtime list is empty, the server reports the
+#      artifact anchor, the selected model source serves the round, and the Job
+#      image's daemon carries the argv omp accepts).
 #
 # It is idempotent: everything is looked up by name and only created when
 # missing; the provider registration is one Secret applied in place and one
@@ -282,7 +284,7 @@ ensure_chat
 register_model_endpoint
 clear_fault_agent_model
 
-# The environment gate ①②③④, the gate every round opens with. Run here, with
+# The environment gate ①②③④⑤, the gate every round opens with. Run here, with
 # the instance under test stopped, ② is the reset-time state this entry sets
 # up; a blocked environment exits 2 through this call.
 "$TEST_MULTICA_DIR/selfcheck.sh"

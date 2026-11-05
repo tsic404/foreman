@@ -2,8 +2,9 @@
 // could otherwise notice were wrong: the model selector and the model
 // backend's in-cluster address. Neither is observable without a cluster, so
 // reset.sh runs here against stubs that answer every call up to the writes and
-// keep the request bodies for judgement: the selector must name the served tag
-// in full, and custom_env must carry the backend address and nothing else.
+// keep the request bodies for judgement: the selector must name the served
+// tag in full — the form omp's catalog carries — and custom_env must carry the
+// backend address and nothing else.
 package testinfra
 
 import (
@@ -41,6 +42,13 @@ case " $* " in
 	printf 'Error from server (NotFound): deployments.apps "%s" not found\n' "$TEST_MULTICA_INSTANCE" >&2
 	exit 1
 	;;
+*" -n $TEST_MULTICA_NS get deploy $TEST_MULTICA_SCRIPTED_DEPLOY "*)
+	if [ -n "${STUB_SCRIPTED_READ_ERROR:-}" ]; then
+		printf '%s\n' "$STUB_SCRIPTED_READ_ERROR" >&2
+		exit 1
+	fi
+	printf '%s' "${STUB_SCRIPTED_ID:-}"
+	;;
 *" -n $TEST_MULTICA_NS get deploy $TEST_MULTICA_MODEL_DEPLOY "*)
 	if [ -n "${STUB_MODEL_READ_ERROR:-}" ]; then
 		printf '%s\n' "$STUB_MODEL_READ_ERROR" >&2
@@ -55,6 +63,9 @@ case " $* " in
 	# One ready schedulable node: the endpoint-less branch rolls back through a
 	# one-shot carrier per node.
 	printf '{"items":[{"metadata":{"name":"node-a"},"spec":{},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}'
+	;;
+*" create secret generic "*)
+	printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: test-multica-model-provider\n'
 	;;
 *" apply -f "*)
 	# The removal carrier's manifest is applied; no pod ever runs here.
@@ -128,14 +139,14 @@ case "$method $path" in
 esac
 `
 
-// TestResetPinsTheServedModelSelectorAndTheBackendAddress judges the agent
-// writes reset.sh sends when no endpoint is configured. A family-form selector
-// (the served tag stripped) is the regression the live path cannot catch: omp
-// resolves a provided selector against the catalog it reports at startup, so
-// the failure only shows up as a dead task. The last case is the chain's floor:
-// neither the endpoint triple nor a deployed local backend, so both fields are
-// cleared.
-func TestResetPinsTheServedModelSelectorAndTheBackendAddress(t *testing.T) {
+// TestResetPinsTheServedModelTagAndTheBackendAddress judges the agent writes
+// reset.sh sends when no endpoint is configured. A selector that drops the
+// served tag is the regression the live path shows as a dead task: omp
+// resolves a provided selector against the catalog it discovers, and the
+// family form without `:tag` matches no row there. The last case is the
+// chain's floor: neither the endpoint triple nor a deployed local backend, so
+// both fields are cleared.
+func TestResetPinsTheServedModelTagAndTheBackendAddress(t *testing.T) {
 	for _, tc := range []struct {
 		name, served, wantModel, wantInfo string
 		wantEnv                           map[string]string
@@ -163,7 +174,7 @@ func TestResetPinsTheServedModelSelectorAndTheBackendAddress(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			run := runReset(t, resetOptions{served: tc.served})
+			run := runReset(t, resetOptions{source: "ollama", served: tc.served})
 			if run.err != nil {
 				t.Fatalf("reset.sh did not finish: %v\n--- stderr ---\n%s", run.err, run.stderr)
 			}
@@ -205,6 +216,7 @@ func TestResetPinsTheServedModelSelectorAndTheBackendAddress(t *testing.T) {
 // non-zero and write nothing at all.
 func TestResetFailsWhenTheModelBackendReadFails(t *testing.T) {
 	run := runReset(t, resetOptions{
+		source:         "ollama",
 		served:         "qwen2.5:0.5b",
 		modelReadError: `Error from server (Forbidden): deployments.apps "` + resetModelDeploy + `" is forbidden`,
 	})
@@ -228,6 +240,7 @@ func TestResetFailsWhenTheModelBackendReadFails(t *testing.T) {
 func TestResetFallsToTheFloorWhenTheModelBackendIsNotDeployed(t *testing.T) {
 	run := runReset(t, resetOptions{
 		modelReadError: `Error from server (NotFound): deployments.apps "` + resetModelDeploy + `" not found`,
+		source:         "ollama",
 	})
 	if run.err != nil {
 		t.Fatalf("reset.sh did not finish: %v\n--- stderr ---\n%s", run.err, run.stderr)
@@ -256,13 +269,91 @@ func TestResetFallsToTheFloorWhenTheModelBackendIsNotDeployed(t *testing.T) {
 	}
 }
 
+// TestResetRegistersTheScriptedBackend judges the default local round: the
+// scripted backend is the source, so the agent's model names its served id in
+// full and the registration the Job pods read is written through the same
+// installer a deployment-supplied endpoint uses — Secret plus one carrier per
+// node. It is neither the ollama path (no OLLAMA_BASE_URL) nor the floor
+// (which clears the model).
+func TestResetRegistersTheScriptedBackend(t *testing.T) {
+	run := runReset(t, resetOptions{scriptedID: "fixture:deterministic"})
+	if run.err != nil {
+		t.Fatalf("reset.sh did not finish: %v\n--- stderr ---\n%s", run.err, run.stderr)
+	}
+	wantInfo := "test-multica: agent foreman-test-agent → scripted/fixture:deterministic (http://test-multica-scripted.multica-test.svc:8080/v1)"
+	if !strings.Contains(run.stderr, wantInfo) {
+		t.Errorf("reset.sh does not report %q\n--- stderr ---\n%s", wantInfo, run.stderr)
+	}
+
+	modelWrites := run.requests("PUT", "/api/agents/"+resetAgentID)
+	if len(modelWrites) != 1 {
+		t.Fatalf("reset.sh sent %d model writes, want 1", len(modelWrites))
+	}
+	var model struct {
+		Model string `json:"model"`
+	}
+	decodeResetBody(t, modelWrites[0], &model)
+	if model.Model != "scripted/fixture:deterministic" {
+		t.Errorf("the model write carries %q, want the scripted selector", model.Model)
+	}
+
+	envWrites := run.requests("PUT", "/api/agents/"+resetAgentID+"/env")
+	if len(envWrites) != 1 {
+		t.Fatalf("reset.sh sent %d env writes, want 1", len(envWrites))
+	}
+	var env struct {
+		CustomEnv map[string]string `json:"custom_env"`
+	}
+	decodeResetBody(t, envWrites[0], &env)
+	if !maps.Equal(env.CustomEnv, map[string]string{}) {
+		t.Errorf("custom_env = %v, want empty — the scripted endpoint carries its own base URL in the registration", env.CustomEnv)
+	}
+
+	for _, want := range []string{
+		"create secret generic " + "test-multica-model-provider",
+		"apply -f",
+	} {
+		if !strings.Contains(run.kubectl, want) {
+			t.Errorf("the scripted round never ran %q — the Job pods would carry no provider registration:\n%s", want, run.kubectl)
+		}
+	}
+}
+
+// TestResetFailsWhenTheScriptedBackendReadFails is the same fail-closed rule on
+// the default source: a read failure that is not NotFound must not fall to the
+// floor, which would clear a working agent's model behind a green gate.
+func TestResetFailsWhenTheScriptedBackendReadFails(t *testing.T) {
+	run := runReset(t, resetOptions{
+		scriptedReadError: `Error from server (Forbidden): deployments.apps "test-multica-scripted" is forbidden`,
+	})
+	if run.err == nil {
+		t.Fatalf("reset.sh finished with status 0 after the scripted backend read failed\n--- stderr ---\n%s", run.stderr)
+	}
+	if want := "cannot read Deployment multica-test/test-multica-scripted"; !strings.Contains(run.stderr, want) {
+		t.Errorf("reset.sh does not report the failed read (%q)\n--- stderr ---\n%s", want, run.stderr)
+	}
+	for _, path := range []string{"/api/agents/" + resetAgentID, "/api/agents/" + resetAgentID + "/env"} {
+		if writes := run.requests("PUT", path); len(writes) != 0 {
+			t.Errorf("reset.sh sent %d PUT %s after the read failed — a failed read must not be written as an empty model", len(writes), path)
+		}
+	}
+}
+
 // resetOptions are the cluster answers the stubs give reset.sh.
 type resetOptions struct {
-	// served is the model the stubbed model backend reports.
+	// source is the round's local model source: empty means the lib default
+	// (scripted), `ollama` selects the keyless engine.
+	source string
+	// served is the model the stubbed ollama backend reports.
 	served string
-	// modelReadError, when set, makes every read of the model backend fail
+	// modelReadError, when set, makes every read of the ollama backend fail
 	// with this message instead of answering.
 	modelReadError string
+	// scriptedID is the model id the stubbed scripted Deployment reports.
+	scriptedID string
+	// scriptedReadError, when set, makes every read of the scripted
+	// Deployment fail with this message instead of answering.
+	scriptedReadError string
 	// agents, when set, is the agent list GET /api/agents answers; empty means
 	// the test agent alone, which is the state a first round sees.
 	agents string
@@ -275,9 +366,10 @@ type resetCall struct {
 
 // resetRun is one reset.sh invocation against the stubs.
 type resetRun struct {
-	calls  []resetCall
-	stderr string
-	err    error
+	calls   []resetCall
+	kubectl string
+	stderr  string
+	err     error
 }
 
 // requests is every recorded call with the given method and path.
@@ -343,6 +435,10 @@ func runReset(t *testing.T, opts resetOptions) resetRun {
 	if agents == "" {
 		agents = `[{"id":"` + resetAgentID + `","name":"` + resetAgentName + `","archived_at":null}]`
 	}
+	source := opts.source
+	if source == "" {
+		source = "scripted"
+	}
 	agentsPath := filepath.Join(dir, "agents.json")
 	if err := os.WriteFile(agentsPath, []byte(agents), 0o644); err != nil {
 		t.Fatalf("seed the agent list: %v", err)
@@ -357,32 +453,39 @@ func runReset(t *testing.T, opts resetOptions) resetRun {
 			"TMPDIR": dir,
 		},
 		map[string]string{
-			"STUB_CALLS":            callsPath,
-			"STUB_KUBECTL_CALLS":    filepath.Join(dir, "kubectl.calls"),
-			"STUB_STATE":            stateDir,
-			"STUB_MODEL":            opts.served,
-			"STUB_MODEL_READ_ERROR": opts.modelReadError,
-			"STUB_AGENT_ID":         resetAgentID,
-			"STUB_AGENT_NAME":       resetAgentName,
-			"STUB_AGENTS":           agentsPath,
-			"STUB_WORKSPACE_ID":     resetWorkspaceID,
-			"STUB_REPO_URL":         resetRepoURL,
-			"STUB_CHAT_TITLE":       resetChatTitle,
+			"STUB_CALLS":               callsPath,
+			"STUB_KUBECTL_CALLS":       filepath.Join(dir, "kubectl.calls"),
+			"STUB_STATE":               stateDir,
+			"STUB_MODEL":               opts.served,
+			"STUB_MODEL_READ_ERROR":    opts.modelReadError,
+			"STUB_SCRIPTED_ID":         opts.scriptedID,
+			"STUB_SCRIPTED_READ_ERROR": opts.scriptedReadError,
+			"STUB_AGENT_ID":            resetAgentID,
+			"STUB_AGENT_NAME":          resetAgentName,
+			"STUB_AGENTS":              agentsPath,
+			"STUB_WORKSPACE_ID":        resetWorkspaceID,
+			"STUB_REPO_URL":            resetRepoURL,
+			"STUB_CHAT_TITLE":          resetChatTitle,
 			// The scripts' own defaults are restated so an exported
 			// TEST_MULTICA_* on the host cannot decide what this test reads.
-			"TEST_MULTICA_PROFILE":      "test-multica",
-			"TEST_MULTICA_SERVER_URL":   resetServerURL,
-			"TEST_MULTICA_NS":           resetNamespace,
-			"TEST_MULTICA_MODEL_DEPLOY": resetModelDeploy,
-			"TEST_MULTICA_INSTANCE_NS":  "foreman",
-			"TEST_MULTICA_INSTANCE":     "foreman",
-			"TEST_MULTICA_AGENT":        resetAgentName,
-			"TEST_MULTICA_CHAT":         resetChatTitle,
-			"TEST_MULTICA_REPO":         resetRepoURL,
-			"TEST_MULTICA_ENTRY_URL":    "http://entry.test.local:30300",
-			// No endpoint triple: the local backend is the source this test
-			// judges. Blanks, not absences, so an exported TEST_MULTICA_* on
-			// the host cannot switch reset.sh to the endpoint branch.
+			"TEST_MULTICA_PROFILE":         "test-multica",
+			"TEST_MULTICA_SERVER_URL":      resetServerURL,
+			"TEST_MULTICA_NS":              resetNamespace,
+			"TEST_MULTICA_MODEL_DEPLOY":    resetModelDeploy,
+			"TEST_MULTICA_INSTANCE_NS":     "foreman",
+			"TEST_MULTICA_INSTANCE":        "foreman",
+			"TEST_MULTICA_AGENT":           resetAgentName,
+			"TEST_MULTICA_CHAT":            resetChatTitle,
+			"TEST_MULTICA_REPO":            resetRepoURL,
+			"TEST_MULTICA_ENTRY_URL":       "http://entry.test.local:30300",
+			"TEST_MULTICA_SCRIPTED_DEPLOY": "test-multica-scripted",
+			// The local source is a setting too; empty means the default. An
+			// exported override on the host must not decide which source the
+			// test judges.
+			"TEST_MULTICA_MODEL_LOCAL_SOURCE": source,
+			// No endpoint triple: the local source is what this test judges.
+			// Blanks, not absences, so an exported TEST_MULTICA_* on the host
+			// cannot switch reset.sh to the endpoint branch.
 			"TEST_MULTICA_MODEL_BASE_URL":     "",
 			"TEST_MULTICA_MODEL_ID":           "",
 			"TEST_MULTICA_MODEL_API_KEY":      "",
@@ -397,6 +500,9 @@ func runReset(t *testing.T, opts resetOptions) resetRun {
 	run := resetRun{err: cmd.Run()}
 	run.stderr = stderr.String()
 	run.calls = parseResetCalls(t, callsPath)
+	if body, err := os.ReadFile(filepath.Join(dir, "kubectl.calls")); err == nil {
+		run.kubectl = string(body)
+	}
 	return run
 }
 

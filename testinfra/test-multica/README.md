@@ -15,13 +15,15 @@ itself, one face per consumer (see §Addresses).
 | File | Purpose |
 |---|---|
 | `deploy.yaml` | The multica deployment: namespace, backend config, frontend entry config, PVCs, postgres/backend/web/proxy Deployments, Services |
-| `model-backend.yaml` | The keyless local model backend (ollama PVC, Service, Deployment) — applied by `deploy.sh` only when no endpoint triple is set |
+| `model-backend.yaml` | The keyless ollama backend (PVC, Service, Deployment) — one of the two local model sources, applied by `deploy.sh` only when it is the selected one |
+| `scripted-backend.yaml` | The scripted fixture backend (ConfigMap, Service, Deployment) — the default local model source; `deploy.sh` injects `scripted-agent.py` into it |
+| `scripted-agent.py` | The scripted backend's server: a chat-completions endpoint that declares the task's window (one warmup call, then `sleep` holds) and never runs anything itself (§ Scripted agent backend) |
 | `deploy.sh` | Deployment entry: picks the model source, renders the entry origin, creates the Secret, applies, waits for the rollout |
-| `reset.sh` | Reset entry: stops the instance under test, wipes runtime/task rows, rebuilds the test objects, binds the test agent's model source (endpoint triple when supplied, else the local backend), runs the environment gate |
+| `reset.sh` | Reset entry: stops the instance under test, wipes runtime/task rows, rebuilds the test objects, binds the test agent's model source (endpoint triple when supplied, else the selected local source), runs the environment gate |
 | `wire.sh` | Wiring entry: points the instance under test at the access point and starts it |
 | `bind-agent.sh` | Binds the test agent to the runtime the instance registers (the step between "the instance is up" and "tasks can be dispatched") |
 | `recycle.sh` | Recycle entry: deletes the namespace, nothing else |
-| `selfcheck.sh` | The environment gate ①②③④ — `reset.sh` and `wire.sh` run it at the pre-start moment |
+| `selfcheck.sh` | The environment gate ①②③④⑤ — `reset.sh` and `wire.sh` run it at the pre-start moment |
 | `multica-test` | CLI wrapper — the profile, with the platform's task environment cleared |
 | `lib.sh` | Shared settings and helpers for the scripts, including the model-source precedence and the endpoint registration |
 
@@ -76,10 +78,23 @@ Absolute, not drifting: the manifests pin every image to the `v0.6.1` release
 `nginx:1.27-alpine` as the persistence and entry layers), and
 `model-backend.yaml` pins the local backend the same way
 (`ollama/ollama:0.40.11`); that backend's model tag is the only value that may
-follow the operator's `TEST_MULTICA_MODEL`. The Job image is not
+follow the operator's `TEST_MULTICA_MODEL`. The scripted backend is pinned too
+(`scripted-backend.yaml`: `python:3.12.9-alpine3.20`) — a floating base would let
+a node run a different server than the round was verified against. The Job image is not
 part of this pin: `build-foreman-job.yml` resolves upstream's newest release at
 build time and tags the image with that daemon version (`latest` follows the
 newest release), so the CLI a Job runs can be newer than the `v0.6.1` server.
+
+The Job image carries a **floor**, though, and it is not optional: the daemon
+starts `omp` with `--session <path>` up to multica v0.6.1 and with
+`--session-dir <dir>` from v0.6.2 on. `omp`'s `--session` is an alias of
+`--resume` — strictly a resume — so an older daemon resumes the empty session
+file it just created, the agent exits before its first turn, and every task
+lands as `agent_error.process_failure` with no tool call. Deploy the image
+built for the newest upstream release (`ghcr.io/tsic404/foreman-job:<daemon
+version>`, e.g. `0.8.0`); `./selfcheck.sh` gate ⑤ refuses anything below
+`0.6.2` with that root cause instead of letting the next round discover it as a
+dead task.
 
 Upgrading means rebuilding the environment against a new anchor
 (`./recycle.sh && ./deploy.sh`), never an in-place upgrade. The environment
@@ -115,19 +130,21 @@ agent to the `provider=omp` runtime it registers. The full round is:
 
 ```
 ./deploy.sh                    # the test cluster itself
-./reset.sh                     # stop, wipe, rebuild objects, gate ①②③④
+./reset.sh                     # stop, wipe, rebuild objects, gate ①②③④⑤
 ./wire.sh                      # MULTICA_SERVER_URL → the access point, start
 ./bind-agent.sh                # agent ← the omp runtime the instance registered
 <TC-tech cases>
 ```
 
 `reset.sh` and `wire.sh` both run `./selfcheck.sh` — the environment gate
-①②③④ — while the instance is stopped: ① it points at the access point (never
+①②③④⑤ — while the instance is stopped: ① it points at the access point (never
 the production address), ② the runtime list is empty, ③ the server reports the
 artifact anchor, ④ the selected model source serves the round (the supplied
-endpoint, or the local backend and the model it serves). Any failure is
-`QA_BLOCKED` (exit 2); once the instance runs, ②'s assertion becomes "exactly
-one `provider=omp` runtime", which TC-tech-protocol-01 judges.
+endpoint, or the local backend and the model it serves), ⑤ the Job image's
+daemon can start `omp` (see §Version anchor — the gate runs the image's own
+`multica version`, because a tag is not evidence). Any failure is `QA_BLOCKED`
+(exit 2); once the instance runs, ②'s assertion becomes "exactly one
+`provider=omp` runtime", which TC-tech-protocol-01 judges.
 
 On a fresh environment the first `reset.sh` stops at ① — the Deployment still
 carries the production address from `deploy/` — and `./wire.sh` is what fixes
@@ -145,19 +162,24 @@ assignee has no runtime.
 
 The test agent's model configuration is reconciled on every reset, not only on
 creation, through one explicit precedence: the deployment-supplied endpoint
-(§ Model endpoint) wins; without it the deployed local backend is the source —
-`model` is set to `ollama/<id>:<tag>` (the served tag in full) and `custom_env`
-carries that backend's in-cluster base URL as `OLLAMA_BASE_URL`; with neither,
-`model` is cleared and `custom_env` emptied. Both fields travel in the claim
-payload's agent section — the Job daemon passes `model` to the runtime and
-layers `custom_env` onto the agent process — so a task can actually reach the
-model. A selector always names the full served tag: omp resolves a provided
-selector against the catalog it reports at startup, the catalog lists served
-tags (`<id>:<tag>`), and a family form without `:tag` matches no row there, so
-omp refuses it before the task starts (`Model "ollama/<family>" not found`).
-The backend prunes other tags of the family, so the one served tag is the one
-the selector names. Reconciling rather than create-only is what repairs an
-agent left model-less by an earlier environment.
+(§ Model endpoint) wins; without it the selected local source serves the round
+(§ Scripted agent backend) — `model` is set to its served selector and the
+registration the Job pods read is written through the same installer an
+endpoint uses. For the scripted source that is `scripted/<id>` with an empty
+`custom_env`; for the ollama source it is `ollama/<id>:<tag>` — the served tag
+in full — with `custom_env.OLLAMA_BASE_URL` set to the engine's in-cluster
+address. With neither, `model` is cleared and `custom_env` emptied. Both
+fields travel in the claim payload's agent section — the Job daemon passes
+`model` to the runtime and layers `custom_env` onto the agent process — so a
+task can actually reach the model. A selector always names the full served
+tag: omp resolves a provided selector against the catalog it reports at
+startup, the catalog lists served tags (the scripted server reports the id it
+was rendered with; the ollama engine lists `<id>:<tag>`), and a family form
+without `:tag` matches no row there, so omp refuses it before the task starts
+(`Model "ollama/<family>" not found`). The ollama backend prunes other tags of
+the family, so the one served tag is the one the selector names. Reconciling
+rather than create-only is what repairs an agent left model-less by an earlier
+environment.
 
 The wipe is SQL inside the persistence pod (`kubectl exec deploy/postgres`) —
 the server has no API for deleting task history, and a runtime delete detaches
@@ -170,12 +192,13 @@ tasks instead of removing them.
 | Workspace + loginable account | `foreman-test` (`Foreman Test`), `acceptance@test.local` | task cancellation, board, chat entry |
 | Test agent | `foreman-test-agent` | dispatch (its runtime is the one Foreman registers) |
 | Failure agent | `foreman-test-agent-failing` | the failed terminal class: same runtime, deliberately no model source, so every task it runs ends failed |
-| Model backend (local mode only) | PVC `ollama-models`, Deployment/Service `test-multica-ollama`, model `qwen2.5:0.5b` (overridable) | the test agent's inference, token usage — absent when the endpoint triple is set |
+| Scripted backend (the default local source) | ConfigMap `test-multica-scripted-server`, Service/Deployment `test-multica-scripted`, model `fixture:deterministic` (overridable) | deterministic task windows: the fixture declares one warmup call and then `sleep` holds, and the Job's `omp` executes them |
+| Ollama backend (the other local source) | PVC `ollama-models`, Deployment/Service `test-multica-ollama`, model `qwen2.5:0.5b` (overridable) | real model output and token usage for a round that selects it |
 | Repository | `https://github.com/tsic404/foreman` | agent checkout, cache cases |
 | Autopilot (manual trigger) | `foreman-test-autopilot` (short), `foreman-test-autopilot-long` (long) | `./multica-test autopilot trigger <id>` |
 | Chat entry | chat session `foreman-test-chat` | messages to the agent |
 | Task status query surface | `./multica-test runtime list` / board at the entry origin | runtime, task and cancellation state |
-| Model provider registration | `foreman-test/<model id>` in `${FOREMAN_STATE_ROOT}/home/<workspace>/.omp/agent/models.yml`; Secret `test-multica-model-provider` | the test agent's model (only when the endpoint is supplied) |
+| Model provider registration | `<provider>/<model id>` in `${FOREMAN_STATE_ROOT}/home/<workspace>/.omp/agent/models.yml`; Secret `test-multica-model-provider` | the test agent's model: the endpoint triple when supplied, else the selected local source (scripted by default) |
 
 The repository is the implementation repo, which the acceptance side can write
 to with its own git credentials. The autopilot is created by `bind-agent.sh`
@@ -218,7 +241,25 @@ is the run prompt:
 | Shape | Autopilot | Prompt |
 |---|---|---|
 | short | `foreman-test-autopilot` | one `multica issue list` call, then `OK` |
-| long | `foreman-test-autopilot-long` | `sleep ${TEST_MULTICA_LONG_TASK_SLEEP:-900}`, then `DONE` |
+| long | `foreman-test-autopilot-long` | the fixture's declared window, then `DONE` |
+
+Both shapes are executed by the scripted backend (§ Scripted agent backend),
+which ignores the prompt text: turn 0 is one `multica issue list` call (the
+fixture's `SCRIPTED_WARMUP_COMMAND`), turns 1 through `SCRIPTED_HOLD_TURNS` are
+`sleep SCRIPTED_SLEEP`, and turn `SCRIPTED_HOLD_TURNS+1` is the final `DONE` —
+the warmup never consumes a hold turn, so `HOLD_TURNS=1` still holds for one
+full `SCRIPTED_SLEEP`. The task's own API call
+is deliberately kept — it is the only observable face of G2's passthrough
+counter; without it the counter would never move. The window's length is
+therefore `SCRIPTED_SLEEP × SCRIPTED_HOLD_TURNS`, not the prompt's `sleep`: a
+round that needs a longer in-flight task (recovery) raises
+`TEST_MULTICA_SCRIPTED_SLEEP` / `TEST_MULTICA_SCRIPTED_HOLD_TURNS`. With the
+ollama source selected, the short shape completes and the long shape cannot
+hold a window (the model does not call tools); the carriers that need one
+report their own blocked precondition rather than silently passing. The recovery
+case's 900s window is therefore set with
+`TEST_MULTICA_SCRIPTED_SLEEP=900 TEST_MULTICA_SCRIPTED_HOLD_TURNS=1`, not with
+the prompt text: the prompt no longer decides anything a task does.
 
 ```bash
 ./multica-test autopilot list --output json       # the two autopilot ids and titles
@@ -292,18 +333,18 @@ pod can only finish a task when it has a model endpoint. The endpoint is a
 deployment parameter of this environment, never a manual UI step: every round
 rebuilds the test-multica namespace, so anything configured by hand would be
 gone by the next one. Supplying the triple takes precedence; with no triple the
-keyless local backend `model-backend.yaml` declares is the model source (Reset
-semantics above).
+selected local source serves the round (§ Scripted agent backend).
 
-The two sources are alternatives for the whole round, so exactly one of them is
-a prerequisite — never both:
+Three sources exist and exactly one of them is a prerequisite of a round —
+never two: the deployment-supplied endpoint, the scripted fixture backend (the
+default local source), or the ollama engine:
 
-| | Endpoint triple set | Endpoint triple unset |
-|---|---|---|
-| Objects `./deploy.sh` applies | `deploy.yaml` only | `deploy.yaml` and `model-backend.yaml` |
-| Local model backend (PVC/Service/Deployment `ollama-models` / `test-multica-ollama`) | absent — not rendered, not applied, not waited for | present; its rollout is the slow one (model pull) |
-| Objects `./reset.sh` writes | provider registration (Secret + node-local file), agent `model` = `<provider>/<model id>` | no registration; agent `model` = `ollama/<id>:<tag>`, `custom_env.OLLAMA_BASE_URL` = the in-cluster address |
-| Gate ④ (`./selfcheck.sh`) | asserts the endpoint is the selected source | asserts the local backend serves the model |
+| | Endpoint triple set | No triple, scripted (default) | No triple, ollama |
+|---|---|---|---|
+| Objects `./deploy.sh` applies | `deploy.yaml` only | `deploy.yaml` and `scripted-backend.yaml` | `deploy.yaml` and `model-backend.yaml` |
+| Backend object | absent — not rendered, not applied, not waited for | ConfigMap/Service/Deployment `test-multica-scripted` | PVC/Service/Deployment `ollama-models` / `test-multica-ollama`; its rollout is the slow one (model pull) |
+| Objects `./reset.sh` writes | provider registration (Secret + node-local file), agent `model` = `<provider>/<model id>` | the same registration for `scripted/<id>`, agent `custom_env` empty | no registration (omp's built-in provider); agent `model` = `ollama/<id>:<tag>`, `custom_env.OLLAMA_BASE_URL` = the in-cluster address |
+| Gate ④ (`./selfcheck.sh`) | asserts the endpoint is the selected source | asserts the scripted server reports the declared id | asserts the engine serves the model |
 
 A half-set triple is refused by every entry (`./deploy.sh` included) with the
 missing variable named: deploying would otherwise install a model source nobody
@@ -375,6 +416,56 @@ A stub endpoint — one that accepts a connection and never answers — only
 lengthens the agent's life (the long-window cases); it produces no completion
 terminal, so it is a diagnostic, never a default and never an acceptance
 substitute.
+
+### Scripted agent backend
+
+The window cases need a task that stays in flight while Foreman holds it: a
+claim to cancel, a run to read the in-flight gauge from, an agent to carry
+across a fault window, two tasks running at once. The fixture states the window
+itself — `SCRIPTED_HOLD_TURNS` turns of `sleep SCRIPTED_SLEEP` — because the
+daemon's first turn hands the agent a runtime brief rather than the issue body,
+so a prompt-stated command is not something the model can rely on reading. A
+model produces that process only when it emits the command as a tool call; a
+model that answers in prose settles the task in seconds, and every carrier that
+requires a live task then blocks on its own precondition.
+
+`scripted-agent.py` is that model: a small chat-completions endpoint served in
+the cluster by `scripted-backend.yaml` (Service/Deployment
+`test-multica-scripted`; `./deploy.sh` injects the file into the ConfigMap). Its
+decision is a function of the request only: the first turn answers with a
+`bash` tool call carrying `SCRIPTED_WARMUP_COMMAND` (one Multica API call — the
+G2 passthrough counter's only observable face), the turns up to
+`SCRIPTED_HOLD_TURNS` carry `sleep SCRIPTED_SLEEP`, and the turn after the hold
+is answered with the final text. Nothing is stored, so a retried request
+decides the same way, and the prompt text the daemon sends is never parsed.
+
+It is a served endpoint, not a substitute for the job-side half of a carrier:
+the Job's real daemon and real `omp` resolve it through the same provider
+registration a deployment-supplied endpoint uses, execute the command inside
+the Job pod, and the cluster facts — claim, Job, pod, lifecycle projection —
+stay what they are. The command runs in the Job pod, this server never runs it,
+and the token usage it reports is what the round's usage metric counts.
+
+| `TEST_MULTICA_MODEL_LOCAL_SOURCE` | Backend | Selector |
+|---|---|---|
+| `scripted` (default) | `test-multica-scripted` | `scripted/<id>` (`fixture:deterministic`) |
+| `ollama` | `test-multica-ollama` | `ollama/<id>:<tag>` |
+
+| Variable | Meaning |
+|---|---|
+| `TEST_MULTICA_MODEL_LOCAL_SOURCE` | Optional local source: `scripted` (default) or `ollama` |
+| `TEST_MULTICA_SCRIPTED_DEPLOY` | Optional Deployment/Service name (default `test-multica-scripted`) |
+| `TEST_MULTICA_SCRIPTED_MODEL` | Optional model id the server reports (default `fixture:deterministic`); rendered into the manifest and read back from the applied Deployment |
+| `TEST_MULTICA_SCRIPTED_SLEEP` | Optional seconds per hold turn (default `60`), rendered into the applied Deployment |
+| `TEST_MULTICA_SCRIPTED_HOLD_TURNS` | Optional hold turns per task (default `3`); the task settles on the turn after the last one |
+| `TEST_MULTICA_SCRIPTED_WARMUP` | Optional first-turn command (default `multica issue list --output json`) — the task's own API call, which is what moves G2's passthrough counter |
+| `TEST_MULTICA_SCRIPTED_PROVIDER` | Optional provider id (default `scripted`) |
+| `TEST_MULTICA_SCRIPTED_API` | Optional wire dialect (default `openai-completions`) |
+| `TEST_MULTICA_SCRIPTED_WAIT` | Optional rollout budget (default 180s) |
+
+A round that wants genuine model output selects the ollama source; its small
+model answers in prose, so the short shape completes and the long shape cannot
+hold a window — that is a property of the model, not of the fixture.
 
 ## CLI profile (查询面凭据)
 
