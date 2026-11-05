@@ -110,6 +110,7 @@ func TestOwnership01DomainClearedAndRewritten(t *testing.T) {
 	wantAnnotations := map[string]string{
 		registry.AnnoDaemonID:        "fm-task-1",
 		registry.AnnoJobRuntimeID:    entry.JobRuntimeID,
+		registry.AnnoRealRuntimeID:   "rid-omp",
 		registry.AnnoIssueID:         "issue-1",
 		registry.AnnoIssueIdentifier: "TSI-1",
 		"example.com/note":           "keep-me",

@@ -106,9 +106,9 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 			continue
 		}
 		if e.RealRuntimeID == "" {
-			// No dispatch record (rebuilt entry): the startup convergence
-			// owns it, and a lease against the wrong runtime would read as a
-			// vanished task.
+			// No dispatch record (a Job rendered before the record was
+			// annotated): the startup convergence owns it, and a lease against
+			// a guessed runtime would read as a vanished task.
 			continue
 		}
 		ready, err := k.client.PrepareLease(ctx, e.RealRuntimeID, e.TaskID)

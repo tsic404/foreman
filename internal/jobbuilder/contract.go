@@ -29,6 +29,15 @@ const (
 	annoJobRuntimeID    = "foreman.tsic.top/job-runtime-id"
 	annoClaimedAt       = "foreman.tsic.top/claimed-at"
 	annoAttempt         = "foreman.tsic.top/attempt"
+	// annoRealRuntimeID / annoRuntimeProvider / annoRuntimeProfileID are the
+	// claim's dispatch record (§4.3): the real runtime it was leased under and
+	// the declared identity S-4 matches against. They make a K8s rebuild
+	// faithful, which is the only path left when the shared-state row is gone.
+	// The identity travels as its two components because the identity key
+	// itself is a NUL-joined pair — not an annotation value.
+	annoRealRuntimeID    = "foreman.tsic.top/real-runtime-id"
+	annoRuntimeProvider  = "foreman.tsic.top/runtime-provider"
+	annoRuntimeProfileID = "foreman.tsic.top/runtime-profile-id"
 )
 
 // Names the writers of both render paths share: the Foreman-owned domain, the
@@ -74,10 +83,13 @@ func (b *Builder) identityAnnotations(daemonID string, e TaskEntry) map[string]s
 		annoAttempt:      strconv.Itoa(e.Attempt),
 	}
 	for key, value := range map[string]string{
-		annoIssueID:         e.IssueID,
-		annoIssueIdentifier: e.IssueIdentifier,
-		annoAutopilotRunID:  e.AutopilotRunID,
-		annoChatSessionID:   e.ChatSessionID,
+		annoIssueID:          e.IssueID,
+		annoIssueIdentifier:  e.IssueIdentifier,
+		annoAutopilotRunID:   e.AutopilotRunID,
+		annoChatSessionID:    e.ChatSessionID,
+		annoRealRuntimeID:    e.RealRuntimeID,
+		annoRuntimeProvider:  e.RuntimeProvider,
+		annoRuntimeProfileID: e.RuntimeProfileID,
 	} {
 		if value != "" {
 			annotations[key] = value

@@ -2361,6 +2361,7 @@ type recordingMetrics struct {
 	deliveryLatencies []float64
 	unconfirmed       int
 	authReasons       []string
+	s4Refusals        []string
 	duplicates        int
 	skillResults      []string
 	skillEvicts       []string
@@ -2462,6 +2463,27 @@ func (m *recordingMetrics) AuthFailure(reason string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.authReasons = append(m.authReasons, reason)
+}
+
+// S4Refusal records one S-4 registration refusal by stage
+// (foreman_s4_refusals_total{stage}).
+func (m *recordingMetrics) S4Refusal(stage string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.s4Refusals = append(m.s4Refusals, stage)
+}
+
+// s4RefusalCount is the number of refusals counted under one stage.
+func (m *recordingMetrics) s4RefusalCount(stage string) int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	n := 0
+	for _, got := range m.s4Refusals {
+		if got == stage {
+			n++
+		}
+	}
+	return n
 }
 
 // The scheduler's own seam. Recording is passive: the scheduler must never

@@ -159,19 +159,24 @@ func TestTechRuntimeProfile01DeclarationAndThreeStateReplay(t *testing.T) {
 	}
 
 	// Declared but absent in the Job: zero hit refuses registration (409) and
-	// settles the entry; it must never fall back to the same type's builtin.
+	// never falls back to the same type's builtin. The declaration still names
+	// the provider, so the refusal is retryable — a probe killed for that one
+	// profile is indistinguishable from a missing one — and the entry waits for
+	// the next round or the boot bound instead of being settled.
 	refusedTok := claim("task-3", "rid-prof-a")
 	code, body = registerJobDaemon(t, h, "task-3", refusedTok,
 		`[{"name":"foreman-omp","type":"omp"}]`)
 	if code != 409 {
 		t.Fatalf("zero-hit S-4 = %d: %s, want 409", code, body)
 	}
-	// The refusal still settles the entry; the daemon's answer comes first and
-	// the settlement runs behind it, so the convergence is awaited.
-	waitFor(t, "the refused task to settle", 5*time.Second, func() bool {
-		entry, ok := h.reg.Get("task-3")
-		return ok && entry.IsTerminal()
-	})
+	assertNoSettlement(t, h, "task-3")
+	entry, ok := h.reg.Get("task-3")
+	if !ok || entry.State != registry.StateJobCreated {
+		t.Fatalf("entry = %+v, %v; want the untouched job_created entry", entry, ok)
+	}
+	if _, ok := h.reg.RuntimeByDaemon("fm-task-3"); ok {
+		t.Error("a refused registration must not fall back to the same type's builtin row")
+	}
 }
 
 func TestTechRuntimeProfile01RefreshSequence(t *testing.T) {

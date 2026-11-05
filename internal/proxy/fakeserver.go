@@ -359,17 +359,6 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 	writeRaw(w, code, raw)
 }
 
-// flushResponse pushes the bytes written so far to the client. It is for
-// answers that must not carry the cost of work the handler starts before it
-// returns: without the flush the response only leaves with the handler's
-// return, and a close handshake or settlement behind it would be charged to
-// the caller.
-func flushResponse(w http.ResponseWriter) {
-	if f, ok := w.(http.Flusher); ok {
-		f.Flush()
-	}
-}
-
 // entryFor re-reads the token's mapping entry; it may have been deleted
 // between Verify and here (terminal cleanup).
 func (s *FakeServer) entryFor(w http.ResponseWriter, claims auth.Claims) (registry.TaskEntry, bool) {

@@ -34,8 +34,18 @@ type TaskEntry struct {
 	ChatSessionID   string
 	WorkspaceID     string
 	JobRuntimeID    string
-	ClaimedAt       time.Time
-	Attempt         int
+	// RealRuntimeID, RuntimeProvider and RuntimeProfileID are the dispatch
+	// record of the claim: the real runtime it was leased under and the
+	// declared identity S-4 answers for. They are annotated so a K8s rebuild
+	// restores them (§4.3) — a rebuilt entry without them can never answer
+	// its daemon's re-registration. An empty provider is a claim whose
+	// identity the process never learned; the annotations are then absent,
+	// not empty.
+	RealRuntimeID    string
+	RuntimeProvider  string
+	RuntimeProfileID string
+	ClaimedAt        time.Time
+	Attempt          int
 	// PriorSessionID is the claim payload's session-resume path; its session
 	// key is the only soft-affinity key (ADR-015).
 	PriorSessionID string

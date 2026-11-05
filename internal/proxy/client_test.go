@@ -1381,6 +1381,7 @@ type fakeMetrics struct {
 	codes              []int
 	claimErrors        []string
 	authFails          []string
+	s4Refusals         []string
 	wsConnected        map[string]int
 	wsReconnect        []string
 	catalogCodes       []string
@@ -1412,6 +1413,12 @@ func (m *fakeMetrics) AuthFailure(reason string) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.authFails = append(m.authFails, reason)
+}
+
+func (m *fakeMetrics) S4Refusal(stage string) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.s4Refusals = append(m.s4Refusals, stage)
 }
 
 func (m *fakeMetrics) WSConnect(side string) {

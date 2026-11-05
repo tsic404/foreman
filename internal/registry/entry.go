@@ -169,10 +169,10 @@ type TaskEntry struct {
 
 	// RealRuntimeID is the real runtime the claim was dispatched under: the
 	// C4 lease, the C19 resolve and the S8 body translation are all addressed
-	// by it when Foreman declares N runtimes. Persisted only in the shared
-	// state snapshot (ADR-046 阶段一), so a restored entry keeps addressing
-	// those calls; absent on a K8s-rebuilt entry, whose Job is already past its
-	// start.
+	// by it when Foreman declares N runtimes. Persisted in the shared state
+	// snapshot (ADR-046 阶段一) and annotated on the Job (§4.3), so both a
+	// restored and a K8s-rebuilt entry keep addressing those calls; only a Job
+	// rendered before that annotation carries no record.
 	RealRuntimeID string `json:"-"`
 
 	// RuntimeIdentity is the declared identity the claim was dispatched under
@@ -180,9 +180,10 @@ type TaskEntry struct {
 	// resolved once at claim time and never re-resolved: a rebuild moves the
 	// server-side row id, never the identity. S-4 matches the Job's reported
 	// runtimes against it (§2.3), so an empty value means the identity is
-	// unknown — a rebuilt entry, whose Job carries no dispatch record — and no
-	// entry of the declaration may answer for it. Persisted only in the shared
-	// state snapshot, like RealRuntimeID; absent on a K8s-rebuilt entry.
+	// unknown — a Job rendered before the dispatch record was annotated, or a
+	// claim whose identity never resolved — and no entry of the declaration
+	// may answer for it. Persisted in the shared state snapshot like
+	// RealRuntimeID, and restored from the Job annotations (§4.3).
 	RuntimeIdentity string `json:"-"`
 
 	// Payload: raw claim payload until MarkDelivering replaces it with the
@@ -322,6 +323,12 @@ const (
 	AnnoJobRuntimeID    = "foreman.tsic.top/job-runtime-id"
 	AnnoClaimedAt       = "foreman.tsic.top/claimed-at"
 	AnnoAttempt         = "foreman.tsic.top/attempt"
+	// AnnoRealRuntimeID / AnnoRuntimeProvider / AnnoRuntimeProfileID are the
+	// claim's dispatch record (§4.3): without them a K8s-rebuilt entry cannot
+	// match its daemon's re-registration and would refuse a healthy Job.
+	AnnoRealRuntimeID    = "foreman.tsic.top/real-runtime-id"
+	AnnoRuntimeProvider  = "foreman.tsic.top/runtime-provider"
+	AnnoRuntimeProfileID = "foreman.tsic.top/runtime-profile-id"
 )
 
 // TaskEntryFromJob rebuilds an entry from a Job's labels and annotations
@@ -355,6 +362,15 @@ func TaskEntryFromJob(job batchv1.Job) (TaskEntry, error) {
 		ChatSessionID:   annos[AnnoChatSessionID],
 		DaemonID:        annos[AnnoDaemonID],
 		JobRuntimeID:    annos[AnnoJobRuntimeID],
+		// The dispatch record is the only identity a rebuilt entry can answer
+		// S-4 with: the real runtime the claim was leased under and the
+		// declared identity it was matched by. Absent on a Job rendered
+		// before this face existed, which is exactly the "unknown identity"
+		// the registration refusal is reserved for.
+		RealRuntimeID: annos[AnnoRealRuntimeID],
+	}
+	if provider := annos[AnnoRuntimeProvider]; provider != "" {
+		e.RuntimeIdentity = RuntimeIdentityKey(provider, annos[AnnoRuntimeProfileID])
 	}
 	if e.TaskID == "" {
 		return TaskEntry{}, fmt.Errorf("job %s: missing label %s", job.GetName(), LabelTaskID)

@@ -41,6 +41,7 @@ var observability01Families = []string{
 	"foreman_forward_total",
 	"foreman_forward_latency_seconds",
 	"foreman_auth_failures_total",
+	"foreman_s4_refusals_total",
 	"foreman_token_usage_total",
 	"foreman_duplicate_dispatch_total",
 	"foreman_pending_reports",
@@ -97,6 +98,8 @@ func TestTechObservability01DesignedFamiliesAtBoot(t *testing.T) {
 		`foreman_workspace_state_refreshes_total{result="success"} 0`,
 		`foreman_workspace_state_refreshes_total{result="stale_replay"} 0`,
 		`foreman_workspace_state_refreshes_total{result="failed"} 0`,
+		`foreman_s4_refusals_total{stage="first"} 0`,
+		`foreman_s4_refusals_total{stage="re_register"} 0`,
 	} {
 		if !strings.Contains(exposition, want) {
 			t.Errorf("missing designed series %q in the boot exposition", want)

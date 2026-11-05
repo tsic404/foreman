@@ -14,14 +14,14 @@ import (
 	"testing"
 	"time"
 
-	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
 )
 
 // TestStartup03FailRegisterRefusedOnProviderMiss covers AC-38's refusal
 // branch: the daemon's registration names no runtime for the provider its
-// claim was dispatched under, so Foreman refuses the registration and settles
-// the task instead of waiting out the boot deadline.
+// claim was dispatched under, so Foreman refuses the registration. The refusal
+// alone settles nothing — the entry waits for the daemon's next round or its
+// boot bound.
 func TestStartup03FailRegisterRefusedOnProviderMiss(t *testing.T) {
 	h := newHarness(t, true)
 	h.upstream.registerIDs = map[string]string{"omp": "rid-omp", "zz": "rid-zz"}
@@ -53,26 +53,13 @@ func TestStartup03FailRegisterRefusedOnProviderMiss(t *testing.T) {
 		t.Fatalf("register with a foreign provider = %d (%s), want 409", code, body)
 	}
 
-	// The entry converges to terminal/failed without waiting out the boot
-	// deadline, and the compensation report reaches the server. The daemon's
-	// 409 is answered first and the settlement follows it, so the convergence
-	// is awaited rather than read off the response instant.
-	waitFor(t, "the refused task's compensation report", 5*time.Second, func() bool {
-		return len(h.server.forwarded(scheduler.EPFail)) == 1
-	})
-	settled, ok := h.reg.Get("task-1")
-	if !ok {
-		t.Fatal("the entry must still be visible (it drains)")
-	}
-	if settled.State != registry.StateTerminal || settled.Result != registry.ResultFailed {
-		t.Fatalf("entry state = %s/%s, want terminal/failed", settled.State, settled.Result)
-	}
-	forwarded := h.server.forwarded(scheduler.EPFail)
-	if len(forwarded) != 1 {
-		t.Fatalf("C10 reports = %d, want 1", len(forwarded))
-	}
-	if !bytes.Contains(forwarded[0].Body, []byte(scheduler.FailureReasonDaemonNotRegistered)) {
-		t.Errorf("fail body = %s, want the daemon-not-registered classification", forwarded[0].Body)
+	// A foreign provider is still a refusal, not a verdict: a killed probe
+	// leaves exactly this shape, so the entry stays live for the next round or
+	// its boot bound.
+	assertNoSettlement(t, h, "task-1")
+	live, ok := h.reg.Get("task-1")
+	if !ok || live.IsTerminal() {
+		t.Fatalf("entry = %+v, %v; want the live entry after the refusal", live, ok)
 	}
 }
 

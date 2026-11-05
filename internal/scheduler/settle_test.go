@@ -247,15 +247,15 @@ func TestDiscardTaskKeepsEntryWhenC13Fails(t *testing.T) {
 }
 
 // An outstanding carrier list is not an empty queue: no settlement may act on
-// it (§4.3). FailJob is reachable outside the recovery round (the proxy's
-// refused-registration path), so the gate must sit at the settlement entry
-// points, not only in the round.
+// it (§4.3). FailJob is reachable outside the recovery round (the compensation
+// path), so the gate must sit at the settlement entry points, not only in the
+// round.
 func TestSettlementWaitsForTheQueueRebuild(t *testing.T) {
 	f := newFixture(t)
 	f.pending.notRebuilt = true
 	f.claim(t, "task-1")
 
-	if err := f.sched.FailJob(context.Background(), "fm-task-1", FailureReasonDaemonNotRegistered); err != nil {
+	if err := f.sched.FailJob(context.Background(), "fm-task-1", FailureReasonJobBootTimeout); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	if err := f.sched.SettleTerminal(context.Background(), "task-1", "completed"); err != nil {

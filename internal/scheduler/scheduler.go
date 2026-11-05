@@ -69,11 +69,6 @@ const (
 	// task cannot run under this claim and is settled failed instead of
 	// being re-dispatched.
 	FailureReasonStaleClaim = "stale_claim"
-	// FailureReasonDaemonNotRegistered is the S-4 refusal: the Job's daemon
-	// declared no runtime for the provider its claim was dispatched under, so
-	// the task is settled instead of waiting out the boot deadline (S-4,
-	// §2.3).
-	FailureReasonDaemonNotRegistered = "daemon_not_registered"
 	// FailureReasonDeliveryUnconfirmed is the S-6 lost-response form: the
 	// delivery was committed but no start fact arrived within the delivery
 	// confirmation window, so the payload never reached the daemon
@@ -3094,23 +3089,29 @@ func (s *Scheduler) deleteObjects(ctx context.Context, e registry.TaskEntry) err
 	return errors.Join(errs...)
 }
 
-// jobbuilderEntry maps the registry entry to the builder's input view.
+// jobbuilderEntry maps the registry entry to the builder's input view. The
+// dispatch identity is split into its two declared components: the annotations
+// carry them separately (§4.3), so the builder never writes the NUL-joined key.
 func jobbuilderEntry(e registry.TaskEntry) jobbuilder.TaskEntry {
+	provider, profileID, _ := registry.SplitRuntimeIdentity(e.RuntimeIdentity)
 	return jobbuilder.TaskEntry{
-		TaskID:          e.TaskID,
-		AgentID:         e.AgentID,
-		IssueID:         e.IssueID,
-		IssueIdentifier: e.IssueIdentifier,
-		AutopilotRunID:  e.AutopilotRunID,
-		ChatSessionID:   e.ChatSessionID,
-		WorkspaceID:     e.WorkspaceID,
-		JobRuntimeID:    e.JobRuntimeID,
-		ClaimedAt:       e.ClaimedAt,
-		Attempt:         e.Attempt,
-		PriorSessionID:  e.PriorSessionID,
-		AgentName:       e.AgentName,
-		ProjectID:       e.ProjectID,
-		ProjectSource:   e.ProjectSource,
+		TaskID:           e.TaskID,
+		AgentID:          e.AgentID,
+		IssueID:          e.IssueID,
+		IssueIdentifier:  e.IssueIdentifier,
+		AutopilotRunID:   e.AutopilotRunID,
+		ChatSessionID:    e.ChatSessionID,
+		WorkspaceID:      e.WorkspaceID,
+		JobRuntimeID:     e.JobRuntimeID,
+		RealRuntimeID:    e.RealRuntimeID,
+		RuntimeProvider:  provider,
+		RuntimeProfileID: profileID,
+		ClaimedAt:        e.ClaimedAt,
+		Attempt:          e.Attempt,
+		PriorSessionID:   e.PriorSessionID,
+		AgentName:        e.AgentName,
+		ProjectID:        e.ProjectID,
+		ProjectSource:    e.ProjectSource,
 	}
 }
 

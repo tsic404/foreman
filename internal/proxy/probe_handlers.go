@@ -187,6 +187,19 @@ func selectDeclaredRuntime(runtimes []registerRuntime, identity string) (registe
 	return candidates[0], true
 }
 
+// declaredRuntimeKeys renders the registration's declared identities in
+// declaration order as "type/profile_id" (the builtin profile renders as an
+// empty suffix). It is the refusal event's declaration face (§9.1): the
+// identity alone cannot tell a degraded declaration from a lost dispatch
+// record.
+func declaredRuntimeKeys(runtimes []registerRuntime) []string {
+	keys := make([]string, 0, len(runtimes))
+	for _, rt := range runtimes {
+		keys = append(keys, rt.Type+"/"+rt.ProfileID)
+	}
+	return keys
+}
+
 // probeAnswerRuntime picks the entry S4 answers with (§2.3 探针 Job 的选条). A
 // command-driven probe serves the one real runtime it was started for: its
 // answer must name that runtime's identity, because the result is relayed to it

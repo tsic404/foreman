@@ -14,6 +14,9 @@ type Metrics interface {
 	ClaimError(code string)
 	// AuthFailure records a Job Token verification failure by reason label.
 	AuthFailure(reason string)
+	// S4Refusal records one S-4 registration refusal by stage (§9.2
+	// foreman_s4_refusals_total): one of the S4RefusalStage values.
+	S4Refusal(stage string)
 	// WSConnect/WSDisconnect track foreman_ws_connected by side
 	// ("server"=C20, "job"=S30); WSReconnect counts reconnects.
 	WSConnect(side string)
@@ -76,6 +79,16 @@ const (
 // agent-API passthrough (§9.2).
 const EndpointAgentAPI = "agent-api"
 
+// S4 refusal stage label values (§9.2 foreman_s4_refusals_total, §9.1's stage
+// rule): first = the entry has neither a registration instant nor a startup
+// fact; re_register = either one exists — a rebuilt entry adopted by the
+// disposal table has only the startup fact and still lands here. Neither stage
+// settles on the refusal itself.
+const (
+	S4RefusalFirst      = "first"
+	S4RefusalReRegister = "re_register"
+)
+
 // S6 claim result label values (§9.2 foreman_delivery_claims_total,
 // ADR-032): delivered = the payload was handed over; redelivered = the payload
 // was handed over again after the confirmation window released a delivery that
@@ -100,6 +113,7 @@ type noopMetrics struct{}
 func (noopMetrics) Forward(string, int, time.Duration) {}
 func (noopMetrics) ClaimError(string)                  {}
 func (noopMetrics) AuthFailure(string)                 {}
+func (noopMetrics) S4Refusal(string)                   {}
 func (noopMetrics) WSConnect(string)                   {}
 func (noopMetrics) WSDisconnect(string)                {}
 func (noopMetrics) WSReconnect(string)                 {}

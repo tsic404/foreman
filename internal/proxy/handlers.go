@@ -1,7 +1,6 @@
 package proxy
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"io"
@@ -204,22 +203,24 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	declared, matched := selectDeclaredRuntime(req.Runtimes, identity)
 	if !matched {
+		// The stage only labels the event: neither branch settles here.
+		stage := S4RefusalFirst
+		if !e.DaemonRegisteredAt.IsZero() || !e.StartedAt.IsZero() {
+			stage = S4RefusalReRegister
+		}
+		s.metrics.S4Refusal(stage)
 		s.log.Error("job declared no runtime for its identity; refusing registration",
-			"task_id", e.TaskID, "job_name", e.JobName, "identity", identity)
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", claims.JobName,
+			"workspace_id", e.WorkspaceID,
+			"identity", identity, "stage", stage, "entry_state", string(e.State),
+			"registered_at", registry.ProjectedTime(e.DaemonRegisteredAt),
+			"declared_runtimes", declaredRuntimeKeys(req.Runtimes))
 		writeError(w, http.StatusConflict, "runtime identity not declared by this job")
-		flushResponse(w)
-		// The 409 is the daemon's whole answer and does not depend on the
-		// settlement behind it: C13 may wait on the upstream status and the
-		// C10 report (~124s of forward budget), and a daemon that times out
-		// must not abort that round half-way — an interrupted settlement
-		// leaves the write-ahead entry behind. Detached from the request
-		// context for exactly that reason; a failed round still leaves the
-		// report in the pending queue (§10).
-		go func(ctx context.Context) {
-			if err := s.sched.FailJob(ctx, e.JobName, scheduler.FailureReasonDaemonNotRegistered); err != nil {
-				s.log.Error("settle refused registration failed", "task_id", e.TaskID, "err", err)
-			}
-		}(context.WithoutCancel(r.Context()))
+		// A refusal is never a verdict on its own (§2.3): a single round can
+		// be the daemon's version probes dying, and the same shape (other
+		// providers declared, the Job's own missing) is exactly what a killed
+		// probe produces. A Job that never registers converges at its boot
+		// bound; a registered one keeps its task.
 		return
 	}
 	name, provider := declared.Name, declared.Type
@@ -477,10 +478,10 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	if entry.RealRuntimeID == "" {
-		// A rebuilt entry has no dispatch record, so C4 cannot be addressed:
-		// the malformed path's 404 would read as a vanished task. Startup
-		// convergence owns the entry (ADR-026), and no server lease exists to
-		// restamp locally.
+		// No dispatch record (a Job rendered before the record was
+		// annotated), so C4 cannot be addressed: the malformed path's 404
+		// would read as a vanished task. Startup convergence owns the entry
+		// (ADR-026), and no server lease exists to restamp locally.
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
