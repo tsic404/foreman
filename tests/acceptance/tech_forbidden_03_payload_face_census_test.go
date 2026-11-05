@@ -337,7 +337,7 @@ var tcPayloadLogKeys = []string{
 	"reservations_cleared", "resolved_workspace_id", "resource_policy",
 	"resource_source", "result",
 	"retried", "retried_write", "retry_in", "runtime_id",
-	"runtimes", "saturated", "secret", "server_url",
+	"runtimes", "saturated", "secret", "segment", "server_url",
 	"session_exists", "side", "skill_cache", "skill_cache_max_bytes",
 	"skill_cache_ttl", "skipped", "soft_affinity_suppressed",
 	"source", "stage", "state_root", "status",

@@ -82,8 +82,9 @@ type Config struct {
 	// CacheMaxBytes caps the total size of .repos; the excess is reclaimed
 	// LRU-first (FOREMAN_CACHE_MAX_BYTES).
 	CacheMaxBytes int64
-	// Quiesce skips a round when the state root was written within it
-	// (FOREMAN_GC_QUIESCE): a round must never race a running Job.
+	// Quiesce is the quiet window a unit must sit out before it is cleaned
+	// (FOREMAN_GC_QUIESCE): a unit written within it is skipped for the round,
+	// so reclamation never races a running Job.
 	Quiesce time.Duration
 	// AgentStateTTL is the retention for node-local agent sessions and
 	// transcripts (FOREMAN_AGENT_STATE_TTL); 0 disables the rule.
