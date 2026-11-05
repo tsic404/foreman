@@ -31,6 +31,7 @@ apply)
 	case ${3##*/} in
 	deploy.yaml) cp "$3" "$STUB_RENDER" ;;
 	model-backend.yaml) cp "$3" "$STUB_RENDER_MODEL" ;;
+	scripted-backend.yaml) cp "$3" "$STUB_RENDER_SCRIPTED" ;;
 	esac
 	;;
 get)
@@ -55,12 +56,57 @@ func TestDeployWaitsForEveryDeployedObject(t *testing.T) {
 	}
 
 	waited, budgets := rolloutWait(t, run)
-	judgeWaitList(t, waited, manifestDeployments(t, run.render, run.renderModel))
+	judgeWaitList(t, waited, manifestDeployments(t, run.render, run.renderScripted))
 
-	// The model backend's init step downloads the model on the first rollout, so
-	// its budget is the long one; every other object gets the standard budget. A
-	// branch keyed to a name nothing declares would quietly apply the standard
-	// timeout to the slow object instead of failing loudly.
+	// The default round's source is the scripted backend: one python server,
+	// no model download, so it carries the short scripted budget while the
+	// rest keep the standard one. A branch keyed to a name nothing declares
+	// would quietly apply the wrong timeout to a slow object.
+	for name, want := range map[string]string{
+		"postgres":              "300s",
+		"test-multica-scripted": "180s",
+		"backend":               "300s",
+		"web":                   "300s",
+		"proxy":                 "300s",
+	} {
+		if got := budgets[name]; got != want {
+			t.Errorf("deploy.sh waits for deploy/%s with --timeout=%s, want %s", name, got, want)
+		}
+	}
+}
+
+// TestDeployScriptedBudgetIsConfigurable pins the documented
+// TEST_MULTICA_SCRIPTED_WAIT: it is the scripted backend's rollout budget, so
+// an operator's slower cluster can lengthen it without touching the manifest.
+func TestDeployScriptedBudgetIsConfigurable(t *testing.T) {
+	run := runDeploy(t, answeringKubectlStub, mergeEnv(noEndpointEnv(), map[string]string{
+		"TEST_MULTICA_SCRIPTED_WAIT": "600s",
+	}))
+	if run.err != nil {
+		t.Fatalf("deploy.sh did not finish: %v\nstderr:\n%s", run.err, run.stderr)
+	}
+	_, budgets := rolloutWait(t, run)
+	if got := budgets["test-multica-scripted"]; got != "600s" {
+		t.Errorf("deploy.sh waits for deploy/test-multica-scripted with --timeout=%s, want the configured 600s", got)
+	}
+}
+
+// TestDeployOllamaRoundWaitsForItsBackend is the other local source: the ollama
+// engine is selected explicitly and its init step pulls the model (hundreds of
+// MB) on the first rollout, so it is the one object with the long budget. The
+// scripted backend is not part of that round.
+func TestDeployOllamaRoundWaitsForItsBackend(t *testing.T) {
+	run := runDeploy(t, answeringKubectlStub, mergeEnv(noEndpointEnv(), map[string]string{
+		"TEST_MULTICA_MODEL_LOCAL_SOURCE": "ollama",
+	}))
+	if run.err != nil {
+		t.Fatalf("deploy.sh did not finish: %v\nstderr:\n%s", run.err, run.stderr)
+	}
+	if run.renderScripted != "" {
+		t.Errorf("the ollama round applied the scripted backend as well:\n%s", run.renderScripted)
+	}
+	waited, budgets := rolloutWait(t, run)
+	judgeWaitList(t, waited, manifestDeployments(t, run.render, run.renderModel))
 	for name, want := range map[string]string{
 		"postgres":            "300s",
 		"test-multica-ollama": "900s",
@@ -84,7 +130,10 @@ func TestDeployEndpointRoundWaitsOnlyForWhatItDeploys(t *testing.T) {
 		t.Fatalf("deploy.sh did not finish: %v\nstderr:\n%s", run.err, run.stderr)
 	}
 	if run.renderModel != "" {
-		t.Errorf("the endpoint round applied a local model backend:\n%s", run.renderModel)
+		t.Errorf("the endpoint round applied the ollama model backend:\n%s", run.renderModel)
+	}
+	if run.renderScripted != "" {
+		t.Errorf("the endpoint round applied the scripted backend:\n%s", run.renderScripted)
 	}
 
 	waited, budgets := rolloutWait(t, run)

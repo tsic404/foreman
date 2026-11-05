@@ -23,15 +23,18 @@
 #      leaves the runtime list empty on purpose — ./bind-agent.sh creates it
 #      once the agent is bound;
 #   6. model — one writer, one precedence: the deployment-supplied endpoint
-#      triple wins; without it the keyless local backend ./deploy.sh installed
-#      is the source (its family selector plus its in-cluster address); with
-#      neither, the agent's model is cleared and any registration a previous
-#      round left on the nodes is removed (the node file outlives the
-#      namespace). The failure agent is cleared unconditionally: its missing
-#      model source is the fixture's failure guarantee;
-#   7. gate — ./selfcheck.sh: the environment gate ①②③④ (the instance points at
-#      the access point, the runtime list is empty, the server reports the
-#      artifact anchor, the selected model source serves the round).
+#      triple wins; without it the selected local source (the scripted fixture
+#      backend by default, the keyless ollama engine when the round asks for
+#      it) is registered through the same installer; with neither, the agent's
+#      model is cleared and any registration a previous round left on the
+#      nodes is removed (the node file outlives the namespace). The failure
+#      agent is written unconditionally to a selector no round can resolve —
+#      an empty one would let omp resolve the node's registration by itself and
+#      the failed class would complete instead;
+#   7. gate — ./selfcheck.sh: the environment gate ①②③④⑤ (the instance points
+#      at the access point, the runtime list is empty, the server reports the
+#      artifact anchor, the selected model source serves the round, and the Job
+#      image's daemon carries the argv omp accepts).
 #
 # It is idempotent: everything is looked up by name and only created when
 # missing; the provider registration is one Secret applied in place and one
@@ -230,7 +233,7 @@ ensure_agents() {
 	agent_id=$(ensure_agent "$AGENT_NAME" "Foreman acceptance test agent") ||
 		die "agent $AGENT_NAME is missing"
 	fault_agent_id=$(ensure_agent "$FAULT_AGENT_NAME" \
-		"Foreman acceptance failure fixture: no model source, every task ends failed") ||
+		"Foreman acceptance failure fixture: an unresolvable model selector, every task ends failed") ||
 		die "agent $FAULT_AGENT_NAME is missing"
 }
 
@@ -254,17 +257,27 @@ ensure_chat() {
 # installed, else no model. The entry only decides when to call it — the
 # agent id it needs comes from ensure_agents above.
 
-# The failure agent is the fixture's deterministic failure: it must carry no
-# model source in any round, whatever the round's model precedence chose. A
-# selector left by an earlier round (the row survives the wipe) would quietly
-# turn it into a second working agent and take the failure scenario with it, so
-# this is an unconditional write, not a create-time default.
-clear_fault_agent_model() {
-	set_agent_model "$fault_agent_id" "" ||
-		die "cannot clear agent $FAULT_AGENT_NAME's model"
+# The failure agent is the fixture's deterministic failure: it must carry a
+# selector that cannot resolve in any round, whatever the round's model
+# precedence chose. Clearing the field is not that guarantee — omp then reads
+# the registration in the Pod's own home (the workspace home every agent of the
+# workspace mounts) and runs the test agent's model, so the failed class
+# quietly becomes a second completed one. A selector left by an earlier round
+# (the row survives the wipe) has the same problem, so this is an unconditional
+# write, not a create-time default.
+isolate_fault_agent_model() {
+	# The round's own registration is the one document that could resolve the
+	# selector: a round whose provider is the fixture's would make the failure
+	# agent a second working agent. Refuse it instead of writing a guarantee
+	# that no longer holds.
+	_served_provider=${model_text%%/*}
+	[ "${FAULT_MODEL_SELECTOR%%/*}" != "$_served_provider" ] ||
+		die "the round's provider ($_served_provider) is the failure agent's selector provider — the failure guarantee would resolve; change TEST_MULTICA_MODEL_PROVIDER / TEST_MULTICA_SCRIPTED_PROVIDER"
+	set_agent_model "$fault_agent_id" "$FAULT_MODEL_SELECTOR" ||
+		die "cannot point agent $FAULT_AGENT_NAME at $FAULT_MODEL_SELECTOR"
 	set_agent_env "$fault_agent_id" "" ||
 		die "cannot clear agent $FAULT_AGENT_NAME's model backend address"
-	info "agent $FAULT_AGENT_NAME → (no model source: every task fails)"
+	info "agent $FAULT_AGENT_NAME → $FAULT_MODEL_SELECTOR (unresolvable: every task fails)"
 }
 
 # --- 7. gate and report ------------------------------------------------------
@@ -280,9 +293,9 @@ ensure_repo
 ensure_agents
 ensure_chat
 register_model_endpoint
-clear_fault_agent_model
+isolate_fault_agent_model
 
-# The environment gate ①②③④, the gate every round opens with. Run here, with
+# The environment gate ①②③④⑤, the gate every round opens with. Run here, with
 # the instance under test stopped, ② is the reset-time state this entry sets
 # up; a blocked environment exits 2 through this call.
 "$TEST_MULTICA_DIR/selfcheck.sh"
@@ -293,7 +306,7 @@ printf 'profile:      %s (%s)\n' "$PROFILE" "$PROFILE_CONFIG"
 printf 'server:       %s\n' "$SERVER_URL"
 printf 'entry:        %s\n' "$ENTRY_URL"
 printf 'agent:        %s\n' "$AGENT_NAME"
-printf 'failure agent: %s (no model source)\n' "$FAULT_AGENT_NAME"
+printf 'failure agent: %s (%s, unresolvable)\n' "$FAULT_AGENT_NAME" "$FAULT_MODEL_SELECTOR"
 printf 'model:        %s\n' "$model_text"
 printf 'chat session: %s\n' "$CHAT_TITLE"
 printf 'next:         ./wire.sh         # points the instance at the access point and starts it\n'

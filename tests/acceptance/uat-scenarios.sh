@@ -15,10 +15,10 @@
 # in the log.
 #
 # Each class is built by the mechanism its class needs: the working agent for
-# completed, the test environment's model-less failure agent for failed, a
-# server-side cancel of an in-flight run for cancelled, and a compressed Job
-# deadline for the platform timeout. Each function states why that
-# construction is deterministic.
+# completed, the test environment's unresolvable-selector failure agent for
+# failed, a server-side cancel of an in-flight run for cancelled, and a
+# compressed Job deadline for the platform timeout. Each function states why
+# that construction is deterministic.
 #
 # Exit: 0 = PASS · 1 = FAIL (raw observation printed) · 2 = blocked.
 set -eu

@@ -1,0 +1,142 @@
+# The scripted agent backend — the local model source of the default round
+# (lib.sh §MODEL_LOCAL_SOURCE, README.md §Scripted agent backend).
+#
+# It is a small served endpoint, not a substitute for the job-side half of a
+# carrier: the Job's agent reaches it over the network through the same
+# provider registration a deployment-supplied endpoint uses, and everything the
+# carriers judge — claim, Job, pod, lifecycle projection — is the real path.
+# What it adds is a model that declares the task's window — turn 0 is one
+# warmup call, turns 1..SCRIPTED_HOLD_TURNS are `sleep`, then the answer — which
+# is what gives a task a process that can be observed, cancelled, deadlined or
+# carried across a fault window. The warmup is not a hold turn: HOLD_TURNS=1
+# still holds for one full sleep. The Job's `omp` runs those commands inside the
+# pod; this server runs nothing.
+#
+# One source per round: ./deploy.sh applies this manifest only when the round's
+# local source is `scripted`; the ollama backend (model-backend.yaml) is the
+# other local source and the two are never applied together.
+#
+# The server script is one file in this directory; ./deploy.sh injects it into
+# the ConfigMap below, so the served code has a single source of truth. The
+# model id is rendered the same way and read back by ./reset.sh and
+# ./selfcheck.sh from the applied Deployment.
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: test-multica-scripted-server
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: scripted-model
+data:
+  server.py: |
+    __SCRIPTED_SERVER_PY__
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-multica-scripted
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: scripted-model
+spec:
+  type: ClusterIP
+  selector:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: scripted-model
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-multica-scripted
+  namespace: multica-test
+  labels:
+    app.kubernetes.io/name: multica
+    app.kubernetes.io/component: scripted-model
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: multica
+      app.kubernetes.io/component: scripted-model
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: multica
+        app.kubernetes.io/component: scripted-model
+      annotations:
+        # ./deploy.sh renders the digest of the injected server file here. The
+        # ConfigMap's name never changes, so without this a code-only change
+        # leaves the pod on the old script while `rollout status` reports ready.
+        test-multica/scripted-digest: "__SCRIPTED_DIGEST__"
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsUser: 1000
+        runAsGroup: 1000
+        runAsNonRoot: true
+        seccompProfile: { type: RuntimeDefault }
+      containers:
+        - name: model
+          image: python:3.12.9-alpine3.20
+          imagePullPolicy: IfNotPresent
+          command: ["python3", "-B", "/opt/scripted/server.py", "serve", "0.0.0.0:8080"]
+          env:
+            # The id the server reports from /v1/models and echoes in every
+            # completion. ./reset.sh registers exactly this value, read back
+            # from here, so the selector and the served row cannot disagree.
+            - name: SCRIPTED_MODEL_ID
+              value: "__SCRIPTED_MODEL_ID__"
+            # The window the fixture declares: HOLD_TURNS turns of `sleep
+            # SECONDS`, then the final answer. It is the fixture's, not the
+            # prompt's — the daemon's first turn carries a runtime brief, not
+            # the issue body, so a task can rely on the model, not on reading
+            # its own instructions back. TEST_MULTICA_SCRIPTED_SLEEP /
+            # TEST_MULTICA_SCRIPTED_HOLD_TURNS override both for a round whose
+            # window is longer or shorter.
+            - name: SCRIPTED_SLEEP
+              value: "__SCRIPTED_SLEEP__"
+            - name: SCRIPTED_HOLD_TURNS
+              value: "__SCRIPTED_HOLD_TURNS__"
+            # The first turn's command. It is what makes the task call the
+            # Multica API once (G2's passthrough counter has no other observable
+            # face); later turns hold the window with `sleep`.
+            - name: SCRIPTED_WARMUP_COMMAND
+              value: "__SCRIPTED_WARMUP__"
+            - name: PYTHONDONTWRITEBYTECODE
+              value: "1"
+            - name: PYTHONUNBUFFERED
+              value: "1"
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /v1/models
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 5
+            failureThreshold: 6
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities: { drop: ["ALL"] }
+          resources:
+            requests: { cpu: 20m, memory: 32Mi }
+            limits: { cpu: "1", memory: 128Mi }
+          volumeMounts:
+            - name: server
+              mountPath: /opt/scripted
+              readOnly: true
+      volumes:
+        - name: server
+          configMap:
+            name: test-multica-scripted-server

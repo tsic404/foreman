@@ -1,5 +1,5 @@
 #!/bin/sh
-# The environment gate — the four checks every acceptance round opens with.
+# The environment gate — the five checks every acceptance round opens with.
 #
 #   ./selfcheck.sh
 #
@@ -12,11 +12,19 @@
 #      the field is `omitempty`: a missing `server_version` is a data-surface
 #      mismatch, not a version mismatch;
 #   ④ the selected model source serves the round — the deployment-supplied
-#      endpoint when its triple is set, else the local backend and the model
-#      its pull step installed. The premise of a real task result and a
-#      non-zero token count, not something to discover at the inference step.
+#      endpoint when its triple is set; otherwise the selected local source:
+#      the scripted backend reports its declared model id, or the ollama engine
+#      lists the model its pull step installed. The premise of a real task
+#      result and a non-zero token count, not something to discover at the
+#      inference step;
+#   ⑤ the Job image carries a daemon whose agent start omp accepts: the daemon
+#      passes `--session <path>` up to v0.6.1, which omp (strictly resume-only
+#      there) rejects on the empty file the daemon creates — every task then
+#      dies as `agent_error.process_failure` with no tool call — and
+#      `--session-dir <dir>` from v0.6.2 on. The image's own binary answers,
+#      because a tag is not evidence.
 #
-# Exit codes: 0 = all four hold; 2 = the environment is blocked — fix it,
+# Exit codes: 0 = the checks hold; 2 = the environment is blocked — fix it,
 # never run a case against an unknown one. ② only holds before the instance
 # under test starts: ./reset.sh and ./wire.sh run this at that moment.
 
@@ -82,12 +90,30 @@ info "③ ok: server_version $version"
 
 # The agent must produce a real task result and a non-zero token count, so the
 # source ./reset.sh selected is part of the environment the gate asserts. The
-# deployment-supplied endpoint wins; the keyless local backend is the source
-# otherwise, and its pull step must have completed.
-if model_endpoint_configured; then
+# deployment-supplied endpoint wins; with no triple the selected local source
+# is asserted — the scripted fixture backend by default, the ollama engine when
+# a round asks for it.
+source=$(model_source) || blocked "④ cannot resolve the model source"
+case $source in
+endpoint)
 	model_source="endpoint $(model_selector)"
 	info "④ ok: the deployment supplies the model endpoint ($model_source)"
-else
+	;;
+scripted)
+	model=$(kubectl -n "$NS" get deploy "$SCRIPTED_BACKEND_DEPLOY" \
+		-o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="SCRIPTED_MODEL_ID")].value}' 2>/dev/null) ||
+		blocked "④ cannot read Deployment $NS/$SCRIPTED_BACKEND_DEPLOY — run ./deploy.sh (the scripted backend is part of the test cluster)"
+	[ -n "$model" ] ||
+		blocked "④ $NS/$SCRIPTED_BACKEND_DEPLOY carries no SCRIPTED_MODEL_ID — re-run ./deploy.sh"
+	served=$(kubectl -n "$NS" exec "deploy/$SCRIPTED_BACKEND_DEPLOY" -- python3 -c \
+		'import json,urllib.request;print(json.load(urllib.request.urlopen("http://127.0.0.1:8080/v1/models"))["data"][0]["id"])' 2>/dev/null) ||
+		blocked "④ the scripted backend is not serving — kubectl -n $NS logs deploy/$SCRIPTED_BACKEND_DEPLOY, then re-run ./deploy.sh"
+	[ "$served" = "$model" ] ||
+		blocked "④ the scripted backend serves '$served', the Deployment declares '$model' — re-run ./deploy.sh"
+	model_source="scripted backend $model"
+	info "④ ok: scripted backend serves $model"
+	;;
+ollama)
 	model=$(kubectl -n "$NS" get deploy "$MODEL_BACKEND_DEPLOY" \
 		-o jsonpath='{.spec.template.spec.initContainers[0].env[?(@.name=="OLLAMA_MODEL")].value}' 2>/dev/null) ||
 		blocked "④ cannot read Deployment $NS/$MODEL_BACKEND_DEPLOY — run ./deploy.sh (the model backend is part of the test cluster)"
@@ -99,6 +125,36 @@ else
 		blocked "④ the model backend does not serve $model — re-run ./deploy.sh (its pull step fills the models volume)"
 	model_source="local backend $model"
 	info "④ ok: model backend serves $model"
-fi
+	;;
+esac
 
-info "self-check passed: ①②③④ (access point $ACCESS_URL, model source $model_source)"
+# --- ⑤ the Job image's daemon can start omp --------------------------------
+
+# The daemon's agent argv is the contract: `--session <path>` up to v0.6.1,
+# `--session-dir <dir>` from v0.6.2 on. omp's `--session` is an alias of
+# `--resume` — strictly a resume — so an older daemon resumes the empty file it
+# just created, the process exits before its first turn, and the task lands as
+# `agent_error.process_failure` with no tool call. Asserting it here keeps the
+# next round from discovering it as a dead task.
+job_image=$(instance_env FOREMAN_JOB_IMAGE 2>/dev/null) || job_image=
+[ -n "$job_image" ] ||
+	blocked "⑤ $INSTANCE_NS/$INSTANCE carries no FOREMAN_JOB_IMAGE — deploy the instance under test first (deploy/README.md)"
+daemon_version=$(job_daemon_version "$job_image") || daemon_version=
+[ -n "$daemon_version" ] ||
+	blocked "⑤ cannot read the daemon version out of Job image $job_image — the image does not answer 'multica version' (pull it on a node, or fix FOREMAN_JOB_IMAGE); every Job's agent start depends on it"
+daemon_floor=0.6.2
+if ! awk -v have="$daemon_version" -v want="$daemon_floor" 'BEGIN {
+	split(have, h, "."); split(want, w, ".")
+	for (i = 1; i <= 3; i++) {
+		a = (h[i] == "" ? 0 : h[i]) + 0
+		b = (w[i] == "" ? 0 : w[i]) + 0
+		if (a > b) exit 0
+		if (a < b) exit 1
+	}
+	exit 0
+}'; then
+	blocked "⑤ Job image $job_image carries multica $daemon_version; the daemon/omp contract needs >= $daemon_floor — a daemon below it starts omp with '--session <path>', omp treats that as --resume and rejects the empty session file it is given ('the session file holds no entries'), and every task dies as agent_error.process_failure with no tool call. Use the Job image built by build-foreman-job.yml for the newest upstream release (ghcr.io/tsic404/foreman-job:<daemon version>)"
+fi
+info "⑤ ok: Job image $job_image carries multica $daemon_version (>= $daemon_floor)"
+
+info "self-check passed: ①②③④⑤ (access point $ACCESS_URL, model source $model_source, Job daemon $daemon_version)"

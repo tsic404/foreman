@@ -40,25 +40,31 @@ WORKSPACE_NAME=${TEST_MULTICA_WORKSPACE_NAME:-Foreman Test}
 WORKSPACE_SLUG=${TEST_MULTICA_WORKSPACE_SLUG:-foreman-test}
 ACCOUNT_EMAIL=${TEST_MULTICA_EMAIL:-acceptance@test.local}
 AGENT_NAME=${TEST_MULTICA_AGENT:-foreman-test-agent}
-# The failure agent: the same runtime as the test agent, deliberately without a
-# model source, so every task dispatched to it ends in a failed terminal. It is
-# the fixture's deterministic way to build the failure side of the lifecycle
-# and observability cases (README §The failure agent).
+# The failure agent: the same runtime as the test agent, carrying a model
+# selector no round can resolve, so every task dispatched to it ends in a
+# failed terminal. It is the fixture's deterministic way to build the failure
+# side of the lifecycle and observability cases (README §The failure agent).
 FAULT_AGENT_NAME=${TEST_MULTICA_FAULT_AGENT:-foreman-test-agent-failing}
+# The selector that guarantees the failure. An empty selector is not a failure:
+# omp then resolves a model by itself from the registration in the Job's home —
+# the workspace home every agent of the workspace mounts — and the failure
+# agent would run the test agent's model. This provider is registered by no
+# round, so the refusal is decided before the first turn whatever the round's
+# model source is; reset.sh refuses a round whose own registration claims it.
+FAULT_MODEL_SELECTOR=foreman-failing/absent
 AUTOPILOT_TITLE=${TEST_MULTICA_AUTOPILOT:-foreman-test-autopilot}
 CHAT_TITLE=${TEST_MULTICA_CHAT:-foreman-test-chat}
-# What the test agent is told to do. A task makes one Multica API call of its
-# own (the CLI resolves MULTICA_SERVER_URL / MULTICA_TOKEN from the task
-# environment), because the agent-api passthrough counter only moves when the
-# Job's tenant calls the server — G2's "透传" leg has no other observable face.
+# The prompt text the short shape asks for. The scripted backend ignores it and
+# declares the same call itself (SCRIPTED_WARMUP): the prompt is what a human
+# reads on the board, not what drives the model.
 AGENT_INSTRUCTIONS=${TEST_MULTICA_AGENT_INSTRUCTIONS:-"Run this shell command exactly once, then reply with OK only: multica issue list --output json. Do not modify any repository."}
 TASK_PROMPT=${TEST_MULTICA_TASK_PROMPT:-"Run this shell command exactly once, then reply with OK only: multica issue list --output json"}
-# The long shape: a task whose agent stays alive until the command ends, so
-# the window it occupies is the operator's (`sleep` length), not the model's.
-# It is what the deadline, cancel and in-flight-fault cases need — a task that
-# settles in seconds cannot be cancelled mid-flight or outlive a budget.
+# The long shape: the task's in-flight window is the fixture's declaration —
+# SCRIPTED_SLEEP × SCRIPTED_HOLD_TURNS (see README §Task shapes) — not the
+# prompt. It is what the deadline, cancel and in-flight-fault cases need: a task
+# that settles in seconds cannot be cancelled mid-flight or outlive a budget.
 LONG_AUTOPILOT_TITLE=${TEST_MULTICA_LONG_AUTOPILOT:-foreman-test-autopilot-long}
-TASK_PROMPT_LONG=${TEST_MULTICA_LONG_TASK_PROMPT:-"Run this shell command and wait for it to finish, then reply with DONE only: sleep ${TEST_MULTICA_LONG_TASK_SLEEP:-900}"}
+TASK_PROMPT_LONG=${TEST_MULTICA_LONG_TASK_PROMPT:-"Stay in flight until this task's window ends, then reply with DONE only. Do not modify any repository."}
 REPO_URL=${TEST_MULTICA_REPO:-https://github.com/tsic404/foreman}
 # Development login code (MULTICA_DEV_VERIFICATION_CODE in the Secret).
 VERIFICATION_CODE=${TEST_MULTICA_VERIFICATION_CODE:-888888}
@@ -126,6 +132,46 @@ MODEL_WAIT=${TEST_MULTICA_MODEL_WAIT:-600}
 # a slow test-network pull costs seconds, where the carriers' node-observation
 # image costs a minute per node.
 MODEL_IMAGE=${TEST_MULTICA_MODEL_IMAGE:-alpine:3.20}
+
+# --- The local model source (a round without an endpoint triple) --------------
+# The deployment-supplied endpoint wins over both local sources; with no triple
+# the round runs one of these:
+#
+#   scripted (default) — the fixture's own served backend (scripted-agent.py,
+#     scripted-backend.yaml). It declares the task's window itself: one warmup
+#     call, then `sleep` holds, so the Job's agent has a process that can be
+#     observed, cancelled or deadlined. Deterministic by construction, no
+#     inference, no credential.
+#   ollama — the keyless real engine model-backend.yaml declares. Kept for a
+#     round that wants genuine model output; its small model answers in prose,
+#     so a task settles in seconds and cannot hold a window.
+#
+# The scripted backend's model id is rendered into its manifest and read back
+# from the applied Deployment, so the server and the agent's selector cannot
+# disagree about what is served.
+MODEL_LOCAL_SOURCE=${TEST_MULTICA_MODEL_LOCAL_SOURCE:-scripted}
+SCRIPTED_BACKEND_DEPLOY=${TEST_MULTICA_SCRIPTED_DEPLOY:-test-multica-scripted}
+SCRIPTED_MODEL_PROVIDER=${TEST_MULTICA_SCRIPTED_PROVIDER:-scripted}
+SCRIPTED_MODEL_ID=${TEST_MULTICA_SCRIPTED_MODEL:-fixture:deterministic}
+SCRIPTED_MODEL_API=${TEST_MULTICA_SCRIPTED_API:-openai-completions}
+# The scripted server ignores the credential; the provider document requires a
+# value, and a fixture key keeps a real one out of this repository.
+SCRIPTED_MODEL_TOKEN=${TEST_MULTICA_SCRIPTED_TOKEN:-fixture-key}
+# The window the fixture declares (scripted-agent.py §SCRIPTED_SLEEP): the
+# number of `sleep` turns a task holds for. It is the fixture's statement, so a
+# round reads its window here instead of trusting a prompt the daemon may not
+# deliver verbatim.
+SCRIPTED_SLEEP=${TEST_MULTICA_SCRIPTED_SLEEP:-60}
+SCRIPTED_HOLD_TURNS=${TEST_MULTICA_SCRIPTED_HOLD_TURNS:-3}
+# The first turn's command, declared by the fixture: the task's own Multica API
+# call is what moves the G2 passthrough counter, and the daemon's first turn
+# carries a runtime brief rather than the issue body.
+SCRIPTED_WARMUP=${TEST_MULTICA_SCRIPTED_WARMUP:-"multica issue list --output json"}
+# Rollout budget of the scripted backend: one python server, no model download,
+# so it is short next to the ollama engine's — but a first pull on a cold node
+# still has to fit.
+SCRIPTED_WAIT=${TEST_MULTICA_SCRIPTED_WAIT:-180s}
+SCRIPTED_MODEL_URL="http://$SCRIPTED_BACKEND_DEPLOY.$NS.svc:8080/v1"
 
 PROFILE_CONFIG="$HOME/.multica/profiles/$PROFILE/config.json"
 MULTICA_TEST_CLI="$TEST_MULTICA_DIR/multica-test"
@@ -357,6 +403,21 @@ model_selector() {
 	printf '%s/%s' "$MODEL_PROVIDER" "$MODEL_ID"
 }
 
+# model_source: which source serves this round — `endpoint` when the
+# deployment supplies the triple, else the local source setting. The triple is
+# absolute; an unknown local-source value is an operator error, never a silent
+# fallback to a source nobody named.
+model_source() {
+	if model_endpoint_configured; then
+		printf 'endpoint'
+		return 0
+	fi
+	case $MODEL_LOCAL_SOURCE in
+	scripted | ollama) printf '%s' "$MODEL_LOCAL_SOURCE" ;;
+	*) die "TEST_MULTICA_MODEL_LOCAL_SOURCE must be scripted or ollama (got '$MODEL_LOCAL_SOURCE')" ;;
+	esac
+}
+
 # yaml_scalar <value>: a YAML scalar carrying the value verbatim. jq quotes it
 # (a JSON string is a YAML double-quoted scalar), so `:`, `#`, quotes and
 # control characters cannot re-shape the document.
@@ -394,6 +455,79 @@ model_provider_document() {
 state_root() {
 	_root=$(instance_env FOREMAN_STATE_ROOT 2>/dev/null) || _root=
 	printf '%s' "${_root:-$STATE_ROOT}"
+}
+
+# job_daemon_version <image>: the `multica` version the Job image carries, as
+# the image's own binary reports it. The daemon's omp contract changed at
+# v0.6.2 — `--session <path>` (strictly a resume for omp, so the empty file the
+# daemon creates kills every task before its prompt) gave way to
+# `--session-dir <dir>` — so the version is the one fact that separates a round
+# that can run tasks from one that cannot. The tag is not evidence (`latest`
+# moves, a hand-built image may carry anything), so a one-shot Pod in the Job
+# namespace — the one place the image's pull secret exists — runs the binary
+# and prints what it says. Empty when the image cannot answer.
+job_daemon_version() {
+	_image=$1
+	_job_ns=$(instance_env FOREMAN_JOB_NAMESPACE 2>/dev/null) || _job_ns=
+	_job_ns=${_job_ns:-multica-agents}
+	_name=test-multica-job-daemon-version
+	_work=$(mktemp -d)
+	jq -n --arg ns "$_job_ns" --arg name "$_name" --arg image "$_image" '{
+		apiVersion: "v1",
+		kind: "Pod",
+		metadata: {
+			name: $name,
+			namespace: $ns,
+			labels: {
+				"app.kubernetes.io/name": "test-multica",
+				"test-multica/role": "job-version"
+			}
+		},
+		spec: {
+			restartPolicy: "Never",
+			automountServiceAccountToken: false,
+			imagePullSecrets: [{ name: "registry-tsic" }],
+			containers: [{
+				name: "version",
+				image: $image,
+				# The Job template pulls with Always, and FOREMAN_JOB_IMAGE is a
+				# movable tag: a node cache would let an older image answer for
+				# `latest`, turning this gate into a false pass (or a false block
+				# once the cache ages). Same policy as the Jobs it guards.
+				imagePullPolicy: "Always",
+				command: ["/usr/local/bin/multica", "version", "--output", "json"],
+				securityContext: {
+					runAsUser: 1000,
+					runAsNonRoot: true,
+					allowPrivilegeEscalation: false,
+					readOnlyRootFilesystem: true,
+					capabilities: { drop: ["ALL"] }
+				},
+				resources: {
+					requests: { cpu: "10m", memory: "16Mi" },
+					limits: { cpu: "200m", memory: "128Mi" }
+				}
+			}]
+		}
+	}' >"$_work/pod.yaml" ||
+		die "cannot render the Job version Pod"
+	k delete pod "$_name" -n "$_job_ns" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+	k apply -f "$_work/pod.yaml" >/dev/null ||
+		die "cannot apply the Job version Pod $_name"
+	_deadline=$(( $(date +%s) + MODEL_WAIT ))
+	while :; do
+		_phase=$(kubectl -n "$_job_ns" get pod "$_name" -o jsonpath='{.status.phase}' 2>/dev/null) ||
+			_phase=
+		case $_phase in
+		Succeeded | Failed) break ;;
+		esac
+		[ "$(date +%s)" -lt "$_deadline" ] || break
+		sleep 3
+	done
+	_out=$(kubectl -n "$_job_ns" logs "$_name" 2>/dev/null) || _out=
+	k delete pod "$_name" -n "$_job_ns" --ignore-not-found --wait=true >/dev/null 2>&1 || true
+	rm -rf "$_work"
+	printf '%s' "$_out" | jq -r '.version // empty' 2>/dev/null || true
 }
 
 # schedulable_linux_nodes: every node a Job can land on, one name per line.
@@ -636,16 +770,65 @@ local_model_backend() {
 	local_model_text="ollama/${_id}"
 }
 
+# scripted_model_backend: the fixture backend ./deploy.sh installed, as the
+# endpoint registration shape. The id is read back from the applied Deployment
+# (the manifest renders it there) instead of reusing this process's copy: a
+# round cannot register a model the served endpoint does not answer. 0 =
+# `scripted_model_id` and `scripted_model_text` hold the bare id and the
+# selector, 1 = not deployed (the self-check reports that), and a read failure
+# of any other kind dies for the same reason the ollama reader does.
+scripted_model_backend() {
+	_err=$(mktemp) || die "cannot create a temporary file"
+	if _id=$(kubectl -n "$NS" get deploy "$SCRIPTED_BACKEND_DEPLOY" \
+		-o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="SCRIPTED_MODEL_ID")].value}' 2>"$_err"); then
+		rm -f "$_err"
+	else
+		_err_text=$(cat "$_err")
+		case $_err_text in
+		*NotFound*)
+			rm -f "$_err"
+			return 1
+			;;
+		esac
+		if ! _id=$(k -n "$NS" get deploy "$SCRIPTED_BACKEND_DEPLOY" \
+			-o jsonpath='{.spec.template.spec.containers[0].env[?(@.name=="SCRIPTED_MODEL_ID")].value}' 2>"$_err"); then
+			_err_text=$(cat "$_err")
+			rm -f "$_err"
+			die "cannot read Deployment $NS/$SCRIPTED_BACKEND_DEPLOY — ${_err_text:-no output}"
+		fi
+		rm -f "$_err"
+	fi
+	[ -n "$_id" ] || return 1
+	scripted_model_id=$_id
+	scripted_model_text="$SCRIPTED_MODEL_PROVIDER/$_id"
+}
+
+# scripted_model_endpoint <id>: the scripted backend expressed as the endpoint
+# registration the existing installer writes — one provider, one model, the
+# in-cluster URL. The deployment-supplied names are shadowed on purpose: one
+# source has one registration, and the installer reads these same variables.
+scripted_model_endpoint() {
+	MODEL_BASE_URL=$SCRIPTED_MODEL_URL
+	MODEL_ID=$1
+	MODEL_API_KEY=$SCRIPTED_MODEL_TOKEN
+	MODEL_API_KEY_FILE=
+	MODEL_PROVIDER=$SCRIPTED_MODEL_PROVIDER
+	MODEL_API=$SCRIPTED_MODEL_API
+}
+
 # register_model_endpoint: the one writer of the agent's model and custom_env.
 # The precedence is explicit: the deployment-supplied endpoint wins; without it
-# the keyless local backend ./deploy.sh installed is the source; with neither
-# the model is cleared. The endpoint-less rollback is unconditional — the agent
-# row is not evidence of a carrier (it is recreated every round and the
-# node-local file survives the namespace). `agent_id` and `AGENT_NAME` belong
-# to the calling entry; `model_text` is the value the entry reports.
+# the selected local source — the scripted fixture backend by default, the
+# keyless ollama engine when a round asks for it — is registered through the
+# same installer; with neither the model is cleared. The endpoint-less rollback
+# is unconditional — the agent row is not evidence of a carrier (it is
+# recreated every round and the node-local file survives the namespace).
+# `agent_id` and `AGENT_NAME` belong to the calling entry; `model_text` is the
+# value the entry reports.
 register_model_endpoint() {
 	model_text=未配置
-	if model_endpoint_configured; then
+	source=$(model_source) || die "cannot resolve the model source"
+	if [ "$source" = endpoint ]; then
 		install_model_provider ||
 			die "the model endpoint could not be registered"
 		model_text=$(model_selector)
@@ -659,15 +842,33 @@ register_model_endpoint() {
 	info "未配置模型端点"
 	remove_model_provider ||
 		die "cannot clear the previous model endpoint registration"
-	if local_model_backend; then
-		model_text=$local_model_text
-		set_agent_model "$agent_id" "$model_text" ||
-			die "cannot point agent $AGENT_NAME at $model_text"
-		set_agent_env "$agent_id" "$MODEL_BACKEND_URL" ||
-			die "cannot set agent $AGENT_NAME's model backend address"
-		info "agent $AGENT_NAME → $model_text ($MODEL_BACKEND_URL)"
-		return 0
-	fi
+	case $source in
+	scripted)
+		if scripted_model_backend; then
+			scripted_model_endpoint "$scripted_model_id"
+			install_model_provider ||
+				die "the scripted model endpoint could not be registered"
+			model_text=$scripted_model_text
+			set_agent_model "$agent_id" "$model_text" ||
+				die "cannot point agent $AGENT_NAME at $model_text"
+			set_agent_env "$agent_id" "" ||
+				die "cannot clear agent $AGENT_NAME's model backend address"
+			info "agent $AGENT_NAME → $model_text ($SCRIPTED_MODEL_URL)"
+			return 0
+		fi
+		;;
+	ollama)
+		if local_model_backend; then
+			model_text=$local_model_text
+			set_agent_model "$agent_id" "$model_text" ||
+				die "cannot point agent $AGENT_NAME at $model_text"
+			set_agent_env "$agent_id" "$MODEL_BACKEND_URL" ||
+				die "cannot set agent $AGENT_NAME's model backend address"
+			info "agent $AGENT_NAME → $model_text ($MODEL_BACKEND_URL)"
+			return 0
+		fi
+		;;
+	esac
 	set_agent_model "$agent_id" "" ||
 		die "cannot clear the agent model"
 	set_agent_env "$agent_id" "" ||

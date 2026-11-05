@@ -699,6 +699,7 @@ register_model_endpoint
 		"TEST_MULTICA_INSTANCE_NS=foreman",
 		"TEST_MULTICA_INSTANCE=foreman",
 		"LOCAL_MODEL=",
+		"TEST_MULTICA_MODEL_LOCAL_SOURCE=ollama",
 		"APPLY_DIR=" + capture,
 		"KUBECTL_LOG=" + kubectlLog,
 		"WSAPI_LOG=" + wsapiLog,

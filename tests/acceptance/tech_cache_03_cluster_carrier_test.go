@@ -21,7 +21,7 @@ import (
 )
 
 const (
-	tcCache03ModeMarker    = ".foreman-tc-cache-03-workspaces-mode"
+	tcCache03ModesJournal  = ".foreman-tc-cache-03-workspaces-modes"
 	tcCache03BreakAtMarker = ".foreman-tc-cache-03-break-at"
 	// The break instant is read on the node's clock and the start on the
 	// server's; a fixed second for each keeps the comparison under test.
@@ -77,6 +77,11 @@ case " $* " in
 		echo "error: unable to create debug pod on $node" >&2
 		exit 1
 	fi
+	if [ -n "${FAKE_DEBUG_EMPTY_NODE:-}" ] && [ "$FAKE_DEBUG_EMPTY_NODE" = "$node" ]; then
+		# kubectl debug can exit 0 after a lost attach: the command ran, its
+		# answer never came back. That is not evidence of anything.
+		exit 0
+	fi
 	for last; do :; done
 	root="$state/$node/host"
 	mkdir -p "$root/tmp"
@@ -98,6 +103,18 @@ cat "$f"
 	tcCache03WriteExecutable(t, filepath.Join(bin, "date"), `#!/bin/sh
 printf '%s\n' "${FAKE_NOW:?FAKE_NOW is not set}"
 `)
+	// The fake node filesystem is a temp dir owned by the test user, so the
+	// carrier's privilege drop is a no-op here: the real probe still sees the
+	// modes the carrier installs.
+	tcCache03WriteExecutable(t, filepath.Join(bin, "setpriv"), `#!/bin/sh
+while [ $# -gt 0 ]; do
+	case "$1" in
+	--reuid=*|--regid=*|--clear-groups) shift ;;
+	--reuid|--regid) shift 2 ;;
+	*) break ;;
+	esac
+done
+exec "$@"`)
 	return bin
 }
 
@@ -169,8 +186,15 @@ func tcCache03Node(t *testing.T, state, node string) string {
 		t.Fatalf("create %s: %v", ws, err)
 	}
 	// A case that keeps the break in place (or fails before restoring it)
-	// leaves the tree at 0555, which t.TempDir's RemoveAll cannot enter.
-	t.Cleanup(func() { _ = os.Chmod(ws, 0o755) })
+	// leaves directories at 0555, which t.TempDir's RemoveAll cannot clean.
+	t.Cleanup(func() {
+		_ = filepath.WalkDir(filepath.Dir(filepath.Dir(ws)), func(path string, d os.DirEntry, err error) error {
+			if err == nil && d.IsDir() {
+				_ = os.Chmod(path, 0o755)
+			}
+			return nil
+		})
+	})
 	return ws
 }
 
@@ -236,8 +260,13 @@ func TestCache03CarrierPassesWhenTheJudgedTaskFailedOnItsNode(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("break exit = %d, want 0:\n%s", code, out)
 	}
-	if !strings.Contains(out, "workspaces=0555") || !strings.Contains(out, fmt.Sprintf("broken_at=%d", tcCache03BreakAt)) {
-		t.Errorf("the break does not report the mode and instant it installed:\n%s", out)
+	if !strings.Contains(out, "workspaces-readonly") ||
+		!strings.Contains(out, "root_mode=555") ||
+		!strings.Contains(out, fmt.Sprintf("broken_at=%d", tcCache03BreakAt)) {
+		t.Errorf("the break does not report the state and instant it installed:\n%s", out)
+	}
+	if !strings.Contains(out, "control=writable") || !strings.Contains(out, "allowed=0") {
+		t.Errorf("the break does not prove the tree is unwritable to the task user:\n%s", out)
 	}
 	if mode := tcCache03Mode(t, ws); mode != 0o555 {
 		t.Fatalf("workspaces mode = %04o after break, want 0555:\n%s", mode, out)
@@ -253,7 +282,7 @@ func TestCache03CarrierPassesWhenTheJudgedTaskFailedOnItsNode(t *testing.T) {
 	if mode := tcCache03Mode(t, ws); mode != 0o755 {
 		t.Errorf("workspaces mode = %04o after a passing judgement, want 0755:\n%s", mode, out)
 	}
-	if tcCache03HasMarker(t, state, "node-a", tcCache03ModeMarker) ||
+	if tcCache03HasMarker(t, state, "node-a", tcCache03ModesJournal) ||
 		tcCache03HasMarker(t, state, "node-a", tcCache03BreakAtMarker) {
 		t.Errorf("a marker survived the restore:\n%s", out)
 	}
@@ -310,7 +339,7 @@ func TestCache03CarrierBlocksAndNamesTheBrokenNode(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("verify exit = %d, want 2 (the task met a writable tree):\n%s", code, out)
 	}
-	if !strings.Contains(out, "not the tree break installs") {
+	if !strings.Contains(out, "never met flat cache") {
 		t.Errorf("the blocker does not name the missing break:\n%s", out)
 	}
 	if !strings.Contains(out, "node-a still carries the break — run: ") {
@@ -333,7 +362,7 @@ func TestCache03CarrierBlocksAndNamesTheBrokenNode(t *testing.T) {
 	if mode := tcCache03Mode(t, broken); mode != 0o755 {
 		t.Errorf("the broken node's mode = %04o after restore, want 0755:\n%s", mode, out)
 	}
-	if tcCache03HasMarker(t, state, "node-a", tcCache03ModeMarker) ||
+	if tcCache03HasMarker(t, state, "node-a", tcCache03ModesJournal) ||
 		tcCache03HasMarker(t, state, "node-a", tcCache03BreakAtMarker) {
 		t.Errorf("restore left a marker on the node:\n%s", out)
 	}
@@ -359,7 +388,7 @@ func TestCache03CarrierBlocksWhenTheBreakCameAfterTheTaskStarted(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("verify exit = %d, want 2 (the tree changed after the task started):\n%s", code, out)
 	}
-	if !strings.Contains(out, "not before task late started") {
+	if !strings.Contains(out, "not before task late's started_at") {
 		t.Errorf("the blocker does not name the instant comparison:\n%s", out)
 	}
 	if strings.Contains(out, "FAIL:") {
@@ -414,7 +443,7 @@ func TestCache03CarrierBlocksWhenTheTaskHasNoStartedAt(t *testing.T) {
 	if code != 2 {
 		t.Fatalf("verify exit = %d, want 2 (no start fact to compare):\n%s", code, out)
 	}
-	if !strings.Contains(out, "task b has no started_at") {
+	if !strings.Contains(out, "task b has neither started_at nor job_created_at") {
 		t.Errorf("the blocker does not name the missing fact:\n%s", out)
 	}
 	if mode := tcCache03Mode(t, ws); mode != 0o755 {
@@ -518,7 +547,7 @@ func TestCache03CarrierRestoreIsIdempotent(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("second restore exit = %d, want 0 (nothing left to undo):\n%s", code, out)
 	}
-	if !strings.Contains(out, "restored=0755 (no recorded mode)") {
+	if !strings.Contains(out, "no-journal") {
 		t.Errorf("the second restore does not report the writable fallback:\n%s", out)
 	}
 	if mode := tcCache03Mode(t, ws); mode != 0o755 {
@@ -628,7 +657,7 @@ func TestCache03CarrierBlocksWhenTheRestoreCannotReachTheNode(t *testing.T) {
 	if mode := tcCache03Mode(t, ws); mode != 0o555 {
 		t.Errorf("a failed restore changed the mode to %04o, want 0555:\n%s", mode, out)
 	}
-	if !tcCache03HasMarker(t, state, "node-a", tcCache03ModeMarker) ||
+	if !tcCache03HasMarker(t, state, "node-a", tcCache03ModesJournal) ||
 		!tcCache03HasMarker(t, state, "node-a", tcCache03BreakAtMarker) {
 		t.Errorf("a failed restore dropped a marker:\n%s", out)
 	}
@@ -645,5 +674,31 @@ func TestCache03CarrierBlocksWhenTheRestoreCannotReachTheNode(t *testing.T) {
 	}
 	if got := tcCache03Journal(t, state); got != "" {
 		t.Errorf("journal = %q after the retry, want it empty:\n%s", got, out)
+	}
+}
+
+// An attach that exits 0 with no answer proves nothing: the restore must block
+// and keep the journal, or a break whose cleanup never ran is reported done.
+func TestCache03CarrierBlocksWhenTheRestoreAnswerIsEmpty(t *testing.T) {
+	bin := tcCache03CarrierFakeBin(t)
+	state := t.TempDir()
+	ws := tcCache03Node(t, state, "node-a")
+	tcCache03Task(t, state, "a", "node-a", "completed", tcCache03StartedAt(tcCache03BreakAt-100))
+
+	if out, code := tcCache03CarrierRun(t, bin, state, nil, "break", "a"); code != 0 {
+		t.Fatalf("break exit = %d, want 0:\n%s", code, out)
+	}
+	out, code := tcCache03CarrierRun(t, bin, state, map[string]string{"FAKE_DEBUG_EMPTY_NODE": "node-a"}, "restore", "node-a")
+	if code != 2 {
+		t.Fatalf("restore exit = %d, want 2 (no node-side answer):\n%s", code, out)
+	}
+	if !strings.Contains(out, "returned no output") {
+		t.Errorf("the blocker does not name the missing answer:\n%s", out)
+	}
+	if mode := tcCache03Mode(t, ws); mode != 0o555 {
+		t.Errorf("workspaces mode = %04o after an unanswered restore, want 0555:\n%s", mode, out)
+	}
+	if got := tcCache03Journal(t, state); got != "node-a" {
+		t.Errorf("journal = %q after an unanswered restore, want the node kept:\n%s", got, out)
 	}
 }
