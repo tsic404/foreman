@@ -3,6 +3,8 @@ package recovery
 import (
 	"context"
 	"log/slog"
+	"strconv"
+	"strings"
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
@@ -94,19 +96,144 @@ func podNodeName(pods []corev1.Pod) string {
 // (FailureTarget or Failed) first, the pod's container termination reason
 // only on a miss. Node losses (§4.6) are named from the pod; anything else is
 // job_failed (§4.6).
-func jobEndReason(job *batchv1.Job, pods []corev1.Pod, since time.Time) (string, bool) {
+func jobEndReason(job *batchv1.Job, pods []corev1.Pod, since time.Time) (reason, detail string, ended bool) {
 	if job == nil {
-		return "", false
+		return "", "", false
 	}
 	if _, hit := scheduler.PlatformTermination(job, pods, since); hit {
-		return scheduler.FailureReasonJobDeadline, true
+		return scheduler.FailureReasonJobDeadline, jobEndDetail(job, pods, since), true
 	}
 	for i := range pods {
 		if podLost(&pods[i]) {
-			return scheduler.FailureReasonJobEvicted, true
+			return scheduler.FailureReasonJobEvicted, jobEndDetail(job, pods, since), true
 		}
 	}
-	return endReasonFromJob(job)
+	reason, ended = endReasonFromJob(job)
+	if !ended {
+		return "", "", false
+	}
+	return reason, jobEndDetail(job, pods, since), true
+}
+
+// jobEndDetail renders the termination facts of the ended instance as the
+// key=value tail of the fail report's error text. Key order is fixed:
+// container, exit, signal, reason, others, node, pod, finished, then the Job
+// side's failure condition — both condition types of §4.4's deadline surface,
+// since the controller may publish only FailureTarget before pod termination.
+// Every empty fact is omitted: an end with no pod and no condition (the Job
+// object alone carries the fact) renders "" and the report keeps its fixed
+// sentence.
+func jobEndDetail(job *batchv1.Job, pods []corev1.Pod, since time.Time) string {
+	fields := make([]string, 0, 9)
+	if pod, ok := endedPod(pods, since); ok {
+		var finished time.Time
+		if terminated := terminatedContainers(pod); len(terminated) > 0 {
+			pick := terminated[0]
+			for _, status := range terminated {
+				if status.State.Terminated.ExitCode != 0 {
+					pick = status
+					break
+				}
+			}
+			term := pick.State.Terminated
+			fields = append(fields, "container="+pick.Name, "exit="+strconv.Itoa(int(term.ExitCode)))
+			if term.Signal != 0 {
+				fields = append(fields, "signal="+strconv.Itoa(int(term.Signal)))
+			}
+			if term.Reason != "" {
+				fields = append(fields, "reason="+term.Reason)
+			}
+			if others := len(terminated) - 1; others > 0 {
+				fields = append(fields, "others="+strconv.Itoa(others))
+			}
+			finished = term.FinishedAt.Time
+		}
+		if pod.Spec.NodeName != "" {
+			fields = append(fields, "node="+pod.Spec.NodeName)
+		}
+		if pod.Name != "" {
+			fields = append(fields, "pod="+pod.Name)
+		}
+		if !finished.IsZero() {
+			fields = append(fields, "finished="+finished.UTC().Format(time.RFC3339))
+		}
+	}
+	if cond, ok := jobFailureCondition(job); ok {
+		if cond.Reason != "" {
+			fields = append(fields, "job_reason="+cond.Reason)
+		}
+		if cond.Message != "" {
+			fields = append(fields, "job_message="+strconv.Quote(cond.Message))
+		}
+	}
+	return strings.Join(fields, " ")
+}
+
+// endedPod picks the pod whose facts describe the end: the newest pod of the
+// instance that has a terminated container (the container that ended is the
+// stronger fact), falling back to the newest pod when none reports one — an
+// evicted or node-lost pod still names its node and itself.
+func endedPod(pods []corev1.Pod, since time.Time) (*corev1.Pod, bool) {
+	newest, ended := -1, -1
+	for i := range pods {
+		if !since.IsZero() && pods[i].CreationTimestamp.Time.Before(since) {
+			continue
+		}
+		if newest < 0 || pods[i].CreationTimestamp.Time.After(pods[newest].CreationTimestamp.Time) {
+			newest = i
+		}
+		if len(terminatedContainers(&pods[i])) > 0 &&
+			(ended < 0 || pods[i].CreationTimestamp.Time.After(pods[ended].CreationTimestamp.Time)) {
+			ended = i
+		}
+	}
+	if ended >= 0 {
+		return &pods[ended], true
+	}
+	if newest >= 0 {
+		return &pods[newest], true
+	}
+	return nil, false
+}
+
+// terminatedContainers returns the pod's terminated containers, init ones
+// first: they run before the regular containers, so the first non-zero exit
+// is the earliest stage that failed.
+func terminatedContainers(pod *corev1.Pod) []corev1.ContainerStatus {
+	terminated := make([]corev1.ContainerStatus, 0, len(pod.Status.InitContainerStatuses)+len(pod.Status.ContainerStatuses))
+	for _, status := range pod.Status.InitContainerStatuses {
+		if status.State.Terminated != nil {
+			terminated = append(terminated, status)
+		}
+	}
+	for _, status := range pod.Status.ContainerStatuses {
+		if status.State.Terminated != nil {
+			terminated = append(terminated, status)
+		}
+	}
+	return terminated
+}
+
+// jobFailureCondition returns the Job controller's failure condition, the
+// Failed one when both are present.
+func jobFailureCondition(job *batchv1.Job) (batchv1.JobCondition, bool) {
+	var target *batchv1.JobCondition
+	for i := range job.Status.Conditions {
+		cond := &job.Status.Conditions[i]
+		if cond.Status != corev1.ConditionTrue {
+			continue
+		}
+		switch cond.Type {
+		case batchv1.JobFailed:
+			return *cond, true
+		case batchv1.JobFailureTarget:
+			target = cond
+		}
+	}
+	if target != nil {
+		return *target, true
+	}
+	return batchv1.JobCondition{}, false
 }
 
 // endReasonFromJob reads the Job's own end evidence: the Failed condition or

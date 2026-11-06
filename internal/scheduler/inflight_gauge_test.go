@@ -50,7 +50,7 @@ func TestFailJobResetsInflightGauge(t *testing.T) {
 	f.claim(t, "task-1")
 	f.server.status = "running"
 
-	if err := f.sched.FailJob(context.Background(), "fm-task-1", FailureReasonJobMissing); err != nil {
+	if err := f.sched.FailJob(context.Background(), "fm-task-1", FailureReasonJobMissing, ""); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	f.assertSettled(t, "task-1")
@@ -65,7 +65,7 @@ func TestFailJobResetsInflightGaugeWhenTheReportIsRetained(t *testing.T) {
 	f.server.status = "running"
 	f.server.forwardErr = errors.New("transport down")
 
-	if err := f.sched.FailJob(context.Background(), "fm-task-1", FailureReasonJobMissing); err != nil {
+	if err := f.sched.FailJob(context.Background(), "fm-task-1", FailureReasonJobMissing, ""); err != nil {
 		t.Fatalf("FailJob: %v", err)
 	}
 	e, ok := f.reg.Get("task-1")

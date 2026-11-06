@@ -37,8 +37,9 @@ type TaskScheduler interface {
 	OnReport(ctx context.Context, ep scheduler.Endpoint, e registry.TaskEntry, body []byte, sessionID string) (int, []byte, error)
 	OnTaskVanished(ctx context.Context, taskID string) error
 	// FailJob settles a Job whose daemon was refused at S4: the entry reaches
-	// terminal/failed without waiting out the boot deadline (S-4).
-	FailJob(ctx context.Context, jobName, reason string) error
+	// terminal/failed without waiting out the boot deadline (S-4). detail is
+	// the termination facts for the report's error text; that path has none.
+	FailJob(ctx context.Context, jobName, reason, detail string) error
 }
 
 // FakeServer is the J→F face: it speaks the official server protocol to the

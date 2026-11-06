@@ -160,9 +160,138 @@ func TestJobEndReason(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			reason, ended := jobEndReason(tt.job, tt.pods, time.Time{})
+			reason, _, ended := jobEndReason(tt.job, tt.pods, time.Time{})
 			if ended != tt.ended || reason != tt.reason {
 				t.Fatalf("jobEndReason = (%q, %v), want (%q, %v)", reason, ended, tt.reason, tt.ended)
+			}
+		})
+	}
+}
+
+// TestJobEndDetailNamesTheTerminatingContainer pins what the synthesized fail
+// report carries: the four start-up shapes the platform could not tell apart
+// before (init, prepare, agent exit, OOM kill), the eviction fallback that has
+// no container status, the Job controller's own condition, and the empty
+// detail that must leave the fixed sentence alone.
+func TestJobEndDetailNamesTheTerminatingContainer(t *testing.T) {
+	finished := time.Date(2026, 11, 5, 13, 14, 4, 0, time.UTC)
+	placed := func(p *corev1.Pod) {
+		p.Spec.NodeName = "company-01"
+		p.CreationTimestamp = metav1.NewTime(finished.Add(-time.Minute))
+	}
+	endedAt := func(name string, exit int32, reason string) corev1.ContainerStatus {
+		return corev1.ContainerStatus{
+			Name: name,
+			State: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				ExitCode: exit, Reason: reason, FinishedAt: metav1.NewTime(finished),
+			}},
+		}
+	}
+
+	tests := []struct {
+		name   string
+		job    *batchv1.Job
+		pods   []corev1.Pod
+		reason string
+		detail string
+	}{
+		{
+			name: "init container fails",
+			job:  failedJob("fm-a", "BackoffLimitExceeded"),
+			pods: []corev1.Pod{podFor("fm-a", func(p *corev1.Pod) {
+				placed(p)
+				p.Status.InitContainerStatuses = []corev1.ContainerStatus{endedAt("init", 2, "Error")}
+			})},
+			reason: scheduler.FailureReasonJobFailed,
+			detail: "container=init exit=2 reason=Error node=company-01 pod=fm-a-x finished=2026-11-05T13:14:04Z job_reason=BackoffLimitExceeded",
+		},
+		{
+			name: "prepare fails after the init step succeeded",
+			job:  failedJob("fm-a", "BackoffLimitExceeded"),
+			pods: []corev1.Pod{podFor("fm-a", func(p *corev1.Pod) {
+				placed(p)
+				p.Status.InitContainerStatuses = []corev1.ContainerStatus{
+					endedAt("init", 0, "Completed"),
+					endedAt("prepare", 3, "Error"),
+				}
+			})},
+			reason: scheduler.FailureReasonJobFailed,
+			detail: "container=prepare exit=3 reason=Error others=1 node=company-01 pod=fm-a-x finished=2026-11-05T13:14:04Z job_reason=BackoffLimitExceeded",
+		},
+		{
+			name: "agent container exits non-zero",
+			job:  failedJob("fm-a", "BackoffLimitExceeded"),
+			pods: []corev1.Pod{podFor("fm-a", func(p *corev1.Pod) {
+				placed(p)
+				p.Status.InitContainerStatuses = []corev1.ContainerStatus{endedAt("prepare", 0, "Completed")}
+				p.Status.ContainerStatuses = []corev1.ContainerStatus{endedAt("agent", 1, "Error")}
+			})},
+			reason: scheduler.FailureReasonJobFailed,
+			detail: "container=agent exit=1 reason=Error others=1 node=company-01 pod=fm-a-x finished=2026-11-05T13:14:04Z job_reason=BackoffLimitExceeded",
+		},
+		{
+			name: "agent container is OOM-killed",
+			job:  failedJob("fm-a", "BackoffLimitExceeded"),
+			pods: []corev1.Pod{podFor("fm-a", func(p *corev1.Pod) {
+				placed(p)
+				p.Status.ContainerStatuses = []corev1.ContainerStatus{endedAt("agent", 137, "OOMKilled")}
+			})},
+			reason: scheduler.FailureReasonJobFailed,
+			detail: "container=agent exit=137 reason=OOMKilled node=company-01 pod=fm-a-x finished=2026-11-05T13:14:04Z job_reason=BackoffLimitExceeded",
+		},
+		{
+			name: "evicted pod has no container status",
+			job:  failedJob("fm-a", "BackoffLimitExceeded"),
+			pods: []corev1.Pod{podFor("fm-a", func(p *corev1.Pod) {
+				placed(p)
+				p.Status.Phase = corev1.PodFailed
+				p.Status.Reason = "Evicted"
+			})},
+			reason: scheduler.FailureReasonJobEvicted,
+			detail: "node=company-01 pod=fm-a-x job_reason=BackoffLimitExceeded",
+		},
+		{
+			name: "platform deadline kill",
+			job:  failedJob("fm-a", "DeadlineExceeded"),
+			pods: []corev1.Pod{podFor("fm-a", func(p *corev1.Pod) {
+				placed(p)
+				p.Status.ContainerStatuses = []corev1.ContainerStatus{endedAt("agent", 143, "DeadlineExceeded")}
+			})},
+			reason: scheduler.FailureReasonJobDeadline,
+			detail: `container=agent exit=143 reason=DeadlineExceeded node=company-01 pod=fm-a-x finished=2026-11-05T13:14:04Z job_reason=DeadlineExceeded`,
+		},
+		{
+			name: "job condition is carried beside the pod facts",
+			job: func() *batchv1.Job {
+				job := failedJob("fm-a", "BackoffLimitExceeded")
+				job.Status.Conditions[0].Message = "Job has reached the specified backoff limit"
+				return job
+			}(),
+			pods: []corev1.Pod{podFor("fm-a", func(p *corev1.Pod) {
+				placed(p)
+				p.Status.ContainerStatuses = []corev1.ContainerStatus{endedAt("agent", 1, "Error")}
+			})},
+			reason: scheduler.FailureReasonJobFailed,
+			detail: `container=agent exit=1 reason=Error node=company-01 pod=fm-a-x finished=2026-11-05T13:14:04Z ` +
+				`job_reason=BackoffLimitExceeded job_message="Job has reached the specified backoff limit"`,
+		},
+		{
+			// The Job object alone carries the end (no condition, no pod):
+			// the detail is empty and the report keeps its fixed sentence.
+			name:   "no pod facts",
+			job:    &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "fm-a"}, Status: batchv1.JobStatus{Failed: 1}},
+			reason: scheduler.FailureReasonJobFailed,
+			detail: "",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			reason, detail, ended := jobEndReason(tt.job, tt.pods, time.Time{})
+			if !ended || reason != tt.reason {
+				t.Fatalf("jobEndReason = (%q, %v), want (%q, true)", reason, ended, tt.reason)
+			}
+			if detail != tt.detail {
+				t.Fatalf("detail = %q, want %q", detail, tt.detail)
 			}
 		})
 	}

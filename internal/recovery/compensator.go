@@ -28,8 +28,9 @@ type Settler interface {
 	OnJobGone(ctx context.Context, jobName string) error
 	// FailJob reports a synthesized failure for a Job whose container ended
 	// without a daemon terminal report (§4.6). reason is the reported
-	// failure_reason.
-	FailJob(ctx context.Context, jobName, reason string) error
+	// failure_reason; detail is the pod-level termination facts carried into
+	// the report's error text, empty when the caller has none.
+	FailJob(ctx context.Context, jobName, reason, detail string) error
 	// SettleTerminal converges an entry the server holds as terminal: any
 	// queued report lands first, then the Job is deleted. The credential and
 	// the entry stay for the drain (ADR-017).
@@ -97,13 +98,14 @@ func NewCompensator(settler Settler, log *slog.Logger) *Compensator {
 // Fail settles e as failed and reports it on the daemon's behalf. It is
 // idempotent (收敛算法 Fail): the scheduler re-reads the entry state and
 // C13, so a second call for an already settled task is a no-op, and a C10
-// answer of 404/409 also counts as delivered.
-func (c *Compensator) Fail(ctx context.Context, e registry.TaskEntry, reason string) error {
+// answer of 404/409 also counts as delivered. detail carries the pod-level
+// termination facts into the report's error text.
+func (c *Compensator) Fail(ctx context.Context, e registry.TaskEntry, reason, detail string) error {
 	if e.IsTerminal() {
 		// Already settled locally: only the K8s objects may still linger.
 		return c.settler.SettleTerminal(ctx, e.TaskID, string(e.Result))
 	}
-	if err := c.settler.FailJob(ctx, e.JobName, reason); err != nil {
+	if err := c.settler.FailJob(ctx, e.JobName, reason, detail); err != nil {
 		c.log.ErrorContext(ctx, "compensation deferred",
 			"task_id", e.TaskID, "job_name", e.JobName, "failure_reason", reason, "err", err)
 		return err
