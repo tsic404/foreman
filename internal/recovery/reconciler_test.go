@@ -147,6 +147,13 @@ func (f *fakeSettler) SettleTerminal(_ context.Context, taskID, result string) e
 	return f.err
 }
 
+func (f *fakeSettler) SettleCancelled(_ context.Context, taskID string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.settles = append(f.settles, settleCall{taskID, string(registry.ResultCancelled)})
+	return f.err
+}
+
 func (f *fakeSettler) AdoptRunning(_ context.Context, taskID, status string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()

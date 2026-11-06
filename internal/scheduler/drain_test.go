@@ -630,6 +630,42 @@ func TestSweepSecretDomainsKeepCarriersOutOfTheCredentialCriterion(t *testing.T)
 	}
 }
 
+// A synthesized confirmation is held by the queue, so its carrier must survive
+// the sweep until it is delivered: membership is the sweep's question, and the
+// Job gate's narrower answer must not leak into it (§4.6 兜底一).
+func TestSweepKeepsTheCarrierOfASynthesizedConfirmation(t *testing.T) {
+	f := newFixture(t)
+	if err := f.pending.EnqueueSynthetic(context.Background(), "task-1", "fm-task-1", "fm-task-1",
+		testWorkspaceID, EPCancelAck, cancelAckConfirmation); err != nil {
+		t.Fatalf("EnqueueSynthetic: %v", err)
+	}
+	f.jobs.secrets = []corev1.Secret{{ObjectMeta: metav1.ObjectMeta{
+		Name: "fm-carrier-task-1",
+		Labels: map[string]string{
+			registry.LabelManagedBy:   registry.ManagedByForeman,
+			registry.LabelTaskID:      "task-1",
+			registry.LabelWorkspaceID: testWorkspaceID,
+			registry.LabelRole:        registry.RolePendingReport,
+		},
+	}}}
+
+	if err := f.sched.SweepOrphanSecrets(context.Background()); err != nil {
+		t.Fatalf("SweepOrphanSecrets: %v", err)
+	}
+	if len(f.jobs.deletedSecrets) != 0 {
+		t.Fatalf("deleted secrets = %v, want none: the confirmation is still queued", f.jobs.deletedSecrets)
+	}
+
+	// Settled: the carrier goes like any other delivered entry's.
+	f.pending.Drop(context.Background(), "task-1")
+	if err := f.sched.SweepOrphanSecrets(context.Background()); err != nil {
+		t.Fatalf("second SweepOrphanSecrets: %v", err)
+	}
+	if got := f.jobs.deletedSecrets; len(got) != 1 || got[0] != "fm-carrier-task-1" {
+		t.Fatalf("deleted secrets = %v, want the settled carrier", got)
+	}
+}
+
 // A failed orphan delete is retried next round and logged per object: the
 // round's aggregate error alone does not say which Secret survived.
 func TestSweepOrphanSecretsLogsAFailedDelete(t *testing.T) {

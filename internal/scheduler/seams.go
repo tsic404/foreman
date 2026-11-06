@@ -138,9 +138,15 @@ type Reconciler interface {
 // report.
 type PendingReportQueue interface {
 	Enqueue(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string) error
+	// EnqueueSynthetic lands a confirmation Foreman synthesized on the
+	// daemon's behalf (§4.6 兜底一). It is durable and replayed like any other
+	// entry, but it never holds the object cleanup back: Queued ignores it.
+	EnqueueSynthetic(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte) error
 	// Queued reports whether taskID's terminal report is still undelivered.
 	// It is conservative: while the carrier list has not completed every task
 	// reads as queued (§4.3 — an uncompleted rebuild is not an empty queue).
+	// A synthesized confirmation is not counted: it reports the Job's own
+	// termination, not a verdict awaiting delivery.
 	Queued(taskID string) bool
 	// Rebuilt reports whether the carrier list completed, so the queue's
 	// state is authoritative and a settlement may act on it.

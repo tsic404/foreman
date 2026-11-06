@@ -35,6 +35,13 @@ type Settler interface {
 	// queued report lands first, then the Job is deleted. The credential and
 	// the entry stay for the drain (ADR-017).
 	SettleTerminal(ctx context.Context, taskID, result string) error
+	// SettleCancelled converges a cancelled entry whose daemon did not confirm
+	// inside the confirmation window (§4.6 兜底一): the verdict is already
+	// server-side, so no report is sent, but the confirmation Foreman owes is
+	// recorded on the entry and emitted once the instance's pods have all
+	// terminated. The Job deletion and the drain bound are the same as
+	// SettleTerminal's.
+	SettleCancelled(ctx context.Context, taskID string) error
 	// AdoptRunning keeps the Job of a task the server reports as post-delivery
 	// (running or waiting_local_directory) and stops lease renewals (§4.3);
 	// status is the observed value, carried into the adopt event.

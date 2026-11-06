@@ -769,6 +769,10 @@ func (s *redisStore) mergeEntry(ctx context.Context, ws, taskID string, p regist
 			e.TokenHash = *p.TokenHash
 			changed = true
 		}
+		if p.CancelAckOwed != nil && e.CancelAckOwed != *p.CancelAckOwed {
+			e.CancelAckOwed = *p.CancelAckOwed
+			changed = true
+		}
 		return e, changed, nil
 	})
 	return err

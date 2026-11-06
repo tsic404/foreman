@@ -15,7 +15,10 @@ import (
 type fakePendingReports struct {
 	reports []pendingCall
 	queued  map[string]bool
-	err     error // Enqueue's durable-write failure
+	// synthetic marks the entries EnqueueSynthetic landed: they are held like
+	// any other report but never satisfy Queued, the Job gate.
+	synthetic map[string]bool
+	err       error // Enqueue's durable-write failure
 	// notRebuilt models an outstanding carrier list: Queued answers true for
 	// every task (unknown is not empty) and Rebuilt answers false.
 	notRebuilt bool
@@ -46,13 +49,33 @@ func (f *fakePendingReports) Enqueue(_ context.Context, taskID, jobName, daemonI
 	return nil
 }
 
+// EnqueueSynthetic records a confirmation Foreman synthesized. It is held like
+// any other entry — membership stays true — but never holds the Job gate:
+// Queued answers false for it.
+func (f *fakePendingReports) EnqueueSynthetic(_ context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte) error {
+	f.reports = append(f.reports, pendingCall{taskID, jobName, daemonID, workspaceID, ep, string(body), ""})
+	if f.err != nil {
+		return f.err
+	}
+	if f.queued == nil {
+		f.queued = map[string]bool{}
+	}
+	f.queued[taskID] = true
+	if f.synthetic == nil {
+		f.synthetic = map[string]bool{}
+	}
+	f.synthetic[taskID] = true
+	return nil
+}
+
 // Queued reports whether the report is still undelivered. An outstanding
-// carrier list reads as "may be queued" (§4.3).
+// carrier list reads as "may be queued" (§4.3). A synthesized confirmation is
+// held but never gates the object cleanup (§4.6 兜底一).
 func (f *fakePendingReports) Queued(taskID string) bool {
 	if f.notRebuilt {
 		return true
 	}
-	return f.queued[taskID]
+	return f.queued[taskID] && !f.synthetic[taskID]
 }
 
 // Rebuilt reports whether the carrier list completed.
@@ -63,7 +86,10 @@ func (f *fakePendingReports) Rebuilt() bool { return !f.notRebuilt }
 func (f *fakePendingReports) HasQueuedEntry(taskID string) bool { return f.queued[taskID] }
 
 // Drop forgets the report the direct forward settled.
-func (f *fakePendingReports) Drop(_ context.Context, taskID string) { delete(f.queued, taskID) }
+func (f *fakePendingReports) Drop(_ context.Context, taskID string) {
+	delete(f.queued, taskID)
+	delete(f.synthetic, taskID)
+}
 
 // DropIfUnchanged forgets the report only while the recorded snapshot is the
 // one the caller wrote: a later Enqueue for the same task keeps its entry.
@@ -75,6 +101,7 @@ func (f *fakePendingReports) DropIfUnchanged(_ context.Context, taskID string, e
 		}
 		if rep.ep == ep && rep.body == string(body) {
 			delete(f.queued, taskID)
+			delete(f.synthetic, taskID)
 		}
 		return
 	}
@@ -83,7 +110,10 @@ func (f *fakePendingReports) DropIfUnchanged(_ context.Context, taskID string, e
 // SweepCarrier models the queue's one-step settled check and delete: an
 // unfinished rebuild or a live entry keeps the object.
 func (f *fakePendingReports) SweepCarrier(ctx context.Context, taskID, name string) (bool, error) {
-	if f.Queued(taskID) {
+	// Membership, not the Job gate: a synthesized confirmation is held by the
+	// queue, so its carrier must survive until it is delivered (pending.go's
+	// heldByQueueLocked has the same answer).
+	if f.queued[taskID] {
 		return false, nil
 	}
 	if f.deleteCarrier == nil {

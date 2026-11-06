@@ -202,6 +202,15 @@ type TaskEntry struct {
 	// persisted only in the shared state snapshot (ADR-046 阶段一), so a late
 	// replay after a restart sends the same body.
 	DecidedReport []byte `json:"-"`
+
+	// CancelAckOwed marks a cancellation Foreman settled on the daemon's
+	// behalf after the confirmation window expired (§4.6 兜底一): the server
+	// already holds the verdict, and the confirmation the daemon never sent is
+	// Foreman's once the instance's pods have all terminated. It is the only
+	// durable form of that debt before the entry is reclaimed, so it rides the
+	// shared state snapshot and comes back with a restored entry. Never
+	// projected, never annotated, never read as a verdict.
+	CancelAckOwed bool `json:"-"`
 }
 
 // MarshalJSON renders the entry as /foreman/tasks projects it (§4.1,

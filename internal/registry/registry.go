@@ -922,6 +922,53 @@ func (r *Registry) DecidedReport(taskID string) ([]byte, bool) {
 	return e.DecidedReport, true
 }
 
+// MarkCancelAckOwed records the confirmation debt a cancellation settled on the
+// daemon's behalf leaves behind (§4.6 兜底一). It is written before the verdict
+// and through the shared state face synchronously: a restart between the
+// verdict and the instance's last pod must still know that Foreman, not the
+// daemon, owes the server its confirmation. The marker is not a gate field —
+// it changes neither state nor verdict — so the merge of it can never revert a
+// decision another instance made.
+func (r *Registry) MarkCancelAckOwed(taskID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.live[taskID]
+	if !ok {
+		return fmt.Errorf("%w: cancel confirmation", ErrNoLiveEntry)
+	}
+	if e.CancelAckOwed {
+		return nil
+	}
+	e.CancelAckOwed = true
+	r.live[taskID] = e
+	if r.shared != nil {
+		owed := true
+		return r.mergeNow(taskID, e, EntryPatch{CancelAckOwed: &owed})
+	}
+	r.persist(taskID, e)
+	return nil
+}
+
+// ClearCancelAckOwed drops the confirmation debt: either Foreman sent it or the
+// daemon's own confirmation landed first (§4.6 兜底一, "daemon 已确认则不代发").
+// A missing entry or an absent marker is a no-op.
+func (r *Registry) ClearCancelAckOwed(taskID string) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.live[taskID]
+	if !ok || !e.CancelAckOwed {
+		return
+	}
+	e.CancelAckOwed = false
+	r.live[taskID] = e
+	if r.shared != nil {
+		owed := false
+		r.mergeShared(taskID, e, EntryPatch{CancelAckOwed: &owed})
+		return
+	}
+	r.persist(taskID, e)
+}
+
 // RegisterDecidedReport records body as the instance's decided terminal body
 // unless one is already registered — the first decision wins, so a replay, a
 // compensation or a late report can never displace the body its verdict was

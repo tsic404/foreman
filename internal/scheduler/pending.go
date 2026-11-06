@@ -82,6 +82,15 @@ type pendingReport struct {
 	// the projection is rebuilt from it after a restart; the body is never
 	// the source (an inbound failure body carries the same key).
 	FailureReason string `json:"failure_reason,omitempty"`
+	// Synthetic marks a confirmation Foreman synthesized on the daemon's
+	// behalf (§4.6 兜底一) instead of one the daemon reported. It is durable
+	// and replayed like any other entry, but it never holds the Job deletion
+	// back: it states that the instance's pods are gone, not that a verdict is
+	// still waiting for delivery, and the cancel path's 60s deletion bound must
+	// not move with it. It is also why a replay sends the queued body rather
+	// than the instance's decided verdict body (§4.4): C11 carries a
+	// confirmation, never a verdict.
+	Synthetic bool `json:"synthetic,omitempty"`
 }
 
 var taskIDFileChars = regexp.MustCompile(`^[a-zA-Z0-9-]+$`)
@@ -232,6 +241,19 @@ func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReport
 // see — an unlistable queue directory, a carrier backlog the rebuild has not
 // landed — reads as reached, never as room (unknown is not empty, §4.3).
 func (p *PendingReports) Enqueue(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string) error {
+	return p.enqueue(ctx, taskID, jobName, daemonID, workspaceID, ep, body, failureReason, false)
+}
+
+// EnqueueSynthetic lands a confirmation Foreman synthesized on the daemon's
+// behalf (§4.6 兜底一). It is durable and replayed exactly like a report the
+// daemon sent — the server's pending confirmation survives a process exit only
+// because this entry does — with one difference that rides the entry: it never
+// holds the Job deletion back (see pendingReport.Synthetic).
+func (p *PendingReports) EnqueueSynthetic(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte) error {
+	return p.enqueue(ctx, taskID, jobName, daemonID, workspaceID, ep, body, "", true)
+}
+
+func (p *PendingReports) enqueue(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string, synthetic bool) error {
 	p.mu.Lock()
 	// A report the queue already holds — staged, carrier-backed, or on disk —
 	// is a replacement (§4.6): it never grows the queue, so it is admitted
@@ -276,6 +298,7 @@ func (p *PendingReports) Enqueue(ctx context.Context, taskID, jobName, daemonID,
 		Body:          json.RawMessage(bytes.Clone(body)),
 		EnqueuedAt:    p.now(),
 		FailureReason: failureReason,
+		Synthetic:     synthetic,
 	}
 	p.inheritClockLocked(&rep)
 	var diskErr error
@@ -344,6 +367,7 @@ func (p *PendingReports) persistCarrier(ctx context.Context, rep pendingReport) 
 		EnqueuedAt:    rep.EnqueuedAt,
 		Attempts:      rep.Attempts,
 		FailureReason: rep.FailureReason,
+		Synthetic:     rep.Synthetic,
 	}
 	if n := carrier.sizeBytes(); n > MaxCarrierBytes {
 		// Registered boundary: the report is kept in process memory and the
@@ -786,7 +810,40 @@ func (p *PendingReports) queuedKnownLocked(taskID string) bool {
 // completed, the queue's state is unknown, and "unknown" must never read as
 // "empty" (§4.3). A task may hold a queued report the rebuild has not seen
 // yet, so every task reads as queued until the list lands.
+//
+// A synthesized confirmation does not hold the Job back (§4.6 兜底一): it
+// reports that the instance's pods are gone, not that a verdict awaits
+// delivery, so the cancel path's 60s deletion bound never moves with it. The
+// entry's own shape decides — the disk and staging faces carry it; a
+// carrier-backed id with neither face is read as gating, because the
+// conservative answer only delays a deletion the drain settles in one round.
+//
+// This is the Job gate and nothing else. Membership questions — does a queue
+// face still hold a report for this task, which is what the carrier sweep
+// asks — go through heldByQueueLocked: reading a synthesized confirmation as
+// "no entry" would sweep its carrier and lose the confirmation on the next
+// reschedule.
 func (p *PendingReports) queuedLocked(taskID string) bool {
+	if !p.restored {
+		return true
+	}
+	if rep, ok := p.staged[taskID]; ok {
+		return !rep.Synthetic
+	}
+	if validTaskID(taskID) {
+		if rep, ok := p.readLocked(taskID); ok {
+			return !rep.Synthetic
+		}
+	}
+	return p.carrierBacked[taskID]
+}
+
+// heldByQueueLocked answers the membership question: does any queue face still
+// hold a report for taskID, whatever its kind? A synthesized confirmation is a
+// member like any other entry — only queuedLocked, the Job gate, treats it
+// differently. An uncompleted carrier list reads every task as held (§4.3), so
+// a sweep before the rebuild deletes nothing.
+func (p *PendingReports) heldByQueueLocked(taskID string) bool {
 	if !p.restored {
 		return true
 	}
@@ -964,13 +1021,16 @@ func (p *PendingReports) deleteCarrierLocked(ctx context.Context, taskID string)
 
 // SweepCarrier deletes one listed carrier object when no queue entry holds
 // its task — the sweep's only criterion (§6.5: carriers are swept by
-// settlement, never by the retention bound or by Job absence). The membership
-// check and the delete take the task's carrier lock with the carrier writes,
-// so an enqueue that lands in between cannot adopt the object this sweep
-// removes. An uncompleted carrier list reads every task as queued (§4.3), so a
-// sweep before the rebuild deletes nothing. It reports whether the object
-// went. The delete targets the listed name, not a name derived from the task
-// id: the name form is not a selection surface (§6.5, ADR-046 decision 1).
+// settlement, never by the retention bound or by Job absence). Membership is
+// the question, so a synthesized confirmation counts as held: it is undelivered
+// and its carrier is the only face that survives a reschedule (heldByQueueLocked;
+// the Job gate's narrower answer is not this question). The membership check
+// and the delete take the task's carrier lock with the carrier writes, so an
+// enqueue that lands in between cannot adopt the object this sweep removes. An
+// uncompleted carrier list reads every task as held (§4.3), so a sweep before
+// the rebuild deletes nothing. It reports whether the object went. The delete
+// targets the listed name, not a name derived from the task id: the name form
+// is not a selection surface (§6.5, ADR-046 decision 1).
 func (p *PendingReports) SweepCarrier(ctx context.Context, taskID, name string) (bool, error) {
 	if p.carriers == nil {
 		return false, nil
@@ -978,9 +1038,9 @@ func (p *PendingReports) SweepCarrier(ctx context.Context, taskID, name string) 
 	unlock := p.carrierLocks.Lock(taskID)
 	defer unlock()
 	p.mu.Lock()
-	queued := p.queuedLocked(taskID)
+	held := p.heldByQueueLocked(taskID)
 	p.mu.Unlock()
-	if queued {
+	if held {
 		return false, nil
 	}
 	if err := p.carriers.DeleteCarrier(ctx, name); err != nil {
@@ -1022,6 +1082,7 @@ func (p *PendingReports) Restore(ctx context.Context) error {
 			EnqueuedAt:    c.EnqueuedAt,
 			Attempts:      c.Attempts,
 			FailureReason: c.FailureReason,
+			Synthetic:     c.Synthetic,
 		}
 		if rep.TaskID == "" || rep.Endpoint == "" {
 			p.log.Error("pending carrier malformed",
