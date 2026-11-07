@@ -76,8 +76,9 @@ spec:
       # loopback, waits for it, pulls the model (a no-op when the volume
       # already carries it), and lets the trap stop it before the main
       # container binds the port. Other tags of the same family are removed:
-      # the agent's selector is the untagged family (omp resolves it fuzzily
-      # after discovery), so a leftover tag would make that match ambiguous.
+      # the agent's selector is the full served tag, and leaving a second tag
+      # of the family beside it would make the engine's catalog ambiguous for
+      # a selector that names only one of them.
       initContainers:
         - name: pull
           image: ollama/ollama:0.40.11
