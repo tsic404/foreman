@@ -128,6 +128,15 @@ type Snapshot struct {
 	DecidedReport []byte          `json:"decided_report,omitempty"`
 	TokenHash     string          `json:"token_hash,omitempty"`
 
+	// CancelAckOwed is the debt the cancellation on the daemon's behalf left
+	// behind (§4.6 兜底一): the server holds the verdict and waits for the
+	// confirmation the daemon never sent. A restart between the verdict and
+	// the instance's last pod is exactly the window this row must survive, so
+	// the marker is part of the mapping record and not process memory. It is a
+	// flag, not a body: the settled record and the projection stay untouched.
+	// The key is always present — the row's shape is one shape.
+	CancelAckOwed bool `json:"cancel_ack_owed"`
+
 	// The claim-time dispatch record (§4.1's non-projected fields). A
 	// restored pre-delivery entry keeps renewing its prepare lease (C4) and
 	// translating S8/S26 through the runtime it was dispatched under; without
@@ -193,6 +202,7 @@ func FromEntry(e registry.TaskEntry) Snapshot {
 		Payload:             e.Payload,
 		DecidedReport:       e.DecidedReport,
 		TokenHash:           e.TokenHash,
+		CancelAckOwed:       e.CancelAckOwed,
 		RealRuntimeID:       e.RealRuntimeID,
 		RuntimeIdentity:     e.RuntimeIdentity,
 		AgentName:           e.AgentName,
@@ -241,6 +251,7 @@ func (s Snapshot) ToEntry() registry.TaskEntry {
 		Payload:             s.Payload,
 		DecidedReport:       s.DecidedReport,
 		TokenHash:           s.TokenHash,
+		CancelAckOwed:       s.CancelAckOwed,
 		RealRuntimeID:       s.RealRuntimeID,
 		RuntimeIdentity:     s.RuntimeIdentity,
 		AgentName:           s.AgentName,

@@ -55,6 +55,10 @@ const (
 	// an inbound failure body also carries the key, and reading it from there
 	// would mislabel a server-side verdict.
 	carrierKeyFailureReason = "failure_reason"
+	// carrierKeySynthetic marks the confirmation Foreman sent on the daemon's
+	// behalf (§4.6 兜底一): a rebuilt queue keeps the entry's Job-gate shape
+	// only if the marker survives with it.
+	carrierKeySynthetic = "synthetic"
 )
 
 // ErrCarrierPayloadTooLarge reports a report the carrier object cannot hold.
@@ -94,6 +98,10 @@ type Carrier struct {
 	// a failure Foreman judged itself (§4.1). Empty for a report the server
 	// decided.
 	FailureReason string
+	// Synthetic marks the confirmation Foreman sent on the daemon's behalf
+	// (§4.6 兜底一). It rides the object because a rebuilt queue must keep
+	// answering the Job gate with the same shape the entry was written with.
+	Synthetic bool
 }
 
 // CarrierStore is the K8s Secret face the pending-report queue persists
@@ -137,6 +145,10 @@ func (c Carrier) data() map[string][]byte {
 		carrierKeyEnqueuedAt:    []byte(c.EnqueuedAt.UTC().Format(time.RFC3339Nano)),
 		carrierKeyAttempts:      []byte(strconv.Itoa(c.Attempts)),
 		carrierKeyFailureReason: []byte(c.FailureReason),
+		// The key is always present so the object's shape stays one shape: a
+		// daemon-reported entry and a synthesized confirmation differ in the
+		// value, never in which keys the rebuild can read.
+		carrierKeySynthetic: []byte(strconv.FormatBool(c.Synthetic)),
 	}
 }
 
@@ -229,6 +241,7 @@ func (s *secretCarrierStore) ListCarriers(ctx context.Context) ([]Carrier, error
 			Endpoint:      string(data[carrierKeyEndpoint]),
 			Body:          data[carrierKeyBody],
 			FailureReason: string(data[carrierKeyFailureReason]),
+			Synthetic:     string(data[carrierKeySynthetic]) == "true",
 		}
 		if raw := string(data[carrierKeyEnqueuedAt]); raw != "" {
 			if at, perr := time.Parse(time.RFC3339Nano, raw); perr == nil {

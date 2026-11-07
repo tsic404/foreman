@@ -17,6 +17,11 @@ type EntryPatch struct {
 	Result         *string
 	FailureReason  *string
 	TokenHash      *string
+	// CancelAckOwed carries the cancel-confirmation debt (§4.6 兜底一). It is
+	// a fact about the entry's own termination, not a gate field: it never
+	// moves state, the verdict, the start fact or the delivery accounting, so
+	// a late merge of it cannot revert a decision another instance made.
+	CancelAckOwed *bool
 }
 
 // SlotRetirement names one reservation marker whose in-flight slot a claim's

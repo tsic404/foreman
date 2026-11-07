@@ -224,6 +224,7 @@ var tcPayloadProjectionKeys = []string{
 // 未完成创建的接续): the render must reproduce the row's job_name.
 var tcPayloadSnapshotKeys = []string{
 	"agent_id", "agent_name", "attempt", "autopilot_run_id", "boot_deadline",
+	"cancel_ack_owed",
 	"chat_session_id", "claims_after_delivery", "claimed_at",
 	"completed_at", "daemon_id", "daemon_registered_at", "decided_report",
 	"delivered_at", "deliveries", "delivery_deadline", "drain_deadline",
@@ -240,7 +241,7 @@ var tcPayloadSnapshotKeys = []string{
 // design-registered face that carries the verdict body.
 var tcPayloadCarrierKeys = []string{
 	"attempts", "body", "daemon_id", "endpoint", "enqueued_at",
-	"failure_reason", "job_name", "task_id", "workspace_id",
+	"failure_reason", "job_name", "synthetic", "task_id", "workspace_id",
 }
 
 // tcPayloadCarrierLabelKeys is the carrier's label set (§6.5: 角色标签（载体）

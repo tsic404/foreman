@@ -728,8 +728,10 @@ func (r *Reconciler) settleCancelled(ctx context.Context, e registry.TaskEntry) 
 		"cancel_ack_timeout_seconds", r.cancelAckTimeout.Seconds())
 	delete(r.cancels, e.TaskID)
 	// cancelled is already terminal server-side: no fail report, but the
-	// verdict still starts the drain (ADR-017 路径 ④).
-	return r.settler.SettleTerminal(ctx, e.TaskID, string(registry.ResultCancelled))
+	// verdict still starts the drain (ADR-017 路径 ④). The confirmation the
+	// daemon never sent becomes Foreman's and follows once the instance's
+	// pods are gone (§4.6 兜底一).
+	return r.settler.SettleCancelled(ctx, e.TaskID)
 }
 
 // reportSuspects flags every live task whose daemon has been silent on both

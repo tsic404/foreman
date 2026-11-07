@@ -1404,6 +1404,12 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			// retry: the write-ahead entry goes, and the Job goes now (the
 			// convergence round would delete it anyway).
 			s.pendingReports.Drop(ctx, e.TaskID)
+			if ep == EPCancelAck {
+				// The daemon confirmed its own cancellation, so the debt a
+				// settle-on-its-behalf recorded is settled by this arrival and
+				// Foreman never synthesizes a second confirmation (§4.6 兜底一).
+				s.reg.ClearCancelAckOwed(e.TaskID)
+			}
 			if code == 404 && undecided {
 				// §4.4's in-place decision: the server no longer holds the
 				// task, so nothing is writable. A report that was still
@@ -1863,6 +1869,42 @@ func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) e
 	return s.settleTerminalLocked(ctx, taskID, result)
 }
 
+// SettleCancelled converges a cancelled entry whose daemon never confirmed the
+// cancellation (§4.6 兜底一): the verdict is already server-side, so no report
+// is sent, but the confirmation the daemon owes becomes Foreman's and is
+// recorded on the entry before the verdict — a restart between the two must
+// still know who owes it. The confirmation itself follows once the instance's
+// pods have all terminated (OnJobTerminated); a daemon confirmation that lands
+// first clears the debt.
+func (s *Scheduler) SettleCancelled(ctx context.Context, taskID string) error {
+	unlock, err := s.lockTaskFor(ctx, taskID)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	if !s.pendingReports.Rebuilt() {
+		return nil
+	}
+	e, ok := s.reg.Get(taskID)
+	if !ok {
+		return nil
+	}
+	if !e.IsTerminal() {
+		// Only an entry this path decides owes the confirmation: a terminal
+		// one was decided by the daemon's own report (or an earlier settle),
+		// and re-recording the debt would send a second confirmation.
+		if err := s.reg.MarkCancelAckOwed(taskID); err != nil {
+			// The marker's only durable face failed: this process still knows,
+			// so the settlement proceeds — a restart degrades to the
+			// pre-existing behaviour (the server's pending confirmation waits
+			// for a human).
+			s.log.ErrorContext(ctx, "task.cancel_ack_owed_unrecorded",
+				"task_id", taskID, "err", err)
+		}
+	}
+	return s.settleTerminalLocked(ctx, taskID, string(registry.ResultCancelled))
+}
+
 // settleTerminalLocked is SettleTerminal for callers that already hold the
 // task's lock: the S8 answer round (OnStartRejected) and the Job compensation
 // (FailJob).
@@ -2096,6 +2138,14 @@ func (s *Scheduler) discardQuietly(ctx context.Context, e registry.TaskEntry) bo
 // under names that may not even be legal.
 func (s *Scheduler) reclaimObjectless(ctx context.Context, e registry.TaskEntry) error {
 	s.revokeCredential(ctx, e)
+	// The confirmation debt is settled here too (§4.6 兜底一): this instance
+	// never produced a Job or a Pod, so no process ever ran under the task and
+	// there is no termination fact to wait for — the design counts "never
+	// created" with "objects gone". Dropping the entry without this would
+	// leave the server waiting on a confirmation that no longer has an owner.
+	if e.CancelAckOwed {
+		s.synthesizeCancelAck(ctx, e, time.Time{})
+	}
 	drainSeconds := s.drainSeconds(e.TaskID)
 	if err := s.reg.Delete(e.TaskID); err != nil {
 		return err
@@ -2179,7 +2229,17 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 			"task_id", e.TaskID, "job_name", jobName, "err", err)
 		return err
 	}
-	// ③ The entry goes last.
+	// ③ The cancellation the daemon never confirmed is Foreman's to confirm
+	// once the instance is provably gone (§4.6 兜底一). It is written ahead of
+	// the entry's removal: the entry is the debt's only in-cluster record, and
+	// the job_terminated verdict is the only one that carries it. A drain
+	// upper bound that expires with pods still alive reaches here with
+	// reason=drain_timeout and synthesizes nothing — there is no "the process
+	// is dead" fact to report.
+	if e.CancelAckOwed && reason == JobTerminationReasonJobTerminated {
+		s.synthesizeCancelAck(ctx, e, podTerminatedAt)
+	}
+	// ④ The entry goes last.
 	if err := s.reg.Delete(e.TaskID); err != nil {
 		return err
 	}
@@ -2213,6 +2273,74 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 		}
 	}
 	return nil
+}
+
+// cancelAckConfirmation is the C11 body Foreman sends for a cancellation the
+// daemon never confirmed (§4.6 兜底一): the endpoint's minimal positive
+// confirmation — one field, true. No verdict is restated and nothing is
+// fabricated: there is no branch, session, error text or failure attribution
+// in it.
+var cancelAckConfirmation = []byte(`{"process_cleanup_confirmed":true}`)
+
+// synthesizeCancelAck emits the confirmation Foreman owes after a cancellation
+// it settled on the daemon's behalf (§4.6 兜底一). The caller has established
+// the only admissible premise — the Job instance's pods have all terminated,
+// including their objects being gone — and holds the task lock.
+//
+// The queue entry is written before the forward: it is what survives a process
+// exit between the forward and the entry's removal, and the drain replays it
+// with the settlement every terminal report gets (2xx / 404 / 409 delivered,
+// permanent 4xx dropped with an error). A forward that settles drops it back
+// out in the same step.
+func (s *Scheduler) synthesizeCancelAck(ctx context.Context, e registry.TaskEntry, podTerminatedAt time.Time) {
+	forward := s.server.Forward
+	if e.WorkspaceID != "" {
+		forward = func(ctx context.Context, ep Endpoint, taskID string, body []byte) (int, []byte, error) {
+			return s.server.ForwardInWorkspace(ctx, ep, taskID, e.WorkspaceID, body)
+		}
+	}
+	queued := s.pendingReports.EnqueueSynthetic(ctx, e.TaskID, e.JobName, e.DaemonID, e.WorkspaceID, EPCancelAck, cancelAckConfirmation) == nil
+	if queued {
+		// The durable record exists; keeping the entry marker too would only
+		// re-enqueue the same confirmation if this teardown is retried.
+		s.reg.ClearCancelAckOwed(e.TaskID)
+	}
+	podField := ""
+	if !podTerminatedAt.IsZero() {
+		podField = podTerminatedAt.UTC().Format(time.RFC3339)
+	}
+	code, _, err := forward(ctx, EPCancelAck, e.TaskID, cancelAckConfirmation)
+	switch {
+	case err != nil:
+		// The proxy's retry budget is spent: the queued entry replays it, and
+		// losing it degrades to the pre-existing behaviour (the server's
+		// pending confirmation waits for a human).
+		s.log.WarnContext(ctx, "task.cancel_ack_synthesized",
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+			"workspace_id", e.WorkspaceID, "pod_terminated_at", podField,
+			"queued", queued, "status", 0, "err", err)
+	case terminalReportDelivered(code):
+		s.pendingReports.Drop(ctx, e.TaskID)
+		s.reg.ClearCancelAckOwed(e.TaskID)
+		s.log.InfoContext(ctx, "task.cancel_ack_synthesized",
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+			"workspace_id", e.WorkspaceID, "pod_terminated_at", podField,
+			"queued", queued, "status", code)
+	case permanentTerminalRejection(code):
+		s.pendingReports.Drop(ctx, e.TaskID)
+		s.reg.ClearCancelAckOwed(e.TaskID)
+		s.log.ErrorContext(ctx, "task.cancel_ack_synthesized",
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+			"workspace_id", e.WorkspaceID, "pod_terminated_at", podField,
+			"queued", queued, "status", code, "reason", "permanent_4xx")
+	default:
+		// 5xx / 408 / 429: the queued entry owns the retry, like every other
+		// terminal report's transient failure.
+		s.log.WarnContext(ctx, "task.cancel_ack_synthesized",
+			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+			"workspace_id", e.WorkspaceID, "pod_terminated_at", podField,
+			"queued", queued, "status", code)
+	}
 }
 
 // drainSeconds is the time between the task's verdict and its credential
@@ -3021,8 +3149,13 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, work
 		}
 		return code, resp, err
 	}
-	if decided, ok := s.reg.DecidedReport(taskID); ok {
-		body = decided
+	// C11 is a confirmation, not a verdict: the instance's decided verdict
+	// body never stands for it, or a synthesized confirmation would be
+	// replayed as whatever body decided the task (§4.6 兜底一).
+	if ep != EPCancelAck {
+		if decided, ok := s.reg.DecidedReport(taskID); ok {
+			body = decided
+		}
 	}
 	code, resp, err := s.server.Forward(ctx, ep, taskID, body)
 	if err != nil {
@@ -3033,6 +3166,12 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, work
 	}
 	switch {
 	case terminalReportDelivered(code):
+		if ep == EPCancelAck {
+			// Accepted (2xx / 404 / 409) means the confirmation is settled
+			// server-side, whoever sent it: the debt a settle-on-the-daemon's-
+			// behalf recorded dies with this replay (§4.6 兜底一).
+			s.reg.ClearCancelAckOwed(taskID)
+		}
 		if code == 404 {
 			// §4.4's in-place decision: the server no longer holds the task.
 			// The verdict is re-read under the task lock after the forward: the
