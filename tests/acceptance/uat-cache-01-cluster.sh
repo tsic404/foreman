@@ -1,11 +1,13 @@
 #!/bin/sh
 # TC-uat-cache-01 — G5: a repeated task on the same node does not re-clone the
 # repository. The design's authoritative face for "reuse, not a full clone" is
-# the node cache object's creation instant versus the second pod's start
-# instant (AC-12); the technical carrier owns that judgement and this case adds
+# the node cache object's existence before the second pod started (AC-12); the
+# creation instant is established by the carrier's mark, and the technical
+# carrier owns that judgement (`tech-cache-01-cluster.sh mark`). This case adds
 # the user-visible half — the first task completed and the repeated task ran on
 # the same node without a fresh clone.
 #
+#   TASK1=<id> ./tech-cache-01-cluster.sh mark   # TASK1 settled, before TASK2
 #   TASK1=<id> TASK2=<id> ./uat-cache-01-cluster.sh
 #
 # No Job is read: TASK1 has already settled and its Job is gone with the

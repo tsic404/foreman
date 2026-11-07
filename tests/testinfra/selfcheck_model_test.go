@@ -26,10 +26,32 @@ case " $* " in
 	printf 'deployment.apps/%s\n' "$TEST_MULTICA_INSTANCE"
 	;;
 *" -n $TEST_MULTICA_INSTANCE_NS get deploy $TEST_MULTICA_INSTANCE -o jsonpath="*)
-	printf '%s' "$TEST_MULTICA_ACCESS_URL"
+	case " $* " in
+	*MULTICA_SERVER_URL*) printf '%s' "$TEST_MULTICA_ACCESS_URL" ;;
+	*FOREMAN_JOB_IMAGE*) printf '%s' "$JOB_IMAGE" ;;
+	*) printf '' ;;
+	esac
+	;;
+*" get pod test-multica-job-daemon-version -o jsonpath="*)
+	printf 'Succeeded'
+	;;
+*" logs test-multica-job-daemon-version "* | *" logs test-multica-job-daemon-version")
+	printf '{"version":"%s"}' "${JOB_DAEMON_VERSION:-}"
+	;;
+*" delete pod test-multica-job-daemon-version "* | *" apply -f "*)
 	;;
 *" -n $TEST_MULTICA_NS get deploy $TEST_MULTICA_MODEL_DEPLOY -o jsonpath="*)
 	printf '%s' "${LOCAL_MODEL:-}"
+	;;
+*" -n $TEST_MULTICA_NS get deploy $TEST_MULTICA_SCRIPTED_DEPLOY -o jsonpath="*)
+	printf '%s' "${SCRIPTED_MODEL:-}"
+	;;
+*" exec deploy/$TEST_MULTICA_SCRIPTED_DEPLOY "*)
+	[ -z "${SCRIPTED_PROBE_FAILS:-}" ] || {
+		printf 'error: the scripted backend is not answering\n' >&2
+		exit 1
+	}
+	printf '%s\n' "${SCRIPTED_MODEL:-}"
 	;;
 *" exec deploy/$TEST_MULTICA_MODEL_DEPLOY "*)
 	[ -z "${OLLAMA_LIST_FAILS:-}" ] || {
@@ -70,8 +92,10 @@ func TestSelfcheckChecksTheSelectedModelSource(t *testing.T) {
 		}
 	})
 
-	t.Run("local backend serves", func(t *testing.T) {
-		run := runSelfcheck(t, "LOCAL_MODEL=qwen2.5:0.5b")
+	local := "TEST_MULTICA_MODEL_LOCAL_SOURCE=ollama"
+
+	t.Run("local engine serves", func(t *testing.T) {
+		run := runSelfcheck(t, local, "LOCAL_MODEL=qwen2.5:0.5b")
 		if run.exit != 0 {
 			t.Fatalf("selfcheck exited %d with a serving local backend\n--- output ---\n%s", run.exit, run.output)
 		}
@@ -84,8 +108,8 @@ func TestSelfcheckChecksTheSelectedModelSource(t *testing.T) {
 		}
 	})
 
-	t.Run("local backend not serving", func(t *testing.T) {
-		run := runSelfcheck(t, "LOCAL_MODEL=qwen2.5:0.5b", "OLLAMA_LIST_FAILS=1")
+	t.Run("local engine not serving", func(t *testing.T) {
+		run := runSelfcheck(t, local, "LOCAL_MODEL=qwen2.5:0.5b", "OLLAMA_LIST_FAILS=1")
 		if run.exit != 2 {
 			t.Fatalf("selfcheck exited %d, want the blocked code 2\n--- output ---\n%s", run.exit, run.output)
 		}
@@ -94,12 +118,39 @@ func TestSelfcheckChecksTheSelectedModelSource(t *testing.T) {
 		}
 	})
 
-	t.Run("no model source", func(t *testing.T) {
+	t.Run("scripted backend serves", func(t *testing.T) {
 		run := runSelfcheck(t)
+		if run.exit != 0 {
+			t.Fatalf("selfcheck exited %d with the scripted backend serving\n--- output ---\n%s", run.exit, run.output)
+		}
+		want := "④ ok: scripted backend serves " + scriptedModelID
+		if !strings.Contains(run.output, want) {
+			t.Errorf("output does not carry %q\n--- output ---\n%s", want, run.output)
+		}
+		if !strings.Contains(run.kubectl, "exec deploy/test-multica-scripted") {
+			t.Errorf("the default gate did not probe the scripted backend it serves:\n%s", run.kubectl)
+		}
+		if strings.Contains(run.kubectl, "exec deploy/test-multica-ollama") {
+			t.Errorf("the default gate probed the ollama engine the round does not serve:\n%s", run.kubectl)
+		}
+	})
+
+	t.Run("scripted backend not answering", func(t *testing.T) {
+		run := runSelfcheck(t, "SCRIPTED_PROBE_FAILS=1")
 		if run.exit != 2 {
 			t.Fatalf("selfcheck exited %d, want the blocked code 2\n--- output ---\n%s", run.exit, run.output)
 		}
-		if want := "carries no OLLAMA_MODEL"; !strings.Contains(run.output, want) {
+		if want := "④ the scripted backend is not serving"; !strings.Contains(run.output, want) {
+			t.Errorf("output does not carry %q\n--- output ---\n%s", want, run.output)
+		}
+	})
+
+	t.Run("no model source", func(t *testing.T) {
+		run := runSelfcheck(t, "SCRIPTED_MODEL=")
+		if run.exit != 2 {
+			t.Fatalf("selfcheck exited %d, want the blocked code 2\n--- output ---\n%s", run.exit, run.output)
+		}
+		if want := "carries no SCRIPTED_MODEL_ID"; !strings.Contains(run.output, want) {
 			t.Errorf("output does not carry %q\n--- output ---\n%s", want, run.output)
 		}
 	})
@@ -149,22 +200,27 @@ func runSelfcheck(t *testing.T, env ...string) selfcheckRun {
 	}
 
 	values := map[string]string{
-		"PATH":                         binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
-		"HOME":                         homeDir,
-		"TMPDIR":                       dir,
-		"KUBECTL_LOG":                  kubectlLog,
-		"LOCAL_MODEL":                  "",
-		"TEST_MULTICA_PROFILE":         "test-multica",
-		"TEST_MULTICA_SERVER_URL":      "http://127.0.0.1:30080",
-		"TEST_MULTICA_ACCESS_URL":      "http://test-multica-server.multica-test.svc:8080",
-		"TEST_MULTICA_NS":              "multica-test",
-		"TEST_MULTICA_MODEL_DEPLOY":    "test-multica-ollama",
-		"TEST_MULTICA_INSTANCE_NS":     "foreman",
-		"TEST_MULTICA_INSTANCE":        "foreman",
-		"TEST_MULTICA_KUBECTL_RETRIES": "1",
-		"TEST_MULTICA_MODEL_BASE_URL":  "",
-		"TEST_MULTICA_MODEL_ID":        "",
-		"TEST_MULTICA_MODEL_API_KEY":   "",
+		"PATH":                            binDir + string(os.PathListSeparator) + os.Getenv("PATH"),
+		"HOME":                            homeDir,
+		"TMPDIR":                          dir,
+		"KUBECTL_LOG":                     kubectlLog,
+		"LOCAL_MODEL":                     "",
+		"SCRIPTED_MODEL":                  scriptedModelID,
+		"JOB_IMAGE":                       "ghcr.io/tsic404/foreman-job:latest",
+		"JOB_DAEMON_VERSION":              "0.8.0",
+		"TEST_MULTICA_PROFILE":            "test-multica",
+		"TEST_MULTICA_SERVER_URL":         "http://127.0.0.1:30080",
+		"TEST_MULTICA_ACCESS_URL":         "http://test-multica-server.multica-test.svc:8080",
+		"TEST_MULTICA_NS":                 "multica-test",
+		"TEST_MULTICA_MODEL_DEPLOY":       "test-multica-ollama",
+		"TEST_MULTICA_SCRIPTED_DEPLOY":    "test-multica-scripted",
+		"TEST_MULTICA_MODEL_LOCAL_SOURCE": "scripted",
+		"TEST_MULTICA_INSTANCE_NS":        "foreman",
+		"TEST_MULTICA_INSTANCE":           "foreman",
+		"TEST_MULTICA_KUBECTL_RETRIES":    "1",
+		"TEST_MULTICA_MODEL_BASE_URL":     "",
+		"TEST_MULTICA_MODEL_ID":           "",
+		"TEST_MULTICA_MODEL_API_KEY":      "",
 	}
 	for _, kv := range env {
 		key, value, _ := strings.Cut(kv, "=")
@@ -193,4 +249,48 @@ func runSelfcheck(t *testing.T, env ...string) selfcheckRun {
 		t.Fatalf("read the kubectl log: %v", err)
 	}
 	return selfcheckRun{output: combined.String(), kubectl: string(kubectl), exit: exit}
+}
+
+// TestSelfcheckRefusesADaemonBelowTheOmpContract pins gate ⑤: the Job image's
+// daemon must carry the argv omp accepts. Up to v0.6.1 the daemon passes
+// `--session <path>`, which omp reads as a resume of the empty file it was
+// just given — every task then dies before its first turn. The gate reads the
+// version out of the image's own binary, so a moving tag cannot pass it.
+func TestSelfcheckRefusesADaemonBelowTheOmpContract(t *testing.T) {
+	t.Run("the pre-0.6.2 daemon is refused with the root cause", func(t *testing.T) {
+		run := runSelfcheck(t, "JOB_DAEMON_VERSION=0.6.1")
+		if run.exit == 0 {
+			t.Fatalf("selfcheck accepted a daemon that starts omp with --session\n--- output ---\n%s", run.output)
+		}
+		for _, want := range []string{
+			"⑤ Job image",
+			"carries multica 0.6.1",
+			"--session <path>",
+			"agent_error.process_failure",
+		} {
+			if !strings.Contains(run.output, want) {
+				t.Errorf("the refusal does not name %q\n--- output ---\n%s", want, run.output)
+			}
+		}
+	})
+
+	t.Run("the floor itself passes", func(t *testing.T) {
+		run := runSelfcheck(t, "JOB_DAEMON_VERSION=0.6.2")
+		if run.exit != 0 {
+			t.Fatalf("selfcheck refused the contract's floor version\n--- output ---\n%s", run.output)
+		}
+		if !strings.Contains(run.output, "⑤ ok: Job image") {
+			t.Errorf("the passing gate is not reported\n--- output ---\n%s", run.output)
+		}
+	})
+
+	t.Run("an image that does not answer is refused", func(t *testing.T) {
+		run := runSelfcheck(t, "JOB_DAEMON_VERSION=")
+		if run.exit == 0 {
+			t.Fatalf("selfcheck accepted an unreadable Job image\n--- output ---\n%s", run.output)
+		}
+		if !strings.Contains(run.output, "cannot read the daemon version out of Job image") {
+			t.Errorf("the refusal does not name the unreadable image\n--- output ---\n%s", run.output)
+		}
+	})
 }
