@@ -2,9 +2,12 @@
 // isolation face. The probe holds only its own Job Token, in its own Secret,
 // under its own daemon profile; it never enters the task mapping table, never
 // appears in /foreman/tasks and never consumes the in-flight budget. The two
-// literal substitutions are judged where §8.4 pins them — the mount-path face
-// and the volume-reference face (03-acceptance.md「模型目录」; contracts §6.3 /
-// §8.4).
+// literal substitutions are judged on the faces the reference template
+// expresses them on — the daemon's start line and prepare's script name the
+// probe's profile, and the volume-reference face carries the probe's Secret
+// (03-acceptance.md「模型目录」; contracts §6.3 / §8.4). The probe's profile
+// directory sits inside the probe's own credential volume, so isolation is
+// structural: the two Jobs never share a directory.
 package acceptance
 
 import (
@@ -144,18 +147,31 @@ func TestCatalog05ProbeCredentialAndIsolationFaces(t *testing.T) {
 		t.Errorf("inflight after the probe = %d, want the single claimed task (the probe is not a task)", got)
 	}
 
-	// The profile literal's judgement point is the rendered mount-path face
-	// (§8.4: not the command and args).
+	// The profile face: the credential volume is mounted at the profile root
+	// (both windows; the directory inside is what differs), and every place
+	// the reference template names the profile carries the probe's own name.
 	agent := pod.Containers[0]
-	if got := mountPathOf(t, agent.VolumeMounts, "cred"); got != "/home/agent/.multica/profiles/foreman-catalog/config.json" {
-		t.Errorf("cred mount = %q, want the probe profile's config path", got)
+	if got := mountPathOf(t, agent.VolumeMounts, "cred"); got != "/home/agent/.multica/profiles" {
+		t.Errorf("cred mount = %q, want the profile root", got)
+	}
+	daemonArgs := strings.Join(agent.Args, " ")
+	if !strings.Contains(daemonArgs, "--profile foreman-catalog") {
+		t.Errorf("probe daemon args = %q, want the probe profile", daemonArgs)
 	}
 	for _, container := range probeContainers(job) {
+		text := container.Name + " " + strings.Join(container.Command, " ") + " " + strings.Join(container.Args, " ")
+		if strings.Contains(text, "foreman-job") {
+			t.Errorf("container %s still carries the task profile literal: %q", container.Name, text)
+		}
 		for _, mount := range container.VolumeMounts {
-			if strings.Contains(mount.MountPath, "/profiles/foreman-job") {
+			if strings.Contains(mount.MountPath, "foreman-job") {
 				t.Errorf("container %s mount %q still carries the task profile literal", container.Name, mount.MountPath)
 			}
 		}
+	}
+	prepare := tcJob09Container(t, job.Spec.Template.Spec.InitContainers, "prepare")
+	if got := strings.Join(prepare.Args, " "); !strings.Contains(got, "/credout/foreman-catalog") {
+		t.Errorf("probe prepare args = %q, want the probe profile directory inside its credential volume", got)
 	}
 	// The credential Secret literal's judgement point is the volume-reference
 	// face (§8.4).

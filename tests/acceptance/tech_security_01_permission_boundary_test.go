@@ -131,10 +131,11 @@ func TestSecurity01PermissionBoundary(t *testing.T) {
 
 	// The ownership write itself (ADR-011 / AC-13): prepare chowns the three
 	// trees whose contents cross task boundaries — the home volume, the
-	// profile directory inside it and the workspaces tree. This literal is the
-	// only in-repo assertion that goes red when a chown target leaves the
-	// template; the published-template/fixture byte comparison cannot see it,
-	// because both copies would move together.
+	// workspaces tree and the Job's credential volume, which carries the
+	// profile directory (ADR-059). This literal is the only in-repo assertion
+	// that goes red when a chown target leaves the template; the
+	// published-template/fixture byte comparison cannot see it, because both
+	// copies would move together.
 	if len(prepare.Args) != 1 ||
 		!strings.Contains(prepare.Args[0], "chown -R 1000:1000 /home/agent /state/workspaces /credout") {
 		t.Errorf("prepare args = %v, want the ownership write over /home/agent, /state/workspaces and /credout (ADR-011 / AC-13)", prepare.Args)

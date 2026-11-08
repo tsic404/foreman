@@ -190,24 +190,7 @@ case $url in
 esac
 cat "$FAKE_TASK_JSON"
 `
-	// The node scripts run as root inside the debugger pod in production, so
-	// their ownership writes are outside the harness's rights. The shim runs
-	// in their place: it records the requested owner instead of applying it,
-	// which keeps the suite independent of the runner's chown rights and lets
-	// the case assert what owner the window ended with. FAKE_CHOWN_FAIL makes
-	// the write fail the way an unprivileged runner sees it, so the abort
-	// path that a swallowed `chown ... || true` would hide stays covered.
-	chown := `#!/bin/sh
-set -eu
-debug_dir=${FAKE_DEBUG_DIR:-$(dirname "$0")/debug}
-mkdir -p "$debug_dir"
-printf '%s\n' "$*" >>"$debug_dir/chown_calls"
-if [ "${FAKE_CHOWN_FAIL:-}" = "1" ]; then
-	echo "chown: changing ownership: Operation not permitted" >&2
-	exit 1
-fi
-`
-	for name, body := range map[string]string{"kubectl": kubectl, "curl": curl, "chown": chown} {
+	for name, body := range map[string]string{"kubectl": kubectl, "curl": curl} {
 		path := filepath.Join(bin, name)
 		if err := os.WriteFile(path, []byte(body), 0o755); err != nil {
 			t.Fatalf("write fake %s: %v", name, err)
@@ -277,8 +260,10 @@ func tcAuth05Require(t *testing.T, ok bool, format string, args ...any) {
 	}
 }
 
-// tcAuth05SeedPartition writes the two positions the carrier will turn into
-// anomalies and the originals it must put back.
+// tcAuth05SeedPartition writes the two node-side positions: the marker the
+// carrier turns into an anomaly, and a legacy profile directory from an earlier
+// release (ADR-059 decision 9) that the window must move aside and put back
+// untouched.
 func tcAuth05SeedPartition(t *testing.T, partition, label string) {
 	t.Helper()
 	tcAuth05WriteFile(t, filepath.Join(partition, ".multica", "profiles", "foreman-job", "keep"), label+" profile")
@@ -325,18 +310,21 @@ func tcAuth05WritePods(t *testing.T, path string, prepareExit int, agentRunning 
 	tcAuth05WriteFile(t, path, tcAuth05PodsJSON(prepareExit, state))
 }
 
-// tcAuth05HealPartition applies what the Job's prepare init container does to
-// the two shapes: the profile position becomes a directory again and the
-// marker path disappears. `verify` reads the healed tree from the node, so a
-// window whose pod actually ran must heal it before the read.
+// tcAuth05HealPartition applies what the Job's prepare init container does on
+// the node: `.multica` and its `profiles` child are directories, and the marker
+// path disappears. Nothing else is written there — the profile directory lives
+// in the pod's credential volume, so the node face stays without one. `verify`
+// reads that face from the node, so a window whose pod actually ran must show
+// the healed positions first.
 func tcAuth05HealPartition(t *testing.T, partition string) {
 	t.Helper()
-	profile := filepath.Join(partition, ".multica", "profiles", "foreman-job")
-	if err := os.RemoveAll(profile); err != nil {
-		t.Fatalf("heal the profile position: %v", err)
-	}
-	if err := os.MkdirAll(profile, 0o755); err != nil {
-		t.Fatalf("heal the profile position: %v", err)
+	for _, dir := range []string{
+		filepath.Join(partition, ".multica"),
+		filepath.Join(partition, ".multica", "profiles"),
+	} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("heal the directory position %s: %v", dir, err)
+		}
 	}
 	if err := os.RemoveAll(filepath.Join(partition, ".multica", "daemon_task_context.json")); err != nil {
 		t.Fatalf("heal the marker position: %v", err)
@@ -389,10 +377,11 @@ func TestAuth05ClusterCarrierSelectsWorkspacePartition(t *testing.T) {
 	tcAuth05Require(t, strings.Contains(out, "state=1|"), "prepare did not move the existing profile aside:\n%s", out)
 
 	profile := filepath.Join(partition, ".multica", "profiles", "foreman-job")
-	info, err := os.Stat(profile)
-	tcAuth05Require(t, err == nil && info.Mode().IsRegular(), "profile position is not a regular file: %v", err)
+	if _, err := os.Stat(profile); !os.IsNotExist(err) {
+		tcAuth05Require(t, false, "the window did not clear the legacy profile directory out of the home face: %v", err)
+	}
 	marker := filepath.Join(partition, ".multica", "daemon_task_context.json")
-	info, err = os.Stat(marker)
+	info, err := os.Stat(marker)
 	tcAuth05Require(t, err == nil && info.IsDir(), "marker position is not a directory: %v", err)
 	tcAuth05Require(t, tcAuth05MustRead(t, filepath.Join(marker, "nested", "marker")) == "anomaly\n",
 		"marker nested anomaly content changed")
@@ -736,7 +725,7 @@ func TestAuth05ClusterCarrierJudgesAfterTheAgentContainerIsRecycled(t *testing.T
 		tcAuth05Require(t, strings.Contains(out, "PASS: TC-tech-auth-05"), "verify did not PASS:\n%s", out)
 		tcAuth05Require(t, strings.Contains(out, "ended before an exec landed"),
 			"the verdict did not name the evidence it rested on:\n%s", out)
-		tcAuth05Require(t, strings.Contains(out, "carries the read-only 0400 credential mount"),
+		tcAuth05Require(t, strings.Contains(out, "rendered Job mounts the credential volume at the profile root"),
 			"the PASS did not name the rendered credential mount:\n%s", out)
 		profile := filepath.Join(partition, ".multica", "profiles", "foreman-job")
 		marker := filepath.Join(partition, ".multica", "daemon_task_context.json")
@@ -946,10 +935,18 @@ func TestAuth05ClusterCarrierRefusesNonReferenceJobShapes(t *testing.T) {
 			},
 		},
 		{
-			"no_three_path_heal",
-			"does not carry the three-path heal",
+			"no_profile_directory_in_the_credential_volume",
+			"does not create the profile directory inside the credential volume",
 			func(t *testing.T, job *batchv1.Job) {
-				tcAuth05PrepareArg(t, job, `[ -d "$d" ] || { rm -f "$d"; mkdir -p "$d"; }`, `[ -d "$d" ] || true`)
+				tcAuth05PrepareArg(t, job, "mkdir -p /credout/foreman-job", "true")
+			},
+		},
+		{
+			"no_node_face_heal",
+			"does not heal the node face's directory positions",
+			func(t *testing.T, job *batchv1.Job) {
+				tcAuth05PrepareArg(t, job,
+					`[ -d "$d" ] || { rm -f "$d"; mkdir -p "$d"; }`, `[ -d "$d" ]`)
 			},
 		},
 		{
@@ -961,21 +958,29 @@ func TestAuth05ClusterCarrierRefusesNonReferenceJobShapes(t *testing.T) {
 		},
 		{
 			"no_credential_mode",
-			"does not set the credential copy to 0400",
+			"does not set the credential copy in the profile volume to 0400",
 			func(t *testing.T, job *batchv1.Job) {
-				tcAuth05PrepareArg(t, job, "chmod 0400 /credout/config.json", "chmod 0644 /credout/config.json")
+				tcAuth05PrepareArg(t, job, "chmod 0400 /credout/foreman-job/config.json", "chmod 0644 /credout/foreman-job/config.json")
 			},
 		},
 		{
 			"no_credential_owner",
-			"does not own the credential copy as 1000:1000",
+			"does not own the credential volume as 1000:1000",
 			func(t *testing.T, job *batchv1.Job) {
-				tcAuth05PrepareArg(t, job, "chown -R 1000:1000", "chown -R 0:0")
+				tcAuth05PrepareArg(t, job, "chown -R 1000:1000 /home/agent /state/workspaces /credout", "chown -R 0:0 /home/agent /state/workspaces /credout")
 			},
 		},
 		{
-			"credential_not_the_single_file_mount",
-			"does not mount the credential as the single read-only file",
+			"no_profile_scope_declaration",
+			"does not carry the fixed profile-scope declaration",
+			func(t *testing.T, job *batchv1.Job) {
+				tcAuth05PrepareArg(t, job,
+					`echo "profile-relative state is per-Job and is not reused across tasks"`, "true")
+			},
+		},
+		{
+			"credential_not_at_the_profile_root",
+			"does not mount the credential volume at the profile root",
 			func(t *testing.T, job *batchv1.Job) {
 				for i := range job.Spec.Template.Spec.Containers {
 					agent := &job.Spec.Template.Spec.Containers[i]
@@ -984,7 +989,7 @@ func TestAuth05ClusterCarrierRefusesNonReferenceJobShapes(t *testing.T) {
 					}
 					for j := range agent.VolumeMounts {
 						if agent.VolumeMounts[j].Name == "cred" {
-							agent.VolumeMounts[j].MountPath = "/home/agent/.multica/profiles/foreman-job/other.json"
+							agent.VolumeMounts[j].MountPath = "/home/agent/.multica/profiles/foreman-job"
 							return
 						}
 					}
@@ -1057,25 +1062,20 @@ func TestAuth05ClusterCarrierRestoresPositionsThatWereAbsent(t *testing.T) {
 	tcAuth05Require(t, strings.Contains(out, "state=0||0|"),
 		"the install did not report both originals absent:\n%s", out)
 	profile := filepath.Join(partition, ".multica", "profiles", "foreman-job")
-	info, err := os.Stat(profile)
-	tcAuth05Require(t, err == nil && info.Mode().IsRegular(), "the profile anomaly was not installed: %v", err)
+	if _, err := os.Stat(profile); !os.IsNotExist(err) {
+		tcAuth05Require(t, false, "the window wrote a profile directory on the home face: %v", err)
+	}
 
 	out, code = tcAuth05RunCarrier(t, script, bin, env, "restore")
 	tcAuth05Require(t, code == 0, "restore exited %d:\n%s", code, out)
-	info, err = os.Stat(profile)
-	tcAuth05Require(t, err == nil && info.IsDir(), "the profile position was not restored to a directory: %v", err)
+	if _, err := os.Stat(profile); !os.IsNotExist(err) {
+		tcAuth05Require(t, false, "restore created a profile directory the window never had: %v", err)
+	}
 	if _, err := os.Stat(filepath.Join(partition, ".multica", "daemon_task_context.json")); !os.IsNotExist(err) {
 		t.Fatalf("the marker position survived restore: %v", err)
 	}
 	leftovers, _ := filepath.Glob(filepath.Join(partition, ".tc-auth-05-*"))
 	tcAuth05Require(t, len(leftovers) == 0, "restore left node-side state behind: %v", leftovers)
-	// Recreating the absent profile must still hand it to 1000:1000. In
-	// production that chown runs as root inside the debugger pod; the shim
-	// records the request in its place, so the case holds without the runner
-	// being able to chown to another user.
-	chowns := tcAuth05MustRead(t, filepath.Join(bin, "debug", "chown_calls"))
-	tcAuth05Require(t, strings.TrimSpace(chowns) == "1000:1000 "+profile,
-		"the recreated profile owner was %q, want 1000:1000 %s", chowns, profile)
 }
 
 // tcAuth05AbsentOriginalsWindow prepares a window on a home partition where
@@ -1109,42 +1109,6 @@ func tcAuth05AbsentOriginalsWindow(t *testing.T) (script, bin string, env map[st
 	return script, bin, env, stateDir, partition, profile
 }
 
-// The ownership write is the restore's only privileged step. When it fails the
-// node script must abort before its success line, the restore must report the
-// failed node, and the prepared state must survive for the operator's retry —
-// swallowing the failure would turn a half-restored node into a clean verdict.
-func TestAuth05ClusterCarrierBlocksWhenTheOwnershipWriteFails(t *testing.T) {
-	if _, err := exec.LookPath("jq"); err != nil {
-		t.Skip("jq is required to drive the carrier")
-	}
-	script, bin, env, stateDir, _, profile := tcAuth05AbsentOriginalsWindow(t)
-	env["FAKE_CHOWN_FAIL"] = "1"
-
-	out, code := tcAuth05RunCarrier(t, script, bin, env, "restore")
-	tcAuth05Require(t, code == 2, "restore exited %d, want blocked when the ownership write fails:\n%s", code, out)
-	tcAuth05Require(t, strings.Contains(out, "restore failed on: node-1"),
-		"the failed node was not named:\n%s", out)
-	tcAuth05Require(t, strings.Contains(out, "the tree restore failed — the state file is kept"),
-		"the kept state was not named:\n%s", out)
-	chowns := tcAuth05MustRead(t, filepath.Join(bin, "debug", "chown_calls"))
-	tcAuth05Require(t, strings.TrimSpace(chowns) == "1000:1000 "+profile,
-		"the failing ownership write did not target 1000:1000 %s: %q", profile, chowns)
-	if _, err := os.Stat(stateDir); err != nil {
-		t.Fatalf("the state dir was dropped after a failed restore: %v", err)
-	}
-
-	// The kept state is what makes the retry possible; without the failure the
-	// same window finishes and removes it.
-	delete(env, "FAKE_CHOWN_FAIL")
-	out, code = tcAuth05RunCarrier(t, script, bin, env, "restore")
-	tcAuth05Require(t, code == 0, "the retry exited %d:\n%s", code, out)
-	info, err := os.Stat(profile)
-	tcAuth05Require(t, err == nil && info.IsDir(), "the retry did not restore the profile directory: %v", err)
-	if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
-		t.Fatalf("the state dir survived the successful retry: %v", err)
-	}
-}
-
 // The install journal is the only record that a window with no originals
 // touched the node. Losing it leaves nothing to undo and nothing to prove a
 // restore happened; the run must say so instead of reaching the success line.
@@ -1152,7 +1116,7 @@ func TestAuth05ClusterCarrierReportsUntouchedWhenTheInstallRecordIsGone(t *testi
 	if _, err := exec.LookPath("jq"); err != nil {
 		t.Skip("jq is required to drive the carrier")
 	}
-	script, bin, env, stateDir, partition, profile := tcAuth05AbsentOriginalsWindow(t)
+	script, bin, env, stateDir, partition, _ := tcAuth05AbsentOriginalsWindow(t)
 	journals, _ := filepath.Glob(filepath.Join(partition, ".tc-auth-05-*.journal"))
 	tcAuth05Require(t, len(journals) == 1, "the install left %d journals, want 1: %v", len(journals), journals)
 	if err := os.Remove(journals[0]); err != nil {
@@ -1171,8 +1135,8 @@ func TestAuth05ClusterCarrierReportsUntouchedWhenTheInstallRecordIsGone(t *testi
 	nodeReport := tcAuth05MustRead(t, logs[0])
 	tcAuth05Require(t, strings.Contains(nodeReport, "the install never touched this node"),
 		"restore claimed a restore it could not evidence: %s", nodeReport)
-	info, err := os.Stat(profile)
-	tcAuth05Require(t, err == nil && info.Mode().IsRegular(), "restore touched the window without a record: %v", err)
+	info, err := os.Stat(filepath.Join(partition, ".multica", "daemon_task_context.json"))
+	tcAuth05Require(t, err == nil && info.IsDir(), "restore touched the window without a record: %v", err)
 	if _, err := os.Stat(stateDir); !os.IsNotExist(err) {
 		t.Fatalf("the state dir survived the untouched report: %v", err)
 	}

@@ -283,14 +283,17 @@ func renderProbeTemplate(template map[string]any, v probeValues) (*batchv1.Job, 
 
 // writeProbeLiterals performs A1.4 ④ on the template copy: the task profile
 // name and the task credential Secret name, each renamed along the face the
-// probe write face declares. The profile name is written where the profile is
-// expressed — every container's command, arguments and mount path, the daemon's
-// own start line and the profile directory beside it (§6.2: profile name and
-// mount point come from one constant). The credential Secret name is written
-// where the token reaches that directory — every Secret reference a pod volume
-// carries. Images, pull credentials, env values, labels and volume names are
-// not among those positions, so the write cannot reach them: the template's own
-// text there survives (A2) by construction, not by an exclusion list.
+// probe write face declares. The profile name is written wherever it occurs in
+// every container's command and arguments, and in every mount path. The
+// reference template expresses it only in the first of those: its credential
+// volume is mounted at the profile root, so the mount path names no profile
+// (ADR-059). The mount path face stays in the write because a template of its
+// own may spell the profile there, and A1.4 ④ is a property of the face, not of
+// the reference template. The credential Secret name is written where the token
+// reaches that directory — every Secret reference a pod volume carries. Images,
+// pull credentials, env values, labels and volume names are not among those
+// positions, so the write cannot reach them: the template's own text there
+// survives (A2) by construction, not by an exclusion list.
 func writeProbeLiterals(rendered map[string]any, credSecret string) {
 	podSpec := nestedObject(nestedObject(nestedObject(rendered, "spec"), "template"), "spec")
 	for _, side := range []string{"containers", "initContainers"} {

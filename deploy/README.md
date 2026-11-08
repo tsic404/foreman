@@ -459,6 +459,54 @@ Job pods and `foreman-gc` share the node directory `${FOREMAN_STATE_ROOT}`
 - Job pods mount `${FOREMAN_STATE_ROOT}/{home,workspaces}`,
 - `foreman-gc` mounts `${FOREMAN_STATE_ROOT}` at `/state`
 
+The `home` partition carries the session files a resumed task continues from
+(`~/.multica/pi-sessions` and the `~/.omp` runtime state). Agent memory is a
+profile-relative store, not a `home` entry, so it starts empty with every task.
+**The daemon profile is not part of it.** Each task Job gets its own profile
+directory inside that Job's credential volume (the `emptyDir` that also carries
+the Job Token), so the profile and everything the provider caches under it
+disappear with the pod:
+
+> profile-relative state is per-Job and is not reused across tasks
+
+That sentence is the fixed declaration required by ADR-059: the reference
+template prints it in every task Job's startup log (the `prepare` init
+container prints it to stdout), and this page states it here. Two consequences
+a deployer should plan for:
+
+- every task starts from an **empty profile**; provider-side cold-start cost is
+  paid per task, not once per node. A cold start is a startup cost, not a
+  failure by itself: it fails the task only if it crosses
+  `FOREMAN_JOB_BOOT_TIMEOUT`, or if the profile it writes grows past the
+  credential volume's `sizeLimit` (below). Size both bounds against your
+  providers;
+- two Jobs of the same workspace on one node no longer contend for a profile
+  directory: each has its own volume, so the same-node concurrency that
+  `TC-tech-cache-02` exercises is available again.
+
+The credential volume is now the profile's bound. The reference template sizes
+it `512Mi`, up from `16Mi` while the profile lived on the node: the old bound
+carried the token file alone, this one also carries every provider
+profile-relative store a task creates at cold start. `512Mi` is a starting
+value, not a measurement — the reference deployment has not measured any
+provider's cold-start footprint, and that footprint is provider- and
+task-dependent. Measure the profile directory of a representative task and set
+the bound above it; a pod whose `emptyDir` exceeds `sizeLimit` is evicted, the
+Job does not retry it (`backoffLimit: 0`), and the task converges to a failed
+terminal. The pod declares no `ephemeral-storage` request or limit, so the
+bound is not in the scheduler's account: plan node capacity as `sizeLimit` per
+concurrent Job by hand.
+
+A profile directory left on the `home` partition by an earlier release is not
+reclaimed as a whole. The collector's only paths into a profile root are the
+four profile-anchored store rules: `hermes-sessions`, `dsh-sessions` and
+`reasonix-state` under the agent-state retention (`FOREMAN_AGENT_STATE_TTL`),
+and `hermes-state` under the memory retention (`FOREMAN_AGENT_MEMORY_TTL`). The
+profile directory itself and the rest of its entries — `config.json`,
+`daemon.pid`, `daemon.log`, provider configuration caches — are never
+reclaimed, so a node that ran the earlier layout keeps them until an operator
+removes them by hand. `foreman-gc` never creates directories; it only reclaims.
+
 The DaemonSet's `hostPath.path` and the Deployment's `FOREMAN_STATE_ROOT` must
 be changed together; the collector's own view is the mount point, passed back
 in as `FOREMAN_STATE_ROOT=/state`.
@@ -693,10 +741,12 @@ runtime socket, `serviceAccountName` or `automountServiceAccountToken`: that is
 the deployment's own decision and its own risk. Three consequences worth knowing
 before copying the reference template:
 
-- The Job Token reaches the daemon only if the template mounts the per-task
-  Secret `fm-<task_id>-cred` (or another source of `config.json` at the profile
-  path); without one the task fails with `job_auth_failed` — nothing checks
-  this at startup.
+- The Job Token reaches the daemon only if the template carries the per-task
+  Secret `fm-<task_id>-cred` into the Job and puts the copied `config.json`
+  where the daemon reads its profile's configuration (the reference template
+  copies it into the profile directory inside that Job's credential volume);
+  without one the task fails with `job_auth_failed` — nothing checks this at
+  startup.
 - A template carrying its own `image` removes the image audit anchor:
   `/foreman/version` keeps reporting `FOREMAN_JOB_IMAGE`, which is then no
   longer what the Job runs.
@@ -765,11 +815,15 @@ Foreman declares to the server; it also doubles as the template preflight.
   template must express them with the two literals Foreman rewrites —
   profile `foreman-job` → `foreman-catalog`, Secret `fm-<task_id>-cred` →
   `fm-catalog-<request_id>-cred`. The rewrite reaches the profile where the
-  template expresses it (each container's command line and the mount path the
-  profile directory sits at) and the Secret where the token reaches that
+  template expresses it (each container's command and arguments, and any mount
+  path that names the profile) and the Secret where the token reaches that
   directory (the Secret references a pod volume carries). Every other position
   keeps the template's own text — an image reference reading `foreman-job`, the
-  pull credential beside it, any env value or label. A template that does not
+  pull credential beside it, any env value or label. The reference template
+  names the profile in the daemon's start line and in `prepare`'s script, and
+  mounts the credential volume at the profile root; the probe's own profile
+  directory is created inside the probe's own volume, so the two Jobs stay
+  apart at the directory level by construction. A template that does not
   express the two faces means the probe cannot authenticate, so startup exits
   non-zero (visible, not silent).
 - **Credential duty**: the probe's Job Token sits in the template-shaped pod and
