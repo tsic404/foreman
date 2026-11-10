@@ -516,6 +516,11 @@ func runReset(t *testing.T, opts resetOptions) resetRun {
 			// One attempt: an unexpected call is a broken stub, not a flaky
 			// API server.
 			"TEST_MULTICA_KUBECTL_RETRIES": "1",
+			// The witness has its own export ahead of lib.sh's HOME default,
+			// so restating TEST_MULTICA_* is not enough: an exported value on
+			// the host would point reset.sh's rm at a file outside the
+			// sandbox. Tests that state their own path layer it on top.
+			"PIN_NODE_WITNESS": filepath.Join(dir, "witness"),
 		},
 		opts.extraEnv,
 	)
