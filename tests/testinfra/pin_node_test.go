@@ -150,6 +150,10 @@ func runPinNodeAt(t *testing.T, dir string, stubs map[string]string, args ...str
 		"TEST_MULTICA_INSTANCE_NS":     "foreman",
 		"TEST_MULTICA_INSTANCE":        "foreman",
 		"TEST_MULTICA_KUBECTL_RETRIES": "1",
+		// The witness has its own export ahead of lib.sh's HOME default; the
+		// stubs below write and read exactly this path, so it stays the one
+		// the next invocation of the sandbox sees unless a case overrides it.
+		"PIN_NODE_WITNESS": filepath.Join(homeDir, ".foreman-job-policy-witness"),
 	}
 	for key, value := range stubs {
 		env[key] = value
