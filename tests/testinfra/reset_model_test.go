@@ -57,6 +57,20 @@ case " $* " in
 	fi
 	printf '%s' "$STUB_MODEL"
 	;;
+*" get namespace $TEST_MULTICA_INSTANCE_NS "*)
+	if [ -n "${STUB_INSTANCE_NS_ABSENT:-}" ]; then
+		printf 'Error from server (NotFound): namespaces "%s" not found\n' "$TEST_MULTICA_INSTANCE_NS" >&2
+		exit 1
+	fi
+	printf 'namespace/%s\n' "$TEST_MULTICA_INSTANCE_NS"
+	;;
+*" -n $TEST_MULTICA_INSTANCE_NS delete configmap foreman-job-policy "*)
+	# The reset clears the pin the previous round left behind.
+	if [ -n "${STUB_DELETE_CONFIGMAP_ERROR:-}" ]; then
+		printf '%s\n' "$STUB_DELETE_CONFIGMAP_ERROR" >&2
+		exit 1
+	fi
+	;;
 *" exec deploy/postgres "*)
 	# psql_exec: the wipe prints nothing the entry reads.
 	;;
@@ -557,5 +571,37 @@ func TestResetDropsAStalePinWitness(t *testing.T) {
 	}
 	if !strings.Contains(run.stderr, "dropped the stale job-policy witness") {
 		t.Errorf("reset.sh does not report dropping the witness:\n%s", run.stderr)
+	}
+	if !strings.Contains(run.kubectl, "-n foreman delete configmap foreman-job-policy") {
+		t.Errorf("reset.sh did not delete the pin object the witness describes:\n%s", run.kubectl)
+	}
+	if !strings.Contains(run.stderr, "cleared the job policy") {
+		t.Errorf("reset.sh does not report clearing the job policy:\n%s", run.stderr)
+	}
+}
+
+// TestResetToleratesAMissingInstanceNamespace: a fresh cluster may have no
+// instance namespace at all. The reset must still finish, and it must not
+// call the job-policy delete it cannot address.
+func TestResetToleratesAMissingInstanceNamespace(t *testing.T) {
+	run := runReset(t, resetOptions{extraEnv: map[string]string{"STUB_INSTANCE_NS_ABSENT": "1"}})
+	if run.err != nil {
+		t.Fatalf("reset.sh did not finish without the instance namespace: %v\n--- stderr ---\n%s", run.err, run.stderr)
+	}
+	if strings.Contains(run.kubectl, "delete configmap foreman-job-policy") {
+		t.Errorf("reset.sh tried to delete the job policy without the instance namespace:\n%s", run.kubectl)
+	}
+}
+
+// TestResetReportsAnUndeletableJobPolicyWithoutFailing: the pin cleanup is
+// best-effort. A delete the API refuses is reported, and the reset still
+// finishes — it must not turn a stale object into a failed round.
+func TestResetReportsAnUndeletableJobPolicyWithoutFailing(t *testing.T) {
+	run := runReset(t, resetOptions{extraEnv: map[string]string{"STUB_DELETE_CONFIGMAP_ERROR": "forbidden"}})
+	if run.err != nil {
+		t.Fatalf("reset.sh failed although the job-policy delete was refused: %v\n--- stderr ---\n%s", run.err, run.stderr)
+	}
+	if !strings.Contains(run.stderr, "cannot clear the job policy") {
+		t.Errorf("reset.sh does not report the refused delete:\n%s", run.stderr)
 	}
 }

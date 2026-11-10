@@ -18,11 +18,11 @@
 #   4. wipe — delete every runtime row and task row of the test workspace
 #      (可重置). The agent rows survive, unbound;
 #   5. rebuild the test objects — writable repository, test agent and failure
-#      agent (both unbound), chat entry; drop the pin witness a stopped-instance
-#      pin/restore left for the previous instance. The autopilot is not here:
-#      the server refuses an autopilot whose assignee agent has no runtime, and
-#      this entry leaves the runtime list empty on purpose — ./bind-agent.sh
-#      creates it once the agent is bound;
+#      agent (both unbound), chat entry; drop the pin and witness a
+#      stopped-instance pin/restore left for the previous instance. The
+#      autopilot is not here: the server refuses an autopilot whose assignee
+#      agent has no runtime, and this entry leaves the runtime list empty on
+#      purpose — ./bind-agent.sh creates it once the agent is bound;
 #   6. model — one writer, one precedence: the deployment-supplied endpoint
 #      triple wins; without it the selected local source (the scripted fixture
 #      backend by default, the keyless ollama engine when the round asks for
@@ -180,9 +180,19 @@ wipe_rows() {
 
 # --- 5. the test objects ------------------------------------------------------
 
-# The witness is state from the previous round's instance, not an object this
-# one rebuilds: a leftover would make the next ./wire.sh fail on a pin the
-# rebuilt environment no longer carries.
+# The witness and the pin it describes are one state: dropping only the
+# evidence would leave a hard nodeSelector in force with nothing left to
+# verify it (--verify would read "nothing pending"). The instance is stopped
+# above, so the policy is inert and goes with it. A fresh cluster may have no
+# instance namespace at all — the state stop_instance tolerates — so the
+# delete is gated on the namespace and a failure is reported, never fatal.
+if kubectl get namespace "$INSTANCE_NS" >/dev/null 2>&1; then
+	if _policy_out=$(kubectl -n "$INSTANCE_NS" delete configmap foreman-job-policy --ignore-not-found 2>&1); then
+		info "cleared the job policy ($INSTANCE_NS/foreman-job-policy)"
+	else
+		info "cannot clear the job policy ($INSTANCE_NS/foreman-job-policy): $_policy_out"
+	fi
+fi
 if [ -e "$POLICY_WITNESS" ]; then
 	rm -f "$POLICY_WITNESS"
 	info "dropped the stale job-policy witness $POLICY_WITNESS"
