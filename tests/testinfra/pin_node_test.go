@@ -371,3 +371,39 @@ func TestPinNodeVerifyWithoutAWitnessIsANoOp(t *testing.T) {
 		t.Errorf("--verify read the instance although nothing was pending:\n%s", run.kubectl)
 	}
 }
+
+// TestPinNodeVerifyRefusesAnUnreadableWitness: a witness that exists but
+// cannot be read is not "nothing pending". Treating the two as the same would
+// skip the startup check silently — the exact failure mode this entry exists
+// to prevent — so --verify must fail and must not print the no-pending line.
+func TestPinNodeVerifyRefusesAnUnreadableWitness(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatalf("create the sandbox home: %v", err)
+	}
+	witness := filepath.Join(home, ".foreman-job-policy-witness")
+	if err := os.WriteFile(witness, []byte("expect=sha256="+strings.Repeat("a", 64)+"\nnode=node-a\n"), 0o600); err != nil {
+		t.Fatalf("write the witness: %v", err)
+	}
+	if err := os.Chmod(witness, 0o000); err != nil {
+		t.Fatalf("make the witness unreadable: %v", err)
+	}
+	if _, err := os.ReadFile(witness); err == nil {
+		t.Skip("this user can still read a 0000 file (running as root?); the unreadable case is not constructible")
+	}
+
+	run := runPinNodeAt(t, dir, map[string]string{}, "--verify")
+	if run.err == nil {
+		t.Fatalf("--verify reported success although the pending witness is unreadable:\n%s", run.out)
+	}
+	if strings.Contains(run.out, "no pending job-policy pin") {
+		t.Errorf("--verify reports an unreadable witness as nothing pending:\n%s", run.out)
+	}
+	if !strings.Contains(run.out, "unreadable") {
+		t.Errorf("the refusal does not say the witness is unreadable:\n%s", run.out)
+	}
+	if strings.Contains(run.kubectl, "get pod") {
+		t.Errorf("--verify read the instance although the witness could not be read:\n%s", run.kubectl)
+	}
+}

@@ -127,14 +127,17 @@ trap 'rm -rf "$work"' EXIT
 
 # The witness a stopped-instance pin/restore leaves for ./wire.sh: the exact
 # startup-log fragment the started instance must print. An absent witness means
-# nothing is pending and --verify is a no-op success.
+# nothing is pending and --verify is a no-op success; a witness that exists but
+# cannot be read is an error, not an absence.
 POLICY_WITNESS=${PIN_NODE_WITNESS:-$HOME/.foreman-job-policy-witness}
 
 verify_pending_witness() {
-	[ -r "$POLICY_WITNESS" ] || {
+	if [ ! -e "$POLICY_WITNESS" ]; then
 		info "no pending job-policy pin to verify"
 		return 0
-	}
+	fi
+	[ -r "$POLICY_WITNESS" ] ||
+		die "the pending job-policy witness $POLICY_WITNESS exists but is unreadable — fix its permissions or remove it; the startup check cannot be verified"
 	_expect=$(sed -n 's/^expect=//p' "$POLICY_WITNESS" | head -1)
 	[ -n "$_expect" ] ||
 		die "the policy witness $POLICY_WITNESS carries no expect= line — remove it and re-run ./pin-node.sh"
