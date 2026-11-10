@@ -92,7 +92,6 @@ type pinRun struct {
 	err      error
 	policy   string
 	witness  string
-	home     string
 	exitCode int
 }
 
@@ -166,7 +165,7 @@ func runPinNodeAt(t *testing.T, dir string, stubs map[string]string, args ...str
 		env,
 	)
 	raw, err := cmd.CombinedOutput()
-	run := pinRun{out: string(raw), err: err, home: homeDir}
+	run := pinRun{out: string(raw), err: err}
 	if ee, ok := err.(*exec.ExitError); ok {
 		run.exitCode = ee.ExitCode()
 	}
