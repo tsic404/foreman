@@ -593,15 +593,27 @@ func TestResetDropsAStalePinWitness(t *testing.T) {
 }
 
 // TestResetToleratesAMissingInstanceNamespace: a fresh cluster may have no
-// instance namespace at all. The reset must still finish, and it must not
-// call the job-policy delete it cannot address.
+// instance namespace at all. That is itself the answer the pin question needs —
+// the object lives in the namespace, so an absent namespace means the pin is
+// confirmed gone — and the reset must finish without the delete it cannot
+// address. The witness still goes with it: left behind, the next wire.sh would
+// demand a startup line from wiped state, which is the stale expectation this
+// entry exists to drop.
 func TestResetToleratesAMissingInstanceNamespace(t *testing.T) {
-	run := runReset(t, resetOptions{extraEnv: map[string]string{"STUB_INSTANCE_NS_ABSENT": "1"}})
+	witness := writeResetWitness(t)
+
+	run := runReset(t, resetOptions{extraEnv: map[string]string{
+		"PIN_NODE_WITNESS":        witness,
+		"STUB_INSTANCE_NS_ABSENT": "1",
+	}})
 	if run.err != nil {
 		t.Fatalf("reset.sh did not finish without the instance namespace: %v\n--- stderr ---\n%s", run.err, run.stderr)
 	}
 	if strings.Contains(run.kubectl, "delete configmap foreman-job-policy") {
 		t.Errorf("reset.sh tried to delete the job policy without the instance namespace:\n%s", run.kubectl)
+	}
+	if _, err := os.Stat(witness); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("reset.sh left the stale witness behind when the instance namespace was absent (stat err = %v)", err)
 	}
 }
 
