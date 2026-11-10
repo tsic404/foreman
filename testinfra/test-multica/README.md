@@ -19,7 +19,7 @@ itself, one face per consumer (see §Addresses).
 | `scripted-backend.yaml` | The scripted fixture backend (ConfigMap, Service, Deployment) — the default local model source; `deploy.sh` injects `scripted-agent.py` into it |
 | `scripted-agent.py` | The scripted backend's server: a chat-completions endpoint that declares the task's window (one warmup call, then `sleep` holds) and never runs anything itself (§ Scripted agent backend) |
 | `deploy.sh` | Deployment entry: picks the model source, renders the entry origin, creates the Secret, applies, waits for the rollout |
-| `reset.sh` | Reset entry: stops the instance under test, wipes runtime/task rows, rebuilds the test objects, binds the test agent's model source (endpoint triple when supplied, else the selected local source), runs the environment gate |
+| `reset.sh` | Reset entry: stops the instance under test, wipes runtime/task rows, rebuilds the test objects, drops a stale pin witness, binds the test agent's model source (endpoint triple when supplied, else the selected local source), runs the environment gate |
 | `wire.sh` | Wiring entry: points the instance under test at the access point and starts it |
 | `bind-agent.sh` | Binds the test agent to the runtime the instance registers (the step between "the instance is up" and "tasks can be dispatched") |
 | `pin-node.sh` | Placement entry: writes the job policy's nodeSelector axis so the test agent's Jobs land on one node (the same-node window cache-02 needs), rolls the instance and verifies the loaded file's hash; when the instance is stopped it records the expected startup line as a witness and exits 3, and `./wire.sh` (or `./pin-node.sh --verify`) checks it after start; `--off` restores the no-axis deployment |
@@ -359,7 +359,9 @@ startup line to `$HOME/.foreman-job-policy-witness`, and `./wire.sh` compares it
 with the started instance's log (run `./pin-node.sh --verify` to make the same
 check on demand). A witness that is not checked is exactly the silent no-op the
 entry exists to prevent, so `wire.sh` fails the round rather than starting a
-case against an unloaded pin.
+case against an unloaded pin. `reset.sh` drops a witness left by an earlier
+round when it rebuilds the test objects, so a stale expectation cannot fail the
+next start.
 
 ```bash
 kubectl get nodes                                  # the node both tasks should share

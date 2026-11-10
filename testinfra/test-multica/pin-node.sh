@@ -126,11 +126,10 @@ work=$(mktemp -d) || die "cannot create a temporary directory"
 trap 'rm -rf "$work"' EXIT
 
 # The witness a stopped-instance pin/restore leaves for ./wire.sh: the exact
-# startup-log fragment the started instance must print. An absent witness means
-# nothing is pending and --verify is a no-op success; a witness that exists but
-# cannot be read is an error, not an absence.
-POLICY_WITNESS=${PIN_NODE_WITNESS:-$HOME/.foreman-job-policy-witness}
-
+# startup-log fragment the started instance must print (the path is shared
+# with ./reset.sh in lib.sh). An absent witness means nothing is pending and
+# --verify is a no-op success; a witness that exists but cannot be read is an
+# error, not an absence.
 verify_pending_witness() {
 	if [ ! -e "$POLICY_WITNESS" ]; then
 		info "no pending job-policy pin to verify"

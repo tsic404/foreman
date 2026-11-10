@@ -174,6 +174,10 @@ SCRIPTED_WAIT=${TEST_MULTICA_SCRIPTED_WAIT:-180s}
 SCRIPTED_MODEL_URL="http://$SCRIPTED_BACKEND_DEPLOY.$NS.svc:8080/v1"
 
 PROFILE_CONFIG="$HOME/.multica/profiles/$PROFILE/config.json"
+# The witness ./pin-node.sh leaves when a pin/restore is written against a
+# stopped instance: the startup-log fragment ./wire.sh must then find. It is
+# operator-side state, so ./reset.sh drops it with the test objects.
+POLICY_WITNESS=${PIN_NODE_WITNESS:-$HOME/.foreman-job-policy-witness}
 MULTICA_TEST_CLI="$TEST_MULTICA_DIR/multica-test"
 
 # --- Helpers -----------------------------------------------------------------

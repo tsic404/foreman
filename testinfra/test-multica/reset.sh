@@ -18,10 +18,11 @@
 #   4. wipe — delete every runtime row and task row of the test workspace
 #      (可重置). The agent rows survive, unbound;
 #   5. rebuild the test objects — writable repository, test agent and failure
-#      agent (both unbound), chat entry. The autopilot is not here: the server
-#      refuses an autopilot whose assignee agent has no runtime, and this entry
-#      leaves the runtime list empty on purpose — ./bind-agent.sh creates it
-#      once the agent is bound;
+#      agent (both unbound), chat entry; drop the pin witness a stopped-instance
+#      pin/restore left for the previous instance. The autopilot is not here:
+#      the server refuses an autopilot whose assignee agent has no runtime, and
+#      this entry leaves the runtime list empty on purpose — ./bind-agent.sh
+#      creates it once the agent is bound;
 #   6. model — one writer, one precedence: the deployment-supplied endpoint
 #      triple wins; without it the selected local source (the scripted fixture
 #      backend by default, the keyless ollama engine when the round asks for
@@ -178,6 +179,14 @@ wipe_rows() {
 }
 
 # --- 5. the test objects ------------------------------------------------------
+
+# The witness is state from the previous round's instance, not an object this
+# one rebuilds: a leftover would make the next ./wire.sh fail on a pin the
+# rebuilt environment no longer carries.
+if [ -e "$POLICY_WITNESS" ]; then
+	rm -f "$POLICY_WITNESS"
+	info "dropped the stale job-policy witness $POLICY_WITNESS"
+fi
 
 ensure_repo() {
 	if ! ws=$(api GET "/api/workspaces/$(workspace_id)"); then

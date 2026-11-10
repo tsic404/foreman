@@ -10,6 +10,7 @@ package testinfra
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"maps"
 	"os"
 	"os/exec"
@@ -535,4 +536,26 @@ func parseResetCalls(t *testing.T, path string) []resetCall {
 		})
 	}
 	return calls
+}
+
+// TestResetDropsAStalePinWitness: a witness left by an earlier round makes the
+// next wire.sh fail against a pin the rebuilt environment no longer carries.
+// reset rebuilds the test objects, so it must drop that operator-side state.
+func TestResetDropsAStalePinWitness(t *testing.T) {
+	dir := t.TempDir()
+	witness := filepath.Join(dir, "witness")
+	if err := os.WriteFile(witness, []byte("expect=sha256="+strings.Repeat("a", 64)+"\n"), 0o600); err != nil {
+		t.Fatalf("write the stale witness: %v", err)
+	}
+
+	run := runReset(t, resetOptions{extraEnv: map[string]string{"PIN_NODE_WITNESS": witness}})
+	if run.err != nil {
+		t.Fatalf("reset.sh did not finish: %v\n--- stderr ---\n%s", run.err, run.stderr)
+	}
+	if _, err := os.Stat(witness); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("reset.sh left the stale witness behind (stat err = %v)", err)
+	}
+	if !strings.Contains(run.stderr, "dropped the stale job-policy witness") {
+		t.Errorf("reset.sh does not report dropping the witness:\n%s", run.stderr)
+	}
 }
