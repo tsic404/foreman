@@ -200,6 +200,11 @@ break)
 	tid=${2:-}
 	NODE=$(pin_node "$tid")
 	observe "node=$NODE action=$ACTION${tid:+ target=$tid}"
+	# Record the node before the mode change runs: find+chmod can fail partway
+	# through the tree, and the node-side script then exits without its summary
+	# line. A half-broken tree must stay named for restore even when the answer
+	# is empty or partial — the failure paths below carry it as the residue hint.
+	record_broken "$NODE"
 	rc=0
 	out=$(node_sh "[ -d \"\$R/workspaces\" ] || { echo 'QA_BLOCKED: no workspaces tree' >&2; exit 2; }
 		W=\"\$R/workspaces\"
@@ -254,16 +259,15 @@ break)
 		dirs=\$(wc -l <'$MODES_JOURNAL' | tr -d ' ')
 		echo \"workspaces-readonly dirs=\$dirs root_mode=\$(stat -c '%a' \"\$W\") probes=\$probes denied=\$denied allowed=\$allowed control=\$control broken_at=\$(cat '$BREAK_AT_MARKER')\"
 		[ \"\$allowed\" -eq 0 ] || exit 1") || rc=$?
-	[ -n "$out" ] || blocked "the node-side call returned no output (image $NODE_DEBUG_IMAGE not attached?)"
+	[ -n "$out" ] || blocked "the node-side call returned no output (image $NODE_DEBUG_IMAGE not attached?) — the tree on $NODE may be half broken$(residue)"
 	observe "break: $out"
 	case $out in
 	*QA_BLOCKED*) blocked "$(printf '%s\n' "$out" | sed -n 's/^QA_BLOCKED: //p' | head -1)" ;;
 	*workspaces-readonly*allowed=0*) : ;;
-	*) blocked "the workspaces tree was not made unwritable for the task user on $NODE (rc=$rc): $out" ;;
+	*) blocked "the workspaces tree was not made unwritable for the task user on $NODE (rc=$rc): $out$(residue)" ;;
 	esac
 	[ "$rc" -eq 0 ] ||
-		blocked "a write as uid 1000 still succeeded after the break on $NODE (rc=$rc): $out"
-	record_broken "$NODE"
+		blocked "a write as uid 1000 still succeeded after the break on $NODE (rc=$rc): $out$(residue)"
 	observe "trigger the same agent's continuation now (soft affinity prefers $NODE; the next action blocks if it landed elsewhere), then run: $0 verify-unwritable <task id>"
 	;;
 verify-unwritable)

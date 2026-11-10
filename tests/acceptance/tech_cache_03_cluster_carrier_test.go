@@ -118,6 +118,19 @@ exec "$@"`)
 	return bin
 }
 
+// tcCache03FailChmod makes the break's find+chmod die on the first path that
+// matches, leaving the tree part-way through the mode change. Every other call
+// delegates to the host's chmod.
+func tcCache03FailChmod(t *testing.T, bin, match string) {
+	t.Helper()
+	real, err := exec.LookPath("chmod")
+	if err != nil {
+		t.Skipf("host has no chmod: %v", err)
+	}
+	body := "#!/bin/sh\ncase \"$*\" in\n*" + match + "*) echo 'fake chmod: simulated mid-tree failure' >&2; exit 1 ;;\nesac\nexec " + real + " \"$@\"\n"
+	tcCache03WriteExecutable(t, filepath.Join(bin, "chmod"), body)
+}
+
 func tcCache03CarrierEnv(bin string, overrides map[string]string) []string {
 	merged := map[string]string{}
 	for _, kv := range os.Environ() {
@@ -492,6 +505,27 @@ func TestCache03CarrierBreaksTheNamedTasksNode(t *testing.T) {
 	}
 	if got := tcCache03Journal(t, state); got != "node-a" {
 		t.Errorf("journal = %q, want node-a:\n%s", got, out)
+	}
+}
+
+// A chmod that dies partway leaves the tree half broken with no summary line.
+// The run must still name the node the operator has to restore.
+func TestCache03CarrierKeepsTheNodeWhenTheBreakFailsPartway(t *testing.T) {
+	bin := tcCache03CarrierFakeBin(t)
+	state := t.TempDir()
+	tcCache03Node(t, state, "node-a")
+	tcCache03Task(t, state, "a", "node-a", "completed", tcCache03StartedAt(tcCache03BreakAt-100))
+	tcCache03FailChmod(t, bin, "repo.git")
+
+	out, code := tcCache03CarrierRun(t, bin, state, nil, "break", "a")
+	if code != 2 {
+		t.Fatalf("break exit = %d, want 2 (the mode change failed partway):\n%s", code, out)
+	}
+	if !strings.Contains(out, "still carries the break") || !strings.Contains(out, "restore node-a") {
+		t.Errorf("the blocker does not name the node to restore:\n%s", out)
+	}
+	if got := tcCache03Journal(t, state); got != "node-a" {
+		t.Errorf("journal = %q, want the half-broken node recorded:\n%s", got, out)
 	}
 }
 
