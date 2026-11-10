@@ -27,6 +27,7 @@ const (
 	resetRepoURL     = "https://github.com/tsic404/foreman"
 	resetServerURL   = "http://server.test.local:8080"
 	resetNamespace   = "multica-test"
+	resetInstanceNS  = "foreman"
 	resetModelDeploy = "test-multica-ollama"
 	resetBackendURL  = "http://test-multica-ollama.multica-test.svc:11434"
 )
@@ -58,6 +59,10 @@ case " $* " in
 	printf '%s' "$STUB_MODEL"
 	;;
 *" get namespace $TEST_MULTICA_INSTANCE_NS "*)
+	if [ -n "${STUB_INSTANCE_NS_READ_ERROR:-}" ]; then
+		printf '%s\n' "$STUB_INSTANCE_NS_READ_ERROR" >&2
+		exit 1
+	fi
 	if [ -n "${STUB_INSTANCE_NS_ABSENT:-}" ]; then
 		printf 'Error from server (NotFound): namespaces "%s" not found\n' "$TEST_MULTICA_INSTANCE_NS" >&2
 		exit 1
@@ -490,7 +495,7 @@ func runReset(t *testing.T, opts resetOptions) resetRun {
 			"TEST_MULTICA_SERVER_URL":      resetServerURL,
 			"TEST_MULTICA_NS":              resetNamespace,
 			"TEST_MULTICA_MODEL_DEPLOY":    resetModelDeploy,
-			"TEST_MULTICA_INSTANCE_NS":     "foreman",
+			"TEST_MULTICA_INSTANCE_NS":     resetInstanceNS,
 			"TEST_MULTICA_INSTANCE":        "foreman",
 			"TEST_MULTICA_AGENT":           resetAgentName,
 			"TEST_MULTICA_CHAT":            resetChatTitle,
@@ -552,15 +557,22 @@ func parseResetCalls(t *testing.T, path string) []resetCall {
 	return calls
 }
 
+// writeResetWitness plants the operator-side witness a stopped-instance pin
+// leaves for wire.sh: the startup line the instance must print.
+func writeResetWitness(t *testing.T) string {
+	t.Helper()
+	witness := filepath.Join(t.TempDir(), "witness")
+	if err := os.WriteFile(witness, []byte("expect=sha256="+strings.Repeat("a", 64)+"\n"), 0o600); err != nil {
+		t.Fatalf("write the pending witness: %v", err)
+	}
+	return witness
+}
+
 // TestResetDropsAStalePinWitness: a witness left by an earlier round makes the
 // next wire.sh fail against a pin the rebuilt environment no longer carries.
 // reset rebuilds the test objects, so it must drop that operator-side state.
 func TestResetDropsAStalePinWitness(t *testing.T) {
-	dir := t.TempDir()
-	witness := filepath.Join(dir, "witness")
-	if err := os.WriteFile(witness, []byte("expect=sha256="+strings.Repeat("a", 64)+"\n"), 0o600); err != nil {
-		t.Fatalf("write the stale witness: %v", err)
-	}
+	witness := writeResetWitness(t)
 
 	run := runReset(t, resetOptions{extraEnv: map[string]string{"PIN_NODE_WITNESS": witness}})
 	if run.err != nil {
@@ -590,6 +602,29 @@ func TestResetToleratesAMissingInstanceNamespace(t *testing.T) {
 	}
 	if strings.Contains(run.kubectl, "delete configmap foreman-job-policy") {
 		t.Errorf("reset.sh tried to delete the job policy without the instance namespace:\n%s", run.kubectl)
+	}
+}
+
+// TestResetFailsWhenTheInstanceNamespaceReadFails: an unreadable namespace is
+// not an absent one. Read as absence it would skip the pin cleanup and then
+// drop the witness, leaving the pin in force with nothing left to verify it —
+// so the read failure must fail the reset and leave both alone.
+func TestResetFailsWhenTheInstanceNamespaceReadFails(t *testing.T) {
+	witness := writeResetWitness(t)
+
+	run := runReset(t, resetOptions{extraEnv: map[string]string{
+		"PIN_NODE_WITNESS":            witness,
+		"STUB_INSTANCE_NS_READ_ERROR": "Unable to connect to the server: net/http: TLS handshake timeout",
+	}})
+	if run.err == nil {
+		t.Fatalf("reset.sh finished with status 0 after the namespace read failed\n--- stderr ---\n%s", run.stderr)
+	}
+	want := "cannot read namespace " + resetInstanceNS
+	if !strings.Contains(run.stderr, want) {
+		t.Errorf("reset.sh does not report the failed namespace read (%q)\n--- stderr ---\n%s", want, run.stderr)
+	}
+	if _, err := os.Stat(witness); err != nil {
+		t.Errorf("reset.sh dropped the witness after the namespace read failed (stat err = %v) — the pin was never confirmed gone", err)
 	}
 }
 

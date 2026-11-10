@@ -183,10 +183,32 @@ wipe_rows() {
 # The witness and the pin it describes are one state: dropping only the
 # evidence would leave a hard nodeSelector in force with nothing left to
 # verify it (--verify would read "nothing pending"). The instance is stopped
-# above, so the policy is inert and goes with it. A fresh cluster may have no
-# instance namespace at all — the state stop_instance tolerates — so the
-# delete is gated on the namespace and a failure is reported, never fatal.
-if kubectl get namespace "$INSTANCE_NS" >/dev/null 2>&1; then
+# above, so the policy is inert and goes with it.
+#
+# "Is the instance namespace there?" is a three-way question, the same split
+# instance_object_present applies: a fresh cluster has no such namespace — the
+# state stop_instance tolerates — and that is an answer, while an unreadable
+# namespace is a read failure and must not be read as absence, or the pin
+# cleanup is skipped and the witness dropped with the pin still in force.
+instance_ns_present() {
+	# The first read is unretried: NotFound is definitive and a retry loop
+	# would spend its budget on it. Anything else is a read failure — a
+	# starved API server answers with a TLS handshake timeout here — and goes
+	# through k() like every other read.
+	if _ns_out=$(kubectl get namespace "$INSTANCE_NS" -o name 2>&1); then
+		return 0
+	fi
+	case $_ns_out in
+	*NotFound*) return 1 ;;
+	esac
+	# The retry's own error is the one to report: the first read's message may
+	# be a transient failure the retry already got past.
+	_ns_retry=$(k get namespace "$INSTANCE_NS" -o name 2>&1) ||
+		die "cannot read namespace $INSTANCE_NS — ${_ns_retry:-$_ns_out}"
+	return 0
+}
+
+if instance_ns_present; then
 	if _policy_out=$(kubectl -n "$INSTANCE_NS" delete configmap foreman-job-policy --ignore-not-found 2>&1); then
 		info "cleared the job policy ($INSTANCE_NS/foreman-job-policy)"
 	else
