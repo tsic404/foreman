@@ -667,3 +667,28 @@ func TestResetFailsWhenTheJobPolicyCannotBeCleared(t *testing.T) {
 		t.Errorf("reset.sh dropped the witness although the pin may still be in force (stat err = %v)", err)
 	}
 }
+
+// TestResetIgnoresAnExportedWitnessPath: lib.sh reads PIN_NODE_WITNESS ahead of
+// its HOME default, so an operator's exported value reaches the entry through
+// the inherited environment. These runs are sandboxed — a run that honoured the
+// export would delete the operator's pending witness outside t.TempDir() and
+// still report success, which is the silent loss the sandbox exists to keep out
+// of the suite.
+func TestResetIgnoresAnExportedWitnessPath(t *testing.T) {
+	exported := filepath.Join(t.TempDir(), "operator-witness")
+	if err := os.WriteFile(exported, []byte("expect=sha256="+strings.Repeat("b", 64)+"\n"), 0o600); err != nil {
+		t.Fatalf("plant the exported witness: %v", err)
+	}
+	t.Setenv("PIN_NODE_WITNESS", exported)
+
+	run := runReset(t, resetOptions{})
+	if run.err != nil {
+		t.Fatalf("reset.sh did not finish: %v\n--- stderr ---\n%s", run.err, run.stderr)
+	}
+	if body, err := os.ReadFile(exported); err != nil || !strings.Contains(string(body), "expect=sha256=") {
+		t.Errorf("reset.sh acted on the exported witness outside the sandbox (err = %v):\n%s", err, run.stderr)
+	}
+	if strings.Contains(run.stderr, exported) {
+		t.Errorf("reset.sh reports %q as its witness — the sandbox did not own the variable:\n%s", exported, run.stderr)
+	}
+}

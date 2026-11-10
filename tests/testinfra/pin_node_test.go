@@ -410,3 +410,48 @@ func TestPinNodeVerifyRefusesAnUnreadableWitness(t *testing.T) {
 		t.Errorf("--verify read the instance although the witness could not be read:\n%s", run.kubectl)
 	}
 }
+
+// TestPinNodeIgnoresAnExportedWitnessPath: lib.sh reads PIN_NODE_WITNESS ahead
+// of its HOME default, so an operator's exported value reaches both the write a
+// stopped-instance pin makes and the read --verify does. The sandbox must keep
+// the pair in the test's own home: otherwise the write overwrites the operator's
+// pending witness with this round's digest, and the read judges a file the test
+// never planted.
+func TestPinNodeIgnoresAnExportedWitnessPath(t *testing.T) {
+	exported := filepath.Join(t.TempDir(), "operator-witness")
+	sentinel := "expect=sha256=" + strings.Repeat("c", 64) + "\nnode=operator-node\n"
+	if err := os.WriteFile(exported, []byte(sentinel), 0o600); err != nil {
+		t.Fatalf("plant the exported witness: %v", err)
+	}
+	t.Setenv("PIN_NODE_WITNESS", exported)
+
+	dir := t.TempDir()
+	run := runPinNodeAt(t, dir, map[string]string{"STUB_REPLICAS": "0"}, "node-a")
+	if run.exitCode != 3 {
+		t.Fatalf("the stopped-instance pin exited %d, want 3 (written, not verified):\n%s", run.exitCode, run.out)
+	}
+	if !strings.Contains(run.witness, "expect=sha256=") {
+		t.Fatalf("the witness was not written under the sandbox home:\n%s", run.witness)
+	}
+
+	verified := runPinNodeAt(t, dir, map[string]string{
+		"STUB_LOG": `level=INFO msg="no job policy loaded"`,
+	}, "--verify")
+	if verified.err == nil {
+		t.Fatalf("--verify passed although the log carries no line the witness expects:\n%s", verified.out)
+	}
+	if sandbox := filepath.Join(dir, "home", ".foreman-job-policy-witness"); !strings.Contains(verified.out, sandbox) {
+		t.Errorf("--verify does not report the sandbox witness %q:\n%s", sandbox, verified.out)
+	}
+	if strings.Contains(verified.out, exported) {
+		t.Errorf("--verify read the exported witness outside the sandbox:\n%s", verified.out)
+	}
+
+	body, err := os.ReadFile(exported)
+	if err != nil {
+		t.Fatalf("the exported witness did not survive the run: %v", err)
+	}
+	if string(body) != sentinel {
+		t.Errorf("the run rewrote the exported witness outside the sandbox:\n%s", body)
+	}
+}
