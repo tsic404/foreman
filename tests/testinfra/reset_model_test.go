@@ -628,15 +628,25 @@ func TestResetFailsWhenTheInstanceNamespaceReadFails(t *testing.T) {
 	}
 }
 
-// TestResetReportsAnUndeletableJobPolicyWithoutFailing: the pin cleanup is
-// best-effort. A delete the API refuses is reported, and the reset still
-// finishes — it must not turn a stale object into a failed round.
-func TestResetReportsAnUndeletableJobPolicyWithoutFailing(t *testing.T) {
-	run := runReset(t, resetOptions{extraEnv: map[string]string{"STUB_DELETE_CONFIGMAP_ERROR": "forbidden"}})
-	if run.err != nil {
-		t.Fatalf("reset.sh failed although the job-policy delete was refused: %v\n--- stderr ---\n%s", run.err, run.stderr)
+// TestResetFailsWhenTheJobPolicyCannotBeCleared: a delete the API refuses
+// leaves the pin in force, and while it is in force the instance prints the
+// very startup line the witness demands — --verify would pass on the leftover
+// selector instead of catching it. So the round must fail, and the witness
+// must stay where the next wire.sh can still use it.
+func TestResetFailsWhenTheJobPolicyCannotBeCleared(t *testing.T) {
+	witness := writeResetWitness(t)
+
+	run := runReset(t, resetOptions{extraEnv: map[string]string{
+		"PIN_NODE_WITNESS":            witness,
+		"STUB_DELETE_CONFIGMAP_ERROR": `Error from server (Forbidden): configmaps "foreman-job-policy" is forbidden`,
+	}})
+	if run.err == nil {
+		t.Fatalf("reset.sh finished with status 0 although the job-policy delete was refused\n--- stderr ---\n%s", run.stderr)
 	}
 	if !strings.Contains(run.stderr, "cannot clear the job policy") {
 		t.Errorf("reset.sh does not report the refused delete:\n%s", run.stderr)
+	}
+	if _, err := os.Stat(witness); err != nil {
+		t.Errorf("reset.sh dropped the witness although the pin may still be in force (stat err = %v)", err)
 	}
 }

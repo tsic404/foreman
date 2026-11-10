@@ -361,7 +361,11 @@ check on demand). A witness that is not checked is exactly the silent no-op the
 entry exists to prevent, so `wire.sh` fails the round rather than starting a
 case against an unloaded pin. `reset.sh` drops both the witness and the policy
 it describes when it rebuilds the test objects, so an earlier round's pin
-neither fails the next start nor stays in force unobservable.
+neither fails the next start nor stays in force unobservable. The witness goes
+only after the pin is confirmed gone: a reset that cannot read the instance
+namespace or cannot clear the policy fails instead of dropping the evidence
+alone, because while the pin is in force the instance still prints the startup
+line the witness demands and `--verify` would pass on it.
 
 ```bash
 kubectl get nodes                                  # the node both tasks should share

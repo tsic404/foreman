@@ -180,10 +180,12 @@ wipe_rows() {
 
 # --- 5. the test objects ------------------------------------------------------
 
-# The witness and the pin it describes are one state: dropping only the
-# evidence would leave a hard nodeSelector in force with nothing left to
-# verify it (--verify would read "nothing pending"). The instance is stopped
-# above, so the policy is inert and goes with it.
+# The witness and the pin it describes are one state, and the evidence must not
+# go before the state does: while the pin stays in force the instance prints the
+# very startup line the witness demands, so --verify passes on the leftover
+# selector instead of catching it. The delete therefore comes first, and the
+# witness goes only once the pin is known gone — its namespace is absent, or
+# the delete succeeded.
 #
 # "Is the instance namespace there?" is a three-way question, the same split
 # instance_object_present applies: a fresh cluster has no such namespace — the
@@ -209,12 +211,16 @@ instance_ns_present() {
 }
 
 if instance_ns_present; then
-	if _policy_out=$(kubectl -n "$INSTANCE_NS" delete configmap foreman-job-policy --ignore-not-found 2>&1); then
-		info "cleared the job policy ($INSTANCE_NS/foreman-job-policy)"
-	else
-		info "cannot clear the job policy ($INSTANCE_NS/foreman-job-policy): $_policy_out"
+	# The delete is a retried write: a transient failure must not leave the pin
+	# behind. A refusal that survives the retries is fatal — the namespace is
+	# there and the object was not confirmed cleared.
+	if ! _policy_out=$(k -n "$INSTANCE_NS" delete configmap foreman-job-policy --ignore-not-found 2>&1); then
+		die "cannot clear the job policy ($INSTANCE_NS/foreman-job-policy) — the agent may stay pinned while ./wire.sh reports nothing pending: $_policy_out"
 	fi
+	info "cleared the job policy ($INSTANCE_NS/foreman-job-policy)"
 fi
+# Reached only with the pin known gone: the namespace is absent, or the delete
+# above succeeded.
 if [ -e "$POLICY_WITNESS" ]; then
 	rm -f "$POLICY_WITNESS"
 	info "dropped the stale job-policy witness $POLICY_WITNESS"
