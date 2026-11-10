@@ -1,9 +1,15 @@
 #!/bin/sh
 # TC-tech-security-01 — the runtime half of AC-13's permission boundary: the
-# agent runs as the fixed non-root user, prepare's chown took effect, the
-# credential file is the single-file read-only mount with the fixed mode, and
-# the mount face is the template's. The task Job must still be running. The
-# manifest half is tech_security_01_permission_boundary_test.go.
+# agent runs as the fixed non-root user, prepare's chown took effect over the
+# home and workspaces trees and over the Job's credential volume, the
+# credential file sits in that volume with the fixed mode, and the mount face
+# is the template's. The task Job must still be running. The manifest half is
+# tech_security_01_permission_boundary_test.go.
+#
+# The profile directory is the credential volume's content (ADR-059): the
+# volume is mounted writable at the profile root, so the credential file is a
+# plain file inside it rather than a single-file read-only mount, and the
+# profile directory is not a mount point of its own.
 #
 #   TASK_ID=<task id> ./tech-security-01-cluster.sh   (or pass the id as $1)
 # Exit: 0 = PASS · 1 = FAIL (raw observation printed) · 2 = blocked.
@@ -38,9 +44,8 @@ observe "task=$TASK_ID job=$JOB_NAME"
 rc=0
 runtime=$(kubectl -n "$JOB_NS" exec "job/$JOB_NAME" -c agent -- sh -c '
   id -u
-  stat -c "%u:%g %n" /home/agent /home/agent/.multica/profiles/foreman-job /state/workspaces
+  stat -c "%u:%g %n" /home/agent /home/agent/.multica/profiles /home/agent/.multica/profiles/foreman-job /state/workspaces
   stat -c "%a %u:%g %n" /home/agent/.multica/profiles/foreman-job/config.json
-  stat -c "%d %n" /home/agent /home/agent/.multica/profiles/foreman-job
 ') || rc=$?
 observe "runtime: ${runtime:-<empty>}"
 if [ "$rc" -ne 0 ]; then
@@ -51,7 +56,7 @@ uid=$(printf '%s\n' "$runtime" | sed -n '1p' | tr -d '[:space:]')
 [ "$uid" = "1000" ] || fail "id -u = '$uid', want 1000 (agent is not the fixed non-root user)"
 
 i=2
-while [ "$i" -le 4 ]; do
+while [ "$i" -le 5 ]; do
 	line=$(printf '%s\n' "$runtime" | sed -n "${i}p")
 	case $line in
 	1000:1000\ *) : ;;
@@ -60,24 +65,21 @@ while [ "$i" -le 4 ]; do
 	i=$((i + 1))
 done
 
-cred=$(printf '%s\n' "$runtime" | sed -n '5p')
+cred=$(printf '%s\n' "$runtime" | sed -n '6p')
 case $cred in
 400\ 1000:1000\ *) : ;;
 *) fail "credential file '$cred' is not mode 400 owned by 1000:1000" ;;
 esac
 
-device_a=$(printf '%s\n' "$runtime" | sed -n '6p' | awk '{print $1}')
-device_b=$(printf '%s\n' "$runtime" | sed -n '7p' | awk '{print $1}')
-[ -n "$device_a" ] && [ "$device_a" = "$device_b" ] ||
-	fail "device numbers differ ($device_a vs $device_b): the profile directory is not in the home volume"
 
 # ---- Step 4: the mount face ------------------------------------------------
 rc=0
 mounts=$(kubectl -n "$JOB_NS" exec "job/$JOB_NAME" -c agent -- sh -c '
   echo "home=$(grep -c " /home/agent " /proc/mounts)"
+  echo "profiles=$(grep -c " /home/agent/.multica/profiles " /proc/mounts)"
+  echo "profiles_line=$(grep " /home/agent/.multica/profiles " /proc/mounts)"
   echo "profile=$(grep -c " /home/agent/.multica/profiles/foreman-job " /proc/mounts)"
   echo "config=$(grep -c " /home/agent/.multica/profiles/foreman-job/config.json " /proc/mounts)"
-  echo "config_line=$(grep " /home/agent/.multica/profiles/foreman-job/config.json " /proc/mounts)"
   echo "workspaces=$(grep -c " /state/workspaces " /proc/mounts)"
   echo "tmp=$(grep -c " /tmp " /proc/mounts)"
 ') || rc=$?
@@ -86,14 +88,14 @@ observe "mounts: ${mounts:-<empty>}"
 
 value() { printf '%s\n' "$mounts" | sed -n "s/^$1=//p"; }
 [ "$(value home)" = "1" ] || fail "/home/agent is not exactly one mount entry (got '$(value home)')"
+[ "$(value profiles)" = "1" ] || fail "the profile root is not exactly one mount entry (got '$(value profiles)')"
 [ "$(value profile)" = "0" ] || fail "the profile directory is a separate mount (got '$(value profile)')"
-[ "$(value config)" = "1" ] || fail "config.json is not exactly one mount entry (got '$(value config)')"
+[ "$(value config)" = "0" ] || fail "config.json is a separate mount, want a plain file in the credential volume (got '$(value config)')"
 # /proc/mounts is "device mountpoint fstype options dump pass": the options
 # live in $4 ($3 is the filesystem type). The raw line stays in the observation.
-config_opts=$(value config_line | awk '{print $4}')
-case ",$config_opts," in
-*,ro,*) : ;;
-*) fail "the credential mount is not read-only: $(value config_line)" ;;
+profiles_opts=$(value profiles_line | awk '{print $4}')
+case ",$profiles_opts," in
+*,ro,*) fail "the credential volume is mounted read-only: $(value profiles_line)" ;;
 esac
 [ "$(value workspaces)" = "1" ] || fail "/state/workspaces is not exactly one mount entry (got '$(value workspaces)')"
 [ "$(value tmp)" = "1" ] || fail "/tmp is not exactly one mount entry (got '$(value tmp)')"

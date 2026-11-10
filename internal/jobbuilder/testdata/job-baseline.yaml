@@ -13,6 +13,10 @@
 # 故基线（= CM 字面）不含；归一化时从实际对象删除，形状由 TC-tech-job-01（issue 触发分支）与 TC-tech-job-04（**首跑**分支）单独断言。
 # **软亲和项在渲染面上的取舍（取值 → 恰一项 / 不满足条件 → 删项并上收空结构）由 TC-tech-job-01 步骤 3b 与 TC-tech-cache-05/06 断言（ADR-015）。**
 # `prepare` 的 chown 目标含 `/state/workspaces`（ADR-011 / AC-13 的属主面；由 tests/acceptance/tech_security_01_permission_boundary_test.go 的字面断言锁定）。
+# **daemon profile 归每个 Job 独占**（ADR-059）：profile 目录建在该 Job 的凭据卷里，节点 home 面不出现 profile 目录与令牌；
+# profile 相对状态不跨任务续用。该事实的固定声明同时出现在部署说明（deploy/README.md）与本模板 prepare 的启动输出（每个任务 Job 的启动日志）里，两处逐字相同。
+# prepare 仍自愈节点面的两个目录位（`.multica` 与其 `profiles` 挂载点父目录）：它们不在凭据卷内，被普通文件占用时 agent 容器的挂载建不起来；
+# prepare 在 agent 容器创建前运行、又不挂该路径，是唯一能修的位置。
 # 修订参考模板时：基线夹具与部署清单两处必须同 PR 同步（同一份字面，AC-20 断言逐字一致）。
 # 末段 Secret 文档是该夹具的**凭据回归面**，不是模板内容（模板 = 单份 `batch/v1 Job`）。
 apiVersion: batch/v1
@@ -112,12 +116,14 @@ spec:
           command: ["/bin/sh", "-ec"]
           args:
             - |
-              for d in /home/agent/.multica /home/agent/.multica/profiles /home/agent/.multica/profiles/foreman-job; do
+              for d in /home/agent/.multica /home/agent/.multica/profiles; do
                 [ -d "$d" ] || { rm -f "$d"; mkdir -p "$d"; }
               done
+              mkdir -p /credout/foreman-job
               rm -rf /home/agent/.multica/daemon_task_context.json
-              cp /cred/config.json /credout/config.json
-              chmod 0400 /credout/config.json
+              cp /cred/config.json /credout/foreman-job/config.json
+              chmod 0400 /credout/foreman-job/config.json
+              echo "profile-relative state is per-Job and is not reused across tasks"
               chown -R 1000:1000 /home/agent /state/workspaces /credout
           securityContext:
             runAsUser: 0
@@ -168,15 +174,22 @@ spec:
             - { name: LOG_LEVEL,                           value: "info" }
           volumeMounts:
             - { name: home,       mountPath: /home/agent }
-            - { name: cred,       mountPath: /home/agent/.multica/profiles/foreman-job/config.json, subPath: config.json, readOnly: true }
+            # The credential volume IS the Job's profile area at run time: the
+            # daemon resolves its profile under $HOME/.multica/profiles/<name>
+            # inside it, so the token file prepare wrote and every
+            # profile-relative store it creates live and die with this pod.
+            # The node's home face stays free of the profile directory and of
+            # the token (ADR-059).
+            - { name: cred,       mountPath: /home/agent/.multica/profiles }
             - { name: workspaces, mountPath: /state/workspaces }
             - { name: tmp,        mountPath: /tmp }
             - { name: agent-bin,  mountPath: /usr/local/bin/omp, subPath: omp, readOnly: true }
       volumes:
         # Node-side agent state is partitioned per workspace (§8.8): the
         # placeholder is the Job's workspace, so two workspaces on one
-        # node never share profiles, sessions or memory — and the gc
-        # rounds judge each workspace's tree independently.
+        # node never share sessions or memory — and the gc rounds judge
+        # each workspace's tree independently. The daemon profile is not
+        # here: it lives in the credential volume, per Job (ADR-059).
         - name: home
           hostPath: { path: /var/lib/foreman/home/<workspace_id>, type: DirectoryOrCreate }
         - name: workspaces
@@ -185,8 +198,16 @@ spec:
           emptyDir: { sizeLimit: 2Gi }
         - name: agent-bin
           emptyDir: { sizeLimit: 1Gi }
+        # The Job's credential volume, now also carrying that Job's daemon
+        # profile directory: the token file, pid, log and profile-relative
+        # state are all pod-local, so the profile never lands on the node's
+        # shared home face and two Jobs on one node cannot contend for it.
+        # 512Mi is a starting value, not a measured bound: the provider's
+        # profile-relative stores are what fill this volume. Size it from the
+        # cold-start footprint measured on your own provider (README
+        # §Node-local state).
         - name: cred
-          emptyDir: { sizeLimit: 16Mi }
+          emptyDir: { sizeLimit: 512Mi }
         - name: cred-src
           secret: { secretName: fm-<task_id>-cred, defaultMode: 0400 }
 ---

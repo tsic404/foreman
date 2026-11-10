@@ -1,35 +1,36 @@
 #!/bin/sh
-# TC-tech-auth-05 — AC-21's self-healing face: prepare survives the two
-# abnormal file shapes a task payload can leave on the node's shared home
-# volume — the profile directory's position occupied by a regular file, and the
-# marker path occupied by a directory — and the Job still boots. The carrier
-# installs both shapes on the schedulable nodes, the operator triggers a task,
-# and `verify` judges the landed pod, its prepare init container and the token
-# mount, then restores the node trees.
+# TC-tech-auth-05 — AC-21's live window: the marker position on the node's
+# shared home volume is occupied by a directory, prepare heals it, and the Job
+# still boots; the daemon profile — which is no longer a node-side position —
+# lives in the Job's own credential volume, so the home face carries no profile
+# directory and no token during or after the run (ADR-059).
 #
 #   WORKSPACE_ID=<workspace_id> ./tech-auth-05-cluster.sh prepare [NODE=<node>]
-#       install both shapes (existing profile and marker are moved aside on the
+#       install the marker anomaly (an existing marker is moved aside on the
 #       node, not deleted) and print the trigger instruction. The home
 #       partition is resolved from the reference template's home volume —
 #       `hostPath: .../home/<workspace_id>` — so only the workspace under test
 #       is touched and the other partitions on a shared node stay intact.
 #   ./tech-auth-05-cluster.sh verify TASK_ID
-#       judge the task's pod, restore every prepared node, clear the state.
+#       judge the task's pod and the node face, restore every prepared node,
+#       clear the state.
 #   ./tech-auth-05-cluster.sh restore
 #       restore without judging (aborted window).
 #
 # The reference-template window is a precondition: the task Job must carry the
-# prepare init container with the three-path heal, the marker `rm -rf` and the
-# 0400 credential copy, its home volume must mount the prepared partition, and
-# the agent container must mount the credential as the single read-only file at
-# the profile path — AC-21 judges that face on the rendered Job, so `verify`
-# reads it there.
+# prepare init container that heals the node face's two directory positions
+# (`.multica` and the `profiles` mount target), creates the profile directory
+# inside the credential volume, writes the 0400 credential file there, removes
+# the marker and prints the fixed profile-scope declaration; its home volume
+# must mount the prepared partition; the agent container must mount the
+# credential volume at the profile root (no single-file subPath). AC-21 judges
+# those faces on the rendered Job, so `verify` reads them there.
 #
-# `verify` reads the healed tree from the node itself, so the verdict does not
-# depend on the agent container's lifetime. The mounted credential file is read
-# inside that container when an exec still lands there; when the task finishes
-# its few seconds first, the rendered Job's mount shape is the evidence, and
-# the run still reaches a verdict instead of blocking.
+# `verify` reads the node face itself, so the verdict does not depend on the
+# agent container's lifetime. The credential file is read inside that container
+# when an exec still lands there; when the task finishes its few seconds first,
+# the rendered Job's mount shape is the evidence, and the run still reaches a
+# verdict instead of blocking.
 #
 # NODE_HOST_ROOT names where the node debugger mounts the node root; the
 # default /host is what the profile's sysadmin image provides. Only a debug
@@ -188,15 +189,16 @@ state_workspace() {
 	cat "$STATE_DIR/workspace"
 }
 
-# restore_node <node> <meta> <host_root> <home>: undo the anomaly and put the
-# moved-aside profile and marker back. <host_root> is where the debug image
-# mounts the node root; <home> is the node-side home partition written by
-# prepare. The install writes a per-run journal on the node before touching
-# either position, and records the positions whose original was absent: a
-# command that is cut off mid-way (log lost, NODE_WAIT expiry) must still be
-# undone without deleting an original that was never moved. Idempotent;
-# returns non-zero with a diagnostic instead of exiting, so a partial restore
-# keeps the remaining nodes' state.
+# restore_node <node> <meta> <host_root> <home>: undo the marker anomaly and put
+# the moved-aside marker back. <host_root> is where the debug image mounts the
+# node root; <home> is the node-side home partition written by prepare. The
+# install writes a per-run journal on the node before touching the position, and
+# records whether its original was absent: a command that is cut off mid-way
+# (log lost, NODE_WAIT expiry) must still be undone without deleting an original
+# that was never moved. The profile position is never restored here — a new
+# deployment keeps none on the home face (ADR-059). Idempotent; returns
+# non-zero with a diagnostic instead of exiting, so a partial restore keeps the
+# remaining nodes' state.
 restore_node() {
 	_node=$1
 	_meta=$2
@@ -220,7 +222,7 @@ H='@HOST_ROOT@@HOME@'
 [ -d "$H" ] || { echo 'QA_BLOCKED: the prepared home partition @HOME@ does not exist on this node' >&2; exit 2; }
 journal="$H/@JOURNAL@"
 # An empty backup name carries no on-node name to probe: `[ ! -e "$H/" ]`
-# would test the home directory itself and never hold, so a window whose two
+# would test the home directory itself and never hold, so a window whose
 # originals were absent would fall through to the success line as if it had
 # restored something. A missing journal and no backup means nothing to undo.
 if [ ! -e "$journal" ] &&
@@ -229,7 +231,6 @@ if [ ! -e "$journal" ] &&
 	echo "restored: the install never touched this node"
 	exit 0
 fi
-prof_state=$(sed -n 's/^profile=//p' "$journal" 2>/dev/null | head -1)
 marker_state=$(sed -n 's/^marker=//p' "$journal" 2>/dev/null | head -1)
 base="$H/.multica"
 prof="$base/profiles/foreman-job"
@@ -237,13 +238,11 @@ marker="$base/daemon_task_context.json"
 if [ -n "@PB@" ] && [ -e "$H/@PB@" ]; then
 	rm -rf "$prof"
 	mv "$H/@PB@" "$prof"
-elif [ "$prof_state" = "absent" ] || [ "$prof_state" = "moved" ]; then
-	# "moved" without the backup means it was lost after the move; the
-	# directory shape is still what every task expects, so restore it empty
-	# instead of leaving the anomaly file in place.
+else
+	# The window starts and ends without a node-side profile directory: one
+	# that was absent stays absent, and nothing recreates it — the profile is a
+	# per-Job credential-volume entry (ADR-059).
 	rm -rf "$prof"
-	mkdir -p "$prof"
-	chown 1000:1000 "$prof"
 fi
 if [ -n "@MB@" ] && [ -e "$H/@MB@" ]; then
 	rm -rf "$marker"
@@ -346,9 +345,11 @@ H='@HOST_ROOT@@HOME@'
 [ -d "$H" ] || { echo 'QA_BLOCKED: the home partition @HOME@ for workspace @WS@ is not a directory on this node — run a task of this workspace here first (the template creates it with DirectoryOrCreate)' >&2; exit 2; }
 base="$H/.multica"
 [ -d "$base" ] || { echo 'QA_BLOCKED: @HOME@/.multica is not a directory on this node' >&2; exit 2; }
-[ -d "$base/profiles" ] || { echo 'QA_BLOCKED: @HOME@/.multica/profiles is not a directory on this node' >&2; exit 2; }
 journal="$H/@JOURNAL@"
 : >"$journal"
+# A profile directory under the home face is legacy state from an earlier
+# release (ADR-059 decision 9): move it out of the window, not delete it, so the
+# negative judgement below starts from the clean face a new deployment has.
 prof="$base/profiles/foreman-job"
 pe=0
 pb=""
@@ -361,7 +362,6 @@ if [ -e "$prof" ] || [ -L "$prof" ]; then
 else
 	printf 'profile=absent\n' >>"$journal"
 fi
-printf 'anomaly\n' >"$prof"
 marker="$base/daemon_task_context.json"
 me=0
 mb=""
@@ -390,7 +390,7 @@ NODE
 		printf '%s\n' "$meta|$journal" >"$STATE_DIR/$n.meta"
 		observe "prepared node=$n state=$meta"
 	done
-	observe "window: both shapes installed on $(wc -l <"$STATE_DIR/nodes" | tr -d ' ') node(s)"
+	observe "window: marker anomaly installed on $(wc -l <"$STATE_DIR/nodes" | tr -d ' ') node(s)"
 	echo "trigger a task of workspace $WORKSPACE_ID now, then run: $0 verify <task id>"
 	echo "abort: $0 restore"
 	;;
@@ -420,23 +420,27 @@ verify)
 	[ -n "$prepare_args" ] ||
 		blocked "Job $job carries no prepare init container — not the reference-template window"
 	printf '%s' "$prepare_args" | grep -Fq '[ -d "$d" ] || { rm -f "$d"; mkdir -p "$d"; }' ||
-		blocked "prepare does not carry the three-path heal — not the reference-template window"
+		blocked "prepare does not heal the node face's directory positions — not the reference-template window"
+	printf '%s' "$prepare_args" | grep -Fq 'mkdir -p /credout/foreman-job' ||
+		blocked "prepare does not create the profile directory inside the credential volume — not the reference-template window"
 	printf '%s' "$prepare_args" | grep -Fq 'rm -rf /home/agent/.multica/daemon_task_context.json' ||
 		blocked "prepare does not carry the marker rm -rf — not the reference-template window"
 
 	# The credential face, judged on the rendered Job (the design's judgment
-	# object): one read-only file at the profile path, out of the emptyDir that
-	# prepare fills with mode 0400 and owner 1000. This is also the evidence
-	# that stands when the agent container ends before an exec lands inside it.
-	printf '%s' "$prepare_args" | grep -Fq 'chmod 0400 /credout/config.json' ||
-		blocked "prepare does not set the credential copy to 0400 — not the reference-template window"
-	printf '%s' "$prepare_args" | grep -Fq 'chown -R 1000:1000' ||
-		blocked "prepare does not own the credential copy as 1000:1000 — not the reference-template window"
+	# object): the credential volume carries the profile directory, and prepare
+	# fills it with the 0400 file owned by 1000. This is also the evidence that
+	# stands when the agent container ends before an exec lands inside it.
+	printf '%s' "$prepare_args" | grep -Fq 'chmod 0400 /credout/foreman-job/config.json' ||
+		blocked "prepare does not set the credential copy in the profile volume to 0400 — not the reference-template window"
+	printf '%s' "$prepare_args" | grep -Fq 'chown -R 1000:1000 /home/agent /state/workspaces /credout' ||
+		blocked "prepare does not own the credential volume as 1000:1000 — not the reference-template window"
+	printf '%s' "$prepare_args" | grep -Fq 'profile-relative state is per-Job and is not reused across tasks' ||
+		blocked "prepare does not carry the fixed profile-scope declaration — not the reference-template window"
 	cred_mount=$(printf '%s' "$job_json" | jq -r '
 		[.spec.template.spec.containers[]? | select(.name == "agent") | .volumeMounts[]? | select(.name == "cred")]
 		| first // empty | "\(.subPath // "")|\(.readOnly // false)|\(.mountPath // "")"')
-	[ "$cred_mount" = "config.json|true|/home/agent/.multica/profiles/foreman-job/config.json" ] ||
-		blocked "Job $job's agent container does not mount the credential as the single read-only file at the profile path (got '${cred_mount:-absent}')"
+	[ "$cred_mount" = "|false|/home/agent/.multica/profiles" ] ||
+		blocked "Job $job's agent container does not mount the credential volume at the profile root (got '${cred_mount:-absent}')"
 	cred_volume=$(printf '%s' "$job_json" | jq -r '
 		[.spec.template.spec.volumes[]? | select(.name == "cred") | if has("emptyDir") then "emptyDir" else "other" end]
 		| first // empty')
@@ -448,10 +452,10 @@ verify)
 	# seen running — not after the loop has settled the other observations —
 	# and is retried while the container lives. A container that ends before an
 	# exec lands is a task that outran the carrier, not a broken window: the
-	# credential face is then the rendered Job's above, and the healed tree is
-	# read from the node below. A pod that stays in CreateContainerConfigError
-	# is the failure this case exists to catch, so the wait is bounded and the
-	# raw status is printed.
+	# credential face is then the rendered Job's above, and the node face is
+	# read below. A pod that stays in CreateContainerConfigError is the failure
+	# this case exists to catch, so the wait is bounded and the raw status is
+	# printed.
 	deadline=$(( $(date +%s) + WAIT ))
 	pod=""
 	node=""
@@ -534,20 +538,19 @@ verify)
 			fail "the credential file is not readable at the profile path inside pod $pod: $runtime"
 		case $cred in
 		400\ 1000:1000\ *) : ;;
-		*) fail "the token mount is '$cred', want 400 1000:1000" ;;
+		*) fail "the credential file is '$cred', want 400 1000:1000" ;;
 		esac
 		printf '%s\n' "$runtime" | grep -qx 'profile=dir' ||
-			fail "the profile position is still not a directory: $runtime"
+			fail "the profile directory inside the credential volume is not a directory: $runtime"
 		printf '%s\n' "$runtime" | grep -qx 'marker=absent' ||
 			fail "the marker path still exists after prepare: $runtime"
 	else
-		observe "the agent container ended before an exec landed (last exec error: ${exec_err:-none}) — the credential face is judged on the rendered Job, the healed tree on the node"
+		observe "the agent container ended before an exec landed (last exec error: ${exec_err:-none}) — the credential face is judged on the rendered Job, the node face below"
 	fi
 
-	# The healed tree, read from the node's shared home partition: this is what
-	# prepare rewrote, and the read does not depend on the container's
-	# lifetime. The credential file itself is a per-pod subPath mount, so it
-	# has no node-side position to read.
+	# The node's shared home face, read from the node itself: the marker is
+	# healed, and the daemon profile (with its token) is not there — it lives in
+	# the pod's credential volume and disappears with it (ADR-059).
 	_script=$(sed -e "s|@HOST_ROOT@|$host_root|g" -e "s|@HOME@|$home_root|g" <<'NODE'
 set -eu
 [ -d '@HOST_ROOT@' ] || { echo 'QA_BLOCKED: the node filesystem is not mounted at @HOST_ROOT@' >&2; exit 2; }
@@ -555,7 +558,21 @@ H='@HOST_ROOT@@HOME@'
 [ -d "$H" ] || H='@HOME@'
 [ -d "$H" ] || { echo 'QA_BLOCKED: the prepared home partition @HOME@ does not exist on this node' >&2; exit 2; }
 base="$H/.multica"
-[ -d "$base/profiles/foreman-job" ] && echo profile=dir || echo profile=notdir
+if [ -e "$base/profiles/foreman-job" ] || [ -L "$base/profiles/foreman-job" ]; then
+	echo profile=present
+else
+	echo profile=absent
+fi
+if [ -d "$base/profiles" ]; then
+	echo profiles=dir
+else
+	echo profiles=missing
+fi
+if [ -n "$(find "$base" -name config.json -print 2>/dev/null | head -1)" ]; then
+	echo token=present
+else
+	echo token=absent
+fi
 [ -e "$base/daemon_task_context.json" ] && echo marker=present || echo marker=absent
 NODE
 	)
@@ -565,17 +582,21 @@ NODE
 	case $tree in
 	*QA_BLOCKED*) blocked "$(node_blocked_reason "$tree")" ;;
 	esac
-	observe "node tree: $(printf '%s' "$tree" | tr '\n' ' ')"
-	printf '%s\n' "$tree" | grep -qx 'profile=dir' ||
-		fail "the profile position on $node is still not a directory: $tree"
+	observe "node face: $(printf '%s' "$tree" | tr '\n' ' ')"
+	printf '%s\n' "$tree" | grep -qx 'profile=absent' ||
+		fail "the node's home face carries a profile directory after the run: $tree"
+	printf '%s\n' "$tree" | grep -qx 'profiles=dir' ||
+		fail "the node face's profiles mount target is not a directory after the run: $tree"
+	printf '%s\n' "$tree" | grep -qx 'token=absent' ||
+		fail "the node's home face carries the credential file after the run: $tree"
 	printf '%s\n' "$tree" | grep -qx 'marker=absent' ||
 		fail "the marker path still exists on $node after prepare: $tree"
 
 	restore_all || blocked "the tree restore failed — the state file is kept for '$0 restore'"
 	if [ "$live" -eq 1 ]; then
-		echo "PASS: TC-tech-auth-05 (task $TASK on $node booted with both abnormal shapes; prepare healed the tree and the token mount is 400 1000:1000)"
+		echo "PASS: TC-tech-auth-05 (task $TASK on $node booted with the marker anomaly; prepare healed the marker, the credential volume carries 400 1000:1000, and the node face carries neither a profile directory nor a token)"
 	else
-		echo "PASS: TC-tech-auth-05 (task $TASK on $node booted with both abnormal shapes; prepare healed the tree and the rendered Job carries the read-only 0400 credential mount)"
+		echo "PASS: TC-tech-auth-05 (task $TASK on $node booted with the marker anomaly; prepare healed the marker, the rendered Job mounts the credential volume at the profile root, and the node face carries neither a profile directory nor a token)"
 	fi
 	;;
 
