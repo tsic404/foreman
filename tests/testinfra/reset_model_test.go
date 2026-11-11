@@ -418,10 +418,16 @@ func decodeResetBody(t *testing.T, call resetCall, into any) {
 // before the model writes; `opts` is what the stubbed cluster reports.
 func runReset(t *testing.T, opts resetOptions) resetRun {
 	t.Helper()
+	return runResetAt(t, t.TempDir(), opts)
+}
+
+// runResetAt is runReset on a caller-owned sandbox so a test can plant state in
+// the home reset.sh reads and observe what one round leaves there.
+func runResetAt(t *testing.T, dir string, opts resetOptions) resetRun {
+	t.Helper()
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skipf("host has no sh: %v", err)
 	}
-	dir := t.TempDir()
 	binDir := filepath.Join(dir, "bin")
 	entryDir := filepath.Join(dir, "test-multica")
 	homeDir := filepath.Join(dir, "home")
@@ -519,8 +525,11 @@ func runReset(t *testing.T, opts resetOptions) resetRun {
 			// The witness has its own export ahead of lib.sh's HOME default,
 			// so restating TEST_MULTICA_* is not enough: an exported value on
 			// the host would point reset.sh's rm at a file outside the
-			// sandbox. Tests that state their own path layer it on top.
-			"PIN_NODE_WITNESS": filepath.Join(dir, "witness"),
+			// sandbox. Present but empty keeps the key in the child
+			// environment while letting the default fall through to the
+			// sandboxed HOME, which is what the entry lands on. Tests that
+			// state their own path layer it on top.
+			"PIN_NODE_WITNESS": "",
 		},
 		opts.extraEnv,
 	)
@@ -690,5 +699,33 @@ func TestResetIgnoresAnExportedWitnessPath(t *testing.T) {
 	}
 	if strings.Contains(run.stderr, exported) {
 		t.Errorf("reset.sh reports %q as its witness — the sandbox did not own the variable:\n%s", exported, run.stderr)
+	}
+}
+
+// TestResetDropsTheWitnessAtTheHomeDefaultPath: with the export empty, the
+// path can only come from lib.sh's own default — the round must find and drop
+// a witness a stopped-instance pin left in $HOME. The planted path restates
+// that default, so a literal that drifts away from it leaves the file behind
+// and turns this red instead of passing quietly.
+func TestResetDropsTheWitnessAtTheHomeDefaultPath(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatalf("create the sandbox home: %v", err)
+	}
+	witness := filepath.Join(home, ".foreman-job-policy-witness")
+	if err := os.WriteFile(witness, []byte("expect=sha256="+strings.Repeat("a", 64)+"\n"), 0o600); err != nil {
+		t.Fatalf("plant the witness at the home default: %v", err)
+	}
+
+	run := runResetAt(t, dir, resetOptions{})
+	if run.err != nil {
+		t.Fatalf("reset.sh did not finish: %v\n--- stderr ---\n%s", run.err, run.stderr)
+	}
+	if _, err := os.Stat(witness); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("reset.sh left the witness at lib.sh's home default behind (stat err = %v) — no export named this path", err)
+	}
+	if !strings.Contains(run.stderr, "dropped the stale job-policy witness") {
+		t.Errorf("reset.sh does not report dropping the witness:\n%s", run.stderr)
 	}
 }
