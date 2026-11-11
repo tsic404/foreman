@@ -15,8 +15,8 @@ TEST_MULTICA_SERVER_URL=${TEST_MULTICA_SERVER_URL:-http://127.0.0.1:30080}
 TEST_MULTICA_VERSION_ANCHOR=${TEST_MULTICA_VERSION_ANCHOR:-v0.6.1}
 TEST_AGENT_NAME=${TEST_AGENT_NAME:-foreman-test-agent}
 # The failure agent the test environment creates (testinfra/test-multica
-# README §The failure agent): same runtime, no model source, so a task
-# dispatched to it always ends failed.
+# README §The failure agent): same runtime, a model selector no round can
+# resolve, so a task dispatched to it always ends failed.
 FAULT_AGENT_NAME=${TEST_MULTICA_FAULT_AGENT:-foreman-test-agent-failing}
 # The window uat-scenarios.sh builds and the two terminal-class carriers read:
 # four task ids and the terminal counters taken before the first of them.

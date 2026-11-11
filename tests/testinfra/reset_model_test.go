@@ -2,14 +2,15 @@
 // could otherwise notice were wrong: the model selector and the model
 // backend's in-cluster address. Neither is observable without a cluster, so
 // reset.sh runs here against stubs that answer every call up to the writes and
-// keep the request bodies for judgement: the selector must be the untagged
-// family omp resolves after discovery, and custom_env must carry the backend
-// address and nothing else.
+// keep the request bodies for judgement: the selector must name the served
+// tag in full — the form omp's catalog carries — and custom_env must carry the
+// backend address and nothing else.
 package testinfra
 
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"maps"
 	"os"
 	"os/exec"
@@ -26,6 +27,7 @@ const (
 	resetRepoURL     = "https://github.com/tsic404/foreman"
 	resetServerURL   = "http://server.test.local:8080"
 	resetNamespace   = "multica-test"
+	resetInstanceNS  = "foreman"
 	resetModelDeploy = "test-multica-ollama"
 	resetBackendURL  = "http://test-multica-ollama.multica-test.svc:11434"
 )
@@ -42,12 +44,37 @@ case " $* " in
 	printf 'Error from server (NotFound): deployments.apps "%s" not found\n' "$TEST_MULTICA_INSTANCE" >&2
 	exit 1
 	;;
+*" -n $TEST_MULTICA_NS get deploy $TEST_MULTICA_SCRIPTED_DEPLOY "*)
+	if [ -n "${STUB_SCRIPTED_READ_ERROR:-}" ]; then
+		printf '%s\n' "$STUB_SCRIPTED_READ_ERROR" >&2
+		exit 1
+	fi
+	printf '%s' "${STUB_SCRIPTED_ID:-}"
+	;;
 *" -n $TEST_MULTICA_NS get deploy $TEST_MULTICA_MODEL_DEPLOY "*)
 	if [ -n "${STUB_MODEL_READ_ERROR:-}" ]; then
 		printf '%s\n' "$STUB_MODEL_READ_ERROR" >&2
 		exit 1
 	fi
 	printf '%s' "$STUB_MODEL"
+	;;
+*" get namespace $TEST_MULTICA_INSTANCE_NS "*)
+	if [ -n "${STUB_INSTANCE_NS_READ_ERROR:-}" ]; then
+		printf '%s\n' "$STUB_INSTANCE_NS_READ_ERROR" >&2
+		exit 1
+	fi
+	if [ -n "${STUB_INSTANCE_NS_ABSENT:-}" ]; then
+		printf 'Error from server (NotFound): namespaces "%s" not found\n' "$TEST_MULTICA_INSTANCE_NS" >&2
+		exit 1
+	fi
+	printf 'namespace/%s\n' "$TEST_MULTICA_INSTANCE_NS"
+	;;
+*" -n $TEST_MULTICA_INSTANCE_NS delete configmap foreman-job-policy "*)
+	# The reset clears the pin the previous round left behind.
+	if [ -n "${STUB_DELETE_CONFIGMAP_ERROR:-}" ]; then
+		printf '%s\n' "$STUB_DELETE_CONFIGMAP_ERROR" >&2
+		exit 1
+	fi
 	;;
 *" exec deploy/postgres "*)
 	# psql_exec: the wipe prints nothing the entry reads.
@@ -56,6 +83,9 @@ case " $* " in
 	# One ready schedulable node: the endpoint-less branch rolls back through a
 	# one-shot carrier per node.
 	printf '{"items":[{"metadata":{"name":"node-a"},"spec":{},"status":{"conditions":[{"type":"Ready","status":"True"}]}}]}'
+	;;
+*" create secret generic "*)
+	printf 'apiVersion: v1\nkind: Secret\nmetadata:\n  name: test-multica-model-provider\n'
 	;;
 *" apply -f "*)
 	# The removal carrier's manifest is applied; no pod ever runs here.
@@ -129,13 +159,14 @@ case "$method $path" in
 esac
 `
 
-// TestResetPinsTheUntaggedModelFamilyAndTheBackendAddress judges the agent
-// writes reset.sh sends when no endpoint is configured. A tagged selector is
-// the regression the live path cannot catch: omp validates it against a
-// startup catalog a fresh Job pod does not have, so the failure only shows up
-// as a dead task. The last case is the chain's floor: neither the endpoint
-// triple nor a deployed local backend, so both fields are cleared.
-func TestResetPinsTheUntaggedModelFamilyAndTheBackendAddress(t *testing.T) {
+// TestResetPinsTheServedModelTagAndTheBackendAddress judges the agent writes
+// reset.sh sends when no endpoint is configured. A selector that drops the
+// served tag is the regression the live path shows as a dead task: omp
+// resolves a provided selector against the catalog it discovers, and the
+// family form without `:tag` matches no row there. The last case is the
+// chain's floor: neither the endpoint triple nor a deployed local backend, so
+// both fields are cleared.
+func TestResetPinsTheServedModelTagAndTheBackendAddress(t *testing.T) {
 	for _, tc := range []struct {
 		name, served, wantModel, wantInfo string
 		wantEnv                           map[string]string
@@ -143,15 +174,15 @@ func TestResetPinsTheUntaggedModelFamilyAndTheBackendAddress(t *testing.T) {
 		{
 			name:      "tagged model",
 			served:    "qwen2.5:0.5b",
-			wantModel: "ollama/qwen2.5",
-			wantInfo:  "test-multica: agent foreman-test-agent → ollama/qwen2.5 (" + resetBackendURL + ")",
+			wantModel: "ollama/qwen2.5:0.5b",
+			wantInfo:  "test-multica: agent foreman-test-agent → ollama/qwen2.5:0.5b (" + resetBackendURL + ")",
 			wantEnv:   map[string]string{"OLLAMA_BASE_URL": resetBackendURL},
 		},
 		{
 			name:      "latest tag",
 			served:    "some-model:latest",
-			wantModel: "ollama/some-model",
-			wantInfo:  "test-multica: agent foreman-test-agent → ollama/some-model (" + resetBackendURL + ")",
+			wantModel: "ollama/some-model:latest",
+			wantInfo:  "test-multica: agent foreman-test-agent → ollama/some-model:latest (" + resetBackendURL + ")",
 			wantEnv:   map[string]string{"OLLAMA_BASE_URL": resetBackendURL},
 		},
 		{
@@ -163,7 +194,7 @@ func TestResetPinsTheUntaggedModelFamilyAndTheBackendAddress(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			run := runReset(t, resetOptions{served: tc.served})
+			run := runReset(t, resetOptions{source: "ollama", served: tc.served})
 			if run.err != nil {
 				t.Fatalf("reset.sh did not finish: %v\n--- stderr ---\n%s", run.err, run.stderr)
 			}
@@ -205,6 +236,7 @@ func TestResetPinsTheUntaggedModelFamilyAndTheBackendAddress(t *testing.T) {
 // non-zero and write nothing at all.
 func TestResetFailsWhenTheModelBackendReadFails(t *testing.T) {
 	run := runReset(t, resetOptions{
+		source:         "ollama",
 		served:         "qwen2.5:0.5b",
 		modelReadError: `Error from server (Forbidden): deployments.apps "` + resetModelDeploy + `" is forbidden`,
 	})
@@ -228,6 +260,7 @@ func TestResetFailsWhenTheModelBackendReadFails(t *testing.T) {
 func TestResetFallsToTheFloorWhenTheModelBackendIsNotDeployed(t *testing.T) {
 	run := runReset(t, resetOptions{
 		modelReadError: `Error from server (NotFound): deployments.apps "` + resetModelDeploy + `" not found`,
+		source:         "ollama",
 	})
 	if run.err != nil {
 		t.Fatalf("reset.sh did not finish: %v\n--- stderr ---\n%s", run.err, run.stderr)
@@ -256,16 +289,97 @@ func TestResetFallsToTheFloorWhenTheModelBackendIsNotDeployed(t *testing.T) {
 	}
 }
 
+// TestResetRegistersTheScriptedBackend judges the default local round: the
+// scripted backend is the source, so the agent's model names its served id in
+// full and the registration the Job pods read is written through the same
+// installer a deployment-supplied endpoint uses — Secret plus one carrier per
+// node. It is neither the ollama path (no OLLAMA_BASE_URL) nor the floor
+// (which clears the model).
+func TestResetRegistersTheScriptedBackend(t *testing.T) {
+	run := runReset(t, resetOptions{scriptedID: "fixture:deterministic"})
+	if run.err != nil {
+		t.Fatalf("reset.sh did not finish: %v\n--- stderr ---\n%s", run.err, run.stderr)
+	}
+	wantInfo := "test-multica: agent foreman-test-agent → scripted/fixture:deterministic (http://test-multica-scripted.multica-test.svc:8080/v1)"
+	if !strings.Contains(run.stderr, wantInfo) {
+		t.Errorf("reset.sh does not report %q\n--- stderr ---\n%s", wantInfo, run.stderr)
+	}
+
+	modelWrites := run.requests("PUT", "/api/agents/"+resetAgentID)
+	if len(modelWrites) != 1 {
+		t.Fatalf("reset.sh sent %d model writes, want 1", len(modelWrites))
+	}
+	var model struct {
+		Model string `json:"model"`
+	}
+	decodeResetBody(t, modelWrites[0], &model)
+	if model.Model != "scripted/fixture:deterministic" {
+		t.Errorf("the model write carries %q, want the scripted selector", model.Model)
+	}
+
+	envWrites := run.requests("PUT", "/api/agents/"+resetAgentID+"/env")
+	if len(envWrites) != 1 {
+		t.Fatalf("reset.sh sent %d env writes, want 1", len(envWrites))
+	}
+	var env struct {
+		CustomEnv map[string]string `json:"custom_env"`
+	}
+	decodeResetBody(t, envWrites[0], &env)
+	if !maps.Equal(env.CustomEnv, map[string]string{}) {
+		t.Errorf("custom_env = %v, want empty — the scripted endpoint carries its own base URL in the registration", env.CustomEnv)
+	}
+
+	for _, want := range []string{
+		"create secret generic " + "test-multica-model-provider",
+		"apply -f",
+	} {
+		if !strings.Contains(run.kubectl, want) {
+			t.Errorf("the scripted round never ran %q — the Job pods would carry no provider registration:\n%s", want, run.kubectl)
+		}
+	}
+}
+
+// TestResetFailsWhenTheScriptedBackendReadFails is the same fail-closed rule on
+// the default source: a read failure that is not NotFound must not fall to the
+// floor, which would clear a working agent's model behind a green gate.
+func TestResetFailsWhenTheScriptedBackendReadFails(t *testing.T) {
+	run := runReset(t, resetOptions{
+		scriptedReadError: `Error from server (Forbidden): deployments.apps "test-multica-scripted" is forbidden`,
+	})
+	if run.err == nil {
+		t.Fatalf("reset.sh finished with status 0 after the scripted backend read failed\n--- stderr ---\n%s", run.stderr)
+	}
+	if want := "cannot read Deployment multica-test/test-multica-scripted"; !strings.Contains(run.stderr, want) {
+		t.Errorf("reset.sh does not report the failed read (%q)\n--- stderr ---\n%s", want, run.stderr)
+	}
+	for _, path := range []string{"/api/agents/" + resetAgentID, "/api/agents/" + resetAgentID + "/env"} {
+		if writes := run.requests("PUT", path); len(writes) != 0 {
+			t.Errorf("reset.sh sent %d PUT %s after the read failed — a failed read must not be written as an empty model", len(writes), path)
+		}
+	}
+}
+
 // resetOptions are the cluster answers the stubs give reset.sh.
 type resetOptions struct {
-	// served is the model the stubbed model backend reports.
+	// source is the round's local model source: empty means the lib default
+	// (scripted), `ollama` selects the keyless engine.
+	source string
+	// served is the model the stubbed ollama backend reports.
 	served string
-	// modelReadError, when set, makes every read of the model backend fail
+	// modelReadError, when set, makes every read of the ollama backend fail
 	// with this message instead of answering.
 	modelReadError string
+	// scriptedID is the model id the stubbed scripted Deployment reports.
+	scriptedID string
+	// scriptedReadError, when set, makes every read of the scripted
+	// Deployment fail with this message instead of answering.
+	scriptedReadError string
 	// agents, when set, is the agent list GET /api/agents answers; empty means
 	// the test agent alone, which is the state a first round sees.
 	agents string
+	// extraEnv, when set, overrides one more variable for the run — the way a
+	// test states a configuration the round itself does not own.
+	extraEnv map[string]string
 }
 
 // resetCall is one request the stubbed test server received.
@@ -275,9 +389,10 @@ type resetCall struct {
 
 // resetRun is one reset.sh invocation against the stubs.
 type resetRun struct {
-	calls  []resetCall
-	stderr string
-	err    error
+	calls   []resetCall
+	kubectl string
+	stderr  string
+	err     error
 }
 
 // requests is every recorded call with the given method and path.
@@ -303,10 +418,16 @@ func decodeResetBody(t *testing.T, call resetCall, into any) {
 // before the model writes; `opts` is what the stubbed cluster reports.
 func runReset(t *testing.T, opts resetOptions) resetRun {
 	t.Helper()
+	return runResetAt(t, t.TempDir(), opts)
+}
+
+// runResetAt is runReset on a caller-owned sandbox so a test can plant state in
+// the home reset.sh reads and observe what one round leaves there.
+func runResetAt(t *testing.T, dir string, opts resetOptions) resetRun {
+	t.Helper()
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skipf("host has no sh: %v", err)
 	}
-	dir := t.TempDir()
 	binDir := filepath.Join(dir, "bin")
 	entryDir := filepath.Join(dir, "test-multica")
 	homeDir := filepath.Join(dir, "home")
@@ -343,6 +464,10 @@ func runReset(t *testing.T, opts resetOptions) resetRun {
 	if agents == "" {
 		agents = `[{"id":"` + resetAgentID + `","name":"` + resetAgentName + `","archived_at":null}]`
 	}
+	source := opts.source
+	if source == "" {
+		source = "scripted"
+	}
 	agentsPath := filepath.Join(dir, "agents.json")
 	if err := os.WriteFile(agentsPath, []byte(agents), 0o644); err != nil {
 		t.Fatalf("seed the agent list: %v", err)
@@ -357,32 +482,39 @@ func runReset(t *testing.T, opts resetOptions) resetRun {
 			"TMPDIR": dir,
 		},
 		map[string]string{
-			"STUB_CALLS":            callsPath,
-			"STUB_KUBECTL_CALLS":    filepath.Join(dir, "kubectl.calls"),
-			"STUB_STATE":            stateDir,
-			"STUB_MODEL":            opts.served,
-			"STUB_MODEL_READ_ERROR": opts.modelReadError,
-			"STUB_AGENT_ID":         resetAgentID,
-			"STUB_AGENT_NAME":       resetAgentName,
-			"STUB_AGENTS":           agentsPath,
-			"STUB_WORKSPACE_ID":     resetWorkspaceID,
-			"STUB_REPO_URL":         resetRepoURL,
-			"STUB_CHAT_TITLE":       resetChatTitle,
+			"STUB_CALLS":               callsPath,
+			"STUB_KUBECTL_CALLS":       filepath.Join(dir, "kubectl.calls"),
+			"STUB_STATE":               stateDir,
+			"STUB_MODEL":               opts.served,
+			"STUB_MODEL_READ_ERROR":    opts.modelReadError,
+			"STUB_SCRIPTED_ID":         opts.scriptedID,
+			"STUB_SCRIPTED_READ_ERROR": opts.scriptedReadError,
+			"STUB_AGENT_ID":            resetAgentID,
+			"STUB_AGENT_NAME":          resetAgentName,
+			"STUB_AGENTS":              agentsPath,
+			"STUB_WORKSPACE_ID":        resetWorkspaceID,
+			"STUB_REPO_URL":            resetRepoURL,
+			"STUB_CHAT_TITLE":          resetChatTitle,
 			// The scripts' own defaults are restated so an exported
 			// TEST_MULTICA_* on the host cannot decide what this test reads.
-			"TEST_MULTICA_PROFILE":      "test-multica",
-			"TEST_MULTICA_SERVER_URL":   resetServerURL,
-			"TEST_MULTICA_NS":           resetNamespace,
-			"TEST_MULTICA_MODEL_DEPLOY": resetModelDeploy,
-			"TEST_MULTICA_INSTANCE_NS":  "foreman",
-			"TEST_MULTICA_INSTANCE":     "foreman",
-			"TEST_MULTICA_AGENT":        resetAgentName,
-			"TEST_MULTICA_CHAT":         resetChatTitle,
-			"TEST_MULTICA_REPO":         resetRepoURL,
-			"TEST_MULTICA_ENTRY_URL":    "http://entry.test.local:30300",
-			// No endpoint triple: the local backend is the source this test
-			// judges. Blanks, not absences, so an exported TEST_MULTICA_* on
-			// the host cannot switch reset.sh to the endpoint branch.
+			"TEST_MULTICA_PROFILE":         "test-multica",
+			"TEST_MULTICA_SERVER_URL":      resetServerURL,
+			"TEST_MULTICA_NS":              resetNamespace,
+			"TEST_MULTICA_MODEL_DEPLOY":    resetModelDeploy,
+			"TEST_MULTICA_INSTANCE_NS":     resetInstanceNS,
+			"TEST_MULTICA_INSTANCE":        "foreman",
+			"TEST_MULTICA_AGENT":           resetAgentName,
+			"TEST_MULTICA_CHAT":            resetChatTitle,
+			"TEST_MULTICA_REPO":            resetRepoURL,
+			"TEST_MULTICA_ENTRY_URL":       "http://entry.test.local:30300",
+			"TEST_MULTICA_SCRIPTED_DEPLOY": "test-multica-scripted",
+			// The local source is a setting too; empty means the default. An
+			// exported override on the host must not decide which source the
+			// test judges.
+			"TEST_MULTICA_MODEL_LOCAL_SOURCE": source,
+			// No endpoint triple: the local source is what this test judges.
+			// Blanks, not absences, so an exported TEST_MULTICA_* on the host
+			// cannot switch reset.sh to the endpoint branch.
 			"TEST_MULTICA_MODEL_BASE_URL":     "",
 			"TEST_MULTICA_MODEL_ID":           "",
 			"TEST_MULTICA_MODEL_API_KEY":      "",
@@ -390,13 +522,25 @@ func runReset(t *testing.T, opts resetOptions) resetRun {
 			// One attempt: an unexpected call is a broken stub, not a flaky
 			// API server.
 			"TEST_MULTICA_KUBECTL_RETRIES": "1",
+			// The witness has its own export ahead of lib.sh's HOME default,
+			// so restating TEST_MULTICA_* is not enough: an exported value on
+			// the host would point reset.sh's rm at a file outside the
+			// sandbox. Present but empty keeps the key in the child
+			// environment while letting the default fall through to the
+			// sandboxed HOME, which is what the entry lands on. Tests that
+			// state their own path layer it on top.
+			"PIN_NODE_WITNESS": "",
 		},
+		opts.extraEnv,
 	)
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
 	run := resetRun{err: cmd.Run()}
 	run.stderr = stderr.String()
 	run.calls = parseResetCalls(t, callsPath)
+	if body, err := os.ReadFile(filepath.Join(dir, "kubectl.calls")); err == nil {
+		run.kubectl = string(body)
+	}
 	return run
 }
 
@@ -425,4 +569,163 @@ func parseResetCalls(t *testing.T, path string) []resetCall {
 		})
 	}
 	return calls
+}
+
+// writeResetWitness plants the operator-side witness a stopped-instance pin
+// leaves for wire.sh: the startup line the instance must print.
+func writeResetWitness(t *testing.T) string {
+	t.Helper()
+	witness := filepath.Join(t.TempDir(), "witness")
+	if err := os.WriteFile(witness, []byte("expect=sha256="+strings.Repeat("a", 64)+"\n"), 0o600); err != nil {
+		t.Fatalf("write the pending witness: %v", err)
+	}
+	return witness
+}
+
+// TestResetDropsAStalePinWitness: a witness left by an earlier round makes the
+// next wire.sh fail against a pin the rebuilt environment no longer carries.
+// reset rebuilds the test objects, so it must drop that operator-side state.
+func TestResetDropsAStalePinWitness(t *testing.T) {
+	witness := writeResetWitness(t)
+
+	run := runReset(t, resetOptions{extraEnv: map[string]string{"PIN_NODE_WITNESS": witness}})
+	if run.err != nil {
+		t.Fatalf("reset.sh did not finish: %v\n--- stderr ---\n%s", run.err, run.stderr)
+	}
+	if _, err := os.Stat(witness); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("reset.sh left the stale witness behind (stat err = %v)", err)
+	}
+	if !strings.Contains(run.stderr, "dropped the stale job-policy witness") {
+		t.Errorf("reset.sh does not report dropping the witness:\n%s", run.stderr)
+	}
+	if !strings.Contains(run.kubectl, "-n foreman delete configmap foreman-job-policy") {
+		t.Errorf("reset.sh did not delete the pin object the witness describes:\n%s", run.kubectl)
+	}
+	if !strings.Contains(run.stderr, "cleared the job policy") {
+		t.Errorf("reset.sh does not report clearing the job policy:\n%s", run.stderr)
+	}
+}
+
+// TestResetToleratesAMissingInstanceNamespace: a fresh cluster may have no
+// instance namespace at all. That is itself the answer the pin question needs —
+// the object lives in the namespace, so an absent namespace means the pin is
+// confirmed gone — and the reset must finish without the delete it cannot
+// address. The witness still goes with it: left behind, the next wire.sh would
+// demand a startup line from wiped state, which is the stale expectation this
+// entry exists to drop.
+func TestResetToleratesAMissingInstanceNamespace(t *testing.T) {
+	witness := writeResetWitness(t)
+
+	run := runReset(t, resetOptions{extraEnv: map[string]string{
+		"PIN_NODE_WITNESS":        witness,
+		"STUB_INSTANCE_NS_ABSENT": "1",
+	}})
+	if run.err != nil {
+		t.Fatalf("reset.sh did not finish without the instance namespace: %v\n--- stderr ---\n%s", run.err, run.stderr)
+	}
+	if strings.Contains(run.kubectl, "delete configmap foreman-job-policy") {
+		t.Errorf("reset.sh tried to delete the job policy without the instance namespace:\n%s", run.kubectl)
+	}
+	if _, err := os.Stat(witness); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("reset.sh left the stale witness behind when the instance namespace was absent (stat err = %v)", err)
+	}
+}
+
+// TestResetFailsWhenTheInstanceNamespaceReadFails: an unreadable namespace is
+// not an absent one. Read as absence it would skip the pin cleanup and then
+// drop the witness, leaving the pin in force with nothing left to verify it —
+// so the read failure must fail the reset and leave both alone.
+func TestResetFailsWhenTheInstanceNamespaceReadFails(t *testing.T) {
+	witness := writeResetWitness(t)
+
+	run := runReset(t, resetOptions{extraEnv: map[string]string{
+		"PIN_NODE_WITNESS":            witness,
+		"STUB_INSTANCE_NS_READ_ERROR": "Unable to connect to the server: net/http: TLS handshake timeout",
+	}})
+	if run.err == nil {
+		t.Fatalf("reset.sh finished with status 0 after the namespace read failed\n--- stderr ---\n%s", run.stderr)
+	}
+	want := "cannot read namespace " + resetInstanceNS
+	if !strings.Contains(run.stderr, want) {
+		t.Errorf("reset.sh does not report the failed namespace read (%q)\n--- stderr ---\n%s", want, run.stderr)
+	}
+	if _, err := os.Stat(witness); err != nil {
+		t.Errorf("reset.sh dropped the witness after the namespace read failed (stat err = %v) — the pin was never confirmed gone", err)
+	}
+}
+
+// TestResetFailsWhenTheJobPolicyCannotBeCleared: a delete the API refuses
+// leaves the pin in force, and while it is in force the instance prints the
+// very startup line the witness demands — --verify would pass on the leftover
+// selector instead of catching it. So the round must fail, and the witness
+// must stay where the next wire.sh can still use it.
+func TestResetFailsWhenTheJobPolicyCannotBeCleared(t *testing.T) {
+	witness := writeResetWitness(t)
+
+	run := runReset(t, resetOptions{extraEnv: map[string]string{
+		"PIN_NODE_WITNESS":            witness,
+		"STUB_DELETE_CONFIGMAP_ERROR": `Error from server (Forbidden): configmaps "foreman-job-policy" is forbidden`,
+	}})
+	if run.err == nil {
+		t.Fatalf("reset.sh finished with status 0 although the job-policy delete was refused\n--- stderr ---\n%s", run.stderr)
+	}
+	if !strings.Contains(run.stderr, "cannot clear the job policy") {
+		t.Errorf("reset.sh does not report the refused delete:\n%s", run.stderr)
+	}
+	if _, err := os.Stat(witness); err != nil {
+		t.Errorf("reset.sh dropped the witness although the pin may still be in force (stat err = %v)", err)
+	}
+}
+
+// TestResetIgnoresAnExportedWitnessPath: lib.sh reads PIN_NODE_WITNESS ahead of
+// its HOME default, so an operator's exported value reaches the entry through
+// the inherited environment. These runs are sandboxed — a run that honoured the
+// export would delete the operator's pending witness outside t.TempDir() and
+// still report success, which is the silent loss the sandbox exists to keep out
+// of the suite.
+func TestResetIgnoresAnExportedWitnessPath(t *testing.T) {
+	exported := filepath.Join(t.TempDir(), "operator-witness")
+	if err := os.WriteFile(exported, []byte("expect=sha256="+strings.Repeat("b", 64)+"\n"), 0o600); err != nil {
+		t.Fatalf("plant the exported witness: %v", err)
+	}
+	t.Setenv("PIN_NODE_WITNESS", exported)
+
+	run := runReset(t, resetOptions{})
+	if run.err != nil {
+		t.Fatalf("reset.sh did not finish: %v\n--- stderr ---\n%s", run.err, run.stderr)
+	}
+	if body, err := os.ReadFile(exported); err != nil || !strings.Contains(string(body), "expect=sha256=") {
+		t.Errorf("reset.sh acted on the exported witness outside the sandbox (err = %v):\n%s", err, run.stderr)
+	}
+	if strings.Contains(run.stderr, exported) {
+		t.Errorf("reset.sh reports %q as its witness — the sandbox did not own the variable:\n%s", exported, run.stderr)
+	}
+}
+
+// TestResetDropsTheWitnessAtTheHomeDefaultPath: with the export empty, the
+// path can only come from lib.sh's own default — the round must find and drop
+// a witness a stopped-instance pin left in $HOME. The planted path restates
+// that default, so a literal that drifts away from it leaves the file behind
+// and turns this red instead of passing quietly.
+func TestResetDropsTheWitnessAtTheHomeDefaultPath(t *testing.T) {
+	dir := t.TempDir()
+	home := filepath.Join(dir, "home")
+	if err := os.MkdirAll(home, 0o755); err != nil {
+		t.Fatalf("create the sandbox home: %v", err)
+	}
+	witness := filepath.Join(home, ".foreman-job-policy-witness")
+	if err := os.WriteFile(witness, []byte("expect=sha256="+strings.Repeat("a", 64)+"\n"), 0o600); err != nil {
+		t.Fatalf("plant the witness at the home default: %v", err)
+	}
+
+	run := runResetAt(t, dir, resetOptions{})
+	if run.err != nil {
+		t.Fatalf("reset.sh did not finish: %v\n--- stderr ---\n%s", run.err, run.stderr)
+	}
+	if _, err := os.Stat(witness); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("reset.sh left the witness at lib.sh's home default behind (stat err = %v) — no export named this path", err)
+	}
+	if !strings.Contains(run.stderr, "dropped the stale job-policy witness") {
+		t.Errorf("reset.sh does not report dropping the witness:\n%s", run.stderr)
+	}
 }

@@ -97,10 +97,11 @@ settled_on_node() { # <task-id> <label> -> prints the learned node
 }
 
 epoch() {
-	printf '%s' "$1" | jq -Rr '
-		capture("^(?<b>[^.]+)(?<f>\\.[0-9]+)?(Z|\\+00:00)$")
-		| ((.b + "Z") | fromdateiso8601)
-		  + ((.f // "") | if . == "" then 0 else (("0" + .) | tonumber) end)'
+	# Whole seconds: the values this script compares are shell integers
+	# (`[ ... -gt ... ]`), and the log carries fractional seconds. Truncation
+	# can only make an instant earlier, never later than the wall clock it
+	# came from, so the ordering the window checks assert is preserved.
+	printf '%s' "$1" | jq -Rr 'sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601'
 }
 
 same_issue() { # <a> <b>

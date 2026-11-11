@@ -9,12 +9,15 @@ package testinfra
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"io"
 	"maps"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -52,6 +55,9 @@ func noEndpointEnv() map[string]string {
 		"TEST_MULTICA_MODEL_ID":           "",
 		"TEST_MULTICA_MODEL_API_KEY":      "",
 		"TEST_MULTICA_MODEL_API_KEY_FILE": "",
+		// The local source is a setting too: an exported override on the host
+		// would otherwise decide which backend a local-path test reads.
+		"TEST_MULTICA_MODEL_LOCAL_SOURCE": "scripted",
 	}
 }
 
@@ -89,35 +95,56 @@ func TestDeployRendersEntryURLVerbatim(t *testing.T) {
 // default origin and model carry none of the characters the two escape layers
 // touch, so every correct renderer — the pre-fix one included — produced
 // exactly the placeholders replaced by those values; any other difference is a
-// regression in what re-deploying this environment changes. Both manifests are
-// pinned: deploy.yaml carries the origin, model-backend.yaml the model the
-// local backend serves. The two rendered values are set explicitly: an
-// operator's exported TEST_MULTICA_* must not decide what this test reads.
+// regression in what re-deploying this environment changes. The default
+// round's manifests are pinned: deploy.yaml carries the origin, and
+// scripted-backend.yaml the served model id plus the injected server file. The
+// rendered values are set explicitly: an operator's exported TEST_MULTICA_*
+// must not decide what this test reads.
 func TestDeployDefaultRenderStaysLiteral(t *testing.T) {
 	run := runDeploy(t, renderOnlyKubectlStub, mergeEnv(noEndpointEnv(), map[string]string{
 		"TEST_MULTICA_ENTRY_URL": defaultEntryURL,
-		"TEST_MULTICA_MODEL":     defaultModel,
 	}))
-	replace := strings.NewReplacer(
-		entryPlaceholder, defaultEntryURL,
-		modelPlaceholder, defaultModel,
-	)
-	for _, tc := range []struct{ manifest, rendered string }{
-		{deployManifest, run.render},
-		{modelBackendManifest, run.renderModel},
-	} {
-		if tc.rendered == "" {
-			t.Fatalf("deploy.sh never rendered %s", tc.manifest)
-		}
-		source, err := os.ReadFile(tc.manifest)
-		if err != nil {
-			t.Fatalf("read %s: %v", tc.manifest, err)
-		}
-		if want := replace.Replace(string(source)); tc.rendered != want {
-			t.Errorf("%s's default render is no longer the literal substitution of %s and %s",
-				tc.manifest, entryPlaceholder, modelPlaceholder)
-		}
+	entrySource, err := os.ReadFile(deployManifest)
+	if err != nil {
+		t.Fatalf("read %s: %v", deployManifest, err)
 	}
+	wantEntry := strings.ReplaceAll(string(entrySource), entryPlaceholder, defaultEntryURL)
+	if run.render != wantEntry {
+		t.Errorf("%s's default render is no longer the literal substitution of %s", deployManifest, entryPlaceholder)
+	}
+	if run.renderScripted == "" {
+		t.Fatalf("deploy.sh rendered no scripted-backend.yaml on the default round")
+	}
+	if want := expectedScriptedRender(t); run.renderScripted != want {
+		t.Errorf("%s's default render is not the literal injection of the server file and the model id", scriptedManifest)
+	}
+}
+
+// expectedScriptedRender is scripted-backend.yaml with the two values deploy.sh
+// substitutes: the served model id, and the block-scalar server file indented
+// for the ConfigMap.
+func expectedScriptedRender(t *testing.T) string {
+	t.Helper()
+	source, err := os.ReadFile(scriptedManifest)
+	if err != nil {
+		t.Fatalf("read %s: %v", scriptedManifest, err)
+	}
+	server, err := os.ReadFile(scriptedServer)
+	if err != nil {
+		t.Fatalf("read %s: %v", scriptedServer, err)
+	}
+	indented := make([]string, 0)
+	for _, line := range strings.Split(strings.TrimSuffix(string(server), "\n"), "\n") {
+		indented = append(indented, "    "+line)
+	}
+	rendered := strings.ReplaceAll(string(source), "__SCRIPTED_MODEL_ID__", scriptedModelID)
+	rendered = strings.ReplaceAll(rendered, "__SCRIPTED_SLEEP__", scriptedSleep)
+	rendered = strings.ReplaceAll(rendered, "__SCRIPTED_HOLD_TURNS__", strconv.Itoa(scriptedHoldTurns))
+	rendered = strings.ReplaceAll(rendered, "__SCRIPTED_WARMUP__", scriptedWarmup)
+	digest := sha256.Sum256(server)
+	rendered = strings.ReplaceAll(rendered, "__SCRIPTED_DIGEST__", hex.EncodeToString(digest[:]))
+	rendered = strings.ReplaceAll(rendered, "    __SCRIPTED_SERVER_PY__", strings.Join(indented, "\n"))
+	return rendered
 }
 
 // TestDeployRendersModelVerbatim pins the second rendered value where it is
@@ -132,7 +159,10 @@ func TestDeployRendersModelVerbatim(t *testing.T) {
 		{"untagged", "some-model", "some-model:latest"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			run := renderBoth(t, mergeEnv(noEndpointEnv(), map[string]string{"TEST_MULTICA_MODEL": tc.override}))
+			run := renderBoth(t, mergeEnv(noEndpointEnv(), map[string]string{
+				"TEST_MULTICA_MODEL":              tc.override,
+				"TEST_MULTICA_MODEL_LOCAL_SOURCE": "ollama",
+			}))
 
 			if strings.Contains(run.renderModel, modelPlaceholder) {
 				t.Fatalf("the rendered manifest still carries %s — the value broke the substitution", modelPlaceholder)
@@ -154,8 +184,9 @@ func TestDeployEnvOverridesInheritedValues(t *testing.T) {
 	t.Setenv("TEST_MULTICA_MODEL", "inherited-model:1b")
 
 	run := renderBoth(t, mergeEnv(noEndpointEnv(), map[string]string{
-		"TEST_MULTICA_ENTRY_URL": "http://chosen.example:30300",
-		"TEST_MULTICA_MODEL":     "chosen-model:2b",
+		"TEST_MULTICA_ENTRY_URL":          "http://chosen.example:30300",
+		"TEST_MULTICA_MODEL":              "chosen-model:2b",
+		"TEST_MULTICA_MODEL_LOCAL_SOURCE": "ollama",
 	}))
 	for _, rendered := range []string{run.render, run.renderModel} {
 		if strings.Contains(rendered, "inherited") {
@@ -170,29 +201,57 @@ func TestDeployEnvOverridesInheritedValues(t *testing.T) {
 	}
 }
 
-// localBackendObjects are the objects the local model source consists of. The
-// endpoint round must carry none of them: one model source per round, never two
-// prerequisites.
-var localBackendObjects = []struct{ kind, name string }{
+// ollamaBackendObjects are the objects the ollama local source consists of;
+// scriptedBackendObjects the ones the scripted source consists of. A round has
+// exactly one of them, and the endpoint round has neither: one model source per
+// round, never two prerequisites.
+var ollamaBackendObjects = []struct{ kind, name string }{
 	{"PersistentVolumeClaim", "ollama-models"},
 	{"Service", "test-multica-ollama"},
 	{"Deployment", "test-multica-ollama"},
 }
 
-// TestDeployEndpointRoundCarriesNoLocalBackend pins the model-source split. The
-// triple names the endpoint that serves the round, so the local backend is not
-// rendered at all — not its PVC, not its Service, not its Deployment. Without
-// the triple the same objects are the round's model source and must be there:
-// that is the control that keeps the assertion from passing vacuously.
-func TestDeployEndpointRoundCarriesNoLocalBackend(t *testing.T) {
-	t.Run("without the triple", func(t *testing.T) {
+var scriptedBackendObjects = []struct{ kind, name string }{
+	{"ConfigMap", "test-multica-scripted-server"},
+	{"Service", "test-multica-scripted"},
+	{"Deployment", "test-multica-scripted"},
+}
+
+// TestDeployCarriesExactlyOneLocalBackend pins the model-source split. The
+// triple names the endpoint that serves the round, so no local backend is
+// rendered — not its objects, not its Deployment. Without the triple the
+// selected source's objects are the round's model source and must be there:
+// that is the control that keeps the assertion from passing vacuously. The
+// other source must not appear in the same round.
+func TestDeployCarriesExactlyOneLocalBackend(t *testing.T) {
+	t.Run("scripted is the default local source", func(t *testing.T) {
 		run := renderBoth(t, noEndpointEnv())
-		if run.renderModel == "" {
-			t.Fatal("deploy.sh rendered no local backend without the endpoint triple — the round would have no model source")
+		if run.renderScripted == "" {
+			t.Fatal("deploy.sh rendered no scripted backend on the default local round — the round would have no model source")
 		}
-		for _, object := range localBackendObjects {
+		if run.renderModel != "" {
+			t.Errorf("the scripted round also rendered the ollama backend:\n%s", run.renderModel)
+		}
+		for _, object := range scriptedBackendObjects {
+			if !manifestCarries(t, run.renderScripted, object.kind, object.name) {
+				t.Errorf("the rendered scripted backend carries no %s/%s", object.kind, object.name)
+			}
+		}
+	})
+
+	t.Run("ollama is selected explicitly", func(t *testing.T) {
+		run := renderBoth(t, mergeEnv(noEndpointEnv(), map[string]string{
+			"TEST_MULTICA_MODEL_LOCAL_SOURCE": "ollama",
+		}))
+		if run.renderModel == "" {
+			t.Fatal("deploy.sh rendered no ollama backend when that source was selected")
+		}
+		if run.renderScripted != "" {
+			t.Errorf("the ollama round also rendered the scripted backend:\n%s", run.renderScripted)
+		}
+		for _, object := range ollamaBackendObjects {
 			if !manifestCarries(t, run.renderModel, object.kind, object.name) {
-				t.Errorf("the rendered local backend carries no %s/%s", object.kind, object.name)
+				t.Errorf("the rendered ollama backend carries no %s/%s", object.kind, object.name)
 			}
 		}
 	})
@@ -200,11 +259,16 @@ func TestDeployEndpointRoundCarriesNoLocalBackend(t *testing.T) {
 	t.Run("with the triple", func(t *testing.T) {
 		run := renderBoth(t, endpointEnv())
 		if run.renderModel != "" {
-			t.Errorf("deploy.sh rendered the local backend even though the endpoint serves the round:\n%s", run.renderModel)
+			t.Errorf("deploy.sh rendered the ollama backend even though the endpoint serves the round:\n%s", run.renderModel)
 		}
-		for _, object := range localBackendObjects {
-			if manifestCarries(t, run.render, object.kind, object.name) {
-				t.Errorf("deploy.yaml declares %s/%s — the endpoint round must not carry the local backend", object.kind, object.name)
+		if run.renderScripted != "" {
+			t.Errorf("deploy.sh rendered the scripted backend even though the endpoint serves the round:\n%s", run.renderScripted)
+		}
+		for _, objects := range [][]struct{ kind, name string }{ollamaBackendObjects, scriptedBackendObjects} {
+			for _, object := range objects {
+				if manifestCarries(t, run.render, object.kind, object.name) {
+					t.Errorf("deploy.yaml declares %s/%s — the endpoint round must not carry a local backend", object.kind, object.name)
+				}
 			}
 		}
 		if got := entrySites(t, run.render)["configmap/MULTICA_APP_URL"]; got != defaultEntryURL {
@@ -248,6 +312,7 @@ func renderManifest(t *testing.T, entryURL string) string {
 const renderOnlyKubectlStub = `#!/bin/sh
 for f in "$TMPDIR"/tmp.*/deploy.yaml; do [ -f "$f" ] && cp "$f" "$STUB_RENDER"; done
 for f in "$TMPDIR"/tmp.*/model-backend.yaml; do [ -f "$f" ] && cp "$f" "$STUB_RENDER_MODEL"; done
+for f in "$TMPDIR"/tmp.*/scripted-backend.yaml; do [ -f "$f" ] && cp "$f" "$STUB_RENDER_SCRIPTED"; done
 exit 1
 `
 
@@ -269,17 +334,35 @@ func renderBoth(t *testing.T, env map[string]string) deployRun {
 
 // deployRun is one deploy.sh invocation against a stub kubectl.
 type deployRun struct {
-	render      string   // deploy.yaml as deploy.sh rendered it, empty if it never got there
-	renderModel string   // model-backend.yaml as deploy.sh rendered it, empty when the round has no local backend
-	calls       []string // one line per kubectl invocation, its arguments joined by spaces
-	stderr      string
-	err         error // deploy.sh's exit status
+	render         string   // deploy.yaml as deploy.sh rendered it, empty if it never got there
+	renderModel    string   // model-backend.yaml as deploy.sh rendered it, empty unless the ollama source was selected
+	renderScripted string   // scripted-backend.yaml as deploy.sh rendered it, empty unless the scripted source was selected
+	calls          []string // one line per kubectl invocation, its arguments joined by spaces
+	stderr         string
+	err            error // deploy.sh's exit status
 }
 
 // runDeploy runs deploy.sh with `stub` standing in for kubectl; how far the
 // script gets is the stub's answer, and every call it makes is recorded for the
 // caller to judge. `env` overrides a single value per key — see envWith.
 func runDeploy(t *testing.T, stub string, env map[string]string) deployRun {
+	t.Helper()
+	return runDeployWithExtra(t, stub, env, nil)
+}
+
+// runDeployWithExtra is runDeploy plus stub binaries written into the same
+// directory: a case can shadow a real tool (sha256sum, say) without rebuilding
+// the sandbox.
+func runDeployWithExtra(t *testing.T, stub string, env map[string]string, extra map[string]string) deployRun {
+	t.Helper()
+	return runDeployWithExtraPath(t, stub, env, extra, os.Getenv("PATH"))
+}
+
+// runDeployWithExtraPath is runDeployWithExtra with the search path the script
+// runs against. A case can withhold a tool from the entry point this way —
+// shadowing cannot remove it, because command -v skips a non-executable entry
+// and finds the real binary further down.
+func runDeployWithExtraPath(t *testing.T, stub string, env map[string]string, extra map[string]string, searchPath string) deployRun {
 	t.Helper()
 	dir := t.TempDir()
 	stubDir := filepath.Join(dir, "bin")
@@ -291,9 +374,18 @@ func runDeploy(t *testing.T, stub string, env map[string]string) deployRun {
 	}
 	renderPath := filepath.Join(dir, "rendered.yaml")
 	modelRenderPath := filepath.Join(dir, "rendered-model-backend.yaml")
+	scriptedRenderPath := filepath.Join(dir, "rendered-scripted-backend.yaml")
 	callsPath := filepath.Join(dir, "calls")
+	// The stub is a shell script written as a raw string, so its newlines are
+	// already real: rewriting a literal `\n` here would quietly corrupt any
+	// line that legitimately needs one.
 	if err := os.WriteFile(filepath.Join(stubDir, "kubectl"), []byte(stub), 0o755); err != nil {
 		t.Fatalf("write the kubectl stub: %v", err)
+	}
+	for name, body := range extra {
+		if err := os.WriteFile(filepath.Join(stubDir, name), []byte(body), 0o755); err != nil {
+			t.Fatalf("write the %s stub: %v", name, err)
+		}
 	}
 	script, err := filepath.Abs(deployScript)
 	if err != nil {
@@ -301,11 +393,12 @@ func runDeploy(t *testing.T, stub string, env map[string]string) deployRun {
 	}
 	cmd := exec.Command("sh", script)
 	cmd.Env = envWith(map[string]string{
-		"PATH":              stubDir + string(os.PathListSeparator) + os.Getenv("PATH"),
-		"TMPDIR":            tmpDir,
-		"STUB_RENDER":       renderPath,
-		"STUB_RENDER_MODEL": modelRenderPath,
-		"STUB_CALLS":        callsPath,
+		"PATH":                 stubDir + string(os.PathListSeparator) + searchPath,
+		"TMPDIR":               tmpDir,
+		"STUB_RENDER":          renderPath,
+		"STUB_RENDER_MODEL":    modelRenderPath,
+		"STUB_RENDER_SCRIPTED": scriptedRenderPath,
+		"STUB_CALLS":           callsPath,
 		// One attempt: a stub that fails on purpose must stop the script, not
 		// make it sleep through the retry budget.
 		"TEST_MULTICA_KUBECTL_RETRIES": "1",
@@ -320,6 +413,9 @@ func runDeploy(t *testing.T, stub string, env map[string]string) deployRun {
 	}
 	if body, err := os.ReadFile(modelRenderPath); err == nil {
 		run.renderModel = string(body)
+	}
+	if body, err := os.ReadFile(scriptedRenderPath); err == nil {
+		run.renderScripted = string(body)
 	}
 	if body, err := os.ReadFile(callsPath); err == nil {
 		if calls := strings.TrimSpace(string(body)); calls != "" {
@@ -454,4 +550,87 @@ func entrySites(t *testing.T, rendered string) map[string]string {
 		}
 	}
 	return sites
+}
+
+// TestDeployRefusesAnUnreadableDigest pins the difference between "the value
+// came back empty" and "the pipeline exited 0": a broken sha256sum must stop
+// the entry, or the digest annotation freezes at an empty constant and a code
+// change no longer rolls the pod.
+func TestDeployRefusesAnUnreadableDigest(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"sha256sum fails", "#!/bin/sh\nexit 1\n"},
+		{"sha256sum prints nothing", "#!/bin/sh\nexit 0\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := runDeployWithExtra(t, answeringKubectlStub, noEndpointEnv(),
+				map[string]string{"sha256sum": tc.body})
+			if run.err == nil {
+				t.Fatalf("deploy.sh finished with an unreadable digest\n--- stderr ---\n%s", run.stderr)
+			}
+			if !strings.Contains(run.stderr, "cannot digest") {
+				t.Errorf("the failure does not name the digest:\n%s", run.stderr)
+			}
+		})
+	}
+}
+
+// deployPathWithout builds a search path the named tool is absent from by
+// symlinking every other executable on the host's PATH into one directory.
+// Shadowing cannot express absence: command -v skips a non-executable entry and
+// finds the real binary further down the same PATH.
+func deployPathWithout(t *testing.T, absent string) string {
+	t.Helper()
+	dir := t.TempDir()
+	seen := map[string]bool{}
+	for _, entry := range filepath.SplitList(os.Getenv("PATH")) {
+		names, err := os.ReadDir(entry)
+		if err != nil {
+			continue
+		}
+		for _, name := range names {
+			if name.Name() == absent || seen[name.Name()] {
+				continue
+			}
+			source := filepath.Join(entry, name.Name())
+			info, err := os.Stat(source)
+			if err != nil || info.IsDir() || info.Mode()&0o111 == 0 {
+				continue
+			}
+			if err := os.Symlink(source, filepath.Join(dir, name.Name())); err != nil {
+				continue
+			}
+			seen[name.Name()] = true
+		}
+	}
+	return dir
+}
+
+// TestDeployEndpointRoundDoesNotNeedTheDigestTool: sha256sum only fingerprints
+// the scripted backend's served file, so a round whose model source is the
+// deployment-supplied endpoint must not fail at the entry point on a host
+// without GNU coreutils.
+func TestDeployEndpointRoundDoesNotNeedTheDigestTool(t *testing.T) {
+	run := runDeployWithExtraPath(t, answeringKubectlStub, mergeEnv(noEndpointEnv(), endpointEnv()),
+		nil, deployPathWithout(t, "sha256sum"))
+	if run.err != nil {
+		t.Fatalf("an endpoint round failed without sha256sum:\n%s", run.stderr)
+	}
+	if run.render == "" {
+		t.Fatalf("deploy.sh never rendered its manifest:\n%s", run.stderr)
+	}
+}
+
+// TestDeployScriptedRoundStillNeedsTheDigestTool keeps the move honest: the
+// scripted backend reads its pod-template digest from sha256sum, so that round
+// must stop when the tool is missing rather than apply a manifest whose digest
+// annotation is empty.
+func TestDeployScriptedRoundStillNeedsTheDigestTool(t *testing.T) {
+	run := runDeployWithExtraPath(t, answeringKubectlStub, noEndpointEnv(),
+		nil, deployPathWithout(t, "sha256sum"))
+	if run.err == nil {
+		t.Fatalf("a scripted round finished without sha256sum:\n%s", run.stderr)
+	}
+	if !strings.Contains(run.stderr, "required command not found: sha256sum") {
+		t.Errorf("the failure does not name the missing tool:\n%s", run.stderr)
+	}
 }

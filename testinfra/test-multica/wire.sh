@@ -15,9 +15,12 @@
 #      address), MULTICA_WORKSPACE_ID := the test workspace, and the
 #      Deployment's MULTICA_TOKEN := the credential the test server minted for
 #      that workspace (the profile's);
-#   3. self-check — ./selfcheck.sh, the environment gate ①②③④, while the
+#   3. self-check — ./selfcheck.sh, the environment gate ①②③④⑤, while the
 #      instance is still stopped;
-#   4. start — scale back to 1 and wait for the rollout.
+#   4. start — scale back to 1 and wait for the rollout;
+#   5. verify — if a stopped-instance ./pin-node.sh left a policy witness, the
+#      started instance's log must carry the expected line (the policy file is
+#      read once at startup, so this is the only moment it can be checked).
 #
 # The Deployment object itself is not created here: it comes from
 # `kubectl apply -f deploy/` (deploy/README.md), whose MULTICA_SERVER_URL is
@@ -104,6 +107,11 @@ info "credential: MULTICA_TOKEN ← profile $PROFILE (minted by the test server)
 k -n "$INSTANCE_NS" scale deploy "$INSTANCE" --replicas=1 >/dev/null
 k -n "$INSTANCE_NS" rollout status deploy "$INSTANCE" --timeout=180s >/dev/null
 info "started $INSTANCE_NS/$INSTANCE"
+
+# A pin written while the instance was stopped could not be verified then; the
+# startup log is the evidence that the file was loaded, and this is the first
+# moment it exists. No witness = nothing pending (the entry is a no-op).
+"$TEST_MULTICA_DIR/pin-node.sh" --verify
 
 printf '\n'
 printf 'access point: %s\n' "$ACCESS_URL"

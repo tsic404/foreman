@@ -1,10 +1,10 @@
 // The failure agent is what makes the failed terminal class reproducible: a
-// second agent bound to the same runtime, deliberately without a model source,
-// so a dispatched task ends failed on its own. Neither half is observable
-// without a cluster, so the two entries run here against the stubs that answer
-// the server calls: reset.sh must create the row and clear its model source on
-// every round, and bind-agent.sh must bind it to the runtime the instance
-// registered.
+// second agent bound to the same runtime whose model selector no round can
+// resolve, so a dispatched task ends failed on its own. Neither half is
+// observable without a cluster, so the two entries run here against the stubs
+// that answer the server calls: reset.sh must write that selector on every round
+// and refuse a round whose own registration would resolve it, and bind-agent.sh
+// must bind the row to the runtime the instance registered.
 package testinfra
 
 import (
@@ -25,22 +25,34 @@ const (
 const faultAgentList = `[{"id":"` + resetAgentID + `","name":"` + resetAgentName + `","archived_at":null},` +
 	`{"id":"` + faultAgentID + `","name":"` + faultAgentName + `","archived_at":null}]`
 
-// TestResetClearsTheFailureAgentsModelOnEveryRound judges the failure
+// TestResetIsolatesTheFailureAgentsModelOnEveryRound judges the failure
 // guarantee: the row may survive from an earlier round (the wipe keeps agent
 // rows), so every reset rewrites both model fields even though nothing else
-// touches that agent. A leftover selector would turn it into a second working
-// agent and the failed class would quietly disappear.
-func TestResetClearsTheFailureAgentsModelOnEveryRound(t *testing.T) {
+// touches that agent. The written selector must also be one that cannot resolve
+// inside the round — empty is not a failure: the daemon's omp then picks a model
+// by itself out of the registration in the pod's home, which every agent of the
+// workspace mounts (02-contracts §8.7), and the failed class quietly completes.
+// So the assertion is a non-empty selector whose provider the round's own
+// registration does not declare: that registration is the only one a Job pod
+// can see, and a provider it does not name has no row to match.
+func TestResetIsolatesTheFailureAgentsModelOnEveryRound(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		agents     string
 		wantCreate bool
+		round      resetOptions
 	}{
-		{name: "created when missing", agents: "", wantCreate: true},
-		{name: "cleared when present", agents: faultAgentList, wantCreate: false},
+		{name: "created when missing", agents: "", wantCreate: true,
+			round: resetOptions{source: "ollama", served: "qwen2.5:0.5b"}},
+		{name: "rewritten when present", agents: faultAgentList,
+			round: resetOptions{source: "ollama", served: "qwen2.5:0.5b"}},
+		{name: "scripted round", agents: faultAgentList,
+			round: resetOptions{scriptedID: "fixture:deterministic"}},
+		{name: "no model source", agents: faultAgentList, round: resetOptions{}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			run := runReset(t, resetOptions{served: "qwen2.5:0.5b", agents: tc.agents})
+			tc.round.agents = tc.agents
+			run := runReset(t, tc.round)
 			if run.err != nil {
 				t.Fatalf("reset.sh did not finish: %v\n--- stderr ---\n%s", run.err, run.stderr)
 			}
@@ -70,8 +82,19 @@ func TestResetClearsTheFailureAgentsModelOnEveryRound(t *testing.T) {
 				Model string `json:"model"`
 			}
 			decodeResetBody(t, modelWrites[0], &model)
-			if model.Model != "" {
-				t.Errorf("the failure agent's model is %q, want empty — its missing model source is the failure guarantee", model.Model)
+			if model.Model == "" {
+				t.Fatalf("the failure agent's model is empty — an empty selector is not a failure: omp resolves one from the pod home's registration, which this workspace shares with the test agent")
+			}
+			// The round's registered provider: the test agent's selector was
+			// just written from the same source, so it is the round's own. A
+			// round with no source registers nothing, and then no provider is
+			// answerable — nothing to compare.
+			faultProvider, faultID, ok := strings.Cut(model.Model, "/")
+			if !ok || faultProvider == "" || faultID == "" || strings.Contains(faultID, "/") {
+				t.Fatalf("the failure agent's model %q is not a provider/id selector", model.Model)
+			}
+			if servedProvider, registered := servedTestAgentModel(t, run); registered && faultProvider == servedProvider {
+				t.Errorf("the failure agent's model %q names the round's provider %q — the registration the Job pods mount answers it, so the task completes instead of failing", model.Model, servedProvider)
 			}
 
 			envWrites := run.requests("PUT", "/api/agents/"+faultAgentID+"/env")
@@ -86,6 +109,49 @@ func TestResetClearsTheFailureAgentsModelOnEveryRound(t *testing.T) {
 				t.Errorf("the failure agent's custom_env is %v, want empty", env.CustomEnv)
 			}
 		})
+	}
+}
+
+// servedTestAgentModel is the provider the round's own registration declares —
+// the test agent's model write, which register_model_endpoint made from the same
+// source it installed for the Job pods. registered is false when the round has
+// no source at all: it wrote the cleared selector, so nothing is registered.
+func servedTestAgentModel(t *testing.T, run resetRun) (provider string, registered bool) {
+	t.Helper()
+	writes := run.requests("PUT", "/api/agents/"+resetAgentID)
+	if len(writes) != 1 {
+		t.Fatalf("reset.sh sent %d model writes to the test agent, want 1: %v", len(writes), writes)
+	}
+	var model struct {
+		Model string `json:"model"`
+	}
+	decodeResetBody(t, writes[0], &model)
+	provider, _, ok := strings.Cut(model.Model, "/")
+	if !ok {
+		return "", false
+	}
+	return provider, true
+}
+
+// TestResetRefusesAFailureSelectorTheRoundCanResolve: the failure guarantee is
+// the selector's provider being one this round never registers. A round that
+// installs its endpoint under the fixture's provider name would answer the
+// failure agent too, so reset.sh must refuse it — naming the variable — rather
+// than write a guarantee that no longer holds. The run is the same as a healthy
+// one except for that name, which is what pins the check to the collision.
+func TestResetRefusesAFailureSelectorTheRoundCanResolve(t *testing.T) {
+	run := runReset(t, resetOptions{
+		scriptedID: "fixture:deterministic",
+		agents:     faultAgentList,
+		extraEnv: map[string]string{
+			"TEST_MULTICA_SCRIPTED_PROVIDER": "foreman-failing",
+		},
+	})
+	if run.err == nil {
+		t.Fatalf("reset.sh finished with status 0 although the round's provider is the failure selector's provider\n--- stderr ---\n%s", run.stderr)
+	}
+	if want := "TEST_MULTICA_SCRIPTED_PROVIDER"; !strings.Contains(run.stderr, want) {
+		t.Errorf("the refusal does not name %q — the operator cannot tell which setting collided\n--- stderr ---\n%s", want, run.stderr)
 	}
 }
 

@@ -25,20 +25,23 @@ need jq
 [ -n "$TASK" ] || blocked "TASK_ID is required (the task this round dispatched after wiring)"
 
 # ---- Upstream unmodified: the running images are the pinned manifest's -----
-# Every image deploy.yaml pins must be running. The local model backend lives in
+# Every image deploy.yaml pins must be running. A local model backend lives in
 # its own manifest because it is only the model source of a round without an
 # endpoint: its images are admitted, not required — an endpoint round never
-# deploys them. Nothing outside the two pinned manifests may run.
+# deploys them, and either local source is the round's choice. Nothing outside
+# the pinned manifests may run.
 manifest="$TEST_MULTICA_DIR/deploy.yaml"
 model_manifest="$TEST_MULTICA_DIR/model-backend.yaml"
+scripted_manifest="$TEST_MULTICA_DIR/scripted-backend.yaml"
 [ -r "$manifest" ] || blocked "no test-infra manifest at $manifest"
 [ -r "$model_manifest" ] || blocked "no test-infra model backend manifest at $model_manifest"
+[ -r "$scripted_manifest" ] || blocked "no test-infra scripted backend manifest at $scripted_manifest"
 kubectl get namespace "$TEST_MULTICA_NS" >/dev/null 2>&1 ||
 	blocked "namespace $TEST_MULTICA_NS does not exist — deploy the test environment first"
 pods_json=$(kubectl -n "$TEST_MULTICA_NS" get pods -o json) ||
 	blocked "cannot list pods in $TEST_MULTICA_NS"
 expected=$(sed -n 's/^[[:space:]]*image:[[:space:]]*//p' "$manifest" | tr -d '"' | sort -u)
-admitted=$(cat "$manifest" "$model_manifest" |
+admitted=$(cat "$manifest" "$model_manifest" "$scripted_manifest" |
 	sed -n 's/^[[:space:]]*image:[[:space:]]*//p' | tr -d '"' | sort -u)
 running=$(printf '%s' "$pods_json" |
 	jq -r '.items[] | (.spec.containers[]?.image, .spec.initContainers[]?.image)' | sort -u)

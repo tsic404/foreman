@@ -4,7 +4,7 @@
 # operator (each step needs a task triggered under the state the previous
 # action installed). The isolated-shape half is tech_cache_03_isolated_test.go.
 #
-#   ./tech-cache-03-cluster.sh break [TASK]           # workspaces unwritable
+#   ./tech-cache-03-cluster.sh break [TASK]           # workspaces tree unwritable (whole tree)
 #   ./tech-cache-03-cluster.sh verify-unwritable TID  # must fail; restores
 #   ./tech-cache-03-cluster.sh rebuild-prepare [TASK] # delete bare repos
 #   ./tech-cache-03-cluster.sh rebuild-verify TID     # must complete, cache back
@@ -140,9 +140,12 @@ node_sh() {
 		$1"
 }
 
-# The original mode is recorded on the node so verify-unwritable can restore what
-# break changed; /host is the node's own /tmp, which survives the debug pod.
-MODE_MARKER=/host/tmp/.foreman-tc-cache-03-workspaces-mode
+# The break strips every directory's write bits under the workspaces tree — the
+# layer a task actually writes (its own workspace partition and the per-workspace
+# bare cache), not just the shared root. The original mode of every directory it
+# changed is journaled on the node so the restore puts the whole tree back
+# verbatim; /host is the node's own /tmp, which survives the debug pod.
+MODES_JOURNAL=/host/tmp/.foreman-tc-cache-03-workspaces-modes
 # The break instant, read in the node's clock domain: a judging run compares it
 # with the task projection's started_at, so a tree broken after the task started
 # is never read as met by it.
@@ -157,17 +160,31 @@ task_entry() {
 		blocked "cannot read $FOREMAN_URL/foreman/tasks/$1 (port-forward svc/foreman-ops 8081:8081 first)"
 }
 
-# restore_node puts $NODE's workspaces tree back and drops both markers. It
-# echoes the node-side answer and returns that call's status, so a caller can
-# tell a restored node from an unreachable one; the observation goes to stderr.
+# restore_node puts every directory break changed back to its recorded mode and
+# drops the markers. It echoes the node-side answer and returns that call's
+# status, so a caller can tell a restored node from an unreachable one; the
+# observation goes to stderr.
 restore_node() {
 	_rc=0
-	_out=$(node_sh "if [ -e '$MODE_MARKER' ]; then m=\$(cat '$MODE_MARKER')
-		chmod \"\$m\" \"\$R/workspaces\" && rm -f '$MODE_MARKER' '$BREAK_AT_MARKER' && echo \"workspaces restored=\$m\"
+	_out=$(node_sh "if [ -r '$MODES_JOURNAL' ]; then
+		n=0
+		while IFS=\"\$(printf '\\t')\" read -r m p; do
+			[ -n \"\$p\" ] || continue
+			[ -e \"\$p\" ] || continue
+			chmod \"\$m\" \"\$p\" || { echo \"restore-failed=\$p\" >&2; exit 2; }
+			n=\$((n + 1))
+		done <'$MODES_JOURNAL'
+		rm -f '$MODES_JOURNAL' '$BREAK_AT_MARKER'
+		echo \"workspaces restored dirs=\$n\"
 	else
-		chmod 0755 \"\$R/workspaces\" && rm -f '$BREAK_AT_MARKER' && echo 'workspaces restored=0755 (no recorded mode)'
+		echo 'workspaces restored=no-journal'
+		rm -f '$BREAK_AT_MARKER'
 	fi" 2>&1) || _rc=$?
 	printf '# observation: restore: %s\n' "${_out:-<no output>}" >&2
+	# An empty answer never proves the node was reached; a restore that did not
+	# run must not read as done, or the journal and the break are dropped while
+	# the tree stays unwritable.
+	[ -n "$_out" ] || _rc=1
 	printf '%s' "$_out"
 	return "$_rc"
 }
@@ -183,20 +200,74 @@ break)
 	tid=${2:-}
 	NODE=$(pin_node "$tid")
 	observe "node=$NODE action=$ACTION${tid:+ target=$tid}"
+	# Record the node before the mode change runs: find+chmod can fail partway
+	# through the tree, and the node-side script then exits without its summary
+	# line. A half-broken tree must stay named for restore even when the answer
+	# is empty or partial — the failure paths below carry it as the residue hint.
+	record_broken "$NODE"
+	rc=0
 	out=$(node_sh "[ -d \"\$R/workspaces\" ] || { echo 'QA_BLOCKED: no workspaces tree' >&2; exit 2; }
-		if [ ! -e '$MODE_MARKER' ]; then stat -c '%a' \"\$R/workspaces\" > '$MODE_MARKER' || exit 2; fi
-		if [ ! -e '$BREAK_AT_MARKER' ]; then date +%s > '$BREAK_AT_MARKER' || exit 2; fi
-		original=\$(cat '$MODE_MARKER')
-		broken_at=\$(cat '$BREAK_AT_MARKER')
-		chmod 0555 \"\$R/workspaces\" && echo \"workspaces=0555 original=\$original broken_at=\$broken_at\"") ||
-		blocked "cannot make the workspaces tree unwritable on $NODE"
-	[ -n "$out" ] || blocked "the node-side call returned no output (image $NODE_DEBUG_IMAGE not attached?)"
+		W=\"\$R/workspaces\"
+		if [ ! -e '$MODES_JOURNAL' ]; then
+			: >'$MODES_JOURNAL'
+			find \"\$W\" -type d -print | while IFS= read -r d; do
+				m=\$(stat -c '%a' \"\$d\" 2>/dev/null) || exit 2
+				printf '%s\\t%s\\n' \"\$m\" \"\$d\" >>'$MODES_JOURNAL'
+			done || exit 2
+			# Positive control: the same user the task runs as can write into
+			# this tree before the break, in a directory the tree itself owns.
+			ctl=\"\$W/.tc-cache-03-control.\$\$\"
+			mkdir -m 0755 \"\$ctl\" || exit 2
+			# The node debug shell runs as root and can chown; a sandbox that
+			# already runs as the task uid does not need the ownership change.
+			# The probe below is the proof, not the chown's exit status.
+			chown 1000:1000 \"\$ctl\" 2>/dev/null || true
+			if setpriv --reuid=1000 --regid=1000 --clear-groups sh -c 'printf x > \"\$1/probe\"' _ \"\$ctl\" 2>/dev/null; then
+				control=writable
+			else
+				control=denied
+			fi
+			rm -rf \"\$ctl\"
+			[ \"\$control\" = writable ] || {
+				echo \"QA_BLOCKED: uid 1000 cannot write a fresh directory under workspaces before the break (control=\$control) — the probe identity is not the task user\" >&2
+				exit 2
+			}
+		else
+			control=already-broken
+		fi
+		[ -e '$BREAK_AT_MARKER' ] || date +%s >'$BREAK_AT_MARKER'
+		find \"\$W\" -type d -exec chmod a-w {} + || exit 2
+		# Probe the directories the task actually writes: the workspace
+		# partition, the per-workspace cache root and the bare repositories.
+		dirs=\"\$W\"
+		for d in \"\$W\"/.repos/*/*.git \"\$W\"/.repos/*/ \"\$W\"/*/; do
+			[ -d \"\$d\" ] && dirs=\"\$dirs
+\$d\"
+		done
+		probes=0; denied=0; allowed=0
+		for t in \$(printf '%s\\n' \"\$dirs\" | sed '/^\$/d' | head -12); do
+			probes=\$((probes + 1))
+			if setpriv --reuid=1000 --regid=1000 --clear-groups sh -c 'printf x > \"\$1/.foreman-write-probe.\$\$\"' _ \"\$t\" 2>/dev/null; then
+				allowed=\$((allowed + 1))
+				rm -f \"\$t/.foreman-write-probe.\"* 2>/dev/null || true
+				echo \"probe=\$t result=allowed\"
+			else
+				denied=\$((denied + 1))
+				echo \"probe=\$t result=denied\"
+			fi
+		done
+		dirs=\$(wc -l <'$MODES_JOURNAL' | tr -d ' ')
+		echo \"workspaces-readonly dirs=\$dirs root_mode=\$(stat -c '%a' \"\$W\") probes=\$probes denied=\$denied allowed=\$allowed control=\$control broken_at=\$(cat '$BREAK_AT_MARKER')\"
+		[ \"\$allowed\" -eq 0 ] || exit 1") || rc=$?
+	[ -n "$out" ] || blocked "the node-side call returned no output (image $NODE_DEBUG_IMAGE not attached?) — the tree on $NODE may be half broken$(residue)"
 	observe "break: $out"
 	case $out in
-	*workspaces=0555*) : ;;
-	*) blocked "the workspaces tree was not made unwritable: $out" ;;
+	*QA_BLOCKED*) blocked "$(printf '%s\n' "$out" | sed -n 's/^QA_BLOCKED: //p' | head -1)" ;;
+	*workspaces-readonly*allowed=0*) : ;;
+	*) blocked "the workspaces tree was not made unwritable for the task user on $NODE (rc=$rc): $out$(residue)" ;;
 	esac
-	record_broken "$NODE"
+	[ "$rc" -eq 0 ] ||
+		blocked "a write as uid 1000 still succeeded after the break on $NODE (rc=$rc): $out$(residue)"
 	observe "trigger the same agent's continuation now (soft affinity prefers $NODE; the next action blocks if it landed elsewhere), then run: $0 verify-unwritable <task id>"
 	;;
 verify-unwritable)
@@ -204,7 +275,17 @@ verify-unwritable)
 	[ -n "$tid" ] || blocked "a task id is required"
 	NODE=$(pin_place "$tid")
 	body=$(task_entry "$tid")
-	started=$(printf '%s' "$body" | jq -r '.started_at // empty')
+	# The instant the task first met the tree. A task that fails while creating
+	# its environment root never reports a start: job_created_at is then the
+	# only lower bound, and it is still after the break only if the break was
+	# installed before the Job existed. Both anchors are equivalent for this
+	# check — a write cannot happen before the Job that carries it.
+	anchor=$(printf '%s' "$body" | jq -r '.started_at // empty')
+	anchor_field=started_at
+	if [ -z "$anchor" ]; then
+		anchor=$(printf '%s' "$body" | jq -r '.job_created_at // empty')
+		anchor_field=job_created_at
+	fi
 	BROKEN=0
 	# Every exit after the tree is confirmed broken restores it and drops the
 	# journal line; a tree this run did not break is never touched. The trap is
@@ -221,28 +302,49 @@ verify-unwritable)
 	# mid-flight — completes for reasons this TC does not judge. Both facts are
 	# read here, before the result.
 	rc=0
-	probe=$(node_sh "m=none; [ -e '$MODE_MARKER' ] && m=\$(cat '$MODE_MARKER')
-		b=none; [ -e '$BREAK_AT_MARKER' ] && b=\$(cat '$BREAK_AT_MARKER')
-		[ -d \"\$R/workspaces\" ] || { echo \"mode=absent marker=\$m broken_at=\$b\"; exit 0; }
-		echo \"mode=\$(stat -c '%a' \"\$R/workspaces\") marker=\$m broken_at=\$b\"") || rc=$?
+	probe=$(node_sh "b=none; [ -e '$BREAK_AT_MARKER' ] && b=\$(cat '$BREAK_AT_MARKER')
+		[ -d \"\$R/workspaces\" ] || { echo \"tree=absent broken_at=\$b probes=0 denied=0 allowed=0\"; exit 0; }
+		W=\"\$R/workspaces\"
+		dirs=\"\$W\"
+		for d in \"\$W\"/.repos/*/*.git \"\$W\"/.repos/*/ \"\$W\"/*/; do
+			[ -d \"\$d\" ] && dirs=\"\$dirs
+\$d\"
+		done
+		probes=0; denied=0; allowed=0
+		for t in \$(printf '%s\\n' \"\$dirs\" | sed '/^\$/d' | head -12); do
+			probes=\$((probes + 1))
+			if setpriv --reuid=1000 --regid=1000 --clear-groups sh -c 'printf x > \"\$1/.foreman-write-probe.\$\$\"' _ \"\$t\" 2>/dev/null; then
+				allowed=\$((allowed + 1))
+				rm -f \"\$t/.foreman-write-probe.\"* 2>/dev/null || true
+				echo \"probe=\$t result=allowed\"
+			else
+				denied=\$((denied + 1))
+				echo \"probe=\$t result=denied\"
+			fi
+		done
+		echo \"tree=present broken_at=\$b probes=\$probes denied=\$denied allowed=\$allowed\"") || rc=$?
 	observe "workspaces: ${probe:-<empty>} (rc=$rc)"
-	mode=$(printf '%s\n' "$probe" | sed -n 's/^mode=\([^ ]*\) marker=.*$/\1/p' | head -1)
-	[ -n "$mode" ] ||
-		blocked "no mode marker in the node-side output (rc=$rc, image $NODE_DEBUG_IMAGE) — the debug call did not reach $NODE$(residue)"
-	[ "$mode" = 555 ] ||
-		blocked "workspaces on $NODE is not the tree break installs (mode=$mode) — the task never met the broken cache on its own node$(residue)"
+	probes=$(printf '%s\n' "$probe" | sed -n 's/^.* probes=\([0-9][0-9]*\).*$/\1/p' | head -1)
+	allowed=$(printf '%s\n' "$probe" | sed -n 's/^.* allowed=\([0-9][0-9]*\).*$/\1/p' | head -1)
+	[ -n "$probes" ] && [ -n "$allowed" ] ||
+		blocked "no write probe in the node-side output (rc=$rc, image $NODE_DEBUG_IMAGE) — the debug call did not reach $NODE$(residue)"
+	[ "$allowed" -eq 0 ] ||
+		blocked "the task user (uid 1000) can still write in $allowed of $probes probed directories under workspaces on $NODE — the task never met flat cache, so the criterion this step judges was not constructed$(residue)"
+	[ "$probes" -gt 0 ] ||
+		blocked "no directory under workspaces on $NODE could be probed$(residue)"
 	BROKEN=1
-	broken_at=$(printf '%s\n' "$probe" | sed -n 's/^.*broken_at=\([^ ]*\)$/\1/p' | head -1)
+	broken_at=$(printf '%s\n' "$probe" | sed -n 's/^.*broken_at=\([0-9][0-9]*\).*$/\1/p' | head -1)
 	case $broken_at in
 	'' | *[!0-9]*)
 		blocked "the break instant on $NODE is unreadable (broken_at=${broken_at:-<missing>}) — a tree broken after the task started is not a scenario this run can judge" ;;
 	esac
-	[ -n "$started" ] ||
-		blocked "task $tid has no started_at — the break on $NODE cannot be placed before its start"
-	start_epoch=$(epoch "$started") ||
-		blocked "cannot parse task $tid's started_at '$started' — the two instants are incomparable"
-	[ "$broken_at" -lt "$start_epoch" ] ||
-		blocked "the break on $NODE was installed at $broken_at, not before task $tid started ($start_epoch) — the task may have passed the cache write before the tree changed"
+	[ -n "$anchor" ] ||
+		blocked "task $tid has neither started_at nor job_created_at — the break on $NODE cannot be placed before the task existed"
+	anchor_epoch=$(epoch "$anchor") ||
+		blocked "cannot parse task $tid's $anchor_field '$anchor' — the two instants are incomparable"
+	[ "$broken_at" -lt "$anchor_epoch" ] ||
+		blocked "the break on $NODE was installed at $broken_at, not before task $tid's $anchor_field ($anchor_epoch) — the task may have passed the cache write before the tree changed"
+	observe "task met the tree at $anchor_field=$anchor (tree broken at $broken_at)"
 	wait_terminal "$tid"
 	body=$(task_entry "$tid")
 	observe "task=$body"
@@ -302,6 +404,8 @@ restore)
 	NODE=$node_name
 	rc=0
 	out=$(restore_node) || rc=$?
+	[ -n "$out" ] ||
+		blocked "the node-side call returned no output (rc=$rc, image $NODE_DEBUG_IMAGE) — the journal keeps the break on $NODE"
 	[ "$rc" -eq 0 ] ||
 		blocked "cannot restore $NODE (rc=$rc, image $NODE_DEBUG_IMAGE): ${out:-<no output>} — the journal keeps it"
 	forget_broken "$NODE"

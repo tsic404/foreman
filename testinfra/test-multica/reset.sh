@@ -18,20 +18,24 @@
 #   4. wipe — delete every runtime row and task row of the test workspace
 #      (可重置). The agent rows survive, unbound;
 #   5. rebuild the test objects — writable repository, test agent and failure
-#      agent (both unbound), chat entry. The autopilot is not here: the server
-#      refuses an autopilot whose assignee agent has no runtime, and this entry
-#      leaves the runtime list empty on purpose — ./bind-agent.sh creates it
-#      once the agent is bound;
+#      agent (both unbound), chat entry; drop the pin and witness a
+#      stopped-instance pin/restore left for the previous instance. The
+#      autopilot is not here: the server refuses an autopilot whose assignee
+#      agent has no runtime, and this entry leaves the runtime list empty on
+#      purpose — ./bind-agent.sh creates it once the agent is bound;
 #   6. model — one writer, one precedence: the deployment-supplied endpoint
-#      triple wins; without it the keyless local backend ./deploy.sh installed
-#      is the source (its family selector plus its in-cluster address); with
-#      neither, the agent's model is cleared and any registration a previous
-#      round left on the nodes is removed (the node file outlives the
-#      namespace). The failure agent is cleared unconditionally: its missing
-#      model source is the fixture's failure guarantee;
-#   7. gate — ./selfcheck.sh: the environment gate ①②③④ (the instance points at
-#      the access point, the runtime list is empty, the server reports the
-#      artifact anchor, the selected model source serves the round).
+#      triple wins; without it the selected local source (the scripted fixture
+#      backend by default, the keyless ollama engine when the round asks for
+#      it) is registered through the same installer; with neither, the agent's
+#      model is cleared and any registration a previous round left on the
+#      nodes is removed (the node file outlives the namespace). The failure
+#      agent is written unconditionally to a selector no round can resolve —
+#      an empty one would let omp resolve the node's registration by itself and
+#      the failed class would complete instead;
+#   7. gate — ./selfcheck.sh: the environment gate ①②③④⑤ (the instance points
+#      at the access point, the runtime list is empty, the server reports the
+#      artifact anchor, the selected model source serves the round, and the Job
+#      image's daemon carries the argv omp accepts).
 #
 # It is idempotent: everything is looked up by name and only created when
 # missing; the provider registration is one Secret applied in place and one
@@ -176,6 +180,52 @@ wipe_rows() {
 
 # --- 5. the test objects ------------------------------------------------------
 
+# The witness and the pin it describes are one state, and the evidence must not
+# go before the state does: while the pin stays in force the instance prints the
+# very startup line the witness demands, so --verify passes on the leftover
+# selector instead of catching it. The delete therefore comes first, and the
+# witness goes only once the pin is known gone — its namespace is absent, or
+# the delete succeeded.
+#
+# "Is the instance namespace there?" is a three-way question, the same split
+# instance_object_present applies: a fresh cluster has no such namespace — the
+# state stop_instance tolerates — and that is an answer, while an unreadable
+# namespace is a read failure and must not be read as absence, or the pin
+# cleanup is skipped and the witness dropped with the pin still in force.
+instance_ns_present() {
+	# The first read is unretried: NotFound is definitive and a retry loop
+	# would spend its budget on it. Anything else is a read failure — a
+	# starved API server answers with a TLS handshake timeout here — and goes
+	# through k() like every other read.
+	if _ns_out=$(kubectl get namespace "$INSTANCE_NS" -o name 2>&1); then
+		return 0
+	fi
+	case $_ns_out in
+	*NotFound*) return 1 ;;
+	esac
+	# The retry's own error is the one to report: the first read's message may
+	# be a transient failure the retry already got past.
+	_ns_retry=$(k get namespace "$INSTANCE_NS" -o name 2>&1) ||
+		die "cannot read namespace $INSTANCE_NS — ${_ns_retry:-$_ns_out}"
+	return 0
+}
+
+if instance_ns_present; then
+	# The delete is a retried write: a transient failure must not leave the pin
+	# behind. A refusal that survives the retries is fatal — the namespace is
+	# there and the object was not confirmed cleared.
+	if ! _policy_out=$(k -n "$INSTANCE_NS" delete configmap foreman-job-policy --ignore-not-found 2>&1); then
+		die "cannot clear the job policy ($INSTANCE_NS/foreman-job-policy) — the agent may stay pinned while ./wire.sh reports nothing pending: $_policy_out"
+	fi
+	info "cleared the job policy ($INSTANCE_NS/foreman-job-policy)"
+fi
+# Reached only with the pin known gone: the namespace is absent, or the delete
+# above succeeded.
+if [ -e "$POLICY_WITNESS" ]; then
+	rm -f "$POLICY_WITNESS"
+	info "dropped the stale job-policy witness $POLICY_WITNESS"
+fi
+
 ensure_repo() {
 	if ! ws=$(api GET "/api/workspaces/$(workspace_id)"); then
 		die "workspace $(workspace_id) is not readable on $SERVER_URL — remove $PROFILE_CONFIG and re-run"
@@ -230,7 +280,7 @@ ensure_agents() {
 	agent_id=$(ensure_agent "$AGENT_NAME" "Foreman acceptance test agent") ||
 		die "agent $AGENT_NAME is missing"
 	fault_agent_id=$(ensure_agent "$FAULT_AGENT_NAME" \
-		"Foreman acceptance failure fixture: no model source, every task ends failed") ||
+		"Foreman acceptance failure fixture: an unresolvable model selector, every task ends failed") ||
 		die "agent $FAULT_AGENT_NAME is missing"
 }
 
@@ -254,17 +304,27 @@ ensure_chat() {
 # installed, else no model. The entry only decides when to call it — the
 # agent id it needs comes from ensure_agents above.
 
-# The failure agent is the fixture's deterministic failure: it must carry no
-# model source in any round, whatever the round's model precedence chose. A
-# selector left by an earlier round (the row survives the wipe) would quietly
-# turn it into a second working agent and take the failure scenario with it, so
-# this is an unconditional write, not a create-time default.
-clear_fault_agent_model() {
-	set_agent_model "$fault_agent_id" "" ||
-		die "cannot clear agent $FAULT_AGENT_NAME's model"
+# The failure agent is the fixture's deterministic failure: it must carry a
+# selector that cannot resolve in any round, whatever the round's model
+# precedence chose. Clearing the field is not that guarantee — omp then reads
+# the registration in the Pod's own home (the workspace home every agent of the
+# workspace mounts) and runs the test agent's model, so the failed class
+# quietly becomes a second completed one. A selector left by an earlier round
+# (the row survives the wipe) has the same problem, so this is an unconditional
+# write, not a create-time default.
+isolate_fault_agent_model() {
+	# The round's own registration is the one document that could resolve the
+	# selector: a round whose provider is the fixture's would make the failure
+	# agent a second working agent. Refuse it instead of writing a guarantee
+	# that no longer holds.
+	_served_provider=${model_text%%/*}
+	[ "${FAULT_MODEL_SELECTOR%%/*}" != "$_served_provider" ] ||
+		die "the round's provider ($_served_provider) is the failure agent's selector provider — the failure guarantee would resolve; change TEST_MULTICA_MODEL_PROVIDER / TEST_MULTICA_SCRIPTED_PROVIDER"
+	set_agent_model "$fault_agent_id" "$FAULT_MODEL_SELECTOR" ||
+		die "cannot point agent $FAULT_AGENT_NAME at $FAULT_MODEL_SELECTOR"
 	set_agent_env "$fault_agent_id" "" ||
 		die "cannot clear agent $FAULT_AGENT_NAME's model backend address"
-	info "agent $FAULT_AGENT_NAME → (no model source: every task fails)"
+	info "agent $FAULT_AGENT_NAME → $FAULT_MODEL_SELECTOR (unresolvable: every task fails)"
 }
 
 # --- 7. gate and report ------------------------------------------------------
@@ -280,9 +340,9 @@ ensure_repo
 ensure_agents
 ensure_chat
 register_model_endpoint
-clear_fault_agent_model
+isolate_fault_agent_model
 
-# The environment gate ①②③④, the gate every round opens with. Run here, with
+# The environment gate ①②③④⑤, the gate every round opens with. Run here, with
 # the instance under test stopped, ② is the reset-time state this entry sets
 # up; a blocked environment exits 2 through this call.
 "$TEST_MULTICA_DIR/selfcheck.sh"
@@ -293,7 +353,7 @@ printf 'profile:      %s (%s)\n' "$PROFILE" "$PROFILE_CONFIG"
 printf 'server:       %s\n' "$SERVER_URL"
 printf 'entry:        %s\n' "$ENTRY_URL"
 printf 'agent:        %s\n' "$AGENT_NAME"
-printf 'failure agent: %s (no model source)\n' "$FAULT_AGENT_NAME"
+printf 'failure agent: %s (%s, unresolvable)\n' "$FAULT_AGENT_NAME" "$FAULT_MODEL_SELECTOR"
 printf 'model:        %s\n' "$model_text"
 printf 'chat session: %s\n' "$CHAT_TITLE"
 printf 'next:         ./wire.sh         # points the instance at the access point and starts it\n'
