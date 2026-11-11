@@ -146,17 +146,18 @@ assignee has no runtime.
 The test agent's model configuration is reconciled on every reset, not only on
 creation, through one explicit precedence: the deployment-supplied endpoint
 (§ Model endpoint) wins; without it the deployed local backend is the source —
-`model` is set to `ollama/<family>` (the served tag without its `:tag` suffix)
-and `custom_env` carries that backend's in-cluster base URL as
-`OLLAMA_BASE_URL`; with neither, `model` is cleared and `custom_env` emptied.
-Both fields travel in the claim payload's agent section — the Job daemon passes
-`model` to the runtime and layers `custom_env` onto the agent process — so a
-task can actually reach the model. The selector is deliberately untagged: a
-fresh Job pod has no discovered local-engine catalog at startup, and a
-colon-tagged selector would be rejected before discovery; the untagged form
-resolves after discovery against the single served tag of that family (the
-backend prunes other tags). Reconciling rather than create-only is what
-repairs an agent left model-less by an earlier environment.
+`model` is set to `ollama/<id>:<tag>` (the served tag in full) and `custom_env`
+carries that backend's in-cluster base URL as `OLLAMA_BASE_URL`; with neither,
+`model` is cleared and `custom_env` emptied. Both fields travel in the claim
+payload's agent section — the Job daemon passes `model` to the runtime and
+layers `custom_env` onto the agent process — so a task can actually reach the
+model. A selector always names the full served tag: omp resolves a provided
+selector against the catalog it reports at startup, the catalog lists served
+tags (`<id>:<tag>`), and a family form without `:tag` matches no row there, so
+omp refuses it before the task starts (`Model "ollama/<family>" not found`).
+The backend prunes other tags of the family, so the one served tag is the one
+the selector names. Reconciling rather than create-only is what repairs an
+agent left model-less by an earlier environment.
 
 The wipe is SQL inside the persistence pod (`kubectl exec deploy/postgres`) —
 the server has no API for deleting task history, and a runtime delete detaches
@@ -301,7 +302,7 @@ a prerequisite — never both:
 |---|---|---|
 | Objects `./deploy.sh` applies | `deploy.yaml` only | `deploy.yaml` and `model-backend.yaml` |
 | Local model backend (PVC/Service/Deployment `ollama-models` / `test-multica-ollama`) | absent — not rendered, not applied, not waited for | present; its rollout is the slow one (model pull) |
-| Objects `./reset.sh` writes | provider registration (Secret + node-local file), agent `model` = `<provider>/<model id>` | no registration; agent `model` = `ollama/<family>`, `custom_env.OLLAMA_BASE_URL` = the in-cluster address |
+| Objects `./reset.sh` writes | provider registration (Secret + node-local file), agent `model` = `<provider>/<model id>` | no registration; agent `model` = `ollama/<id>:<tag>`, `custom_env.OLLAMA_BASE_URL` = the in-cluster address |
 | Gate ④ (`./selfcheck.sh`) | asserts the endpoint is the selected source | asserts the local backend serves the model |
 
 A half-set triple is refused by every entry (`./deploy.sh` included) with the
@@ -343,7 +344,7 @@ the baseline:
   file and deletes the Secret (`--ignore-not-found`), whether or not the agent
   row still carries the old selector. The agent then falls to the next step of
   the precedence: the local backend when `./deploy.sh` installed one (`model` =
-  `ollama/<family>`, `custom_env` = its in-cluster address), otherwise `model`
+  `ollama/<id>:<tag>`, `custom_env` = its in-cluster address), otherwise `model`
   is cleared and `custom_env` emptied, so tasks keep the baseline behaviour
   (they converge to `process_failure` quickly). That is what keeps the
   guarantee when `recycle.sh` has deleted the namespace: the node-local file

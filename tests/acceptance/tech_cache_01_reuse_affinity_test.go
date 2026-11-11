@@ -2,8 +2,9 @@
 // assertion: an agent's continuation carries exactly one soft-affinity item for
 // the node its terminal report taught, while a different agent's task on the
 // same issue carries no block (issue_id is not a key). The node-side cache
-// evidence (the bare .repos object's creation instant against the second pod's
-// start) runs from tests/acceptance/tech-cache-01-cluster.sh.
+// evidence — the fixture's mark inside the bare .repos object, compared with
+// the second pod's start — runs from tests/acceptance/tech-cache-01-cluster.sh
+// and its mark/check cases live in tech_cache_01_carrier_mark_test.go.
 package acceptance
 
 import (
