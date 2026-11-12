@@ -26,8 +26,9 @@ const (
 
 // TestJobImageLatestOnlyFollowsUpstreamsNewestRelease covers
 // build-foreman-job.yml: the version is upstream's newest release unless a
-// dispatch names one, and only the run that publishes upstream's newest release
-// moves `foreman-job:latest`.
+// dispatch names one, every run publishes the version tag (the rollback path),
+// and only the run that publishes upstream's newest release moves
+// `foreman-job:latest` beside it.
 func TestJobImageLatestOnlyFollowsUpstreamsNewestRelease(t *testing.T) {
 	requireTools(t, "bash", "git")
 	top := workflowEnv(t, foremanJobWorkflow)
@@ -66,9 +67,13 @@ func TestJobImageLatestOnlyFollowsUpstreamsNewestRelease(t *testing.T) {
 				"MULTICA_CLI_SHA256_ARM64": "s",
 			}, resolved.outputs))
 			buildArgs := runPublish(t, publish.run, dir, env)
-			if got := strings.Contains(buildArgs, "foreman-job:latest"); got != tc.wantLatest {
-				t.Errorf("buildx args contain foreman-job:latest = %v, want %v\n%s", got, tc.wantLatest, buildArgs)
+			// The version tag is the rollback path (ADR-012), so every run
+			// pushes it; only upstream's newest release moves `latest` beside it.
+			wantTags := []string{env["REGISTRY"] + "/foreman-job:" + tc.version}
+			if tc.wantLatest {
+				wantTags = append(wantTags, env["REGISTRY"]+"/foreman-job:latest")
 			}
+			assertPublishTags(t, buildArgs, wantTags...)
 		})
 	}
 
@@ -160,13 +165,20 @@ func runForemanPublish(t *testing.T, top map[string]string, publish step, resolv
 }
 
 // assertPublishTags requires the recorded buildx invocation to carry exactly the
-// tags the trigger names: one tag per run, none beside it.
+// tags the trigger names, compared as a set: `--tag` order is not part of the
+// contract. For a job publish that is the version tag plus `latest` only when
+// this run publishes upstream's newest release.
 func assertPublishTags(t *testing.T, args string, want ...string) {
 	t.Helper()
 	var got []string
 	for _, match := range buildxTag.FindAllStringSubmatch(args, -1) {
 		got = append(got, match[1])
 	}
+	// Sorted copies: a reordered argv is equivalent, a duplicated tag is not —
+	// it still shows as a length or element mismatch.
+	slices.Sort(got)
+	want = slices.Clone(want)
+	slices.Sort(want)
 	if !slices.Equal(got, want) {
 		t.Errorf("buildx published %v, want %v\n%s", got, want, args)
 	}
