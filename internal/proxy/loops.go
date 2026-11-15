@@ -3,6 +3,7 @@ package proxy
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -44,9 +45,21 @@ func NewClaimLoop(cfg Config, client *Client, claim Claimer, capacity func() int
 	}
 }
 
-// Run serves the claim loop until ctx ends.
+// Run serves the claim loop until ctx ends. Before each round it makes sure
+// Foreman's current daemon set is registered to the server (C1): a claimed
+// task can only be delivered to a daemon whose runtime the server knows, and a
+// daemon that registers after startup is declared on the very next round.
 func (l *ClaimLoop) Run(ctx context.Context) error {
 	for {
+		if err := l.preflight(ctx); err != nil {
+			wait := l.backoff.next()
+			l.log.Error("preflight failed", "err", err, "retry_in", wait)
+			if !sleepOrDone(ctx, wait) {
+				return nil
+			}
+			continue
+		}
+		l.backoff.reset()
 		if err := l.iterate(ctx); err != nil {
 			wait := l.backoff.next()
 			l.log.Error("claim failed", "err", err, "retry_in", wait)
@@ -55,11 +68,28 @@ func (l *ClaimLoop) Run(ctx context.Context) error {
 			}
 			continue
 		}
-		l.backoff.reset()
 		if !sleepOrDone(ctx, l.interval()) {
 			return nil
 		}
 	}
+}
+
+// preflight registers the daemon set to the server (C1) when it is dirty and
+// renews the server token (C16). A clean declaration (no daemon changed since
+// the last C1) skips the register call and only renews the token.
+func (l *ClaimLoop) preflight(ctx context.Context) error {
+	if l.client.NeedsRegistration() {
+		if err := l.client.Register(ctx); err != nil {
+			if errors.Is(err, errNoDeclaredRuntime) {
+				// No daemon registered to Foreman yet: defer. A later daemon
+				// registration marks the declaration dirty and the next round
+				// declares it.
+				return nil
+			}
+			return err
+		}
+	}
+	return l.client.RenewToken(ctx)
 }
 
 // iterate runs one claim round.

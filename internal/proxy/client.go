@@ -149,7 +149,6 @@ type RuntimeRef struct {
 // Key is the identity key (provider \x00 profile id).
 func (r RuntimeRef) Key() string { return r.Provider + "\x00" + r.ProfileID }
 
-// Client is the fake client: every Foreman→server call.
 type Client struct {
 	cfg     Config
 	token   string
@@ -161,8 +160,12 @@ type Client struct {
 	// runtimes is the declared set. v2 declares one runtime per daemon that
 	// registered to Foreman; the server binds each to a real runtime id.
 	runtimes []RuntimeRef
-	// discovery carries the declared runtimes until the first C1 binds ids.
+	// declared is the declaration derived from the registered daemons; it is
+	// sent at the next C1. dirty marks a declaration that differs from what the
+	// server last accepted, so the claim loop's preflight only re-runs C1 when
+	// a daemon registered or deregistered — never every round.
 	declared []DeclaredRuntime
+	dirty    bool
 
 	workspaceName string
 }
@@ -233,15 +236,29 @@ func (c *Client) RuntimeIDs() []string {
 // RuntimeRefs returns the declared runtimes and their ids.
 func (c *Client) RuntimeRefs() []RuntimeRef { return append([]RuntimeRef(nil), c.runtimes...) }
 
-// SetDeclared updates the runtime set Foreman will declare at the next C1. It
-// is called when a daemon registers or goes away.
-func (c *Client) SetDeclared(d []DeclaredRuntime) { c.declared = d }
+// SetDeclared updates the runtime set Foreman will declare at the next C1 and
+// marks the declaration dirty, so the claim loop re-runs the registration.
+func (c *Client) SetDeclared(d []DeclaredRuntime) {
+	c.declared = append([]DeclaredRuntime(nil), d...)
+	c.dirty = true
+}
+
+// errNoDeclaredRuntime is the no-daemon-yet signal Register returns. It is not
+// an error of configuration or transport: a daemon has simply not registered to
+// Foreman yet, so there is nothing to declare. The claim loop treats it as a
+// deferral, not a failure.
+var errNoDeclaredRuntime = errors.New("register: no daemon registered to declare")
+
+// NeedsRegistration reports whether the declared set is dirty (a daemon
+// registered or deregistered since the last C1) or no runtime has ever been
+// registered. The claim loop's preflight reads it to skip a no-op round.
+func (c *Client) NeedsRegistration() bool { return c.dirty || len(c.runtimes) == 0 }
 
 // Register performs C1 with the current declaration. A server that answers
 // binds each declared identity to a real runtime id.
 func (c *Client) Register(ctx context.Context) error {
 	if len(c.declared) == 0 {
-		return errors.New("register: no runtime declared (no daemon registered yet)")
+		return errNoDeclaredRuntime
 	}
 	payloads := make([]runtimePayload, 0, len(c.declared))
 	for _, d := range c.declared {
@@ -276,6 +293,7 @@ func (c *Client) Register(ctx context.Context) error {
 		return fmt.Errorf("register: decode: %w", err)
 	}
 	c.runtimes = bindRuntimes(payloads, resp.Runtimes)
+	c.dirty = false
 	return nil
 }
 

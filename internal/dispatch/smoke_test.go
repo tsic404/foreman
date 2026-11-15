@@ -1,7 +1,7 @@
 package dispatch_test
 
 import (
-	"github.com/tsic404/foreman/internal/dispatch"
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -12,6 +12,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tsic404/foreman/internal/daemonauth"
+	"github.com/tsic404/foreman/internal/dispatch"
 	"github.com/tsic404/foreman/internal/proxy"
 	"github.com/tsic404/foreman/internal/registry"
 )
@@ -19,9 +21,10 @@ import (
 // stubServer stands in for the multica server: it answers C17/C1/C3 and records
 // every forwarded lifecycle report.
 type stubServer struct {
-	mu      sync.Mutex
-	claims  int
-	reports []recordedReport
+	mu       sync.Mutex
+	claims   int
+	register int
+	reports  []recordedReport
 }
 
 type recordedReport struct {
@@ -43,8 +46,12 @@ func (s *stubServer) handler() http.Handler {
 			} `json:"runtimes"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
+		s.mu.Lock()
+		s.register++
+		s.mu.Unlock()
 		rts := make([]map[string]any, 0, len(req.Runtimes))
 		for _, rt := range req.Runtimes {
+			// The server assigns a real runtime id per declared identity.
 			rts = append(rts, map[string]any{
 				"id": rt.Type + "-real", "name": rt.Name, "provider": rt.Type,
 				"status": "online", "profile_id": nil,
@@ -66,7 +73,6 @@ func (s *stubServer) handler() http.Handler {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"tasks": tasks})
 	})
-	// Report endpoints: /api/daemon/tasks/{tid}/{endpoint}
 	mux.HandleFunc("/api/daemon/tasks/", func(w http.ResponseWriter, r *http.Request) {
 		parts := strings.Split(strings.TrimPrefix(r.URL.Path, "/api/daemon/tasks/"), "/")
 		if len(parts) != 2 {
@@ -85,9 +91,27 @@ func (s *stubServer) handler() http.Handler {
 	return mux
 }
 
-// TestEndToEndChain drives the v2 flow: Foreman registers to the server,
-// claims a task, hands it to a registered daemon, and the daemon's terminal
-// report is forwarded back to the server.
+func creds(t *testing.T) *daemonauth.Store {
+	t.Helper()
+	store, err := daemonauth.Load(func(k string) string {
+		switch k {
+		case daemonauth.EnvDaemonTokens:
+			return "worker-1=tok-1"
+		case daemonauth.EnvDaemonTokenWorkspaces:
+			return "worker-1=ws-1"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("load daemon creds: %v", err)
+	}
+	return store
+}
+
+// TestEndToEndChain drives the whole v2 flow through the real faces: a daemon
+// registers to the fake server, the change hook re-derives Foreman's C1
+// declaration, Foreman registers to the server and claims a task, the daemon's
+// S6 claim collects it, and the terminal report is forwarded back.
 func TestEndToEndChain(t *testing.T) {
 	stub := &stubServer{}
 	server := httptest.NewServer(stub.handler())
@@ -101,23 +125,61 @@ func TestEndToEndChain(t *testing.T) {
 		Version:     "test",
 	}
 	client := proxy.NewClient(cfg, "mul_test")
-	// Foreman declares the runtime of the daemon registered to it.
-	client.SetDeclared([]proxy.DeclaredRuntime{{Name: "worker-1", Type: "omp"}})
+	disp := dispatch.New(dispatch.Config{}, reg, client, nil)
+
+	// The daemon face, with the change hook that re-derives the declaration.
+	redeclare := func() {
+		rts := reg.RuntimesForWorkspace("ws-1")
+		declared := make([]proxy.DeclaredRuntime, 0, len(rts))
+		for _, rt := range rts {
+			declared = append(declared, proxy.DeclaredRuntime{Name: rt.Name, Type: rt.Provider, ProfileID: rt.ProfileID})
+		}
+		client.SetDeclared(declared)
+	}
+	fakeServer := proxy.NewFakeServer(creds(t), reg, dispatchAdapter{disp}, proxy.WithDaemonChangeHook(redeclare))
+	daemonHTTP := httptest.NewServer(fakeServer)
+	defer daemonHTTP.Close()
+
+	// The daemon registers to Foreman.
+	registerBody, _ := json.Marshal(map[string]any{
+		"daemon_id": "worker-1", "workspace_id": "ws-1",
+		"runtimes": []map[string]string{{"name": "worker-1", "type": "omp", "status": "online"}},
+	})
+	req, _ := http.NewRequest(http.MethodPost, daemonHTTP.URL+"/api/daemon/register", bytes.NewReader(registerBody))
+	req.Header.Set("Authorization", "Bearer tok-1")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("daemon register: %v", err)
+	}
+	resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("daemon register status %d", resp.StatusCode)
+	}
+
+	// The hook marked the declaration dirty; the claim loop's preflight would
+	// register. Do it explicitly so the test drives one round.
+	if !client.NeedsRegistration() {
+		t.Fatal("daemon registration should dirty the declaration")
+	}
 	if err := client.Register(context.Background()); err != nil {
 		t.Fatalf("client register: %v", err)
 	}
+	if client.NeedsRegistration() {
+		t.Fatal("successful C1 should clear the dirty flag")
+	}
+	stub.mu.Lock()
+	registers := stub.register
+	stub.mu.Unlock()
+	if registers != 1 {
+		t.Fatalf("expected exactly one C1, got %d", registers)
+	}
 
-	// The daemon is registered to Foreman (in production it dials the fake
-	// server; the row is what the dispatcher reads).
-	reg.PutRuntime(registry.Runtime{
-		RuntimeID: "worker-1", DaemonID: "worker-1", Provider: "omp", Name: "worker-1",
-		WorkspaceID: "ws-1", Online: true, RegisteredAt: reg.Now(),
-	})
-
-	disp := dispatch.New(dispatch.Config{}, reg, client, nil)
 	ctx := context.Background()
 
 	// One claim round: capacity 1 → claim task-1.
+	if disp.IdleDaemons() != 1 {
+		t.Fatalf("expected 1 idle daemon, got %d", disp.IdleDaemons())
+	}
 	tasks, err := client.ClaimTasks(ctx, disp.IdleDaemons())
 	if err != nil {
 		t.Fatalf("claim: %v", err)
@@ -129,7 +191,6 @@ func TestEndToEndChain(t *testing.T) {
 		t.Fatalf("on-claim: %v", err)
 	}
 
-	// The task is assigned to worker-1.
 	entry, ok := reg.ByDaemonInWorkspace("ws-1", "worker-1")
 	if !ok {
 		t.Fatalf("task not assigned to worker-1")
@@ -153,39 +214,44 @@ func TestEndToEndChain(t *testing.T) {
 		t.Fatalf("complete report: %v", err)
 	}
 
-	// Both reports reached the server, in order.
 	stub.mu.Lock()
 	reports := append([]recordedReport(nil), stub.reports...)
 	stub.mu.Unlock()
 	if len(reports) != 2 {
 		t.Fatalf("expected 2 forwarded reports, got %d: %+v", len(reports), reports)
 	}
-	if reports[0].Endpoint != "start" {
-		t.Fatalf("expected start first, got %q", reports[0].Endpoint)
-	}
-	if reports[1].Endpoint != "complete" {
-		t.Fatalf("expected complete second, got %q", reports[1].Endpoint)
+	if reports[0].Endpoint != "start" || reports[1].Endpoint != "complete" {
+		t.Fatalf("expected start then complete, got %q, %q", reports[0].Endpoint, reports[1].Endpoint)
 	}
 	if !strings.Contains(reports[1].Body, "sess-1") {
 		t.Fatalf("session id missing from forwarded body: %s", reports[1].Body)
 	}
 
-	// The task settled and was reclaimed: no live entry remains, but the
-	// settled index remembers it so a re-dispatch is caught.
 	if _, live := reg.Get("task-1"); live {
 		t.Fatalf("task-1 should have been reclaimed after terminal")
 	}
 	if !reg.IsDone("ws-1", "task-1") {
 		t.Fatalf("task-1 should be remembered as done")
 	}
-
-	// The daemon learned the session for affinity.
 	rt, _ := reg.RuntimeByID("worker-1")
 	if !rt.HoldsSession("sess-1") {
 		t.Fatalf("daemon should have learned session sess-1")
 	}
 	_ = time.Now
 }
+
+// dispatchAdapter routes the fake server's single Dispatcher seam to one
+// dispatcher.
+type dispatchAdapter struct{ d *dispatch.Dispatcher }
+
+func (a dispatchAdapter) Deliver(ctx context.Context, ws, daemonID, runtimeID string, max int) (dispatch.Delivery, error) {
+	return a.d.Deliver(ctx, ws, daemonID, runtimeID, max)
+}
+func (a dispatchAdapter) OnReport(ctx context.Context, ep dispatch.Endpoint, e registry.TaskEntry, body []byte, sessionID string) (int, []byte, error) {
+	return a.d.OnReport(ctx, ep, e, body, sessionID)
+}
+func (a dispatchAdapter) OnTaskVanished(ctx context.Context, taskID string) error { return nil }
+func (a dispatchAdapter) OnBootTimeout(ctx context.Context, taskID string) error  { return nil }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")

@@ -37,6 +37,10 @@ type FakeServer struct {
 	metrics Metrics
 	log    *slog.Logger
 	mux    *http.ServeMux
+	// onDaemonChanged fires after a daemon registers or deregisters, so the
+	// assembly can re-derive its C1 declaration from the registry and have the
+	// claim loop tell the server about the new runtime set.
+	onDaemonChanged func()
 }
 
 // ServerOption customizes a FakeServer.
@@ -50,6 +54,18 @@ func WithServerMetrics(m Metrics) ServerOption {
 // WithServerLogger overrides the logger.
 func WithServerLogger(l *slog.Logger) ServerOption {
 	return func(s *FakeServer) { s.log = l.With("component", "fake-server") }
+}
+
+// WithDaemonChangeHook wires the post-registration callback.
+func WithDaemonChangeHook(fn func()) ServerOption {
+	return func(s *FakeServer) { s.onDaemonChanged = fn }
+}
+
+// notifyChanged runs the daemon-change hook, if wired.
+func (s *FakeServer) notifyChanged() {
+	if s.onDaemonChanged != nil {
+		s.onDaemonChanged()
+	}
 }
 
 // NewFakeServer builds the daemon face.
@@ -192,6 +208,7 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		RegisteredAt: s.reg.Now(),
 	}
 	s.reg.PutRuntime(rt)
+	s.notifyChanged()
 	answer := map[string]any{
 		"id":         runtimeID,
 		"name":       rt.Name,
@@ -248,6 +265,7 @@ func (s *FakeServer) handleDeregister(w http.ResponseWriter, r *http.Request) {
 	}
 	if rt, known := s.reg.RuntimeByDaemon(cred.DaemonID); known {
 		s.reg.SetRuntimeOffline(rt.RuntimeID)
+		s.notifyChanged()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }

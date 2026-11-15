@@ -146,10 +146,30 @@ func run() error {
 		dispatchers[wsID] = d
 	}
 
-	// The daemon face: long-lived daemons register, heartbeat secret hash and
-	// claim tasks.
+	// The daemon face: long-lived daemons register, heartbeat and claim tasks.
+	// A daemon's registration changes the runtime set Foreman declares to the
+	// server, so the hook re-derives it per workspace; the claim loop's
+	// preflight then re-runs C1 on the next round.
+	redeclare := func() {
+		for _, wsID := range workspaceIDs {
+			client, _ := clients.For(wsID)
+			if client == nil {
+				continue
+			}
+			rts := reg.RuntimesForWorkspace(wsID)
+			declared := make([]proxy.DeclaredRuntime, 0, len(rts))
+			for _, rt := range rts {
+				declared = append(declared, proxy.DeclaredRuntime{
+					Name: rt.Name, Type: rt.Provider,
+					ProfileID: rt.ProfileID,
+				})
+			}
+			client.SetDeclared(declared)
+		}
+	}
 	fakeServer := proxy.NewFakeServer(daemonCreds, reg, dispatcherSet(dispatchers),
-		proxy.WithServerMetrics(metrics), proxy.WithServerLogger(baseLog))
+		proxy.WithServerMetrics(metrics), proxy.WithServerLogger(baseLog),
+		proxy.WithDaemonChangeHook(redeclare))
 
 	// Capacity: how many tasks Foreman may claim now. v2 claims up to the
 	// number of currently idle daemons across the workspaces — the number of

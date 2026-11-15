@@ -427,6 +427,30 @@ func (r *Registry) Runtimes() []Runtime {
 	return out
 }
 
+// RuntimesForWorkspace returns the daemon rows of one workspace, online first,
+// in registration order. The C1 declaration is derived from this set.
+func (r *Registry) RuntimesForWorkspace(workspaceID string) []Runtime {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	out := make([]Runtime, 0, len(r.runtimes))
+	for _, rt := range r.runtimes {
+		if rt.WorkspaceID != workspaceID {
+			continue
+		}
+		out = append(out, rt)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if out[i].Online != out[j].Online {
+			return out[i].Online
+		}
+		if out[i].RegisteredAt.Equal(out[j].RegisteredAt) {
+			return out[i].RuntimeID < out[j].RuntimeID
+		}
+		return out[i].RegisteredAt.Before(out[j].RegisteredAt)
+	})
+	return out
+}
+
 // TouchHeartbeat refreshes one daemon's liveness clock and marks it online.
 func (r *Registry) TouchHeartbeat(runtimeID string, at time.Time) {
 	r.mu.Lock()
