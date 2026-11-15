@@ -38,6 +38,14 @@ AGENT_NAME=${TEST_MULTICA_AGENT:-v2-agent-foreman}
 
 DAEMON_ID=${TEST_MULTICA_DAEMON_ID:-foreman-v2-daemon}
 DAEMON_TOKEN=${TEST_MULTICA_DAEMON_TOKEN:-dc-tok-v2-test}
+# --two-daemons adds a second resident daemon under its own identity, proving
+# that Foreman aggregates several daemons behind one server-side runtime.
+TWO_DAEMONS=0
+for _arg in "$@"; do
+	[ "$_arg" = "--two-daemons" ] && TWO_DAEMONS=1
+done
+DAEMON2_ID=${TEST_MULTICA_DAEMON2_ID:-foreman-v2-daemon-b}
+DAEMON2_TOKEN=${TEST_MULTICA_DAEMON2_TOKEN:-fo-d2-kx-91qj}
 FOREMAN_LISTEN=${FOREMAN_LISTEN:-:18080}
 FOREMAN_OPS_LISTEN=${FOREMAN_OPS_LISTEN:-:18081}
 OPS_TOKEN=${FOREMAN_OPS_TOKEN:-ops-secret}
@@ -58,10 +66,14 @@ step() { printf '\n\033[1;34m== %s\033[0m\n' "$*"; }
 die() { printf '\033[1;31mFAIL: %s\033[0m\n' "$*" >&2; exit 1; }
 
 # --- 1. stack ----------------------------------------------------------------
-if [ "${1:-}" = "--reset" ]; then
-	step "resetting the multica stack"
-	"${COMPOSE[@]}" down -v
-fi
+for arg in "$@"; do
+	case "$arg" in
+	--reset)
+		step "resetting the multica stack"
+		"${COMPOSE[@]}" down -v
+		;;
+	esac
+done
 step "starting the multica stack"
 "${COMPOSE[@]}" up -d
 step "waiting for the multica server"
@@ -126,14 +138,20 @@ mkdir -p "$GOTMPDIR"
 go build -o bin/foreman ./cmd/foreman
 pkill -9 -f 'bin/foreman -listen' 2>/dev/null || true
 sleep 1
+DAEMON_TOKENS_ARG="$DAEMON_ID=$DAEMON_TOKEN"
+DAEMON_WS_ARG="$DAEMON_ID=$WS_ID"
+if [ "$TWO_DAEMONS" = "1" ]; then
+	DAEMON_TOKENS_ARG="$DAEMON_TOKENS_ARG,$DAEMON2_ID=$DAEMON2_TOKEN"
+	DAEMON_WS_ARG="$DAEMON_WS_ARG,$DAEMON2_ID=$WS_ID"
+fi
 cat > "$WORK/foreman-run.sh" <<RUNEOF
 #!/usr/bin/env bash
 cd "$(pwd)"
 exec env \
   MULTICA_SERVER_URL=$SERVER_URL MULTICA_WORKSPACE_ID=$WS_ID \
   MULTICA_TOKEN=$PAT FOREMAN_DAEMON_ID=foreman \
-  FOREMAN_DAEMON_TOKENS=$DAEMON_ID=$DAEMON_TOKEN \
-  FOREMAN_DAEMON_TOKEN_WORKSPACES=$DAEMON_ID=$WS_ID \
+  FOREMAN_DAEMON_TOKENS=$DAEMON_TOKENS_ARG \
+  FOREMAN_DAEMON_TOKEN_WORKSPACES=$DAEMON_WS_ARG \
   FOREMAN_OPS_TOKEN=$OPS_TOKEN FOREMAN_LOG_LEVEL=debug \
   FOREMAN_CLAIM_INTERVAL=2s FOREMAN_CLAIM_INTERVAL_IDLE=2s \
   ./bin/foreman -listen=$FOREMAN_LISTEN -ops-listen=$FOREMAN_OPS_LISTEN
@@ -216,6 +234,56 @@ for _ in $(seq 1 30); do
 done
 grep -q 'daemon.registered' "$WORK/foreman.log" || die "daemon did not register to Foreman"
 echo "daemon registered to Foreman"
+
+# --- 6b. optional second resident daemon -------------------------------------
+D2PID=""
+if [ "$TWO_DAEMONS" = "1" ]; then
+	step "launching a second resident daemon"
+	mkdir -p "$WORK/daemon2-home/.multica" "$WORK/daemon2-root"
+	# The second daemon gets its own HOME so its control port, session store
+	# and omp config are independent — otherwise it collides with the first
+	# daemon's health port and refuses to start.
+	rm -f "$WORK/daemon2-home/.multica/pi-sessions/"*.jsonl 2>/dev/null || true
+	if [ -x "$REAL_OMP" ]; then
+		mkdir -p "$WORK/daemon2-home/.local/bin"
+		cp "$SHIM" "$WORK/daemon2-home/.local/bin/omp"
+	fi
+	if [ -d "$HOME/.omp" ]; then
+		ln -sfn "$HOME/.omp" "$WORK/daemon2-home/.omp"
+	fi
+	# The CLI keys its "already running" lock and control port on the profile,
+	# not on HOME, so the second daemon needs its own profile as well.
+	# The profile lives under the daemon's own HOME, since the CLI resolves
+	# profiles relative to $HOME — writing it under the host HOME would be
+	# invisible to a daemon running with HOME=$WORK/daemon2-home.
+	PROF2="$WORK/daemon2-home/.multica/profiles/foreman-b"
+	mkdir -p "$PROF2"
+	cat > "$PROF2/config.json" <<CFGEOF
+{"server_url":"http://127.0.0.1:${FOREMAN_LISTEN#:}","workspace_id":"$WS_ID","token":"$DAEMON2_TOKEN"}
+CFGEOF
+	chmod 600 "$PROF2/config.json"
+	cat > "$WORK/daemon2-run.sh" <<DMN2EOF
+#!/usr/bin/env bash
+cd "$WORK/daemon2-home"
+exec env HOME=$WORK/daemon2-home \
+  PATH=$WORK/daemon2-home/.local/bin:$HOME/.local/bin:/usr/local/bin:/usr/bin:/bin \
+  MULTICA_SERVER_URL=http://127.0.0.1:${FOREMAN_LISTEN#:} \
+  MULTICA_WORKSPACE_ID=$WS_ID \
+  "$MULTICA_BIN" --profile foreman-b --server-url http://127.0.0.1:${FOREMAN_LISTEN#:} \
+  --workspace-id "$WS_ID" daemon start --foreground \
+  --daemon-id "$DAEMON2_ID" --runtime-name "$DAEMON2_ID" --workspaces-root "$WORK/daemon2-root"
+DMN2EOF
+	chmod +x "$WORK/daemon2-run.sh"
+	setsid "$WORK/daemon2-run.sh" > "$WORK/daemon2.log" 2>&1 < /dev/null &
+	D2PID=$!
+	echo "daemon2 pid $D2PID (log $WORK/daemon2.log)"
+	for _ in $(seq 1 30); do
+		[ "$(grep -c 'daemon.registered' "$WORK/foreman.log")" -ge 2 ] && break
+		sleep 1
+	done
+	grep -q "$DAEMON2_ID" "$WORK/foreman.log" || die "second daemon did not register to Foreman"
+	echo "second daemon registered to Foreman"
+fi
 
 # --- 7. bind the agent to Foreman's runtime --------------------------------
 step "binding the agent to Foreman's runtime"
@@ -305,4 +373,4 @@ grep -iE 'agent result|did not complete|completed' "$WORK/daemon.log" 2>/dev/nul
 echo
 echo "foreman log:  $WORK/foreman.log"
 echo "daemon log:   $WORK/daemon.log"
-echo "pids: foreman=$FPID daemon=$DPID (kill to stop; stack: ${COMPOSE[*]} down)"
+echo "pids: foreman=$FPID daemon=$DPID${D2PID:+ daemon2=$D2PID} (kill to stop; stack: ${COMPOSE[*]} down)"
