@@ -360,22 +360,19 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 	}
 	delivery, err := s.disp.Deliver(r.Context(), cred.WorkspaceID, cred.DaemonID, req.RuntimeIDs, req.MaxTasks)
 	if err != nil {
-		s.log.Warn("claim deliver failed", "daemon_id", cred.DaemonID, "workspace_id", cred.WorkspaceID,
-			"runtime_ids", req.RuntimeIDs, "err", err)
-		// A claim for a runtime Foreman holds no task for is an ordinary empty
-		// claim, not an authorization failure: a multi-runtime daemon sends one
-		// claim per runtime, and only the runtime its task is bound to has work.
-		// Answering 403 would make the daemon log a failure every poll cycle.
-		// No task bound to this daemon right now is an ordinary empty claim: a
-		// daemon polls on its own cadence and regularly arrives before Foreman
-		// has claimed anything for it. Answering 403 would make every such poll
-		// log a failure on the daemon.
+		// "No task bound to this daemon right now" is the ordinary case, not a
+		// fault: a daemon polls on its own cadence and regularly arrives before
+		// Foreman has claimed anything for it, and a multi-runtime daemon sends
+		// one claim per runtime. Answer it as an empty claim and keep the log
+		// quiet — this fires several times a minute per daemon. Only a genuine
+		// dispatch failure is worth an error line.
 		if errors.Is(err, dispatch.ErrRuntimeMismatch) || errors.Is(err, dispatch.ErrUnknownDaemon) {
 			s.metrics.DeliveryClaim("empty")
 			writeRaw(w, http.StatusOK, mustMarshal(map[string]any{"tasks": []any{}}))
 			return
 		}
-		s.log.Error("deliver failed", "daemon_id", cred.DaemonID, "err", err)
+		s.log.Error("deliver failed", "daemon_id", cred.DaemonID, "workspace_id", cred.WorkspaceID,
+			"runtime_ids", req.RuntimeIDs, "err", err)
 		writeError(w, http.StatusInternalServerError, "deliver failed")
 		return
 	}
