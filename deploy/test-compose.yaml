@@ -55,6 +55,11 @@ services:
       FRONTEND_ORIGIN: http://localhost:30300
       CORS_ALLOWED_ORIGINS: http://localhost:30300
       MULTICA_DEV_VERIFICATION_CODE: "888888"
+      # Sweeper stale-runtime window: a runtime whose last heartbeat is older
+      # than this is marked offline and its dispatched tasks fail with
+      # runtime_offline. Foreman proxies the daemon heartbeat at 15s; keep this
+      # comfortably larger than the delivery window.
+      MULTICA_RUNTIME_RECONNECT_GRACE: "180s"
       DATABASE_URL: postgres://multica:test-oezogxxx@postgres:5432/multica?sslmode=disable
     volumes:
       - backend-uploads:/app/data/uploads

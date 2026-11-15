@@ -201,6 +201,17 @@ func run() error {
 				return 0, nil, fmt.Errorf("no client for task %s", taskID)
 			}
 			return client.ResolveSkillBundles(ctx, taskID, body)
+		}),
+		proxy.WithLeaseForwarder(func(ctx context.Context, workspaceID, taskID string) (bool, error) {
+			e, ok := reg.Get(taskID)
+			if !ok || e.RuntimeID == "" {
+				return false, nil
+			}
+			client, _ := clients.For(e.WorkspaceID)
+			if client == nil {
+				return false, nil
+			}
+			return client.PrepareLease(ctx, e.RuntimeID, taskID)
 		}))
 
 	// Capacity: how many tasks Foreman may claim now. v2 claims up to the

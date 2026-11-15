@@ -31,9 +31,12 @@ type Dispatcher interface {
 // multica server with Foreman's credential (C19). Nil answers an empty set.
 type SkillResolver func(ctx context.Context, taskID string, body []byte) (int, []byte, error)
 
-// WithSkillResolver wires the S-26 forward seam.
-func WithSkillResolver(fn SkillResolver) ServerOption {
-	return func(s *FakeServer) { s.skills = fn }
+// LeaseForwarder forwards the daemon's S-7 prepare-lease to multica as C4.
+type LeaseForwarder func(ctx context.Context, workspaceID, taskID string) (bool, error)
+
+// WithLeaseForwarder wires the S-7 → C4 seam.
+func WithLeaseForwarder(fn LeaseForwarder) ServerOption {
+	return func(s *FakeServer) { s.lease = fn }
 }
 
 // FakeServer is the D→F face: it speaks the official server protocol to the
@@ -47,6 +50,7 @@ type FakeServer struct {
 	log     *slog.Logger
 	mux     *http.ServeMux
 	skills  SkillResolver
+	lease   LeaseForwarder
 	// onDaemonChanged fires after a daemon registers or deregisters, so the
 	// assembly can re-derive its C1 declaration from the registry and have the
 	// claim loop tell the server about the new runtime set.
@@ -69,6 +73,11 @@ func WithServerLogger(l *slog.Logger) ServerOption {
 // WithDaemonChangeHook wires the post-registration callback.
 func WithDaemonChangeHook(fn func()) ServerOption {
 	return func(s *FakeServer) { s.onDaemonChanged = fn }
+}
+
+// WithSkillResolver wires the S-26 forward seam.
+func WithSkillResolver(fn SkillResolver) ServerOption {
+	return func(s *FakeServer) { s.skills = fn }
 }
 
 // notifyChanged runs the daemon-change hook, if wired.
@@ -350,11 +359,27 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusNotFound, "runtime not found")
 		return
 	}
-	// The daemon renews the server-side lease of the task it was handed: the
-	// dispatcher's Server.PrepareLease is what actually renews against the
-	// multica server (S7 + C4). This endpoint is the daemon's S-7 face.
+	// The daemon renews the server-side lease of the task it was handed: this
+	// must reach multica as C4, or the prepare lease lapses and the server
+	// rejects the later start with runtime_offline. Forward to multica when a
+	// seam is wired; otherwise answer ok locally (test fallback).
+	tid := r.PathValue("tid")
+	if s.lease != nil {
+		ready, err := s.lease(ctxFor(r), cred.WorkspaceID, tid)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, "prepare-lease forward failed")
+			return
+		}
+		if !ready {
+			writeError(w, http.StatusBadRequest, "task not renewable")
+			return
+		}
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
+
+// ctxFor returns the request context.
+func ctxFor(r *http.Request) context.Context { return r.Context() }
 
 // ---- S2 repos ----
 

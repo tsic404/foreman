@@ -372,7 +372,11 @@ func (d *Dispatcher) Deliver(ctx context.Context, workspaceID, daemonID, runtime
 		d.log.Warn("task.payload_missing", "task_id", e.TaskID, "daemon_id", e.DaemonID)
 		return Delivery{}, nil
 	}
-	out, err := rewriteRuntime(e.Payload, e.RuntimeID)
+	// The daemon expects the payload's runtime_id to name ITS OWN runtime id
+	// (that is what it matches against its registration). Foreman rewrites the
+	// daemon's start/report back to the server's real id at S8. Using the real
+	// id here makes the daemon reject the task as "not my runtime".
+	out, err := rewriteRuntime(e.Payload, e.DaemonRuntimeID)
 	if err != nil {
 		return Delivery{}, fmt.Errorf("rewrite runtime for task %s: %w", e.TaskID, err)
 	}
@@ -520,7 +524,10 @@ func (d *Dispatcher) convergeOne(ctx context.Context, e registry.TaskEntry) {
 		return
 	}
 	// Lease renewal for a claimed-but-unstarted task (§10: renew every ≤20s).
-	if e.StartedAt.IsZero() && e.State == registry.StateDaemonRegistered && e.RuntimeID != "" {
+	// Covers pending, daemon-registered and delivering — the daemon renews via
+	// S7 while it holds the task, and this is the Foreman-side fallback.
+	if e.StartedAt.IsZero() && e.RuntimeID != "" &&
+		(e.State == registry.StatePending || e.State == registry.StateDaemonRegistered || e.State == registry.StateDelivering) {
 		ready, err := d.server.PrepareLease(ctx, e.RuntimeID, e.TaskID)
 		switch {
 		case err == nil && ready:
