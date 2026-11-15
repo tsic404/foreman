@@ -106,6 +106,22 @@ claim interval, which is functionally equivalent at the cost of latency — and
 the model-catalog probe (`C21`), since the resident daemon resolves its models
 through its own agent CLI discovery.
 
+### Cancellation has no down-channel
+
+A v1 task was a Job: cancelling it meant deleting the Job, which killed the
+pod. A v2 task runs inside an already-resident daemon, and the daemon protocol
+has no server-to-daemon cancel signal — no push frame, no claim-time flag, and
+the daemon never polls task status while a run is in flight. S-15
+`cancel-ack` only travels daemon → server, and the daemon only sends it when
+something inside its own run decided to stop.
+
+So a task cancelled on the server keeps running on the resident daemon and
+reports its own terminal state (`complete`), while multica has already settled
+it as `cancelled`. Foreman forwards what the daemon sends; it cannot invent a
+cancel the daemon has no way to receive. Closing this needs a protocol
+extension upstream (a cancel frame or a claim-time cancellation field) — it is
+not fixable inside Foreman without patching the daemon CLI.
+
 ## Status
 
 Early development, but the v2 path is proven end to end. `deploy/test-real-daemon.sh`
