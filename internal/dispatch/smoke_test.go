@@ -258,3 +258,76 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(v)
 }
+
+// TestSessionAffinityWinsOverRegistrationOrder pins the affinity branch of
+// pickDaemon. The claim carries a prior_session_id, and only the daemon that
+// already holds that session must receive the task — even though the other
+// daemon registered first and would win on registration order alone.
+func TestSessionAffinityWinsOverRegistrationOrder(t *testing.T) {
+	stub := &stubServer{}
+	server := httptest.NewServer(stub.handler())
+	defer server.Close()
+
+	reg := registry.New()
+	client := proxy.NewClient(proxy.Config{
+		ServerURL: server.URL, WorkspaceID: "ws-1", DaemonID: "foreman-ws-1", Version: "test",
+	}, "mul_test")
+	disp := dispatch.New(dispatch.Config{}, reg, client, nil)
+
+	// "worker-first" registers first, so plain registration order would pick it.
+	for _, id := range []string{"worker-first", "worker-holder"} {
+		reg.PutRuntime(registry.Runtime{
+			RuntimeID: id, DaemonID: id, WorkspaceID: "ws-1", Provider: "omp",
+			Online: true, RegisteredAt: reg.Now(),
+		})
+	}
+	reg.LearnSession("ws-1", "sess-affinity", "worker-holder")
+
+	claim, _ := json.Marshal(map[string]any{
+		"id": "task-affinity", "workspace_id": "ws-1", "agent_id": "agent-1",
+		"prior_session_id": "sess-affinity",
+	})
+	if err := disp.OnClaim(context.Background(), "ws-1", claim); err != nil {
+		t.Fatalf("on claim: %v", err)
+	}
+	e, ok := reg.Get("task-affinity")
+	if !ok {
+		t.Fatal("task not registered")
+	}
+	if e.DaemonID != "worker-holder" {
+		t.Fatalf("bound to %q, want worker-holder (the session holder)", e.DaemonID)
+	}
+}
+
+// TestPickDaemonFallsBackWithoutSession shows the other side of the same
+// branch: with no prior session the daemon that registered first wins.
+func TestPickDaemonFallsBackWithoutSession(t *testing.T) {
+	stub := &stubServer{}
+	server := httptest.NewServer(stub.handler())
+	defer server.Close()
+
+	reg := registry.New()
+	client := proxy.NewClient(proxy.Config{
+		ServerURL: server.URL, WorkspaceID: "ws-1", DaemonID: "foreman-ws-1", Version: "test",
+	}, "mul_test")
+	disp := dispatch.New(dispatch.Config{}, reg, client, nil)
+
+	for _, id := range []string{"worker-first", "worker-second"} {
+		reg.PutRuntime(registry.Runtime{
+			RuntimeID: id, DaemonID: id, WorkspaceID: "ws-1", Provider: "omp",
+			Online: true, RegisteredAt: reg.Now(),
+		})
+	}
+
+	claim, _ := json.Marshal(map[string]any{"id": "task-plain", "workspace_id": "ws-1"})
+	if err := disp.OnClaim(context.Background(), "ws-1", claim); err != nil {
+		t.Fatalf("on claim: %v", err)
+	}
+	e, ok := reg.Get("task-plain")
+	if !ok {
+		t.Fatal("task not registered")
+	}
+	if e.DaemonID != "worker-first" {
+		t.Fatalf("bound to %q, want worker-first (registration order)", e.DaemonID)
+	}
+}
