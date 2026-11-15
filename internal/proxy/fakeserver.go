@@ -588,10 +588,27 @@ func (s *FakeServer) reportHandler(ep dispatch.Endpoint) http.HandlerFunc {
 		// Reports address one task by id. Looking up "the daemon's current
 		// task" instead would break as soon as a daemon holds more than one:
 		// the id under report need not be the one the index yields next.
+		//
+		// A missing entry is not a reason to drop the report. Foreman's
+		// registry is in-memory, so a Foreman restart loses every binding while
+		// the daemons keep running their tasks; refusing their reports would
+		// strand those tasks on the server forever (the daemon retries a
+		// rejected terminal report indefinitely). The report is self-describing
+		// — task id plus the daemon's own credential — which is all the forward
+		// needs, so an unbound report is forwarded rather than rejected.
 		e, known := s.reg.GetInWorkspace(cred.WorkspaceID, tid)
-		if !known || e.DaemonID != cred.DaemonID {
+		if known && e.DaemonID != cred.DaemonID {
 			writeError(w, http.StatusNotFound, "task not found")
 			return
+		}
+		if !known {
+			e = registry.TaskEntry{
+				TaskID:      tid,
+				WorkspaceID: cred.WorkspaceID,
+				DaemonID:    cred.DaemonID,
+			}
+			s.log.Debug("report for unbound task", "task_id", tid, "daemon_id", cred.DaemonID,
+				"endpoint", string(ep))
 		}
 		body, ok := s.readBody(w, r)
 		if !ok {
