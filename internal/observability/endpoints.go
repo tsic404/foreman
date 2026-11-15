@@ -238,7 +238,6 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, cfg OpsConfig) *OpsHandler
 	return handler
 }
 
-
 // opsScope is the workspace dimension an ops request resolves to: either the
 // id, or the refusal the handler answers with (status 0 = resolved).
 type opsScope struct {

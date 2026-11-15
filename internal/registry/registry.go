@@ -27,11 +27,11 @@ const doneRetention = 24 * time.Hour
 
 // Registry is the process-local task index plus the daemon table.
 type Registry struct {
-	mu       sync.RWMutex
-	tasks    map[string]TaskEntry
-	byDaemon map[string]string   // daemonID → taskID (one task per daemon at a time)
-	done     map[string]time.Time // taskID → verdict instant
-	runtimes map[string]Runtime
+	mu              sync.RWMutex
+	tasks           map[string]TaskEntry
+	byDaemon        map[string]string    // daemonID → taskID (one task per daemon at a time)
+	done            map[string]time.Time // taskID → verdict instant
+	runtimes        map[string]Runtime
 	byRuntimeDaemon map[string]string // runtimeID → daemonID
 
 	now func() time.Time

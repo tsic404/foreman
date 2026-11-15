@@ -30,7 +30,7 @@ import (
 var version = "dev"
 
 const (
-	shutdownTimeout  = 20 * time.Second
+	shutdownTimeout   = 20 * time.Second
 	readHeaderTimeout = 10 * time.Second
 )
 
@@ -140,12 +140,33 @@ func run() error {
 			continue
 		}
 		d := dispatch.New(dispatch.Config{
-			BootTimeout:     0, // configured via env below
+			BootTimeout:       0, // configured via env below
 			ReconcileInterval: 30 * time.Second,
-		}, reg, client, metrics, dispatch.WithLogger(baseLog))
+		}, reg, client, metrics,
+			dispatch.WithLogger(baseLog),
+			dispatch.WithRealRuntimeID(func(daemonID string) (string, bool) {
+				refs := client.RuntimeRefs()
+				// The server rewrites a runtime's display name (e.g. to the
+				// device name), so the declared name is not the join key. Match
+				// on the provider instead: v2 declares exactly one omp runtime
+				// per daemon, so the single matching ref is that daemon's.
+				var match string
+				for _, ref := range refs {
+					if ref.ID == "" {
+						continue
+					}
+					if match != "" && match != ref.ID {
+						return "", false // ambiguous: more than one candidate
+					}
+					match = ref.ID
+				}
+				if match == "" {
+					return "", false
+				}
+				return match, true
+			}))
 		dispatchers[wsID] = d
 	}
-
 	// The daemon face: long-lived daemons register, heartbeat and claim tasks.
 	// A daemon's registration changes the runtime set Foreman declares to the
 	// server, so the hook re-derives it per workspace; the claim loop's
@@ -169,7 +190,18 @@ func run() error {
 	}
 	fakeServer := proxy.NewFakeServer(daemonCreds, reg, dispatcherSet(dispatchers),
 		proxy.WithServerMetrics(metrics), proxy.WithServerLogger(baseLog),
-		proxy.WithDaemonChangeHook(redeclare))
+		proxy.WithDaemonChangeHook(redeclare),
+		proxy.WithSkillResolver(func(ctx context.Context, taskID string, body []byte) (int, []byte, error) {
+			e, ok := reg.Get(taskID)
+			if !ok {
+				return 0, nil, fmt.Errorf("no entry for task %s", taskID)
+			}
+			client, _ := clients.For(e.WorkspaceID)
+			if client == nil {
+				return 0, nil, fmt.Errorf("no client for task %s", taskID)
+			}
+			return client.ResolveSkillBundles(ctx, taskID, body)
+		}))
 
 	// Capacity: how many tasks Foreman may claim now. v2 claims up to the
 	// number of currently idle daemons across the workspaces — the number of
@@ -272,8 +304,8 @@ func run() error {
 		Drain: func(ctx context.Context) {
 			_ = jobServer.Shutdown(ctx)
 		},
-		Wait:  func(ctx context.Context) { supervisor.Wait(ctx) },
-		Log:   log,
+		Wait: func(ctx context.Context) { supervisor.Wait(ctx) },
+		Log:  log,
 	})
 	if err := supervisor.Failure(); err != nil {
 		return err

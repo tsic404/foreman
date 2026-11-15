@@ -8,11 +8,11 @@ import "time"
 // heartbeats to stay online; the dispatcher assigns tasks to the best online
 // daemon of the task's runtime.
 type Runtime struct {
-	RuntimeID string // the daemon's self-chosen runtime id (stable across tasks)
-	DaemonID  string // the daemon's identity (its token subject)
-	Provider  string // runtime type the daemon serves (e.g. "omp")
-	ProfileID string // runtime profile id ("" for builtin)
-	Name      string // display name
+	RuntimeID   string // the daemon's self-chosen runtime id (stable across tasks)
+	DaemonID    string // the daemon's identity (its token subject)
+	Provider    string // runtime type the daemon serves (e.g. "omp")
+	ProfileID   string // runtime profile id ("" for builtin)
+	Name        string // display name
 	WorkspaceID string
 
 	Online          bool

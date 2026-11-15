@@ -36,12 +36,12 @@ type ClaimLoop struct {
 // NewClaimLoop builds the loop. capacity returns the free task capacity.
 func NewClaimLoop(cfg Config, client *Client, claim Claimer, capacity func() int) *ClaimLoop {
 	return &ClaimLoop{
-		cfg:     cfg,
-		client:  client,
-		claim:   claim,
+		cfg:      cfg,
+		client:   client,
+		claim:    claim,
 		Capacity: capacity,
-		log:     slog.Default().With("component", "claim-loop"),
-		backoff: newBackoff(),
+		log:      slog.Default().With("component", "claim-loop"),
+		backoff:  newBackoff(),
 	}
 }
 

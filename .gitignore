@@ -3,3 +3,6 @@
 # Per-platform binaries staged as the image build context (make build-*-image)
 # and the CI release record.
 /dist/
+
+# Local test stack secrets
+deploy/.env

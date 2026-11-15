@@ -297,6 +297,38 @@ func (c *Client) Register(ctx context.Context) error {
 	return nil
 }
 
+// Heartbeat is C2: it keeps one real runtime online on the server. Without it
+// the server's runtime row lapses to offline and dispatch is refused
+// ("agent runtime is offline at dispatch time"). The body names the runtime id
+// the server assigned at C1.
+func (c *Client) Heartbeat(ctx context.Context, runtimeID string) error {
+	body, err := json.Marshal(map[string]any{"runtime_id": runtimeID, "supports_batch_import": true})
+	if err != nil {
+		return err
+	}
+	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodPost, "/api/daemon/heartbeat", body)
+	if err != nil {
+		return fmt.Errorf("heartbeat: %w", err)
+	}
+	if code < 200 || code >= 300 {
+		return fmt.Errorf("heartbeat: %w", &StatusError{Code: code, Body: raw})
+	}
+	return nil
+}
+
+// ResolveSkillBundles is C19: forwards the daemon's skill-bundle resolve body
+// to the server (S26) with Foreman's credential and the real runtime id the
+// server assigned, not the daemon's self-chosen id.
+func (c *Client) ResolveSkillBundles(ctx context.Context, taskID string, body []byte) (int, []byte, error) {
+	ids := c.RuntimeIDs()
+	if len(ids) == 0 {
+		return 0, nil, errors.New("skill bundles: no real runtime registered")
+	}
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/skill-bundles/resolve",
+		url.PathEscape(ids[0]), url.PathEscape(taskID))
+	return c.doOnce(ctx, c.ctrl, http.MethodPost, path, body)
+}
+
 // ClaimTasks is C3 over the declared runtime set.
 func (c *Client) ClaimTasks(ctx context.Context, maxTasks int) ([]json.RawMessage, error) {
 	if maxTasks < 1 {

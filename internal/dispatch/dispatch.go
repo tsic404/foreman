@@ -146,6 +146,15 @@ type Dispatcher struct {
 
 	// mu guards the last-claim bookkeeping that is not per-task.
 	mu sync.Mutex
+
+	// realRuntimeID maps a registered daemon id to the multica server's runtime
+	// id (from its C1 answer). Nil keeps the daemon's own id.
+	realRuntimeID func(daemonID string) (string, bool)
+}
+
+// WithRealRuntimeID wires the daemon→server-runtime-id mapping.
+func WithRealRuntimeID(fn func(daemonID string) (string, bool)) Option {
+	return func(d *Dispatcher) { d.realRuntimeID = fn }
 }
 
 // Option customizes a Dispatcher.
@@ -189,10 +198,10 @@ func New(cfg Config, reg *registry.Registry, server Server, metrics Metrics, opt
 // claimHead is the tolerant read of a claim payload: only the identity and the
 // affinity/scheduling inputs.
 type claimHead struct {
-	ID             string `json:"id"`
-	WorkspaceID    string `json:"workspace_id"`
-	AgentID        string `json:"agent_id"`
-	IssueID        string `json:"issue_id"`
+	ID              string `json:"id"`
+	WorkspaceID     string `json:"workspace_id"`
+	AgentID         string `json:"agent_id"`
+	IssueID         string `json:"issue_id"`
 	IssueIdentifier string `json:"issue_identifier"`
 	AutopilotRunID  string `json:"autopilot_run_id"`
 	ChatSessionID   string `json:"chat_session_id"`
@@ -268,7 +277,17 @@ func (d *Dispatcher) OnClaim(ctx context.Context, workspaceID string, task json.
 		return ErrNoDaemon
 	}
 	e.DaemonID = rt.DaemonID
+	e.DaemonRuntimeID = rt.RuntimeID
+	// The delivery payload and S8 start carry the multica server's runtime id
+	// (from the C1 answer), not the daemon's self-chosen id — the server
+	// rejects a start naming an id it never registered. The daemon's own id is
+	// kept separately for its S6 claim to match.
 	e.RuntimeID = rt.RuntimeID
+	if d.realRuntimeID != nil {
+		if real, ok := d.realRuntimeID(rt.DaemonID); ok {
+			e.RuntimeID = real
+		}
+	}
 	e.State = registry.StateDaemonRegistered
 	if err := d.reg.Put(e); err != nil {
 		return fmt.Errorf("register task %s: %w", head.ID, err)
@@ -336,7 +355,10 @@ func (d *Dispatcher) Deliver(ctx context.Context, workspaceID, daemonID, runtime
 	if !ok {
 		return Delivery{}, fmt.Errorf("%w: %s", ErrUnknownDaemon, daemonID)
 	}
-	if runtimeID != "" && e.RuntimeID != "" && runtimeID != e.RuntimeID {
+	// The daemon's S6 claim names its own runtime id (DaemonRuntimeID), not the
+	// server-assigned id Foreman rewrites into the payload. Accept the
+	// daemon-side id; a claim naming neither is refused.
+	if runtimeID != "" && e.DaemonRuntimeID != "" && runtimeID != e.DaemonRuntimeID {
 		return Delivery{}, fmt.Errorf("%w: %s", ErrRuntimeMismatch, runtimeID)
 	}
 	unlock := d.taskMu.Lock(e.TaskID)
@@ -550,8 +572,8 @@ func (d *Dispatcher) convergeStatus(ctx context.Context, e registry.TaskEntry) {
 // claimID tolerantly reads the id of a claim payload whose full parse failed.
 func claimID(task json.RawMessage) string {
 	var probe struct {
-		ID        string `json:"id"`
-		TaskID    string `json:"task_id"`
+		ID     string `json:"id"`
+		TaskID string `json:"task_id"`
 	}
 	if err := json.Unmarshal(task, &probe); err != nil {
 		return ""
@@ -631,12 +653,12 @@ func (k *keyedMutex) Lock(key string) func() {
 
 type noopMetrics struct{}
 
-func (noopMetrics) TaskClaimed()          {}
-func (noopMetrics) TaskTerminal(string)   {}
-func (noopMetrics) InflightJobs(int)      {}
-func (noopMetrics) DuplicateDispatch()    {}
-func (noopMetrics) CredReclaimed(string, float64) {}
-func (noopMetrics) ClaimError(string)     {}
+func (noopMetrics) TaskClaimed()                                          {}
+func (noopMetrics) TaskTerminal(string)                                   {}
+func (noopMetrics) InflightJobs(int)                                      {}
+func (noopMetrics) DuplicateDispatch()                                    {}
+func (noopMetrics) CredReclaimed(string, float64)                         {}
+func (noopMetrics) ClaimError(string)                                     {}
 func (noopMetrics) TokenUsage(string, string, int64, int64, int64, int64) {}
 
 func orNoopMetrics(m Metrics) Metrics {

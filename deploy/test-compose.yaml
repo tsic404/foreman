@@ -1,0 +1,98 @@
+# Local multica stack for testing Foreman v2, mirroring the K8s test cluster
+# (testinfra/test-multica/deploy.yaml) in plain podman/docker compose. The
+# version anchor is absolute: v0.6.1 = multica@2ea01ae4.
+#
+# Services:
+#   postgres   pgvector/pgvector:pg17       the persistence layer
+#   backend    multica-backend:v0.6.1        the multica server (migrations on boot)
+#   web        multica-web:v0.6.1            the Next.js frontend
+#   proxy      nginx:1.27-alpine             the entry origin (web UI + /ws)
+#
+# Foreman v2 and a resident daemon run as processes on the host, dialing the
+# backend's published port (30080) and the daemon face of the foreman process.
+#
+# Usage:
+#   podman-compose -f deploy/test-compose.yaml up -d
+#   bash deploy/test-multica-boot.sh        # mint a PAT, wire foreman + a daemon
+#
+# The login/API is exercised over localhost:30080; the web UI at localhost:30300.
+
+name: foreman-test-multica
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg17
+    environment:
+      POSTGRES_DB: multica
+      POSTGRES_USER: multica
+      POSTGRES_PASSWORD: test-oezogxxx
+      PGDATA: /var/lib/postgresql/data/pgdata
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U multica -d multica"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+    networks: [mtest]
+
+  backend:
+    image: ghcr.io/multica-ai/multica-backend:v0.6.1
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      - ./.env
+    environment:
+      PORT: "8080"
+      APP_ENV: development
+      ALLOW_SIGNUP: "true"
+      ANALYTICS_DISABLED: "true"
+      DO_NOT_TRACK: "1"
+      MULTICA_DATABASE_CONNECT_TIMEOUT: 5s
+      MULTICA_DATABASE_STARTUP_TIMEOUT: 3m
+      MULTICA_APP_URL: http://localhost:30300
+      FRONTEND_ORIGIN: http://localhost:30300
+      CORS_ALLOWED_ORIGINS: http://localhost:30300
+      MULTICA_DEV_VERIFICATION_CODE: "888888"
+      DATABASE_URL: postgres://multica:test-oezogxxx@postgres:5432/multica?sslmode=disable
+    volumes:
+      - backend-uploads:/app/data/uploads
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/healthz || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 30
+      start_period: 20s
+    ports:
+      - "30080:8080"
+    networks: [mtest]
+
+  web:
+    image: ghcr.io/multica-ai/multica-web:v0.6.1
+    depends_on:
+      backend:
+        condition: service_healthy
+    environment:
+      HOSTNAME: 0.0.0.0
+      PORT: "3000"
+      REMOTE_API_URL: http://backend:8080
+    networks: [mtest]
+
+  proxy:
+    image: nginx:1.27-alpine
+    depends_on:
+      backend:
+        condition: service_healthy
+    ports:
+      - "30300:80"
+    volumes:
+      - ./nginx-default.conf:/etc/nginx/conf.d/default.conf:ro
+    networks: [mtest]
+
+volumes:
+  pgdata:
+  backend-uploads:
+
+networks:
+  mtest:

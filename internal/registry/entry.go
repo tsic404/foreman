@@ -52,26 +52,27 @@ func (e TaskEntry) IsTerminal() bool { return e.State == StateTerminal }
 // dispatcher forward. Payload is the claim body (never projected, never
 // persisted beyond the process); it is the daemon-side delivery face.
 type TaskEntry struct {
-	TaskID          string    `json:"task_id"`
-	AgentID         string    `json:"agent_id"`
-	IssueID         string    `json:"issue_id"`
-	IssueIdentifier string    `json:"issue_identifier"`
-	AutopilotRunID  string    `json:"autopilot_run_id"`
-	ChatSessionID   string    `json:"chat_session_id"`
-	WorkspaceID     string    `json:"workspace_id"`
-	DaemonID        string    `json:"daemon_id"`        // the registered daemon the task was handed to
-	RuntimeID       string    `json:"runtime_id"`       // the daemon's declared runtime id
-	State           State     `json:"state"`
-	Result          Result    `json:"result"`
-	FailureReason   string    `json:"failure_reason"`
-	Attempt         int       `json:"attempt"`
-	ClaimedAt       time.Time `json:"claimed_at"`
-	AssignedAt      time.Time `json:"assigned_at"`      // dispatch commit instant (was job_created_at / delivered_at)
-	StartedAt       time.Time `json:"started_at"`
-	CompletedAt     time.Time `json:"completed_at"`     // verdict instant
-	LeaseKeepUntil  time.Time `json:"lease_keep_until"`
-	TokenHash       string    `json:"-"`                // the dispatched daemon credential's digest (ADR-017)
-	Payload         json.RawMessage `json:"-"`          // the claim body, handed to the daemon at delivery
+	TaskID          string          `json:"task_id"`
+	AgentID         string          `json:"agent_id"`
+	IssueID         string          `json:"issue_id"`
+	IssueIdentifier string          `json:"issue_identifier"`
+	AutopilotRunID  string          `json:"autopilot_run_id"`
+	ChatSessionID   string          `json:"chat_session_id"`
+	WorkspaceID     string          `json:"workspace_id"`
+	DaemonID        string          `json:"daemon_id"`         // the registered daemon the task was handed to
+	DaemonRuntimeID string          `json:"daemon_runtime_id"` // the daemon's own runtime id, what its S6 claim names
+	RuntimeID       string          `json:"runtime_id"`        // the multica server's runtime id (from the C1 answer)
+	State           State           `json:"state"`
+	Result          Result          `json:"result"`
+	FailureReason   string          `json:"failure_reason"`
+	Attempt         int             `json:"attempt"`
+	ClaimedAt       time.Time       `json:"claimed_at"`
+	AssignedAt      time.Time       `json:"assigned_at"` // dispatch commit instant (was job_created_at / delivered_at)
+	StartedAt       time.Time       `json:"started_at"`
+	CompletedAt     time.Time       `json:"completed_at"` // verdict instant
+	LeaseKeepUntil  time.Time       `json:"lease_keep_until"`
+	TokenHash       string          `json:"-"` // the dispatched daemon credential's digest (ADR-017)
+	Payload         json.RawMessage `json:"-"` // the claim body, handed to the daemon at delivery
 
 	// PriorSessionID is the claim payload's prior_session_id; a long-lived
 	// daemon uses it to resume the session it already holds, so Foreman

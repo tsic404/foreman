@@ -19,7 +19,7 @@ import (
 )
 
 // Dispatcher is the fake server's scheduling surface: delivery, report
-// handlinghare, task-vanish settlement.
+// handling, task-vanish settlement.
 type Dispatcher interface {
 	Deliver(ctx context.Context, workspaceID, daemonID, runtimeID string, maxTasks int) (dispatch.Delivery, error)
 	OnReport(ctx context.Context, ep dispatch.Endpoint, e registry.TaskEntry, body []byte, sessionID string) (int, []byte, error)
@@ -27,16 +27,26 @@ type Dispatcher interface {
 	OnBootTimeout(ctx context.Context, taskID string) error
 }
 
+// SkillResolver forwards the daemon's S-26 skill-bundle resolve to the real
+// multica server with Foreman's credential (C19). Nil answers an empty set.
+type SkillResolver func(ctx context.Context, taskID string, body []byte) (int, []byte, error)
+
+// WithSkillResolver wires the S-26 forward seam.
+func WithSkillResolver(fn SkillResolver) ServerOption {
+	return func(s *FakeServer) { s.skills = fn }
+}
+
 // FakeServer is the D→F face: it speaks the official server protocol to the
 // registered daemons. ServeHTTP applies two rules — a configured daemon
 // credential to the local daemon face, anything else 401.
 type FakeServer struct {
-	creds  *daemonauth.Store
-	reg    *registry.Registry
-	disp   Dispatcher
+	creds   *daemonauth.Store
+	reg     *registry.Registry
+	disp    Dispatcher
 	metrics Metrics
-	log    *slog.Logger
-	mux    *http.ServeMux
+	log     *slog.Logger
+	mux     *http.ServeMux
+	skills  SkillResolver
 	// onDaemonChanged fires after a daemon registers or deregisters, so the
 	// assembly can re-derive its C1 declaration from the registry and have the
 	// claim loop tell the server about the new runtime set.
@@ -99,23 +109,27 @@ func (s *FakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 func (s *FakeServer) routes() {
 	m := s.mux
 	handle := func(pattern string, h http.HandlerFunc) { m.Handle(pattern, h) }
-	handle("GET /api/daemon/workspaces", s.handleWorkspaces)                  // S1
-	handle("GET /api/workspaces", s.handleWorkspaces)                         // S28
-	handle("POST /api/daemon/register", s.handleRegister)                     // S4
-	handle("POST /api/daemon/heartbeat", s.handleHeartbeat)                   // S5
-	handle("POST /api/daemon/deregister", s.handleDeregister)                 // S19
-	handle("POST /api/daemon/tasks/claim", s.handleClaim)                     // S6
-	handle("GET /api/daemon/tasks/{tid}/status", s.handleTaskStatus)          // S9
-	handle("POST /api/daemon/tasks/{tid}/start", s.reportHandler(dispatch.EPStart))     // S8
-	handle("POST /api/daemon/tasks/{tid}/progress", s.reportHandler(dispatch.EPProgress))   // S10
-	handle("POST /api/daemon/tasks/{tid}/messages", s.reportHandler(dispatch.EPMessages))   // S11
-	handle("POST /api/daemon/tasks/{tid}/usage", s.reportHandler(dispatch.EPUsage))         // S12
-	handle("POST /api/daemon/tasks/{tid}/complete", s.reportHandler(dispatch.EPComplete))   // S13
-	handle("POST /api/daemon/tasks/{tid}/fail", s.reportHandler(dispatch.EPFail))           // S14
-	handle("POST /api/daemon/tasks/{tid}/cancel-ack", s.reportHandler(dispatch.EPCancelAck)) // S15
-	handle("POST /api/daemon/tasks/{tid}/session", s.reportHandler(dispatch.EPSession))     // S16
+	handle("GET /api/daemon/workspaces", s.handleWorkspaces)                                              // S1
+	handle("GET /api/workspaces", s.handleWorkspaces)                                                     // S28
+	handle("POST /api/daemon/register", s.handleRegister)                                                 // S4
+	handle("POST /api/daemon/heartbeat", s.handleHeartbeat)                                               // S5
+	handle("POST /api/daemon/deregister", s.handleDeregister)                                             // S19
+	handle("POST /api/daemon/tasks/claim", s.handleClaim)                                                 // S6
+	handle("GET /api/daemon/tasks/{tid}/status", s.handleTaskStatus)                                      // S9
+	handle("POST /api/daemon/tasks/{tid}/start", s.reportHandler(dispatch.EPStart))                       // S8
+	handle("POST /api/daemon/tasks/{tid}/progress", s.reportHandler(dispatch.EPProgress))                 // S10
+	handle("POST /api/daemon/tasks/{tid}/messages", s.reportHandler(dispatch.EPMessages))                 // S11
+	handle("POST /api/daemon/tasks/{tid}/usage", s.reportHandler(dispatch.EPUsage))                       // S12
+	handle("POST /api/daemon/tasks/{tid}/complete", s.reportHandler(dispatch.EPComplete))                 // S13
+	handle("POST /api/daemon/tasks/{tid}/fail", s.reportHandler(dispatch.EPFail))                         // S14
+	handle("POST /api/daemon/tasks/{tid}/cancel-ack", s.reportHandler(dispatch.EPCancelAck))              // S15
+	handle("POST /api/daemon/tasks/{tid}/session", s.reportHandler(dispatch.EPSession))                   // S16
 	handle("POST /api/daemon/tasks/{tid}/wait-local-directory", s.reportHandler(dispatch.EPWaitLocalDir)) // S17
-	handle("POST /api/daemon/runtimes/{rid}/tasks/{tid}/prepare-lease", s.handlePrepareLease) // S7
+	handle("POST /api/daemon/runtimes/{rid}/tasks/{tid}/prepare-lease", s.handlePrepareLease)             // S7
+	handle("GET /api/daemon/workspaces/{ws}/repos", s.handleRepos)                                        // S2
+	handle("GET /api/daemon/workspaces/{ws}/runtime-profiles", s.handleRuntimeProfiles)                   // S3
+	handle("POST /api/daemon/runtimes/{rid}/tasks/{tid}/skill-bundles/resolve", s.handleSkillBundles)     // S26
+	handle("POST /api/tokens/current/renew", s.handleTokenRenew)                                          // S24
 	// Everything else under /api/ with a daemon credential is not a local
 	// endpoint.
 	handle("/api/", s.handleNotFound)
@@ -154,8 +168,8 @@ func (s *FakeServer) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 // ---- S4 register ----
 
 type daemonRegisterRequest struct {
-	DaemonID    string          `json:"daemon_id"`
-	WorkspaceID string          `json:"workspace_id"`
+	DaemonID    string            `json:"daemon_id"`
+	WorkspaceID string            `json:"workspace_id"`
 	Runtimes    []registerRuntime `json:"runtimes"`
 }
 
@@ -198,13 +212,13 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// target it and the server's real-runtime id stays alive.
 	runtimeID := req.DaemonID // the daemon's identity is its runtime's identity
 	rt := registry.Runtime{
-		RuntimeID:   runtimeID,
-		DaemonID:    cred.DaemonID,
-		Provider:    req.Runtimes[0].Type,
-		ProfileID:   req.Runtimes[0].ProfileID,
-		Name:        req.Runtimes[0].Name,
-		WorkspaceID: cred.WorkspaceID,
-		Online:      true,
+		RuntimeID:    runtimeID,
+		DaemonID:     cred.DaemonID,
+		Provider:     req.Runtimes[0].Type,
+		ProfileID:    req.Runtimes[0].ProfileID,
+		Name:         req.Runtimes[0].Name,
+		WorkspaceID:  cred.WorkspaceID,
+		Online:       true,
 		RegisteredAt: s.reg.Now(),
 	}
 	s.reg.PutRuntime(rt)
@@ -220,8 +234,8 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		answer["profile_id"] = rt.ProfileID
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"runtimes": []any{answer},
-		"repos":    []any{},
+		"runtimes":      []any{answer},
+		"repos":         []any{},
 		"repos_version": "",
 	})
 	s.log.Info("daemon.registered",
@@ -340,6 +354,71 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 	// dispatcher's Server.PrepareLease is what actually renews against the
 	// multica server (S7 + C4). This endpoint is the daemon's S-7 face.
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// ---- S2 repos ----
+
+// handleRepos answers S-2 with an empty repo set: v2 carries no node-local
+// repository cache (the resident daemon owns its workspace state), so there
+// is nothing to report.
+func (s *FakeServer) handleRepos(w http.ResponseWriter, r *http.Request) {
+	cred, ok := s.credential(w, r)
+	if !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"repos": []any{}, "repos_version": "", "workspace_id": cred.WorkspaceID})
+}
+
+// ---- S3 runtime profiles ----
+
+// handleRuntimeProfiles answers S-3 with an empty profile list: the daemon
+// runs the runtime it registered, and v2 has no server-side profile set to
+// serve.
+func (s *FakeServer) handleRuntimeProfiles(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.credential(w, r); !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, []any{})
+}
+
+// ---- S24 token renew ----
+
+// handleTokenRenew answers S-24 locally: the daemon credential is static, so
+// there is nothing to renew against.
+func (s *FakeServer) handleTokenRenew(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.credential(w, r); !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"expires_at": time.Now().Add(24 * time.Hour).UTC().Format(time.RFC3339),
+		"renewed":    true,
+	})
+}
+
+// ---- S26 skill bundles ----
+
+// handleSkillBundles answers S-26 with an empty bundle set. The resident
+// daemon resolves skills itself from its own cache; v2 has no skill-bundle
+// proxy, so an empty set is the honest answer (a daemon that needs a bundle
+// Foreman does not carry falls back to its own resolution).
+func (s *FakeServer) handleSkillBundles(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.credential(w, r); !ok {
+		return
+	}
+	if s.skills == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"skills": []any{}})
+		return
+	}
+	body, ok := s.readBody(w, r)
+	if !ok {
+		return
+	}
+	code, resp, err := s.skills(r.Context(), r.PathValue("tid"), body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "skill bundle resolve failed")
+		return
+	}
+	writeRaw(w, code, resp)
 }
 
 // ---- S9 status ----
