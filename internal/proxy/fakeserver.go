@@ -10,6 +10,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -230,39 +231,54 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "register requires at least one runtime")
 		return
 	}
-	// A long-lived daemon registers its runtime set once and keeps it across
-	// tasks. Its runtime id is the self-chosen one: stable, so Foreman can
-	// target it and the server's real-runtime id stays alive.
-	runtimeID := req.DaemonID // the daemon's identity is its runtime's identity
-	rt := registry.Runtime{
-		RuntimeID:    runtimeID,
-		DaemonID:     cred.DaemonID,
-		Provider:     req.Runtimes[0].Type,
-		ProfileID:    req.Runtimes[0].ProfileID,
-		Name:         req.Runtimes[0].Name,
-		WorkspaceID:  cred.WorkspaceID,
-		Online:       true,
-		RegisteredAt: s.reg.Now(),
+	// A long-lived daemon registers its whole runtime set once and keeps it
+	// across tasks. Each declared runtime gets its own registry row keyed by a
+	// stable per-runtime identity: the daemon's own id for the builtin runtime,
+	// and daemon-id/profile-id for a custom runtime profile. The server's real
+	// id is assigned later (C1 response), so the daemon's self-chosen id stays
+	// the targeting key Foreman uses on delivery (§runtime-id 双轨).
+	answer := make([]map[string]any, 0, len(req.Runtimes))
+	for i, decl := range req.Runtimes {
+		key := req.DaemonID
+		if i > 0 || decl.ProfileID != "" {
+			profile := decl.ProfileID
+			if profile == "" {
+				profile = "builtin-" + strconv.Itoa(i)
+			}
+			key = req.DaemonID + "/" + profile
+		}
+		rt := registry.Runtime{
+			RuntimeID:    key,
+			DaemonID:     cred.DaemonID,
+			Provider:     decl.Type,
+			ProfileID:    decl.ProfileID,
+			Name:         decl.Name,
+			WorkspaceID:  cred.WorkspaceID,
+			Online:       true,
+			RegisteredAt: s.reg.Now(),
+		}
+		s.reg.PutRuntime(rt)
+		entry := map[string]any{
+			"id":       key,
+			"name":     rt.Name,
+			"provider": rt.Provider,
+			"status":   "online",
+		}
+		if rt.ProfileID != "" {
+			entry["profile_id"] = rt.ProfileID
+		} else {
+			entry["profile_id"] = nil
+		}
+		answer = append(answer, entry)
 	}
-	s.reg.PutRuntime(rt)
 	s.notifyChanged()
-	answer := map[string]any{
-		"id":         runtimeID,
-		"name":       rt.Name,
-		"provider":   rt.Provider,
-		"status":     "online",
-		"profile_id": nil,
-	}
-	if rt.ProfileID != "" {
-		answer["profile_id"] = rt.ProfileID
-	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"runtimes":      []any{answer},
+		"runtimes":      answer,
 		"repos":         []any{},
 		"repos_version": "",
 	})
 	s.log.Info("daemon.registered",
-		"daemon_id", cred.DaemonID, "runtime_id", runtimeID, "workspace_id", cred.WorkspaceID,
+		"daemon_id", cred.DaemonID, "runtimes", len(answer), "workspace_id", cred.WorkspaceID,
 		"remote_addr", r.RemoteAddr)
 }
 

@@ -147,13 +147,13 @@ type Dispatcher struct {
 	// mu guards the last-claim bookkeeping that is not per-task.
 	mu sync.Mutex
 
-	// realRuntimeID maps a registered daemon id to the multica server's runtime
-	// id (from its C1 answer). Nil keeps the daemon's own id.
-	realRuntimeID func(daemonID string) (string, bool)
+	// realRuntimeID maps a daemon's runtime key (its self-chosen runtime id,
+	// unique per daemon runtime) to the multica server's runtime id (from its C1 answer). Nil keeps the daemon's own id.
+	realRuntimeID func(runtimeKey string) (string, bool)
 }
 
-// WithRealRuntimeID wires the daemon→server-runtime-id mapping.
-func WithRealRuntimeID(fn func(daemonID string) (string, bool)) Option {
+// WithRealRuntimeID wires the daemon-runtime→server-runtime-id mapping.
+func WithRealRuntimeID(fn func(runtimeKey string) (string, bool)) Option {
 	return func(d *Dispatcher) { d.realRuntimeID = fn }
 }
 
@@ -284,7 +284,7 @@ func (d *Dispatcher) OnClaim(ctx context.Context, workspaceID string, task json.
 	// kept separately for its S6 claim to match.
 	e.RuntimeID = rt.RuntimeID
 	if d.realRuntimeID != nil {
-		if real, ok := d.realRuntimeID(rt.DaemonID); ok {
+		if real, ok := d.realRuntimeID(rt.RuntimeID); ok {
 			e.RuntimeID = real
 		}
 	}

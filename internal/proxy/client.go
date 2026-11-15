@@ -144,6 +144,8 @@ type RuntimeRef struct {
 	Provider  string
 	ProfileID string
 	Name      string
+	// RuntimeKey is the daemon-side runtime id this ref was bound from.
+	RuntimeKey string
 }
 
 // Key is the identity key (provider \x00 profile id).
@@ -177,6 +179,11 @@ type DeclaredRuntime struct {
 	Type      string `json:"type"`
 	Version   string `json:"version"`
 	ProfileID string `json:"profile_id"`
+	// RuntimeKey is the daemon's own runtime id for this declaration (unique
+	// per daemon runtime). It never travels in the C1 payload — the server
+	// assigns the real id — but it keys the daemon→real-id mapping so a
+	// multi-runtime daemon resolves each task to the right server runtime.
+	RuntimeKey string `json:"-"`
 }
 
 // Option customizes a Client.
@@ -268,6 +275,7 @@ func (c *Client) Register(ctx context.Context) error {
 		payloads = append(payloads, runtimePayload{
 			Name: d.Name, Type: d.Type, Version: d.Version,
 			Status: "online", ProfileID: d.ProfileID,
+			RuntimeKey: d.RuntimeKey,
 		})
 	}
 	if len(payloads) == 0 {
@@ -543,6 +551,9 @@ type runtimePayload struct {
 	Version   string `json:"version"`
 	Status    string `json:"status"`
 	ProfileID string `json:"profile_id"`
+	// RuntimeKey is the daemon-side id; it keys the bind map and never hits
+	// the wire (the register body is built from the json-tagged fields).
+	RuntimeKey string `json:"-"`
 }
 
 type registerResponse struct {
@@ -557,38 +568,53 @@ type runtimeAnswer struct {
 	ProfileID *string `json:"profile_id"`
 }
 
-// bindRuntimes matches every declared runtime to exactly one answered row by
-// identity (provider, profile_id), preferring a name match and then the
-// smallest id (§2.3, ADR-043).
+// bindRuntimes matches every declared runtime to exactly one answered row.
+// The daemon's C1 answer carries one row per declared runtime in the same
+// order Foreman sent them, so the answer row is the primary join: consuming
+// each row once keeps two daemons that declare the same identity (same
+// provider and profile) from sharing one server runtime. Identity matching is
+// the fallback for a server that reorders its answer.
 func bindRuntimes(declared []runtimePayload, answers []runtimeAnswer) []RuntimeRef {
-	byIdentity := map[string][]runtimeAnswer{}
-	for _, a := range answers {
-		pid := ""
-		if a.ProfileID != nil {
-			pid = *a.ProfileID
-		}
-		key := a.Provider + "\x00" + pid
-		byIdentity[key] = append(byIdentity[key], a)
-	}
+	used := make([]bool, len(answers))
 	refs := make([]RuntimeRef, 0, len(declared))
-	for _, d := range declared {
-		key := d.Type + "\x00" + d.ProfileID
-		cands := byIdentity[key]
-		if len(cands) == 0 {
+	pickRow := func(i int, d runtimePayload, exactIndex bool) (int, bool) {
+		if exactIndex {
+			if i < len(answers) && !used[i] {
+				return i, true
+			}
+			return -1, false
+		}
+		best := -1
+		for j, a := range answers {
+			if used[j] {
+				continue
+			}
+			pid := ""
+			if a.ProfileID != nil {
+				pid = *a.ProfileID
+			}
+			if a.Provider != d.Type || pid != d.ProfileID {
+				continue
+			}
+			if best == -1 || (a.Name == d.Name && answers[best].Name != d.Name) || a.ID < answers[best].ID {
+				best = j
+			}
+		}
+		return best, best >= 0
+	}
+	for i, d := range declared {
+		j, ok := pickRow(i, d, true)
+		if !ok {
+			j, ok = pickRow(i, d, false)
+		}
+		if !ok {
 			continue
 		}
-		pick := cands[0]
-		for _, a := range cands {
-			if a.Name == d.Name {
-				pick = a
-				break
-			}
-			if a.ID < pick.ID {
-				pick = a
-			}
-		}
+		used[j] = true
+		a := answers[j]
 		refs = append(refs, RuntimeRef{
-			ID: pick.ID, Provider: d.Type, ProfileID: d.ProfileID, Name: d.Name,
+			ID: a.ID, Provider: d.Type, ProfileID: d.ProfileID, Name: d.Name,
+			RuntimeKey: d.RuntimeKey,
 		})
 	}
 	return refs

@@ -144,26 +144,18 @@ func run() error {
 			ReconcileInterval: 30 * time.Second,
 		}, reg, client, metrics,
 			dispatch.WithLogger(baseLog),
-			dispatch.WithRealRuntimeID(func(daemonID string) (string, bool) {
-				refs := client.RuntimeRefs()
+			dispatch.WithRealRuntimeID(func(runtimeKey string) (string, bool) {
 				// The server rewrites a runtime's display name (e.g. to the
-				// device name), so the declared name is not the join key. Match
-				// on the provider instead: v2 declares exactly one omp runtime
-				// per daemon, so the single matching ref is that daemon's.
-				var match string
-				for _, ref := range refs {
-					if ref.ID == "" {
-						continue
+				// device name), so names are not join keys. The daemon-side
+				// runtime key is: it is unique per daemon runtime and carried
+				// through C1's bind, so a multi-runtime daemon maps each task
+				// to exactly the server runtime it declared.
+				for _, ref := range client.RuntimeRefs() {
+					if ref.RuntimeKey == runtimeKey && ref.ID != "" {
+						return ref.ID, true
 					}
-					if match != "" && match != ref.ID {
-						return "", false // ambiguous: more than one candidate
-					}
-					match = ref.ID
 				}
-				if match == "" {
-					return "", false
-				}
-				return match, true
+				return "", false
 			}))
 		dispatchers[wsID] = d
 	}
@@ -182,7 +174,7 @@ func run() error {
 			for _, rt := range rts {
 				declared = append(declared, proxy.DeclaredRuntime{
 					Name: rt.Name, Type: rt.Provider,
-					ProfileID: rt.ProfileID,
+					ProfileID: rt.ProfileID, RuntimeKey: rt.RuntimeID,
 				})
 			}
 			client.SetDeclared(declared)
