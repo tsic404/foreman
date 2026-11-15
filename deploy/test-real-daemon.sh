@@ -41,8 +41,12 @@ DAEMON_TOKEN=${TEST_MULTICA_DAEMON_TOKEN:-dc-tok-v2-test}
 # --two-daemons adds a second resident daemon under its own identity, proving
 # that Foreman aggregates several daemons behind one server-side runtime.
 TWO_DAEMONS=0
+MULTI_WS=0
 for _arg in "$@"; do
-	[ "$_arg" = "--two-daemons" ] && TWO_DAEMONS=1
+	case "$_arg" in
+	--two-daemons) TWO_DAEMONS=1 ;;
+	--multi-workspace) MULTI_WS=1 ;;
+	esac
 done
 DAEMON2_ID=${TEST_MULTICA_DAEMON2_ID:-foreman-v2-daemon-b}
 DAEMON2_TOKEN=${TEST_MULTICA_DAEMON2_TOKEN:-fo-d2-kx-91qj}
@@ -144,11 +148,36 @@ if [ "$TWO_DAEMONS" = "1" ]; then
 	DAEMON_TOKENS_ARG="$DAEMON_TOKENS_ARG,$DAEMON2_ID=$DAEMON2_TOKEN"
 	DAEMON_WS_ARG="$DAEMON_WS_ARG,$DAEMON2_ID=$WS_ID"
 fi
+# Discovery mode: no MULTICA_WORKSPACE_ID, so Foreman asks the server which
+# workspaces its credential can act for and derives one daemon identity per
+# discovered workspace (base-<wsID>). Each derived identity needs its own
+# token, and the workspace bindings are filled in from the discovery answer.
+WS_ENV="MULTICA_WORKSPACE_ID=$WS_ID"
+if [ "$MULTI_WS" = "1" ]; then
+	WS_ENV=""
+	DISCOVERED=$(api GET /api/workspaces | jq -r '[.[].id] | join(" ")')
+	[ -n "$DISCOVERED" ] || die "credential sees no workspaces"
+	DAEMON_TOKENS_ARG=""
+	DAEMON_WS_ARG=""
+	_i=0
+	for _ws in $DISCOVERED; do
+		_i=$((_i + 1))
+		_tok="mw-token-$_i"
+		DAEMON_TOKENS_ARG="${DAEMON_TOKENS_ARG:+$DAEMON_TOKENS_ARG,}foreman-$_ws=$_tok"
+		DAEMON_WS_ARG="${DAEMON_WS_ARG:+$DAEMON_WS_ARG,}foreman-$_ws=$_ws"
+	done
+	echo "discovery mode: $(echo "$DISCOVERED" | wc -w) workspace(s)"
+	# The resident daemon must present the identity Foreman derived for the
+	# workspace it serves, or its registration is rejected as unknown.
+	PRIMARY_WS=$(echo "$DISCOVERED" | awk '{print $1}')
+	DAEMON_ID="foreman-$PRIMARY_WS"
+	DAEMON_TOKEN="mw-token-1"
+fi
 cat > "$WORK/foreman-run.sh" <<RUNEOF
 #!/usr/bin/env bash
 cd "$(pwd)"
 exec env \
-  MULTICA_SERVER_URL=$SERVER_URL MULTICA_WORKSPACE_ID=$WS_ID \
+  MULTICA_SERVER_URL=$SERVER_URL $WS_ENV \
   MULTICA_TOKEN=$PAT FOREMAN_DAEMON_ID=foreman \
   FOREMAN_DAEMON_TOKENS=$DAEMON_TOKENS_ARG \
   FOREMAN_DAEMON_TOKEN_WORKSPACES=$DAEMON_WS_ARG \
@@ -309,8 +338,10 @@ step "binding the agent to Foreman's runtime"
 # agent CLI came first — here codex, which has no credentials on this host.
 RT=""
 for _ in $(seq 1 30); do
+	# The daemon identity is "foreman" in workspace-scoped mode and
+	# "foreman-<wsID>" in discovery mode; match either.
 	RT=$(api GET "/api/runtimes?workspace_id=$WS_ID" \
-		| jq -r '[.[]|select(.daemon_id=="foreman" and .provider=="omp")][0].id // ""')
+		| jq -r '[.[]|select((.daemon_id|startswith("foreman")) and .provider=="omp")][0].id // ""')
 	[ -n "$RT" ] && break
 	sleep 2
 done
