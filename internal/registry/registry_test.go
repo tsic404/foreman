@@ -69,7 +69,7 @@ func TestDaemonAffinityAndBusy(t *testing.T) {
 	if !rt.HoldsSession("sess-x") {
 		t.Fatal("daemon should hold learned session")
 	}
-	if rt.Busy != 0 {
+	if r.BusyFor("d1") != 0 {
 		t.Fatal("new daemon starts idle")
 	}
 }

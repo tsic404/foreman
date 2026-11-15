@@ -212,7 +212,34 @@ func run() error {
 				return false, nil
 			}
 			return client.PrepareLease(ctx, e.RuntimeID, taskID)
-		}))
+		}),
+		proxy.WithTaskForwarder(func(ctx context.Context, taskID string, body []byte) (int, []byte, error) {
+			e, ok := reg.Get(taskID)
+			if !ok {
+				return 0, nil, fmt.Errorf("no entry for task %s", taskID)
+			}
+			client, _ := clients.For(e.WorkspaceID)
+			if client == nil {
+				return 0, nil, fmt.Errorf("no client for task %s", taskID)
+			}
+			return client.ContextReceipt(ctx, taskID, body)
+		}),
+		proxy.WithWorkspaceForwarders(
+			func(ctx context.Context, workspaceID string) (int, []byte, error) {
+				client, _ := clients.For(workspaceID)
+				if client == nil {
+					return 0, nil, fmt.Errorf("no client for workspace %s", workspaceID)
+				}
+				return client.WorkspaceRepos(ctx)
+			},
+			func(ctx context.Context, workspaceID string) (int, []byte, error) {
+				client, _ := clients.For(workspaceID)
+				if client == nil {
+					return 0, nil, fmt.Errorf("no client for workspace %s", workspaceID)
+				}
+				return client.RuntimeProfiles(ctx)
+			},
+		))
 
 	// Capacity: how many tasks Foreman may claim now. v2 claims up to the
 	// number of currently idle daemons across the workspaces — the number of

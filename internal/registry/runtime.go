@@ -22,9 +22,6 @@ type Runtime struct {
 	// learned from terminal reports (session affinity, ADR-015); a claimed
 	// task whose prior_session_id is here prefers this daemon.
 	Sessions map[string]bool
-	// Busy reports the number of tasks currently running on this daemon; the
-	// dispatcher balances across daemons by this count.
-	Busy int
 }
 
 // HoldsSession reports whether the daemon already has sessionID's files.

@@ -34,23 +34,35 @@ type SkillResolver func(ctx context.Context, taskID string, body []byte) (int, [
 // LeaseForwarder forwards the daemon's S-7 prepare-lease to multica as C4.
 type LeaseForwarder func(ctx context.Context, workspaceID, taskID string) (bool, error)
 
+// TaskForwarder forwards one task-addressed daemon call (S-31 context
+// receipt) to the multica server verbatim.
+type TaskForwarder func(ctx context.Context, taskID string, body []byte) (int, []byte, error)
+
 // WithLeaseForwarder wires the S-7 → C4 seam.
 func WithLeaseForwarder(fn LeaseForwarder) ServerOption {
 	return func(s *FakeServer) { s.lease = fn }
+}
+
+// WithTaskForwarder wires the S-31 context-receipt seam.
+func WithTaskForwarder(fn TaskForwarder) ServerOption {
+	return func(s *FakeServer) { s.receipt = fn }
 }
 
 // FakeServer is the D→F face: it speaks the official server protocol to the
 // registered daemons. ServeHTTP applies two rules — a configured daemon
 // credential to the local daemon face, anything else 401.
 type FakeServer struct {
-	creds   *daemonauth.Store
-	reg     *registry.Registry
-	disp    Dispatcher
-	metrics Metrics
-	log     *slog.Logger
-	mux     *http.ServeMux
-	skills  SkillResolver
-	lease   LeaseForwarder
+	creds       *daemonauth.Store
+	reg         *registry.Registry
+	disp        Dispatcher
+	metrics     Metrics
+	log         *slog.Logger
+	mux         *http.ServeMux
+	skills      SkillResolver
+	lease       LeaseForwarder
+	reposFwd    WorkspaceForwarder
+	profilesFwd WorkspaceForwarder
+	receipt     TaskForwarder
 	// onDaemonChanged fires after a daemon registers or deregisters, so the
 	// assembly can re-derive its C1 declaration from the registry and have the
 	// claim loop tell the server about the new runtime set.
@@ -135,6 +147,8 @@ func (s *FakeServer) routes() {
 	handle("POST /api/daemon/tasks/{tid}/session", s.reportHandler(dispatch.EPSession))                   // S16
 	handle("POST /api/daemon/tasks/{tid}/wait-local-directory", s.reportHandler(dispatch.EPWaitLocalDir)) // S17
 	handle("POST /api/daemon/runtimes/{rid}/tasks/{tid}/prepare-lease", s.handlePrepareLease)             // S7
+	handle("POST /api/daemon/runtimes/{rid}/recover-orphans", s.handleRecoverOrphans)                     // S18
+	handle("POST /api/daemon/tasks/{tid}/context-receipt", s.handleContextReceipt)                        // S31 (v0.9.0)
 	handle("GET /api/daemon/workspaces/{ws}/repos", s.handleRepos)                                        // S2
 	handle("GET /api/daemon/workspaces/{ws}/runtime-profiles", s.handleRuntimeProfiles)                   // S3
 	handle("POST /api/daemon/runtimes/{rid}/tasks/{tid}/skill-bundles/resolve", s.handleSkillBundles)     // S26
@@ -378,32 +392,99 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
+// handleRecoverOrphans answers S-18 with zeros: orphans inside a long-lived
+// daemon's run set are the daemon's own business — it reaps its run
+// directories itself — so Foreman always reports nothing to recover. The
+// daemon calls this once after a re-registration.
+func (s *FakeServer) handleRecoverOrphans(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.credential(w, r); !ok {
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]int{"orphaned": 0, "retried": 0})
+}
+
+// handleContextReceipt forwards S-31 (v0.9.0) to the multica server: the
+// daemon acknowledges the task context it received, and the server records
+// the receipt against the task. The forward rewrites nothing — path and body
+// travel as the daemon sent them.
+func (s *FakeServer) handleContextReceipt(w http.ResponseWriter, r *http.Request) {
+	if _, ok := s.credential(w, r); !ok {
+		return
+	}
+	if s.receipt == nil {
+		// Without the forward seam the honest answer is the upstream's own
+		// "does not accept receipts" shape, which the daemon treats as a
+		// one-time capability probe and never retries.
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	body, ok := s.readBody(w, r)
+	if !ok {
+		return
+	}
+	code, resp, err := s.receipt(r.Context(), r.PathValue("tid"), body)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "context receipt forward failed")
+		return
+	}
+	writeRaw(w, code, resp)
+}
+
 // ctxFor returns the request context.
 func ctxFor(r *http.Request) context.Context { return r.Context() }
 
-// ---- S2 repos ----
+// ---- S2 repos / S3 runtime profiles ----
 
-// handleRepos answers S-2 with an empty repo set: v2 carries no node-local
-// repository cache (the resident daemon owns its workspace state), so there
-// is nothing to report.
+// WorkspaceForwarder forwards one workspace-scoped read (C22 repos, C18
+// runtime profiles) to the multica server with that workspace's credential.
+type WorkspaceForwarder func(ctx context.Context, workspaceID string) (int, []byte, error)
+
+// WithWorkspaceForwarder wires the S-2/S-3 forward seam. A nil repos or
+// profiles forwarder answers the v2 static shape (empty set), which the
+// daemon treats as "no workspace state, built-in runtimes".
+func WithWorkspaceForwarders(repos, profiles WorkspaceForwarder) ServerOption {
+	return func(s *FakeServer) { s.reposFwd = repos; s.profilesFwd = profiles }
+}
+
+// handleRepos forwards S-2 to C-22 verbatim: the daemon reads the repo set,
+// the repos_version and the settings map, and Foreman never interprets any of
+// them (§1.7). An upstream failure answers 502 — the daemon keeps its
+// previous state and continues.
 func (s *FakeServer) handleRepos(w http.ResponseWriter, r *http.Request) {
 	cred, ok := s.credential(w, r)
 	if !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"repos": []any{}, "repos_version": "", "workspace_id": cred.WorkspaceID})
+	if s.reposFwd == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"repos": []any{}, "repos_version": "", "workspace_id": cred.WorkspaceID})
+		return
+	}
+	code, body, err := s.reposFwd(r.Context(), cred.WorkspaceID)
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "workspace repos forward failed")
+		return
+	}
+	writeRaw(w, code, body)
 }
 
-// ---- S3 runtime profiles ----
-
-// handleRuntimeProfiles answers S-3 with an empty profile list: the daemon
-// runs the runtime it registered, and v2 has no server-side profile set to
-// serve.
+// handleRuntimeProfiles forwards S-3 to C-18 verbatim: a 404 is the
+// workspace's own "no custom profiles" answer and reaches the daemon as 404
+// (it continues with its built-in runtimes), a 200 replays the profile list
+// byte for byte.
 func (s *FakeServer) handleRuntimeProfiles(w http.ResponseWriter, r *http.Request) {
 	if _, ok := s.credential(w, r); !ok {
 		return
 	}
-	writeJSON(w, http.StatusOK, []any{})
+	if s.profilesFwd == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	code, body, err := s.profilesFwd(r.Context(), r.PathValue("ws"))
+	if err != nil {
+		writeError(w, http.StatusBadGateway, "runtime profiles forward failed")
+		return
+	}
+	writeRaw(w, code, body)
 }
 
 // ---- S24 token renew ----

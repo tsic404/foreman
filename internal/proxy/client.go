@@ -329,6 +329,30 @@ func (c *Client) ResolveSkillBundles(ctx context.Context, taskID string, body []
 	return c.doOnce(ctx, c.ctrl, http.MethodPost, path, body)
 }
 
+// WorkspaceRepos is C22: the workspace's repos/settings snapshot the daemon
+// asks for at S-2. The raw map keeps key presence faithful — an absent key
+// stays absent from the daemon-facing answer (§1.7).
+func (c *Client) WorkspaceRepos(ctx context.Context) (int, []byte, error) {
+	path := "/api/daemon/workspaces/" + url.PathEscape(c.cfg.WorkspaceID) + "/repos"
+	return c.doOnce(ctx, c.ctrl, http.MethodGet, path, nil)
+}
+
+// RuntimeProfiles is C18: the workspace's custom runtime profiles the daemon
+// asks for at S-3. A 404 means the workspace has no profile set (the daemon
+// continues with its built-in runtimes), a failure means unavailable.
+func (c *Client) RuntimeProfiles(ctx context.Context) (int, []byte, error) {
+	path := "/api/daemon/workspaces/" + url.PathEscape(c.cfg.WorkspaceID) + "/runtime-profiles"
+	return c.doOnce(ctx, c.ctrl, http.MethodGet, path, nil)
+}
+
+// ContextReceipt is C23 (v0.9.0): forwards the daemon's task-context
+// acknowledgment to the server, verbatim. The upstream route is task-scoped
+// under the daemon credential, not runtime-scoped.
+func (c *Client) ContextReceipt(ctx context.Context, taskID string, body []byte) (int, []byte, error) {
+	path := "/api/daemon/tasks/" + url.PathEscape(taskID) + "/context-receipt"
+	return c.doOnce(ctx, c.ctrl, http.MethodPost, path, body)
+}
+
 // ClaimTasks is C3 over the declared runtime set.
 func (c *Client) ClaimTasks(ctx context.Context, maxTasks int) ([]json.RawMessage, error) {
 	if maxTasks < 1 {

@@ -334,7 +334,6 @@ func (r *Registry) MarkTerminal(taskID string, result Result, reason string, at 
 	r.dropIndexLocked(e)
 	r.tasks[taskID] = e
 	r.noteDoneLocked(e)
-	r.releaseRuntimeLocked(e)
 	return e, true, nil
 }
 
@@ -365,20 +364,17 @@ func (r *Registry) SetTokenHash(taskID, hash string) error {
 
 // ---- daemons ----
 
-// PutRuntime inserts or replaces one daemon's row, keeping its live counters.
+// PutRuntime inserts or replaces one daemon's row, preserving the learned
+// session set across re-registrations (a daemon that reconnects still holds
+// the session files it holds on disk).
 func (r *Registry) PutRuntime(rt Runtime) {
 	if rt.RuntimeID == "" || rt.DaemonID == "" {
 		return
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if prev, ok := r.runtimes[rt.RuntimeID]; ok {
-		if rt.Busy == 0 {
-			rt.Busy = prev.Busy
-		}
-		if rt.Sessions == nil {
-			rt.Sessions = prev.Sessions
-		}
+	if prev, ok := r.runtimes[rt.RuntimeID]; ok && rt.Sessions == nil {
+		rt.Sessions = prev.Sessions
 	}
 	if rt.Sessions == nil {
 		rt.Sessions = map[string]bool{}
@@ -449,6 +445,24 @@ func (r *Registry) RuntimesForWorkspace(workspaceID string) []Runtime {
 		return out[i].RegisteredAt.Before(out[j].RegisteredAt)
 	})
 	return out
+}
+
+// BusyFor counts the non-terminal tasks currently bound to the daemon with
+// the given runtime id. The count is derived from the task rows on every
+// call — never accumulated — so a daemon that reconnects mid-task, a lost
+// release, or a restart cannot leak a stale count (the counter has no
+// state to leak).
+func (r *Registry) BusyFor(runtimeID string) int {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	n := 0
+	for _, e := range r.tasks {
+		if e.IsTerminal() || e.DaemonRuntimeID != runtimeID {
+			continue
+		}
+		n++
+	}
+	return n
 }
 
 // TouchHeartbeat refreshes one daemon's liveness clock and marks it online.
@@ -534,26 +548,4 @@ func (r *Registry) pruneDoneLocked() {
 			delete(r.done, id)
 		}
 	}
-}
-
-// releaseRuntimeLocked decrements the daemon's busy count when its task
-// settles.
-func (r *Registry) releaseRuntimeLocked(e TaskEntry) {
-	// The daemon table is keyed by the daemon's own runtime id
-	// (DaemonRuntimeID); RuntimeID is the server-assigned id and is not a key.
-	key := e.DaemonRuntimeID
-	if key == "" {
-		key = e.RuntimeID
-	}
-	if key == "" {
-		return
-	}
-	rt, ok := r.runtimes[key]
-	if !ok {
-		return
-	}
-	if rt.Busy > 0 {
-		rt.Busy--
-	}
-	r.runtimes[key] = rt
 }

@@ -292,7 +292,7 @@ func (d *Dispatcher) OnClaim(ctx context.Context, workspaceID string, task json.
 	if err := d.reg.Put(e); err != nil {
 		return fmt.Errorf("register task %s: %w", head.ID, err)
 	}
-	d.reg.PutRuntime(bumpBusy(rt))
+	d.reg.PutRuntime(rt)
 	d.log.Info("task.claimed",
 		"task_id", e.TaskID, "workspace_id", e.WorkspaceID,
 		"daemon_id", e.DaemonID, "runtime_id", e.RuntimeID,
@@ -322,8 +322,8 @@ func (d *Dispatcher) pickDaemon(head claimHead) (registry.Runtime, bool) {
 		if ah, bh := a.HoldsSession(head.PriorSessionID), b.HoldsSession(head.PriorSessionID); ah != bh {
 			return ah
 		}
-		if a.Busy != b.Busy {
-			return a.Busy < b.Busy
+		if aBusy, bBusy := d.reg.BusyFor(a.RuntimeID), d.reg.BusyFor(b.RuntimeID); aBusy != bBusy {
+			return aBusy < bBusy
 		}
 		return a.RegisteredAt.Before(b.RegisteredAt)
 	})
@@ -337,7 +337,7 @@ func (d *Dispatcher) pickDaemon(head claimHead) (registry.Runtime, bool) {
 func (d *Dispatcher) IdleDaemons() int {
 	n := 0
 	for _, rt := range d.reg.Runtimes() {
-		if rt.Online && rt.Busy == 0 {
+		if rt.Online && d.reg.BusyFor(rt.RuntimeID) == 0 {
 			n++
 		}
 	}
@@ -609,12 +609,6 @@ func rewriteRuntime(payload json.RawMessage, runtimeID string) (json.RawMessage,
 	}
 	fields["runtime_id"] = raw
 	return json.Marshal(fields)
-}
-
-// bumpBusy returns rt with its busy count incremented.
-func bumpBusy(rt registry.Runtime) registry.Runtime {
-	rt.Busy++
-	return rt
 }
 
 // ---- keyed mutex ----
