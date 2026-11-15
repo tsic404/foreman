@@ -16,6 +16,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -270,6 +271,9 @@ func (d *Dispatcher) OnClaim(ctx context.Context, workspaceID string, task json.
 	// first write.
 	rt, ok := d.pickDaemon(head)
 	if !ok {
+		// No daemon can take it: record the claim so the next round sees it as
+		// live, but leave the daemon binding untouched (it has none). A later
+		// round re-binds it once a daemon is idle.
 		if err := d.reg.Put(e); err != nil && !errors.Is(err, registry.ErrDuplicateTask) {
 			return err
 		}
@@ -289,8 +293,12 @@ func (d *Dispatcher) OnClaim(ctx context.Context, workspaceID string, task json.
 		}
 	}
 	e.State = registry.StateDaemonRegistered
-	if err := d.reg.Put(e); err != nil {
-		return fmt.Errorf("register task %s: %w", head.ID, err)
+	// Bind the picked daemon onto the entry. The entry may already exist from
+	// an earlier round that found no idle daemon, in which case Put reports a
+	// duplicate and the daemon index must still be written this round.
+	e, _, bindErr := d.reg.BindOrInsert(e)
+	if bindErr != nil {
+		return fmt.Errorf("register task %s: %w", head.ID, bindErr)
 	}
 	d.reg.PutRuntime(rt)
 	d.log.Info("task.claimed",
@@ -304,6 +312,10 @@ func (d *Dispatcher) OnClaim(ctx context.Context, workspaceID string, task json.
 // already holds prior_session_id) first, then the least busy online daemon of
 // the workspace, ties broken by registration order.
 func (d *Dispatcher) pickDaemon(head claimHead) (registry.Runtime, bool) {
+	target := ""
+	if d.realRuntimeID != nil && head.RuntimeID != "" {
+		target = head.RuntimeID // the server's runtime id the task must run on
+	}
 	candidates := make([]registry.Runtime, 0, 8)
 	for _, rt := range d.reg.Runtimes() {
 		if !rt.Online {
@@ -311,6 +323,16 @@ func (d *Dispatcher) pickDaemon(head claimHead) (registry.Runtime, bool) {
 		}
 		if head.WorkspaceID != "" && rt.WorkspaceID != head.WorkspaceID {
 			continue
+		}
+		// The server names the runtime the task's agent is bound to. A daemon
+		// that registered several runtimes must only receive the task on that
+		// one: running it elsewhere would execute on the wrong agent CLI and
+		// every downstream call (skill bundles, models) would address a
+		// runtime that never claimed the task.
+		if target != "" {
+			if real, ok := d.realRuntimeID(rt.RuntimeID); !ok || real != target {
+				continue
+			}
 		}
 		candidates = append(candidates, rt)
 	}
@@ -347,7 +369,7 @@ func (d *Dispatcher) IdleDaemons() int {
 // Deliver answers a daemon's S-6 claim with its pending task (§5). The daemon
 // is identified by its token's daemon id; the runtime id it names must be its
 // own.
-func (d *Dispatcher) Deliver(ctx context.Context, workspaceID, daemonID, runtimeID string, maxTasks int) (Delivery, error) {
+func (d *Dispatcher) Deliver(ctx context.Context, workspaceID, daemonID string, runtimeIDs []string, maxTasks int) (Delivery, error) {
 	if maxTasks < 1 {
 		return Delivery{}, nil
 	}
@@ -355,11 +377,13 @@ func (d *Dispatcher) Deliver(ctx context.Context, workspaceID, daemonID, runtime
 	if !ok {
 		return Delivery{}, fmt.Errorf("%w: %s", ErrUnknownDaemon, daemonID)
 	}
-	// The daemon's S6 claim names its own runtime id (DaemonRuntimeID), not the
-	// server-assigned id Foreman rewrites into the payload. Accept the
-	// daemon-side id; a claim naming neither is refused.
-	if runtimeID != "" && e.DaemonRuntimeID != "" && runtimeID != e.DaemonRuntimeID {
-		return Delivery{}, fmt.Errorf("%w: %s", ErrRuntimeMismatch, runtimeID)
+	// The daemon's S6 claim names its own runtime ids (DaemonRuntimeID), not
+	// the server-assigned id Foreman rewrites into the payload. A daemon that
+	// registered several runtimes claims for all of them at once, so the
+	// task's bound runtime only has to be one of them; a claim naming none of
+	// the task's runtime is refused.
+	if e.DaemonRuntimeID != "" && len(runtimeIDs) > 0 && !containsString(runtimeIDs, e.DaemonRuntimeID) {
+		return Delivery{}, fmt.Errorf("%w: %s", ErrRuntimeMismatch, strings.Join(runtimeIDs, ","))
 	}
 	unlock := d.taskMu.Lock(e.TaskID)
 	defer unlock()
@@ -376,6 +400,17 @@ func (d *Dispatcher) Deliver(ctx context.Context, workspaceID, daemonID, runtime
 	// (that is what it matches against its registration). Foreman rewrites the
 	// daemon's start/report back to the server's real id at S8. Using the real
 	// id here makes the daemon reject the task as "not my runtime".
+	// C-1 may not have bound the runtime when the task was claimed; by the
+	// time the daemon claims the task the bind is in place, so resolve the
+	// server id here and carry it forward to every report (skill bundles,
+	// context receipt, status).
+	if d.realRuntimeID != nil {
+		if real, ok := d.realRuntimeID(e.DaemonRuntimeID); ok && real != e.RuntimeID {
+			if upd, found := d.reg.Update(e.TaskID, func(t *registry.TaskEntry) { t.RuntimeID = real }); found {
+				e = upd
+			}
+		}
+	}
 	out, err := rewriteRuntime(e.Payload, e.DaemonRuntimeID)
 	if err != nil {
 		return Delivery{}, fmt.Errorf("rewrite runtime for task %s: %w", e.TaskID, err)
@@ -538,7 +573,12 @@ func (d *Dispatcher) convergeOne(ctx context.Context, e registry.TaskEntry) {
 			// The task left the renewable pre-start state: converge via C13.
 			d.convergeStatus(ctx, e)
 		case errors.Is(err, ErrTaskNotFound):
-			_ = d.OnTaskVanished(ctx, e.TaskID)
+			// A 404 from prepare-lease is ambiguous: the task may be gone, or
+			// the runtime id may not be the one the server expects. Confirm
+			// with C-13 before dropping the entry — deleting on the first 404
+			// strands a live task and makes every later claim answer
+			// "unknown daemon".
+			d.convergeStatus(ctx, e)
 		}
 		return
 	}
@@ -669,4 +709,14 @@ func orNoopMetrics(m Metrics) Metrics {
 		return noopMetrics{}
 	}
 	return m
+}
+
+// containsString reports whether want appears in ids.
+func containsString(ids []string, want string) bool {
+	for _, id := range ids {
+		if id == want {
+			return true
+		}
+	}
+	return false
 }

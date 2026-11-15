@@ -89,6 +89,39 @@ func (r *Registry) Put(e TaskEntry) error {
 	return nil
 }
 
+// BindOrInsert stores e, inserting it when absent and applying the daemon
+// binding when a live entry already exists from an earlier round that found no
+// idle daemon. It reports whether the entry was inserted.
+func (r *Registry) BindOrInsert(e TaskEntry) (TaskEntry, bool, error) {
+	if e.TaskID == "" {
+		return TaskEntry{}, false, errors.New("task id is required")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	old, ok := r.tasks[e.TaskID]
+	if !ok {
+		if e.State == StateTerminal {
+			return TaskEntry{}, false, fmt.Errorf("%w: cannot insert a terminal entry", ErrTerminalImmutable)
+		}
+		r.tasks[e.TaskID] = e
+		r.indexLocked(e)
+		return e, true, nil
+	}
+	if old.IsTerminal() {
+		return old, false, ErrTerminalImmutable
+	}
+	// Re-bind: the daemon choice and its runtime id are what the S-6 claim
+	// addresses; every other field stays as the entry already had it.
+	r.dropIndexLocked(old)
+	old.DaemonID = e.DaemonID
+	old.DaemonRuntimeID = e.DaemonRuntimeID
+	old.RuntimeID = e.RuntimeID
+	old.State = e.State
+	r.tasks[e.TaskID] = old
+	r.indexLocked(old)
+	return old, false, nil
+}
+
 // Update applies fn to the entry and stores the result. A terminal entry is
 // never rewritten into a live state.
 func (r *Registry) Update(taskID string, fn func(*TaskEntry)) (TaskEntry, bool) {

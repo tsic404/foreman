@@ -184,6 +184,10 @@ type DeclaredRuntime struct {
 	// assigns the real id — but it keys the daemon→real-id mapping so a
 	// multi-runtime daemon resolves each task to the right server runtime.
 	RuntimeKey string `json:"-"`
+	// DeviceName is the daemon's own device name, forwarded verbatim so the
+	// server builds the runtime's display name from the daemon's identity
+	// rather than from anything Foreman invents.
+	DeviceName string `json:"-"`
 }
 
 // Option customizes a Client.
@@ -243,6 +247,22 @@ func (c *Client) RuntimeIDs() []string {
 // RuntimeRefs returns the declared runtimes and their ids.
 func (c *Client) RuntimeRefs() []RuntimeRef { return append([]RuntimeRef(nil), c.runtimes...) }
 
+// RealRuntimeID maps a daemon-side runtime key to the server's runtime id.
+// It answers "" when the declaration has not been bound yet (C1 still in
+// flight), so a caller can fall back instead of sending a key the server
+// never registered.
+func (c *Client) RealRuntimeID(runtimeKey string) string {
+	if runtimeKey == "" {
+		return ""
+	}
+	for _, ref := range c.RuntimeRefs() {
+		if ref.RuntimeKey == runtimeKey && ref.ID != "" {
+			return ref.ID
+		}
+	}
+	return ""
+}
+
 // SetDeclared updates the runtime set Foreman will declare at the next C1 and
 // marks the declaration dirty, so the claim loop re-runs the registration.
 func (c *Client) SetDeclared(d []DeclaredRuntime) {
@@ -281,11 +301,23 @@ func (c *Client) Register(ctx context.Context) error {
 	if len(payloads) == 0 {
 		return errors.New("register: declared set has no usable runtime")
 	}
+	// The device name is the daemon's own, forwarded verbatim: the server
+	// builds a runtime's display name from device_name + provider, so Foreman
+	// must never substitute a name of its own. With several daemons behind one
+	// Foreman identity the first non-empty device name wins, which keeps the
+	// server-side label stable across re-registrations.
+	deviceName := ""
+	for _, d := range c.declared {
+		if d.DeviceName != "" {
+			deviceName = d.DeviceName
+			break
+		}
+	}
 	body := registerRequest{
 		WorkspaceID:     c.cfg.WorkspaceID,
 		DaemonID:        c.cfg.DaemonID,
 		LegacyDaemonIDs: []string{},
-		DeviceName:      "foreman",
+		DeviceName:      deviceName,
 		CLIVersion:      c.cfg.Version,
 		Runtimes:        payloads,
 	}
@@ -325,15 +357,15 @@ func (c *Client) Heartbeat(ctx context.Context, runtimeID string) error {
 }
 
 // ResolveSkillBundles is C19: forwards the daemon's skill-bundle resolve body
-// to the server (S26) with Foreman's credential and the real runtime id the
-// server assigned, not the daemon's self-chosen id.
-func (c *Client) ResolveSkillBundles(ctx context.Context, taskID string, body []byte) (int, []byte, error) {
-	ids := c.RuntimeIDs()
-	if len(ids) == 0 {
-		return 0, nil, errors.New("skill bundles: no real runtime registered")
+// to the server (S26) under the runtime the task is actually bound to. The
+// path is runtime-scoped upstream, so using "the first registered runtime"
+// would address a runtime that never claimed the task and earn a 404.
+func (c *Client) ResolveSkillBundles(ctx context.Context, runtimeID, taskID string, body []byte) (int, []byte, error) {
+	if runtimeID == "" {
+		return 0, nil, errors.New("skill bundles: task has no bound runtime")
 	}
 	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/skill-bundles/resolve",
-		url.PathEscape(ids[0]), url.PathEscape(taskID))
+		url.PathEscape(runtimeID), url.PathEscape(taskID))
 	return c.doOnce(ctx, c.ctrl, http.MethodPost, path, body)
 }
 

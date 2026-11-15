@@ -175,6 +175,7 @@ func run() error {
 				declared = append(declared, proxy.DeclaredRuntime{
 					Name: rt.Name, Type: rt.Provider,
 					ProfileID: rt.ProfileID, RuntimeKey: rt.RuntimeID,
+					DeviceName: rt.DeviceName,
 				})
 			}
 			client.SetDeclared(declared)
@@ -192,7 +193,17 @@ func run() error {
 			if client == nil {
 				return 0, nil, fmt.Errorf("no client for task %s", taskID)
 			}
-			return client.ResolveSkillBundles(ctx, taskID, body)
+			// The task's own runtime id, not any registered one: C-19's path is
+			// runtime-scoped and the server only knows the runtime that claimed
+			// this task.
+			// e.RuntimeID is already the server's id when the bind resolved;
+			// it stays the daemon key only while C-1 is still in flight, so
+			// try the mapping and keep the original on a miss.
+			runtimeID := e.RuntimeID
+			if real := client.RealRuntimeID(runtimeID); real != "" {
+				runtimeID = real
+			}
+			return client.ResolveSkillBundles(ctx, runtimeID, taskID, body)
 		}),
 		proxy.WithLeaseForwarder(func(ctx context.Context, workspaceID, taskID string) (bool, error) {
 			e, ok := reg.Get(taskID)
@@ -214,6 +225,9 @@ func run() error {
 			if client == nil {
 				return 0, nil, fmt.Errorf("no client for task %s", taskID)
 			}
+			// The task's own runtime id, not any registered one: C-19's path is
+			// runtime-scoped and the server only knows the runtime that claimed
+			// this task.
 			return client.ContextReceipt(ctx, taskID, body)
 		}),
 		proxy.WithWorkspaceForwarders(
@@ -348,12 +362,12 @@ func run() error {
 // owns one workspace's tasks, so the routing is unambiguous.
 type dispatcherSet map[string]*dispatch.Dispatcher
 
-func (s dispatcherSet) Deliver(ctx context.Context, workspaceID, daemonID, runtimeID string, maxTasks int) (dispatch.Delivery, error) {
+func (s dispatcherSet) Deliver(ctx context.Context, workspaceID, daemonID string, runtimeIDs []string, maxTasks int) (dispatch.Delivery, error) {
 	d, ok := s[workspaceID]
 	if !ok {
 		return dispatch.Delivery{}, dispatch.ErrUnknownDaemon
 	}
-	return d.Deliver(ctx, workspaceID, daemonID, runtimeID, maxTasks)
+	return d.Deliver(ctx, workspaceID, daemonID, runtimeIDs, maxTasks)
 }
 
 func (s dispatcherSet) OnReport(ctx context.Context, ep dispatch.Endpoint, e registry.TaskEntry, body []byte, sessionID string) (int, []byte, error) {

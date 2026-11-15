@@ -33,6 +33,14 @@ Multica Server  ◄── fake client ──  Foreman  ── fake server ──
 - **Dispatcher** — picks the daemon for a claim: session affinity first (the
   daemon that already holds the task's `prior_session_id`), then the least busy
   online daemon, then registration order.
+- **Multiple runtimes per daemon.** A daemon may declare several runtimes — the
+  built-in agent it detects plus any custom runtime profiles the workspace
+  defines, and those can differ in provider (say `omp` next to `codex`).
+  Foreman declares every one of them to the server as separate runtimes under
+  its single daemon identity, binds each to the server-assigned id, and routes
+  a task to the exact runtime it was claimed for. A daemon claiming for all its
+  runtimes at once is matched against the task's bound runtime, not against
+  whichever id happens to come first.
 - **No per-task credential.** v1 minted a short-lived Job Token per task; v2
   authenticates daemons with a deployment-configured credential set
   (`FOREMAN_DAEMON_TOKENS`).
@@ -72,11 +80,39 @@ call. A daemon identity with no workspace binding refuses startup, and a token
 shared by two identities refuses startup. Tokens are compared by SHA-256 digest
 in constant time and are never logged.
 
+## Protocol surface
+
+Foreman speaks two faces. The **client face** (Foreman → Multica Server) is the
+full daemon protocol subset a long-lived daemon needs; the **server face**
+(resident daemon → Foreman) is the same subset plus the report endpoints.
+
+Client face (C-numbers as in `internal/proxy`): `C1` register, `C2` heartbeat,
+`C3` claim, `C4` prepare-lease, `C18` runtime profiles, `C19` skill bundles,
+`C22` workspace repos, `C23` context receipt, and the report forwards `S8`,
+`S10`–`S17`.
+
+Server face: `S1` workspaces, `S2` repos, `S3` runtime profiles, `S4` register,
+`S5` heartbeat, `S6` claim, `S7` prepare-lease, `S8` start, `S9` status,
+`S10`–`S17` reports, `S18` recover-orphans, `S19` deregister, `S24` token renew,
+`S26` skill bundles, `S28` workspace list, `S31` context receipt.
+
+Validated end to end against Multica **v0.9.0** (backend + web + pgvector, run
+with docker or podman) with a real `multica daemon` process: a task dispatched
+by the server is claimed by Foreman, delivered to a resident daemon, executed by
+the agent, and settled back on the server as `completed`.
+
+Not implemented: the WebSocket push face (`S30`/`C20`) — Foreman polls on the
+claim interval, which is functionally equivalent at the cost of latency — and
+the model-catalog probe (`C21`), since the resident daemon resolves its models
+through its own agent CLI discovery.
+
 ## Status
 
-Early development. Protocol feasibility was validated against Multica daemon
-`v0.6.0` in v1; v2 keeps the server-side protocol (C1–C22) and the daemon-facing
-control-plane subset (S1, S4–S9, S19, S28) and drops the rest.
+Early development, but the v2 path is proven end to end. `deploy/test-real-daemon.sh`
+brings up a local Multica stack, extracts the official CLI from the backend
+image, mints a token, creates a workspace and agent, starts Foreman and a real
+daemon, binds them, triggers an autopilot, and asserts the task settles as
+`completed` — on both docker and podman.
 
 ## License
 

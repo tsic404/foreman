@@ -77,7 +77,9 @@ MULTICA_BIN="$WORK/multica"
 "$ENGINE" run --rm --entrypoint sh "$BACKEND_IMAGE" \
 	-c "cat /app/multica" > "$MULTICA_BIN"
 chmod +x "$MULTICA_BIN"
-"$MULTICA_BIN" version | head -1
+# No pipe to head: under pipefail a closed pipe SIGPIPEs the CLI and the
+# script dies with 141 before it starts the real work.
+"$MULTICA_BIN" version
 
 # --- 3. credentials ----------------------------------------------------------
 step "minting a personal access token"
@@ -217,13 +219,21 @@ echo "daemon registered to Foreman"
 
 # --- 7. bind the agent to Foreman's runtime --------------------------------
 step "binding the agent to Foreman's runtime"
+# A daemon may declare several runtimes (one per agent CLI it detects, plus
+# any custom profile). Pick the omp one explicitly: it is the runtime this
+# stack is configured to drive, and "the first runtime" would pick whichever
+# agent CLI came first — here codex, which has no credentials on this host.
+RT=""
 for _ in $(seq 1 30); do
-	RT=$(api GET "/api/runtimes?workspace_id=$WS_ID" | jq -r '[.[]|select(.daemon_id=="foreman")][0].id // ""')
+	RT=$(api GET "/api/runtimes?workspace_id=$WS_ID" \
+		| jq -r '[.[]|select(.daemon_id=="foreman" and .provider=="omp")][0].id // ""')
 	[ -n "$RT" ] && break
 	sleep 2
 done
-[ -n "$RT" ] || die "Foreman did not register a runtime to multica"
-echo "foreman runtime: $RT"
+if [ -z "$RT" ]; then
+	die "Foreman did not register an omp runtime to multica"
+fi
+echo "foreman runtime: $RT (provider omp)"
 AGENT_ID=$(api GET "/api/agents?workspace_id=$WS_ID" | jq -r --arg n "$AGENT_NAME" \
 	'[.[]|select(.name==$n and .archived_at==null)][0].id // ""')
 if [ -z "$AGENT_ID" ]; then

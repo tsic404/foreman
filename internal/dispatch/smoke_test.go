@@ -197,7 +197,7 @@ func TestEndToEndChain(t *testing.T) {
 	}
 
 	// The daemon's S6 claim picks the payload up.
-	delivery, err := disp.Deliver(ctx, "ws-1", "worker-1", "worker-1", 1)
+	delivery, err := disp.Deliver(ctx, "ws-1", "worker-1", []string{"worker-1"}, 1)
 	if err != nil {
 		t.Fatalf("deliver: %v", err)
 	}
@@ -244,8 +244,8 @@ func TestEndToEndChain(t *testing.T) {
 // dispatcher.
 type dispatchAdapter struct{ d *dispatch.Dispatcher }
 
-func (a dispatchAdapter) Deliver(ctx context.Context, ws, daemonID, runtimeID string, max int) (dispatch.Delivery, error) {
-	return a.d.Deliver(ctx, ws, daemonID, runtimeID, max)
+func (a dispatchAdapter) Deliver(ctx context.Context, ws, daemonID string, runtimeIDs []string, max int) (dispatch.Delivery, error) {
+	return a.d.Deliver(ctx, ws, daemonID, runtimeIDs, max)
 }
 func (a dispatchAdapter) OnReport(ctx context.Context, ep dispatch.Endpoint, e registry.TaskEntry, body []byte, sessionID string) (int, []byte, error) {
 	return a.d.OnReport(ctx, ep, e, body, sessionID)

@@ -14,6 +14,10 @@ type Runtime struct {
 	ProfileID   string // runtime profile id ("" for builtin)
 	Name        string // display name
 	WorkspaceID string
+	// DeviceName is the daemon's own device name as it reported it. It is
+	// forwarded verbatim to the server so a runtime's display name is built
+	// from the daemon's own identity, never from a Foreman-chosen one.
+	DeviceName string
 
 	Online          bool
 	RegisteredAt    time.Time
