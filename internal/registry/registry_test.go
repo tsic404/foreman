@@ -149,3 +149,28 @@ func TestDaemonHoldsSeveralTasks(t *testing.T) {
 		t.Fatalf("saw %d tasks, want 3", len(seen))
 	}
 }
+
+func TestOwnerOfSurvivesSettlement(t *testing.T) {
+	r := New()
+	now := time.Now()
+	if err := r.Put(TaskEntry{TaskID: "t1", WorkspaceID: "ws", DaemonID: "d1", State: StateRunning, ClaimedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.OwnerOf("t1"); got != "d1" {
+		t.Fatalf("live owner = %q, want d1", got)
+	}
+	if _, _, err := r.MarkTerminal("t1", ResultCompleted, "", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete("t1"); err != nil {
+		t.Fatal(err)
+	}
+	// The live row is gone; the owner must still be known so a report from a
+	// different daemon can be refused.
+	if got := r.OwnerOf("t1"); got != "d1" {
+		t.Fatalf("settled owner = %q, want d1", got)
+	}
+	if got := r.OwnerOf("never-seen"); got != "" {
+		t.Fatalf("unknown task owner = %q, want empty", got)
+	}
+}

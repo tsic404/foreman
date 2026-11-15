@@ -27,10 +27,14 @@ const doneRetention = 24 * time.Hour
 
 // Registry is the process-local task index plus the daemon table.
 type Registry struct {
-	mu              sync.RWMutex
-	tasks           map[string]TaskEntry
-	byDaemon        map[string][]string  // daemonID → taskIDs, oldest first (a daemon may hold several)
-	done            map[string]time.Time // taskID → verdict instant
+	mu       sync.RWMutex
+	tasks    map[string]TaskEntry
+	byDaemon map[string][]string  // daemonID → taskIDs, oldest first (a daemon may hold several)
+	done     map[string]time.Time // taskID → verdict instant
+	// doneOwner remembers which daemon settled each retained task id, so a
+	// report arriving after the live row is gone can still be checked against
+	// the daemon that owned it. Pruned on the same clock as done.
+	doneOwner       map[string]string
 	runtimes        map[string]Runtime
 	byRuntimeDaemon map[string]string // runtimeID → daemonID
 
@@ -51,6 +55,7 @@ func New(opts ...Option) *Registry {
 		tasks:           map[string]TaskEntry{},
 		byDaemon:        map[string][]string{},
 		done:            map[string]time.Time{},
+		doneOwner:       map[string]string{},
 		runtimes:        map[string]Runtime{},
 		byRuntimeDaemon: map[string]string{},
 		now:             time.Now,
@@ -162,6 +167,17 @@ func (r *Registry) GetInWorkspace(workspaceID, taskID string) (TaskEntry, bool) 
 		return TaskEntry{}, false
 	}
 	return e, true
+}
+
+// OwnerOf reports which daemon held a task, live or settled. It answers "" for
+// a task Foreman has never seen (or has already pruned).
+func (r *Registry) OwnerOf(taskID string) string {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
+	if e, ok := r.tasks[taskID]; ok {
+		return e.DaemonID
+	}
+	return r.doneOwner[taskID]
 }
 
 // SettledInWorkspace returns the retained terminal record of an
@@ -613,6 +629,9 @@ func (r *Registry) noteDoneLocked(e TaskEntry) {
 		at = r.now()
 	}
 	r.done[e.TaskID] = at
+	if e.DaemonID != "" {
+		r.doneOwner[e.TaskID] = e.DaemonID
+	}
 	r.pruneDoneLocked()
 }
 
@@ -621,6 +640,7 @@ func (r *Registry) pruneDoneLocked() {
 	for id, at := range r.done {
 		if now.Sub(at) >= doneRetention {
 			delete(r.done, id)
+			delete(r.doneOwner, id)
 		}
 	}
 }

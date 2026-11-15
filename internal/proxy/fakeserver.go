@@ -602,6 +602,13 @@ func (s *FakeServer) reportHandler(ep dispatch.Endpoint) http.HandlerFunc {
 			return
 		}
 		if !known {
+			// The live row is gone (a restart, or the task already settled).
+			// The retained owner still tells us whose task this was, so a
+			// report from any other daemon is refused instead of forwarded.
+			if owner := s.reg.OwnerOf(tid); owner != "" && owner != cred.DaemonID {
+				writeError(w, http.StatusNotFound, "task not found")
+				return
+			}
 			e = registry.TaskEntry{
 				TaskID:      tid,
 				WorkspaceID: cred.WorkspaceID,
