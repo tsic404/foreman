@@ -458,6 +458,15 @@ func (d *Dispatcher) OnReport(ctx context.Context, ep Endpoint, e registry.TaskE
 	case ep == EPStart && code >= 200 && code < 300:
 		d.reg.MarkStarted(e.TaskID, now)
 	case ep.IsTerminal() && code >= 200 && code < 300:
+		// A cancel-ack only acknowledges a cancellation; the server settles the
+		// task only when it was the one that asked for the cancel. A daemon that
+		// cancelled on its own (its connection to us dropped, say) sends just
+		// this ack, so the task would sit "running" on the server forever. Close
+		// it with a fail carrying the reason — done before the local bookkeeping
+		// below, which needs a registry entry a restart may have dropped.
+		if ep == EPCancelAck {
+			d.settleCancelledTask(ctx, e)
+		}
 		result := ep.TerminalResult()
 		updated, first, terr := d.reg.MarkTerminal(e.TaskID, result, "", now)
 		if terr != nil {
@@ -473,6 +482,21 @@ func (d *Dispatcher) OnReport(ctx context.Context, ep Endpoint, e registry.TaskE
 		}
 	}
 	return code, resp, nil
+}
+
+// settleCancelledTask closes a task the server still considers live after the
+// daemon acknowledged a cancellation nobody on the server asked for.
+func (d *Dispatcher) settleCancelledTask(ctx context.Context, e registry.TaskEntry) {
+	status, err := d.server.TaskStatus(ctx, e.TaskID)
+	if err != nil || registry.IsTerminalResult(status) {
+		return
+	}
+	body, _ := json.Marshal(map[string]any{"error": "cancelled by daemon"})
+	if _, _, ferr := d.server.ForwardInWorkspace(ctx, EPFail, e.TaskID, e.WorkspaceID, body); ferr != nil {
+		d.log.Warn("cancel_settle_failed", "task_id", e.TaskID, "err", ferr)
+		return
+	}
+	d.log.Info("task.settled_after_cancel", "task_id", e.TaskID, "server_status", status)
 }
 
 // reclaim revokes the settled task's credential and drops the entry, releasing
