@@ -41,9 +41,17 @@ DAEMON_TOKEN=${TEST_MULTICA_DAEMON_TOKEN:-dc-tok-v2-test}
 FOREMAN_LISTEN=${FOREMAN_LISTEN:-:18080}
 FOREMAN_OPS_LISTEN=${FOREMAN_OPS_LISTEN:-:18081}
 OPS_TOKEN=${FOREMAN_OPS_TOKEN:-ops-secret}
+BACKEND_IMAGE=${BACKEND_IMAGE:-ghcr.io/multica-ai/multica-backend:v0.9.0}
 
 WORK=$(mktemp -d /tmp/foreman-e2e.XXXXXX)
-COMPOSE=(podman compose -f deploy/test-compose.yaml)
+# Docker preferred; podman is the fallback for hosts without docker.
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+	COMPOSE=(docker compose -f deploy/test-compose.yaml)
+	ENGINE=docker
+else
+	COMPOSE=(podman compose -f deploy/test-compose.yaml)
+	ENGINE=podman
+fi
 export PATH="$HOME/goroot/bin:$PATH"
 
 step() { printf '\n\033[1;34m== %s\033[0m\n' "$*"; }
@@ -66,7 +74,7 @@ curl -fsS "$SERVER_URL/healthz" >/dev/null || die "server never became healthy"
 # --- 2. real daemon binary (extracted from the backend image) -----------------
 step "extracting the real multica daemon CLI"
 MULTICA_BIN="$WORK/multica"
-podman run --rm --entrypoint sh ghcr.io/multica-ai/multica-backend:v0.6.1 \
+"$ENGINE" run --rm --entrypoint sh "$BACKEND_IMAGE" \
 	-c "cat /app/multica" > "$MULTICA_BIN"
 chmod +x "$MULTICA_BIN"
 "$MULTICA_BIN" version | head -1
@@ -110,6 +118,9 @@ echo "workspace: $WS_ID"
 # --- 5. Foreman --------------------------------------------------------------
 step "building and launching Foreman v2"
 mkdir -p bin
+# Some hosts lack /dev/shm; keep Go's temp files under WORK.
+export GOTMPDIR="$WORK/gotmp" TMPDIR="${TMPDIR:-/tmp}"
+mkdir -p "$GOTMPDIR"
 go build -o bin/foreman ./cmd/foreman
 pkill -9 -f 'bin/foreman -listen' 2>/dev/null || true
 sleep 1
@@ -284,4 +295,4 @@ grep -iE 'agent result|did not complete|completed' "$WORK/daemon.log" 2>/dev/nul
 echo
 echo "foreman log:  $WORK/foreman.log"
 echo "daemon log:   $WORK/daemon.log"
-echo "pids: foreman=$FPID daemon=$DPID (kill to stop; stack: podman compose -f deploy/test-compose.yaml down)"
+echo "pids: foreman=$FPID daemon=$DPID (kill to stop; stack: ${COMPOSE[*]} down)"
