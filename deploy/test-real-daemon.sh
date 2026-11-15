@@ -258,8 +258,11 @@ if [ "$TWO_DAEMONS" = "1" ]; then
 	# invisible to a daemon running with HOME=$WORK/daemon2-home.
 	PROF2="$WORK/daemon2-home/.multica/profiles/foreman-b"
 	mkdir -p "$PROF2"
+	# The CLI binds a local health port (default 19514); two daemons on one
+	# host collide there even with separate HOMEs and profiles, so the second
+	# gets its own port.
 	cat > "$PROF2/config.json" <<CFGEOF
-{"server_url":"http://127.0.0.1:${FOREMAN_LISTEN#:}","workspace_id":"$WS_ID","token":"$DAEMON2_TOKEN"}
+{"server_url":"http://127.0.0.1:${FOREMAN_LISTEN#:}","workspace_id":"$WS_ID","token":"$DAEMON2_TOKEN","health_port":19515}
 CFGEOF
 	chmod 600 "$PROF2/config.json"
 	cat > "$WORK/daemon2-run.sh" <<DMN2EOF
@@ -277,11 +280,20 @@ DMN2EOF
 	setsid "$WORK/daemon2-run.sh" > "$WORK/daemon2.log" 2>&1 < /dev/null &
 	D2PID=$!
 	echo "daemon2 pid $D2PID (log $WORK/daemon2.log)"
-	for _ in $(seq 1 30); do
-		[ "$(grep -c 'daemon.registered' "$WORK/foreman.log")" -ge 2 ] && break
+	# Match the JSON field exactly: the second identity's name contains the
+	# first one as a prefix, so a plain substring grep passes even when the
+	# second daemon never registered.
+	for _ in $(seq 1 45); do
+		grep 'daemon.registered' "$WORK/foreman.log" \
+			| grep -q "\"daemon_id\":\"$DAEMON2_ID\"" && break
 		sleep 1
 	done
-	grep -q "$DAEMON2_ID" "$WORK/foreman.log" || die "second daemon did not register to Foreman"
+	# Match the registration event specifically: the second identity also
+	# appears in claim-failure warnings, so a bare daemon_id grep is a false
+	# positive.
+	grep 'daemon.registered' "$WORK/foreman.log" \
+		| grep -q "\"daemon_id\":\"$DAEMON2_ID\"" \
+		|| die "second daemon did not register to Foreman"
 	echo "second daemon registered to Foreman"
 fi
 
