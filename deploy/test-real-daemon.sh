@@ -167,7 +167,11 @@ done
 
 # --- 6. real daemon pointed at Foreman ---------------------------------------
 step "launching the real multica daemon against Foreman"
-pkill -9 -f "multica --server-url .* daemon start" 2>/dev/null || true
+# Kill every resident daemon from a previous run, whatever profile it used:
+# the CLI's "already running" lock is per profile, so a leftover second daemon
+# from --two-daemons blocks the next run before it starts.
+pkill -9 -f "daemon start --foreground" 2>/dev/null || true
+pkill -9 -f "multica .*daemon start" 2>/dev/null || true
 sleep 1
 mkdir -p "$WORK/daemon-home/.multica" "$WORK/daemon-home/.local/bin" "$WORK/daemon-root"
 # A previous run's empty session file makes the next run's omp refuse to
