@@ -139,14 +139,18 @@ step "launching the real multica daemon against Foreman"
 pkill -9 -f "multica --server-url .* daemon start" 2>/dev/null || true
 sleep 1
 mkdir -p "$WORK/daemon-home/.multica" "$WORK/daemon-home/.local/bin" "$WORK/daemon-root"
+# A previous run's empty session file makes the next run's omp refuse to
+# resume it ("session file holds no entries"); start clean.
+rm -f "$WORK/daemon-home/.multica/pi-sessions/"*.jsonl 2>/dev/null || true
 # The daemon needs an agent CLI on PATH and an auth config for its server.
 # Provide omp (if the host has it) and write the CLI config that points at
 # Foreman with the daemon credential.
 if [ -x "$HOME/.local/bin/omp" ]; then
 	ln -sf "$HOME/.local/bin/omp" "$WORK/daemon-home/.local/bin/omp"
 fi
-# omp reads its provider/model config from $HOME/.omp; link it into the
-# isolated daemon home so the real agent can start.
+# omp reads its provider/model config from $HOME/.omp; link the host's real
+# config into the isolated daemon home so the agent uses the same model the
+# host's omp uses (the gateway key is fixed upstream).
 if [ -d "$HOME/.omp" ]; then
 	ln -sfn "$HOME/.omp" "$WORK/daemon-home/.omp"
 fi
