@@ -3,85 +3,46 @@ package proxy
 import (
 	"context"
 	"log/slog"
+	"time"
 
 	"github.com/tsic404/foreman/internal/registry"
 )
 
-// ControlPlane is one workspace's daemon-side control-loop set: claim,
-// heartbeat, lease keepalive, profile refresh and (when enabled) the WS
-// subscription. cmd/foreman and the assembly-level acceptance tests build it
-// through NewControlPlane, so the leader gating and the declaration
-// publication are wired by the same code in production and under test
-// (02-contracts.md §1.1 发出者口径, §0 术语「leader」).
+// ControlPlane is one workspace's daemon-side loop set: claim, daemon
+// reconciliation and lease renewal. v2 has no heartbeat-to-server loop (the
+// daemons themselves heartbeat to Foreman) and no WS subscription.
 type ControlPlane struct {
 	Claim     *ClaimLoop
-	Heartbeat *HeartbeatLoop
-	Lease     *LeaseKeeper
-	Profiles  *ProfileRefresher
-	WS        *WSSubscriber
-
-	wsEnabled bool
+	Reconcile *ReconcileLoop
 }
 
 // ControlPlaneOptions are the per-workspace construction inputs.
 type ControlPlaneOptions struct {
 	ProxyConfig Config
 	Client      *Client
-	Scheduler   ClaimScheduler
+	Claimer     Claimer
 	Registry    *registry.Registry
-	LeaseHooks  LeaseHooks
-	Reporter    *ModelCatalogReporter
-	Metrics     Metrics
+	Capacity    func() int
+	Reconciler  Reconciler
+	Interval    time.Duration
 	Logger      *slog.Logger
-	WorkspaceID string
-	WSEnabled   bool
+}
+
+// Reconciler converges in-flight tasks (the dispatcher's round).
+type Reconciler interface {
+	Reconcile(ctx context.Context) error
 }
 
 // NewControlPlane builds the loop set for one workspace.
 func NewControlPlane(opts ControlPlaneOptions) *ControlPlane {
-	logger := opts.Logger
-	if logger == nil {
-		logger = slog.Default()
+	interval := opts.Interval
+	if interval <= 0 {
+		interval = 30 * time.Second
 	}
-	claim := NewClaimLoop(opts.ProxyConfig, opts.Client, opts.Scheduler)
-	heartbeat := NewHeartbeatLoop(opts.Client, opts.Reporter)
-	lease := NewLeaseKeeper(opts.Client, opts.Registry, opts.LeaseHooks, opts.ProxyConfig.LeaseRefreshInterval,
-		WithLeaseWorkspace(opts.WorkspaceID))
-	refresher := NewProfileRefresher(opts.Client, WithProfileRefresherLogger(logger))
-	plane := &ControlPlane{
-		Claim:     claim,
-		Heartbeat: heartbeat,
-		Lease:     lease,
-		Profiles:  refresher,
-		wsEnabled: opts.WSEnabled,
+	return &ControlPlane{
+		Claim:     NewClaimLoop(opts.ProxyConfig, opts.Client, opts.Claimer, opts.Capacity),
+		Reconcile: NewReconcileLoop(opts.Reconciler, interval),
 	}
-	if opts.WSEnabled {
-		plane.WS = NewWSSubscriber(opts.Client, claim.Wake, opts.Metrics,
-			WithProfileChangeNotify(refresher.Notify))
-	}
-	return plane
-}
-
-// SetLeaderGate wires the control-plane ownership check on the actions §1.1
-// enumerates as holder-only: claim, heartbeat (ack consumption), WS
-// subscription and the probe-backed profile refresh. Prepare-lease renewal is
-// deliberately NOT gated: §1.1 lists 续租 among the requests a non-holder
-// still forwards, and §10 requires a renewal cadence well below the
-// control-plane lease timing.
-func (c *ControlPlane) SetLeaderGate(g func() bool) {
-	c.Claim.SetLeaderGate(g)
-	c.Heartbeat.SetLeaderGate(g)
-	c.Profiles.SetLeaderGate(g)
-	if c.WS != nil {
-		c.WS.SetLeaderGate(g)
-	}
-}
-
-// SetDeclarationPublisher wires the post-C1 declaration writer: the holder
-// publishes each workspace's registration identity so followers and a future
-// takeover adopt it without re-registering (AC-77 沿用同一注册身份).
-func (c *ControlPlane) SetDeclarationPublisher(fn func(context.Context, *Client) error) {
-	c.Claim.SetRegisteredHook(fn)
 }
 
 // Component is one supervised loop.
@@ -92,16 +53,38 @@ type Component struct {
 
 // Components renders the loop set in supervision order.
 func (c *ControlPlane) Components() []Component {
-	out := []Component{
+	return []Component{
 		{Name: "claim", Run: c.Claim.Run},
-		{Name: "heartbeat", Run: c.Heartbeat.Run},
-		{Name: "lease", Run: c.Lease.Run},
+		{Name: "reconcile", Run: c.Reconcile.Run},
 	}
-	if c.wsEnabled && c.WS != nil {
-		out = append(out,
-			Component{Name: "ws-subscriber", Run: c.WS.Run},
-			Component{Name: "profile-refresh", Run: c.Profiles.Run},
-		)
+}
+
+// ReconcileLoop runs the dispatcher's convergence round on a fixed cadence.
+type ReconcileLoop struct {
+	rec      Reconciler
+	interval time.Duration
+	log      *slog.Logger
+}
+
+// NewReconcileLoop builds the loop.
+func NewReconcileLoop(rec Reconciler, interval time.Duration) *ReconcileLoop {
+	return &ReconcileLoop{
+		rec:      rec,
+		interval: interval,
+		log:      slog.Default().With("component", "reconcile-loop"),
 	}
-	return out
+}
+
+// Run runs one round per interval until ctx ends.
+func (l *ReconcileLoop) Run(ctx context.Context) error {
+	for {
+		if l.rec != nil {
+			if err := l.rec.Reconcile(ctx); err != nil && ctx.Err() == nil {
+				l.log.Warn("reconcile round failed", "err", err)
+			}
+		}
+		if !sleepOrDone(ctx, l.interval) {
+			return nil
+		}
+	}
 }

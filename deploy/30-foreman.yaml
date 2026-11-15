@@ -1,20 +1,10 @@
-# Foreman Deployment + Service (02-contracts.md §9.3, §8.1).
+# Foreman v2 Deployment + Services.
 #
-# One or more replicas form one logical instance set (ADR-046 阶段二): every
-# replica serves the Job daemon face, while the control plane (registration,
-# heartbeat, subscription, claim, convergence) is held by the replica that owns
-# the shared lease. Multi-replica operation requires FOREMAN_STATE_URL: the
-# delivery queue, the in-flight counters and the per-task write locks live in
-# the shared store. The baseline ships one replica; scale up freely — the
-# strategy is RollingUpdate because a second instance no longer double-claims.
-#
-# Job pods reach Foreman through this Service (the deployment never points a
-# Job at a specific replica).
-# Environment: every key with its deployment default spelled out, except
-# MULTICA_SERVER_URL / MULTICA_WORKSPACE_ID (deployment values) and the two
-# secret keys. FOREMAN_JOB_IMAGE is a full movable image reference (ADR-012);
-# the foreman-gc DaemonSet carries the same literal — see deploy/README.md
-# §Images.
+# v2 has no per-task Kubernetes objects: Foreman registers to the multica
+# server as one daemon per workspace, claims tasks, and hands each to a
+# long-lived registered multica daemon. The long-lived daemons dial this
+# Deployment's daemon face (:8080) with their operator-issued credential; the
+# ops surface (:8081) is credential-gated.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -26,37 +16,25 @@ metadata:
     app.kubernetes.io/component: scheduler
 spec:
   replicas: 1
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
   selector:
     matchLabels:
       app.kubernetes.io/name: foreman
       app.kubernetes.io/component: scheduler
   template:
     metadata:
-      # The component key keeps this pod set disjoint from the shared-state
-      # pods (deploy/35-shared-state.yaml carries component: shared-state), so
-      # `kubectl logs deploy/foreman` and the Service below resolve only here.
       labels:
         app.kubernetes.io/name: foreman
         app.kubernetes.io/component: scheduler
       annotations:
-        # The metric endpoint is on the ops listener (02-contracts.md S-25),
-        # not the Job-facing port. Every ops request needs the bearer
-        # credential below, so a scraper must send it too (see deploy/README.md
-        # §Operations surface) — these annotations only locate the port.
+        # The metric endpoint is on the ops listener, not the daemon face.
         prometheus.io/scrape: "true"
         prometheus.io/port: "8081"
         prometheus.io/path: "/metrics"
     spec:
       serviceAccountName: foreman
-      automountServiceAccountToken: true
+      automountServiceAccountToken: false
       imagePullSecrets:
         - name: registry-tsic
-      terminationGracePeriodSeconds: 30
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -67,11 +45,7 @@ spec:
       containers:
         - name: foreman
           image: ghcr.io/tsic404/foreman:latest
-          # A moving tag: always pull so a rollout restart picks up the release
-          # the build-foreman workflow just published.
           imagePullPolicy: Always
-          # Two listeners: the Job daemon face (:8080, the only port the Job
-          # Service publishes) and the ops surface (:8081, credential-gated).
           args: ["-listen=:8080", "-ops-listen=:8081"]
           ports:
             - name: http
@@ -84,16 +58,15 @@ spec:
             # --- server identity / credentials ---
             - name: MULTICA_SERVER_URL
               value: "http://multica.tsic.top"
-            # Credential form (ADR-049). This file ships the legacy
-            # single-workspace form: one workspace-scoped credential.
+            # Credential form. This file ships the legacy single-workspace
+            # form: one workspace-scoped credential.
             #   • one user-scoped credential + no workspace id ⇒ discovery:
             #     the startup C-17 lists every workspace the credential sees;
             #     FOREMAN_DAEMON_ID is the base identity, each workspace's
             #     identity derives from it. Optional narrowing manifest:
-            #     FOREMAN_WORKSPACES_MANIFEST[_FILE] (JSON workspace-id list).
+            #     FOREMAN_WORKSPACES_MANIFEST[_FILE].
             #   • per-workspace credentials ⇒ drop MULTICA_WORKSPACE_ID and
-            #     mount FOREMAN_WORKSPACES_FILE (deploy/README.md
-            #     §Multi-workspace). A manifest is refused in this form.
+            #     mount FOREMAN_WORKSPACES_FILE.
             - name: MULTICA_WORKSPACE_ID
               value: "f311e8ff-e026-4c6e-b267-dcc004f08782"
             - name: MULTICA_TOKEN
@@ -101,34 +74,21 @@ spec:
                 secretKeyRef:
                   name: foreman-secret
                   key: MULTICA_TOKEN
-            # Workspace-scoped form: this workspace's daemon identity.
-            # Discovery form: the deployment-level base identity every
-            # workspace's identity derives from.
             - name: FOREMAN_DAEMON_ID
               value: "foreman"
-            - name: FOREMAN_JOB_TOKEN_KEY
+            # --- the long-lived daemons that register to Foreman ---
+            # Their operator-issued credential set (see 10-secrets.yaml).
+            - name: FOREMAN_DAEMON_TOKENS
               valueFrom:
                 secretKeyRef:
-                  name: foreman-secret
-                  key: FOREMAN_JOB_TOKEN_KEY
-            # Covers boot + task + drain (ADR-017): the startup self-check
-            # refuses a TTL below 300s + 86400s + 120s.
-            - name: FOREMAN_JOB_TOKEN_TTL
-              value: "24h7m"
-            # --- Job placement / lifecycle ---
-            - name: FOREMAN_JOB_NAMESPACE
-              value: "multica-agents"
-            # The address every Job daemon dials (this Foreman's Service). Must
-            # match the Service below; renaming it here without updating this
-            # key breaks the Job→Foreman loop (F5).
-            - name: FOREMAN_JOB_SERVER_URL
-              value: "http://foreman.foreman.svc.cluster.local:8080"
-            - name: FOREMAN_JOB_IMAGE
-              value: "ghcr.io/tsic404/foreman-job:latest"
-            - name: FOREMAN_MAX_INFLIGHT_JOBS
-              value: "100"
-            - name: FOREMAN_CLAIM_BATCH_MAX
-              value: "32"
+                  name: foreman-daemons
+                  key: FOREMAN_DAEMON_TOKENS
+            - name: FOREMAN_DAEMON_TOKEN_WORKSPACES
+              valueFrom:
+                secretKeyRef:
+                  name: foreman-daemons
+                  key: FOREMAN_DAEMON_TOKEN_WORKSPACES
+            # --- claim / dispatch ---
             - name: FOREMAN_CLAIM_INTERVAL
               value: "5s"
             - name: FOREMAN_CLAIM_INTERVAL_IDLE
@@ -137,147 +97,21 @@ spec:
             # 20s are refused at startup (§10: renewed every ≤20s).
             - name: FOREMAN_LEASE_REFRESH_INTERVAL
               value: "15s"
-            - name: FOREMAN_JOB_BOOT_TIMEOUT
-              value: "300s"
-            # Boot window: claim → daemon start, including every init step the
-            # template runs — the reference template fetches the agent backend
-            # there, so a slow or cold link needs a larger value (§4.2).
-            # Credential-reclaim upper bound after a task's verdict; a
-            # deployment that raises the template's
-            # terminationGracePeriodSeconds must raise this too (ADR-017).
-            - name: FOREMAN_JOB_DRAIN_TIMEOUT
-              value: "120s"
-            - name: FOREMAN_TASK_MAX_DURATION
-              value: "86400"
             - name: FOREMAN_RECONCILE_INTERVAL
               value: "30s"
-            # --- catalog probe / model catalog route (ADR-019 / ADR-025) ---
-            # Path-level switch (ack → probe → C21); false stops consuming the
-            # server's commands but keeps the startup probe (list/version truth
-            # and the template preflight).
-            - name: FOREMAN_MODEL_CATALOG_ENABLED
-              value: "true"
-            # One catalog probe's own budget, anchored at the moment the ack is
-            # consumed; must stay >= 3x the probe heartbeat interval (45s).
-            - name: FOREMAN_MODEL_CATALOG_TIMEOUT
-              value: "45s"
-            # Catalog cache staleness threshold: crossing it only warns, it
-            # never stops answering.
-            - name: FOREMAN_MODEL_CATALOG_CACHE_TTL
-              value: "6h"
-            # --- skill-bundle resolve cache (ADR-045 / §1.8) ---
-            # Fresh window: a resolved payload inside it answers locally and
-            # never reaches the server. Must not exceed the retention below.
-            - name: FOREMAN_SKILL_CACHE_FRESH_TTL
-              value: "30m"
-            # Outer age at which an entry may still answer an upstream failure
-            # (with an error-level event and a degraded count). "0" turns the
-            # downgrade off; any other value must be >= the fresh window above
-            # (a shorter one could never apply).
-            - name: FOREMAN_SKILL_CACHE_DOWNGRADE_WINDOW
-              value: "6h"
-            # An entry left unused for this long is reclaimed; the cache is
-            # process-local, so a restart starts empty.
-            - name: FOREMAN_SKILL_CACHE_RETENTION
-              value: "6h"
-            # Capacity bounds; the excess is reclaimed least-recently-used
-            # first, and a response larger than the byte bound is not stored.
-            - name: FOREMAN_SKILL_CACHE_MAX_ENTRIES
-              value: "1024"
-            - name: FOREMAN_SKILL_CACHE_MAX_BYTES
-              value: "256Mi"
-            # Startup probe window: the first probe must register within it or
-            # Foreman exits non-zero (default = FOREMAN_JOB_BOOT_TIMEOUT).
-            # Twice the boot bound here: the probe's init downloads ≈200 MB
-            # of agent backend per pod (≈40s download at the measured
-            # ~5 MB/s; cold start ≈270s, ≈262s per task, roughly doubled on
-            # a half-rate link), and a missed window CrashLoops the whole
-            # deployment instead of failing one task.
-            - name: FOREMAN_STARTUP_PROBE_TIMEOUT
-              value: "600s"
-            # --- node-local state (ADR-005) ---
-            - name: FOREMAN_STATE_ROOT
-              value: "/var/lib/foreman"
-            - name: FOREMAN_PREFER_NODE_REUSE
-              value: "true"
-            - name: FOREMAN_MAX_JOBS_PER_NODE
-              value: "4"
-            - name: FOREMAN_CACHE_MAX_BYTES
-              value: "50Gi"
-            - name: FOREMAN_CACHE_TTL
-              value: "720h"
-            - name: FOREMAN_TASK_DIR_TTL
-              value: "168h"
-            - name: FOREMAN_GC_INTERVAL
-              value: "6h"
-            - name: FOREMAN_GC_QUIESCE
-              value: "30m"
-            # Same env as the foreman-gc DaemonSet: here it
-            # bounds the learned session-index entries of the soft-affinity
-            # key, so one value keeps placement and node GC in step (ADR-015).
-            # "0" disables expiry.
-            - name: FOREMAN_AGENT_STATE_TTL
-              value: "336h"
+            # Boot window: claim → daemon start. A long-lived daemon starts
+            # immediately (no image pull, no agent download), so the default is
+            # far below v1's 300s pod window.
+            - name: FOREMAN_JOB_BOOT_TIMEOUT
+              value: "60s"
             # --- observability ---
             - name: FOREMAN_LOG_LEVEL
               value: "info"
-            # Bearer credential of the ops surface (02-contracts.md S-25):
-            # /metrics, the task projections, the payload preview, the Job log
-            # proxy, the version endpoint and /foreman/register-source all
-            # require it. Job pods never hold it, and the Job-facing Service
-            # publishes only :8080. Optional workspace-scoped credentials:
-            # FOREMAN_OPS_WORKSPACE_TOKENS="<workspace-id>=<token>,…", each
-            # reading one workspace (deploy/README.md §Operations surface).
             - name: FOREMAN_OPS_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: foreman-secret
                   key: FOREMAN_OPS_TOKEN
-            - name: FOREMAN_WS_ENABLED
-              value: "true"
-            # --- shared state (ADR-046 阶段一) ---
-            # The Job Token entries, the settled terminal records and the
-            # revocation set persist in the shared state store, so a Foreman
-            # restart restores them instead of rebuilding from K8s
-            # (02-contracts.md §4.3/§6.1). Required: the store MUST be
-            # persistent (AOF or RDB with an appropriate policy) — the
-            # contract's deployment interface list carries the connection
-            # information and the credential (§7 部署面). Unset keeps the
-            # pre-stage-one behaviour (in-memory index + K8s rebuild).
-            - name: FOREMAN_STATE_URL
-              value: "redis://foreman-redis.foreman.svc.cluster.local:6379"
-            - name: FOREMAN_STATE_PASSWORD
-              valueFrom:
-                secretKeyRef:
-                  name: foreman-secret
-                  key: FOREMAN_STATE_PASSWORD
-            # One entry's retention in the store; must cover the Job Token
-            # TTL (claim → boot → task → drain, §6.1) plus the settled-record
-            # window. Default 48h.
-            - name: FOREMAN_STATE_ENTRY_TTL
-              value: "48h"
-            # Shared-state outage grace: in-flight requests keep adjudicating
-            # from the local positive cache for this long; past it every
-            # non-terminal request fails closed (401/503, §10 共享状态不可用).
-            - name: FOREMAN_STATE_GRACE
-              value: "30s"
-            # Control-plane lease: the holder owns registration, heartbeat,
-            # subscription, claim and convergence; a dead holder is replaced
-            # after this lease plus the takeover window (§10 控制面接管有界).
-            # The window must be at least a third of the lease (one renewal
-            # tick), or startup is refused.
-            - name: FOREMAN_LEADER_LEASE_TTL
-              value: "10s"
-            - name: FOREMAN_LEADER_TAKEOVER_WINDOW
-              value: "5s"
-            # Liveness row of one replica; the shutdown path deregisters only
-            # when this replica is the last live one (§4.6 优雅关闭).
-            - name: FOREMAN_INSTANCE_TTL
-              value: "30s"
-            # Per-task write lock lease: bounds a dead holder's lock. Must
-            # cover the claim chain (secret + Job create).
-            - name: FOREMAN_TASK_LOCK_TTL
-              value: "120s"
           livenessProbe:
             httpGet:
               path: /foreman/healthz
@@ -296,8 +130,8 @@ spec:
             failureThreshold: 3
           resources:
             requests:
-              cpu: 200m
-              memory: 256Mi
+              cpu: 100m
+              memory: 128Mi
             limits:
               cpu: "1"
               memory: 512Mi
@@ -306,44 +140,9 @@ spec:
             runAsUser: 1000
             allowPrivilegeEscalation: false
             readOnlyRootFilesystem: true
-            capabilities:
-              drop: ["ALL"]
-          volumeMounts:
-            # ADR-002: no PVC. This emptyDir holds nothing but the durable
-            # terminal-report queue (contract §10) between container restarts.
-            - name: state
-              mountPath: /var/lib/foreman
-            # §8.1 template carrier: required, so a missing ConfigMap blocks
-            # pod creation with CreateContainerConfigError (the container-layer
-            # half of the fail-fast pair) instead of starting a Foreman with
-            # nothing to render from. Content: 25-job-template.yaml.
-            - name: job-template
-              mountPath: /etc/foreman/job-template
-              readOnly: true
-            # §8.5 policy file: the three-axis policy carrier. Optional on
-            # purpose — an absent file is a legal default (all three axes read
-            # None), so this volume must not block startup. Content:
-            # 26-job-policy.yaml.
-            - name: job-policy
-              mountPath: /etc/foreman/policy
-              readOnly: true
-      volumes:
-        - name: state
-          emptyDir: {}
-        - name: job-template
-          configMap:
-            name: foreman-job-template
-            optional: false
-        - name: job-policy
-          configMap:
-            name: foreman-job-policy
-            optional: true
 ---
-# Job-side entry point: the Job daemon's MULTICA_SERVER_URL resolves to
-# foreman.foreman.svc.cluster.local:8080 (contract §8.2 A1.1). This Service
-# publishes the Job face only (02-contracts.md S-25): the ops listener is not a
-# port of this Service, so a Job pod that resolves this name reaches no ops
-# route.
+# Daemon face: the address the long-lived daemons dial. Only this port is
+# published.
 apiVersion: v1
 kind: Service
 metadata:
@@ -361,13 +160,8 @@ spec:
     - name: http
       port: 8080
       targetPort: http
-      protocol: TCP
 ---
-# Ops surface entry point (02-contracts.md S-25): metrics, task projections,
-# the payload preview, the Job log proxy, the version endpoint and
-# /foreman/register-source. Every request must carry the bearer credential in
-# FOREMAN_OPS_TOKEN; the port is deliberately not part of the Job Service
-# above. Scrape/port-forward this Service, not the Job one.
+# Ops face: metrics + task projections, credential-gated.
 apiVersion: v1
 kind: Service
 metadata:
@@ -376,13 +170,6 @@ metadata:
   labels:
     app.kubernetes.io/name: foreman
     app.kubernetes.io/component: scheduler
-    # Service-only label: the scrape object selects this Service (the metric
-    # port lives here), not the Job-facing one. It is not a pod label.
-    foreman.tsic.top/surface: ops
-  annotations:
-    prometheus.io/scrape: "true"
-    prometheus.io/port: "8081"
-    prometheus.io/path: "/metrics"
 spec:
   type: ClusterIP
   selector:
@@ -392,4 +179,3 @@ spec:
     - name: ops
       port: 8081
       targetPort: ops
-      protocol: TCP

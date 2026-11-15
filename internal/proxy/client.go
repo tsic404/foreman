@@ -1,78 +1,179 @@
+// Package proxy implements v2's two protocol faces:
+//
+//   - the fake client: Foreman registers itself to the multica server as one
+//     daemon per workspace, claims tasks in batches, renews leases, forwards
+//     lifecycle callbacks, and renews its token;
+//   - the fake server: Foreman answers the long-lived multica daemons that
+//     register to it (S1–S32), authenticates them with an operator-issued
+//     bearer credential, and hands each the task it was assigned.
+//
+// v2 dropped everything that existed only because a task used to be a
+// disposable pod: the startup/registration-discovery probe, the catalog-probe
+// Job, the WS control channel (§2 of the v1 contract) and the Job Token
+// minting per task.
 package proxy
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
-	"net"
 	"net/http"
-	"net/textproto"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
-
-	"github.com/tsic404/foreman/internal/registry"
-	"github.com/tsic404/foreman/internal/scheduler"
 )
 
-// Client is the fake client: every F→S call of §1.2 (C-1–C-21). It injects
-// the daemon identity headers and Foreman's server credential, caches the
-// declared real runtime set, and owns the terminal-forward retry budget.
+// Environment variable names read by the proxy module.
+const (
+	EnvServerURL            = "MULTICA_SERVER_URL"
+	EnvWorkspaceID          = "MULTICA_WORKSPACE_ID"
+	EnvDaemonID             = "FOREMAN_DAEMON_ID"
+	EnvClaimInterval        = "FOREMAN_CLAIM_INTERVAL"
+	EnvClaimIntervalIdle    = "FOREMAN_CLAIM_INTERVAL_IDLE"
+	EnvLeaseRefreshInterval = "FOREMAN_LEASE_REFRESH_INTERVAL"
+)
+
+// Defaults applied when the environment variable is unset.
+const (
+	DefaultDaemonID             = "foreman"
+	DefaultClaimInterval        = 5 * time.Second
+	DefaultClaimIntervalIdle    = 30 * time.Second
+	DefaultLeaseRefreshInterval = 15 * time.Second
+
+	// MaxLeaseRefreshInterval caps the renewal cadence: §10 requires a claimed,
+	// not-yet-started task to be renewed at least every 20s.
+	MaxLeaseRefreshInterval = 20 * time.Second
+
+	// ClientCapabilities is the X-Client-Capabilities header value (§1.1).
+	ClientCapabilities = "skill-bundles-v1,coalesced-comments-v1,rpc-v1"
+
+	controlTimeout = 30 * time.Second
+	leaseTimeout   = 10 * time.Second
+)
+
+// Config is the fake client's configuration: one (credential, daemon identity,
+// workspace) tuple.
+type Config struct {
+	ServerURL   string
+	WorkspaceID string
+	DaemonID    string
+	Version     string
+
+	ClaimInterval        time.Duration
+	ClaimIntervalIdle    time.Duration
+	LeaseRefreshInterval time.Duration
+}
+
+// LoadConfig reads the client configuration from env.
+func LoadConfig(getenv func(string) string) (Config, error) {
+	if getenv == nil {
+		getenv = func(k string) string { return "" }
+	}
+	cfg := Config{
+		DaemonID:             DefaultDaemonID,
+		Version:              "dev",
+		ClaimInterval:        DefaultClaimInterval,
+		ClaimIntervalIdle:    DefaultClaimIntervalIdle,
+		LeaseRefreshInterval: DefaultLeaseRefreshInterval,
+	}
+	cfg.ServerURL = strings.TrimRight(strings.TrimSpace(getenv(EnvServerURL)), "/")
+	if cfg.ServerURL == "" {
+		return Config{}, fmt.Errorf("%s is required", EnvServerURL)
+	}
+	parsed, err := url.Parse(cfg.ServerURL)
+	if err != nil {
+		return Config{}, fmt.Errorf("%s is not a valid URL: %v", EnvServerURL, err)
+	}
+	if parsed.Scheme != "http" && parsed.Scheme != "https" {
+		return Config{}, fmt.Errorf("%s must use http or https, got %q", EnvServerURL, parsed.Scheme)
+	}
+	cfg.WorkspaceID = strings.TrimSpace(getenv(EnvWorkspaceID))
+	if v := strings.TrimSpace(getenv(EnvDaemonID)); v != "" {
+		cfg.DaemonID = v
+	}
+	if cfg.ClaimInterval, err = envDuration(getenv, EnvClaimInterval, cfg.ClaimInterval); err != nil {
+		return Config{}, err
+	}
+	if cfg.ClaimIntervalIdle, err = envDuration(getenv, EnvClaimIntervalIdle, cfg.ClaimIntervalIdle); err != nil {
+		return Config{}, err
+	}
+	if cfg.LeaseRefreshInterval, err = envDuration(getenv, EnvLeaseRefreshInterval, cfg.LeaseRefreshInterval); err != nil {
+		return Config{}, err
+	}
+	if cfg.LeaseRefreshInterval > MaxLeaseRefreshInterval {
+		return Config{}, fmt.Errorf("%s (%s) must be <= %s",
+			EnvLeaseRefreshInterval, cfg.LeaseRefreshInterval, MaxLeaseRefreshInterval)
+	}
+	return cfg, nil
+}
+
+func envDuration(getenv func(string) string, key string, def time.Duration) (time.Duration, error) {
+	raw := strings.TrimSpace(getenv(key))
+	if raw == "" {
+		return def, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil || d <= 0 {
+		return 0, fmt.Errorf("%s must be a positive duration: %q", key, raw)
+	}
+	return d, nil
+}
+
+// ---- status errors ----
+
+// StatusError is a non-2xx server response.
+type StatusError struct {
+	Code int
+	Body []byte
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("server returned %d", e.Code)
+}
+
+// ErrTerminalUndelivered reports a terminal forward whose retry budget ran out.
+var ErrTerminalUndelivered = errors.New("terminal report undelivered after retry budget")
+
+// ---- fake client ----
+
+// RuntimeRef is one runtime the server assigned to Foreman's registration.
+type RuntimeRef struct {
+	ID        string
+	Provider  string
+	ProfileID string
+	Name      string
+}
+
+// Key is the identity key (provider \x00 profile id).
+func (r RuntimeRef) Key() string { return r.Provider + "\x00" + r.ProfileID }
+
+// Client is the fake client: every Foreman→server call.
 type Client struct {
 	cfg     Config
 	token   string
-	ctrl    *http.Client // 30s control plane (§1.5)
-	lease   *http.Client // 10s prepare-lease (§1.5)
-	pass    *http.Client // S29: same budget, compression negotiation off
+	ctrl    *http.Client
+	lease   *http.Client
 	metrics Metrics
 	log     *slog.Logger
 
-	// startup stages the startup discovery result by provider until C1 binds
-	// it; slots is the per-real-runtime catalog cache (C21).
-	startup *registry.StartupCatalog
-	slots   *CatalogSlots
-	// taskRuntime resolves the real runtime id a task was dispatched under,
-	// which the S-8 body needs (S-8).
-	taskRuntime func(taskID string) string
+	// runtimes is the declared set. v2 declares one runtime per daemon that
+	// registered to Foreman; the server binds each to a real runtime id.
+	runtimes []RuntimeRef
+	// discovery carries the declared runtimes until the first C1 binds ids.
+	declared []DeclaredRuntime
 
-	mu             sync.RWMutex
-	disc           registry.Discovery
-	refs           []RuntimeRef
-	state          WorkspaceState
-	workspace      string // workspace display name from C17
-	source         string // declaration source: startup or discovery-probe
-	profiles       profileSnapshot
-	discoveryProbe DiscoveryProbeRunner
+	workspaceName string
+}
 
-	// opMu serializes every C1 write: the startup/rebuild register and the
-	// §1.6 refresh sequence (which also creates a probe Job while holding it).
-	opMu sync.Mutex
-
-	// reposMu guards reposCall, the C-22 single-flight slot.
-	reposMu   sync.Mutex
-	reposCall *reposRefresh
-
-	// lost records, per provider, that a 404 "runtime not found" proved that
-	// row deleted and its re-register failed (§1.5); it survives
-	// so the next successful C1 still treats that runtime as rebuilt (C15 +
-	// runtime-set signal) — and only that one.
-	lost map[string]bool
-
-	terminalWaits []time.Duration // §10 terminal retry budget
-	relayWaits    []time.Duration // C-21 relay budget progression (tests)
-
-	// changes is the legacy fan-in channel every notifyChange also feeds;
-	// changeSubs are the per-consumer streams. The loops must each see every
-	// notification, so they subscribe (Changes alone would let the two
-	// consumers race for one queue item).
-	changes    chan RuntimeChange
-	changesMu  sync.Mutex
-	changeSubs []chan RuntimeChange
+// DeclaredRuntime is one runtime Foreman reports at C1, derived from the
+// daemons currently registered to it.
+type DeclaredRuntime struct {
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Version   string `json:"version"`
+	ProfileID string `json:"profile_id"`
 }
 
 // Option customizes a Client.
@@ -83,117 +184,281 @@ func WithMetrics(m Metrics) Option {
 	return func(c *Client) { c.metrics = orNoopMetrics(m) }
 }
 
-// WithLogger overrides the logger (tests).
+// WithLogger overrides the logger.
 func WithLogger(l *slog.Logger) Option {
 	return func(c *Client) { c.log = l.With("component", "proxy-client") }
 }
 
-// WithTerminalRetryWaits overrides the §10 terminal retry budget (tests).
-func WithTerminalRetryWaits(waits []time.Duration) Option {
-	return func(c *Client) { c.terminalWaits = waits }
-}
-
-// WithRelayBackoff overrides the C-21 relay backoff progression (tests);
-// the production progression is the §1.5 1s→30s one.
-func WithRelayBackoff(waits []time.Duration) Option {
-	return func(c *Client) { c.relayWaits = waits }
-}
-
-// NewClient builds the fake client. token is Foreman's server credential
-// (mdt_/mul_, auth.LoadServerToken); it is never forwarded to Jobs (F3).
+// NewClient builds the fake client. token is Foreman's server credential.
 func NewClient(cfg Config, token string, opts ...Option) *Client {
 	c := &Client{
-		cfg:   cfg,
-		token: token,
-		ctrl:  &http.Client{Timeout: controlTimeout},
-		lease: &http.Client{Timeout: leaseTimeout},
-		pass: &http.Client{
-			Transport: passthroughTransport(),
-			// No whole-request deadline: with the body streamed in both
-			// directions (ADR-046) a client timeout would cut a transfer that
-			// is merely slow instead of bounding a dead upstream. The bound
-			// that matters — no response head within the control budget —
-			// lives on the transport.
-			// A 3xx is the upstream's answer to hand back verbatim: the caller
-			// decides whether to follow it (§2.4: S-29 已知边界).
-			CheckRedirect: func(*http.Request, []*http.Request) error {
-				return http.ErrUseLastResponse
-			},
-		},
+		cfg:     cfg,
+		token:   token,
+		ctrl:    &http.Client{Timeout: controlTimeout},
+		lease:   &http.Client{Timeout: leaseTimeout},
 		metrics: noopMetrics{},
 		log:     slog.Default().With("component", "proxy-client"),
-		source:  declarationSourceStartup,
-
-		terminalWaits: terminalRetryWaits,
-		changes:       make(chan RuntimeChange, 16),
-	}
-	if c.cfg.WorkspaceStateTimeout <= 0 {
-		c.cfg.WorkspaceStateTimeout = DefaultWorkspaceStateTimeout
 	}
 	for _, opt := range opts {
 		opt(c)
 	}
-	if c.startup == nil {
-		c.startup = registry.NewStartupCatalog()
-	}
-	if c.slots == nil {
-		c.slots = NewCatalogSlots()
-	}
 	return c
 }
 
-// WorkspaceState returns the workspace state carrier seeded by C-1 and
-// refreshed by C-22 (§1.7): repos / repos_version / settings verbatim plus the
-// seeded flag that marks the pre-C1 window.
-func (c *Client) WorkspaceState() WorkspaceState {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.state.clone()
-}
-
-// WorkspaceID returns the workspace this client serves. One client serves one
-// (credential, daemon identity) pair (§0).
+// WorkspaceID returns the workspace this client serves.
 func (c *Client) WorkspaceID() string { return c.cfg.WorkspaceID }
 
-// DaemonID returns the daemon identity this client registers under.
+// DaemonID returns the daemon identity Foreman registers under.
 func (c *Client) DaemonID() string { return c.cfg.DaemonID }
 
-// CatalogSlots returns the per-real-runtime catalog cache this client owns.
-func (c *Client) CatalogSlots() *CatalogSlots { return c.slots }
+// WorkspaceName returns the server's display name for the workspace.
+func (c *Client) WorkspaceName() (string, bool) {
+	return c.workspaceName, c.workspaceName != ""
+}
 
-// Workspace returns the workspace id and the display name cached by C17
-// (falling back to the id until the preflight runs).
-func (c *Client) Workspace() (id, name string) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	if c.workspace == "" {
-		return c.cfg.WorkspaceID, c.cfg.WorkspaceID
+// SetWorkspaceName records the display name (from a C17 answer).
+func (c *Client) SetWorkspaceName(name string) { c.workspaceName = name }
+
+// RuntimeIDs returns the real runtime ids the server assigned.
+func (c *Client) RuntimeIDs() []string {
+	ids := make([]string, 0, len(c.runtimes))
+	for _, r := range c.runtimes {
+		if r.ID != "" {
+			ids = append(ids, r.ID)
+		}
 	}
-	return c.cfg.WorkspaceID, c.workspace
+	return ids
 }
 
-// WorkspaceName returns the display name cached by C17 and whether it was
-// actually seeded. An unseeded name means the authority has not answered yet
-// (a transient C-17 failure in the workspace-scoped form) — never a fact about
-// the workspace, so callers must not treat "" as the name.
-func (c *Client) WorkspaceName() (name string, seeded bool) {
-	c.mu.RLock()
-	defer c.mu.RUnlock()
-	return c.workspace, c.workspace != ""
+// RuntimeRefs returns the declared runtimes and their ids.
+func (c *Client) RuntimeRefs() []RuntimeRef { return append([]RuntimeRef(nil), c.runtimes...) }
+
+// SetDeclared updates the runtime set Foreman will declare at the next C1. It
+// is called when a daemon registers or goes away.
+func (c *Client) SetDeclared(d []DeclaredRuntime) { c.declared = d }
+
+// Register performs C1 with the current declaration. A server that answers
+// binds each declared identity to a real runtime id.
+func (c *Client) Register(ctx context.Context) error {
+	if len(c.declared) == 0 {
+		return errors.New("register: no runtime declared (no daemon registered yet)")
+	}
+	payloads := make([]runtimePayload, 0, len(c.declared))
+	for _, d := range c.declared {
+		if d.Type == "" {
+			continue
+		}
+		payloads = append(payloads, runtimePayload{
+			Name: d.Name, Type: d.Type, Version: d.Version,
+			Status: "online", ProfileID: d.ProfileID,
+		})
+	}
+	if len(payloads) == 0 {
+		return errors.New("register: declared set has no usable runtime")
+	}
+	body := registerRequest{
+		WorkspaceID:     c.cfg.WorkspaceID,
+		DaemonID:        c.cfg.DaemonID,
+		LegacyDaemonIDs: []string{},
+		DeviceName:      "foreman",
+		CLIVersion:      c.cfg.Version,
+		Runtimes:        payloads,
+	}
+	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodPost, "/api/daemon/register", mustMarshal(body))
+	if err != nil {
+		return fmt.Errorf("register: %w", err)
+	}
+	if code < 200 || code >= 300 {
+		return fmt.Errorf("register: %w", &StatusError{Code: code, Body: raw})
+	}
+	var resp registerResponse
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return fmt.Errorf("register: decode: %w", err)
+	}
+	c.runtimes = bindRuntimes(payloads, resp.Runtimes)
+	return nil
 }
 
-// ---- C1 register (runtime.go) ----
+// ClaimTasks is C3 over the declared runtime set.
+func (c *Client) ClaimTasks(ctx context.Context, maxTasks int) ([]json.RawMessage, error) {
+	if maxTasks < 1 {
+		return nil, nil
+	}
+	ids := c.RuntimeIDs()
+	if len(ids) == 0 {
+		return nil, nil
+	}
+	body, err := json.Marshal(map[string]any{
+		"daemon_id":   c.cfg.DaemonID,
+		"runtime_ids": ids,
+		"max_tasks":   maxTasks,
+	})
+	if err != nil {
+		return nil, err
+	}
+	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodPost, "/api/daemon/tasks/claim", body)
+	if err != nil {
+		c.metrics.ClaimError("transport")
+		return nil, fmt.Errorf("claim: %w", err)
+	}
+	if code < 200 || code >= 300 {
+		c.metrics.ClaimError(fmt.Sprintf("%d", code))
+		return nil, fmt.Errorf("claim: %w", &StatusError{Code: code, Body: raw})
+	}
+	var resp struct {
+		Tasks []json.RawMessage `json:"tasks"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		c.metrics.ClaimError("decode")
+		return nil, fmt.Errorf("claim: decode: %w", err)
+	}
+	return resp.Tasks, nil
+}
 
-// registerRequest is the C1 body (§1.2; field names strict, type not
-// provider, legacy_daemon_ids empty). failed_profiles travels verbatim from
-// the startup probe's registration body — Foreman never interprets it.
+// PrepareLease is C4. 200 → ready, 400 → not ready, 404 → ErrTaskNotFound.
+func (c *Client) PrepareLease(ctx context.Context, runtimeID, taskID string) (bool, error) {
+	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/prepare-lease",
+		url.PathEscape(runtimeID), url.PathEscape(taskID))
+	code, raw, err := c.doOnce(ctx, c.lease, http.MethodPost, path, []byte("{}"))
+	if err != nil {
+		return false, err
+	}
+	switch {
+	case code >= 200 && code < 300:
+		return true, nil
+	case code == http.StatusBadRequest:
+		return false, nil
+	case code == http.StatusNotFound:
+		return false, ErrTaskNotFound
+	default:
+		return false, &StatusError{Code: code, Body: raw}
+	}
+}
+
+// TaskStatus is C13.
+func (c *Client) TaskStatus(ctx context.Context, taskID string) (string, error) {
+	path := "/api/daemon/tasks/" + url.PathEscape(taskID) + "/status"
+	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodGet, path, nil)
+	if err != nil {
+		return "", err
+	}
+	if code == http.StatusNotFound {
+		return "", ErrTaskNotFound
+	}
+	if code < 200 || code >= 300 {
+		return "", &StatusError{Code: code, Body: raw}
+	}
+	var resp struct {
+		Status string `json:"status"`
+	}
+	if err := json.Unmarshal(raw, &resp); err != nil {
+		return "", fmt.Errorf("task status: decode: %w", err)
+	}
+	return resp.Status, nil
+}
+
+// ForwardInWorkspace posts one lifecycle callback (C5–C12). Terminal endpoints
+// carry the retry budget.
+func (c *Client) ForwardInWorkspace(ctx context.Context, ep Endpoint, taskID, workspaceID string, body []byte) (int, []byte, error) {
+	if workspaceID != "" && workspaceID != c.cfg.WorkspaceID {
+		return 0, nil, fmt.Errorf("workspace %s is not served by this client", workspaceID)
+	}
+	path := endpointPath(ep, taskID)
+	if path == "" {
+		return 0, nil, fmt.Errorf("unknown endpoint %q", ep)
+	}
+	if !ep.IsTerminal() {
+		return c.forwardOnce(ctx, ep, path, body)
+	}
+	for attempt, wait := range terminalRetryWaits {
+		if attempt > 0 {
+			select {
+			case <-ctx.Done():
+				return 0, nil, ctx.Err()
+			case <-time.After(wait):
+			}
+		}
+		code, resp, err := c.forwardOnce(ctx, ep, path, body)
+		if err == nil && code < 500 && code != http.StatusRequestTimeout && code != http.StatusTooManyRequests {
+			return code, resp, nil
+		}
+	}
+	return 0, nil, fmt.Errorf("%w: %s %s", ErrTerminalUndelivered, ep, taskID)
+}
+
+func (c *Client) forwardOnce(ctx context.Context, ep Endpoint, path string, body []byte) (int, []byte, error) {
+	start := time.Now()
+	code, resp, err := c.doOnce(ctx, c.ctrl, http.MethodPost, path, body)
+	c.metrics.Forward(string(ep), code, time.Since(start))
+	return code, resp, err
+}
+
+// RenewToken is C16 (non-fatal at the call site).
+func (c *Client) RenewToken(ctx context.Context) error {
+	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodPost, "/api/tokens/current/renew", []byte("{}"))
+	if err != nil {
+		return err
+	}
+	if code < 200 || code >= 300 {
+		return &StatusError{Code: code, Body: raw}
+	}
+	return nil
+}
+
+// Deregister is C14 (graceful shutdown).
+func (c *Client) Deregister(ctx context.Context) error {
+	ids := c.RuntimeIDs()
+	if len(ids) == 0 {
+		return nil
+	}
+	body, err := json.Marshal(map[string]any{"runtime_ids": ids})
+	if err != nil {
+		return err
+	}
+	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodPost, "/api/daemon/deregister", body)
+	if err != nil {
+		return fmt.Errorf("deregister: %w", err)
+	}
+	if code < 200 || code >= 300 {
+		return fmt.Errorf("deregister: %w", &StatusError{Code: code, Body: raw})
+	}
+	return nil
+}
+
+// doOnce performs one request with the daemon identity headers and Foreman's
+// server credential.
+func (c *Client) doOnce(ctx context.Context, hc *http.Client, method, path string, body []byte) (int, []byte, error) {
+	req, err := http.NewRequestWithContext(ctx, method, c.cfg.ServerURL+path, bodyReader(body))
+	if err != nil {
+		return 0, nil, err
+	}
+	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("X-Client-Capabilities", ClientCapabilities)
+	req.Header.Set("X-Client-Version", c.cfg.Version)
+	req.Header.Set("X-Daemon-Id", c.cfg.DaemonID)
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return 0, nil, err
+	}
+	defer resp.Body.Close()
+	raw, err := readLimited(resp.Body)
+	if err != nil {
+		return resp.StatusCode, nil, err
+	}
+	return resp.StatusCode, raw, nil
+}
+
+// ---- wire types ----
+
 type registerRequest struct {
 	WorkspaceID     string            `json:"workspace_id"`
 	DaemonID        string            `json:"daemon_id"`
 	LegacyDaemonIDs []string          `json:"legacy_daemon_ids"`
 	DeviceName      string            `json:"device_name"`
 	CLIVersion      string            `json:"cli_version"`
-	LaunchedBy      string            `json:"launched_by"`
 	Runtimes        []runtimePayload  `json:"runtimes"`
 	FailedProfiles  []json.RawMessage `json:"failed_profiles"`
 }
@@ -208,495 +473,75 @@ type runtimePayload struct {
 
 type registerResponse struct {
 	Runtimes []runtimeAnswer `json:"runtimes"`
-	// Repos / repos_version / settings replay verbatim into the workspace state
-	// carrier (§1.7): a nil raw field means the upstream did not send the key.
-	Repos        json.RawMessage `json:"repos"`
-	ReposVersion json.RawMessage `json:"repos_version"`
-	Settings     json.RawMessage `json:"settings"`
 }
 
-// recoverOrphans is C15, called only after a real-runtime rebuild (§1.2).
-func (c *Client) recoverOrphans(ctx context.Context, runtimeID string) {
-	var resp struct {
-		Orphaned int `json:"orphaned"`
-		Retried  int `json:"retried"`
-	}
-	path := fmt.Sprintf("/api/daemon/runtimes/%s/recover-orphans", url.PathEscape(runtimeID))
-	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodPost, path, []byte("{}"))
-	if err == nil && code >= 200 && code < 300 {
-		err = json.Unmarshal(raw, &resp)
-	}
-	if err != nil {
-		c.log.Warn("recover-orphans failed", "runtime_id", runtimeID, "err", err)
-		return
-	}
-	if resp.Orphaned > 0 {
-		c.log.Warn("recover-orphans settled orphans", "orphaned", resp.Orphaned, "retried", resp.Retried)
-	}
+type runtimeAnswer struct {
+	ID        string  `json:"id"`
+	Name      string  `json:"name"`
+	Provider  string  `json:"provider"`
+	Status    string  `json:"status"`
+	ProfileID *string `json:"profile_id"`
 }
 
-// Preflight runs the post-registration startup checks: C16 token renew
-// (non-fatal). C1 is carried by the cached declaration unless a live runtime
-// set already exists. C18 is not part of the preflight: the profile snapshot is
-// taken before the startup probe (§1.6 startup order). C17 is not part of the
-// preflight either: discovery/scope validation happens once at startup
-// (ADR-049), and §1.5 keeps runtime credential failures inside the per-§1.4
-// backoff — a runtime 401/403 is retried, never judged config (AC-86). Callers
-// retry with the §1.5 backoff.
-func (c *Client) Preflight(ctx context.Context) error {
-	if len(c.RuntimeIDs()) == 0 {
-		if err := c.Register(ctx); err != nil {
-			return err
+// bindRuntimes matches every declared runtime to exactly one answered row by
+// identity (provider, profile_id), preferring a name match and then the
+// smallest id (§2.3, ADR-043).
+func bindRuntimes(declared []runtimePayload, answers []runtimeAnswer) []RuntimeRef {
+	byIdentity := map[string][]runtimeAnswer{}
+	for _, a := range answers {
+		pid := ""
+		if a.ProfileID != nil {
+			pid = *a.ProfileID
 		}
+		key := a.Provider + "\x00" + pid
+		byIdentity[key] = append(byIdentity[key], a)
 	}
-	if err := c.RenewToken(ctx); err != nil {
-		c.log.Warn("token renew failed (non-fatal)", "err", err)
+	refs := make([]RuntimeRef, 0, len(declared))
+	for _, d := range declared {
+		key := d.Type + "\x00" + d.ProfileID
+		cands := byIdentity[key]
+		if len(cands) == 0 {
+			continue
+		}
+		pick := cands[0]
+		for _, a := range cands {
+			if a.Name == d.Name {
+				pick = a
+				break
+			}
+			if a.ID < pick.ID {
+				pick = a
+			}
+		}
+		refs = append(refs, RuntimeRef{
+			ID: pick.ID, Provider: d.Type, ProfileID: d.ProfileID, Name: d.Name,
+		})
 	}
-	return nil
+	return refs
 }
 
-// ---- C5–C12 lifecycle forward ----
-
-// endpointPath maps a lifecycle endpoint to its §1.2 path suffix.
-func endpointPath(ep scheduler.Endpoint, taskID string) string {
+// endpointPath maps a lifecycle endpoint to its C-path.
+func endpointPath(ep Endpoint, taskID string) string {
 	t := url.PathEscape(taskID)
 	switch ep {
-	case scheduler.EPStart:
+	case EPStart:
 		return "/api/daemon/tasks/" + t + "/start"
-	case scheduler.EPProgress:
+	case EPProgress:
 		return "/api/daemon/tasks/" + t + "/progress"
-	case scheduler.EPMessages:
+	case EPMessages:
 		return "/api/daemon/tasks/" + t + "/messages"
-	case scheduler.EPUsage:
+	case EPUsage:
 		return "/api/daemon/tasks/" + t + "/usage"
-	case scheduler.EPComplete:
+	case EPComplete:
 		return "/api/daemon/tasks/" + t + "/complete"
-	case scheduler.EPFail:
+	case EPFail:
 		return "/api/daemon/tasks/" + t + "/fail"
-	case scheduler.EPCancelAck:
+	case EPCancelAck:
 		return "/api/daemon/tasks/" + t + "/cancel-ack"
-	case scheduler.EPSession:
+	case EPSession:
 		return "/api/daemon/tasks/" + t + "/session"
-	case scheduler.EPWaitLocalDir:
+	case EPWaitLocalDir:
 		return "/api/daemon/tasks/" + t + "/wait-local-directory"
 	}
 	return ""
-}
-
-// Forward posts a lifecycle callback (C5–C12) with Foreman's server
-// credential and returns the upstream status and body. S8 is the one
-// callback whose body names a runtime — the daemon names the job runtime it
-// was handed (S-6), the server knows only the real runtime id its claim
-// was dispatched under — so the identity is translated exactly as S7
-// translates {rid}. Terminal endpoints carry the §10 retry budget
-// (4s/8s/16s/32s/64s; 5xx/408/429/network only); exhaustion returns
-// ErrTerminalUndelivered for the PendingReports queue.
-func (c *Client) Forward(ctx context.Context, ep scheduler.Endpoint, taskID string, body []byte) (int, []byte, error) {
-	return c.ForwardInWorkspace(ctx, ep, taskID, c.cfg.WorkspaceID, body)
-}
-
-// ForwardInWorkspace forwards a task-addressed callback for workspaceID. A
-// Client owns exactly one (credential, daemon identity) pair (§1.1), so a
-// different workspace is a routing error, never a borrowed credential.
-func (c *Client) ForwardInWorkspace(ctx context.Context, ep scheduler.Endpoint, taskID, workspaceID string, body []byte) (int, []byte, error) {
-	if workspaceID != "" && workspaceID != c.cfg.WorkspaceID {
-		return 0, nil, fmt.Errorf("workspace %s is not served by the %s client", workspaceID, c.cfg.WorkspaceID)
-	}
-	path := endpointPath(ep, taskID)
-	if path == "" {
-		return 0, nil, fmt.Errorf("unknown endpoint %q", ep)
-	}
-	if ep == scheduler.EPStart {
-		translated, err := c.translateStartBody(taskID, body)
-		if err != nil {
-			return 0, nil, err
-		}
-		body = translated
-	}
-	if !ep.IsTerminal() {
-		return c.forwardOnce(ctx, ep, path, body)
-	}
-	for attempt, wait := range c.terminalWaits {
-		if attempt > 0 {
-			select {
-			case <-ctx.Done():
-				return 0, nil, ctx.Err()
-			case <-time.After(wait):
-			}
-		}
-		code, resp, err := c.forwardOnce(ctx, ep, path, body)
-		if err == nil && code < 500 && code != http.StatusRequestTimeout && code != http.StatusTooManyRequests {
-			return code, resp, nil
-		}
-		if err != nil {
-			c.log.Warn("terminal forward attempt failed", "task_id", taskID, "endpoint", string(ep), "attempt", attempt+1, "err", err)
-		} else {
-			c.log.Warn("terminal forward attempt rejected", "task_id", taskID, "endpoint", string(ep), "attempt", attempt+1, "status", code)
-		}
-	}
-	return 0, nil, fmt.Errorf("%w: %s %s", ErrTerminalUndelivered, ep, taskID)
-}
-
-// translateStartBody rewrites the runtime identity an S8 body carries: the
-// daemon names the job runtime it was handed at S6, while the server knows
-// only the real runtime id its claim was dispatched under. Forwarded
-// verbatim, the daemon's identity reads as a claim the server no longer
-// holds, and the start is refused (409 状态不允许, S-8 +
-// §2.2) — so the field is translated like S7's {rid}.
-// The id comes from the task's own dispatch record, which a rebuilt entry
-// restores from its Job annotations (§4.3); a task without one (a Job
-// rendered before that annotation) falls back to the only declared runtime,
-// and a set that is not registered yet leaves the body verbatim. Every other field keeps its
-// value: the re-marshal may reorder keys and HTML-escape, which §2.4 excludes
-// from the fidelity face (key order has no HTTP or JSON semantics), and a body
-// naming no runtime is forwarded byte-for-byte.
-func (c *Client) translateStartBody(taskID string, body []byte) ([]byte, error) {
-	if len(body) == 0 {
-		return body, nil
-	}
-	var fields map[string]json.RawMessage
-	if err := json.Unmarshal(body, &fields); err != nil {
-		return body, nil
-	}
-	if _, ok := fields["runtime_id"]; !ok {
-		return body, nil
-	}
-	runtimeID, exact := c.runtimeForTask(taskID)
-	if runtimeID == "" {
-		return body, nil
-	}
-	if !exact {
-		c.log.Warn("task dispatch record unknown; using the first declared runtime",
-			"task_id", taskID, "runtime_id", runtimeID)
-	}
-	quoted, err := json.Marshal(runtimeID)
-	if err != nil {
-		return nil, err
-	}
-	if bytes.Equal(fields["runtime_id"], quoted) {
-		return body, nil
-	}
-	fields["runtime_id"] = quoted
-	translated, err := json.Marshal(fields)
-	if err != nil {
-		return body, nil
-	}
-	return translated, nil
-}
-
-func (c *Client) forwardOnce(ctx context.Context, ep scheduler.Endpoint, path string, body []byte) (int, []byte, error) {
-	start := time.Now()
-	code, resp, err := c.doOnce(ctx, c.ctrl, http.MethodPost, path, body)
-	c.metrics.Forward(string(ep), code, time.Since(start))
-	return code, resp, err
-}
-
-// ---- S29 passthrough ----
-
-// exclusionFields is the §2.4 exclusion set: the RFC 7230 §6.1 hop-by-hop
-// fields, plus the two the proxy generates for its own connection and body
-// (the target authority as Host, the forwarded body's real length as
-// Content-Length). Every other field travels as the caller gave it.
-var exclusionFields = map[string]bool{
-	"Connection":          true,
-	"Keep-Alive":          true,
-	"Proxy-Authenticate":  true,
-	"Proxy-Authorization": true,
-	"Te":                  true, // TE (§6.1)
-	"Trailer":             true,
-	"Transfer-Encoding":   true,
-	"Upgrade":             true,
-	"Host":                true,
-	"Content-Length":      true,
-}
-
-// forwardableHeader copies a header set minus the §2.4 exclusion set — the
-// fields above plus whatever a Connection value names. Values keep their
-// order and are never merged or dropped beyond that set; field names are
-// written in canonical form (their case is not a fidelity item). This is the
-// single place the exclusions apply.
-func forwardableHeader(h http.Header) http.Header {
-	var named map[string]bool // built only when a Connection value names fields
-	for _, v := range h.Values("Connection") {
-		for _, f := range strings.Split(v, ",") {
-			if f = textproto.CanonicalMIMEHeaderKey(strings.TrimSpace(f)); f != "" {
-				if named == nil {
-					named = map[string]bool{}
-				}
-				named[f] = true
-			}
-		}
-	}
-	out := make(http.Header, len(h))
-	for k, vv := range h {
-		ck := textproto.CanonicalMIMEHeaderKey(k)
-		if exclusionFields[ck] || named[ck] {
-			continue
-		}
-		// A set carrying the same field under two spellings keeps every
-		// value, in arrival order (the spelling itself carries no meaning).
-		out[ck] = append(out[ck], vv...)
-	}
-	return out
-}
-
-// callerVisible is the status the caller of S29 ends up seeing: upstream
-// 5xx converges to 502 (§2.4), which is also the code the
-// agent-api metric carries (§9.2).
-func callerVisible(upstream int) int {
-	if upstream >= http.StatusInternalServerError {
-		return http.StatusBadGateway
-	}
-	return upstream
-}
-
-// passthroughTransport is the §2.4 transport for S29: compression
-// negotiation is off, so no Accept-Encoding is invented for a caller that
-// sent none and no upstream-encoded body is transparently decoded. A
-// DefaultTransport that is not an *http.Transport falls back to the same
-// connection defaults instead of panicking at startup over a mutable global.
-// Only the head phase is bounded — an upstream that never answers converges to
-// 502 — while the body phase has no proxy-side deadline (ADR-046).
-func passthroughTransport() http.RoundTripper {
-	base, ok := http.DefaultTransport.(*http.Transport)
-	if !ok {
-		base = &http.Transport{
-			Proxy:                 http.ProxyFromEnvironment,
-			DialContext:           (&net.Dialer{Timeout: 30 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
-			ForceAttemptHTTP2:     true,
-			MaxIdleConns:          100,
-			IdleConnTimeout:       90 * time.Second,
-			TLSHandshakeTimeout:   10 * time.Second,
-			ExpectContinueTimeout: time.Second,
-		}
-	}
-	t := base.Clone()
-	t.DisableCompression = true
-	t.ResponseHeaderTimeout = controlTimeout
-	return t
-}
-
-// PassthroughResponse is one S29 upstream answer: the status line, the
-// caller-visible header set (§2.4 exclusion set already applied) and the body,
-// still unread. The receiver owns the body and must close it.
-type PassthroughResponse struct {
-	StatusCode    int
-	Header        http.Header
-	ContentLength int64
-	Body          io.ReadCloser
-}
-
-// Passthrough forwards an agent-API call to the real server verbatim
-// (§2.1 rule 2 + ADR-020 + ADR-046): method, raw path (EscapedPath, keeping
-// %2F-style segments), raw query (no decode/re-encode), the caller's whole
-// header set and body go out as given; the upstream status, whole header set
-// and body come back as given. The exclusion set is applied here, once;
-// application/json is not a fallback and Foreman's own fields never appear.
-// Neither body is buffered: both stream through, so payload size bounds neither
-// memory nor success, and response bytes reach the caller as the upstream
-// produces them.
-func (c *Client) Passthrough(ctx context.Context, method, rawPath, rawQuery string, header http.Header, body io.Reader, contentLength int64) (*PassthroughResponse, error) {
-	u := c.cfg.ServerURL + rawPath
-	if rawQuery != "" {
-		u += "?" + rawQuery
-	}
-	req, err := http.NewRequestWithContext(ctx, method, u, body)
-	if err != nil {
-		return nil, err
-	}
-	if body != nil && contentLength >= 0 {
-		// Content-Length is never forwarded as a field (§2.4 exclusion set);
-		// the forwarded body's length comes from here. The caller's own
-		// framing thus survives: a declared length stays declared, an
-		// undeclared body stays chunked.
-		req.ContentLength = contentLength
-	}
-	req.Header = forwardableHeader(header)
-	if _, ok := req.Header["User-Agent"]; !ok {
-		// Present-but-empty suppresses the client library's default value:
-		// net/http only writes a User-Agent the request was given. The copy
-		// above writes canonical names, so the lookup is exact.
-		req.Header["User-Agent"] = nil
-	}
-	start := time.Now()
-	resp, err := c.pass.Do(req)
-	if err != nil {
-		c.metrics.Forward(EndpointAgentAPI, http.StatusBadGateway, time.Since(start))
-		return nil, err
-	}
-	c.metrics.Forward(EndpointAgentAPI, callerVisible(resp.StatusCode), time.Since(start))
-	return &PassthroughResponse{
-		StatusCode:    resp.StatusCode,
-		Header:        forwardableHeader(resp.Header),
-		ContentLength: resp.ContentLength,
-		Body:          resp.Body,
-	}, nil
-}
-
-// ---- C13 status / S20 gc-check ----
-
-// TaskStatus is C13; a server-side 404 maps to scheduler.ErrTaskNotFound.
-func (c *Client) TaskStatus(ctx context.Context, taskID string) (string, error) {
-	code, raw, err := c.taskStatusRaw(ctx, taskID)
-	if errors.Is(err, scheduler.ErrTaskNotFound) {
-		return "", err
-	}
-	if err != nil {
-		return "", err
-	}
-	if code < 200 || code >= 300 {
-		return "", &StatusError{Code: code, Body: raw}
-	}
-	var resp struct {
-		Status string `json:"status"`
-	}
-	if err := json.Unmarshal(raw, &resp); err != nil {
-		return "", fmt.Errorf("decode task status: %w", err)
-	}
-	return resp.Status, nil
-}
-
-// TaskStatusRaw is C13's response face for S-9: the upstream status code and
-// body bytes, with only 404 mapped to the task-vanished sentinel. Everything
-// else is the upstream's answer and S-9 returns it verbatim (§2.2).
-func (c *Client) TaskStatusRaw(ctx context.Context, taskID string) (int, []byte, error) {
-	return c.taskStatusRaw(ctx, taskID)
-}
-
-func (c *Client) taskStatusRaw(ctx context.Context, taskID string) (int, []byte, error) {
-	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodGet, "/api/daemon/tasks/"+url.PathEscape(taskID)+"/status", nil)
-	if err != nil {
-		return 0, nil, err
-	}
-	if code == 404 {
-		return 0, nil, scheduler.ErrTaskNotFound
-	}
-	return code, raw, nil
-}
-
-// GCCheck forwards the S20 gc-check query to the server verbatim (GC is
-// disabled Job-side, but the endpoint stays truthful if enabled, S-20).
-func (c *Client) GCCheck(ctx context.Context, taskID string) (int, []byte, error) {
-	return c.doOnce(ctx, c.ctrl, http.MethodGet, "/api/daemon/tasks/"+url.PathEscape(taskID)+"/gc-check", nil)
-}
-
-// ---- C19 skill bundles ----
-
-// ResolveSkillBundles is C19: forwards the Job daemon's resolve body with
-// the {rid} rewritten to the real runtime id and Foreman's credential (S26).
-func (c *Client) ResolveSkillBundles(ctx context.Context, taskID string, body []byte) (int, []byte, error) {
-	rid, exact := c.runtimeForTask(taskID)
-	if rid == "" {
-		return 0, nil, errors.New("skill bundles: no real runtime registered")
-	}
-	if !exact {
-		c.log.Warn("task dispatch record unknown; using the first declared runtime",
-			"task_id", taskID, "runtime_id", rid)
-	}
-	path := fmt.Sprintf("/api/daemon/runtimes/%s/tasks/%s/skill-bundles/resolve",
-		url.PathEscape(rid), url.PathEscape(taskID))
-	return c.doOnce(ctx, c.ctrl, http.MethodPost, path, body)
-}
-
-// runtimeForTask resolves the real runtime id a task was dispatched under. A
-// rebuilt entry restores the record from its Job annotations (§4.3); only a
-// Job rendered before that annotation carries none, and then the first
-// declared runtime is the best available answer; exact reports which of the
-// two paths produced the id.
-func (c *Client) runtimeForTask(taskID string) (runtimeID string, exact bool) {
-	if c.taskRuntime != nil {
-		if rid := c.taskRuntime(taskID); rid != "" {
-			return rid, true
-		}
-	}
-	ids := c.RuntimeIDs()
-	if len(ids) == 0 {
-		return "", false
-	}
-	return ids[0], false
-}
-
-// ---- C16/C17/C18 ----
-
-// RenewToken is C16 (startup preflight + periodic; non-fatal on failure).
-func (c *Client) RenewToken(ctx context.Context) error {
-	code, raw, err := c.doOnce(ctx, c.ctrl, http.MethodPost, "/api/tokens/current/renew", []byte("{}"))
-	if err != nil {
-		return fmt.Errorf("renew token: %w", err)
-	}
-	if code < 200 || code >= 300 {
-		return fmt.Errorf("renew token: %w", &StatusError{Code: code, Body: raw})
-	}
-	return nil
-}
-
-// SetWorkspaceName caches the workspace display name discovered from C-17
-// (ADR-049): the discovery answer names each workspace, and S-1 serves the
-// name verbatim. The id itself never changes for one client. The name is never
-// empty: the C-17 decode rejects an unnamed entry first, because "" would read
-// back as "the authority has not answered" (WorkspaceName).
-func (c *Client) SetWorkspaceName(name string) {
-	c.mu.Lock()
-	c.workspace = name
-	c.mu.Unlock()
-}
-
-// ---- transport ----
-
-// doOnce is the transport core: one attempt with the daemon identity
-// headers; the response body is returned verbatim.
-func (c *Client) doOnce(ctx context.Context, hc *http.Client, method, path string, body []byte) (int, []byte, error) {
-	return c.doOnceVersion(ctx, hc, method, path, c.CLIVersion(), body)
-}
-
-// doOnceVersion is doOnce with an explicit X-Client-Version. C-1 uses it: the
-// request declares a discovery whose cli_version the cache does not hold yet
-// (the declaration is committed by that very answer, §1.1 客户端版本头).
-func (c *Client) doOnceVersion(ctx context.Context, hc *http.Client, method, path, version string, body []byte) (int, []byte, error) {
-	var rdr io.Reader
-	if body != nil {
-		rdr = bytes.NewReader(body)
-	}
-	req, err := http.NewRequestWithContext(ctx, method, c.cfg.ServerURL+path, rdr)
-	if err != nil {
-		return 0, nil, err
-	}
-	c.setHeaders(req, body != nil, version)
-	resp, err := hc.Do(req)
-	if err != nil {
-		return 0, nil, err
-	}
-	defer resp.Body.Close()
-	data, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, nil, err
-	}
-	return resp.StatusCode, data, nil
-}
-
-// setHeaders injects the daemon identity (§1.1): the capability string is
-// verbatim and must never gain or lose an entry. version is the
-// X-Client-Version value — the cached discovery's cli_version once C1 has run,
-// Foreman's own version before that (C-1 的取值来源与声明域).
-func (c *Client) setHeaders(req *http.Request, hasBody bool, version string) {
-	req.Header.Set("Authorization", "Bearer "+c.token)
-	req.Header.Set("X-Client-Platform", "daemon")
-	req.Header.Set("X-Client-Version", version)
-	req.Header.Set("X-Client-OS", "linux")
-	req.Header.Set("X-Client-Capabilities", ClientCapabilities)
-	if hasBody {
-		req.Header.Set("Content-Type", "application/json")
-	}
-}
-
-func mustMarshal(v any) []byte {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		panic("proxy: marshal static request body: " + err.Error())
-	}
-	return raw
-}
-
-func containsRuntimeNotFound(body []byte) bool {
-	return bytes.Contains(bytes.ToLower(body), []byte("runtime not found"))
 }

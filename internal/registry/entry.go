@@ -1,27 +1,28 @@
-// Package registry keeps the in-memory task mapping index
-// (taskID ↔ jobName ↔ nodeName ↔ daemonID ↔ jobRuntimeID) and its state
-// machine. The K8s Job object is the only durable truth (ADR-002); this
-// package rebuilds the index from Job labels/annotations after a restart.
-// Design: 02-contracts.md §4.1/§4.2, §2.3 (mapping index and state machine).
+// Package registry keeps Foreman's in-memory view of the tasks it has
+// claimed and the long-lived multica daemons that run them. In v2 there is no
+// K8s Job object behind a task: a claimed task is handed directly to a
+// registered daemon, so the entry's durable truth is the server's own
+// dispatch (a restart rebuilds in-flight tasks from the server), and this
+// package is the process-local index plus its state machine.
+//
+// Design (v2): 02-contracts.md §4.1/§4.2 mapping and state machine, minus the
+// Job-created phase and the node/session affinity that belonged to pod
+// placement.
 package registry
 
 import (
 	"encoding/json"
-	"fmt"
-	"strconv"
 	"time"
-
-	batchv1 "k8s.io/api/batch/v1"
 )
 
-// State is the task lifecycle stage (§4.2). It has exactly six
-// values; "failed" is not a state but a Result of StateTerminal.
+// State is the task lifecycle stage. v2 drops StateJobCreated (a task is
+// deliverable as soon as a daemon is chosen, not when a Job object exists);
+// "failed" stays a Result of StateTerminal, not a state.
 type State string
 
 // Lifecycle states (§4.2, exhaustive).
 const (
 	StatePending          State = "pending"
-	StateJobCreated       State = "job_created"
 	StateDaemonRegistered State = "daemon_registered"
 	StateDelivering       State = "delivering"
 	StateRunning          State = "running"
@@ -38,371 +39,45 @@ const (
 	ResultCancelled Result = "cancelled"
 )
 
-// IsTerminal reports whether s is a server-side terminal status (C13).
+// IsTerminalResult reports whether s is a server-side terminal status (C13).
 func IsTerminalResult(s string) bool {
 	return s == string(ResultCompleted) || s == string(ResultFailed) || s == string(ResultCancelled)
 }
 
-// JobPhase is the Job lifecycle phase, orthogonal to the task state
-// (§4.2). "gone" is expressed by the entry's absence, so only the
-// two live phases are named; the zero value means alive, which is what a
-// rebuilt entry starts from.
-type JobPhase string
-
-// Job lifecycle phases (§4.2, exhaustive).
-const (
-	JobPhaseAlive    JobPhase = "alive"
-	JobPhaseDraining JobPhase = "draining"
-)
-
-// TaskEntry is the mapping table row (§4.1). The four trigger-context
-// fields (issue/autopilot/chat) are optional: an empty value means that context
-// does not exist and is never an error (ADR-014). The JSON projection keeps all
-// four keys (empty string, not omitted), so consumers can test `== ""` (§4.1).
-// Payload is the task body — the raw claim payload until delivery, the S6
-// delivery body (runtime_id rewritten to job_runtime_id) afterwards. It lives
-// on the entry and in the shared-state mapping record (§4.3, ADR-046 阶段一),
-// so a restart restores it whole; it carries auth_token and must never reach a
-// K8s object, annotations, Secrets, logs or the projection (F3).
-type TaskEntry struct {
-	TaskID          string `json:"task_id"`
-	AgentID         string `json:"agent_id"`
-	IssueID         string `json:"issue_id"`
-	IssueIdentifier string `json:"issue_identifier"`
-	AutopilotRunID  string `json:"autopilot_run_id"`
-	ChatSessionID   string `json:"chat_session_id"`
-	WorkspaceID     string `json:"workspace_id"`
-	JobName         string `json:"job_name"`
-	JobNamespace    string `json:"job_namespace"`
-	DaemonID        string `json:"daemon_id"`
-	JobRuntimeID    string `json:"job_runtime_id"`
-	NodeName        string `json:"node_name"`
-	State           State  `json:"state"`
-	Result          Result `json:"result"`
-	// FailureReason is the externally observable attribution of a terminal
-	// failure Foreman judged itself (§4.1): empty for a verdict the
-	// server made (S13/S14/S15 or C13) and for non-failed results.
-	FailureReason      string    `json:"failure_reason"`
-	Attempt            int       `json:"attempt"`
-	ClaimedAt          time.Time `json:"claimed_at"`
-	JobCreatedAt       time.Time `json:"job_created_at"`
-	DaemonRegisteredAt time.Time `json:"daemon_registered_at"`
-	// DeliveredAt is the commit instant of the delivery that stands on the
-	// entry: the first one, or the latest re-delivery once an expired
-	// confirmation window released the payload again. Once non-zero it never
-	// goes back to zero, so it also answers "was this entry ever delivered"
-	// (§4.1).
-	DeliveredAt time.Time `json:"delivered_at"`
-	// Deliveries counts the delivery commits this entry accepted: 1 for the
-	// single-delivery form, more when expired confirmation windows released
-	// the payload for another attempt (§4.1, ADR-032).
-	Deliveries int `json:"deliveries"`
-	// ClaimsAfterDelivery counts the S6 claim calls answered with an empty
-	// batch after this entry's delivery was committed (§4.1): > 0
-	// means the daemon kept asking inside the confirmation window, i.e. the
-	// request arrived and the response was lost, rather than the request
-	// never arriving.
-	ClaimsAfterDelivery int `json:"claims_after_delivery"`
-	// StartedAt and BootDeadline may have no fact yet (§4.1,
-	// ADR-026): the projection then carries an empty string, never the
-	// RFC3339 zero — see MarshalJSON.
-	StartedAt    time.Time `json:"started_at"`
-	BootDeadline time.Time `json:"boot_deadline"`
-	// LeaseKeepUntil is the local upper bound of the server's prepare lease
-	// (§10): the last successful renewal plus PrepareLeaseTTL,
-	// stamped after the response returned (Registry.SetLeaseKeepUntil).
-	LeaseKeepUntil time.Time `json:"lease_keep_until"`
-	LastStatusSeen string    `json:"last_status_seen"`
-
-	// Job lifecycle fields (§4.3): never projected into /foreman/tasks and
-	// never written to a K8s object; they persist only in the shared state
-	// snapshot the restart restores (ADR-046 阶段一). The credential stays
-	// valid while the entry exists, so an entry in draining is still the
-	// authorization row for its Job (ADR-017).
-	JobPhase      JobPhase  `json:"-"`
-	DrainDeadline time.Time `json:"-"`
-	TokenHash     string    `json:"-"`
-
-	// DeliveryDeadline is the S6 delivery confirmation window's expiry
-	// (§5, ADR-032): stamped at each accepted delivery commit from
-	// FOREMAN_DELIVERY_CONFIRM_TIMEOUT. Passing it with no start fact
-	// releases the delivery for another attempt (the re-arm), so the window
-	// bounds the re-delivery rather than the entry. Zero means no window is
-	// armed: either nothing was delivered yet, or the re-delivery exit is
-	// configured off and the boot bound alone owns the entry. Not projected;
-	// persisted only in the shared state snapshot (ADR-046 阶段一).
-	DeliveryDeadline time.Time `json:"-"`
-
-	// CompletedAt is the verdict instant, the stamp the settled index keeps
-	// (registry.DoneAt). Not projected — the projection's timestamp keys keep
-	// their existing set — and persisted only in the shared state snapshot
-	// (ADR-046 阶段一).
-	CompletedAt time.Time `json:"-"`
-
-	// PriorSessionID is the claim payload's prior_session_id: where the
-	// resuming session's file lives, hence the soft-affinity key source
-	// (ADR-015). Not annotated and not projected; persisted only in the shared
-	// state snapshot, because a pre-delivery entry a convergence round
-	// continues is rendered again and its Build reads this key (§4.3
-	// 未完成创建的接续). A path on the member's node, never a credential.
-	PriorSessionID string `json:"-"`
-
-	// AgentName is the claim payload's agent.name — the policy keyspace's
-	// agent side (ADR-035) and the <agent-name> / <agent-segment> source.
-	// Empty means the identity is unavailable, which degrades the axes rather
-	// than failing the task. Persisted only in the shared state snapshot: the
-	// continued render must reproduce the row's job_name and the agent-id
-	// label.
-	AgentName string `json:"-"`
-
-	// ProjectID is the task's project identity (§4.1 项目身份): the
-	// platform's opaque project identifier, read at claim time from the
-	// payload's top-level project_id, or from the read-only reverse lookup by
-	// issue id. It is matched against the startup name → identifier index.
-	// Never annotated, never projected; persisted only in the shared state
-	// snapshot so a continued render keeps the policy axes' project side.
-	ProjectID string `json:"-"`
-	// ProjectSource records where ProjectID came from (payload / api /
-	// none); policy.applied projects it, nothing else reads it. Persisted with
-	// ProjectID in the shared state snapshot.
-	ProjectSource string `json:"-"`
-
-	// RealRuntimeID is the real runtime the claim was dispatched under: the
-	// C4 lease, the C19 resolve and the S8 body translation are all addressed
-	// by it when Foreman declares N runtimes. Persisted in the shared state
-	// snapshot (ADR-046 阶段一) and annotated on the Job (§4.3), so both a
-	// restored and a K8s-rebuilt entry keep addressing those calls; only a Job
-	// rendered before that annotation carries no record.
-	RealRuntimeID string `json:"-"`
-
-	// RuntimeIdentity is the declared identity the claim was dispatched under
-	// (registry.RuntimeIdentityKey of provider + runtime profile identifier),
-	// resolved once at claim time and never re-resolved: a rebuild moves the
-	// server-side row id, never the identity. S-4 matches the Job's reported
-	// runtimes against it (§2.3), so an empty value means the identity is
-	// unknown — a Job rendered before the dispatch record was annotated, or a
-	// claim whose identity never resolved — and no entry of the declaration
-	// may answer for it. Persisted in the shared state snapshot like
-	// RealRuntimeID, and restored from the Job annotations (§4.3).
-	RuntimeIdentity string `json:"-"`
-
-	// Payload: raw claim payload until MarkDelivering replaces it with the
-	// delivered body — the form the ops preview must serve (S6 / AC-07). It
-	// never reaches a K8s object, a log or the projection; the shared state
-	// snapshot carries it (§4.3: 任务载荷存在共享状态的条目里, ADR-046 阶段一).
-	Payload json.RawMessage `json:"-"`
-
-	// DecidedReport is the terminal report body that stands for this instance
-	// once its verdict is written (§4.4, ADR-031): registered at the decision
-	// instant, before the forward, and taken by every later terminal forward
-	// of the instance — the enqueued copy, a queue replay, a late replay in
-	// the drain window and the convergence compensation. A platform-forced
-	// termination registers the compensation body; any other decision
-	// registers the body of that first terminal forward. Never projected;
-	// persisted only in the shared state snapshot (ADR-046 阶段一), so a late
-	// replay after a restart sends the same body.
-	DecidedReport []byte `json:"-"`
-
-	// CancelAckOwed marks a cancellation Foreman settled on the daemon's
-	// behalf after the confirmation window expired (§4.6 兜底一): the server
-	// already holds the verdict, and the confirmation the daemon never sent is
-	// Foreman's once the instance's pods have all terminated. It is the only
-	// durable form of that debt before the entry is reclaimed, so it rides the
-	// shared state snapshot and comes back with a restored entry. Never
-	// projected, never annotated, never read as a verdict.
-	CancelAckOwed bool `json:"-"`
-}
-
-// MarshalJSON renders the entry as /foreman/tasks projects it (§4.1,
-// §9.3): the projection is TaskEntry's own JSON — no second
-// view type to keep in step — with lease_keep_until, started_at and
-// boot_deadline rendered as an empty string while their fact does not exist
-// yet. Those keys stay present, and the RFC3339 zero is banned: it would
-// satisfy a consumer's `!= ""` test (the adoption poll of AC-09) before the
-// fact exists. A set value goes through the same time.Time encoder every other
-// projected time field uses.
-func (e TaskEntry) MarshalJSON() ([]byte, error) {
-	type entry TaskEntry
-	return json.Marshal(struct {
-		entry
-		StartedAt      string `json:"started_at"`
-		BootDeadline   string `json:"boot_deadline"`
-		LeaseKeepUntil string `json:"lease_keep_until"`
-	}{entry(e), projectedOptionalTime(e.StartedAt), projectedOptionalTime(e.BootDeadline),
-		projectedOptionalTime(e.LeaseKeepUntil)})
-}
-
-// projectedOptionalTime renders a time field whose fact may not exist yet: an
-// empty string while it does not, the encoder's RFC3339 form once it does.
-func projectedOptionalTime(t time.Time) string {
-	if t.IsZero() {
-		return ""
-	}
-	return ProjectedTime(t)
-}
-
-// ProjectedTime renders t exactly as the /foreman/tasks projection renders
-// TaskEntry's time fields: through the time.Time JSON encoder that
-// encoding/json uses for them (RFC3339Nano, the value's own location), not
-// through a copy of its layout string. A log field that mirrors a projected
-// field must go through here — §9.1 / ADR-041 requires the lease.renewed
-// lease_keep_until to carry the same value the projection does,
-// and a duplicated layout would drift from it silently. An unencodable value
-// (year outside [0,9999]) yields "" — the projection itself cannot encode it
-// either.
-func ProjectedTime(t time.Time) string {
-	if t.IsZero() {
-		// The projection renders an absent fact as the empty string (the
-		// lease deadline included); a log mirroring it must not invent the
-		// RFC3339 zero.
-		return ""
-	}
-	b, err := t.MarshalJSON()
-	if err != nil {
-		return ""
-	}
-	// MarshalJSON answers a JSON string: drop the quoting.
-	return string(b[1 : len(b)-1])
-}
-
-// IsTerminal reports whether the entry has reached its terminal state.
+// IsTerminal reports whether e has reached a terminal state.
 func (e TaskEntry) IsTerminal() bool { return e.State == StateTerminal }
 
-// IsDraining reports whether the entry's Job is past its task's verdict: the
-// task is terminal, the Job is being torn down, and the credential stays
-// valid until the Job's pods are gone or the drain upper bound expires
-// (ADR-017).
-func (e TaskEntry) IsDraining() bool { return e.JobPhase == JobPhaseDraining }
-
-// DeliveryRearmable reports whether an expired confirmation window released
-// this entry's delivery for another attempt (ADR-032): the entry still stands
-// on a committed delivery, no start fact arrived, and the armed window has
-// passed. It is the S6 gate's re-delivery term — and the one place that says
-// the commit the daemon never answered may be handed over again.
-func (e TaskEntry) DeliveryRearmable(at time.Time) bool {
-	return e.State == StateDelivering && e.StartedAt.IsZero() &&
-		!e.DeliveredAt.IsZero() && !e.DeliveryDeadline.IsZero() &&
-		at.After(e.DeliveryDeadline)
-}
-
-// DeliveryUnconfirmed reports a delivered entry still without a start fact
-// that this claim may not re-deliver: the window is open (the response may be
-// in flight and the daemon may still be preparing the payload it received) or
-// no window is configured at all. An empty batch answering it is the
-// lost-response signature (§9.2 result=empty_unconfirmed).
-func (e TaskEntry) DeliveryUnconfirmed(at time.Time) bool {
-	return e.State == StateDelivering && e.StartedAt.IsZero() &&
-		!e.DeliveredAt.IsZero() && !e.DeliveryRearmable(at)
-}
-
-// JobRuntime is the fake runtime registered to a Job's daemon (§2.3).
-type JobRuntime struct {
-	JobRuntimeID    string    `json:"job_runtime_id"`
-	DaemonID        string    `json:"daemon_id"`
+// TaskEntry is one claimed task's mapping row. It carries the claim identity,
+// the daemon it was dispatched to, and the lifecycle facts the proxy and the
+// dispatcher forward. Payload is the claim body (never projected, never
+// persisted beyond the process); it is the daemon-side delivery face.
+type TaskEntry struct {
 	TaskID          string    `json:"task_id"`
-	Provider        string    `json:"provider"`
-	Name            string    `json:"name"`
-	Online          bool      `json:"online"`
-	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
-	DeliveredTaskID string    `json:"delivered_task_id"`
+	AgentID         string    `json:"agent_id"`
+	IssueID         string    `json:"issue_id"`
+	IssueIdentifier string    `json:"issue_identifier"`
+	AutopilotRunID  string    `json:"autopilot_run_id"`
+	ChatSessionID   string    `json:"chat_session_id"`
+	WorkspaceID     string    `json:"workspace_id"`
+	DaemonID        string    `json:"daemon_id"`        // the registered daemon the task was handed to
+	RuntimeID       string    `json:"runtime_id"`       // the daemon's declared runtime id
+	State           State     `json:"state"`
+	Result          Result    `json:"result"`
+	FailureReason   string    `json:"failure_reason"`
+	Attempt         int       `json:"attempt"`
+	ClaimedAt       time.Time `json:"claimed_at"`
+	AssignedAt      time.Time `json:"assigned_at"`      // dispatch commit instant (was job_created_at / delivered_at)
+	StartedAt       time.Time `json:"started_at"`
+	CompletedAt     time.Time `json:"completed_at"`     // verdict instant
+	LeaseKeepUntil  time.Time `json:"lease_keep_until"`
+	TokenHash       string    `json:"-"`                // the dispatched daemon credential's digest (ADR-017)
+	Payload         json.RawMessage `json:"-"`          // the claim body, handed to the daemon at delivery
+
+	// PriorSessionID is the claim payload's prior_session_id; a long-lived
+	// daemon uses it to resume the session it already holds, so Foreman
+	// prefers a daemon that carries it (session affinity).
+	PriorSessionID string `json:"-"`
 }
 
-// Label and annotation keys carried by every foreman Job.
-// jobbuilder owns the write side; these copies are the read side for rebuild.
-const (
-	LabelManagedBy   = "app.kubernetes.io/managed-by"
-	ManagedByForeman = "foreman"
-
-	// LabelRole discriminates the non-credential Secret domains (§3, §6.5):
-	// RoleCatalogProbe marks a catalog-probe Job/Secret, RolePendingReport
-	// marks a pending-report carrier Secret. Credential Secrets carry no role
-	// label — that absence is the credential domain's membership test.
-	LabelRole         = "foreman.tsic.top/role"
-	RoleCatalogProbe  = "catalog-probe"
-	RolePendingReport = "pending-report"
-	LabelTaskID       = "foreman.tsic.top/task-id"
-	LabelAgentID      = "foreman.tsic.top/agent-id"
-	LabelWorkspaceID  = "foreman.tsic.top/workspace-id"
-
-	AnnoIssueID         = "foreman.tsic.top/issue-id"
-	AnnoIssueIdentifier = "foreman.tsic.top/issue-identifier"
-	AnnoAutopilotRunID  = "foreman.tsic.top/autopilot-run-id"
-	AnnoChatSessionID   = "foreman.tsic.top/chat-session-id"
-	AnnoDaemonID        = "foreman.tsic.top/daemon-id"
-	AnnoJobRuntimeID    = "foreman.tsic.top/job-runtime-id"
-	AnnoClaimedAt       = "foreman.tsic.top/claimed-at"
-	AnnoAttempt         = "foreman.tsic.top/attempt"
-	// AnnoRealRuntimeID / AnnoRuntimeProvider / AnnoRuntimeProfileID are the
-	// claim's dispatch record (§4.3): without them a K8s-rebuilt entry cannot
-	// match its daemon's re-registration and would refuse a healthy Job.
-	AnnoRealRuntimeID    = "foreman.tsic.top/real-runtime-id"
-	AnnoRuntimeProvider  = "foreman.tsic.top/runtime-provider"
-	AnnoRuntimeProfileID = "foreman.tsic.top/runtime-profile-id"
-)
-
-// TaskEntryFromJob rebuilds an entry from a Job's labels and annotations
-// (§4.3). The state starts at the conservative StateJobCreated and
-// is advanced by the startup C13 convergence. This face carries identity and
-// trigger context only (F3), so the rebuilt entry has no payload, no decided
-// body and no credential digest; those live on the shared-state mapping
-// record, so a shared-state restore brings the whole row back (§4.3,
-// ADR-046 阶段一) — only a Job that record cannot supply is rebuilt here.
-// The four trigger-context annotations are conditional blocks: a missing key
-// means that context does not exist, never a rebuild error (ADR-014).
-func TaskEntryFromJob(job batchv1.Job) (TaskEntry, error) {
-	labels := job.GetLabels()
-	annos := job.GetAnnotations()
-
-	e := TaskEntry{
-		TaskID:       labels[LabelTaskID],
-		AgentID:      labels[LabelAgentID],
-		WorkspaceID:  labels[LabelWorkspaceID],
-		JobName:      job.GetName(),
-		JobNamespace: job.GetNamespace(),
-		State:        StateJobCreated,
-		// The apiserver timestamp is the instance-filter basis of the pod
-		// evidence (§4.1): a rebuilt entry must carry the object's
-		// value, never a local clock reading.
-		JobCreatedAt: job.CreationTimestamp.Time,
-
-		IssueID:         annos[AnnoIssueID],
-		IssueIdentifier: annos[AnnoIssueIdentifier],
-		AutopilotRunID:  annos[AnnoAutopilotRunID],
-		ChatSessionID:   annos[AnnoChatSessionID],
-		DaemonID:        annos[AnnoDaemonID],
-		JobRuntimeID:    annos[AnnoJobRuntimeID],
-		// The dispatch record is the only identity a rebuilt entry can answer
-		// S-4 with: the real runtime the claim was leased under and the
-		// declared identity it was matched by. Absent on a Job rendered
-		// before this face existed, which is exactly the "unknown identity"
-		// the registration refusal is reserved for.
-		RealRuntimeID: annos[AnnoRealRuntimeID],
-	}
-	if provider := annos[AnnoRuntimeProvider]; provider != "" {
-		e.RuntimeIdentity = RuntimeIdentityKey(provider, annos[AnnoRuntimeProfileID])
-	}
-	if e.TaskID == "" {
-		return TaskEntry{}, fmt.Errorf("job %s: missing label %s", job.GetName(), LabelTaskID)
-	}
-	if e.DaemonID == "" {
-		return TaskEntry{}, fmt.Errorf("job %s: missing annotation %s", job.GetName(), AnnoDaemonID)
-	}
-	if e.JobRuntimeID == "" {
-		return TaskEntry{}, fmt.Errorf("job %s: missing annotation %s", job.GetName(), AnnoJobRuntimeID)
-	}
-	if raw := annos[AnnoClaimedAt]; raw != "" {
-		claimedAt, err := time.Parse(time.RFC3339, raw)
-		if err != nil {
-			return TaskEntry{}, fmt.Errorf("job %s: annotation %s %q is not RFC3339: %v", job.GetName(), AnnoClaimedAt, raw, err)
-		}
-		e.ClaimedAt = claimedAt
-	}
-	if raw := annos[AnnoAttempt]; raw != "" {
-		attempt, err := strconv.Atoi(raw)
-		if err != nil {
-			return TaskEntry{}, fmt.Errorf("job %s: annotation %s %q is not an integer: %v", job.GetName(), AnnoAttempt, raw, err)
-		}
-		e.Attempt = attempt
-	}
-	return e, nil
-}
+// Assigned reports whether the task has been handed to a daemon.
+func (e TaskEntry) Assigned() bool { return e.State == StateDelivering || e.State == StateRunning }

@@ -1,306 +1,421 @@
+// Package proxy's fake server: the face the long-lived daemons dial. Every
+// request needs a daemon credential; a non-fmj_ bearer token was always
+// forwarded verbatim to the real server in v1 (§2.1 rule 2), and that passthrough
+// is gone in v2 — a credential that is not one of our daemons' is 401.
 package proxy
 
 import (
 	"context"
 	"encoding/json"
 	"errors"
-	"io"
 	"log/slog"
 	"net/http"
 	"strings"
-	"sync"
 	"time"
 
-	"github.com/tsic404/foreman/internal/auth"
+	"github.com/tsic404/foreman/internal/daemonauth"
+	"github.com/tsic404/foreman/internal/dispatch"
 	"github.com/tsic404/foreman/internal/registry"
-	"github.com/tsic404/foreman/internal/scheduler"
 )
 
-// maxLocalBodyBytes bounds the local daemon face's request bodies. The face
-// carries control-plane JSON, not agent payloads, so a body past this bound is
-// an anomaly the caller is told about; S29 passthrough does not use it (its
-// bodies stream through unread).
-//
-// Budget: the bound is per request and each accepted body is materialized in
-// memory (this face does not stream), so the face's worst case is one bound per
-// concurrent daemon call — a few tens of MiB, while payload-sized bodies never
-// land here. The reader stops at the bound instead of draining, and the server
-// closes a connection it had to cut off, which is the backpressure: a refused
-// body costs at most the bound once and buys its caller no retry-friendly
-// keep-alive.
-const maxLocalBodyBytes = 32 << 20
-
-// TaskScheduler is the fake server's scheduling surface (§2.1):
-// S6 delivery, S8–S17 report handling, task-vanish settlement.
-type TaskScheduler interface {
-	Deliver(ctx context.Context, workspaceID, daemonID, runtimeID string, maxTasks int) (scheduler.Delivery, error)
-	OnReport(ctx context.Context, ep scheduler.Endpoint, e registry.TaskEntry, body []byte, sessionID string) (int, []byte, error)
+// Dispatcher is the fake server's scheduling surface: delivery, report
+// handlinghare, task-vanish settlement.
+type Dispatcher interface {
+	Deliver(ctx context.Context, workspaceID, daemonID, runtimeID string, maxTasks int) (dispatch.Delivery, error)
+	OnReport(ctx context.Context, ep dispatch.Endpoint, e registry.TaskEntry, body []byte, sessionID string) (int, []byte, error)
 	OnTaskVanished(ctx context.Context, taskID string) error
-	// FailJob settles a Job whose daemon was refused at S4: the entry reaches
-	// terminal/failed without waiting out the boot deadline (S-4). detail is
-	// the termination facts for the report's error text; that path has none.
-	FailJob(ctx context.Context, jobName, reason, detail string) error
+	OnBootTimeout(ctx context.Context, taskID string) error
 }
 
-// FakeServer is the J→F face: it speaks the official server protocol to the
-// Job daemons (§2.2). ServeHTTP applies the three routing rules — fmj_
-// Job Tokens to the local daemon face, any other credential verbatim to
-// the real server (S29), none to 401.
+// FakeServer is the D→F face: it speaks the official server protocol to the
+// registered daemons. ServeHTTP applies two rules — a configured daemon
+// credential to the local daemon face, anything else 401.
 type FakeServer struct {
-	issuer *auth.Issuer
+	creds  *daemonauth.Store
 	reg    *registry.Registry
-	probes *registry.ProbeRegistry // catalog-probe sessions; nil disables the probe face
-	sched  TaskScheduler
-	// client is the legacy single-workspace client; clients is the
-	// multi-workspace set. Handlers resolve by the token's workspace, falling
-	// back to client when no set is wired (every single-workspace test).
-	client  *Client
-	clients *ClientSet
-	ws      *WSHandler // nil when FOREMAN_WS_ENABLED=false
+	disp   Dispatcher
 	metrics Metrics
-	log     *slog.Logger
-	mux     *http.ServeMux
-
-	// registered lists every pattern routes() registered, in registration
-	// order. The daemon-face census (protocol_test.go) compares this set
-	// against the pinned upstream daemon API both ways: a route cannot be
-	// added to or dropped from the local face without the census moving too.
-	registered []string
-
-	// bundles answers S26: the §1.8 resolve cache (fresh hit, upstream refresh,
-	// bounded downgrade). Never nil once the server is built.
-	bundles *SkillCache
-	// bundlesInjected marks a scenario-supplied cache: it owns the whole
-	// resolve face (clock, logging), so the workspace-partitioned factory is
-	// not consulted.
-	bundlesInjected bool
-
-	// legacyClaimMu guards legacyClaimed: the per-entry dedup of the legacy
-	// claim fallback event. The set lives for the process lifetime — the
-	// contract scopes the dedup there (ADR-042), so it is never evicted.
-	legacyClaimMu sync.Mutex
-	legacyClaimed map[string]struct{}
+	log    *slog.Logger
+	mux    *http.ServeMux
 }
 
-// FakeServerOption customizes a FakeServer.
-type FakeServerOption func(*FakeServer)
+// ServerOption customizes a FakeServer.
+type ServerOption func(*FakeServer)
 
-// WithProbeRegistry wires the catalog-probe session table: it is what makes
-// S4/S5/S19/S27 answer a probe token (§2.1 规则 1 的探针分支).
-func WithProbeRegistry(probes *registry.ProbeRegistry) FakeServerOption {
-	return func(s *FakeServer) { s.probes = probes }
+// WithServerMetrics wires the metrics seam.
+func WithServerMetrics(m Metrics) ServerOption {
+	return func(s *FakeServer) { s.metrics = orNoopMetrics(m) }
 }
 
-// WithClientSet wires the per-workspace client set: S-1's discovery set,
-// S-2/S-3/S-4 routing by workspace and the S-26 cache partition all read it.
-func WithClientSet(clients *ClientSet) FakeServerOption {
-	return func(s *FakeServer) { s.clients = clients }
+// WithServerLogger overrides the logger.
+func WithServerLogger(l *slog.Logger) ServerOption {
+	return func(s *FakeServer) { s.log = l.With("component", "fake-server") }
 }
 
-// WithServerLogger overrides the fake server's logger (tests).
-func WithServerLogger(l *slog.Logger) FakeServerOption {
-	return func(s *FakeServer) { s.log = l }
-}
-
-// WithSkillBundles replaces the resolve cache S26 answers from (§1.8). The
-// default one is built from the client's configuration, which is what a
-// deployment wants; a scenario injects its own to drive the clock.
-func WithSkillBundles(cache *SkillCache) FakeServerOption {
-	return func(s *FakeServer) { s.bundles, s.bundlesInjected = cache, true }
-}
-
-// NewFakeServer builds the handler with the full §2.2 endpoint table.
-// ws may be nil; the S30 route is then not registered and WS dials get a
-// 404 (the FOREMAN_WS_ENABLED=false degradation). client may be nil only when
-// bundles are injected with WithSkillBundles: every built server resolves S-26
-// through a cache, so a build without one panics here.
-func NewFakeServer(issuer *auth.Issuer, reg *registry.Registry, sched TaskScheduler, client *Client, ws *WSHandler, metrics Metrics, opts ...FakeServerOption) *FakeServer {
+// NewFakeServer builds the daemon face.
+func NewFakeServer(creds *daemonauth.Store, reg *registry.Registry, disp Dispatcher, opts ...ServerOption) *FakeServer {
 	s := &FakeServer{
-		issuer:  issuer,
+		creds:   creds,
 		reg:     reg,
-		sched:   sched,
-		client:  client,
-		ws:      ws,
-		metrics: orNoopMetrics(metrics),
+		disp:    disp,
+		metrics: noopMetrics{},
 		log:     slog.Default().With("component", "fake-server"),
 		mux:     http.NewServeMux(),
-
-		legacyClaimed: make(map[string]struct{}),
 	}
 	for _, opt := range opts {
 		opt(s)
-	}
-	if s.clients == nil && client != nil {
-		if set, err := NewClientSet(client); err == nil {
-			s.clients = set
-		}
-	}
-	if s.bundles == nil {
-		if client == nil {
-			// Reject a build that could only nil-panic on the first S-26 resolve.
-			panic("proxy: NewFakeServer needs a client or WithSkillBundles")
-		}
-		s.bundles = NewSkillCache(client.cfg, client, s.metrics)
 	}
 	s.routes()
 	return s
 }
 
-// routes registers the local daemon face (§2.2 table; §2.1).
-// Every registration goes through register/handleFn so the pattern set stays
-// readable (registered) — the daemon-face census in protocol_test.go is what
-// requires it.
-func (s *FakeServer) routes() {
-	m := s.mux
-	register := func(pattern string, h http.Handler) {
-		s.registered = append(s.registered, pattern)
-		m.Handle(pattern, h)
-	}
-	handleFn := func(pattern string, h http.HandlerFunc) { register(pattern, h) }
-	handleFn("GET /api/daemon/workspaces", s.handleWorkspaces)                                               // S1
-	handleFn("GET /api/workspaces", s.handleWorkspaces)                                                      // S28
-	handleFn("GET /api/daemon/workspaces/{ws}/repos", s.handleRepos)                                         // S2
-	handleFn("GET /api/daemon/workspaces/{ws}/runtime-profiles", s.handleRuntimeProfiles)                    // S3
-	handleFn("POST /api/daemon/workspaces/{ws}/issues/gc-check", s.handleIssueGCCheck)                       // S21
-	handleFn("POST /api/daemon/register", s.handleRegister)                                                  // S4
-	handleFn("POST /api/daemon/heartbeat", s.handleHeartbeat)                                                // S5
-	handleFn("POST /api/daemon/deregister", s.handleDeregister)                                              // S19
-	handleFn("POST /api/daemon/tasks/claim", s.handleClaim)                                                  // S6
-	handleFn("POST /api/daemon/runtimes/{rid}/tasks/claim", s.handleLegacyClaim)                             // S32 (no delivery face, ADR-042)
-	handleFn("GET /api/daemon/tasks/{tid}/status", s.handleTaskStatus)                                       // S9
-	handleFn("GET /api/daemon/tasks/{tid}/gc-check", s.handleTaskGCCheck)                                    // S20
-	handleFn("POST /api/daemon/tasks/{tid}/start", s.reportHandler(scheduler.EPStart))                       // S8
-	handleFn("POST /api/daemon/tasks/{tid}/progress", s.reportHandler(scheduler.EPProgress))                 // S10
-	handleFn("POST /api/daemon/tasks/{tid}/messages", s.reportHandler(scheduler.EPMessages))                 // S11
-	handleFn("POST /api/daemon/tasks/{tid}/usage", s.reportHandler(scheduler.EPUsage))                       // S12
-	handleFn("POST /api/daemon/tasks/{tid}/complete", s.reportHandler(scheduler.EPComplete))                 // S13
-	handleFn("POST /api/daemon/tasks/{tid}/fail", s.reportHandler(scheduler.EPFail))                         // S14
-	handleFn("POST /api/daemon/tasks/{tid}/cancel-ack", s.reportHandler(scheduler.EPCancelAck))              // S15
-	handleFn("POST /api/daemon/tasks/{tid}/session", s.reportHandler(scheduler.EPSession))                   // S16
-	handleFn("POST /api/daemon/tasks/{tid}/wait-local-directory", s.reportHandler(scheduler.EPWaitLocalDir)) // S17
-	// S23 is defensive-only this version: these calls carry the caller's
-	// own credential and are forwarded verbatim (§2.1 rule 2 semantics).
-	// The Job Token is still verified first — an invalid fmj_ must 401
-	// locally, never reach the upstream.
-	handleFn("GET /api/daemon/tasks/{tid}/plugin-hooks", s.handleS23)
-	handleFn("POST /api/daemon/tasks/{tid}/plugin-hooks", s.handleS23)
-	handleFn("GET /api/daemon/tasks/{tid}/remote-mcp/{cid}/credential", s.handleS23)
-	handleFn("GET /api/daemon/tasks/{tid}/plugin-mcp/{cid}/credential", s.handleS23)
-	handleFn("POST /api/daemon/runtimes/{rid}/tasks/{tid}/prepare-lease", s.handlePrepareLease)         // S7
-	handleFn("POST /api/daemon/runtimes/{rid}/tasks/{tid}/skill-bundles/resolve", s.handleSkillBundles) // S26
-	handleFn("POST /api/daemon/runtimes/{rid}/recover-orphans", s.handleRecoverOrphans)                 // S18
-	handleFn("POST /api/daemon/runtimes/{rid}/models/{req}/result", s.handleModelResult)                // S27
-	handleFn("POST /api/daemon/runtimes/{rid}/local-skills/{req}/result", s.handle404)                  // S27
-	handleFn("POST /api/daemon/runtimes/{rid}/local-skills/import/{req}/result", s.handle404)           // S27
-	handleFn("POST /api/daemon/runtimes/{rid}/update/{req}/result", s.handle404)                        // S27
-	handleFn("GET /api/daemon/issues/{id}/gc-check", s.handle404)                                       // S22
-	handleFn("GET /api/daemon/chat-sessions/{id}/gc-check", s.handle404)                                // S22
-	handleFn("GET /api/daemon/autopilot-runs/{id}/gc-check", s.handle404)                               // S22
-	handleFn("POST /api/tokens/current/renew", s.handleTokenRenew)                                      // S24
-	if s.ws != nil {
-		register("GET /api/daemon/ws", s.ws) // S30
-	}
-	// Everything else under /api/ with a Job Token is not a local endpoint.
-	handleFn("/api/", s.handleNotFound)
-}
-
-// RegisteredPatterns returns the patterns routes() registered, in order. It is
-// the read side of the daemon-face census: the in-package unit test and the
-// acceptance suite's AC-59 scenario both assert this set against the declared
-// upstream routes, so an undeclared local route is a test failure rather than a
-// silent addition to the face.
-func (s *FakeServer) RegisteredPatterns() []string {
-	return append([]string(nil), s.registered...)
-}
-
-// ServeHTTP applies the §2.1 routing rules before the endpoint table.
+// ServeHTTP applies the routing rules before the endpoint table.
 func (s *FakeServer) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if !strings.HasPrefix(r.URL.Path, "/api/") {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
+	s.mux.ServeHTTP(w, r)
+}
+
+// ---- routing ----
+
+func (s *FakeServer) routes() {
+	m := s.mux
+	handle := func(pattern string, h http.HandlerFunc) { m.Handle(pattern, h) }
+	handle("GET /api/daemon/workspaces", s.handleWorkspaces)                  // S1
+	handle("GET /api/workspaces", s.handleWorkspaces)                         // S28
+	handle("POST /api/daemon/register", s.handleRegister)                     // S4
+	handle("POST /api/daemon/heartbeat", s.handleHeartbeat)                   // S5
+	handle("POST /api/daemon/deregister", s.handleDeregister)                 // S19
+	handle("POST /api/daemon/tasks/claim", s.handleClaim)                     // S6
+	handle("GET /api/daemon/tasks/{tid}/status", s.handleTaskStatus)          // S9
+	handle("POST /api/daemon/tasks/{tid}/start", s.reportHandler(dispatch.EPStart))     // S8
+	handle("POST /api/daemon/tasks/{tid}/progress", s.reportHandler(dispatch.EPProgress))   // S10
+	handle("POST /api/daemon/tasks/{tid}/messages", s.reportHandler(dispatch.EPMessages))   // S11
+	handle("POST /api/daemon/tasks/{tid}/usage", s.reportHandler(dispatch.EPUsage))         // S12
+	handle("POST /api/daemon/tasks/{tid}/complete", s.reportHandler(dispatch.EPComplete))   // S13
+	handle("POST /api/daemon/tasks/{tid}/fail", s.reportHandler(dispatch.EPFail))           // S14
+	handle("POST /api/daemon/tasks/{tid}/cancel-ack", s.reportHandler(dispatch.EPCancelAck)) // S15
+	handle("POST /api/daemon/tasks/{tid}/session", s.reportHandler(dispatch.EPSession))     // S16
+	handle("POST /api/daemon/tasks/{tid}/wait-local-directory", s.reportHandler(dispatch.EPWaitLocalDir)) // S17
+	handle("POST /api/daemon/runtimes/{rid}/tasks/{tid}/prepare-lease", s.handlePrepareLease) // S7
+	// Everything else under /api/ with a daemon credential is not a local
+	// endpoint.
+	handle("/api/", s.handleNotFound)
+}
+
+// ---- auth ----
+
+// credential resolves and validates a request's bearer token against the
+// configured daemon set, failing closed on every defect.
+func (s *FakeServer) credential(w http.ResponseWriter, r *http.Request) (daemonauth.Credential, bool) {
 	token, ok := bearerToken(r)
 	if !ok {
-		// Rule 3: no credential → 401, never forwarded.
-		writeError(w, http.StatusUnauthorized, "authorization required")
-		return
+		writeError(w, http.StatusUnauthorized, "daemon credential required")
+		return daemonauth.Credential{}, false
 	}
-	if auth.HasJobTokenPrefix(token) {
-		// Rule 1: the local daemon face.
-		s.mux.ServeHTTP(w, r)
-		return
-	}
-	// Rule 2: any other credential (agent mat_, remote-mcp) → S29.
-	s.handlePassthrough(w, r)
-}
-
-// authenticate verifies the Job Token against the request scope (§2.1 rule
-// 1 + resource check). On failure it writes the mapped status (401/403).
-func (s *FakeServer) authenticate(w http.ResponseWriter, r *http.Request, scope auth.RequestScope) (auth.Claims, bool) {
-	token, _ := bearerToken(r)
-	claims, err := s.issuer.Verify(token, scope)
+	cred, err := s.creds.Verify(token)
 	if err != nil {
-		s.metrics.AuthFailure(auth.Reason(err))
-		s.log.Warn("job token rejected",
-			"remote_addr", r.RemoteAddr, "path", r.URL.Path, "reason", auth.Reason(err))
-		writeError(w, auth.HTTPStatus(err), http.StatusText(auth.HTTPStatus(err)))
-		return auth.Claims{}, false
+		s.metrics.AuthFailure(reason(err))
+		s.log.Warn("daemon credential rejected", "remote_addr", r.RemoteAddr, "path", r.URL.Path)
+		writeError(w, http.StatusUnauthorized, "unknown daemon credential")
+		return daemonauth.Credential{}, false
 	}
-	return claims, true
+	return cred, true
 }
 
-// clientFor resolves the client of one workspace. A single-workspace server
-// built without a set answers with its one client for any id (the legacy
-// path); once a set is wired an unknown workspace resolves to nil.
-func (s *FakeServer) clientFor(workspaceID string) *Client {
-	if client, ok := s.clients.For(workspaceID); ok {
-		return client
+// ---- S1/S28 workspaces ----
+
+func (s *FakeServer) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
+	cred, ok := s.credential(w, r)
+	if !ok {
+		return
 	}
-	return nil
+	writeJSON(w, http.StatusOK, []map[string]string{{"id": cred.WorkspaceID, "name": ""}})
 }
 
-// workspaceConfigured reports whether the deployment serves workspaceID.
-func (s *FakeServer) workspaceConfigured(workspaceID string) bool {
-	return s.clients.Has(workspaceID)
+// ---- S4 register ----
+
+type daemonRegisterRequest struct {
+	DaemonID    string          `json:"daemon_id"`
+	WorkspaceID string          `json:"workspace_id"`
+	Runtimes    []registerRuntime `json:"runtimes"`
 }
 
-// discoverySet returns the discovery set in configuration order (§2.2 S-1):
-// the set the deployment's credentials scope to — for the user-scoped form the
-// C-17 answer (∩ manifest), for the workspace-scoped form the configured
-// pairs. The clients are built from exactly that set, so their ids are it.
-func (s *FakeServer) discoverySet() []string {
-	return s.clients.IDs()
+type registerRuntime struct {
+	Name      string `json:"name"`
+	Type      string `json:"type"`
+	Version   string `json:"version"`
+	ProfileID string `json:"profile_id"`
+	Status    string `json:"status"`
 }
 
-// allowsWorkspace decides whether a token may address a workspace on the
-// res/{ws} routes. Task and catalog-probe tokens are pinned to their own
-// workspace; a startup / registration-discovery probe carries no pin and
-// spans the discovery set (§1.2).
-func (s *FakeServer) allowsWorkspace(claims auth.Claims, workspaceID string) bool {
-	if claims.WorkspaceID == workspaceID {
-		return true
+func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
+	cred, ok := s.credential(w, r)
+	if !ok {
+		return
 	}
-	if claims.Role != catalogProbeRole {
-		return false
+	body, ok := s.readBody(w, r)
+	if !ok {
+		return
 	}
-	session, ok := s.probeSession(claims)
-	return ok && session.WorkspaceID == "" && s.workspaceConfigured(workspaceID)
+	var req daemonRegisterRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid register body")
+		return
+	}
+	if req.DaemonID != "" && req.DaemonID != cred.DaemonID {
+		writeError(w, http.StatusForbidden, "daemon_id does not belong to this credential")
+		return
+	}
+	if req.WorkspaceID != "" && req.WorkspaceID != cred.WorkspaceID {
+		writeError(w, http.StatusForbidden, "workspace does not belong to this credential")
+		return
+	}
+	if len(req.Runtimes) == 0 {
+		writeError(w, http.StatusBadRequest, "register requires at least one runtime")
+		return
+	}
+	// A long-lived daemon registers its runtime set once and keeps it across
+	// tasks. Its runtime id is the self-chosen one: stable, so Foreman can
+	// target it and the server's real-runtime id stays alive.
+	runtimeID := req.DaemonID // the daemon's identity is its runtime's identity
+	rt := registry.Runtime{
+		RuntimeID:   runtimeID,
+		DaemonID:    cred.DaemonID,
+		Provider:    req.Runtimes[0].Type,
+		ProfileID:   req.Runtimes[0].ProfileID,
+		Name:        req.Runtimes[0].Name,
+		WorkspaceID: cred.WorkspaceID,
+		Online:      true,
+		RegisteredAt: s.reg.Now(),
+	}
+	s.reg.PutRuntime(rt)
+	answer := map[string]any{
+		"id":         runtimeID,
+		"name":       rt.Name,
+		"provider":   rt.Provider,
+		"status":     "online",
+		"profile_id": nil,
+	}
+	if rt.ProfileID != "" {
+		answer["profile_id"] = rt.ProfileID
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"runtimes": []any{answer},
+		"repos":    []any{},
+		"repos_version": "",
+	})
+	s.log.Info("daemon.registered",
+		"daemon_id", cred.DaemonID, "runtime_id", runtimeID, "workspace_id", cred.WorkspaceID,
+		"remote_addr", r.RemoteAddr)
 }
 
-// bundlesFor is the workspace-partitioned S-26 cache.
-func (s *FakeServer) bundlesFor(workspaceID string) *SkillCache {
-	if s.bundlesInjected || s.clients == nil {
-		return s.bundles
+// ---- S5 heartbeat ----
+
+func (s *FakeServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
+	cred, ok := s.credential(w, r)
+	if !ok {
+		return
 	}
-	if cache := s.clients.SkillBundles(workspaceID, s.metrics); cache != nil {
-		return cache
+	body, ok := s.readBody(w, r)
+	if !ok {
+		return
 	}
-	return s.bundles
+	var req struct {
+		RuntimeID string `json:"runtime_id"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil || req.RuntimeID == "" {
+		writeError(w, http.StatusBadRequest, "invalid heartbeat body")
+		return
+	}
+	rt, known := s.reg.RuntimeByID(req.RuntimeID)
+	if !known || rt.DaemonID != cred.DaemonID {
+		writeError(w, http.StatusNotFound, "runtime not found")
+		return
+	}
+	s.reg.TouchHeartbeat(req.RuntimeID, s.reg.Now())
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok", "runtime_id": req.RuntimeID})
 }
 
-// ---- shared helpers ----
+// ---- S19 deregister ----
 
-// bearerToken extracts the Bearer credential.
+func (s *FakeServer) handleDeregister(w http.ResponseWriter, r *http.Request) {
+	cred, ok := s.credential(w, r)
+	if !ok {
+		return
+	}
+	if rt, known := s.reg.RuntimeByDaemon(cred.DaemonID); known {
+		s.reg.SetRuntimeOffline(rt.RuntimeID)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// ---- S6 claim ----
+
+type daemonClaimRequest struct {
+	DaemonID   string   `json:"daemon_id"`
+	RuntimeIDs []string `json:"runtime_ids"`
+	MaxTasks   int      `json:"max_tasks"`
+}
+
+func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
+	cred, ok := s.credential(w, r)
+	if !ok {
+		return
+	}
+	body, ok := s.readBody(w, r)
+	if !ok {
+		return
+	}
+	var req daemonClaimRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid claim body")
+		return
+	}
+	if req.DaemonID != "" && req.DaemonID != cred.DaemonID {
+		writeError(w, http.StatusForbidden, "daemon_id does not belong to this credential")
+		return
+	}
+	runtimeID := ""
+	if len(req.RuntimeIDs) > 0 {
+		runtimeID = req.RuntimeIDs[0]
+	}
+	delivery, err := s.disp.Deliver(r.Context(), cred.WorkspaceID, cred.DaemonID, runtimeID, req.MaxTasks)
+	if err != nil {
+		if errors.Is(err, dispatch.ErrUnknownDaemon) || errors.Is(err, dispatch.ErrRuntimeMismatch) {
+			writeError(w, http.StatusForbidden, "forbidden")
+			return
+		}
+		s.log.Error("deliver failed", "daemon_id", cred.DaemonID, "err", err)
+		writeError(w, http.StatusInternalServerError, "deliver failed")
+		return
+	}
+	if delivery.Delivered {
+		s.metrics.DeliveryClaim("delivered")
+		s.metrics.DeliveryLatency(delivery.Latency.Seconds())
+	} else {
+		s.metrics.DeliveryClaim("empty")
+	}
+	tasks := delivery.Tasks
+	if tasks == nil {
+		tasks = []json.RawMessage{}
+	}
+	writeRaw(w, http.StatusOK, mustMarshal(map[string]any{"tasks": tasks}))
+}
+
+// ---- S7 prepare-lease ----
+
+func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) {
+	cred, ok := s.credential(w, r)
+	if !ok {
+		return
+	}
+	rid := r.PathValue("rid")
+	rt, known := s.reg.RuntimeByID(rid)
+	if !known || rt.DaemonID != cred.DaemonID {
+		writeError(w, http.StatusNotFound, "runtime not found")
+		return
+	}
+	// The daemon renews the server-side lease of the task it was handed: the
+	// dispatcher's Server.PrepareLease is what actually renews against the
+	// multica server (S7 + C4). This endpoint is the daemon's S-7 face.
+	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+// ---- S9 status ----
+
+func (s *FakeServer) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
+	cred, ok := s.credential(w, r)
+	if !ok {
+		return
+	}
+	tid := r.PathValue("tid")
+	e, known := s.reg.Get(tid)
+	if !known || e.WorkspaceID != cred.WorkspaceID {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
+	status := string(e.State)
+	if e.IsTerminal() {
+		status = string(e.Result)
+	}
+	writeJSON(w, http.StatusOK, map[string]string{"status": status})
+}
+
+// ---- S8/S10-S17 forwarded reports ----
+
+func (s *FakeServer) reportHandler(ep dispatch.Endpoint) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		tid := r.PathValue("tid")
+		cred, ok := s.credential(w, r)
+		if !ok {
+			return
+		}
+		e, known := s.reg.ByDaemonInWorkspace(cred.WorkspaceID, cred.DaemonID)
+		if !known || e.TaskID != tid {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
+		body, ok := s.readBody(w, r)
+		if !ok {
+			return
+		}
+		sessionID := ""
+		if learnsSession(ep) {
+			sessionID = s.learnSession(e, body)
+		}
+		code, resp, err := s.disp.OnReport(r.Context(), ep, e, body, sessionID)
+		if err != nil {
+			s.log.Error("report forward failed", "task_id", tid, "endpoint", string(ep), "err", err)
+			writeError(w, http.StatusBadGateway, "upstream unavailable")
+			return
+		}
+		writeRaw(w, code, resp)
+	}
+}
+
+// learnsSession reports whether ep's body carries the session id that teaches
+// the session index (ADR-015): the terminal reports S13/S14.
+func learnsSession(ep dispatch.Endpoint) bool {
+	return ep == dispatch.EPComplete || ep == dispatch.EPFail
+}
+
+func (s *FakeServer) learnSession(e registry.TaskEntry, body []byte) string {
+	var report struct {
+		SessionID string `json:"session_id"`
+	}
+	if err := json.Unmarshal(body, &report); err != nil {
+		return ""
+	}
+	if report.SessionID != "" && e.RuntimeID != "" {
+		s.reg.LearnSession(e.WorkspaceID, report.SessionID, e.RuntimeID)
+	}
+	return report.SessionID
+}
+
+// ---- S404 ----
+
+func (s *FakeServer) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	writeError(w, http.StatusNotFound, "not found")
+}
+
+// ---- helpers ----
+
+func (s *FakeServer) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
+	body, err := readLimited(r.Body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "unreadable body")
+		return nil, false
+	}
+	if len(body) > maxBodyBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "body too large")
+		return nil, false
+	}
+	return body, true
+}
+
 func bearerToken(r *http.Request) (string, bool) {
 	h := strings.TrimSpace(r.Header.Get("Authorization"))
 	if h == "" {
@@ -313,163 +428,30 @@ func bearerToken(r *http.Request) (string, bool) {
 	return strings.TrimSpace(token), true
 }
 
-// readBody reads a local endpoint's body under the face's bound. A body past
-// the bound answers 413 carrying the bound and how much was read — the caller
-// must be able to tell "the proxy refused this body" from "this request is
-// malformed" — and logs the same facts. Bytes past the bound never reach a
-// handler.
-func (s *FakeServer) readBody(w http.ResponseWriter, r *http.Request) ([]byte, bool) {
-	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxLocalBodyBytes))
-	if err == nil {
-		return body, true
-	}
-	var tooLarge *http.MaxBytesError
-	if errors.As(err, &tooLarge) {
-		s.log.Warn("request body over the local face's bound",
-			"path", r.URL.Path, "limit_bytes", tooLarge.Limit, "read_bytes", len(body))
-		writeJSON(w, http.StatusRequestEntityTooLarge, map[string]any{
-			"error":       "request body over the local face's bound",
-			"limit_bytes": tooLarge.Limit,
-			"read_bytes":  len(body),
-		})
-		return nil, false
-	}
-	writeError(w, http.StatusBadRequest, "unreadable request body")
-	return nil, false
+func writeJSON(w http.ResponseWriter, status int, v any) {
+	raw := mustMarshal(v)
+	writeRaw(w, status, raw)
 }
 
-func writeJSON(w http.ResponseWriter, code int, v any) {
-	raw, err := json.Marshal(v)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, "encode response")
-		return
-	}
-	writeRaw(w, code, raw)
-}
-
-// writeRaw replies with an upstream response verbatim (§2.4 forwarding).
-func writeRaw(w http.ResponseWriter, code int, body []byte) {
+func writeRaw(w http.ResponseWriter, status int, body []byte) {
 	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(code)
+	w.WriteHeader(status)
 	_, _ = w.Write(body)
 }
 
-// writeError is the unified error shape of the daemon face.
-func writeError(w http.ResponseWriter, code int, msg string) {
-	raw, _ := json.Marshal(map[string]string{"error": msg})
-	writeRaw(w, code, raw)
+func writeError(w http.ResponseWriter, status int, msg string) {
+	writeJSON(w, status, map[string]string{"error": msg})
 }
 
-// entryFor re-reads the token's mapping entry; it may have been deleted
-// between Verify and here (terminal cleanup).
-func (s *FakeServer) entryFor(w http.ResponseWriter, claims auth.Claims) (registry.TaskEntry, bool) {
-	e, ok := s.reg.ByDaemonInWorkspace(claims.WorkspaceID, claims.JobName)
-	if !ok {
-		writeError(w, http.StatusNotFound, "unknown task")
-		return registry.TaskEntry{}, false
+func reason(err error) string {
+	switch {
+	case errors.Is(err, daemonauth.ErrMissingCredential):
+		return "missing"
+	case errors.Is(err, daemonauth.ErrUnknownCredential):
+		return "unknown"
+	default:
+		return "invalid"
 	}
-	return e, true
 }
 
-// handle404 covers S-22/S-27: fixed 404s that switch the daemon off the
-// path (legacy gc-checks, pending_* results).
-func (s *FakeServer) handle404(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticate(w, r, auth.RequestScope{}); !ok {
-		return
-	}
-	writeError(w, http.StatusNotFound, "not found")
-}
-
-// handleNotFound is the fmj_-authenticated catch-all for unknown /api/
-// paths (a real server 404 shape, not a passthrough).
-func (s *FakeServer) handleNotFound(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.authenticate(w, r, auth.RequestScope{}); !ok {
-		return
-	}
-	writeError(w, http.StatusNotFound, "not found")
-}
-
-// handleLegacyClaim is the per-runtime claim fallback (S32). The path stays a
-// 404 — it carries no delivery face — but a task daemon asking here is the only
-// observable signal that it switched off the batch path, so its first request
-// per entry is recorded (ADR-042).
-func (s *FakeServer) handleLegacyClaim(w http.ResponseWriter, r *http.Request) {
-	claims, ok := s.authenticate(w, r, auth.RequestScope{RuntimeID: r.PathValue("rid")})
-	if !ok {
-		return
-	}
-	if claims.Role != catalogProbeRole {
-		if e, found := s.reg.ByDaemon(claims.JobName); found && s.noteLegacyClaim(e) {
-			s.log.Warn("task.legacy_claim_request",
-				"task_id", e.TaskID, "job_name", e.JobName,
-				"daemon_id", e.DaemonID, "job_runtime_id", e.JobRuntimeID)
-		}
-	}
-	writeError(w, http.StatusNotFound, "not found")
-}
-
-// noteLegacyClaim records the first legacy-claim request for an entry instance.
-// The key pairs the task id with the claim stamp: a re-dispatched task reuses
-// the daemon identity by design, so the entry's start is what marks a new
-// instance. The set lives for the process lifetime (ADR-042).
-func (s *FakeServer) noteLegacyClaim(e registry.TaskEntry) bool {
-	key := e.TaskID + "\x00" + e.ClaimedAt.UTC().Format(time.RFC3339Nano)
-	s.legacyClaimMu.Lock()
-	defer s.legacyClaimMu.Unlock()
-	if _, seen := s.legacyClaimed[key]; seen {
-		return false
-	}
-	s.legacyClaimed[key] = struct{}{}
-	return true
-}
-
-// jobLookup adapts the registry to auth.JobLookup.
-type jobLookup struct{ reg *registry.Registry }
-
-func (a jobLookup) ByDaemonInWorkspace(workspaceID, daemonID string) (auth.JobEntry, bool) {
-	e, ok := a.reg.ByDaemonInWorkspace(workspaceID, daemonID)
-	if !ok {
-		return auth.JobEntry{}, false
-	}
-	return auth.JobEntry{
-		JobRuntimeID: e.JobRuntimeID,
-		WorkspaceID:  e.WorkspaceID,
-		Terminal:     e.IsTerminal(),
-	}, true
-}
-
-// JobTokenIssuer builds the Job Token issuer over the registry's read view
-// (the auth ↔ registry wiring the Job-facing surfaces share). tokenTTL is the
-// issued lifetime; it also bounds the revocation window (ADR-017). probes is
-// the catalog-probe session table a probe token is adjudicated against; a nil
-// one leaves probe tokens unverifiable. state is the shared revocation face
-// (ADR-046 阶段一): nil keeps the in-process revocation set, so a deployment
-// without the shared store behaves exactly as before.
-func JobTokenIssuer(key []byte, reg *registry.Registry, probes *registry.ProbeRegistry, tokenTTL time.Duration, state registry.StateStore, opts ...auth.Option) (*auth.Issuer, error) {
-	all := []auth.Option{}
-	if probes != nil {
-		all = append(all, auth.WithProbeLookup(probeLookup{probes}))
-	}
-	if state != nil {
-		all = append(all, auth.WithRevocationStore(state))
-	}
-	all = append(all, opts...)
-	return auth.NewIssuer(key, jobLookup{reg}, reg, tokenTTL, all...)
-}
-
-// probeLookup adapts the probe session table to auth's read view.
-type probeLookup struct{ probes *registry.ProbeRegistry }
-
-func (p probeLookup) ProbeByJob(jobName string) (auth.ProbeEntry, bool) {
-	session, ok := p.probes.ProbeByJob(jobName)
-	if !ok {
-		return auth.ProbeEntry{}, false
-	}
-	return auth.ProbeEntry{
-		JobRuntime:   session.JobRuntime,
-		RequestID:    session.RequestID,
-		SelfMintedID: session.SelfMintedID,
-		TokenHash:    session.TokenHash,
-		WorkspaceID:  session.WorkspaceID,
-	}, true
-}
+var _ = time.Now

@@ -1,10 +1,10 @@
-# ServiceAccounts and the Foreman least-privilege Role (02-contracts.md §3, F8).
+# ServiceAccounts (v2).
 #
-# The Role is namespaced to multica-agents and carries exactly the verbs the
-# design lists: secrets create/delete/get/list, jobs.batch
-# create/delete/get/list/watch, pods get/list/watch, pods/log get. No `nodes`
-# access, no wildcard, no cluster-scoped object — Foreman may only touch the
-# Jobs and Secrets it created itself (F8).
+# v2 creates no Kubernetes objects: there is no per-task Job, no per-task
+# Secret, no node-local cache DaemonSet. Foreman therefore needs no Role at
+# all — the scheduler talks only to the multica server and to the daemons that
+# dial it, never to the Kubernetes API. This file keeps the ServiceAccount the
+# Deployment runs as; the API token is not automounted.
 ---
 apiVersion: v1
 kind: ServiceAccount
@@ -13,62 +13,5 @@ metadata:
   namespace: foreman
   labels:
     app.kubernetes.io/name: foreman
-# Reads/writes Jobs and Secrets in multica-agents: it needs the API token.
-automountServiceAccountToken: true
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: Role
-metadata:
-  name: foreman
-  namespace: multica-agents
-  labels:
-    app.kubernetes.io/name: foreman
-rules:
-  - apiGroups: [""]
-    resources: ["secrets"]
-    verbs: ["create", "delete", "get", "list"]
-  - apiGroups: ["batch"]
-    resources: ["jobs"]
-    verbs: ["create", "delete", "get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list", "watch"]
-  - apiGroups: [""]
-    resources: ["pods/log"]
-    verbs: ["get"]
----
-apiVersion: rbac.authorization.k8s.io/v1
-kind: RoleBinding
-metadata:
-  name: foreman
-  namespace: multica-agents
-  labels:
-    app.kubernetes.io/name: foreman
-roleRef:
-  apiGroup: rbac.authorization.k8s.io
-  kind: Role
-  name: foreman
-subjects:
-  - kind: ServiceAccount
-    name: foreman
-    namespace: foreman
----
-# Placeholder SA for the Job pods: no RoleBinding, no API token.
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: multica-omp
-  namespace: multica-agents
-  labels:
-    app.kubernetes.io/name: foreman-job
-automountServiceAccountToken: false
----
-# SA for the foreman-gc DaemonSet: it only touches node-local files.
-apiVersion: v1
-kind: ServiceAccount
-metadata:
-  name: foreman-gc
-  namespace: multica-agents
-  labels:
-    app.kubernetes.io/name: foreman-gc
+# No Kubernetes API access is required, so the token is never mounted.
 automountServiceAccountToken: false

@@ -2,23 +2,13 @@ package observability
 
 import (
 	"encoding/json"
-	"errors"
 	"log/slog"
 	"net/http"
 	"slices"
-	"strconv"
 	"strings"
 	"time"
 
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
-
 	"github.com/tsic404/foreman/internal/registry"
-)
-
-// Log tail bounds for /foreman/tasks/{id}/logs (§9.3).
-const (
-	defaultLogTail = 200
-	maxLogTail     = 2000
 )
 
 // TaskIndex is the registry read view the ops endpoints need; satisfied by
@@ -100,9 +90,7 @@ func (h *OpsHandler) RegisteredPatterns() []string {
 // served on its own listener (the Job face mounts only /api). Every request
 // must present one of cfg.Credentials as a bearer token; without one the
 // answer is 401 and no route is reached, so a Job Token — a credential of the
-// other face — never opens this surface. A nil logs reader keeps the route but
-// answers 404 (optional endpoint).
-func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg OpsConfig) *OpsHandler {
+func NewOpsHandler(metrics *Metrics, index TaskIndex, cfg OpsConfig) *OpsHandler {
 	if cfg.StartedAt.IsZero() {
 		cfg.StartedAt = time.Now()
 	}
@@ -199,18 +187,6 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 		}
 		writeJSON(w, http.StatusOK, e)
 	})
-	registerFn("GET /foreman/tasks/{taskID}/logs", func(w http.ResponseWriter, r *http.Request) {
-		scope := handler.scope(r)
-		if scope.status != 0 {
-			writeError(w, scope.status, scope.message)
-			return
-		}
-		if !workspaceVisible(index, r.PathValue("taskID"), scope.workspaceID) {
-			writeError(w, http.StatusNotFound, "task not found")
-			return
-		}
-		serveJobLogs(w, r, index, scope.workspaceID, logs, log)
-	})
 	registerFn("GET /foreman/tasks/{taskID}/payload-preview", func(w http.ResponseWriter, r *http.Request) {
 		scope := handler.scope(r)
 		if scope.status != 0 {
@@ -231,10 +207,9 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 			return
 		}
 		// The served body is the entry's delivered payload — written by the S6
-		// delivery — and the window is delivered_at until reclaim. An entry
-		// that is not delivered yet holds the claim-time payload, which must
-		// never be exposed as the delivery body (§9.3).
-		if e.DeliveredAt.IsZero() || len(e.Payload) == 0 {
+		// delivery — and the window is the assignment until reclaim. A task not
+		// yet handed to a daemon holds only the claim-time payload (§9.3).
+		if !e.Assigned() || len(e.Payload) == 0 {
 			writeError(w, http.StatusNotFound, "payload unavailable")
 			return
 		}
@@ -263,57 +238,6 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 	return handler
 }
 
-// serveJobLogs proxies the newest pod's log tail for the task's Job.
-func serveJobLogs(w http.ResponseWriter, r *http.Request, index TaskIndex, workspaceID string, logs PodLogReader, log *slog.Logger) {
-	e, ok := index.GetInWorkspace(workspaceID, r.PathValue("taskID"))
-	if !ok {
-		writeError(w, http.StatusNotFound, "task not found")
-		return
-	}
-	tail, err := parseTail(r.URL.Query().Get("tail"))
-	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	if logs == nil {
-		writeError(w, http.StatusNotFound, ErrJobLogsUnavailable.Error())
-		return
-	}
-	data, err := logs.ReadLogs(r.Context(), e.JobNamespace, e.JobName, tail)
-	switch {
-	case errors.Is(err, ErrJobLogsUnavailable):
-		writeError(w, http.StatusNotFound, ErrJobLogsUnavailable.Error())
-		return
-	case apierrors.IsForbidden(err):
-		// pods/log RBAC denied is 403 + an error log; the task chain itself
-		// is unaffected.
-		log.ErrorContext(r.Context(), "read job logs forbidden",
-			"task_id", e.TaskID, "job_name", e.JobName, "err", err)
-		writeError(w, http.StatusForbidden, "job logs forbidden")
-		return
-	case err != nil:
-		writeError(w, http.StatusInternalServerError, "read job logs")
-		return
-	}
-	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(data)
-}
-
-// parseTail applies the contract bounds: default 200, clamp to 2000.
-func parseTail(raw string) (int64, error) {
-	if raw == "" {
-		return defaultLogTail, nil
-	}
-	n, err := strconv.ParseInt(raw, 10, 64)
-	if err != nil || n < 1 {
-		return 0, errors.New("tail must be a positive integer")
-	}
-	if n > maxLogTail {
-		n = maxLogTail
-	}
-	return n, nil
-}
 
 // opsScope is the workspace dimension an ops request resolves to: either the
 // id, or the refusal the handler answers with (status 0 = resolved).

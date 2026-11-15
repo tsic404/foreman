@@ -19,8 +19,6 @@ import (
 	"os"
 	"slices"
 	"strings"
-
-	"k8s.io/apimachinery/pkg/util/validation"
 )
 
 // Environment variable names of the multi-workspace interface.
@@ -284,9 +282,8 @@ func newSet(identities []Identity, getenv func(string) string) (Set, error) {
 		if identity.WorkspaceID == "" {
 			return Set{}, fmt.Errorf("workspace identity %d has no workspace_id", i)
 		}
-		if problems := validation.IsValidLabelValue(identity.WorkspaceID); len(problems) > 0 {
-			return Set{}, fmt.Errorf("workspace id %q is not a legal Kubernetes label value: %s",
-				identity.WorkspaceID, strings.Join(problems, "; "))
+		if !validWorkspaceID(identity.WorkspaceID) {
+			return Set{}, fmt.Errorf("workspace id %q is not a legal value (lowercase letters, digits, '.' and '-' only; must start and end alphanumeric; max 63 chars)", identity.WorkspaceID)
 		}
 		token, err := resolveToken(identity, getenv)
 		if err != nil {
@@ -307,6 +304,32 @@ func newSet(identities []Identity, getenv func(string) string) (Set, error) {
 		out.byID[identity.WorkspaceID] = identity
 	}
 	return out, nil
+}
+
+// validWorkspaceID reports whether id is usable as a workspace identity
+// segment. v2 has no Kubernetes object to name, but the id still reaches a
+// filesystem path (a daemon's state root) and a log line, so it keeps the
+// conservative rule: alphanumerics plus '.', '_' and '-', starting and ending
+// alphanumeric, at most 63 characters. This refuses path traversal, leading
+// dots/dashes and empty-looking values.
+func validWorkspaceID(id string) bool {
+	if id == "" || len(id) > 63 {
+		return false
+	}
+	isAlnum := func(b byte) bool {
+		return b >= 'a' && b <= 'z' || b >= 'A' && b <= 'Z' || b >= '0' && b <= '9'
+	}
+	if !isAlnum(id[0]) || !isAlnum(id[len(id)-1]) {
+		return false
+	}
+	for i := range len(id) {
+		c := id[i]
+		if isAlnum(c) || c == '.' || c == '_' || c == '-' {
+			continue
+		}
+		return false
+	}
+	return true
 }
 
 // resolveToken reads the credential from the inline field or its env key.

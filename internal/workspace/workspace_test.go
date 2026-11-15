@@ -224,7 +224,7 @@ func TestNewSetNamesIllegalWorkspaceIDWithBadCredential(t *testing.T) {
 				if !strings.Contains(err.Error(), strconv.Quote(id)) {
 					t.Errorf("error %q does not name %q", err, id)
 				}
-				if !strings.Contains(err.Error(), "label value") {
+				if !strings.Contains(err.Error(), "legal value") {
 					t.Errorf("error %q does not state the id rule", err)
 				}
 			})
@@ -241,9 +241,9 @@ func TestNewSetNamesIllegalWorkspaceIDWithBadCredential(t *testing.T) {
 }
 
 // TestNewSetWorkspaceIDCharset pins the value face the downstream writers
-// already impose: the id is a label value and a placeholder render value, so
-// anything outside the label grammar must fail here rather than at Job
-// creation, and every legal shape passes verbatim.
+// already impose on v2: the id is a stable identity segment that reaches a
+// state-root path and the daemon registry, so anything outside the grammar
+// must fail here rather than surface later.
 func TestNewSetWorkspaceIDCharset(t *testing.T) {
 	identity := func(id string) []Identity {
 		return []Identity{{WorkspaceID: id, DaemonID: "foreman-" + id, Token: "mdt_token"}}
@@ -258,7 +258,7 @@ func TestNewSetWorkspaceIDCharset(t *testing.T) {
 	for _, id := range legal {
 		set, err := NewSet(identity(id))
 		if err != nil {
-			t.Errorf("NewSet(%q) refused a legal label value: %v", id, err)
+			t.Errorf("NewSet(%q) refused a legal workspace id: %v", id, err)
 			continue
 		}
 		if got := set.IDs(); len(got) != 1 || got[0] != id {
@@ -281,13 +281,13 @@ func TestNewSetWorkspaceIDCharset(t *testing.T) {
 	for _, id := range illegal {
 		_, err := NewSet(identity(id))
 		if err == nil {
-			t.Errorf("NewSet(%q) accepted an illegal label value", id)
+			t.Errorf("NewSet(%q) accepted an illegal workspace id", id)
 			continue
 		}
 		if !strings.Contains(err.Error(), strconv.Quote(id)) {
 			t.Errorf("NewSet(%q) error %q does not name the id", id, err)
 		}
-		if !strings.Contains(err.Error(), "label value") {
+		if !strings.Contains(err.Error(), "legal value") {
 			t.Errorf("NewSet(%q) error %q does not state the rule", id, err)
 		}
 	}
