@@ -155,6 +155,10 @@ func run() error {
 		d := dispatch.New(dispatch.Config{
 			BootTimeout:       0, // configured via env below
 			ReconcileInterval: 30 * time.Second,
+			// Four upstream heartbeat intervals: long enough that a slow tick
+			// is not a death sentence, short enough that a dead daemon stops
+			// attracting tasks within a minute.
+			HeartbeatTimeout: time.Minute,
 		}, reg, client, metrics,
 			dispatch.WithLogger(baseLog),
 			dispatch.WithRealRuntimeID(func(runtimeKey string) (string, bool) {

@@ -88,3 +88,27 @@ func TestTerminalImmutableOnPut(t *testing.T) {
 		t.Fatal("re-inserting a terminal task as live must be refused")
 	}
 }
+
+func TestExpireStaleMarksSilentDaemonsOffline(t *testing.T) {
+	r := New()
+	now := time.Now()
+	r.PutRuntime(Runtime{RuntimeID: "live", DaemonID: "d1", WorkspaceID: "ws", Online: true})
+	r.PutRuntime(Runtime{RuntimeID: "dead", DaemonID: "d2", WorkspaceID: "ws", Online: true})
+	r.TouchHeartbeat("live", now)
+	r.TouchHeartbeat("dead", now.Add(-2*time.Minute))
+
+	expired := r.ExpireStale(now, time.Minute)
+	if len(expired) != 1 || expired[0] != "dead" {
+		t.Fatalf("expired = %v, want [dead]", expired)
+	}
+	if rt, _ := r.RuntimeByID("live"); !rt.Online {
+		t.Fatal("a daemon that just heartbeat must stay online")
+	}
+	if rt, _ := r.RuntimeByID("dead"); rt.Online {
+		t.Fatal("a silent daemon must be marked offline")
+	}
+	// Second sweep is a no-op: the flag was already flipped.
+	if again := r.ExpireStale(now, time.Minute); len(again) != 0 {
+		t.Fatalf("second sweep expired %v, want none", again)
+	}
+}

@@ -523,6 +523,30 @@ func (r *Registry) SetRuntimeOffline(runtimeID string) {
 	r.runtimes[runtimeID] = rt
 }
 
+// ExpireStale marks offline every daemon whose last heartbeat is older than
+// staleAfter, returning the ids it flipped. A resident daemon that stops
+// heartbeating (crashed, partitioned, killed) never deregisters, so without
+// this sweep its row stays "online" forever and the dispatcher keeps handing
+// it tasks it can never claim. The heartbeat interval is 15s upstream, so a
+// sweep window of a few intervals tells a slow tick from a dead process.
+func (r *Registry) ExpireStale(now time.Time, staleAfter time.Duration) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var expired []string
+	for id, rt := range r.runtimes {
+		if !rt.Online || rt.LastHeartbeatAt.IsZero() {
+			continue
+		}
+		if now.Sub(rt.LastHeartbeatAt) <= staleAfter {
+			continue
+		}
+		rt.Online = false
+		r.runtimes[id] = rt
+		expired = append(expired, id)
+	}
+	return expired
+}
+
 // DeleteRuntime drops a daemon row entirely (deregistration).
 func (r *Registry) DeleteRuntime(runtimeID string) {
 	r.mu.Lock()

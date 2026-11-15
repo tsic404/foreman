@@ -120,6 +120,10 @@ type Config struct {
 	TaskMaxDuration time.Duration
 	// ReconcileInterval is the convergence round's cadence.
 	ReconcileInterval time.Duration
+	// HeartbeatTimeout bounds how long a daemon may stay silent before the
+	// sweep marks it offline. Zero disables the sweep, leaving only explicit
+	// deregistration to flip the flag.
+	HeartbeatTimeout time.Duration
 }
 
 // Delivery is the outcome of one S-6 delivery attempt (§5).
@@ -536,6 +540,14 @@ func (d *Dispatcher) failLocally(ctx context.Context, taskID, reason string) err
 // so the round reads the local entries, renews leases, and settles the tasks
 // whose bound lapsed.
 func (d *Dispatcher) Reconcile(ctx context.Context) error {
+	// Liveness first: a daemon that stopped heartbeating can never claim, so
+	// its row must stop looking online before the rounds below pick it.
+	if d.cfg.HeartbeatTimeout > 0 {
+		for _, id := range d.reg.ExpireStale(d.now(), d.cfg.HeartbeatTimeout) {
+			d.log.Warn("daemon.heartbeat_lapsed", "runtime_id", id,
+				"timeout", d.cfg.HeartbeatTimeout.String())
+		}
+	}
 	for _, e := range d.reg.List() {
 		if e.IsTerminal() {
 			continue
