@@ -588,8 +588,11 @@ func (s *FakeServer) reportHandler(ep dispatch.Endpoint) http.HandlerFunc {
 		if !ok {
 			return
 		}
-		e, known := s.reg.ByDaemonInWorkspace(cred.WorkspaceID, cred.DaemonID)
-		if !known || e.TaskID != tid {
+		// Reports address one task by id. Looking up "the daemon's current
+		// task" instead would break as soon as a daemon holds more than one:
+		// the id under report need not be the one the index yields next.
+		e, known := s.reg.GetInWorkspace(cred.WorkspaceID, tid)
+		if !known || e.DaemonID != cred.DaemonID {
 			writeError(w, http.StatusNotFound, "task not found")
 			return
 		}
