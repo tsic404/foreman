@@ -519,9 +519,11 @@ func (d *Dispatcher) convergeOne(ctx context.Context, e registry.TaskEntry) {
 	now := d.now()
 	// A task whose daemon went away can never start: fail it locally rather
 	// than wait out the server's lease.
-	if rt, ok := d.reg.RuntimeByID(e.RuntimeID); ok && !rt.Online && e.StartedAt.IsZero() {
-		d.failLocally(ctx, e.TaskID, "daemon_offline")
-		return
+	if e.DaemonRuntimeID != "" {
+		if rt, ok := d.reg.RuntimeByID(e.DaemonRuntimeID); ok && !rt.Online && e.StartedAt.IsZero() {
+			d.failLocally(ctx, e.TaskID, "daemon_offline")
+			return
+		}
 	}
 	// Lease renewal for a claimed-but-unstarted task (§10: renew every ≤20s).
 	// Covers pending, daemon-registered and delivering — the daemon renews via

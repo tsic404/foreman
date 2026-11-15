@@ -539,15 +539,21 @@ func (r *Registry) pruneDoneLocked() {
 // releaseRuntimeLocked decrements the daemon's busy count when its task
 // settles.
 func (r *Registry) releaseRuntimeLocked(e TaskEntry) {
-	if e.RuntimeID == "" {
+	// The daemon table is keyed by the daemon's own runtime id
+	// (DaemonRuntimeID); RuntimeID is the server-assigned id and is not a key.
+	key := e.DaemonRuntimeID
+	if key == "" {
+		key = e.RuntimeID
+	}
+	if key == "" {
 		return
 	}
-	rt, ok := r.runtimes[e.RuntimeID]
+	rt, ok := r.runtimes[key]
 	if !ok {
 		return
 	}
 	if rt.Busy > 0 {
 		rt.Busy--
 	}
-	r.runtimes[e.RuntimeID] = rt
+	r.runtimes[key] = rt
 }
