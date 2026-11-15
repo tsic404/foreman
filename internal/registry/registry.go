@@ -29,7 +29,7 @@ const doneRetention = 24 * time.Hour
 type Registry struct {
 	mu              sync.RWMutex
 	tasks           map[string]TaskEntry
-	byDaemon        map[string]string    // daemonID → taskID (one task per daemon at a time)
+	byDaemon        map[string][]string  // daemonID → taskIDs, oldest first (a daemon may hold several)
 	done            map[string]time.Time // taskID → verdict instant
 	runtimes        map[string]Runtime
 	byRuntimeDaemon map[string]string // runtimeID → daemonID
@@ -49,7 +49,7 @@ func WithClock(now func() time.Time) Option {
 func New(opts ...Option) *Registry {
 	r := &Registry{
 		tasks:           map[string]TaskEntry{},
-		byDaemon:        map[string]string{},
+		byDaemon:        map[string][]string{},
 		done:            map[string]time.Time{},
 		runtimes:        map[string]Runtime{},
 		byRuntimeDaemon: map[string]string{},
@@ -201,11 +201,7 @@ func (r *Registry) ListInWorkspace(workspaceID string) []TaskEntry {
 func (r *Registry) ByDaemonInWorkspace(workspaceID, daemonID string) (TaskEntry, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	taskID, ok := r.byDaemon[daemonID]
-	if !ok {
-		return TaskEntry{}, false
-	}
-	e, ok := r.tasks[taskID]
+	e, ok := r.daemonTaskLocked(daemonID)
 	if !ok || e.WorkspaceID != workspaceID {
 		return TaskEntry{}, false
 	}
@@ -297,16 +293,12 @@ func (r *Registry) DoneAt(taskID string) (time.Time, bool) {
 func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	taskID, ok := r.byDaemon[daemonID]
+	e, ok := r.daemonTaskLocked(daemonID)
 	if !ok {
 		return TaskEntry{}, false
 	}
-	e, ok := r.tasks[taskID]
-	if !ok || e.IsTerminal() {
-		return TaskEntry{}, false
-	}
 	e.State = StateDaemonRegistered
-	r.tasks[taskID] = e
+	r.tasks[e.TaskID] = e
 	return e, true
 }
 
@@ -314,12 +306,8 @@ func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntr
 func (r *Registry) MarkDelivering(daemonID string, at time.Time, payload []byte) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	taskID, ok := r.byDaemon[daemonID]
+	e, ok := r.daemonTaskLocked(daemonID)
 	if !ok {
-		return TaskEntry{}, false
-	}
-	e, ok := r.tasks[taskID]
-	if !ok || e.IsTerminal() {
 		return TaskEntry{}, false
 	}
 	if e.State == StatePending || e.State == StateDaemonRegistered {
@@ -327,7 +315,7 @@ func (r *Registry) MarkDelivering(daemonID string, at time.Time, payload []byte)
 	}
 	e.AssignedAt = at
 	e.Payload = append([]byte(nil), payload...)
-	r.tasks[taskID] = e
+	r.tasks[e.TaskID] = e
 	return e, true
 }
 
@@ -575,16 +563,46 @@ func (r *Registry) LearnSession(workspaceID, sessionID, runtimeID string) {
 
 // ---- internal ----
 
-func (r *Registry) indexLocked(e TaskEntry) {
-	if e.DaemonID != "" && !e.IsTerminal() {
-		r.byDaemon[e.DaemonID] = e.TaskID
+// daemonTaskLocked picks the task a daemon should be handed next: the oldest
+// non-terminal one bound to it. A daemon runs several tasks concurrently
+// (--max-concurrent-tasks), so the binding is a queue, not a single slot.
+func (r *Registry) daemonTaskLocked(daemonID string) (TaskEntry, bool) {
+	for _, id := range r.byDaemon[daemonID] {
+		e, ok := r.tasks[id]
+		if !ok || e.IsTerminal() || e.State == StateDelivering || e.State == StateRunning {
+			continue
+		}
+		return e, true
 	}
+	return TaskEntry{}, false
+}
+
+func (r *Registry) indexLocked(e TaskEntry) {
+	if e.DaemonID == "" || e.IsTerminal() {
+		return
+	}
+	for _, id := range r.byDaemon[e.DaemonID] {
+		if id == e.TaskID {
+			return
+		}
+	}
+	r.byDaemon[e.DaemonID] = append(r.byDaemon[e.DaemonID], e.TaskID)
 }
 
 func (r *Registry) dropIndexLocked(e TaskEntry) {
 	if e.DaemonID != "" {
-		if cur, ok := r.byDaemon[e.DaemonID]; ok && cur == e.TaskID {
-			delete(r.byDaemon, e.DaemonID)
+		if cur, ok := r.byDaemon[e.DaemonID]; ok {
+			out := cur[:0]
+			for _, id := range cur {
+				if id != e.TaskID {
+					out = append(out, id)
+				}
+			}
+			if len(out) == 0 {
+				delete(r.byDaemon, e.DaemonID)
+			} else {
+				r.byDaemon[e.DaemonID] = out
+			}
 		}
 	}
 }

@@ -112,3 +112,40 @@ func TestExpireStaleMarksSilentDaemonsOffline(t *testing.T) {
 		t.Fatalf("second sweep expired %v, want none", again)
 	}
 }
+
+func TestDaemonHoldsSeveralTasks(t *testing.T) {
+	r := New()
+	now := time.Now()
+	r.PutRuntime(Runtime{RuntimeID: "d1", DaemonID: "d1", WorkspaceID: "ws", Online: true, RegisteredAt: now})
+	for _, id := range []string{"t1", "t2", "t3"} {
+		if err := r.Put(TaskEntry{
+			TaskID: id, WorkspaceID: "ws", DaemonID: "d1", DaemonRuntimeID: "d1",
+			State: StateDaemonRegistered, ClaimedAt: now, Payload: []byte(`{"id":"` + id + `"}`),
+		}); err != nil {
+			t.Fatalf("put %s: %v", id, err)
+		}
+	}
+	// Binding a second task must not hide the first: the old single-slot index
+	// overwrote it, so a daemon with two tasks could only ever be handed one
+	// and the other stranded until its lease lapsed.
+	seen := map[string]bool{}
+	for i := 0; i < 3; i++ {
+		e, ok := r.ByDaemonInWorkspace("ws", "d1")
+		if !ok {
+			t.Fatalf("iteration %d: daemon has no task", i)
+		}
+		if seen[e.TaskID] {
+			t.Fatalf("iteration %d: %s handed twice", i, e.TaskID)
+		}
+		seen[e.TaskID] = true
+		if _, ok := r.MarkDelivering("d1", now, e.Payload); !ok {
+			t.Fatalf("iteration %d: mark delivering %s failed", i, e.TaskID)
+		}
+		if i == 0 && r.BusyFor("d1") != 3 {
+			t.Fatalf("busy = %d, want 3", r.BusyFor("d1"))
+		}
+	}
+	if len(seen) != 3 {
+		t.Fatalf("saw %d tasks, want 3", len(seen))
+	}
+}
