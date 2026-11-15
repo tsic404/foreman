@@ -54,8 +54,20 @@ type Store struct {
 	byDigest map[[32]byte]Credential
 }
 
-// Load reads the credential set from env.
+// Load reads the credential set from env. When allowUnbound is set a daemon
+// identity may omit its workspace binding: the user-scoped discovery form
+// derives one identity per discovered workspace, so the binding cannot be
+// written down ahead of time. The caller binds it once discovery completes.
+func LoadUnbound(getenv func(string) string) (*Store, error) {
+	return load(getenv, true)
+}
+
+// Load is the strict form: every daemon identity must name its workspace.
 func Load(getenv func(string) string) (*Store, error) {
+	return load(getenv, false)
+}
+
+func load(getenv func(string) string, allowUnbound bool) (*Store, error) {
 	if getenv == nil {
 		getenv = os.Getenv
 	}
@@ -81,7 +93,7 @@ func Load(getenv func(string) string) (*Store, error) {
 			return nil, fmt.Errorf("%s: malformed pair %q (want <daemon-id>=<token>)", EnvDaemonTokens, pair)
 		}
 		ws, bound := workspaces[id]
-		if !bound {
+		if !bound && !allowUnbound {
 			return nil, fmt.Errorf("%w: %s (set %s)", ErrWorkspaceUnbound, id, EnvDaemonTokenWorkspaces)
 		}
 		digest := sha256.Sum256([]byte(token))
@@ -94,6 +106,22 @@ func Load(getenv func(string) string) (*Store, error) {
 		return nil, fmt.Errorf("%s: no credential configured", EnvDaemonTokens)
 	}
 	return store, nil
+}
+
+// Bind records the workspace a daemon identity serves. The user-scoped
+// discovery form calls it once per discovered workspace; the strict form
+// already has the binding from env and never needs it.
+func (s *Store) Bind(daemonID, workspaceID string) {
+	if daemonID == "" || workspaceID == "" {
+		return
+	}
+	for digest, cred := range s.byDigest {
+		if cred.DaemonID == daemonID {
+			cred.WorkspaceID = workspaceID
+			s.byDigest[digest] = cred
+			return
+		}
+	}
 }
 
 // Verify resolves a presented token to its credential. The comparison is a

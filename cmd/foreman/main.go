@@ -69,8 +69,16 @@ func run() error {
 	}
 
 	// The daemon credential set: the long-lived daemons that register to
-	// Foreman. A malformed or missing set refuses startup.
-	daemonCreds, err := daemonauth.Load(getenv)
+	// Foreman. A malformed or missing set refuses startup. The user-scoped
+	// discovery form derives one identity per discovered workspace, so its
+	// bindings cannot be written down ahead of discovery — they are filled in
+	// below once the workspace set is known.
+	var daemonCreds *daemonauth.Store
+	if deployment.Scope == workspace.ScopeUser {
+		daemonCreds, err = daemonauth.LoadUnbound(getenv)
+	} else {
+		daemonCreds, err = daemonauth.Load(getenv)
+	}
 	if err != nil {
 		return err
 	}
@@ -115,6 +123,11 @@ func run() error {
 			return fmt.Errorf("workspace discovery: %w", derr)
 		}
 		workspaceIDs = discovered.IDs()
+		// Bind each discovered workspace's identity, since the credential set
+		// was loaded before the set was known.
+		for _, id := range deployment.Identities(discovered.Set) {
+			daemonCreds.Bind(id.DaemonID, id.WorkspaceID)
+		}
 		set := make([]*proxy.Client, 0, len(workspaceIDs))
 		for _, wsID := range workspaceIDs {
 			cfg := proxyCfg
