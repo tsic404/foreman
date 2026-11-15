@@ -32,7 +32,14 @@ Multica Server  ◄── fake client ──  Foreman  ── fake server ──
   assigned to it.
 - **Dispatcher** — picks the daemon for a claim: session affinity first (the
   daemon that already holds the task's `prior_session_id`), then the least busy
-  online daemon, then registration order.
+  online daemon, then registration order. Affinity needs two inputs, both
+  upstream: a `prior_session_id` in the claim, and an S-16 `session` report
+  from the daemon naming the runtime that holds the files. Multica **v0.9.0
+  sends neither** on a fresh workspace — claims carry no `prior_session_id`
+  and the daemon runs every task with `resume_session=false` — so in practice
+  the dispatcher falls through to load and registration order. The affinity
+  path is implemented and unit-tested, but on this version of the stack it is
+  dormant rather than exercised.
 - **Multiple runtimes per daemon.** A daemon may declare several runtimes — the
   built-in agent it detects plus any custom runtime profiles the workspace
   defines, and those can differ in provider (say `omp` next to `codex`).
