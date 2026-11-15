@@ -4,8 +4,8 @@
 #
 # Services:
 #   postgres   pgvector/pgvector:pg17       the persistence layer
-#   backend    multica-backend:v0.6.1        the multica server (migrations on boot)
-#   web        multica-web:v0.6.1            the Next.js frontend
+#   backend    multica-backend:v0.9.0        the multica server (migrations on boot)
+#   web        multica-web:v0.9.0            the Next.js frontend
 #   proxy      nginx:1.27-alpine             the entry origin (web UI + /ws)
 #
 # Foreman v2 and a resident daemon run as processes on the host, dialing the
@@ -37,7 +37,7 @@ services:
     networks: [mtest]
 
   backend:
-    image: ghcr.io/multica-ai/multica-backend:v0.6.1
+    image: ghcr.io/multica-ai/multica-backend:v0.9.0
     depends_on:
       postgres:
         condition: service_healthy
@@ -74,7 +74,7 @@ services:
     networks: [mtest]
 
   web:
-    image: ghcr.io/multica-ai/multica-web:v0.6.1
+    image: ghcr.io/multica-ai/multica-web:v0.9.0
     depends_on:
       backend:
         condition: service_healthy

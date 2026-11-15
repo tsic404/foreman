@@ -142,11 +142,31 @@ mkdir -p "$WORK/daemon-home/.multica" "$WORK/daemon-home/.local/bin" "$WORK/daem
 # A previous run's empty session file makes the next run's omp refuse to
 # resume it ("session file holds no entries"); start clean.
 rm -f "$WORK/daemon-home/.multica/pi-sessions/"*.jsonl 2>/dev/null || true
-# The daemon needs an agent CLI on PATH and an auth config for its server.
-# Provide omp (if the host has it) and write the CLI config that points at
-# Foreman with the daemon credential.
-if [ -x "$HOME/.local/bin/omp" ]; then
-	ln -sf "$HOME/.local/bin/omp" "$WORK/daemon-home/.local/bin/omp"
+# omp shim: the multica daemon pre-creates an empty --session file, which
+# omp's resume path refuses ("holds no entries"). The shim seeds the file with
+# one valid session-header line before exec'ing the real omp — an agent-side
+# fixture for the test environment only; Foreman never touches it.
+REAL_OMP="$HOME/.local/bin/omp"
+SHIM="$WORK/daemon-home/.local/bin/omp"
+if [ -x "$REAL_OMP" ]; then
+	cat > "$SHIM" <<'SHIMEOF'
+#!/usr/bin/env bash
+session=""
+prev=""
+for a in "$@"; do
+  if [ "$prev" = "--session" ]; then session="$a"; fi
+  prev="$a"
+done
+if [ -n "$session" ] && [ -f "$session" ] && [ ! -s "$session" ]; then
+  basename "$session" .jsonl > "$session.head"
+  printf '{"type":"session","id":"%s","version":1}\n' "$(cat "$session.head")" > "$session"
+  rm -f "$session.head"
+fi
+exec __REAL_OMP__ "$@"
+SHIMEOF
+	# Replace the placeholder with the real binary's absolute path.
+	sed -i "s|__REAL_OMP__|$REAL_OMP|g" "$SHIM"
+	chmod +x "$SHIM"
 fi
 # omp reads its provider/model config from $HOME/.omp; link the host's real
 # config into the isolated daemon home so the agent uses the same model the
@@ -218,27 +238,36 @@ echo "triggered autopilot $AP_ID"
 # Baseline of the chain-proof line: only starts AFTER this trigger count as
 # this run's evidence.
 BASE_STARTS=$("${COMPOSE[@]}" logs backend 2>/dev/null | grep -cE 'tasks/[0-9a-f-]+/start status=200' || true)
+BASE_DONE=$("${COMPOSE[@]}" logs backend 2>/dev/null | grep -cE 'INF task completed' || true)
 
 # --- 9. verify the chain via Foreman's forward metrics -----------------------
 step "waiting for the forwarded legs"
-deadline=$(( $(date +%s) + 150 ))
+deadline=$(( $(date +%s) + 420 ))
 while [ "$(date +%s)" -lt "$deadline" ]; do
-	# The chain proof is multica accepting the daemon's start forward
-	# (POST .../tasks/{tid}/start 200) for a task dispatched to Foreman's
-	# runtime. That request only exists when Foreman claimed, delivered, the
-	# daemon processed and Foreman forwarded it back.
-	# grep -q would SIGPIPE the compose logs reader under pipefail, so capture
-	# the match with grep -c instead.
+	# Full-chain proof: a task dispatched to Foreman's runtime reached multica
+	# as completed (Foreman claimed, delivered, the daemon ran the agent, and
+	# Foreman forwarded every report leg back). Fall back to the start-only
+	# proof so a partial chain is still visible. grep -q would SIGPIPE the
+	# compose logs reader under pipefail, so capture with grep -c instead.
+	if [ "$("${COMPOSE[@]}" logs backend 2>/dev/null | grep -cE 'INF task completed' || true)" -gt "$BASE_DONE" ]; then
+		CHAIN_OK=1
+		TASK_DONE=1
+		break
+	fi
+	# Track a start-only partial chain, but keep waiting for completion: an
+	# agent run takes a couple of minutes, and exiting at start would report a
+	# false partial.
 	if [ "$("${COMPOSE[@]}" logs backend 2>/dev/null | grep -cE 'tasks/[0-9a-f-]+/start status=200' || true)" -gt "$BASE_STARTS" ]; then
 		CHAIN_OK=1
-		break
 	fi
 	sleep 3
 done
 
 step "result"
-if [ "${CHAIN_OK:-0}" = "1" ]; then
-	echo "CHAIN VERIFIED: multica accepted the daemon's start forwarded by Foreman"
+if [ "${TASK_DONE:-0}" = "1" ]; then
+	echo "TASK COMPLETED: multica settled a task Foreman dispatched and forwarded end to end"
+elif [ "${CHAIN_OK:-0}" = "1" ]; then
+	echo "CHAIN VERIFIED (start only): multica accepted the daemon's start forwarded by Foreman"
 else
 	echo "CHAIN NOT OBSERVED within the window (see logs below)"
 fi
