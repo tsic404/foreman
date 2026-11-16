@@ -542,6 +542,8 @@ func (d *Dispatcher) OnReport(ctx context.Context, ep Endpoint, e registry.TaskE
 			return code, resp, nil
 		}
 		if first {
+			d.log.Info("task.settled", "task_id", e.TaskID, "result", string(result),
+				"workspace_id", e.WorkspaceID, "runtime_id", updated.RuntimeID)
 			d.metrics.TaskTerminal(string(result))
 			d.metrics.InflightJobs(d.reg.Inflight())
 			if sessionID != "" && updated.RuntimeID != "" {
@@ -626,6 +628,8 @@ func (d *Dispatcher) failLocally(ctx context.Context, taskID, reason string) err
 		return err
 	}
 	if first {
+		d.log.Warn("task.settled_locally", "task_id", taskID, "reason", reason,
+			"workspace_id", e.WorkspaceID)
 		d.metrics.TaskTerminal(string(registry.ResultFailed))
 		d.metrics.InflightJobs(d.reg.Inflight())
 		d.reclaim(updated)
@@ -729,6 +733,8 @@ func (d *Dispatcher) convergeStatus(ctx context.Context, e registry.TaskEntry) {
 		defer unlock()
 		updated, first, terr := d.reg.MarkTerminal(e.TaskID, registry.Result(status), "", d.now())
 		if terr == nil && first {
+			d.log.Info("task.settled", "task_id", e.TaskID, "result", status,
+				"workspace_id", e.WorkspaceID, "source", "server_status")
 			d.metrics.TaskTerminal(status)
 			d.metrics.InflightJobs(d.reg.Inflight())
 			d.reclaim(updated)
