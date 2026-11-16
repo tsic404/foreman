@@ -189,6 +189,14 @@ workspace and per extra daemon; the parser tolerates a blank entry between
 commas, so a stray separator is harmless, but the list is the thing to read
 when a daemon registers and still receives nothing.
 
+The ops surface has its own partition on top of that. A deployment-wide
+credential (`FOREMAN_OPS_TOKEN`) reads every served workspace; a bound one
+(`FOREMAN_OPS_WORKSPACE_TOKENS`, `<workspace-id>=<token>`) reads exactly the
+workspace it names. Verified on a two-workspace deployment: the wide credential
+listed both ids, the bound credential listed only its own, and asking for the
+other one by query parameter answered 404 — the same answer an unknown id gets,
+so the parameter cannot be used to probe which workspaces exist.
+
 ## License
 
 MIT
