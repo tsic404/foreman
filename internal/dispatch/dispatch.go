@@ -560,6 +560,13 @@ func (d *Dispatcher) OnReport(ctx context.Context, ep Endpoint, e registry.TaskE
 		result := ep.TerminalResult()
 		updated, first, terr := d.reg.MarkTerminal(e.TaskID, result, "", now)
 		if terr != nil {
+			// The upstream took the report; the local table has no row for it.
+			// That is the restart path (the registry is in-memory, daemons keep
+			// running), which is why it is not an error. It still has to be
+			// visible: a silent drop is indistinguishable from a clean settle
+			// when reading the log afterwards.
+			d.log.Info("task.unbound", "task_id", e.TaskID, "result", string(result),
+				"workspace_id", e.WorkspaceID, "reason", terr.Error())
 			return code, resp, nil
 		}
 		if first {
