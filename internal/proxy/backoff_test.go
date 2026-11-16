@@ -76,3 +76,23 @@ func TestBackoffJitterIsActuallyRandom(t *testing.T) {
 		}
 	}
 }
+
+// TestJitterWaitStaysInBand: the terminal-forward ladder must be spread but
+// bounded — a step of 4s lands in [4s, 5s), and a zero step stays zero (the
+// first attempt must not be delayed).
+func TestJitterWaitStaysInBand(t *testing.T) {
+	if got := jitterWait(0); got != 0 {
+		t.Fatalf("jitterWait(0) = %s, want 0 (the first attempt is immediate)", got)
+	}
+	seen := map[time.Duration]bool{}
+	for i := 0; i < 200; i++ {
+		got := jitterWait(4 * time.Second)
+		if got < 4*time.Second || got >= 5*time.Second {
+			t.Fatalf("jitterWait(4s) = %s, outside [4s, 5s)", got)
+		}
+		seen[got] = true
+	}
+	if len(seen) < 2 {
+		t.Fatalf("200 samples produced %d distinct waits; jitter is not varying", len(seen))
+	}
+}

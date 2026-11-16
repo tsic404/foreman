@@ -499,6 +499,10 @@ func (c *Client) ForwardInWorkspace(ctx context.Context, ep Endpoint, taskID, wo
 	}
 	for attempt, wait := range terminalRetryWaits {
 		if attempt > 0 {
+			// The ladder is shared by every terminal forward, so a server blip
+			// makes all of them line up on the same instant. Spread each step
+			// the way the claim backoff does.
+			wait = jitterWait(wait)
 			select {
 			case <-ctx.Done():
 				return 0, nil, ctx.Err()

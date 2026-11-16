@@ -209,7 +209,7 @@ func (b *backoff) next() time.Duration {
 	if b.rand == nil {
 		return b.cur
 	}
-	return b.cur + time.Duration(float64(b.cur)*0.25*b.rand())
+	return b.cur + time.Duration(float64(b.cur)*jitterBand*b.rand())
 }
 
 func (b *backoff) reset() { b.cur = 0 }
