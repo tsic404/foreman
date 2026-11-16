@@ -74,10 +74,16 @@ Tokens are compared by SHA-256 digest in constant time and are never logged.
 | `FOREMAN_CLAIM_INTERVAL` | `5s` | claim cadence |
 | `FOREMAN_CLAIM_INTERVAL_IDLE` | `30s` | claim cadence when no daemon is idle |
 | `FOREMAN_LEASE_REFRESH_INTERVAL` | `15s` | prepare-lease renewal (refused above `20s`) |
-| `FOREMAN_RECONCILE_INTERVAL` | `30s` | convergence round cadence |
+| `FOREMAN_RECONCILE_INTERVAL` | `30s` | convergence round cadence. `0` is refused: it would disable both the boot bound and the offline sweep |
+| `FOREMAN_HEARTBEAT_TIMEOUT` | `60s` | how long a runtime may stay silent before the sweep marks it offline. `0` disables the sweep |
 | `FOREMAN_JOB_BOOT_TIMEOUT` | `60s` | claim → daemon start bound |
 | `FOREMAN_LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` |
 | `FOREMAN_OPS_TOKEN` | — | the ops-surface credential |
+| `FOREMAN_OPS_WORKSPACE_TOKENS` | — | per-workspace ops credentials, `"<workspace-id>=<token>[, …]"` |
+| `FOREMAN_WORKSPACES` | — | JSON identity list: names every served workspace's daemon identity explicitly (workspace-scoped form, alternative to `MULTICA_WORKSPACE_ID`) |
+| `FOREMAN_WORKSPACES_FILE` | — | path to the same JSON list |
+| `FOREMAN_WORKSPACES_MANIFEST` | — | JSON list of workspace ids the user-scoped credential may serve; workspaces outside it are excluded. Refuses startup when a listed workspace is not visible |
+| `FOREMAN_WORKSPACES_MANIFEST_FILE` | — | path to the same manifest |
 
 ## Post-install checks
 
