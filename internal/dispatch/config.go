@@ -19,6 +19,11 @@ const (
 	EnvHeartbeatTimeout = "FOREMAN_HEARTBEAT_TIMEOUT"
 	// EnvReconcileInterval is the convergence round's cadence.
 	EnvReconcileInterval = "FOREMAN_RECONCILE_INTERVAL"
+	// EnvTaskMaxDuration bounds one task once it started. Zero (the default)
+	// leaves it unbounded. Reaching the bound does not fail the task: the
+	// round reads the server's own status (C-13) and aligns to it, because the
+	// server owns the verdict for a run that is still going.
+	EnvTaskMaxDuration = "FOREMAN_TASK_MAX_DURATION"
 )
 
 // defaultReconcileInterval is the documented convergence cadence.
@@ -41,6 +46,9 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		return Config{}, err
 	}
 	if cfg.HeartbeatTimeout, err = durationEnv(getenv, EnvHeartbeatTimeout, cfg.HeartbeatTimeout); err != nil {
+		return Config{}, err
+	}
+	if cfg.TaskMaxDuration, err = durationEnv(getenv, EnvTaskMaxDuration, cfg.TaskMaxDuration); err != nil {
 		return Config{}, err
 	}
 	if cfg.ReconcileInterval, err = durationEnv(getenv, EnvReconcileInterval, cfg.ReconcileInterval); err != nil {

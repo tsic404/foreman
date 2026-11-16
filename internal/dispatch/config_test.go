@@ -28,13 +28,43 @@ func TestLoadConfigOverride(t *testing.T) {
 		dispatch.EnvBootTimeout:       "45s",
 		dispatch.EnvHeartbeatTimeout:  "2m",
 		dispatch.EnvReconcileInterval: "10s",
+		dispatch.EnvTaskMaxDuration:   "3h",
 	}
 	cfg, err := dispatch.LoadConfig(func(k string) string { return env[k] })
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
-	if cfg.BootTimeout != 45*time.Second || cfg.HeartbeatTimeout != 2*time.Minute || cfg.ReconcileInterval != 10*time.Second {
-		t.Fatalf("got boot=%s heartbeat=%s reconcile=%s", cfg.BootTimeout, cfg.HeartbeatTimeout, cfg.ReconcileInterval)
+	if cfg.BootTimeout != 45*time.Second || cfg.HeartbeatTimeout != 2*time.Minute ||
+		cfg.ReconcileInterval != 10*time.Second || cfg.TaskMaxDuration != 3*time.Hour {
+		t.Fatalf("got boot=%s heartbeat=%s reconcile=%s max=%s",
+			cfg.BootTimeout, cfg.HeartbeatTimeout, cfg.ReconcileInterval, cfg.TaskMaxDuration)
+	}
+}
+
+// TestTaskMaxDurationIsReachableFromEnv is the regression guard for a config
+// field that was read by Reconcile but never populated: every bound the
+// dispatcher honours must be settable from the environment it documents.
+func TestTaskMaxDurationIsReachableFromEnv(t *testing.T) {
+	cfg, err := dispatch.LoadConfig(func(k string) string {
+		if k == dispatch.EnvTaskMaxDuration {
+			return "90m"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.TaskMaxDuration != 90*time.Minute {
+		t.Fatalf("TaskMaxDuration = %s, want 90m (the env key must reach it)",
+			cfg.TaskMaxDuration)
+	}
+	// Unset keeps the documented default: no bound.
+	cfg, err = dispatch.LoadConfig(func(string) string { return "" })
+	if err != nil {
+		t.Fatalf("load default: %v", err)
+	}
+	if cfg.TaskMaxDuration != 0 {
+		t.Fatalf("default TaskMaxDuration = %s, want 0 (unbounded)", cfg.TaskMaxDuration)
 	}
 }
 

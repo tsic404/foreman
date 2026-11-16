@@ -77,6 +77,7 @@ Tokens are compared by SHA-256 digest in constant time and are never logged.
 | `FOREMAN_RECONCILE_INTERVAL` | `30s` | convergence round cadence. `0` is refused: it would disable both the boot bound and the offline sweep |
 | `FOREMAN_HEARTBEAT_TIMEOUT` | `60s` | how long a runtime may stay silent before the sweep marks it offline. `0` disables the sweep |
 | `FOREMAN_JOB_BOOT_TIMEOUT` | `60s` | claim → daemon start bound |
+| `FOREMAN_TASK_MAX_DURATION` | — (unbounded) | how long one started task may run before each reconcile round reads the server's own status (C-13) and aligns to it. The server keeps the verdict — Foreman does not fail the task itself. Round cadence is `FOREMAN_RECONCILE_INTERVAL`, so set this comfortably above it |
 | `FOREMAN_LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` |
 | `FOREMAN_OPS_TOKEN` | — | the ops-surface credential |
 | `FOREMAN_OPS_WORKSPACE_TOKENS` | — | per-workspace ops credentials, `"<workspace-id>=<token>[, …]"`. The order matters and the failure mode is misleading: a reversed pair loads fine (the workspace id becomes a token nobody presents), so every request with the intended token answers 401 rather than a configuration error. If a bound credential unexpectedly 401s, check the pair order first |
