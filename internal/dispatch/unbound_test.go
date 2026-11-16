@@ -112,3 +112,43 @@ func TestTerminalReportForKnownTaskStaysQuiet(t *testing.T) {
 		t.Fatalf("the ordinary settle emitted an unbound line:\n%s", out)
 	}
 }
+
+// TestCancelStatusReadFailureIsLogged: a C13 failure during cancel settlement
+// must not look like "already terminal" — that conflation hid why the synthetic
+// fail was never sent.
+func TestCancelStatusReadFailureIsLogged(t *testing.T) {
+	logs := &bytes.Buffer{}
+	log := slog.New(slog.NewJSONHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+
+	// The report forward (POST) succeeds so OnReport reaches the terminal
+	// branch; only the status read (GET .../status) fails.
+	fail := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		io.WriteString(w, `{"status":"ok"}`)
+	}))
+	defer fail.Close()
+
+	reg := registry.New()
+	client := proxy.NewClient(proxy.Config{
+		ServerURL: fail.URL, WorkspaceID: "ws-1", DaemonID: "foreman-ws-1", Version: "test",
+	}, "tok")
+	disp := dispatch.New(dispatch.Config{}, reg, client, nil, dispatch.WithLogger(log))
+
+	if err := reg.Put(registry.TaskEntry{
+		TaskID: "task-c", WorkspaceID: "ws-1", DaemonID: "worker-1",
+		DaemonRuntimeID: "worker-1", RuntimeID: "srv-1", State: registry.StateRunning,
+	}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	e := registry.TaskEntry{TaskID: "task-c", WorkspaceID: "ws-1", DaemonID: "worker-1"}
+	if _, _, err := disp.OnReport(context.Background(), dispatch.EPCancelAck, e, []byte(`{}`), ""); err != nil {
+		t.Fatalf("cancel-ack: %v", err)
+	}
+	if !strings.Contains(logs.String(), "cancel.status_read_failed") {
+		t.Fatalf("a failed C13 read left no trace:\n%s", logs.String())
+	}
+}

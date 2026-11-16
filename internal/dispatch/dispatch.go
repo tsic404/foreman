@@ -484,8 +484,15 @@ func (d *Dispatcher) OnReport(ctx context.Context, ep Endpoint, e registry.TaskE
 	// the runtime its claim was dispatched under, so it is translated back.
 	out := body
 	if ep == EPStart && e.RuntimeID != "" {
-		if translated, err := rewriteRuntime(body, e.RuntimeID); err == nil {
+		translated, rerr := rewriteRuntime(body, e.RuntimeID)
+		if rerr == nil {
 			out = translated
+		} else {
+			// The start would go upstream naming the daemon-local runtime id,
+			// which the server cannot map: a mis-attributed start that looked
+			// exactly like a clean one.
+			d.log.Warn("start.runtime_rewrite_failed", "task_id", e.TaskID,
+				"runtime_id", e.RuntimeID, "err", rerr)
 		}
 	}
 	code, resp, err := d.server.ForwardInWorkspace(ctx, ep, e.TaskID, e.WorkspaceID, out)
@@ -526,7 +533,11 @@ func (d *Dispatcher) OnReport(ctx context.Context, ep Endpoint, e registry.TaskE
 				CacheWrite int64 `json:"cache_write_tokens"`
 			} `json:"last_token_usage"`
 		}
-		if json.Unmarshal(body, &payload) == nil {
+		if uerr := json.Unmarshal(body, &payload); uerr != nil {
+			// The token series would quietly lose this sample; name the task so
+			// a disappearing usage report is traceable to a payload shape.
+			d.log.Debug("usage.unparseable", "task_id", e.TaskID, "err", uerr)
+		} else {
 			if len(payload.Usage) > 0 {
 				for _, u := range payload.Usage {
 					if u.Input != 0 || u.Output != 0 || u.CacheRead != 0 || u.CacheWrite != 0 {
@@ -594,7 +605,14 @@ func (d *Dispatcher) OnReport(ctx context.Context, ep Endpoint, e registry.TaskE
 // 30s control timeout makes the daemon retry long before that).
 func (d *Dispatcher) settleCancelledTask(ctx context.Context, e registry.TaskEntry) {
 	status, err := d.server.TaskStatus(ctx, e.TaskID)
-	if err != nil || registry.IsTerminalResult(status) {
+	if err != nil {
+		// A C13 failure is not "already terminal": conflating them hid the
+		// reason the synthetic fail was skipped, leaving the task running on
+		// the server with nothing in the log explaining why.
+		d.log.Warn("cancel.status_read_failed", "task_id", e.TaskID, "err", err)
+		return
+	}
+	if registry.IsTerminalResult(status) {
 		return
 	}
 	body, _ := json.Marshal(map[string]any{"error": "cancelled by daemon"})
@@ -775,8 +793,14 @@ func (d *Dispatcher) convergeStatus(ctx context.Context, e registry.TaskEntry) {
 	status, err := d.server.TaskStatus(ctx, e.TaskID)
 	if err != nil {
 		if errors.Is(err, ErrTaskNotFound) {
-			_ = d.OnTaskVanished(ctx, e.TaskID)
+			if verr := d.OnTaskVanished(ctx, e.TaskID); verr != nil {
+				d.log.Warn("task.vanish_failed", "task_id", e.TaskID, "err", verr)
+			}
+			return
 		}
+		// A timeout or 5xx used to drop the whole round with a bare return,
+		// leaving the entry "running" locally forever with no trace.
+		d.log.Warn("converge.status_read_failed", "task_id", e.TaskID, "err", err)
 		return
 	}
 	switch {
