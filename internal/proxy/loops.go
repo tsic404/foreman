@@ -36,12 +36,23 @@ type ClaimLoop struct {
 	// poll), so renewing every round means dozens of calls a minute for a
 	// credential that only needs extending occasionally.
 	lastRenew time.Time
+	// lastIdleNote and idleRounds drive the low-rate idle heartbeat: with the
+	// default INFO level, a quiet system is indistinguishable from a wedged
+	// loop because every claim-round line is DEBUG. One INFO every ten minutes
+	// gives an operator a "the loop is still turning" breadcrumb without
+	// flooding the log.
+	lastIdleNote time.Time
+	idleRounds   int
 }
 
 // tokenRenewInterval bounds how often the claim preflight extends the server
 // credential. Five minutes keeps the token comfortably ahead of expiry without
 // turning the preflight into a load source.
 const tokenRenewInterval = 5 * time.Minute
+
+// idleHeartbeatInterval is how often an idle claim loop states, at INFO, that
+// it is still polling.
+const idleHeartbeatInterval = 10 * time.Minute
 
 // NewClaimLoop builds the loop. capacity returns the free task capacity.
 func NewClaimLoop(cfg Config, client *Client, claim Claimer, capacity func() int) *ClaimLoop {
@@ -78,10 +89,26 @@ func (l *ClaimLoop) Run(ctx context.Context) error {
 			}
 			continue
 		}
+		l.noteIdleRound()
 		if !sleepOrDone(ctx, l.interval()) {
 			return nil
 		}
 	}
+}
+
+// noteIdleRound emits a low-rate INFO breadcrumb while the loop has nothing to
+// do. Without it a healthy idle system and a wedged loop look identical at the
+// default log level, since every per-round line is DEBUG.
+func (l *ClaimLoop) noteIdleRound() {
+	now := time.Now()
+	l.idleRounds++
+	if !l.lastIdleNote.IsZero() && now.Sub(l.lastIdleNote) < idleHeartbeatInterval {
+		return
+	}
+	l.log.Info("claim.idle", "rounds", l.idleRounds, "capacity", l.Capacity(),
+		"interval", l.interval().String())
+	l.lastIdleNote = now
+	l.idleRounds = 0
 }
 
 // preflight registers the daemon set to the server (C1) when it is dirty and
