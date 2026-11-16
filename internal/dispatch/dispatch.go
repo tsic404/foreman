@@ -843,6 +843,11 @@ func (d *Dispatcher) convergeStatus(ctx context.Context, e registry.TaskEntry) {
 			d.reclaim(updated)
 		}
 	case status == "running":
+		// No taskMu here: the file lock would only order this against the
+		// daemon's S-8 start, and MarkStarted is idempotent on the field that
+		// matters — it only stamps StartedAt when it is still zero, so a
+		// concurrent pair cannot move the boot-bound or max-duration
+		// arithmetic. The registry's own mutex makes the write atomic.
 		d.reg.MarkStarted(e.TaskID, d.now())
 	}
 }

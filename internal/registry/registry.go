@@ -390,7 +390,9 @@ func (r *Registry) MarkTerminal(taskID string, result Result, reason string, at 
 	return e, true, nil
 }
 
-// SetLeaseKeepUntil projects the server's prepare-lease deadline (§10).
+// SetLeaseKeepUntil records the server's prepare-lease deadline (§10) as a
+// projection for the ops view. Nothing in the scheduling path reads it, so a
+// convergence round restamping it cannot change a decision.
 func (r *Registry) SetLeaseKeepUntil(taskID string, until time.Time) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
