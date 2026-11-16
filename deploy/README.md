@@ -73,7 +73,7 @@ Tokens are compared by SHA-256 digest in constant time and are never logged.
 | `FOREMAN_DAEMON_ID` | `foreman` | the daemon identity Foreman registers under |
 | `FOREMAN_CLAIM_INTERVAL` | `5s` | claim cadence |
 | `FOREMAN_CLAIM_INTERVAL_IDLE` | `30s` | claim cadence when no daemon is idle |
-| `FOREMAN_LEASE_REFRESH_INTERVAL` | `15s` | prepare-lease renewal (refused above `20s`) |
+| `FOREMAN_LEASE_REFRESH_INTERVAL` | `15s` | daemon-identity heartbeat cadence (C-2); refused above `20s`. The name is historical — task leases are renewed by C-4 from the convergence round below, not by this value |
 | `FOREMAN_RECONCILE_INTERVAL` | `30s` | convergence round cadence. `0` is refused: it would disable both the boot bound and the offline sweep |
 | `FOREMAN_HEARTBEAT_TIMEOUT` | `60s` | how long a runtime may stay silent before the sweep marks it offline. `0` disables the sweep |
 | `FOREMAN_JOB_BOOT_TIMEOUT` | `60s` | claim → daemon start bound |

@@ -96,3 +96,37 @@ func TestJitterWaitStaysInBand(t *testing.T) {
 		t.Fatalf("200 samples produced %d distinct waits; jitter is not varying", len(seen))
 	}
 }
+
+// TestLeaseRefreshIntervalDrivesHeartbeatNotLease pins the wiring this project
+// keeps tripping over: the variable named "lease refresh" is the heartbeat
+// cadence. If someone later wires it to a lease path, this test says the
+// documented meaning changed.
+func TestLeaseRefreshIntervalDrivesHeartbeatNotLease(t *testing.T) {
+	cfg, err := LoadConfig(func(k string) string {
+		switch k {
+		case EnvServerURL:
+			return "https://example.test"
+		case EnvLeaseRefreshInterval:
+			return "10s"
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("load: %v", err)
+	}
+	if cfg.LeaseRefreshInterval != 10*time.Second {
+		t.Fatalf("LeaseRefreshInterval = %s, want 10s", cfg.LeaseRefreshInterval)
+	}
+	// The cap protects the heartbeat contract, not a lease one.
+	if _, err := LoadConfig(func(k string) string {
+		switch k {
+		case EnvServerURL:
+			return "https://example.test"
+		case EnvLeaseRefreshInterval:
+			return "25s"
+		}
+		return ""
+	}); err == nil {
+		t.Fatalf("accepted %s above the %s cap", EnvLeaseRefreshInterval, MaxLeaseRefreshInterval)
+	}
+}

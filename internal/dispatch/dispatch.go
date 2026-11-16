@@ -747,9 +747,12 @@ func (d *Dispatcher) convergeOne(ctx context.Context, e registry.TaskEntry) {
 			return
 		}
 	}
-	// Lease renewal for a claimed-but-unstarted task (§10: renew every ≤20s).
-	// Covers pending, daemon-registered and delivering — the daemon renews via
-	// S7 while it holds the task, and this is the Foreman-side fallback.
+	// Lease renewal for a claimed-but-unstarted task. This is the Foreman-side
+	// fallback: the daemon renews via S-7 while it holds the task, which is the
+	// path that actually meets §10's ≤20s cadence. This fallback runs once per
+	// convergence round (FOREMAN_RECONCILE_INTERVAL, 30s by default), which is
+	// safe against PrepareLeaseTTL (45s) but does NOT by itself satisfy the
+	// 20s requirement — do not raise the TTL to a round or more.
 	if e.StartedAt.IsZero() && e.RuntimeID != "" &&
 		(e.State == registry.StatePending || e.State == registry.StateDaemonRegistered || e.State == registry.StateDelivering) {
 		ready, err := d.server.PrepareLease(ctx, e.RuntimeID, e.TaskID)

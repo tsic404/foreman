@@ -37,13 +37,19 @@ const (
 
 // Defaults applied when the environment variable is unset.
 const (
-	DefaultDaemonID             = "foreman"
-	DefaultClaimInterval        = 5 * time.Second
-	DefaultClaimIntervalIdle    = 30 * time.Second
+	DefaultDaemonID          = "foreman"
+	DefaultClaimInterval     = 5 * time.Second
+	DefaultClaimIntervalIdle = 30 * time.Second
+	// DefaultLeaseRefreshInterval is the daemon-identity heartbeat cadence
+	// (C-2, POST /api/daemon/heartbeat), not the task lease renewal cadence —
+	// despite the historical variable name. Task leases are renewed by C-4
+	// from the dispatcher's convergence round (FOREMAN_RECONCILE_INTERVAL) and
+	// by the daemon itself via S-7.
 	DefaultLeaseRefreshInterval = 15 * time.Second
 
-	// MaxLeaseRefreshInterval caps the renewal cadence: §10 requires a claimed,
-	// not-yet-started task to be renewed at least every 20s.
+	// MaxLeaseRefreshInterval caps the heartbeat cadence: the upstream daemon
+	// heartbeats every 15s, and a slower Foreman-side heartbeat would let a
+	// runtime look stale to the sweep between ticks.
 	MaxLeaseRefreshInterval = 20 * time.Second
 
 	// ClientCapabilities is the X-Client-Capabilities header value (§1.1).
