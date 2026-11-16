@@ -180,6 +180,15 @@ reproduce either, so verify with a second workspace registered and served —
 expect exactly one `claim.idle` and one `reconcile.round` per workspace, and
 nothing tagged with one workspace's id answered by another's loop.
 
+The two modes stack: several workspaces served by several daemons. That is the
+shape the per-workspace scoping is written for, and both flags have to be set
+together to exercise it — a run with only one of them cannot show that a
+daemon's work stays inside its own workspace while another workspace's loop is
+idle. The daemon credential list carries one `<identity>=<token>` pair per
+workspace and per extra daemon; the parser tolerates a blank entry between
+commas, so a stray separator is harmless, but the list is the thing to read
+when a daemon registers and still receives nothing.
+
 ## License
 
 MIT
