@@ -17,7 +17,12 @@ const (
 	// EnvHeartbeatTimeout bounds how long a daemon may stay silent before the
 	// sweep marks it offline. Zero disables the sweep.
 	EnvHeartbeatTimeout = "FOREMAN_HEARTBEAT_TIMEOUT"
+	// EnvReconcileInterval is the convergence round's cadence.
+	EnvReconcileInterval = "FOREMAN_RECONCILE_INTERVAL"
 )
+
+// defaultReconcileInterval is the documented convergence cadence.
+const defaultReconcileInterval = 30 * time.Second
 
 // LoadConfig reads the dispatcher's timing bounds from env, applying the
 // documented defaults. An unparseable or negative value is an error: a bound
@@ -27,8 +32,9 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 		return Config{}, fmt.Errorf("dispatch: getenv is nil")
 	}
 	cfg := Config{
-		BootTimeout:      time.Minute, // documented default: claim → start bound
-		HeartbeatTimeout: time.Minute, // four upstream heartbeat intervals
+		BootTimeout:       time.Minute, // documented default: claim → start bound
+		HeartbeatTimeout:  time.Minute, // four upstream heartbeat intervals
+		ReconcileInterval: defaultReconcileInterval,
 	}
 	var err error
 	if cfg.BootTimeout, err = durationEnv(getenv, EnvBootTimeout, cfg.BootTimeout); err != nil {
@@ -36,6 +42,14 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	}
 	if cfg.HeartbeatTimeout, err = durationEnv(getenv, EnvHeartbeatTimeout, cfg.HeartbeatTimeout); err != nil {
 		return Config{}, err
+	}
+	if cfg.ReconcileInterval, err = durationEnv(getenv, EnvReconcileInterval, cfg.ReconcileInterval); err != nil {
+		return Config{}, err
+	}
+	// A zero cadence would mean "never reconcile", which silently disables the
+	// boot bound and the offline sweep — refuse it rather than idle.
+	if cfg.ReconcileInterval <= 0 {
+		return Config{}, fmt.Errorf("%s: must be positive", EnvReconcileInterval)
 	}
 	return cfg, nil
 }

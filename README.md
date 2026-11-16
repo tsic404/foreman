@@ -131,11 +131,9 @@ not fixable inside Foreman without patching the daemon CLI.
 
 ## Status
 
-Early development, but the v2 path is proven end to end. `deploy/test-real-daemon.sh`
-brings up a local Multica stack, extracts the official CLI from the backend
-image, mints a token, creates a workspace and agent, starts Foreman and a real
-daemon, binds them, triggers an autopilot, and asserts the task settles as
-`completed` — on both docker and podman.
+Early development, but the v2 path is proven end to end against a real Multica
+stack and a real resident daemon: a dispatched task is claimed, delivered, run
+by the agent, and settled back on the server as `completed`.
 
 ## License
 

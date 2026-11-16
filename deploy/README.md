@@ -79,49 +79,6 @@ Tokens are compared by SHA-256 digest in constant time and are never logged.
 | `FOREMAN_LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` |
 | `FOREMAN_OPS_TOKEN` | — | the ops-surface credential |
 
-## Local end-to-end test (docker or podman)
-
-`test-real-daemon.sh` proves the whole dispatch chain against a real Multica
-stack and a real `multica daemon` — no Kubernetes, no fakes:
-
-```bash
-bash deploy/test-real-daemon.sh          # reuse the running stack
-bash deploy/test-real-daemon.sh --reset  # drop the stack's volumes first
-docker compose -f deploy/test-compose.yaml down -v   # tear down afterwards
-```
-
-The script picks the engine automatically: `docker compose` when a docker
-daemon answers, `podman compose` otherwise. It then, in order:
-
-1. brings up `test-compose.yaml` — postgres/pgvector, the multica backend
-   (migrations run on start), the web UI, and an nginx proxy;
-2. extracts the official `multica` CLI out of the backend image and prints its
-   version;
-3. mints a personal access token (retrying the documented 429), creates the
-   workspace and an agent, and binds the agent to Foreman's runtime;
-4. builds and launches `bin/foreman`, then a real daemon **in an isolated
-   `$HOME`** pointed at Foreman's daemon face;
-5. triggers an autopilot and waits for the backend to log a **new**
-   `INF task completed` — the full-chain proof — falling back to a start-only
-   match so a partial chain is still visible.
-
-Expected last line:
-
-```
-TASK COMPLETED: multica settled a task Foreman dispatched and forwarded end to end
-```
-
-`test-compose.yaml` reads `deploy/.env` (gitignored; copy `.env.example` and
-fill it). The test is validated on both engines and against multica v0.9.0.
-
-### Agent requirement
-
-The daemon needs an agent CLI on `PATH`. `omp` needs one extra fixture: the
-daemon pre-creates an empty `--session` file and omp refuses to resume it, so
-the script drops a small shim in the isolated `$HOME` that seeds one session
-header line before exec'ing the real binary. Foreman never touches it — it is
-an agent-side fixture for the test environment only.
-
 ## Post-install checks
 
 ```bash

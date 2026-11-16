@@ -158,9 +158,7 @@ func run() error {
 		if client == nil {
 			continue
 		}
-		wsCfg := dispCfg
-		wsCfg.ReconcileInterval = 30 * time.Second
-		d := dispatch.New(wsCfg, reg, client, metrics,
+		d := dispatch.New(dispCfg, reg, client, metrics,
 			dispatch.WithLogger(baseLog),
 			dispatch.WithRealRuntimeID(func(runtimeKey string) (string, bool) {
 				// The server rewrites a runtime's display name (e.g. to the
