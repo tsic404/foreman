@@ -176,7 +176,12 @@ func run() error {
 		if client == nil {
 			continue
 		}
-		d := dispatch.New(dispCfg, reg, client, metrics,
+		// Each dispatcher is scoped to its own workspace: they share one
+		// registry, so an unscoped dispatcher would count every workspace's
+		// daemons as its own capacity.
+		scoped := dispCfg
+		scoped.WorkspaceID = wsID
+		d := dispatch.New(scoped, reg, client, metrics,
 			dispatch.WithLogger(baseLog),
 			dispatch.WithRealRuntimeID(func(runtimeKey string) (string, bool) {
 				// The server rewrites a runtime's display name (e.g. to the

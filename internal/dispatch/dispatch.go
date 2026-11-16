@@ -128,6 +128,10 @@ type Config struct {
 	// sweep marks it offline. Zero disables the sweep, leaving only explicit
 	// deregistration to flip the flag.
 	HeartbeatTimeout time.Duration
+	// WorkspaceID scopes this dispatcher. One dispatcher exists per served
+	// workspace and they all share one registry, so any count that ignores this
+	// reports another workspace's daemons as this one's capacity.
+	WorkspaceID string
 }
 
 // Delivery is the outcome of one S-6 delivery attempt (§5).
@@ -399,12 +403,20 @@ func (d *Dispatcher) pickDaemon(head claimHead) (registry.Runtime, bool) {
 // workspace: the number of tasks it can dispatch right now. The claim loop's
 // capacity reads it, so Foreman never claims more tasks than it can hand to a
 // daemon.
+//
+// The workspace filter is load-bearing: every dispatcher shares one registry,
+// so an unfiltered walk answers with the global count and lets a workspace with no
+// daemon of its own claim work it can never deliver.
 func (d *Dispatcher) IdleDaemons() int {
 	n := 0
 	for _, rt := range d.reg.Runtimes() {
-		if rt.Online && d.reg.BusyFor(rt.RuntimeID) == 0 {
-			n++
+		if !rt.Online || d.reg.BusyFor(rt.RuntimeID) != 0 {
+			continue
 		}
+		if d.cfg.WorkspaceID != "" && rt.WorkspaceID != d.cfg.WorkspaceID {
+			continue
+		}
+		n++
 	}
 	return n
 }
