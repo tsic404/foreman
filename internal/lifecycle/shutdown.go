@@ -40,7 +40,9 @@ func DeregisterOnShutdown(ctx context.Context, gate LastInstanceGate, served []D
 	for _, c := range served {
 		if err := c.Deregister(ctx); err != nil {
 			log.Warn("daemon.deregister_failed", "workspace_id", c.WorkspaceID(), "err", err.Error())
+			continue
 		}
+		log.Info("daemon.deregistered", "workspace_id", c.WorkspaceID())
 	}
 }
 
@@ -53,9 +55,15 @@ type ShutdownOptions struct {
 	// single-instance form.
 	Gate   LastInstanceGate
 	Served []Deregisterer
-	Drain  func(context.Context)
-	Wait   func(context.Context)
-	Log    *slog.Logger
+	// Inflight reports how many tasks are still live. Those cannot be
+	// settled here — their agents run on the daemon — so the count is
+	// logged and the server's lease expiry is what converges them. Without
+	// the number an operator has no way to tell a quiet drain from one that
+	// abandoned work.
+	Inflight func() int
+	Drain    func(context.Context)
+	Wait     func(context.Context)
+	Log      *slog.Logger
 }
 
 // Shutdown runs the exit sequence of §4.6 优雅关闭 and returns the instant it
@@ -64,6 +72,11 @@ type ShutdownOptions struct {
 // deregistration behind a claim round still in flight.
 func Shutdown(ctx context.Context, opts ShutdownOptions) time.Time {
 	started := time.Now()
+	var inflight int
+	if opts.Inflight != nil {
+		inflight = opts.Inflight()
+	}
+	opts.Log.Info("foreman.shutdown", "workspaces", len(opts.Served), "inflight", inflight)
 	if opts.Cancel != nil {
 		opts.Cancel()
 	}
@@ -74,5 +87,9 @@ func Shutdown(ctx context.Context, opts ShutdownOptions) time.Time {
 	if opts.Wait != nil {
 		opts.Wait(ctx)
 	}
+	// Without this line an operator cannot tell a clean exit from a crash:
+	// C14 only shows up on the server side, and a process that dies mid-exit
+	// logs nothing at all.
+	opts.Log.Info("foreman.stopped", "elapsed_ms", time.Since(started).Milliseconds())
 	return started
 }

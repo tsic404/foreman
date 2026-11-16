@@ -423,8 +423,9 @@ func run() error {
 		Drain: func(ctx context.Context) {
 			_ = jobServer.Shutdown(ctx)
 		},
-		Wait: func(ctx context.Context) { supervisor.Wait(ctx) },
-		Log:  log,
+		Inflight: reg.Inflight,
+		Wait:     func(ctx context.Context) { supervisor.Wait(ctx) },
+		Log:      log,
 	})
 	if err := supervisor.Failure(); err != nil {
 		return err
