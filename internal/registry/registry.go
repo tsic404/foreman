@@ -257,6 +257,24 @@ func (r *Registry) Delete(taskID string) error {
 	return nil
 }
 
+// ForgetVanished drops an entry whose task the server deleted (§4.6). The id
+// still lands in the settled index, without a verdict: the deletion is
+// remembered (a redelivery must not re-run the task), but no result is
+// invented for a run nobody observed. Without the index entry, a server
+// re-dispatch of the deleted id would pass IsDone and execute again.
+func (r *Registry) ForgetVanished(taskID string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	e, ok := r.tasks[taskID]
+	if !ok {
+		return ErrUnknownTask
+	}
+	r.dropIndexLocked(e)
+	delete(r.tasks, taskID)
+	r.noteDoneLocked(e)
+	return nil
+}
+
 // List returns every live entry, ordered by claim instant.
 func (r *Registry) List() []TaskEntry {
 	r.mu.RLock()

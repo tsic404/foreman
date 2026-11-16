@@ -617,6 +617,12 @@ func (d *Dispatcher) reclaim(e registry.TaskEntry) {
 }
 
 // OnTaskVanished drops an entry whose task the server deleted (§4.6).
+//
+// It cannot reuse reclaim: that path is for terminal entries and only records
+// the id in the settled index when the entry already carries a verdict. A
+// vanished task is typically still running, so reclaim would drop it without
+// remembering it, and a later re-dispatch of the same id would execute again.
+// The credential is still revoked and the slot still released.
 func (d *Dispatcher) OnTaskVanished(ctx context.Context, taskID string) error {
 	unlock := d.taskMu.Lock(taskID)
 	defer unlock()
@@ -624,7 +630,14 @@ func (d *Dispatcher) OnTaskVanished(ctx context.Context, taskID string) error {
 	if !ok {
 		return nil
 	}
-	d.reclaim(e)
+	if e.TokenHash != "" && d.revoker != nil {
+		d.revoker.Revoke(e.TokenHash, e.WorkspaceID)
+	}
+	if err := d.reg.ForgetVanished(taskID); err != nil {
+		d.log.Warn("task.vanish_failed", "task_id", taskID, "err", err)
+		return err
+	}
+	d.log.Info("task.vanished", "task_id", taskID, "workspace_id", e.WorkspaceID)
 	return nil
 }
 
