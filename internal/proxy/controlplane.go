@@ -2,7 +2,9 @@ package proxy
 
 import (
 	"context"
+	"errors"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/tsic404/foreman/internal/registry"
@@ -82,10 +84,40 @@ func NewHeartbeatLoop(client *Client, interval time.Duration) *HeartbeatLoop {
 }
 
 // Run heartbeats every runtime until ctx ends.
+//
+// A heartbeat failure is reported once per distinct cause rather than once per
+// tick: a server that is down (or a credential that stopped being valid after a
+// stack rebuild) would otherwise emit one WARN per runtime every 15s forever,
+// burying everything else in the log. Recovery is logged too, so the operator
+// can see the outage window.
 func (l *HeartbeatLoop) Run(ctx context.Context) error {
+	var lastErr string
 	for {
 		for _, id := range l.client.RuntimeIDs() {
-			if err := l.client.Heartbeat(ctx, id); err != nil && ctx.Err() == nil {
+			err := l.client.Heartbeat(ctx, id)
+			if ctx.Err() != nil {
+				return nil
+			}
+			switch {
+			case err == nil:
+				if lastErr != "" {
+					l.log.Info("heartbeat recovered", "runtime_id", id)
+					lastErr = ""
+				}
+			default:
+				msg := err.Error()
+				if msg == lastErr {
+					continue
+				}
+				lastErr = msg
+				var se *StatusError
+				if errors.As(err, &se) && se.Code == http.StatusUnauthorized {
+					// Not transient: the credential Foreman holds is no longer
+					// accepted, so no amount of retrying fixes it.
+					l.log.Error("heartbeat unauthorized: the server credential is no longer valid",
+						"runtime_id", id, "err", err)
+					continue
+				}
 				l.log.Warn("heartbeat failed", "runtime_id", id, "err", err)
 			}
 		}
