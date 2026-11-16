@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	mathrand "math/rand/v2"
 	"time"
 
 	"github.com/tsic404/foreman/internal/dispatch"
@@ -177,23 +178,38 @@ func sleepOrDone(ctx context.Context, d time.Duration) bool {
 }
 
 // backoff is the §1.5 exponential retry policy: 1s doubling to 30s.
+//
+// Each step carries jitter. A multi-workspace deployment runs one claim loop
+// per workspace, all started together; without jitter a server outage makes
+// them retry in lockstep, and the recovery is met by a synchronized burst
+// rather than a spread of light probes. The jitter is additive and capped at a
+// quarter of the step, so the policy's ceiling still holds (30s becomes at
+// most 37.5s).
 type backoff struct {
 	min, max time.Duration
 	cur      time.Duration
+	// rand returns a value in [0,1); nil disables jitter (tests that need a
+	// exact schedule set it to a constant).
+	rand func() float64
 }
 
-func newBackoff() *backoff { return &backoff{min: time.Second, max: 30 * time.Second} }
+func newBackoff() *backoff {
+	return &backoff{min: time.Second, max: 30 * time.Second, rand: mathrand.Float64}
+}
 
 func (b *backoff) next() time.Duration {
 	if b.cur < b.min {
 		b.cur = b.min
+	} else {
+		b.cur *= 2
+		if b.cur > b.max {
+			b.cur = b.max
+		}
+	}
+	if b.rand == nil {
 		return b.cur
 	}
-	b.cur *= 2
-	if b.cur > b.max {
-		b.cur = b.max
-	}
-	return b.cur
+	return b.cur + time.Duration(float64(b.cur)*0.25*b.rand())
 }
 
 func (b *backoff) reset() { b.cur = 0 }
