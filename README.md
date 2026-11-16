@@ -171,6 +171,15 @@ appears in the daemon's declaration, so Foreman cannot dispatch to it, while
 the daemon's other runtimes register normally. Grep `daemon.log` for that line
 when a declared runtime seems missing.
 
+A second workspace is where the per-workspace accounting shows its seams. Two
+defects found this way only exist with more than one served workspace: the idle
+daemon count and the convergence round both walked the shared registry instead
+of their own workspace, so one workspace claimed work it had no daemon to run
+and every workspace converged every task. A single-workspace deployment cannot
+reproduce either, so verify with a second workspace registered and served —
+expect exactly one `claim.idle` and one `reconcile.round` per workspace, and
+nothing tagged with one workspace's id answered by another's loop.
+
 ## License
 
 MIT
