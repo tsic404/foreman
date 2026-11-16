@@ -1,0 +1,100 @@
+# Build and publish the foreman image from the `v2` branch.
+#
+# The release line (build-foreman.yml) only fires on `main` and on `v*.*.*`
+# tags; this branch line exists so the v2 rewrite is shippable while `main`
+# still holds v1. Its tag semantics are deliberately narrower than the release
+# line's: every run publishes exactly `foreman:v2` — one movable tag, no
+# `latest`, no version tags — so a v2 consumer cannot be surprised by this
+# line writing the tag the release line owns.
+#
+# Same build recipe as the release line (per-platform static binaries + the
+# same Containerfile + buildx), so an image built here is the same artifact a
+# later tag build would produce, up to the stamped version string.
+name: build-foreman-v2
+
+on:
+  push:
+    branches: [v2]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+concurrency:
+  group: build-foreman-v2-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  PLATFORMS: linux/amd64,linux/arm64
+
+jobs:
+  publish:
+    runs-on: ${{ fromJSON(vars.FOREMAN_RELEASE_RUNNER || '["ubuntu-latest"]') }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Resolve the version
+        # The binary reports the branch line's version: `v2` always, with the
+        # commit sha as the distinguishing suffix, so `foreman --version`
+        # inside a published image names the exact run that built it.
+        id: version
+        run: |
+          set -euo pipefail
+          sha7=$(git rev-parse --short=7 HEAD)
+          printf 'version=v2-%s\n' "$sha7" >>"$GITHUB_OUTPUT"
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build the per-platform binary
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+              -ldflags "-s -w -X main.version=$VERSION" \
+              -o "dist/foreman-linux-${arch}" ./cmd/foreman
+          done
+          ls -l dist
+
+      - name: Build and push the image
+        id: publish
+        env:
+          VERSION: ${{ steps.version.outputs.version }}
+          REGISTRY: ${{ vars.FOREMAN_REGISTRY || 'ghcr.io/tsic404' }}
+          BASE_IMAGE: ${{ vars.FOREMAN_BASE_IMAGE || 'alpine:3.20' }}
+        run: |
+          set -euo pipefail
+          ref="$REGISTRY/foreman:v2"
+          docker buildx build \
+            --file images/foreman.Containerfile \
+            --platform "$PLATFORMS" \
+            --build-arg "BASE_IMAGE=$BASE_IMAGE" \
+            --tag "$ref" \
+            --label "org.opencontainers.image.version=$VERSION" \
+            --label "org.opencontainers.image.revision=$GITHUB_SHA" \
+            --provenance=false \
+            --push dist
+          echo "foreman_image=$ref" >>"$GITHUB_OUTPUT"
+          echo "published $ref (version $VERSION)" >>"$GITHUB_STEP_SUMMARY"
+
+      - name: Report the failure
+        if: failure()
+        run: echo "::error title=v2 image delivery failed::a partial push may have landed; check the registry before re-running."

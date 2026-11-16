@@ -61,10 +61,15 @@ make check                # gofmt + vet + tests + build
 ```
 
 
-The image is published to GHCR by `.github/workflows/build-foreman.yml`
-(linux/amd64 + linux/arm64): a `v*.*.*` tag push publishes exactly
-`foreman:v<X.Y.Z>` and a `main` push exactly `foreman:latest`. A pull request
-into `main` is checked by `pr-check.yml` — `go build ./...`,
+The image is published to GHCR (linux/amd64 + linux/arm64) by two lines that
+never write the same tag:
+
+| Branch | Workflow | Publishes |
+|---|---|---|
+| `main` / `v*.*.*` tag | `build-foreman.yml` | `foreman:latest`, `foreman:v<X.Y.Z>` |
+| `v2` | `build-foreman-v2.yml` | `foreman:v2` (movable; version stamped `v2-<sha7>`) |
+
+A pull request into `main` is checked by `pr-check.yml` — `go build ./...`,
 `go test -race ./...`, and a two-platform image build that publishes nothing.
 
 Deployment lives in `deploy/` and is applied with `kubectl apply -f deploy/`:
