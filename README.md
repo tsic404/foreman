@@ -146,6 +146,18 @@ cancel-flavoured `failure_reason`, so multica classifies the synthetic verdict
 as `agent_error.unknown`; the daemon's own `cancel-ack` body has already been
 forwarded verbatim beforehand, so no information is lost.
 
+### Rotating the daemon credential leaves old instances hammering
+
+The daemon credential is verified per request, so an instance running with a
+revoked or reset token fails every call it makes. Because the claim loop polls
+every few seconds, a forgotten instance produces a steady 401 stream at
+`/api/daemon/tasks/claim` for as long as it lives — which reads like a server
+auth fault when it is really one stale process. Observed in testing: eleven
+401s in ten seconds, all from an instance that had been left running across a
+database reset, and none from the instance that started a second later.
+Foreman logs these as `daemon credential rejected` (WARN) with the reason, so
+check for a duplicate process before suspecting the server.
+
 ## Status
 
 Early development, but the v2 path is proven end to end against a real Multica
