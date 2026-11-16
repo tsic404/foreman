@@ -19,22 +19,20 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/name: foreman
-      app.kubernetes.io/component: scheduler
   template:
     metadata:
       labels:
         app.kubernetes.io/name: foreman
-        app.kubernetes.io/component: scheduler
       annotations:
         # The metric endpoint is on the ops listener, not the daemon face.
         prometheus.io/scrape: "true"
         prometheus.io/port: "8081"
         prometheus.io/path: "/metrics"
     spec:
-      serviceAccountName: foreman
+      # No Kubernetes API access: v2 spawns no per-task objects, so the pod
+      # runs without a service-account token. ghcr.io is reachable
+      # anonymously for this repository, so no imagePullSecret is needed.
       automountServiceAccountToken: false
-      imagePullSecrets:
-        - name: registry-tsic
       securityContext:
         runAsNonRoot: true
         runAsUser: 1000
@@ -44,8 +42,8 @@ spec:
           type: RuntimeDefault
       containers:
         - name: foreman
-          image: ghcr.io/tsic404/foreman:latest
-          imagePullPolicy: Always
+          image: ghcr.io/tsic404/foreman:v2
+          imagePullPolicy: IfNotPresent
           args: ["-listen=:8080", "-ops-listen=:8081"]
           ports:
             - name: http
@@ -57,18 +55,15 @@ spec:
           env:
             # --- server identity / credentials ---
             - name: MULTICA_SERVER_URL
-              value: "http://multica.tsic.top"
-            # Credential form. This file ships the legacy single-workspace
-            # form: one workspace-scoped credential.
-            #   • one user-scoped credential + no workspace id ⇒ discovery:
-            #     the startup C-17 lists every workspace the credential sees;
-            #     FOREMAN_DAEMON_ID is the base identity, each workspace's
-            #     identity derives from it. Optional narrowing manifest:
-            #     FOREMAN_WORKSPACES_MANIFEST[_FILE].
-            #   • per-workspace credentials ⇒ drop MULTICA_WORKSPACE_ID and
-            #     mount FOREMAN_WORKSPACES_FILE.
-            - name: MULTICA_WORKSPACE_ID
-              value: "f311e8ff-e026-4c6e-b267-dcc004f08782"
+              value: "http://backend.multica.svc.cluster.local:8080"
+            # Credential form: one user-scoped credential, no workspace id, so
+            # startup's C-17 discovery serves every workspace the credential
+            # can see. FOREMAN_DAEMON_ID is the base identity and each
+            # workspace's identity derives from it as <base>-<workspace-id>.
+            #
+            # A workspace-scoped credential instead takes MULTICA_WORKSPACE_ID
+            # (single workspace). Setting that and FOREMAN_WORKSPACES_MANIFEST
+            # together is refused; the manifest narrows a discovery set.
             - name: MULTICA_TOKEN
               valueFrom:
                 secretKeyRef:
@@ -181,3 +176,54 @@ spec:
     - name: ops
       port: 8081
       targetPort: ops
+---
+# Daemon face on a NodePort: the resident daemons normally run outside the
+# cluster, so the ClusterIP above is not reachable from where they live. This
+# is the address they dial when no ingress is in place.
+apiVersion: v1
+kind: Service
+metadata:
+  name: foreman-daemon
+  namespace: foreman
+  labels:
+    app.kubernetes.io/name: foreman
+    app.kubernetes.io/component: daemon-face
+spec:
+  type: NodePort
+  selector:
+    app.kubernetes.io/name: foreman
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+      nodePort: 30080
+---
+# Optional: publish the daemon face by name. The daemons' server_url can point
+# here instead of at a node IP, which survives node renumbering.
+#
+# Note this ingress publishes the daemon face only (8080); the ops face stays
+# cluster-internal.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: foreman
+  namespace: foreman
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-dns01
+spec:
+  ingressClassName: nginx
+  rules:
+    - host: foreman.tsic.top
+      http:
+        paths:
+          - backend:
+              service:
+                name: foreman
+                port:
+                  number: 8080
+            path: /
+            pathType: Prefix
+  tls:
+    - hosts:
+        - foreman.tsic.top
+      secretName: foreman-tls
