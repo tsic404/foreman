@@ -134,6 +134,18 @@ cancel the daemon has no way to receive. Closing this needs a protocol
 extension upstream (a cancel frame or a claim-time cancellation field) — it is
 not fixable inside Foreman without patching the daemon CLI.
 
+One case Foreman does handle: a daemon that stops a run on its own sends
+`cancel-ack` (S-15). The server settles the task only when it was the one that
+asked for the cancel, so that ack alone leaves the task `running` forever.
+Foreman therefore reads the task's server status (C-13) and, if the server still
+considers it live, forwards a synthetic `fail` carrying
+`"error": "cancelled by daemon"` — verified end to end, which moves
+`foreman_tasks_total{result="cancelled"}` and settles the task as `failed` with
+that message. The protocol has no `cancel` report endpoint and no
+cancel-flavoured `failure_reason`, so multica classifies the synthetic verdict
+as `agent_error.unknown`; the daemon's own `cancel-ack` body has already been
+forwarded verbatim beforehand, so no information is lost.
+
 ## Status
 
 Early development, but the v2 path is proven end to end against a real Multica
