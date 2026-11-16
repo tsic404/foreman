@@ -62,3 +62,28 @@ func TestNoteIdleRoundResumesAfterInterval(t *testing.T) {
 		t.Fatalf("claim.idle lines = %d, want 2 (one before the window, one after)", got)
 	}
 }
+
+// TestReconcileLoopNotesRoundsAtLowRate: the convergence loop must leave the
+// same kind of breadcrumb — a successful round writes nothing, so silence has
+// to mean "quiet", never "wedged".
+func TestReconcileLoopNotesRoundsAtLowRate(t *testing.T) {
+	buf := &bytes.Buffer{}
+	l := &ReconcileLoop{
+		interval: time.Second,
+		log:      slog.New(slog.NewJSONHandler(buf, nil)),
+	}
+
+	l.noteRound()
+	if got := strings.Count(buf.String(), `"msg":"reconcile.round"`); got != 1 {
+		t.Fatalf("first round produced %d reconcile.round lines, want 1:\n%s", got, buf.String())
+	}
+	for i := 0; i < 20; i++ {
+		l.noteRound()
+	}
+	if got := strings.Count(buf.String(), `"msg":"reconcile.round"`); got != 1 {
+		t.Fatalf("throttled rounds added lines: %d total", got)
+	}
+	if l.rounds != 20 {
+		t.Fatalf("rounds = %d, want 20", l.rounds)
+	}
+}

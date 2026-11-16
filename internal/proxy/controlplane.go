@@ -132,6 +132,11 @@ type ReconcileLoop struct {
 	rec      Reconciler
 	interval time.Duration
 	log      *slog.Logger
+	// rounds and lastNote drive the same low-rate idle breadcrumb the claim
+	// loop uses: a convergence round that keeps succeeding logs nothing, so a
+	// wedged reconciler and a healthy quiet one look identical at INFO.
+	rounds   int
+	lastNote time.Time
 }
 
 // NewReconcileLoop builds the loop.
@@ -151,8 +156,24 @@ func (l *ReconcileLoop) Run(ctx context.Context) error {
 				l.log.Warn("reconcile round failed", "err", err)
 			}
 		}
+		l.noteRound()
 		if !sleepOrDone(ctx, l.interval) {
 			return nil
 		}
 	}
+}
+
+// noteRound emits a low-rate INFO breadcrumb. A convergence round that keeps
+// succeeding writes nothing, so without this line a wedged reconciler is
+// indistinguishable from a healthy quiet one at the default log level. Ten
+// minutes matches the claim loop's cadence and stays readable.
+func (l *ReconcileLoop) noteRound() {
+	now := time.Now()
+	l.rounds++
+	if !l.lastNote.IsZero() && now.Sub(l.lastNote) < idleHeartbeatInterval {
+		return
+	}
+	l.log.Info("reconcile.round", "rounds", l.rounds, "interval", l.interval.String())
+	l.lastNote = now
+	l.rounds = 0
 }
