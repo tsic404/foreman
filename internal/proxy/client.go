@@ -479,7 +479,13 @@ func (c *Client) TaskStatus(ctx context.Context, taskID string) (string, error) 
 }
 
 // ForwardInWorkspace posts one lifecycle callback (C5–C12). Terminal endpoints
-// carry the retry budget.
+// carry the retry budget — except cancel-ack.
+//
+// Cancel-ack is the daemon's own stop notification, sent while its HTTP
+// request is open. Retrying it inside that request would hold the daemon for up
+// to the full budget (~2 minutes); the daemon re-sends the ack on its own and
+// the server's lease expiry settles the task regardless, so one bounded
+// attempt is the right cost here.
 func (c *Client) ForwardInWorkspace(ctx context.Context, ep Endpoint, taskID, workspaceID string, body []byte) (int, []byte, error) {
 	if workspaceID != "" && workspaceID != c.cfg.WorkspaceID {
 		return 0, nil, fmt.Errorf("workspace %s is not served by this client", workspaceID)
@@ -488,7 +494,7 @@ func (c *Client) ForwardInWorkspace(ctx context.Context, ep Endpoint, taskID, wo
 	if path == "" {
 		return 0, nil, fmt.Errorf("unknown endpoint %q", ep)
 	}
-	if !ep.IsTerminal() {
+	if !ep.IsTerminal() || ep == EPCancelAck {
 		return c.forwardOnce(ctx, ep, path, body)
 	}
 	for attempt, wait := range terminalRetryWaits {

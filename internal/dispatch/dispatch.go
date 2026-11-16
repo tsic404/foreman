@@ -578,13 +578,24 @@ func (d *Dispatcher) OnReport(ctx context.Context, ep Endpoint, e registry.TaskE
 
 // settleCancelledTask closes a task the server still considers live after the
 // daemon acknowledged a cancellation nobody on the server asked for.
+//
+// The synthetic fail is a convergence courtesy, not the only delivery chance:
+// the daemon retries its cancel-ack, and the server's lease expiry settles the
+// task anyway. So the forward here must not carry the terminal retry budget —
+// it runs inside OnReport, holding the task's lock, and a full budget would
+// hold a daemon's cancel-ack HTTP request for up to ~2 minutes (the client's
+// 30s control timeout makes the daemon retry long before that).
 func (d *Dispatcher) settleCancelledTask(ctx context.Context, e registry.TaskEntry) {
 	status, err := d.server.TaskStatus(ctx, e.TaskID)
 	if err != nil || registry.IsTerminalResult(status) {
 		return
 	}
 	body, _ := json.Marshal(map[string]any{"error": "cancelled by daemon"})
-	if _, _, ferr := d.server.ForwardInWorkspace(ctx, EPFail, e.TaskID, e.WorkspaceID, body); ferr != nil {
+	// One bounded attempt: 5s is enough for a healthy control plane and keeps
+	// the ack reply well inside the daemon's patience.
+	bounded, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	if _, _, ferr := d.server.ForwardInWorkspace(bounded, EPFail, e.TaskID, e.WorkspaceID, body); ferr != nil {
 		d.log.Warn("cancel_settle_failed", "task_id", e.TaskID, "err", ferr)
 		return
 	}
