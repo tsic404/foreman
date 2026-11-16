@@ -610,7 +610,11 @@ func (s *FakeServer) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 	}
 	tid := r.PathValue("tid")
 	e, known := s.reg.Get(tid)
-	if !known || e.WorkspaceID != cred.WorkspaceID {
+	// Every task-scoped route checks the daemon binding, not just the
+	// workspace: a shared workspace can host several daemons, and one task's
+	// state is its holder's business. Without this a daemon could read the
+	// progress and result of another daemon's task.
+	if !known || e.WorkspaceID != cred.WorkspaceID || e.DaemonID != cred.DaemonID {
 		writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
