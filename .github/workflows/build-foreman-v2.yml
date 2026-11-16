@@ -39,9 +39,10 @@ jobs:
           go-version-file: go.mod
 
       - name: Resolve the version
-        # The binary reports the branch line's version: `v2` always, with the
-        # commit sha as the distinguishing suffix, so `foreman --version`
-        # inside a published image names the exact run that built it.
+        # The binary carries the branch line's version: `v2` with the commit
+        # sha as suffix. It surfaces in the `foreman.started` log line and in
+        # the C1 registration (there is no --version flag), so a running
+        # container names the exact run that built it.
         id: version
         run: |
           set -euo pipefail
