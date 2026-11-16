@@ -79,7 +79,7 @@ Tokens are compared by SHA-256 digest in constant time and are never logged.
 | `FOREMAN_JOB_BOOT_TIMEOUT` | `60s` | claim → daemon start bound |
 | `FOREMAN_LOG_LEVEL` | `info` | `debug`/`info`/`warn`/`error` |
 | `FOREMAN_OPS_TOKEN` | — | the ops-surface credential |
-| `FOREMAN_OPS_WORKSPACE_TOKENS` | — | per-workspace ops credentials, `"<workspace-id>=<token>[, …]"` |
+| `FOREMAN_OPS_WORKSPACE_TOKENS` | — | per-workspace ops credentials, `"<workspace-id>=<token>[, …]"`. The order matters and the failure mode is misleading: a reversed pair loads fine (the workspace id becomes a token nobody presents), so every request with the intended token answers 401 rather than a configuration error. If a bound credential unexpectedly 401s, check the pair order first |
 | `FOREMAN_WORKSPACES` | — | JSON identity list: names every served workspace's daemon identity explicitly (workspace-scoped form, alternative to `MULTICA_WORKSPACE_ID`) |
 | `FOREMAN_WORKSPACES_FILE` | — | path to the same JSON list |
 | `FOREMAN_WORKSPACES_MANIFEST` | — | JSON list of workspace ids the user-scoped credential may serve; workspaces outside it are excluded. Refuses startup when a listed workspace is not visible |
