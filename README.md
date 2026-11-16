@@ -135,6 +135,13 @@ Early development, but the v2 path is proven end to end against a real Multica
 stack and a real resident daemon: a dispatched task is claimed, delivered, run
 by the agent, and settled back on the server as `completed`.
 
+One environment gotcha seen while testing: the daemon refuses to register any
+runtime whose CLI is below its minimum version and logs
+`skip registering runtime: version too old`. That runtime silently never
+appears in the daemon's declaration, so Foreman cannot dispatch to it, while
+the daemon's other runtimes register normally. Grep `daemon.log` for that line
+when a declared runtime seems missing.
+
 ## License
 
 MIT
