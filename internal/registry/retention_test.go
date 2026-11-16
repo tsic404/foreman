@@ -105,3 +105,62 @@ func TestOwnerOfSurvivesSettleButNotPrune(t *testing.T) {
 		t.Fatalf("retained owner = %q, want worker-a", owner)
 	}
 }
+
+// TestForgetVanishedCoversAllThreeObligations pins the contract of the
+// server-deleted path: the task row goes, the daemon index stops listing it,
+// and a verdict-less marker keeps a redelivery from re-running it. Losing any
+// one of the three is silent — the task either re-executes or a ghost row keeps
+// answering scheduling queries.
+func TestForgetVanishedCoversAllThreeObligations(t *testing.T) {
+	clock := time.Unix(4000, 0)
+	r := New(WithClock(func() time.Time { return clock }))
+
+	// A pending row is what ByDaemonInWorkspace serves (it deliberately skips
+	// running/delivering rows: those are not waiting for delivery).
+	if err := r.Put(TaskEntry{TaskID: "gone", WorkspaceID: "ws-1", DaemonID: "worker-a",
+		RuntimeID: "rt-1", State: StatePending}); err != nil {
+		t.Fatalf("put: %v", err)
+	}
+	// The task is visible to its daemon while live.
+	if e, ok := r.ByDaemonInWorkspace("ws-1", "worker-a"); !ok || e.TaskID != "gone" {
+		t.Fatalf("precondition: live task should be listed for its daemon: %+v ok=%v", e, ok)
+	}
+
+	if err := r.ForgetVanished("gone"); err != nil {
+		t.Fatalf("forget: %v", err)
+	}
+
+	// 1. the live row is gone.
+	if _, live := r.Get("gone"); live {
+		t.Fatal("live row survived ForgetVanished")
+	}
+	// 2. the daemon index no longer lists it, and the per-daemon slice is
+	// dropped rather than left empty — an empty slice per daemon would grow the
+	// map once per daemon forever.
+	if e, ok := r.ByDaemonInWorkspace("ws-1", "worker-a"); ok {
+		t.Fatalf("daemon index still lists the vanished task: %+v", e)
+	}
+	if cur, ok := r.byDaemon["worker-a"]; ok {
+		t.Fatalf("the daemon index key survived with %v; it must be deleted when empty", cur)
+	}
+	// 3. a redelivery of the same id is caught, with no invented verdict.
+	if !r.IsDone("ws-1", "gone") {
+		t.Fatal("vanished task not remembered; a redelivery would re-run it")
+	}
+	if owner := r.OwnerOf("gone"); owner != "worker-a" {
+		t.Fatalf("owner = %q, want worker-a (attribution must survive)", owner)
+	}
+	settled, ok := r.SettledInWorkspace("ws-1", "gone")
+	if ok && settled.Result != "" {
+		t.Fatalf("ForgetVanished invented the verdict %q", settled.Result)
+	}
+}
+
+// TestForgetVanishedUnknownIsQuiet: a duplicate call (the caller retries) must
+// not error, and must not disturb the retained marker.
+func TestForgetVanishedUnknownIsQuiet(t *testing.T) {
+	r := New(WithClock(func() time.Time { return time.Unix(5000, 0) }))
+	if err := r.ForgetVanished("never-seen"); err == nil {
+		t.Fatal("expected ErrUnknownTask for a task the registry never held")
+	}
+}

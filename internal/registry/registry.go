@@ -620,14 +620,6 @@ func (r *Registry) ExpireStale(now time.Time, staleAfter time.Duration) []string
 	return expired
 }
 
-// DeleteRuntime drops a daemon row entirely (deregistration).
-func (r *Registry) DeleteRuntime(runtimeID string) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	delete(r.runtimes, runtimeID)
-	delete(r.byRuntimeDaemon, runtimeID)
-}
-
 // LearnSession records that runtimeID now holds sessionID's files.
 func (r *Registry) LearnSession(workspaceID, sessionID, runtimeID string) {
 	if sessionID == "" || runtimeID == "" {
