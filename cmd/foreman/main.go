@@ -203,7 +203,10 @@ func run() error {
 		proxy.WithSkillResolver(func(ctx context.Context, taskID string, body []byte) (int, []byte, error) {
 			e, ok := reg.Get(taskID)
 			if !ok {
-				return 0, nil, fmt.Errorf("no entry for task %s", taskID)
+				// Skill bundles are resolved under the task's runtime, so unlike
+				// a report there is nothing to forward without the binding.
+				// Say "not bound" (404 downstream), not "gateway broke".
+				return 0, nil, fmt.Errorf("%w: %s", proxy.ErrUnboundTask, taskID)
 			}
 			client, _ := clients.For(e.WorkspaceID)
 			if client == nil {
@@ -233,11 +236,23 @@ func run() error {
 			return client.PrepareLease(ctx, e.RuntimeID, taskID)
 		}),
 		proxy.WithTaskForwarder(func(ctx context.Context, taskID string, body []byte) (int, []byte, error) {
-			e, ok := reg.Get(taskID)
-			if !ok {
-				return 0, nil, fmt.Errorf("no entry for task %s", taskID)
+			// A missing entry must not block the receipt: Foreman's registry is
+			// in-memory, so a restart loses every binding while the daemons keep
+			// running. The receipt is self-describing (task id + workspace from
+			// the daemon credential) and the forward needs nothing else; the
+			// upstream decides whether the task still exists.
+			var client *proxy.Client
+			if e, ok := reg.Get(taskID); ok {
+				client, _ = clients.For(e.WorkspaceID)
 			}
-			client, _ := clients.For(e.WorkspaceID)
+			if client == nil {
+				// Unbound after a restart: fall back to the single served
+				// workspace when there is exactly one, which is the common
+				// deployment shape.
+				if all := clients.All(); len(all) == 1 {
+					client = all[0]
+				}
+			}
 			if client == nil {
 				return 0, nil, fmt.Errorf("no client for task %s", taskID)
 			}

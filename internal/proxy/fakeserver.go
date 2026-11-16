@@ -464,6 +464,10 @@ func ctxFor(r *http.Request) context.Context { return r.Context() }
 
 // ---- S2 repos / S3 runtime profiles ----
 
+// ErrUnboundTask reports a task-addressed forward with no local binding: the
+// request is well-formed but there is nothing to resolve it against.
+var ErrUnboundTask = errors.New("task is not bound")
+
 // WorkspaceForwarder forwards one workspace-scoped read (C22 repos, C18
 // runtime profiles) to the multica server with that workspace's credential.
 type WorkspaceForwarder func(ctx context.Context, workspaceID string) (int, []byte, error)
@@ -550,6 +554,14 @@ func (s *FakeServer) handleSkillBundles(w http.ResponseWriter, r *http.Request) 
 	}
 	code, resp, err := s.skills(r.Context(), r.PathValue("tid"), body)
 	if err != nil {
+		// "This task is not mine to resolve" is a 404 — the daemon's own answer
+		// for a task it holds nothing for. Only an upstream/transport failure is
+		// a 502; conflating the two makes the daemon retry a task that no longer
+		// exists.
+		if errors.Is(err, ErrUnboundTask) {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
 		writeError(w, http.StatusBadGateway, "skill bundle resolve failed")
 		return
 	}

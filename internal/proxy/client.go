@@ -555,14 +555,34 @@ func (c *Client) doOnce(ctx context.Context, hc *http.Client, method, path strin
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
+		// The C face is where every server interaction lives; without a line
+		// here a transport failure is invisible unless the caller happens to
+		// log it, which several do not.
+		c.log.Debug("server request failed", "method", method, "path", path, "err", err)
 		return 0, nil, err
 	}
 	defer resp.Body.Close()
 	raw, err := readLimited(resp.Body)
 	if err != nil {
+		c.log.Debug("server response unreadable", "method", method, "path", path,
+			"status", resp.StatusCode, "err", err)
 		return resp.StatusCode, nil, err
 	}
+	if resp.StatusCode >= 500 {
+		c.log.Warn("server error", "method", method, "path", path,
+			"status", resp.StatusCode, "body", truncateForLog(raw))
+	}
 	return resp.StatusCode, raw, nil
+}
+
+// truncateForLog bounds an upstream error body so one bad response cannot
+// flood the log.
+func truncateForLog(raw []byte) string {
+	const max = 512
+	if len(raw) <= max {
+		return string(raw)
+	}
+	return string(raw[:max]) + "…"
 }
 
 // ---- wire types ----

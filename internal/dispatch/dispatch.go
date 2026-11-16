@@ -247,9 +247,37 @@ func (d *Dispatcher) OnClaim(ctx context.Context, workspaceID string, task json.
 	unlock := d.taskMu.Lock(head.ID)
 	defer unlock()
 
-	if _, ok := d.reg.Get(head.ID); ok {
-		d.metrics.DuplicateDispatch()
-		d.log.Warn("duplicate_claim", "task_id", head.ID, "action", "keep_existing")
+	if cur, ok := d.reg.Get(head.ID); ok {
+		// A re-claim of a task Foreman already tracks is usually a server
+		// retry after a lost report: keep the existing entry. The exception is
+		// an entry that was recorded with no daemon (the earlier round found
+		// none free). That one has to be bound now, or it can never be
+		// delivered — the comment on the no-daemon path promises exactly this
+		// re-bind.
+		if cur.DaemonID != "" {
+			d.metrics.DuplicateDispatch()
+			d.log.Debug("duplicate_claim", "task_id", head.ID, "state", string(cur.State))
+			return nil
+		}
+		rt, ok := d.pickDaemon(head)
+		if !ok {
+			d.metrics.ClaimError("no_daemon")
+			return ErrNoDaemon
+		}
+		rebound, _, err := d.reg.BindOrInsert(registry.TaskEntry{
+			TaskID:          head.ID,
+			WorkspaceID:     cur.WorkspaceID,
+			DaemonID:        rt.DaemonID,
+			DaemonRuntimeID: rt.RuntimeID,
+			RuntimeID:       d.serverRuntimeID(rt.RuntimeID),
+			State:           registry.StateDaemonRegistered,
+		})
+		if err != nil {
+			return fmt.Errorf("re-bind task %s: %w", head.ID, err)
+		}
+		d.reg.PutRuntime(rt)
+		d.log.Info("task.rebound", "task_id", head.ID, "daemon_id", rebound.DaemonID,
+			"runtime_id", rebound.RuntimeID)
 		return nil
 	}
 	if d.reg.IsDone(head.WorkspaceID, head.ID) {
@@ -294,12 +322,7 @@ func (d *Dispatcher) OnClaim(ctx context.Context, workspaceID string, task json.
 	// (from the C1 answer), not the daemon's self-chosen id — the server
 	// rejects a start naming an id it never registered. The daemon's own id is
 	// kept separately for its S6 claim to match.
-	e.RuntimeID = rt.RuntimeID
-	if d.realRuntimeID != nil {
-		if real, ok := d.realRuntimeID(rt.RuntimeID); ok {
-			e.RuntimeID = real
-		}
-	}
+	e.RuntimeID = d.serverRuntimeID(rt.RuntimeID)
 	e.State = registry.StateDaemonRegistered
 	// Bind the picked daemon onto the entry. The entry may already exist from
 	// an earlier round that found no idle daemon, in which case Put reports a
@@ -314,6 +337,17 @@ func (d *Dispatcher) OnClaim(ctx context.Context, workspaceID string, task json.
 		"daemon_id", e.DaemonID, "runtime_id", e.RuntimeID,
 		"issue_identifier", e.IssueIdentifier, "agent_id", e.AgentID)
 	return nil
+}
+
+// serverRuntimeID maps a daemon-side runtime key to the id the server assigned,
+// falling back to the key itself while C-1 is still in flight.
+func (d *Dispatcher) serverRuntimeID(runtimeKey string) string {
+	if d.realRuntimeID != nil {
+		if real, ok := d.realRuntimeID(runtimeKey); ok {
+			return real
+		}
+	}
+	return runtimeKey
 }
 
 // pickDaemon chooses the daemon for a claim: session affinity (the daemon that
@@ -627,6 +661,13 @@ func (d *Dispatcher) convergeOne(ctx context.Context, e registry.TaskEntry) {
 			// strands a live task and makes every later claim answer
 			// "unknown daemon".
 			d.convergeStatus(ctx, e)
+		default:
+			// Any other lease failure (a 5xx, a transport error) means the
+			// renewal did not happen. Without this branch the task silently
+			// loses its lease and dies server-side as runtime_offline with no
+			// trace on the Foreman side.
+			d.log.Warn("lease.renew_failed", "task_id", e.TaskID,
+				"runtime_id", e.RuntimeID, "err", err)
 		}
 		return
 	}

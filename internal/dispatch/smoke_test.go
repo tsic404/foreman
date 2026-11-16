@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -376,5 +377,47 @@ func TestFailLocallyBootGuardOnlyAppliesToBootTimeout(t *testing.T) {
 	}
 	if !reg.IsDone("ws-1", "started") {
 		t.Fatal("the settled verdict should be remembered")
+	}
+}
+
+// TestUnboundTaskIsReboundOnReclaim covers the stranded-task path: an earlier
+// round recorded the task with no daemon (none was free), and the server's
+// re-claim must bind it. The old duplicate check returned early on any existing
+// entry, so such a task could never be delivered.
+func TestUnboundTaskIsReboundOnReclaim(t *testing.T) {
+	stub := &stubServer{}
+	server := httptest.NewServer(stub.handler())
+	defer server.Close()
+
+	reg := registry.New()
+	client := proxy.NewClient(proxy.Config{
+		ServerURL: server.URL, WorkspaceID: "ws-1", DaemonID: "foreman-ws-1", Version: "test",
+	}, "mul_test")
+	disp := dispatch.New(dispatch.Config{}, reg, client, nil)
+
+	claim, _ := json.Marshal(map[string]any{"id": "task-stranded", "workspace_id": "ws-1"})
+
+	// First claim: no daemon exists, so the entry is stored unbound.
+	if err := disp.OnClaim(context.Background(), "ws-1", claim); !errors.Is(err, dispatch.ErrNoDaemon) {
+		t.Fatalf("first claim err = %v, want ErrNoDaemon", err)
+	}
+	if e, ok := reg.Get("task-stranded"); !ok || e.DaemonID != "" {
+		t.Fatalf("entry should exist unbound, got %+v ok=%v", e, ok)
+	}
+
+	// A daemon appears; the re-claim must bind the same entry.
+	reg.PutRuntime(registry.Runtime{
+		RuntimeID: "w1", DaemonID: "w1", WorkspaceID: "ws-1", Provider: "omp",
+		Online: true, RegisteredAt: reg.Now(),
+	})
+	if err := disp.OnClaim(context.Background(), "ws-1", claim); err != nil {
+		t.Fatalf("re-claim: %v", err)
+	}
+	e, ok := reg.Get("task-stranded")
+	if !ok {
+		t.Fatal("task vanished on re-claim")
+	}
+	if e.DaemonID != "w1" {
+		t.Fatalf("re-claim left the task unbound (daemon=%q); it can never be delivered", e.DaemonID)
 	}
 }
