@@ -421,7 +421,15 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 	// must reach multica as C4, or the prepare lease lapses and the server
 	// rejects the later start with runtime_offline. Forward to multica when a
 	// seam is wired; otherwise answer ok locally (test fallback).
+	//
+	// The runtime check above proves the caller owns {rid}; it does not prove
+	// {tid} is that runtime's task. Checking both keeps one daemon from
+	// renewing (and thereby probing) another's lease through its own runtime id.
 	tid := r.PathValue("tid")
+	if e, bound := s.reg.Get(tid); bound && e.DaemonID != cred.DaemonID {
+		writeError(w, http.StatusNotFound, "task not found")
+		return
+	}
 	if s.lease != nil {
 		ready, err := s.lease(ctxFor(r), cred.WorkspaceID, tid)
 		if err != nil {
@@ -456,7 +464,16 @@ func (s *FakeServer) handleRecoverOrphans(w http.ResponseWriter, r *http.Request
 // the receipt against the task. The forward rewrites nothing — path and body
 // travel as the daemon sent them.
 func (s *FakeServer) handleContextReceipt(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.credential(w, r); !ok {
+	cred, ok := s.credential(w, r)
+	if !ok {
+		return
+	}
+	// The receipt acknowledges the context of the task this daemon was handed,
+	// so a foreign daemon must not be able to post one for another's task. An
+	// unbound task passes: a Foreman restart clears the registry while daemons
+	// keep running, and the receipt is self-describing.
+	if e, known := s.reg.Get(r.PathValue("tid")); known && e.DaemonID != cred.DaemonID {
+		writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
 	if s.receipt == nil {
@@ -530,19 +547,28 @@ func (s *FakeServer) handleRepos(w http.ResponseWriter, r *http.Request) {
 // (it continues with its built-in runtimes), a 200 replays the profile list
 // byte for byte.
 func (s *FakeServer) handleRuntimeProfiles(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.credential(w, r); !ok {
+	cred, ok := s.credential(w, r)
+	if !ok {
+		return
+	}
+	// The workspace is the credential's, never the path's: `{ws}` is
+	// caller-controlled, so forwarding it would let one workspace's daemon
+	// read another's profile list. handleRepos (S-2) already takes this
+	// shape; this route is its sibling and must match.
+	if ws := r.PathValue("ws"); ws != "" && ws != cred.WorkspaceID {
+		writeError(w, http.StatusNotFound, "workspace not found")
 		return
 	}
 	if s.profilesFwd == nil {
 		writeJSON(w, http.StatusOK, []any{})
 		return
 	}
-	code, body, err := s.profilesFwd(r.Context(), r.PathValue("ws"))
+	code, body, err := s.profilesFwd(r.Context(), cred.WorkspaceID)
 	if err != nil {
 		// The daemon falls back to its built-in runtimes on a 502; the cause
 		// otherwise leaves no trace on the Foreman side.
 		s.log.Error("runtime profiles forward failed",
-			"workspace_id", r.PathValue("ws"), "err", err)
+			"workspace_id", cred.WorkspaceID, "err", err)
 		writeError(w, http.StatusBadGateway, "runtime profiles forward failed")
 		return
 	}
@@ -570,7 +596,18 @@ func (s *FakeServer) handleTokenRenew(w http.ResponseWriter, r *http.Request) {
 // proxy, so an empty set is the honest answer (a daemon that needs a bundle
 // Foreman does not carry falls back to its own resolution).
 func (s *FakeServer) handleSkillBundles(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.credential(w, r); !ok {
+	cred, ok := s.credential(w, r)
+	if !ok {
+		return
+	}
+	// S-26 resolves under the task's own runtime, so only the daemon holding
+	// that task may ask. Without this check a daemon could point the resolve at
+	// another daemon's task id (and an arbitrary runtime id in the path) and
+	// read its bundle set back. An unbound task is still allowed through: after
+	// a Foreman restart the registry is empty while daemons keep running, and
+	// the resolver answers ErrUnboundTask → 404 for exactly that case.
+	if e, known := s.reg.Get(r.PathValue("tid")); known && e.DaemonID != cred.DaemonID {
+		writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
 	if s.skills == nil {
