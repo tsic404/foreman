@@ -425,6 +425,11 @@ func (d *Dispatcher) IdleDaemons() int {
 // is identified by its token's daemon id; the runtime id it names must be its
 // own.
 func (d *Dispatcher) Deliver(ctx context.Context, workspaceID, daemonID string, runtimeIDs []string, maxTasks int) (Delivery, error) {
+	// maxTasks is the daemon's requested batch size. It gates the call but does
+	// not size the answer: a delivery hands over exactly one task, because the
+	// resident daemon runs one task at a time (README: "receives one task at a
+	// time through the S6 claim"). A daemon asking for more gets its next task
+	// on its next poll.
 	if maxTasks < 1 {
 		return Delivery{}, nil
 	}
