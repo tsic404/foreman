@@ -37,8 +37,6 @@ func (c *claimDispatcher) Deliver(_ context.Context, workspaceID, daemonID strin
 func (c *claimDispatcher) OnReport(context.Context, dispatch.Endpoint, registry.TaskEntry, []byte, string) (int, []byte, error) {
 	return http.StatusOK, nil, nil
 }
-func (c *claimDispatcher) OnTaskVanished(context.Context, string) error { return nil }
-func (c *claimDispatcher) OnBootTimeout(context.Context, string) error  { return nil }
 
 func claimRig(t *testing.T, disp *claimDispatcher, opts ...proxy.ServerOption) (*registry.Registry, string) {
 	t.Helper()

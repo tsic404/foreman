@@ -44,8 +44,6 @@ func (stubDispatcher) Deliver(context.Context, string, string, []string, int) (d
 func (stubDispatcher) OnReport(context.Context, dispatch.Endpoint, registry.TaskEntry, []byte, string) (int, []byte, error) {
 	return http.StatusOK, []byte(`{}`), nil
 }
-func (stubDispatcher) OnTaskVanished(context.Context, string) error { return nil }
-func (stubDispatcher) OnBootTimeout(context.Context, string) error  { return nil }
 
 func do(t *testing.T, s *proxy.FakeServer, method, path, token, body string) *httptest.ResponseRecorder {
 	t.Helper()

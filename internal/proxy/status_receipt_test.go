@@ -24,8 +24,6 @@ func (idleDispatcher) Deliver(context.Context, string, string, []string, int) (d
 func (idleDispatcher) OnReport(context.Context, dispatch.Endpoint, registry.TaskEntry, []byte, string) (int, []byte, error) {
 	return http.StatusOK, nil, nil
 }
-func (idleDispatcher) OnTaskVanished(context.Context, string) error { return nil }
-func (idleDispatcher) OnBootTimeout(context.Context, string) error  { return nil }
 
 // twoDaemonRig builds a daemon face serving two credentials in the same
 // workspace, so cross-daemon visibility can be probed on one WS.

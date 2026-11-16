@@ -463,14 +463,6 @@ func (s dispatcherSet) OnReport(ctx context.Context, ep dispatch.Endpoint, e reg
 	return d.OnReport(ctx, ep, e, body, sessionID)
 }
 
-func (s dispatcherSet) OnTaskVanished(ctx context.Context, taskID string) error {
-	return nil
-}
-
-func (s dispatcherSet) OnBootTimeout(ctx context.Context, taskID string) error {
-	return nil
-}
-
 // serveHTTP runs one HTTP server until ctx ends.
 func serveHTTP(ctx context.Context, srv *http.Server) error {
 	errCh := make(chan error, 1)

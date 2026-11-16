@@ -40,8 +40,6 @@ func (r *recordingDispatcher) OnReport(_ context.Context, ep dispatch.Endpoint, 
 	})
 	return http.StatusOK, []byte(`{"status":"ok"}`), nil
 }
-func (r *recordingDispatcher) OnTaskVanished(context.Context, string) error { return nil }
-func (r *recordingDispatcher) OnBootTimeout(context.Context, string) error  { return nil }
 
 // reportRig builds a daemon face with a recording dispatcher and one live task
 // bound to the credential's daemon.

@@ -19,13 +19,15 @@ import (
 	"github.com/tsic404/foreman/internal/registry"
 )
 
-// Dispatcher is the fake server's scheduling surface: delivery, report
-// handling, task-vanish settlement.
+// Dispatcher is the fake server's scheduling surface: delivery and report
+// forwarding.
+//
+// Vanish and boot-timeout settlement are the dispatcher's own convergence
+// concern: it reaches them through Reconcile, never through the daemon face.
+// Declaring them here would advertise a seam no route calls.
 type Dispatcher interface {
 	Deliver(ctx context.Context, workspaceID, daemonID string, runtimeIDs []string, maxTasks int) (dispatch.Delivery, error)
 	OnReport(ctx context.Context, ep dispatch.Endpoint, e registry.TaskEntry, body []byte, sessionID string) (int, []byte, error)
-	OnTaskVanished(ctx context.Context, taskID string) error
-	OnBootTimeout(ctx context.Context, taskID string) error
 }
 
 // SkillResolver forwards the daemon's S-26 skill-bundle resolve to the real

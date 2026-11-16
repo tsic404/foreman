@@ -251,8 +251,7 @@ func (a dispatchAdapter) Deliver(ctx context.Context, ws, daemonID string, runti
 func (a dispatchAdapter) OnReport(ctx context.Context, ep dispatch.Endpoint, e registry.TaskEntry, body []byte, sessionID string) (int, []byte, error) {
 	return a.d.OnReport(ctx, ep, e, body, sessionID)
 }
-func (a dispatchAdapter) OnTaskVanished(ctx context.Context, taskID string) error { return nil }
-func (a dispatchAdapter) OnBootTimeout(ctx context.Context, taskID string) error  { return nil }
+func (a dispatchAdapter) OnBootTimeout(ctx context.Context, taskID string) error { return nil }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
