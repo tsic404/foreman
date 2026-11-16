@@ -24,22 +24,18 @@ func scrape(t *testing.T, m *Metrics) string {
 }
 
 // TestMetricsExposeAllDesignedNames is TC-tech-observability-01 step 3 at
-// process start: every metric name from §9.2 must appear even before any
-// recording.
+// process start: every metric name from §9.2 that v2 actually records must
+// appear even before any recording. A name whose family has no v2 recorder is
+// deliberately absent — it would expose a series that can never move.
 func TestMetricsExposeAllDesignedNames(t *testing.T) {
 	out := scrape(t, NewMetrics())
 	for _, name := range []string{
 		metricTasksTotal, metricTaskClaimsTotal, metricClaimErrorsTotal,
-		metricJobBootSeconds, metricJobCreateSeconds, metricInflightJobs,
+		metricInflightJobs,
 		metricForwardTotal, metricForwardLatency, metricAuthFailuresTotal,
-		metricTokenUsageTotal, metricDuplicateDispatch, metricPendingReports,
-		metricWSConnected, metricWSReconnectsTotal, metricHeartbeatSuspect,
-		metricDeliveryClaimsTotal, metricDeliveryLatency, metricDeliveryUnconfirmedTotal,
-		metricModelCatalogRelays, metricModelCatalogSecond,
-		metricSkillCacheResolves, metricSkillCacheEntries, metricSkillCacheBytes,
-		metricSkillCacheEvictions, metricWorkspaceStateRefreshes,
-		metricRuntimeProfileRefreshes, metricPolicyHits,
-		metricPolicyNameResolutions,
+		metricTokenUsageTotal, metricDuplicateDispatch,
+		metricDeliveryClaimsTotal, metricDeliveryLatency,
+		metricCredReclaimTotal, metricJobDrainSeconds,
 	} {
 		if !strings.Contains(out, name) {
 			t.Fatalf("metric %s missing from exposition:\n%s", name, out)
@@ -52,22 +48,15 @@ func TestMetricsCardinalityDiscipline(t *testing.T) {
 	m := NewMetrics()
 	m.TaskClaimed()
 	m.TaskTerminal(ResultCompleted)
-	m.JobBootSeconds(12.5)
-	m.JobCreateSeconds(1.5)
 	m.InflightJobs(3)
 	m.TokenUsage("omp", "kimi", 100, 50, 30, 20)
 	m.Forward("complete", 200, 250*time.Millisecond)
 	m.Forward(ForwardAgentAPI, 502, time.Second)
 	m.ClaimError("503")
-	m.AuthFailure("expired")
+	m.AuthFailure("missing")
 	m.DuplicateDispatch()
-	m.PendingReports(2)
-	m.WSConnect("server")
-	m.WSConnect("job")
-	m.WSReconnect("job")
-	m.HeartbeatSuspect(1)
-	m.AuthFailure("revoked")
-	m.CredReclaimed("job_terminated", 12.5)
+	m.AuthFailure("invalid")
+	m.CredReclaimed("task_terminated", 12.5)
 
 	out := scrape(t, m)
 	for _, bad := range []string{"task_id=", "issue_id=", "job_name=", "node_name="} {
@@ -83,16 +72,10 @@ func TestMetricsCardinalityDiscipline(t *testing.T) {
 		`foreman_token_usage_total{direction="cache_write",model="kimi",provider="omp"} 20`,
 		`foreman_forward_total{code="200",endpoint="complete"} 1`,
 		`foreman_claim_errors_total{code="503"} 1`,
-		`foreman_auth_failures_total{reason="expired"} 1`,
+		`foreman_auth_failures_total{reason="missing"} 1`,
 		`foreman_duplicate_dispatch_total 1`,
-		`foreman_pending_reports 2`,
-		`foreman_ws_connected{side="server"} 1`,
-		`foreman_ws_connected{side="job"} 1`,
-		`foreman_ws_reconnects_total{side="job"} 1`,
-		`foreman_heartbeat_suspect 1`,
-		`foreman_auth_failures_total{reason="revoked"} 1`,
-		`foreman_cred_reclaim_total{reason="job_terminated"} 1`,
-		`foreman_cred_reclaim_total{reason="drain_timeout"} 0`,
+		`foreman_auth_failures_total{reason="invalid"} 1`,
+		`foreman_cred_reclaim_total{reason="task_terminated"} 1`,
 		`foreman_job_drain_seconds_count 1`,
 		`foreman_inflight_jobs 3`,
 		`foreman_task_claims_total 1`,
@@ -103,103 +86,10 @@ func TestMetricsCardinalityDiscipline(t *testing.T) {
 	}
 }
 
-// TestWSJobGaugeNeverNegative covers the degradation/restart edge: a
-// disconnect without a matching connect must not drive the gauge below 0.
-func TestWSJobGaugeNeverNegative(t *testing.T) {
-	m := NewMetrics()
-	m.WSDisconnect("job")
-	m.WSConnect("job")
-	m.WSConnect("job")
-	m.WSDisconnect("job")
-	m.WSDisconnect("job")
-	m.WSDisconnect("job")
-	out := scrape(t, m)
-	if !strings.Contains(out, `foreman_ws_connected{side="job"} 0`) {
-		t.Fatalf("job ws gauge went negative:\n%s", out)
-	}
-}
-
-// TestWSDegradationContract: with WS disabled no recorder is ever called,
-// yet the WS series stay registered at 0.
-func TestWSDegradationContract(t *testing.T) {
-	out := scrape(t, NewMetrics())
-	for _, want := range []string{
-		`foreman_ws_connected{side="server"} 0`,
-		`foreman_ws_connected{side="job"} 0`,
-		`foreman_ws_reconnects_total{side="server"} 0`,
-		`foreman_ws_reconnects_total{side="job"} 0`,
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("want %q in fresh exposition", want)
-		}
-	}
-}
-
 func TestMetricsIsolatedRegistries(t *testing.T) {
 	a, b := NewMetrics(), NewMetrics()
 	a.TaskClaimed()
 	if strings.Contains(scrape(t, b), `foreman_task_claims_total 1`) {
 		t.Fatal("metrics instances share registry state")
-	}
-}
-
-// TestPolicyAndRefreshSeries records the four §9.2 families this change and
-// the profile/workspace work expose: the policy hit counter keeps axis and
-// source apart, the resolution counter keeps the six conclusions apart, and
-// the two refresh counters keep their result vocabularies.
-func TestPolicyAndRefreshSeries(t *testing.T) {
-	m := NewMetrics()
-	m.PolicyHit("resources", "direct")
-	m.PolicyHit("capabilities_add", "no_definition")
-	m.PolicyHit("node_selector", "no_identity")
-	m.PolicyNameResolution("resolved")
-	m.PolicyNameResolution("unavailable")
-	m.PolicyNameResolution("conflict")
-	m.PolicyNameResolution("unseeded")
-	m.RuntimeProfileRefresh("unchanged")
-	m.RuntimeProfileRefresh("failed")
-	m.WorkspaceStateRefresh("stale_replay")
-
-	out := scrape(t, m)
-	for _, want := range []string{
-		`foreman_policy_hits_total{axis="resources",source="direct"} 1`,
-		`foreman_policy_hits_total{axis="capabilities_add",source="no_definition"} 1`,
-		`foreman_policy_hits_total{axis="node_selector",source="no_identity"} 1`,
-		`foreman_policy_hits_total{axis="resources",source="no_identity"} 0`,
-		`foreman_policy_name_resolutions_total{conclusion="resolved"} 1`,
-		`foreman_policy_name_resolutions_total{conclusion="unavailable"} 1`,
-		`foreman_policy_name_resolutions_total{conclusion="absent"} 0`,
-		`foreman_policy_name_resolutions_total{conclusion="ambiguous"} 0`,
-		`foreman_policy_name_resolutions_total{conclusion="conflict"} 1`,
-		`foreman_policy_name_resolutions_total{conclusion="unseeded"} 1`,
-		`foreman_runtime_profile_refreshes_total{result="unchanged"} 1`,
-		`foreman_runtime_profile_refreshes_total{result="failed"} 1`,
-		`foreman_runtime_profile_refreshes_total{result="success"} 0`,
-		`foreman_workspace_state_refreshes_total{result="stale_replay"} 1`,
-		`foreman_workspace_state_refreshes_total{result="success"} 0`,
-	} {
-		if !strings.Contains(out, want) {
-			t.Errorf("want series %q in exposition:\n%s", want, out)
-		}
-	}
-}
-
-// TestModelCatalogRelaySeries records the catalog relay metric: the outcome
-// code is the label and the span lands in the histogram (ADR-019 / ADR-025).
-func TestModelCatalogRelaySeries(t *testing.T) {
-	m := NewMetrics()
-	m.ModelCatalogRelay("200", 1.5)
-	m.ModelCatalogRelay("none", 0.2)
-	out := scrape(t, m)
-	for _, want := range []string{
-		`foreman_model_catalog_relays_total{code="200"} 1`,
-		`foreman_model_catalog_relays_total{code="none"} 1`,
-	} {
-		if !strings.Contains(out, want) {
-			t.Fatalf("missing %s in exposition", want)
-		}
-	}
-	if !strings.Contains(out, "foreman_model_catalog_seconds_count 2") {
-		t.Fatalf("catalog span histogram missing: %s", out)
 	}
 }
