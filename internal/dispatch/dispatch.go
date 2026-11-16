@@ -63,6 +63,10 @@ type Server interface {
 type Endpoint string
 
 // Task lifecycle endpoints (§2.2, exhaustive).
+// reasonBootTimeout is the verdict Foreman writes when a claimed task never
+// started inside its boot bound.
+const reasonBootTimeout = "job_boot_timeout"
+
 const (
 	EPStart        Endpoint = "start"
 	EPProgress     Endpoint = "progress"
@@ -527,7 +531,7 @@ func (d *Dispatcher) OnTaskVanished(ctx context.Context, taskID string) error {
 
 // OnBootTimeout fails a claimed task that never started before its boot bound.
 func (d *Dispatcher) OnBootTimeout(ctx context.Context, taskID string) error {
-	return d.failLocally(ctx, taskID, "job_boot_timeout")
+	return d.failLocally(ctx, taskID, reasonBootTimeout)
 }
 
 // failLocally writes a synthetic failed verdict for a task Foreman itself
@@ -540,7 +544,12 @@ func (d *Dispatcher) failLocally(ctx context.Context, taskID, reason string) err
 	if !ok || e.IsTerminal() {
 		return nil
 	}
-	if d.cfg.BootTimeout > 0 && !e.StartedAt.IsZero() {
+	// A boot bound only governs the claim → start window: a task that already
+	// started is past it, so a boot-timeout verdict must not touch it. Every
+	// other reason (a daemon that went away, say) still applies to a started
+	// task, and gating those on the boot configuration would leave them
+	// unenforced the moment BootTimeout is set.
+	if reason == reasonBootTimeout && !e.StartedAt.IsZero() {
 		return nil
 	}
 	body, _ := json.Marshal(map[string]any{"error": reason})
@@ -588,10 +597,13 @@ func (d *Dispatcher) Reconcile(ctx context.Context) error {
 
 func (d *Dispatcher) convergeOne(ctx context.Context, e registry.TaskEntry) {
 	now := d.now()
-	// A task whose daemon went away can never start: fail it locally rather
-	// than wait out the server's lease.
+	// A task whose daemon went away can never finish: the resident process that
+	// owns the run is gone, so the agent is not running anywhere and no report
+	// will ever arrive. Settle it locally instead of waiting out the server's
+	// lease. This covers a task that already started too — leaving those to the
+	// lease would strand them for the full timeout.
 	if e.DaemonRuntimeID != "" {
-		if rt, ok := d.reg.RuntimeByID(e.DaemonRuntimeID); ok && !rt.Online && e.StartedAt.IsZero() {
+		if rt, ok := d.reg.RuntimeByID(e.DaemonRuntimeID); ok && !rt.Online {
 			d.failLocally(ctx, e.TaskID, "daemon_offline")
 			return
 		}
@@ -620,7 +632,7 @@ func (d *Dispatcher) convergeOne(ctx context.Context, e registry.TaskEntry) {
 	}
 	// Boot bound: a task that never started past its bound is failed.
 	if d.cfg.BootTimeout > 0 && e.StartedAt.IsZero() && now.Sub(e.ClaimedAt) > d.cfg.BootTimeout {
-		d.failLocally(ctx, e.TaskID, "job_boot_timeout")
+		d.failLocally(ctx, e.TaskID, reasonBootTimeout)
 		return
 	}
 	// A running task past its max duration is settled by the server's own

@@ -331,3 +331,50 @@ func TestPickDaemonFallsBackWithoutSession(t *testing.T) {
 		t.Fatalf("bound to %q, want worker-first (registration order)", e.DaemonID)
 	}
 }
+
+// TestFailLocallyBootGuardOnlyAppliesToBootTimeout pins the narrowed guard: a
+// task that already started is immune to the boot-timeout verdict, but other
+// local failures must still settle it. Gating on the boot configuration alone
+// would silently disable every other reason once BootTimeout is set.
+func TestFailLocallyBootGuardOnlyAppliesToBootTimeout(t *testing.T) {
+	stub := &stubServer{}
+	server := httptest.NewServer(stub.handler())
+	defer server.Close()
+
+	reg := registry.New()
+	client := proxy.NewClient(proxy.Config{
+		ServerURL: server.URL, WorkspaceID: "ws-1", DaemonID: "foreman-ws-1", Version: "test",
+	}, "mul_test")
+	disp := dispatch.New(dispatch.Config{BootTimeout: time.Minute}, reg, client, nil)
+	reg.PutRuntime(registry.Runtime{
+		RuntimeID: "w1", DaemonID: "w1", WorkspaceID: "ws-1", Provider: "omp", Online: true, RegisteredAt: reg.Now(),
+	})
+
+	// A started task must survive a boot-timeout verdict.
+	if err := reg.Put(registry.TaskEntry{
+		TaskID: "started", WorkspaceID: "ws-1", DaemonID: "w1", DaemonRuntimeID: "w1",
+		State: registry.StateRunning, ClaimedAt: reg.Now(), StartedAt: reg.Now(),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := disp.OnBootTimeout(context.Background(), "started"); err != nil {
+		t.Fatalf("boot timeout on started task: %v", err)
+	}
+	if e, _ := reg.Get("started"); e.IsTerminal() {
+		t.Fatal("a started task must not be settled by the boot bound")
+	}
+
+	// The same started task must still settle when its daemon goes away.
+	reg.SetRuntimeOffline("w1")
+	if err := disp.Reconcile(context.Background()); err != nil {
+		t.Fatalf("reconcile: %v", err)
+	}
+	// Settling reclaims the entry, so "gone from the live table" plus a
+	// remembered verdict is the success shape.
+	if _, live := reg.Get("started"); live {
+		t.Fatal("daemon_offline must settle a started task")
+	}
+	if !reg.IsDone("ws-1", "started") {
+		t.Fatal("the settled verdict should be remembered")
+	}
+}
