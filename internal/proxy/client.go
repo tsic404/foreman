@@ -129,7 +129,14 @@ type StatusError struct {
 	Body []byte
 }
 
+// Error includes the upstream body. A bare code turns every refusal into the
+// same line, so an operator cannot tell a stale registration from a runtime
+// mismatch or a policy denial — the server's message is the only place that
+// difference is spelled out.
 func (e *StatusError) Error() string {
+	if body := strings.TrimSpace(string(e.Body)); body != "" {
+		return fmt.Sprintf("server returned %d: %s", e.Code, truncateForLog(e.Body))
+	}
 	return fmt.Sprintf("server returned %d", e.Code)
 }
 
@@ -496,6 +503,12 @@ func (c *Client) ForwardInWorkspace(ctx context.Context, ep Endpoint, taskID, wo
 		if err == nil && code < 500 && code != http.StatusRequestTimeout && code != http.StatusTooManyRequests {
 			return code, resp, nil
 		}
+		// Without this line the whole budget can burn silently: the final
+		// error carries no status or body, so a complete/fail that never
+		// landed would leave only a metrics counter behind.
+		c.log.Warn("terminal forward attempt failed",
+			"endpoint", string(ep), "task_id", taskID, "attempt", attempt+1,
+			"status", code, "err", err)
 	}
 	return 0, nil, fmt.Errorf("%w: %s %s", ErrTerminalUndelivered, ep, taskID)
 }

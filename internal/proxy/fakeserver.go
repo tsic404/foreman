@@ -377,6 +377,8 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 		// dispatch failure is worth an error line.
 		if errors.Is(err, dispatch.ErrRuntimeMismatch) || errors.Is(err, dispatch.ErrUnknownDaemon) {
 			s.metrics.DeliveryClaim("empty")
+			s.log.Debug("claim_deferred", "reason", "no_bound_task",
+				"daemon_id", cred.DaemonID, "runtime_ids", req.RuntimeIDs)
 			writeRaw(w, http.StatusOK, mustMarshal(map[string]any{"tasks": []any{}}))
 			return
 		}
@@ -419,6 +421,10 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 	if s.lease != nil {
 		ready, err := s.lease(ctxFor(r), cred.WorkspaceID, tid)
 		if err != nil {
+			// The daemon turns this into a failed start with runtime_offline.
+			// Without a line here that symptom has no matching cause anywhere.
+			s.log.Error("prepare-lease forward failed",
+				"task_id", tid, "runtime_id", rid, "daemon_id", cred.DaemonID, "err", err)
 			writeError(w, http.StatusBadGateway, "prepare-lease forward failed")
 			return
 		}
@@ -462,6 +468,8 @@ func (s *FakeServer) handleContextReceipt(w http.ResponseWriter, r *http.Request
 	}
 	code, resp, err := s.receipt(r.Context(), r.PathValue("tid"), body)
 	if err != nil {
+		s.log.Error("context receipt forward failed",
+			"task_id", r.PathValue("tid"), "err", err)
 		writeError(w, http.StatusBadGateway, "context receipt forward failed")
 		return
 	}
@@ -503,6 +511,10 @@ func (s *FakeServer) handleRepos(w http.ResponseWriter, r *http.Request) {
 	}
 	code, body, err := s.reposFwd(r.Context(), cred.WorkspaceID)
 	if err != nil {
+		// The daemon silently keeps its previous repo state on a 502; this is
+		// the only place the cause is visible.
+		s.log.Error("workspace repos forward failed",
+			"workspace_id", cred.WorkspaceID, "err", err)
 		writeError(w, http.StatusBadGateway, "workspace repos forward failed")
 		return
 	}
@@ -523,6 +535,10 @@ func (s *FakeServer) handleRuntimeProfiles(w http.ResponseWriter, r *http.Reques
 	}
 	code, body, err := s.profilesFwd(r.Context(), r.PathValue("ws"))
 	if err != nil {
+		// The daemon falls back to its built-in runtimes on a 502; the cause
+		// otherwise leaves no trace on the Foreman side.
+		s.log.Error("runtime profiles forward failed",
+			"workspace_id", r.PathValue("ws"), "err", err)
 		writeError(w, http.StatusBadGateway, "runtime profiles forward failed")
 		return
 	}
@@ -571,6 +587,10 @@ func (s *FakeServer) handleSkillBundles(w http.ResponseWriter, r *http.Request) 
 			writeError(w, http.StatusNotFound, "task not found")
 			return
 		}
+		// A 502 here makes the daemon fall back to its own cache; the upstream
+		// cause must still be attributable somewhere.
+		s.log.Error("skill bundle resolve failed",
+			"task_id", r.PathValue("tid"), "err", err)
 		writeError(w, http.StatusBadGateway, "skill bundle resolve failed")
 		return
 	}
