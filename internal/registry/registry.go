@@ -34,7 +34,10 @@ type Registry struct {
 	// doneOwner remembers which daemon settled each retained task id, so a
 	// report arriving after the live row is gone can still be checked against
 	// the daemon that owned it. Pruned on the same clock as done.
-	doneOwner       map[string]string
+	doneOwner map[string]string
+	// doneWorkspace records which workspace settled each retained task id, so
+	// IsDone can answer for the workspace it was asked about.
+	doneWorkspace   map[string]string
 	runtimes        map[string]Runtime
 	byRuntimeDaemon map[string]string // runtimeID → daemonID
 
@@ -56,6 +59,7 @@ func New(opts ...Option) *Registry {
 		byDaemon:        map[string][]string{},
 		done:            map[string]time.Time{},
 		doneOwner:       map[string]string{},
+		doneWorkspace:   map[string]string{},
 		runtimes:        map[string]Runtime{},
 		byRuntimeDaemon: map[string]string{},
 		now:             time.Now,
@@ -89,9 +93,20 @@ func (r *Registry) Put(e TaskEntry) error {
 	if e.State == StateTerminal {
 		return fmt.Errorf("%w: cannot insert a terminal entry", ErrTerminalImmutable)
 	}
+	// A fresh live generation must not inherit the previous one's verdict: the
+	// retained index answers OwnerOf/DoneAt for re-dispatched ids otherwise.
+	r.forgetVerdictLocked(e.TaskID)
 	r.tasks[e.TaskID] = e
 	r.indexLocked(e)
 	return nil
+}
+
+// forgetVerdictLocked drops any retained verdict for a task id that is being
+// admitted as a new live generation.
+func (r *Registry) forgetVerdictLocked(taskID string) {
+	delete(r.done, taskID)
+	delete(r.doneOwner, taskID)
+	delete(r.doneWorkspace, taskID)
 }
 
 // BindOrInsert stores e, inserting it when absent and applying the daemon
@@ -108,6 +123,7 @@ func (r *Registry) BindOrInsert(e TaskEntry) (TaskEntry, bool, error) {
 		if e.State == StateTerminal {
 			return TaskEntry{}, false, fmt.Errorf("%w: cannot insert a terminal entry", ErrTerminalImmutable)
 		}
+		r.forgetVerdictLocked(e.TaskID)
 		r.tasks[e.TaskID] = e
 		r.indexLocked(e)
 		return e, true, nil
@@ -291,6 +307,13 @@ func (r *Registry) IsDone(workspaceID, taskID string) bool {
 	defer r.mu.RUnlock()
 	at, ok := r.done[taskID]
 	if !ok {
+		return false
+	}
+	// The index is keyed by task id alone, so the workspace the caller asks
+	// about has to be checked here: task ids are server-assigned UUIDs and
+	// collision is not a real risk, but a caller passing a workspace must not
+	// be told "done" for another workspace's settle.
+	if ws, ok := r.doneWorkspace[taskID]; ok && workspaceID != "" && ws != "" && ws != workspaceID {
 		return false
 	}
 	return r.now().Sub(at) < doneRetention
@@ -629,8 +652,11 @@ func (r *Registry) noteDoneLocked(e TaskEntry) {
 		at = r.now()
 	}
 	r.done[e.TaskID] = at
-	if e.DaemonID != "" {
-		r.doneOwner[e.TaskID] = e.DaemonID
+	// Note the owner unconditionally: a "" owner means "settled with no daemon
+	// binding", which is still an answer OwnerOf must not invent around.
+	r.doneOwner[e.TaskID] = e.DaemonID
+	if e.WorkspaceID != "" {
+		r.doneWorkspace[e.TaskID] = e.WorkspaceID
 	}
 	r.pruneDoneLocked()
 }
@@ -641,6 +667,7 @@ func (r *Registry) pruneDoneLocked() {
 		if now.Sub(at) >= doneRetention {
 			delete(r.done, id)
 			delete(r.doneOwner, id)
+			delete(r.doneWorkspace, id)
 		}
 	}
 }

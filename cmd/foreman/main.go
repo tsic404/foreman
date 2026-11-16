@@ -123,10 +123,28 @@ func run() error {
 			return fmt.Errorf("workspace discovery: %w", derr)
 		}
 		workspaceIDs = discovered.IDs()
+		// The workspace-scoped form validates every id it is configured with; the
+		// discovered form must apply the same invariant, because these ids reach
+		// log lines, derived daemon identities and filesystem paths.
+		for _, ref := range discovered.Set {
+			if !workspace.ValidWorkspaceID(ref.ID) {
+				return fmt.Errorf("workspace discovery: server returned an unusable workspace id %q", ref.ID)
+			}
+		}
+		if len(discovered.Excluded) > 0 {
+			// The manifest hid workspaces the credential can see. Silence here
+			// leaves an operator unable to tell "no workspaces" from "all
+			// excluded by a stale manifest".
+			log.Warn("workspaces excluded by the manifest", "count", len(discovered.Excluded))
+		}
 		// Bind each discovered workspace's identity, since the credential set
 		// was loaded before the set was known.
 		for _, id := range deployment.Identities(discovered.Set) {
-			daemonCreds.Bind(id.DaemonID, id.WorkspaceID)
+			if !daemonCreds.Bind(id.DaemonID, id.WorkspaceID) {
+				return fmt.Errorf("workspace discovery: no daemon credential named %q "+
+					"(FOREMAN_DAEMON_TOKENS must key each identity as <base-daemon-id>-<workspace-id>)",
+					id.DaemonID)
+			}
 		}
 		set := make([]*proxy.Client, 0, len(workspaceIDs))
 		for _, wsID := range workspaceIDs {

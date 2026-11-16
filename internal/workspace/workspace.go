@@ -312,6 +312,10 @@ func newSet(identities []Identity, getenv func(string) string) (Set, error) {
 // conservative rule: alphanumerics plus '.', '_' and '-', starting and ending
 // alphanumeric, at most 63 characters. This refuses path traversal, leading
 // dots/dashes and empty-looking values.
+// ValidWorkspaceID reports whether id is safe to use as a workspace identifier:
+// it reaches log lines, derived daemon identities and filesystem paths.
+func ValidWorkspaceID(id string) bool { return validWorkspaceID(id) }
+
 func validWorkspaceID(id string) bool {
 	if id == "" || len(id) > 63 {
 		return false

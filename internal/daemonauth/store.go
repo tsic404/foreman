@@ -108,20 +108,24 @@ func load(getenv func(string) string, allowUnbound bool) (*Store, error) {
 	return store, nil
 }
 
-// Bind records the workspace a daemon identity serves. The user-scoped
-// discovery form calls it once per discovered workspace; the strict form
-// already has the binding from env and never needs it.
-func (s *Store) Bind(daemonID, workspaceID string) {
+// Bind records the workspace a daemon identity serves and reports whether a
+// credential with that identity exists. The user-scoped discovery form calls it
+// once per discovered workspace; the strict form already has the binding from
+// env and never needs it. A false result means the operator keyed
+// FOREMAN_DAEMON_TOKENS under a name the derivation does not produce, which
+// would otherwise surface only as a 403 at register time.
+func (s *Store) Bind(daemonID, workspaceID string) bool {
 	if daemonID == "" || workspaceID == "" {
-		return
+		return false
 	}
 	for digest, cred := range s.byDigest {
 		if cred.DaemonID == daemonID {
 			cred.WorkspaceID = workspaceID
 			s.byDigest[digest] = cred
-			return
+			return true
 		}
 	}
+	return false
 }
 
 // Verify resolves a presented token to its credential. The comparison is a

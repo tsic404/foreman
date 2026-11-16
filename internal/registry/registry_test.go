@@ -174,3 +174,53 @@ func TestOwnerOfSurvivesSettlement(t *testing.T) {
 		t.Fatalf("unknown task owner = %q, want empty", got)
 	}
 }
+
+// IsDone must answer for the workspace it was asked about. The index is keyed by
+// task id alone; before this guard one workspace's settle suppressed the same id
+// in another.
+func TestIsDoneIsWorkspaceScoped(t *testing.T) {
+	r := New()
+	now := r.now()
+	if err := r.Put(TaskEntry{TaskID: "t1", WorkspaceID: "ws-a", DaemonID: "d1", State: StateRunning, ClaimedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.MarkTerminal("t1", ResultCompleted, "", now); err != nil {
+		t.Fatal(err)
+	}
+	if !r.IsDone("ws-a", "t1") {
+		t.Fatal("the settling workspace must see its own verdict")
+	}
+	if r.IsDone("ws-b", "t1") {
+		t.Fatal("another workspace must not inherit this verdict")
+	}
+}
+
+// A re-dispatched id must not inherit the previous generation's verdict or
+// owner: the retained index would otherwise answer for the wrong run.
+func TestReDispatchedIDForgetsPreviousVerdict(t *testing.T) {
+	r := New()
+	now := r.now()
+	if err := r.Put(TaskEntry{TaskID: "t1", WorkspaceID: "ws", DaemonID: "d1", State: StateRunning, ClaimedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := r.MarkTerminal("t1", ResultCompleted, "", now); err != nil {
+		t.Fatal(err)
+	}
+	if err := r.Delete("t1"); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.OwnerOf("t1"); got != "d1" {
+		t.Fatalf("settled owner = %q, want d1", got)
+	}
+
+	// A new generation of the same id arrives.
+	if err := r.Put(TaskEntry{TaskID: "t1", WorkspaceID: "ws", DaemonID: "d2", State: StatePending, ClaimedAt: now}); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.OwnerOf("t1"); got != "d2" {
+		t.Fatalf("owner after re-dispatch = %q, want d2 (live row wins, stale verdict cleared)", got)
+	}
+	if _, done := r.DoneAt("t1"); done {
+		t.Fatal("the previous generation's verdict must not survive the new insert")
+	}
+}
