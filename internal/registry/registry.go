@@ -186,7 +186,9 @@ func (r *Registry) GetInWorkspace(workspaceID, taskID string) (TaskEntry, bool) 
 }
 
 // OwnerOf reports which daemon held a task, live or settled. It answers "" for
-// a task Foreman has never seen (or has already pruned).
+// a task Foreman has never seen, or one already pruned from the settled index.
+// Row expiry is the prune's job: it drops the owner and workspace rows together
+// with the timestamp, so this lookup cannot disagree with IsDone.
 func (r *Registry) OwnerOf(taskID string) string {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
