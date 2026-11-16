@@ -736,6 +736,13 @@ func (d *Dispatcher) Reconcile(ctx context.Context) error {
 		if e.IsTerminal() {
 			continue
 		}
+		// Every dispatcher shares one registry, so an unfiltered walk makes N
+		// workspace loops each converge every task — and each of them uses its
+		// own workspace-bound client, so N-1 of those calls are answered as
+		// foreign. Skip tasks that are not this dispatcher's to settle.
+		if d.cfg.WorkspaceID != "" && e.WorkspaceID != d.cfg.WorkspaceID {
+			continue
+		}
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
