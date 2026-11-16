@@ -179,3 +179,41 @@ func getWithToken(t *testing.T, url, token string) int {
 	defer resp.Body.Close()
 	return resp.StatusCode
 }
+
+// TestSettledTaskOwnershipAlsoHeld: after a task settles, the live row is gone
+// but the settled index keeps its owner. A daemon that never held the task must
+// not be able to resolve bundles for it or post a receipt on it — the settle
+// does not transfer ownership.
+func TestSettledTaskOwnershipAlsoHeld(t *testing.T) {
+	rec := &seamRecorder{}
+	reg, url := seamRig(t, rec)
+
+	// Settle task-b as its owner, so the live row disappears and only the
+	// retained owner remains.
+	if _, _, err := reg.MarkTerminal("task-b", registry.ResultCompleted, "", reg.Now()); err != nil {
+		t.Fatalf("settle: %v", err)
+	}
+	// Reclaim removes the live row; the settled index keeps the owner.
+	if err := reg.Delete("task-b"); err != nil {
+		t.Fatalf("delete: %v", err)
+	}
+	if _, live := reg.Get("task-b"); live {
+		t.Fatal("precondition: the row should be gone")
+	}
+	if owner := reg.OwnerOf("task-b"); owner != "worker-b" {
+		t.Fatalf("precondition: owner = %q, want worker-b", owner)
+	}
+
+	if code := postWithToken(t, url, "/api/daemon/runtimes/rt-a/tasks/task-b/skill-bundles/resolve", "tok-a", `{}`); code != http.StatusNotFound {
+		t.Fatalf("foreign resolve on a settled task = %d, want 404", code)
+	}
+	if rec.skillTask != "" {
+		t.Fatalf("resolver reached with %q for a task another daemon owned", rec.skillTask)
+	}
+	if code := postWithToken(t, url, "/api/daemon/tasks/task-b/context-receipt", "tok-a", `{}`); code != http.StatusNotFound {
+		t.Fatalf("foreign receipt on a settled task = %d, want 404", code)
+	}
+	if rec.receiptTask != "" {
+		t.Fatalf("receipt forwarder reached with %q for a task another daemon owned", rec.receiptTask)
+	}
+}

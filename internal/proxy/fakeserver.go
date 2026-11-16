@@ -426,7 +426,7 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 	// {tid} is that runtime's task. Checking both keeps one daemon from
 	// renewing (and thereby probing) another's lease through its own runtime id.
 	tid := r.PathValue("tid")
-	if e, bound := s.reg.Get(tid); bound && e.DaemonID != cred.DaemonID {
+	if owner := s.reg.OwnerOf(tid); owner != "" && owner != cred.DaemonID {
 		writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
@@ -469,10 +469,11 @@ func (s *FakeServer) handleContextReceipt(w http.ResponseWriter, r *http.Request
 		return
 	}
 	// The receipt acknowledges the context of the task this daemon was handed,
-	// so a foreign daemon must not be able to post one for another's task. An
-	// unbound task passes: a Foreman restart clears the registry while daemons
-	// keep running, and the receipt is self-describing.
-	if e, known := s.reg.Get(r.PathValue("tid")); known && e.DaemonID != cred.DaemonID {
+	// so a foreign daemon must not be able to post one for another's task. The
+	// retained owner is consulted as well as the live row, the same rule the
+	// report routes use — a settled task keeps its owner. A task with no owner
+	// at all (after a Foreman restart) passes: the receipt is self-describing.
+	if owner := s.reg.OwnerOf(r.PathValue("tid")); owner != "" && owner != cred.DaemonID {
 		writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
@@ -603,10 +604,14 @@ func (s *FakeServer) handleSkillBundles(w http.ResponseWriter, r *http.Request) 
 	// S-26 resolves under the task's own runtime, so only the daemon holding
 	// that task may ask. Without this check a daemon could point the resolve at
 	// another daemon's task id (and an arbitrary runtime id in the path) and
-	// read its bundle set back. An unbound task is still allowed through: after
-	// a Foreman restart the registry is empty while daemons keep running, and
-	// the resolver answers ErrUnboundTask → 404 for exactly that case.
-	if e, known := s.reg.Get(r.PathValue("tid")); known && e.DaemonID != cred.DaemonID {
+	// read its bundle set back.
+	//
+	// The retained owner is consulted too: once a task settles its live row is
+	// reclaimed, and testing only the live row would let any daemon resolve
+	// against a settled task another daemon owned. A task with no owner at all
+	// (after a Foreman restart) is still allowed through — the resolver answers
+	// ErrUnboundTask → 404 for exactly that case.
+	if owner := s.reg.OwnerOf(r.PathValue("tid")); owner != "" && owner != cred.DaemonID {
 		writeError(w, http.StatusNotFound, "task not found")
 		return
 	}
