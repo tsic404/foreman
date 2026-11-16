@@ -330,8 +330,12 @@ func (s *FakeServer) handleDeregister(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if rt, known := s.reg.RuntimeByDaemon(cred.DaemonID); known {
-		s.reg.SetRuntimeOffline(rt.RuntimeID)
+	// C-14 names a daemon identity, and a daemon declares its whole runtime
+	// set in one C-1 — so the whole set goes offline together. Flipping one
+	// arbitrary row would leave the daemon's other runtimes dispatchable until
+	// the heartbeat sweep noticed.
+	if flipped := s.reg.SetDaemonOffline(cred.DaemonID); len(flipped) > 0 {
+		s.log.Info("daemon.deregistered", "daemon_id", cred.DaemonID, "runtimes", flipped)
 		s.notifyChanged()
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})

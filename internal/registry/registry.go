@@ -472,16 +472,21 @@ func (r *Registry) RuntimeByID(runtimeID string) (Runtime, bool) {
 	return rt, ok
 }
 
-// RuntimeByDaemon returns the daemon row registered under daemonID.
-func (r *Registry) RuntimeByDaemon(daemonID string) (Runtime, bool) {
+// RuntimesByDaemon returns every runtime row one daemon registered. A daemon
+// declares its whole runtime set in one C-1, so teardown must reach all of
+// them — answering one arbitrary row (map order) would leave the rest
+// dispatchable until the heartbeat sweep caught up.
+func (r *Registry) RuntimesByDaemon(daemonID string) []Runtime {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
+	out := make([]Runtime, 0, 4)
 	for _, rt := range r.runtimes {
 		if rt.DaemonID == daemonID {
-			return rt, true
+			out = append(out, rt)
 		}
 	}
-	return Runtime{}, false
+	sort.Slice(out, func(i, j int) bool { return out[i].RuntimeID < out[j].RuntimeID })
+	return out
 }
 
 // Runtimes returns every daemon row in registration order.
@@ -566,6 +571,27 @@ func (r *Registry) SetRuntimeOffline(runtimeID string) {
 	}
 	rt.Online = false
 	r.runtimes[runtimeID] = rt
+}
+
+// SetDaemonOffline marks every runtime one daemon registered offline, returning
+// the ids it flipped. Deregistration (C-14) carries a daemon identity, not a
+// runtime id: a daemon that declared several runtimes is gone as a whole, so
+// taking only one offline would leave the others dispatchable until the
+// heartbeat sweep caught up.
+func (r *Registry) SetDaemonOffline(daemonID string) []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var flipped []string
+	for id, rt := range r.runtimes {
+		if rt.DaemonID != daemonID || !rt.Online {
+			continue
+		}
+		rt.Online = false
+		r.runtimes[id] = rt
+		flipped = append(flipped, id)
+	}
+	sort.Strings(flipped)
+	return flipped
 }
 
 // ExpireStale marks offline every daemon whose last heartbeat is older than
