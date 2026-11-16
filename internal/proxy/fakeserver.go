@@ -702,6 +702,14 @@ func (s *FakeServer) learnSession(e registry.TaskEntry, body []byte) string {
 // ---- S404 ----
 
 func (s *FakeServer) handleNotFound(w http.ResponseWriter, r *http.Request) {
+	// The catch-all answers only an authenticated caller. Every real route
+	// guards inside its handler, which leaves this one reachable without a
+	// credential — and its 404 would tell an anonymous caller which paths exist
+	// (a mounted route 401s, an unmounted one 404s). Applying the same guard
+	// here makes the two indistinguishable.
+	if _, ok := s.credential(w, r); !ok {
+		return
+	}
 	writeError(w, http.StatusNotFound, "not found")
 }
 
