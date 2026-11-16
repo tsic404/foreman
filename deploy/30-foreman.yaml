@@ -93,8 +93,10 @@ spec:
               value: "5s"
             - name: FOREMAN_CLAIM_INTERVAL_IDLE
               value: "30s"
-            # Renewal cadence for a claimed, not-yet-started task; values above
-            # 20s are refused at startup (§10: renewed every ≤20s).
+            # Daemon-identity heartbeat cadence (C-2); values above 20s are
+            # refused at startup. The name is historical: task leases are
+            # renewed by C-4 from the convergence round below, and by the
+            # daemon itself via S-7.
             - name: FOREMAN_LEASE_REFRESH_INTERVAL
               value: "15s"
             - name: FOREMAN_RECONCILE_INTERVAL

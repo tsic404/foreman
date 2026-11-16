@@ -319,6 +319,10 @@ func run() error {
 			Registry:    reg,
 			Capacity:    capacity,
 			Reconciler:  d,
+			// Without this the loop falls back to a hardcoded 30s and
+			// FOREMAN_RECONCILE_INTERVAL becomes a key that parses, validates,
+			// and then changes nothing.
+			Interval: dispCfg.ReconcileInterval,
 		})
 		planes = append(planes, plane)
 	}

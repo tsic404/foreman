@@ -130,3 +130,26 @@ func TestLeaseRefreshIntervalDrivesHeartbeatNotLease(t *testing.T) {
 		t.Fatalf("accepted %s above the %s cap", EnvLeaseRefreshInterval, MaxLeaseRefreshInterval)
 	}
 }
+
+// TestControlPlaneHonoursConfiguredInterval is the regression guard for a key
+// that parsed, validated and then changed nothing: FOREMAN_RECONCILE_INTERVAL
+// reached Config.ReconcileInterval but was never passed to the loop, so every
+// deployment ran at the hardcoded 30s regardless of what the operator set.
+func TestControlPlaneHonoursConfiguredInterval(t *testing.T) {
+	plane := NewControlPlane(ControlPlaneOptions{
+		Interval: 5 * time.Second,
+	})
+	if plane.Reconcile == nil {
+		t.Fatal("no reconcile loop built")
+	}
+	if plane.Reconcile.interval != 5*time.Second {
+		t.Fatalf("reconcile interval = %s, want 5s (the configured value must reach the loop)",
+			plane.Reconcile.interval)
+	}
+
+	// An unset/zero value keeps the documented default rather than spinning.
+	fallback := NewControlPlane(ControlPlaneOptions{})
+	if fallback.Reconcile.interval != 30*time.Second {
+		t.Fatalf("fallback interval = %s, want 30s", fallback.Reconcile.interval)
+	}
+}

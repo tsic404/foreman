@@ -47,9 +47,11 @@ const (
 	// by the daemon itself via S-7.
 	DefaultLeaseRefreshInterval = 15 * time.Second
 
-	// MaxLeaseRefreshInterval caps the heartbeat cadence: the upstream daemon
-	// heartbeats every 15s, and a slower Foreman-side heartbeat would let a
-	// runtime look stale to the sweep between ticks.
+	// MaxLeaseRefreshInterval caps the heartbeat cadence. The upstream daemon
+	// heartbeats every 15s; staying near that keeps Foreman's view of liveness
+	// as fresh as the daemon's own. (The offline sweep is a separate window,
+	// FOREMAN_HEARTBEAT_TIMEOUT, default 60s — this cap is about freshness,
+	// not about avoiding false offline verdicts.)
 	MaxLeaseRefreshInterval = 20 * time.Second
 
 	// ClientCapabilities is the X-Client-Capabilities header value (§1.1).
