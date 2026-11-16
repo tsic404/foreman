@@ -307,19 +307,6 @@ func (r *Registry) Inflight() int {
 	return n
 }
 
-// InflightFor counts one workspace's live entries.
-func (r *Registry) InflightFor(workspaceID string) int {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	n := 0
-	for _, e := range r.tasks {
-		if !e.IsTerminal() && e.WorkspaceID == workspaceID {
-			n++
-		}
-	}
-	return n
-}
-
 // IsDone reports whether workspaceID's task reached terminal state inside the
 // retention window.
 func (r *Registry) IsDone(workspaceID, taskID string) bool {
@@ -345,20 +332,6 @@ func (r *Registry) DoneAt(taskID string) (time.Time, bool) {
 	defer r.mu.RUnlock()
 	at, ok := r.done[taskID]
 	return at, ok
-}
-
-// MarkDaemonRegistered records the S4 registration instant on the task the
-// daemon is handling.
-func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntry, bool) {
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	e, ok := r.daemonTaskLocked(daemonID)
-	if !ok {
-		return TaskEntry{}, false
-	}
-	e.State = StateDaemonRegistered
-	r.tasks[e.TaskID] = e
-	return e, true
 }
 
 // MarkDelivering commits the delivery: the payload is handed to the daemon.
@@ -472,23 +445,6 @@ func (r *Registry) RuntimeByID(runtimeID string) (Runtime, bool) {
 	defer r.mu.RUnlock()
 	rt, ok := r.runtimes[runtimeID]
 	return rt, ok
-}
-
-// RuntimesByDaemon returns every runtime row one daemon registered. A daemon
-// declares its whole runtime set in one C-1, so teardown must reach all of
-// them — answering one arbitrary row (map order) would leave the rest
-// dispatchable until the heartbeat sweep caught up.
-func (r *Registry) RuntimesByDaemon(daemonID string) []Runtime {
-	r.mu.RLock()
-	defer r.mu.RUnlock()
-	out := make([]Runtime, 0, 4)
-	for _, rt := range r.runtimes {
-		if rt.DaemonID == daemonID {
-			out = append(out, rt)
-		}
-	}
-	sort.Slice(out, func(i, j int) bool { return out[i].RuntimeID < out[j].RuntimeID })
-	return out
 }
 
 // Runtimes returns every daemon row in registration order.

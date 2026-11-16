@@ -73,17 +73,11 @@ type OpsHandler struct {
 	// workspaceIDs is the deployment's served set (§0, ADR-047); the
 	// credential's grant is resolved against it.
 	workspaceIDs []string
-	registered   []string
 }
 
 // ServeHTTP authenticates the request and dispatches to the mounted routes.
 func (h *OpsHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.auth.serve(h.dispatch, w, r)
-}
-
-// RegisteredPatterns returns the patterns the surface registered, in order.
-func (h *OpsHandler) RegisteredPatterns() []string {
-	return append([]string(nil), h.registered...)
 }
 
 // NewOpsHandler mounts the ops surface (§2.2 S-25): /metrics plus /foreman/*,
@@ -104,15 +98,8 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, cfg OpsConfig) *OpsHandler
 		workspaceIDs: append([]string(nil), cfg.WorkspaceIDs...),
 	}
 	mux := http.NewServeMux()
-	// register is the single mount point: the pattern is recorded by the same
-	// call that mounts it, and the census requires every mount in this closure
-	// to pass that recorded binding, so the mounted set and the recorded set
-	// cannot diverge. Inside the closure the mux is legal only as a mount's
-	// receiver — passing it out, taking a method value or assigning it fails —
-	// and the package keeps one route table: a second construction, a
-	// reassigned or shadowed name, and a foreign receiver all fail.
+	// register is the single mount point for the ops route table.
 	register := func(pattern string, h http.Handler) {
-		handler.registered = append(handler.registered, pattern)
 		mux.Handle(pattern, h)
 	}
 	registerFn := func(pattern string, h http.HandlerFunc) { register(pattern, h) }

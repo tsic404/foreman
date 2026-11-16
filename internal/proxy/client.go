@@ -164,7 +164,6 @@ type RuntimeRef struct {
 }
 
 // Key is the identity key (provider \x00 profile id).
-func (r RuntimeRef) Key() string { return r.Provider + "\x00" + r.ProfileID }
 
 type Client struct {
 	cfg     Config
@@ -183,8 +182,6 @@ type Client struct {
 	// a daemon registered or deregistered — never every round.
 	declared []DeclaredRuntime
 	dirty    bool
-
-	workspaceName string
 }
 
 // DeclaredRuntime is one runtime Foreman reports at C1, derived from the
@@ -236,17 +233,6 @@ func NewClient(cfg Config, token string, opts ...Option) *Client {
 
 // WorkspaceID returns the workspace this client serves.
 func (c *Client) WorkspaceID() string { return c.cfg.WorkspaceID }
-
-// DaemonID returns the daemon identity Foreman registers under.
-func (c *Client) DaemonID() string { return c.cfg.DaemonID }
-
-// WorkspaceName returns the server's display name for the workspace.
-func (c *Client) WorkspaceName() (string, bool) {
-	return c.workspaceName, c.workspaceName != ""
-}
-
-// SetWorkspaceName records the display name (from a C17 answer).
-func (c *Client) SetWorkspaceName(name string) { c.workspaceName = name }
 
 // RuntimeIDs returns the real runtime ids the server assigned.
 func (c *Client) RuntimeIDs() []string {
