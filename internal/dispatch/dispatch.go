@@ -497,10 +497,22 @@ func (d *Dispatcher) OnReport(ctx context.Context, ep Endpoint, e registry.TaskE
 	case ep == EPUsage && code >= 200 && code < 300:
 		// S-12 carries the agent's token accounting; without this the token
 		// series exists but never moves.
-		// The S-12 body wraps the counters under last_token_usage in some agent
-		// protocols and inlines them in others; read both shapes and count only
-		// when something was actually reported.
-		var usage struct {
+		//
+		// The wire shape a real agent sends is an array under "usage":
+		//   {"usage":[{"provider":"omp","model":"...","input_tokens":N,...}]}
+		// Older/proxied agents inline the counters at the top level or nest
+		// them under last_token_usage, so all three are read. Only a body that
+		// actually carries counters is recorded — an empty usage array must not
+		// create a zero sample.
+		var payload struct {
+			Usage []struct {
+				Provider   string `json:"provider"`
+				Model      string `json:"model"`
+				Input      int64  `json:"input_tokens"`
+				Output     int64  `json:"output_tokens"`
+				CacheRead  int64  `json:"cache_read_tokens"`
+				CacheWrite int64  `json:"cache_write_tokens"`
+			} `json:"usage"`
 			Provider   string `json:"provider"`
 			Model      string `json:"model"`
 			Input      int64  `json:"input_tokens"`
@@ -514,14 +526,23 @@ func (d *Dispatcher) OnReport(ctx context.Context, ep Endpoint, e registry.TaskE
 				CacheWrite int64 `json:"cache_write_tokens"`
 			} `json:"last_token_usage"`
 		}
-		if json.Unmarshal(body, &usage) == nil {
-			in, out := usage.Input, usage.Output
-			cr, cw := usage.CacheRead, usage.CacheWrite
+		if json.Unmarshal(body, &payload) == nil {
+			if len(payload.Usage) > 0 {
+				for _, u := range payload.Usage {
+					if u.Input != 0 || u.Output != 0 || u.CacheRead != 0 || u.CacheWrite != 0 {
+						d.metrics.TokenUsage(u.Provider, u.Model,
+							u.Input, u.Output, u.CacheRead, u.CacheWrite)
+					}
+				}
+				break
+			}
+			in, out := payload.Input, payload.Output
+			cr, cw := payload.CacheRead, payload.CacheWrite
 			if in == 0 && out == 0 && cr == 0 && cw == 0 {
-				in, out, cr, cw = usage.Last.Input, usage.Last.Output, usage.Last.CacheRead, usage.Last.CacheWrite
+				in, out, cr, cw = payload.Last.Input, payload.Last.Output, payload.Last.CacheRead, payload.Last.CacheWrite
 			}
 			if in != 0 || out != 0 || cr != 0 || cw != 0 {
-				d.metrics.TokenUsage(usage.Provider, usage.Model, in, out, cr, cw)
+				d.metrics.TokenUsage(payload.Provider, payload.Model, in, out, cr, cw)
 			}
 		}
 	case ep == EPStart && code >= 200 && code < 300:
