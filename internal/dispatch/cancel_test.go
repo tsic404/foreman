@@ -19,9 +19,9 @@ import (
 // cancel-settlement path can be observed end to end without a real daemon.
 type cancelServer struct {
 	mu         sync.Mutex
-	status     int    // HTTP status for C13
-	statusBody string // C13 answer
-	fails      []recordedReport
+	status     int              // HTTP status for C13
+	statusBody string           // C13 answer
+	fails      []recordedReport // every terminal POST (fail, complete, cancel-ack)
 	failStatus int
 }
 
@@ -207,5 +207,33 @@ func TestCancelAckBodyShapeIsStable(t *testing.T) {
 	}
 	if _, ok := body["error"]; !ok {
 		t.Fatalf("fail body has no error field: %v", body)
+	}
+}
+
+// TestCancelAckThenCompleteStillForwardsComplete pins the current, deliberate
+// shape: OnReport forwards before the idempotent MarkTerminal, so after a
+// daemon-cancel (synthetic fail) the daemon's own complete still reaches the
+// server. Multica resolves conflicting terminal reports to its own state, and
+// the daemon can never un-send a report, so blocking the complete here would
+// lose the real run's result for no benefit.
+func TestCancelAckThenCompleteStillForwardsComplete(t *testing.T) {
+	stub := &cancelServer{status: http.StatusOK, statusBody: `{"status":"running"}`}
+	disp, reg := newCancelRig(t, stub)
+	e := cancelledEntry(t, reg)
+
+	ctx := context.Background()
+	if _, _, err := disp.OnReport(ctx, dispatch.EPCancelAck, e, []byte(`{}`), ""); err != nil {
+		t.Fatalf("cancel-ack: %v", err)
+	}
+	body, _ := json.Marshal(map[string]any{"status": "completed"})
+	if _, _, err := disp.OnReport(ctx, dispatch.EPComplete, e, body, ""); err != nil {
+		t.Fatalf("complete: %v", err)
+	}
+
+	stub.mu.Lock()
+	n := len(stub.fails)
+	stub.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("synthetic fails = %d, want 1", n)
 	}
 }
