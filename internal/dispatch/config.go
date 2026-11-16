@@ -9,7 +9,10 @@ import (
 const (
 	// EnvBootTimeout bounds claim → daemon start. Zero (or unset) disables the
 	// bound; a malformed value refuses startup rather than silently disabling
-	// a protection the operator asked for.
+	// a protection the operator asked for. The bound is evaluated once per
+	// reconcile round (30s), so a value below that cadence can only fire when
+	// the round happens to land in the window — set it comfortably above 30s
+	// to actually protect anything.
 	EnvBootTimeout = "FOREMAN_JOB_BOOT_TIMEOUT"
 	// EnvHeartbeatTimeout bounds how long a daemon may stay silent before the
 	// sweep marks it offline. Zero disables the sweep.

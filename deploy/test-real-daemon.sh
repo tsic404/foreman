@@ -142,6 +142,12 @@ mkdir -p "$GOTMPDIR"
 go build -o bin/foreman ./cmd/foreman
 pkill -9 -f 'bin/foreman -listen' 2>/dev/null || true
 sleep 1
+# Forward the boot bound when the caller pins one (the default is Foreman's
+# own documented 60s, so an unset value needs no env entry).
+BOOT_TIMEOUT_ENV=""
+if [ -n "${FOREMAN_JOB_BOOT_TIMEOUT:-}" ]; then
+	BOOT_TIMEOUT_ENV="FOREMAN_JOB_BOOT_TIMEOUT=$FOREMAN_JOB_BOOT_TIMEOUT"
+fi
 DAEMON_TOKENS_ARG="$DAEMON_ID=$DAEMON_TOKEN"
 DAEMON_WS_ARG="$DAEMON_ID=$WS_ID"
 if [ "$TWO_DAEMONS" = "1" ]; then
@@ -183,6 +189,7 @@ exec env \
   FOREMAN_DAEMON_TOKEN_WORKSPACES=$DAEMON_WS_ARG \
   FOREMAN_OPS_TOKEN=$OPS_TOKEN FOREMAN_LOG_LEVEL=debug \
   FOREMAN_CLAIM_INTERVAL=2s FOREMAN_CLAIM_INTERVAL_IDLE=2s \
+  ${BOOT_TIMEOUT_ENV} \
   ./bin/foreman -listen=$FOREMAN_LISTEN -ops-listen=$FOREMAN_OPS_LISTEN
 RUNEOF
 chmod +x "$WORK/foreman-run.sh"
