@@ -144,6 +144,12 @@ func run() error {
 	}
 
 	reg := registry.New()
+	// The dispatcher's timing bounds (boot bound, heartbeat sweep) come from
+	// env; deploying Foreman without them silently disables both protections.
+	dispCfg, err := dispatch.LoadConfig(getenv)
+	if err != nil {
+		return err
+	}
 	// Each workspace's dispatcher maps claimed tasks onto the daemons
 	// registered to that workspace.
 	dispatchers := make(map[string]*dispatch.Dispatcher, len(workspaceIDs))
@@ -152,14 +158,9 @@ func run() error {
 		if client == nil {
 			continue
 		}
-		d := dispatch.New(dispatch.Config{
-			BootTimeout:       0, // configured via env below
-			ReconcileInterval: 30 * time.Second,
-			// Four upstream heartbeat intervals: long enough that a slow tick
-			// is not a death sentence, short enough that a dead daemon stops
-			// attracting tasks within a minute.
-			HeartbeatTimeout: time.Minute,
-		}, reg, client, metrics,
+		wsCfg := dispCfg
+		wsCfg.ReconcileInterval = 30 * time.Second
+		d := dispatch.New(wsCfg, reg, client, metrics,
 			dispatch.WithLogger(baseLog),
 			dispatch.WithRealRuntimeID(func(runtimeKey string) (string, bool) {
 				// The server rewrites a runtime's display name (e.g. to the
