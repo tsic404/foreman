@@ -31,7 +31,17 @@ type ClaimLoop struct {
 	Capacity func() int
 	log      *slog.Logger
 	backoff  *backoff
+	// lastRenew is when the token was last renewed. Renewing is not a
+	// heartbeat: the claim preflight runs every few seconds (and once per idle
+	// poll), so renewing every round means dozens of calls a minute for a
+	// credential that only needs extending occasionally.
+	lastRenew time.Time
 }
+
+// tokenRenewInterval bounds how often the claim preflight extends the server
+// credential. Five minutes keeps the token comfortably ahead of expiry without
+// turning the preflight into a load source.
+const tokenRenewInterval = 5 * time.Minute
 
 // NewClaimLoop builds the loop. capacity returns the free task capacity.
 func NewClaimLoop(cfg Config, client *Client, claim Claimer, capacity func() int) *ClaimLoop {
@@ -89,7 +99,13 @@ func (l *ClaimLoop) preflight(ctx context.Context) error {
 			return err
 		}
 	}
-	return l.client.RenewToken(ctx)
+	if l.lastRenew.IsZero() || time.Since(l.lastRenew) >= tokenRenewInterval {
+		if err := l.client.RenewToken(ctx); err != nil {
+			return err
+		}
+		l.lastRenew = time.Now()
+	}
+	return nil
 }
 
 // iterate runs one claim round.
