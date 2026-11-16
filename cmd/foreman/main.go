@@ -345,6 +345,11 @@ func run() error {
 			Version:      version,
 			WorkspaceIDs: workspaceIDs,
 			Credentials:  obsCfg.OpsCredentials,
+			// The daemon face already gets this view; without it here the ops
+			// healthz answers the documented "always ok" shape even when a
+			// supervised loop has stopped, which is the opposite of what an
+			// operator reading it would conclude.
+			Health: health,
 			// Without this the /foreman/register-source route was mounted but
 			// always answered 404: the v1 wiring was lost in the v2 rewrite, so
 			// an operator had no way to see which identities this process ended

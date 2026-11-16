@@ -332,6 +332,7 @@ func (d *Dispatcher) OnClaim(ctx context.Context, workspaceID string, task json.
 		return fmt.Errorf("register task %s: %w", head.ID, bindErr)
 	}
 	d.reg.PutRuntime(rt)
+	d.metrics.TaskClaimed()
 	d.log.Info("task.claimed",
 		"task_id", e.TaskID, "workspace_id", e.WorkspaceID,
 		"daemon_id", e.DaemonID, "runtime_id", e.RuntimeID,
@@ -493,6 +494,36 @@ func (d *Dispatcher) OnReport(ctx context.Context, ep Endpoint, e registry.TaskE
 	}
 	now := d.now()
 	switch {
+	case ep == EPUsage && code >= 200 && code < 300:
+		// S-12 carries the agent's token accounting; without this the token
+		// series exists but never moves.
+		// The S-12 body wraps the counters under last_token_usage in some agent
+		// protocols and inlines them in others; read both shapes and count only
+		// when something was actually reported.
+		var usage struct {
+			Provider   string `json:"provider"`
+			Model      string `json:"model"`
+			Input      int64  `json:"input_tokens"`
+			Output     int64  `json:"output_tokens"`
+			CacheRead  int64  `json:"cache_read_tokens"`
+			CacheWrite int64  `json:"cache_write_tokens"`
+			Last       struct {
+				Input      int64 `json:"input_tokens"`
+				Output     int64 `json:"output_tokens"`
+				CacheRead  int64 `json:"cache_read_tokens"`
+				CacheWrite int64 `json:"cache_write_tokens"`
+			} `json:"last_token_usage"`
+		}
+		if json.Unmarshal(body, &usage) == nil {
+			in, out := usage.Input, usage.Output
+			cr, cw := usage.CacheRead, usage.CacheWrite
+			if in == 0 && out == 0 && cr == 0 && cw == 0 {
+				in, out, cr, cw = usage.Last.Input, usage.Last.Output, usage.Last.CacheRead, usage.Last.CacheWrite
+			}
+			if in != 0 || out != 0 || cr != 0 || cw != 0 {
+				d.metrics.TokenUsage(usage.Provider, usage.Model, in, out, cr, cw)
+			}
+		}
 	case ep == EPStart && code >= 200 && code < 300:
 		d.reg.MarkStarted(e.TaskID, now)
 	case ep.IsTerminal() && code >= 200 && code < 300:

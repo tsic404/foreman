@@ -73,3 +73,24 @@ func TestRegisterSourceRoute(t *testing.T) {
 		t.Fatalf("body = %s, want the discovery view", body)
 	}
 }
+
+// A stopped component must fail the ops healthz. Without the Health field wired
+// the ops face answers the "always ok" shape, contradicting the daemon face.
+func TestOpsHealthzReflectsStoppedComponent(t *testing.T) {
+	h := observability.NewHealth()
+	stop := h.Running("claim-loop")
+
+	srv := opsServer(t, observability.OpsConfig{Version: "test", Health: h})
+	if code, body := get(t, srv.URL+"/foreman/healthz", "ops-tok"); code != http.StatusOK {
+		t.Fatalf("healthy = %d (%s), want 200", code, body)
+	}
+
+	stop()
+	code, body := get(t, srv.URL+"/foreman/healthz", "ops-tok")
+	if code != http.StatusServiceUnavailable {
+		t.Fatalf("after stop = %d (%s), want 503", code, body)
+	}
+	if !strings.Contains(body, "claim-loop") {
+		t.Fatalf("body = %s, want the stopped component named", body)
+	}
+}
