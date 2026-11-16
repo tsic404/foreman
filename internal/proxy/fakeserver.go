@@ -172,7 +172,16 @@ func (s *FakeServer) credential(w http.ResponseWriter, r *http.Request) (daemona
 	cred, err := s.creds.Verify(token)
 	if err != nil {
 		s.metrics.AuthFailure(reason(err))
-		s.log.Warn("daemon credential rejected", "remote_addr", r.RemoteAddr, "path", r.URL.Path)
+		// S-28 is a user-API path that happens to be mounted here for protocol
+		// completeness, so a CLI (or an agent shelling out to one) reaching it
+		// with a user PAT is expected, not a fault. Log that case at DEBUG so it
+		// cannot bury genuine credential problems.
+		level := s.log.Warn
+		if r.URL.Path == "/api/workspaces" {
+			level = s.log.Debug
+		}
+		level("daemon credential rejected", "remote_addr", r.RemoteAddr,
+			"path", r.URL.Path, "reason", reason(err))
 		writeError(w, http.StatusUnauthorized, "unknown daemon credential")
 		return daemonauth.Credential{}, false
 	}
