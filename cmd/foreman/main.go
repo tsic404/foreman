@@ -345,6 +345,27 @@ func run() error {
 			Version:      version,
 			WorkspaceIDs: workspaceIDs,
 			Credentials:  obsCfg.OpsCredentials,
+			// Without this the /foreman/register-source route was mounted but
+			// always answered 404: the v1 wiring was lost in the v2 rewrite, so
+			// an operator had no way to see which identities this process ended
+			// up serving after discovery.
+			RegisterSource: func() map[string]any {
+				out := make(map[string]any, len(workspaceIDs))
+				for _, wsID := range workspaceIDs {
+					rts := reg.RuntimesForWorkspace(wsID)
+					view := make([]map[string]any, 0, len(rts))
+					for _, rt := range rts {
+						view = append(view, map[string]any{
+							"runtime_id": rt.RuntimeID,
+							"daemon_id":  rt.DaemonID,
+							"provider":   rt.Provider,
+							"online":     rt.Online,
+						})
+					}
+					out[wsID] = view
+				}
+				return out
+			},
 		})
 		opsServer := &http.Server{
 			Addr:              *opsListen,

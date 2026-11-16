@@ -152,7 +152,13 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, cfg OpsConfig) *OpsHandler
 			writeError(w, scope.status, scope.message)
 			return
 		}
-		entries := index.ListInWorkspace(scope.workspaceID)
+		// A handler mounted without a registry (as in the ops tests) has no
+		// tasks to list; answering an empty set keeps the surface usable instead
+		// of panicking on a nil index.
+		var entries []registry.TaskEntry
+		if index != nil {
+			entries = index.ListInWorkspace(scope.workspaceID)
+		}
 		if entries == nil {
 			entries = []registry.TaskEntry{}
 		}
@@ -166,6 +172,10 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, cfg OpsConfig) *OpsHandler
 		}
 		workspaceID := scope.workspaceID
 		taskID := r.PathValue("taskID")
+		if index == nil {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
 		e, ok := index.GetInWorkspace(workspaceID, taskID)
 		if !ok {
 			// A reclaimed task keeps answering with its terminal record until
@@ -194,6 +204,10 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, cfg OpsConfig) *OpsHandler
 			return
 		}
 		workspaceID := scope.workspaceID
+		if index == nil {
+			writeError(w, http.StatusNotFound, "task not found")
+			return
+		}
 		e, ok := index.GetInWorkspace(workspaceID, r.PathValue("taskID"))
 		if ok && !workspaceVisible(index, e.TaskID, workspaceID) {
 			ok = false
