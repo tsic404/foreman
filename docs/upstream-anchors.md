@@ -43,12 +43,13 @@ runtimes.
 **Scope of the premise.** Content addressing holds per reference set while the
 referenced content is unchanged. A workspace skill edited between a task's claim
 and its resolve makes the upstream serve the *current* bundle for the same
-payload, so a cache hit inside the fresh window replays the bundle that landed
-before the edit. That is the version-lag class the upstream daemon already has
-(it reuses its on-disk bundle for an unchanged ref across dispatches); it is
-bounded by `FOREMAN_SKILL_CACHE_FRESH_TTL`, and a claim taken after the edit
-carries the new hash — a different payload, hence a different key. Re-verify this
-anchor when the upstream changes the resolve semantics (ADR-045 复审触发).
+payload, so a cache hit replays the bundle that landed before the edit. That is
+the version-lag class the upstream daemon already has (it reuses its on-disk
+bundle for an unchanged ref across dispatches). Foreman v2 does not cache
+bundles itself — S-26 is forwarded to C-19 verbatim — so the window is the
+daemon's, not ours; a claim taken after the edit carries the new hash — a
+different payload, hence a different key. Re-verify this anchor when the
+upstream changes the resolve semantics (ADR-045 复审触发).
 
 ## Project identity queries (contracts §4.1 / §8.5, ADR-048)
 
