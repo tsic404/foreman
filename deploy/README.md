@@ -70,6 +70,27 @@ credential's grant: a `?workspace=` value outside it is answered like a
 workspace that does not exist (`404`), and a single-workspace grant is the
 default dimension.
 
+A workspace id is only unique inside one upstream, so a bare `workspace=token`
+entry is bound to the single registered source that holds it; when zero or
+several sources hold it the grant is refused (fail closed) rather than widened.
+Name the pair explicitly to pin it:
+
+```yaml
+- name: FOREMAN_OPS_WORKSPACE_TOKENS
+  value: "atlas/ws-core=<token>,harbor/ws-core=<token>"
+```
+
+`server/workspace=token` grants exactly that pair. A route reached with the
+pair grant sees only rows whose `(server_id, workspace_id)` matches; a request
+naming another server's identical workspace id answers `404`.
+
+The bare form also carries the local ops read scope — `/foreman/tasks`, the
+task detail, its logs and `/foreman/register-source` for that workspace, which
+is how a single-workspace operator credential has always worked. The
+`server/workspace` form is a management-surface grant only: it deliberately
+does not grant those local reads, so a credential for a remote source can never
+read this deployment's identically named workspace.
+
 A Prometheus scraper must send the same bearer credential (e.g. the Prometheus
 Operator `authorization.credentials` Secret reference); the `prometheus.io/*`
 annotations on the Deployment and `Service foreman-ops` only locate the port
@@ -79,6 +100,80 @@ and path. `deploy/optional/servicemonitor.yaml` is the Operator form.
 NetworkPolicy that admits the ops port only from the `foreman` namespace. Apply
 it where the CNI enforces policies and the scraper can be placed there; the
 credential face does not depend on it.
+
+### Management surface (`/admin/*`)
+
+The same ops listener also serves the management API the console reads. It has
+its own route table under `/admin/` (so the ops route set above is unchanged)
+and reuses the same bearer credentials: `FOREMAN_OPS_TOKEN` is the
+deployment-wide administrator, `FOREMAN_OPS_WORKSPACE_TOKENS` narrows every
+read and binding write to one workspace. A route never widens `?workspace_id=`
+past the credential's grant; a cross-grant id answers `404`.
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/admin/servers
+curl -s -H "Authorization: Bearer $TOKEN" -X POST localhost:8081/admin/servers \
+  -d '{"server_id":"atlas","url":"https://multica.example.test","credential_ref":"atlas"}'
+curl -s -H "Authorization: Bearer $TOKEN" -X POST localhost:8081/admin/servers/atlas/sync
+curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/admin/overview
+```
+
+| Route | Body / query | Answer |
+|---|---|---|
+| `GET /admin/servers` | — | the registered sources the grant reaches |
+| `POST /admin/servers` | `{"server_id","url","credential_ref","allowed_workspaces","auto_sync","sync_period_s","retry_budget"}` | `201` and the source view |
+| `PATCH /admin/servers/{id}` | `{"auto_sync","sync_period_s","retry_budget"}` | the updated source view |
+| `POST /admin/servers/{id}/sync` | — | the sync report; a failed sync answers non-2xx and names the generation that stayed current |
+| `GET /admin/servers/{id}/directory` | `?workspace_id=` | the current generation (workspaces, projects, agents, runtimes, tombstones) |
+| `GET /admin/agents` | `?server_id=&workspace_id=` | agent rows with their management class and the two runtime groups |
+| `PUT /admin/servers/{id}/workspaces/{ws}/agents/{agent}/binding` | `{"runtime_id","expected_runtime_id"}` | the binding outcome; only `applied` is `200` |
+| `GET /admin/overview` | — | the four counts and the in-progress rows |
+| `GET /admin/audit` | `?server_id=` | audit rows, newest first |
+
+The binding write needs an upstream that can make it conditional on the value
+that was read. The pinned Multica API's `PUT /api/agents/{id}` is
+unconditional — no version or `If-Match` — so the adapter reports the
+capability as absent and this route answers `501` with the reason instead of
+sending an unconditional body. A read-back compared afterwards cannot prove
+that a competing edit did not happen between the read and the write, so the
+surface stays read-only rather than risk overwriting another administrator.
+Calls always carry the agent's workspace (the `workspace_id` query and the
+`X-Workspace-ID` header); the pre-read, the write and the read-back all name
+it, and an answer naming another agent or workspace is refused.
+
+The management console itself is served from the same listener:
+
+```bash
+kubectl -n foreman port-forward svc/foreman-ops 8081:8081 &
+# open http://localhost:8081/admin/ and paste the FOREMAN_OPS_TOKEN value
+```
+
+`GET /admin/` answers the console document and `GET /admin/assets/…` the
+stylesheet and ES modules it loads; both are embedded in the binary, so the
+deployment needs no extra volume or image. These two paths are the only
+`/admin/` answers that do not require the bearer credential: the shell carries
+no data, and a browser cannot attach an `Authorization` header to a
+navigation. Everything it displays comes from the gated `/admin/*` routes
+above, with the credential typed into the page. The page keeps that credential
+in memory only — never a URL, cookie or browser storage — so a refresh asks
+for it again. Do not bake `FOREMAN_OPS_TOKEN` into a page, a proxy rewrite or a
+link: it is the deployment-wide administrator.
+
+Each source credential is a separate file in `FOREMAN_SOURCE_CREDENTIALS_DIR`
+(default `/etc/foreman/catalog-credentials`), named after the registration's
+`credential_ref`. The catalog stores the reference only; the value is read per
+request and never appears in a response, an audit row or a log. Mount that
+directory from a Secret when registering sources:
+
+```yaml
+- name: FOREMAN_SOURCE_CREDENTIALS_DIR
+  value: "/etc/foreman/catalog-credentials"
+volumeMounts:
+- {name: catalog-credentials, mountPath: /etc/foreman/catalog-credentials, readOnly: true}
+volumes:
+- name: catalog-credentials
+  secret: {secretName: foreman-catalog-credentials, optional: true}
+```
 
 > Upgrading an install that shipped before the scheduler label: the Deployment
 > selector now carries `app.kubernetes.io/component: scheduler` (without it

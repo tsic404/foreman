@@ -121,6 +121,27 @@ func (c *Client) RuntimeIDs() []string {
 	return ids
 }
 
+// DeclarationScope freezes the declaration one C3 request will carry: the
+// runtime set and the identity each id answers for. The claim loop keeps this
+// evidence with the response, because a successful refresh may replace the
+// declaration before the first entry is written (02-contracts V2-C02).
+func (c *Client) DeclarationScope() scheduler.ClaimScope {
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	scope := scheduler.ClaimScope{
+		RuntimeIDs: make([]string, 0, len(c.refs)),
+		Identities: make(map[string]string, len(c.refs)),
+	}
+	for _, ref := range c.refs {
+		if ref.ID == "" {
+			continue
+		}
+		scope.RuntimeIDs = append(scope.RuntimeIDs, ref.ID)
+		scope.Identities[ref.ID] = ref.Key()
+	}
+	return scope
+}
+
 // Declaration returns the startup discovery that drives C1.
 func (c *Client) Declaration() registry.Discovery {
 	c.mu.RLock()
@@ -683,29 +704,39 @@ func decodeHeartbeatAck(raw []byte) (HeartbeatAck, error) {
 	return ack, nil
 }
 
+// ClaimResult pairs the C3 response with the request's own evidence: the tasks
+// were confirmed against Scope's runtime set, not whatever the declaration
+// holds by the time the caller consumes them.
+type ClaimResult struct {
+	Tasks []json.RawMessage
+	Scope scheduler.ClaimScope
+}
+
 // ClaimTasks is C3 over the whole declared runtime set: runtime_ids carries
 // every real runtime id, and max_tasks the caller's free slots.
-func (c *Client) ClaimTasks(ctx context.Context, maxTasks int) ([]json.RawMessage, error) {
+func (c *Client) ClaimTasks(ctx context.Context, maxTasks int) (ClaimResult, error) {
 	if maxTasks < 1 {
-		return nil, nil
+		return ClaimResult{}, nil
 	}
-	code, raw, err := c.claimOnce(ctx, c.RuntimeIDs(), maxTasks)
+	scope := c.DeclarationScope()
+	code, raw, err := c.claimOnce(ctx, scope.RuntimeIDs, maxTasks)
 	if err == nil && code == http.StatusNotFound && containsRuntimeNotFound(raw) {
 		c.log.Warn("runtime not found on claim; re-registering")
 		// The claim carries the whole declared set, so the 404 names no row:
 		// the §1.6 sequence still re-fetches C-18 before it writes any C-1, and
 		// the answer moves every stale id at once (ADR-043 §9).
 		if rerr := c.rebuildClaimRuntime(ctx); rerr != nil {
-			return nil, fmt.Errorf("claim: re-register after runtime loss: %w", rerr)
+			return ClaimResult{}, fmt.Errorf("claim: re-register after runtime loss: %w", rerr)
 		}
-		code, raw, err = c.claimOnce(ctx, c.RuntimeIDs(), maxTasks)
+		scope = c.DeclarationScope()
+		code, raw, err = c.claimOnce(ctx, scope.RuntimeIDs, maxTasks)
 	}
 	if err == nil && code >= 200 && code < 300 {
 		var resp struct {
 			Tasks []json.RawMessage `json:"tasks"`
 		}
 		if err = json.Unmarshal(raw, &resp); err == nil {
-			return resp.Tasks, nil
+			return ClaimResult{Tasks: resp.Tasks, Scope: scope}, nil
 		}
 	}
 	if err == nil {
@@ -717,7 +748,7 @@ func (c *Client) ClaimTasks(ctx context.Context, maxTasks int) ([]json.RawMessag
 		codeLabel = fmt.Sprintf("%d", se.Code)
 	}
 	c.metrics.ClaimError(codeLabel)
-	return nil, fmt.Errorf("claim: %w", err)
+	return ClaimResult{}, fmt.Errorf("claim: %w", err)
 }
 
 func (c *Client) claimOnce(ctx context.Context, runtimeIDs []string, maxTasks int) (int, []byte, error) {

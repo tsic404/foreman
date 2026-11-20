@@ -15,22 +15,36 @@ const (
 	// it reads every workspace the deployment serves.
 	EnvOpsToken = "FOREMAN_OPS_TOKEN"
 	// EnvOpsWorkspaceTokens binds additional credentials to single workspaces,
-	// as comma-separated "<workspace-id>=<token>" pairs. The token may itself
-	// contain '=' — the pair is split at the first one.
+	// as comma-separated "<workspace-id>=<token>" or
+	// "<server-id>/<workspace-id>=<token>" pairs. The token may itself contain
+	// '=' — the pair is split at the first one. The server-qualified form is
+	// what survives a second registered source holding the same workspace id;
+	// the unqualified form is resolved against the source registry and refused
+	// when more than one source holds the workspace.
 	EnvOpsWorkspaceTokens = "FOREMAN_OPS_WORKSPACE_TOKENS"
 )
 
-// OpsCredential is one bearer credential of the ops surface and the workspace
-// set it may read. An empty Workspaces grants every workspace the deployment
-// serves; a non-empty one grants exactly those (the workspace-bound form).
+// Scope is one (server, workspace) pair a credential may read. An empty
+// ServerID is the workspace-only form: the management surface resolves it
+// against the registered sources and refuses it when it is ambiguous.
+type Scope struct {
+	ServerID    string
+	WorkspaceID string
+}
+
+// OpsCredential is one bearer credential of the ops surface and the scope set
+// it may read. A nil Workspaces and nil Scopes grant every workspace the
+// deployment serves; otherwise the credential is workspace-bound.
 type OpsCredential struct {
 	Token      string
 	Workspaces []string
+	Scopes     []Scope
 }
 
-// opsIdentity is the authenticated caller's workspace grant. A nil workspaces
-// field grants every configured workspace — the deployment-wide credential.
+// opsIdentity is the authenticated caller's grant. A nil scopes field grants
+// every configured workspace — the deployment-wide credential.
 type opsIdentity struct {
+	scopes     []Scope
 	workspaces []string
 }
 
@@ -49,7 +63,7 @@ func LoadOpsCredentials(getenv func(string) string) ([]OpsCredential, error) {
 	}
 	var credentials []OpsCredential
 	seenTokens := map[string]string{}
-	seenWorkspaces := map[string]bool{}
+	seenScopes := map[string]bool{}
 	if wide := strings.TrimSpace(getenv(EnvOpsToken)); wide != "" {
 		if isPlaceholderCredential(wide) {
 			return nil, fmt.Errorf("%s carries the shipped placeholder, not a credential", EnvOpsToken)
@@ -66,13 +80,13 @@ func LoadOpsCredentials(getenv func(string) string) ([]OpsCredential, error) {
 		if pair == "" {
 			continue
 		}
-		workspaceID, token, ok := strings.Cut(pair, "=")
-		workspaceID, token = strings.TrimSpace(workspaceID), strings.TrimSpace(token)
-		if !ok || workspaceID == "" || token == "" {
+		scopeText, token, ok := strings.Cut(pair, "=")
+		scopeText, token = strings.TrimSpace(scopeText), strings.TrimSpace(token)
+		if !ok || scopeText == "" || token == "" {
 			// The malformed entry may be the credential itself (a missing
 			// separator leaves the token whole), and this error reaches the
 			// container log: name the entry's position only, never its text.
-			return nil, fmt.Errorf("%s entry %d is not a <workspace-id>=<token> pair", EnvOpsWorkspaceTokens, position+1)
+			return nil, fmt.Errorf("%s entry %d is not a <[server-id/]workspace-id>=<token> pair", EnvOpsWorkspaceTokens, position+1)
 		}
 		if isPlaceholderCredential(token) {
 			return nil, fmt.Errorf("%s carries the shipped placeholder, not a credential", EnvOpsWorkspaceTokens)
@@ -80,14 +94,65 @@ func LoadOpsCredentials(getenv func(string) string) ([]OpsCredential, error) {
 		if _, duplicate := seenTokens[token]; duplicate {
 			return nil, fmt.Errorf("%s repeats a token already configured", EnvOpsWorkspaceTokens)
 		}
-		if seenWorkspaces[workspaceID] {
-			return nil, fmt.Errorf("%s binds workspace %q twice", EnvOpsWorkspaceTokens, workspaceID)
+		scope, err := parseScope(scopeText)
+		if err != nil {
+			return nil, fmt.Errorf("%s entry %d: %w", EnvOpsWorkspaceTokens, position+1, err)
 		}
-		seenTokens[token] = workspaceID
-		seenWorkspaces[workspaceID] = true
-		credentials = append(credentials, OpsCredential{Token: token, Workspaces: []string{workspaceID}})
+		key := scope.ServerID + "\x00" + scope.WorkspaceID
+		if seenScopes[key] {
+			return nil, fmt.Errorf("%s binds scope %q twice", EnvOpsWorkspaceTokens, scopeText)
+		}
+		seenTokens[token] = scope.WorkspaceID
+		seenScopes[key] = true
+		// The two forms keep one representation each. An unqualified entry is
+		// a local workspace grant: the ops read routes resolve it from
+		// Workspaces exactly as they did before source qualification existed,
+		// and admit() derives the equivalent Scope from it. A qualified entry
+		// is a source-scoped grant and stays in Scopes alone, so it can never
+		// be mistaken for a local workspace of the same id.
+		credential := OpsCredential{Token: token}
+		if scope.ServerID == "" {
+			credential.Workspaces = []string{scope.WorkspaceID}
+		} else {
+			credential.Scopes = []Scope{scope}
+		}
+		credentials = append(credentials, credential)
 	}
 	return credentials, nil
+}
+
+// parseScope reads one "<[server-id/]workspace-id>" entry. An id is a bare
+// token: a value that needed escaping would silently match nothing.
+func parseScope(text string) (Scope, error) {
+	serverID, workspaceID, qualified := strings.Cut(text, "/")
+	serverID, workspaceID = strings.TrimSpace(serverID), strings.TrimSpace(workspaceID)
+	if qualified {
+		if serverID == "" || workspaceID == "" {
+			return Scope{}, fmt.Errorf("a server-qualified scope needs both a server id and a workspace id")
+		}
+		if !bareID(serverID) {
+			return Scope{}, fmt.Errorf("server id %q is not a bare id", serverID)
+		}
+	} else {
+		workspaceID, serverID = serverID, ""
+	}
+	if !bareID(workspaceID) {
+		return Scope{}, fmt.Errorf("workspace id %q is not a bare id", workspaceID)
+	}
+	return Scope{ServerID: serverID, WorkspaceID: workspaceID}, nil
+}
+
+// bareID reports whether text is one non-empty printable id token.
+func bareID(text string) bool {
+	if text == "" {
+		return false
+	}
+	for _, r := range text {
+		if r <= ' ' || r == 0x7f || r == '/' || r == '=' {
+			return false
+		}
+	}
+	return true
 }
 
 // ValidateOpsCredentials refuses a workspace-bound credential naming a
@@ -106,6 +171,15 @@ func ValidateOpsCredentials(credentials []OpsCredential, served []string) error 
 			if !known[workspaceID] {
 				return fmt.Errorf("%s binds workspace %q, which this deployment does not serve",
 					EnvOpsWorkspaceTokens, workspaceID)
+			}
+		}
+		for _, scope := range credential.Scopes {
+			// A server-qualified scope names a remote source, which is
+			// registered after startup; only its workspace half is knowable
+			// here and only when it is the unqualified form.
+			if scope.ServerID == "" && !known[scope.WorkspaceID] {
+				return fmt.Errorf("%s binds workspace %q, which this deployment does not serve",
+					EnvOpsWorkspaceTokens, scope.WorkspaceID)
 			}
 		}
 	}
@@ -143,6 +217,40 @@ func (a *opsAuth) serve(next http.HandlerFunc, w http.ResponseWriter, r *http.Re
 	next(w, r.WithContext(context.WithValue(r.Context(), opsIdentityKey{}, identity)))
 }
 
+// CredentialGate admits one request against the ops credential set and binds
+// the caller's grant to the request context. A sibling management surface
+// reuses the deployment's one credential face through it instead of growing a
+// second credential loader (§8 管理 UI 分别授权; 跨域检查在服务端).
+type CredentialGate struct {
+	auth *opsAuth
+}
+
+// NewCredentialGate builds a gate over credentials.
+func NewCredentialGate(credentials []OpsCredential) *CredentialGate {
+	return &CredentialGate{auth: newOpsAuth(credentials)}
+}
+
+// Wrap answers 401 for an unauthenticated request and passes an admitted one
+// to next with its grant bound.
+func (g *CredentialGate) Wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		g.auth.serve(func(w http.ResponseWriter, r *http.Request) {
+			next.ServeHTTP(w, r)
+		}, w, r)
+	})
+}
+
+// CallerScopes returns the admitted caller's scope grant. wide is true for the
+// deployment-wide credential; ok is false when the request was not admitted.
+// A non-wide grant with an empty slice sees nothing.
+func CallerScopes(ctx context.Context) (scopes []Scope, wide bool, ok bool) {
+	identity, ok := opsIdentityFrom(ctx)
+	if !ok {
+		return nil, false, false
+	}
+	return identity.scopes, identity.scopes == nil, true
+}
+
 // admit compares the presented credential against every configured one in
 // constant time and without returning early: the comparison time must not
 // reveal which credential, if any, matched.
@@ -160,7 +268,18 @@ func (a *opsAuth) admit(r *http.Request) (opsIdentity, bool) {
 	if matched < 0 {
 		return opsIdentity{}, false
 	}
-	return opsIdentity{workspaces: a.credentials[matched].Workspaces}, true
+	credential := a.credentials[matched]
+	if credential.Scopes == nil && credential.Workspaces == nil {
+		return opsIdentity{}, true
+	}
+	scopes := make([]Scope, 0, len(credential.Scopes)+len(credential.Workspaces))
+	scopes = append(scopes, credential.Scopes...)
+	workspaces := make([]string, 0, len(credential.Workspaces))
+	for _, workspaceID := range credential.Workspaces {
+		scopes = append(scopes, Scope{WorkspaceID: workspaceID})
+		workspaces = append(workspaces, workspaceID)
+	}
+	return opsIdentity{scopes: scopes, workspaces: workspaces}, true
 }
 
 // bearerToken extracts the credential of an Authorization header. Only the

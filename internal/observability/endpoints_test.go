@@ -727,22 +727,28 @@ func TestLoadOpsCredentials(t *testing.T) {
 	}
 	credentials, err := LoadOpsCredentials(env(map[string]string{
 		EnvOpsToken:           "wide-token",
-		EnvOpsWorkspaceTokens: "ws-a=token-a,ws-b=token=b",
+		EnvOpsWorkspaceTokens: "ws-a=token-a,ws-b=token=b,atlas/ws-a=token-c",
 	}))
 	if err != nil {
 		t.Fatalf("LoadOpsCredentials: %v", err)
 	}
-	if len(credentials) != 3 {
-		t.Fatalf("credentials = %+v, want 3", credentials)
+	if len(credentials) != 4 {
+		t.Fatalf("credentials = %+v, want 4", credentials)
 	}
 	if credentials[0].Token != "wide-token" || credentials[0].Workspaces != nil {
 		t.Errorf("wide credential = %+v", credentials[0])
 	}
-	if len(credentials[1].Workspaces) != 1 || credentials[1].Workspaces[0] != "ws-a" || credentials[1].Token != "token-a" {
+	// The unqualified pair is a local workspace grant and keeps the legacy
+	// representation the ops readers resolve from; admit() derives its
+	// equivalent unqualified Scope. A qualified pair keeps Scopes alone.
+	if len(credentials[1].Workspaces) != 1 || credentials[1].Workspaces[0] != "ws-a" || len(credentials[1].Scopes) != 0 || credentials[1].Token != "token-a" {
 		t.Errorf("workspace credential = %+v", credentials[1])
 	}
 	if credentials[2].Token != "token=b" {
 		t.Errorf("token containing '=' = %q", credentials[2].Token)
+	}
+	if len(credentials[3].Scopes) != 1 || credentials[3].Scopes[0] != (Scope{ServerID: "atlas", WorkspaceID: "ws-a"}) {
+		t.Errorf("server-qualified scope = %+v", credentials[3])
 	}
 
 	for name, values := range map[string]map[string]string{
@@ -836,5 +842,143 @@ func TestOpsMetricsWithoutAdmittedIdentityIsForbidden(t *testing.T) {
 	h.dispatch(rec, httptest.NewRequest(http.MethodGet, "/metrics", nil))
 	if rec.Code != http.StatusForbidden {
 		t.Fatalf("metrics without an admitted identity = %d, want 403", rec.Code)
+	}
+}
+
+// TestLoadedWorkspaceCredentialKeepsItsOpsReadScope is the regression the
+// loader introduced: LoadOpsCredentials moved every pair into Scopes, and the
+// four ops readers kept reading only the old Workspaces field, so a legitimate
+// "<workspace>=<token>" configuration started answering 404 everywhere. The
+// handler here is built from the loader's real output, not a hand-made
+// credential, so the production path is what is exercised.
+func TestLoadedWorkspaceCredentialKeepsItsOpsReadScope(t *testing.T) {
+	const token = "ops-legacy-ws-a"
+	credentials, err := LoadOpsCredentials(func(key string) string {
+		switch key {
+		case EnvOpsWorkspaceTokens:
+			return "ws-a=" + token
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("LoadOpsCredentials: %v", err)
+	}
+
+	reg := registry.New(time.Now)
+	for _, e := range []registry.TaskEntry{
+		{TaskID: "task-a", JobName: "fm-task-a", WorkspaceID: "ws-a", State: registry.StateRunning, Payload: json.RawMessage(`{"id":"task-a"}`)},
+		{TaskID: "task-b", JobName: "fm-task-b", WorkspaceID: "ws-b", State: registry.StateRunning, Payload: json.RawMessage(`{"id":"task-b"}`)},
+	} {
+		if err := reg.Put(e); err != nil {
+			t.Fatalf("Put %s: %v", e.TaskID, err)
+		}
+	}
+	view := func() map[string]any {
+		return map[string]any{
+			"ws-a": map[string]any{"declaration": "a"},
+			"ws-b": map[string]any{"declaration": "b"},
+		}
+	}
+	logs := &fakeLogReader{data: []byte("job log")}
+	h := NewOpsHandler(NewMetrics(), reg, logs, OpsConfig{
+		WorkspaceIDs:   []string{"ws-a", "ws-b"},
+		RegisterSource: view,
+		Credentials:    credentials,
+	})
+	call := func(path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, path, nil)
+		req.Header.Set("Authorization", "Bearer "+token)
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// The single-workspace grant is the default dimension again.
+	rec := call("/foreman/tasks")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("tasks = %d: %s", rec.Code, rec.Body)
+	}
+	var entries []struct {
+		TaskID      string `json:"task_id"`
+		WorkspaceID string `json:"workspace_id"`
+	}
+	decodeBody(t, rec, &entries)
+	if len(entries) != 1 || entries[0].TaskID != "task-a" || entries[0].WorkspaceID != "ws-a" {
+		t.Fatalf("tasks = %+v, want only ws-a's row", entries)
+	}
+
+	if rec := call("/foreman/tasks/task-a"); rec.Code != http.StatusOK {
+		t.Fatalf("detail = %d: %s", rec.Code, rec.Body)
+	}
+	if rec := call("/foreman/tasks/task-a/logs"); rec.Code != http.StatusOK {
+		t.Fatalf("logs = %d: %s", rec.Code, rec.Body)
+	}
+	if logs.jobName != "fm-task-a" {
+		t.Fatalf("logs read job %q, want fm-task-a", logs.jobName)
+	}
+	rec = call("/foreman/register-source")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register-source = %d: %s", rec.Code, rec.Body)
+	}
+	var sources map[string]any
+	decodeBody(t, rec, &sources)
+	if len(sources) != 1 || sources["ws-a"] == nil {
+		t.Fatalf("register-source = %+v, want only ws-a", sources)
+	}
+
+	// Another workspace, and the same workspace named across the grant, stay
+	// invisible.
+	if rec := call("/foreman/tasks?workspace=ws-b"); rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-workspace tasks = %d, want 404", rec.Code)
+	}
+	if rec := call("/foreman/tasks/task-b"); rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-workspace detail = %d, want 404", rec.Code)
+	}
+	if rec := call("/foreman/tasks/task-b/logs"); rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-workspace logs = %d, want 404", rec.Code)
+	}
+
+	// Metrics stay deployment-wide: a workspace-bound credential still cannot
+	// read them.
+	if rec := call("/metrics"); rec.Code != http.StatusForbidden {
+		t.Fatalf("workspace credential /metrics = %d, want 403", rec.Code)
+	}
+}
+
+// TestLoadedServerQualifiedCredentialDoesNotBorrowALocalWorkspace: a
+// "server/workspace=token" grant is management-surface scope. It must not be
+// flattened into the unqualified ops workspace list, or the same id on the
+// local deployment would become readable through a credential that was never
+// meant for it.
+func TestLoadedServerQualifiedCredentialDoesNotBorrowALocalWorkspace(t *testing.T) {
+	const token = "ops-atlas-ws-a"
+	credentials, err := LoadOpsCredentials(func(key string) string {
+		switch key {
+		case EnvOpsWorkspaceTokens:
+			return "atlas/ws-a=" + token
+		}
+		return ""
+	})
+	if err != nil {
+		t.Fatalf("LoadOpsCredentials: %v", err)
+	}
+
+	reg := registry.New(time.Now)
+	if err := reg.Put(registry.TaskEntry{
+		TaskID: "task-a", JobName: "fm-task-a", WorkspaceID: "ws-a", State: registry.StateRunning,
+	}); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	h := NewOpsHandler(NewMetrics(), reg, nil, OpsConfig{
+		WorkspaceIDs: []string{"ws-a"},
+		Credentials:  credentials,
+	})
+
+	req := httptest.NewRequest(http.MethodGet, "/foreman/tasks", nil)
+	req.Header.Set("Authorization", "Bearer "+token)
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	if rec.Code == http.StatusOK {
+		t.Fatalf("a source-qualified grant read the local workspace's tasks: %s", rec.Body)
 	}
 }

@@ -1,6 +1,7 @@
 package scheduler
 
 import (
+	"context"
 	"fmt"
 	"os"
 	"strconv"
@@ -137,6 +138,19 @@ type Config struct {
 	// ProjectLookupTimeout bounds one reverse lookup so the claim → Job budget
 	// holds (FOREMAN_PROJECT_LOOKUP_TIMEOUT). Zero falls back to the default.
 	ProjectLookupTimeout time.Duration
+	// DispatchGate decides whether the exact C3 request that returned a task
+	// carried its real runtime. It answers a fact about that request's frozen
+	// declaration, never about the agent's current binding or the live
+	// registration set: an edit or refresh that lands while the claim is in
+	// flight must not revoke a confirmation (02-contracts V2-C02 已确认归原
+	// runtime).
+	//
+	// known=false means no evidence about this runtime (the registered-source
+	// legacy shape or an undeclared runtime set) and the claim proceeds.
+	// known=true, owned=false refuses the claim with an error — the task is
+	// settled as a visible refusing claim, not silently dropped, because the
+	// upstream did confirm it to someone (04-architecture.md §3.1).
+	DispatchGate func(ctx context.Context, workspaceID, agentID, realRuntimeID string, claimedRuntimeIDs []string) (owned, known bool)
 }
 
 // LoadConfig reads the scheduler configuration from env (os.Getenv when

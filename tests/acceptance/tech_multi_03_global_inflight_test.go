@@ -468,7 +468,7 @@ func TestTechMulti03MalformedClaimKeepsTheCallersSlotAndWorkspaceLock(t *testing
 		t.Fatalf("ReserveClaimSlots = %d pairs (err %v), want one", len(reserved), err)
 	}
 	payload := json.RawMessage(`{"id":"task-malformed","workspace_id":"ws-1","agent_id":42}`)
-	if err := tw.a.sched.OnClaimReservedFor(ctx, "ws-1", payload, reserved[0]); err != nil {
+	if err := tw.a.sched.OnClaimReservedFor(ctx, "ws-1", payload, reserved[0], scheduler.ClaimScope{}); err != nil {
 		t.Fatalf("OnClaimReservedFor: %v (an exhausted budget must not strand the claim)", err)
 	}
 

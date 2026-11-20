@@ -31,9 +31,10 @@ type ClaimScheduler interface {
 	// ReleaseSlots returns reservations C3 did not fill.
 	ReleaseSlots(ctx context.Context, reserved []scheduler.SlotReservation)
 	// OnClaimReserved registers a claimed task against an already-held
-	// reservation; duplicate claims (server redispatch) are settled inside
-	// (§4.3), so the loop hands every claimed task over.
-	OnClaimReserved(ctx context.Context, task json.RawMessage, reserved scheduler.SlotReservation) error
+	// reservation and the scope of the exact C3 request that returned it;
+	// duplicate claims (server redispatch) are settled inside (§4.3), so the
+	// loop hands every claimed task over.
+	OnClaimReserved(ctx context.Context, task json.RawMessage, reserved scheduler.SlotReservation, scope scheduler.ClaimScope) error
 }
 
 // ClaimLoop is the polling claim loop (S-6 + §10): it claims up
@@ -162,11 +163,12 @@ func (l *ClaimLoop) iterate(ctx context.Context) error {
 	if len(reserved) == 0 {
 		return nil
 	}
-	tasks, err := l.client.ClaimTasks(ctx, len(reserved))
+	claim, err := l.client.ClaimTasks(ctx, len(reserved))
 	if err != nil {
 		l.sched.ReleaseSlots(ctx, reserved)
 		return err
 	}
+	tasks, scope := claim.Tasks, claim.Scope
 	// Each claimed task retires exactly the pair reserved for it. A response
 	// larger than max_tasks carries no pair of its own: the server's own bound
 	// makes that a contract violation, and the task is handed over unpaired.
@@ -176,7 +178,7 @@ func (l *ClaimLoop) iterate(ctx context.Context) error {
 		if i < paired {
 			res = reserved[i]
 		}
-		if err := l.sched.OnClaimReserved(ctx, task, res); err != nil {
+		if err := l.sched.OnClaimReserved(ctx, task, res, scope); err != nil {
 			if errors.Is(err, scheduler.ErrUnnameableClaim) {
 				// The scheduler counted it and logged at a bounded rate; the
 				// server's lease expiry is the convergence. A per-attempt line

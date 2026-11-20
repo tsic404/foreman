@@ -23,6 +23,7 @@ type fakeClaimScheduler struct {
 	reserved     int
 	released     int
 	claimed      []json.RawMessage
+	scopes       []scheduler.ClaimScope
 	onClaimErr   error
 }
 
@@ -72,10 +73,11 @@ func (f *fakeClaimScheduler) releasedCount() int {
 	return f.released
 }
 
-func (f *fakeClaimScheduler) OnClaimReserved(_ context.Context, task json.RawMessage, _ scheduler.SlotReservation) error {
+func (f *fakeClaimScheduler) OnClaimReserved(_ context.Context, task json.RawMessage, _ scheduler.SlotReservation, scope scheduler.ClaimScope) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.claimed = append(f.claimed, task)
+	f.scopes = append(f.scopes, scope)
 	return f.onClaimErr
 }
 
@@ -533,5 +535,93 @@ func TestClaimLoopReservesBeforeClaim(t *testing.T) {
 	}
 	if sched.releasedCount() != 0 {
 		t.Fatalf("released = %d, want 0 (the one reservation was filled)", sched.releasedCount())
+	}
+}
+
+// TestClaimTasksFreezesTheRequestScopeAcrossARegistrationGeneration pins the
+// C3 boundary: the tasks a response carries were confirmed against the runtime
+// set the request sent. A successful C1 afterwards replaces the live
+// declaration but cannot rewrite that evidence (02-contracts V2-C02 已确认归
+// 原 runtime、沿原确认链收敛).
+func TestClaimTasksFreezesTheRequestScopeAcrossARegistrationGeneration(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stubRegister(stub, "rid-1")
+	stub.on("POST", "/api/daemon/tasks/claim", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 200, map[string]any{"tasks": []json.RawMessage{json.RawMessage(`{"id":"t1"}`)}})
+	})
+	stub.on("GET", "/api/daemon/workspaces/ws-1/runtime-profiles", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 404, map[string]string{"error": "not found"})
+	})
+	client := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, client)
+
+	claim, err := client.ClaimTasks(t.Context(), 1)
+	if err != nil {
+		t.Fatalf("ClaimTasks: %v", err)
+	}
+	if len(claim.Tasks) != 1 {
+		t.Fatalf("tasks = %d, want 1", len(claim.Tasks))
+	}
+	if got := claim.Scope.RuntimeIDs; len(got) != 1 || got[0] != "rid-1" {
+		t.Fatalf("request scope = %v, want the declared rid-1", got)
+	}
+	if got, ok := claim.Scope.Identity("rid-1"); !ok || got != "omp\x00" {
+		t.Fatalf("identity(rid-1) = %q/%v, want the request's declaration", got, ok)
+	}
+
+	// A later refresh moves the live declaration to a new generation; the
+	// response already returned to the caller keeps its own generation.
+	stubRegister(stub, "rid-2")
+	if _, err := client.rebuildRuntime(t.Context(), "rid-1"); err != nil {
+		t.Fatalf("rebuildRuntime: %v", err)
+	}
+	if got := client.RuntimeIDs(); len(got) != 1 || got[0] != "rid-2" {
+		t.Fatalf("live declaration = %v, want the refreshed rid-2", got)
+	}
+	if got := claim.Scope.RuntimeIDs; len(got) != 1 || got[0] != "rid-1" {
+		t.Fatalf("request scope after the refresh = %v, want the frozen rid-1", got)
+	}
+	if _, ok := claim.Scope.Identity("rid-2"); ok {
+		t.Fatal("the refreshed generation leaked into the earlier request's scope")
+	}
+}
+
+// TestClaimLoopHandsOverTheRequestScopeNotTheRefreshedOne: the loop's hand-over
+// must carry the C3 request's own scope even when a refresh replaces the live
+// declaration before the response is consumed. The entry is then admitted from
+// the confirmed generation, not from the runtime the refresh installed.
+func TestClaimLoopHandsOverTheRequestScopeNotTheRefreshedOne(t *testing.T) {
+	srv, stub := newStubUpstream(t)
+	stubRegister(stub, "rid-1")
+	stub.on("GET", "/api/daemon/workspaces/ws-1/runtime-profiles", func(w http.ResponseWriter, _ *http.Request, _ []byte) {
+		writeJSONStub(w, 404, map[string]string{"error": "not found"})
+	})
+	client := NewClient(testConfig(srv.URL), "mdt_test")
+	registerDeclared(t, client)
+
+	stub.on("POST", "/api/daemon/tasks/claim", func(w http.ResponseWriter, r *http.Request, _ []byte) {
+		// The request was built with rid-1. The refresh completes before the
+		// caller reads the answer, so the live declaration is rid-2 by then.
+		stubRegister(stub, "rid-2")
+		if _, err := client.rebuildRuntime(r.Context(), "rid-1"); err != nil {
+			t.Errorf("rebuildRuntime inside the claim window: %v", err)
+		}
+		writeJSONStub(w, 200, map[string]any{"tasks": []json.RawMessage{json.RawMessage(`{"id":"t1"}`)}})
+	})
+	sched := &fakeClaimScheduler{budget: 1}
+	cfg := testConfig(srv.URL)
+	loop := NewClaimLoop(cfg, client, sched)
+
+	if err := loop.iterate(t.Context()); err != nil {
+		t.Fatalf("iterate: %v", err)
+	}
+	if got := client.RuntimeIDs(); len(got) != 1 || got[0] != "rid-2" {
+		t.Fatalf("live declaration = %v, want the refreshed rid-2", got)
+	}
+	if sched.claimedCount() != 1 {
+		t.Fatalf("claimed = %d, want 1", sched.claimedCount())
+	}
+	if got := sched.scopes[0].RuntimeIDs; len(got) != 1 || got[0] != "rid-1" {
+		t.Fatalf("handed-over scope = %v, want the C3 request's rid-1", got)
 	}
 }
