@@ -3,6 +3,7 @@ package scheduler
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -61,14 +62,43 @@ type ReportSender interface {
 	DeliverQueued(ctx context.Context, ep Endpoint, taskID, workspaceID string, body []byte, failureReason string) (int, []byte, error)
 }
 
+// SourceReportSender is the source-aware replay face. A queue rebuilt after a
+// restart still knows the report's source, so the replay must not fall back to
+// the legacy single-client route.
+type SourceReportSender interface {
+	DeliverQueuedInSource(ctx context.Context, ep Endpoint, taskID, sourceID, workspaceID string, body []byte, failureReason string) (int, []byte, error)
+}
+
+// deliverQueued routes one replay through the source-aware sender when the
+// report carries a source and the sender implements it.
+func deliverQueued(ctx context.Context, sender ReportSender, rep pendingReport) (int, []byte, error) {
+	if rep.SourceID != "" {
+		sourceSender, ok := sender.(SourceReportSender)
+		if !ok {
+			return 0, nil, fmt.Errorf("sender cannot route source %q", rep.SourceID)
+		}
+		return sourceSender.DeliverQueuedInSource(ctx, Endpoint(rep.Endpoint), rep.TaskID, rep.SourceID, rep.WorkspaceID, rep.Body, rep.FailureReason)
+	}
+	return sender.DeliverQueued(ctx, Endpoint(rep.Endpoint), rep.TaskID, rep.WorkspaceID, rep.Body, rep.FailureReason)
+}
+
 // pendingReport is one queued terminal report (contract §10). Its disk file is
 // one face of the queue, not the queue itself: until a face holds the entry it
 // lives staged in memory, and an id the disk cannot name stays queued on that
 // copy alone.
 type pendingReport struct {
+	// Key names the queue slot. The upstream task id alone is not unique
+	// across registered servers, so a source-scoped entry carries a
+	// source-qualified key while TaskID stays the id to replay. An empty Key
+	// is the historical bare task-id slot.
+	Key      string `json:"key,omitempty"`
 	TaskID   string `json:"task_id"`
 	JobName  string `json:"job_name"`
 	DaemonID string `json:"daemon_id"`
+	// SourceID is the Multica server the report came from. A queued report
+	// can outlive its entry, so this is the routing key that keeps a replay
+	// on the same source when two servers expose the same workspace id.
+	SourceID string `json:"source_id,omitempty"`
 	// WorkspaceID is the credential the replay must use when the entry is
 	// gone: a queued report can outlive its credential, and a multi-workspace
 	// deployment has no single client to fall back to (§10, ADR-047).
@@ -93,11 +123,69 @@ type pendingReport struct {
 	Synthetic bool `json:"synthetic,omitempty"`
 }
 
+// queueKey is the slot this report occupies across the disk, staging and
+// carrier faces.
+func (r pendingReport) queueKey() string {
+	if r.Key != "" {
+		return r.Key
+	}
+	return r.TaskID
+}
+
+// pendingReportKey resolves the optional key argument. The bare task id is the
+// legacy single-source slot.
+func pendingReportKey(taskID string, key []string) string {
+	if len(key) > 0 && key[0] != "" {
+		return key[0]
+	}
+	return taskID
+}
+
 var taskIDFileChars = regexp.MustCompile(`^[a-zA-Z0-9-]+$`)
 
 // validTaskID gates every task id that may name a queue file, so a task id
 // like ".." or "a/b" can never turn into a path outside the queue directory.
 func validTaskID(taskID string) bool { return taskIDFileChars.MatchString(taskID) }
+
+// queueKeyStorable reports whether key has a node-local file face. A bare
+// task id keeps the historical <id>.json name; a source-scoped key carries a
+// NUL separator that no file name may hold, so it is encoded under a '~'
+// prefix that can never be a bare task id.
+func queueKeyStorable(key string) bool {
+	_, ok := queueFileName(key)
+	return ok
+}
+
+func queueFileName(key string) (string, bool) {
+	switch {
+	case key == "":
+		return "", false
+	case validTaskID(key):
+		return key, true
+	case strings.Contains(key, "\x00"):
+		return "~" + hex.EncodeToString([]byte(key)), true
+	default:
+		return "", false
+	}
+}
+
+func queueKeyFromFileName(name string) (string, bool) {
+	if strings.HasPrefix(name, "~") {
+		raw, err := hex.DecodeString(name[1:])
+		if err != nil || len(raw) == 0 {
+			return "", false
+		}
+		key := string(raw)
+		if !strings.Contains(key, "\x00") {
+			return "", false
+		}
+		return key, true
+	}
+	if validTaskID(name) {
+		return name, true
+	}
+	return "", false
+}
 
 // PendingReports is the durable terminal-report queue
 // (FOREMAN_STATE_ROOT/pending-reports/<taskid>.json, contract §10). Its host
@@ -240,8 +328,13 @@ func NewPendingReports(dir string, opts ...PendingReportsOption) (*PendingReport
 // ones included — are never removed to make room. Capacity the process cannot
 // see — an unlistable queue directory, a carrier backlog the rebuild has not
 // landed — reads as reached, never as room (unknown is not empty, §4.3).
-func (p *PendingReports) Enqueue(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string) error {
-	return p.enqueue(ctx, taskID, jobName, daemonID, workspaceID, ep, body, failureReason, false)
+func (p *PendingReports) Enqueue(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string, key ...string) error {
+	return p.enqueue(ctx, pendingReportKey(taskID, key), taskID, jobName, daemonID, "", workspaceID, ep, body, failureReason, false)
+}
+
+// EnqueueInSource is the source-aware terminal-report enqueue.
+func (p *PendingReports) EnqueueInSource(ctx context.Context, taskID, jobName, daemonID, sourceID, workspaceID string, ep Endpoint, body []byte, failureReason string, key ...string) error {
+	return p.enqueue(ctx, pendingReportKey(taskID, key), taskID, jobName, daemonID, sourceID, workspaceID, ep, body, failureReason, false)
 }
 
 // EnqueueSynthetic lands a confirmation Foreman synthesized on the daemon's
@@ -249,11 +342,16 @@ func (p *PendingReports) Enqueue(ctx context.Context, taskID, jobName, daemonID,
 // daemon sent — the server's pending confirmation survives a process exit only
 // because this entry does — with one difference that rides the entry: it never
 // holds the Job deletion back (see pendingReport.Synthetic).
-func (p *PendingReports) EnqueueSynthetic(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte) error {
-	return p.enqueue(ctx, taskID, jobName, daemonID, workspaceID, ep, body, "", true)
+func (p *PendingReports) EnqueueSynthetic(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, key ...string) error {
+	return p.enqueue(ctx, pendingReportKey(taskID, key), taskID, jobName, daemonID, "", workspaceID, ep, body, "", true)
 }
 
-func (p *PendingReports) enqueue(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string, synthetic bool) error {
+// EnqueueSyntheticInSource is the source-aware synthetic confirmation enqueue.
+func (p *PendingReports) EnqueueSyntheticInSource(ctx context.Context, taskID, jobName, daemonID, sourceID, workspaceID string, ep Endpoint, body []byte, key ...string) error {
+	return p.enqueue(ctx, pendingReportKey(taskID, key), taskID, jobName, daemonID, sourceID, workspaceID, ep, body, "", true)
+}
+
+func (p *PendingReports) enqueue(ctx context.Context, key, taskID, jobName, daemonID, sourceID, workspaceID string, ep Endpoint, body []byte, failureReason string, synthetic bool) error {
 	p.mu.Lock()
 	// A report the queue already holds — staged, carrier-backed, or on disk —
 	// is a replacement (§4.6): it never grows the queue, so it is admitted
@@ -261,13 +359,13 @@ func (p *PendingReports) enqueue(ctx context.Context, taskID, jobName, daemonID,
 	// that can be read; when it cannot, the task's own file is still
 	// probeable by name, so an already-queued report stays a replacement
 	// instead of drawing a depth-unknown drop.
-	_, staged := p.staged[taskID]
-	if held := p.carrierBacked[taskID] || staged; !held {
+	_, staged := p.staged[key]
+	if held := p.carrierBacked[key] || staged; !held {
 		diskIDs, diskErr := p.diskIDsLocked()
 		if diskErr == nil {
-			_, held = diskIDs[taskID]
-		} else if validTaskID(taskID) {
-			if _, statErr := os.Stat(p.path(taskID)); statErr == nil {
+			_, held = diskIDs[key]
+		} else if queueKeyStorable(key) {
+			if _, statErr := os.Stat(p.path(key)); statErr == nil {
 				held = true
 			}
 		}
@@ -287,9 +385,11 @@ func (p *PendingReports) enqueue(ctx context.Context, taskID, jobName, daemonID,
 		}
 	}
 	rep := pendingReport{
+		Key:         key,
 		TaskID:      taskID,
 		JobName:     jobName,
 		DaemonID:    daemonID,
+		SourceID:    sourceID,
 		WorkspaceID: workspaceID,
 		Endpoint:    string(ep),
 		// The caller's buffer is not retained: a queued report outlives the
@@ -302,20 +402,20 @@ func (p *PendingReports) enqueue(ctx context.Context, taskID, jobName, daemonID,
 	}
 	p.inheritClockLocked(&rep)
 	var diskErr error
-	if !validTaskID(taskID) {
+	if !queueKeyStorable(key) {
 		// The id can never name a queue file: keep the report staged so the
 		// drain delivers it straight from memory instead of losing it. Its
 		// carrier is the only durability face left; without one, the file
 		// name is the loss face and the caller sees it.
-		p.staged[taskID] = rep
+		p.staged[key] = rep
 		if p.carriers == nil {
 			diskErr = fmt.Errorf("task id %q is not a safe file name", taskID)
 		}
 	} else if err := p.writeLocked(rep); err != nil {
 		diskErr = err
-		p.staged[taskID] = rep
+		p.staged[key] = rep
 	} else {
-		delete(p.staged, taskID)
+		delete(p.staged, key)
 		// Every terminal report lands here before its forward (write-ahead),
 		// so this is the queue's trace line, not an error signal: the failed
 		// forward is what the error face reports (§9.1).
@@ -358,9 +458,11 @@ func (p *PendingReports) persistCarrier(ctx context.Context, rep pendingReport) 
 		return err
 	}
 	carrier := Carrier{
+		Key:           rep.queueKey(),
 		TaskID:        rep.TaskID,
 		JobName:       rep.JobName,
 		DaemonID:      rep.DaemonID,
+		SourceID:      rep.SourceID,
 		WorkspaceID:   rep.WorkspaceID,
 		Endpoint:      rep.Endpoint,
 		Body:          rep.Body,
@@ -385,7 +487,7 @@ func (p *PendingReports) persistCarrier(ctx context.Context, rep pendingReport) 
 	// delete for this task take the task's carrier lock: a delete for a task
 	// that reads as settled must not remove the object this report's session
 	// just adopted (AlreadyExists is a landed write here).
-	unlock := p.carrierLocks.Lock(rep.TaskID)
+	unlock := p.carrierLocks.Lock(rep.queueKey())
 	defer unlock()
 	if err := p.carriers.PutCarrier(ctx, carrier); err != nil {
 		if errors.Is(err, ErrCarrierPayloadTooLarge) {
@@ -407,14 +509,14 @@ func (p *PendingReports) persistCarrier(ctx context.Context, rep pendingReport) 
 	}
 
 	p.mu.Lock()
-	if !p.entryPresentLocked(rep.TaskID) {
+	if !p.entryPresentLocked(rep.queueKey()) {
 		// The direct forward settled the report while the carrier write was
 		// in flight: the carrier must not outlive the queue entry.
 		p.mu.Unlock()
-		p.deleteCarrierLocked(ctx, rep.TaskID)
+		p.deleteCarrierLocked(ctx, rep.queueKey())
 		return nil
 	}
-	p.carrierBacked[rep.TaskID] = true
+	p.carrierBacked[rep.queueKey()] = true
 	p.notifyLocked()
 	p.mu.Unlock()
 	return nil
@@ -424,14 +526,15 @@ func (p *PendingReports) persistCarrier(ctx context.Context, rep pendingReport) 
 // the queue already knows (staged in memory or on disk), so the TTL bounds
 // the first failure rather than every re-enqueue.
 func (p *PendingReports) inheritClockLocked(rep *pendingReport) {
-	if prev, ok := p.staged[rep.TaskID]; ok && !prev.EnqueuedAt.IsZero() {
+	key := rep.queueKey()
+	if prev, ok := p.staged[key]; ok && !prev.EnqueuedAt.IsZero() {
 		rep.EnqueuedAt, rep.Attempts = prev.EnqueuedAt, prev.Attempts
 		return
 	}
-	if !validTaskID(rep.TaskID) {
+	if !queueKeyStorable(key) {
 		return
 	}
-	raw, err := os.ReadFile(p.path(rep.TaskID))
+	raw, err := os.ReadFile(p.path(key))
 	if err != nil {
 		return
 	}
@@ -467,8 +570,8 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 	for _, rep := range retryCarriers {
 		_ = p.persistCarrier(ctx, rep)
 	}
-	for _, taskID := range expired {
-		p.deleteCarrier(ctx, taskID)
+	for _, key := range expired {
+		p.deleteCarrier(ctx, key)
 	}
 
 	p.mu.Lock()
@@ -486,11 +589,11 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 			deleteCarrier := p.dropSettledLocked(rep)
 			p.mu.Unlock()
 			if deleteCarrier {
-				p.deleteCarrier(ctx, rep.TaskID)
+				p.deleteCarrier(ctx, rep.queueKey())
 			}
 			continue
 		}
-		code, _, err := sender.DeliverQueued(ctx, Endpoint(rep.Endpoint), rep.TaskID, rep.WorkspaceID, rep.Body, rep.FailureReason)
+		code, _, err := deliverQueued(ctx, sender, rep)
 		delivered := err == nil && terminalReportDelivered(code)
 		p.mu.Lock()
 		var deleteCarrier bool
@@ -505,11 +608,11 @@ func (p *PendingReports) Drain(ctx context.Context, sender ReportSender) (int, e
 			// only when no queue entry remains.
 			deleteCarrier = p.dropSettledLocked(rep)
 		} else {
-			p.bumpAttemptsLocked(rep.TaskID)
+			p.bumpAttemptsLocked(rep.queueKey())
 		}
 		p.mu.Unlock()
 		if deleteCarrier {
-			p.deleteCarrier(ctx, rep.TaskID)
+			p.deleteCarrier(ctx, rep.queueKey())
 		}
 		if err != nil && firstErr == nil {
 			firstErr = err
@@ -534,14 +637,14 @@ func (p *PendingReports) drainQueueLocked() []pendingReport {
 	seen := make(map[string]struct{})
 	queue := make([]pendingReport, 0)
 	for _, rep := range p.listLocked() {
-		seen[rep.TaskID] = struct{}{}
+		seen[rep.queueKey()] = struct{}{}
 		queue = append(queue, rep)
 	}
-	for taskID, rep := range p.staged {
-		if _, ok := seen[taskID]; ok {
+	for key, rep := range p.staged {
+		if _, ok := seen[key]; ok {
 			continue
 		}
-		if !validTaskID(taskID) || p.carrierBacked[taskID] {
+		if !queueKeyStorable(key) || p.carrierBacked[key] {
 			queue = append(queue, rep)
 		}
 	}
@@ -557,16 +660,16 @@ func (p *PendingReports) unbackedLocked() []pendingReport {
 	seen := make(map[string]struct{})
 	var out []pendingReport
 	for _, rep := range p.listLocked() {
-		seen[rep.TaskID] = struct{}{}
-		if !p.carrierBacked[rep.TaskID] {
+		seen[rep.queueKey()] = struct{}{}
+		if !p.carrierBacked[rep.queueKey()] {
 			out = append(out, rep)
 		}
 	}
-	for taskID, rep := range p.staged {
-		if _, ok := seen[taskID]; ok {
+	for key, rep := range p.staged {
+		if _, ok := seen[key]; ok {
 			continue
 		}
-		if !p.carrierBacked[taskID] {
+		if !p.carrierBacked[key] {
 			// A staged report whose id cannot name a queue file still has
 			// the carrier face — that is the only durability it can get.
 			out = append(out, rep)
@@ -585,31 +688,31 @@ func (p *PendingReports) unbackedLocked() []pendingReport {
 // caller holds no lock then, because the delete is a network call.
 func (p *PendingReports) flushStagedLocked() []string {
 	var expired []string
-	for taskID, rep := range p.staged {
+	for key, rep := range p.staged {
 		if p.now().Sub(rep.EnqueuedAt) > PendingReportTTL {
 			p.log.Error("task.forward_dropped",
-				"task_id", taskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
+				"task_id", rep.TaskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
 				"endpoint", rep.Endpoint,
 				"attempts", rep.Attempts, "reason", "pending report TTL exceeded")
-			if p.carrierBacked[taskID] {
-				expired = append(expired, taskID)
+			if p.carrierBacked[key] {
+				expired = append(expired, key)
 			}
-			delete(p.staged, taskID)
-			delete(p.carrierBacked, taskID)
+			delete(p.staged, key)
+			delete(p.carrierBacked, key)
 			continue
 		}
-		if !validTaskID(taskID) {
+		if !queueKeyStorable(key) {
 			continue
 		}
 		if err := p.writeLocked(rep); err != nil {
 			p.log.Error("pending report write failed",
-				"task_id", taskID, "endpoint", rep.Endpoint, "err", err)
+				"task_id", rep.TaskID, "endpoint", rep.Endpoint, "err", err)
 			continue
 		}
 		p.log.Info("task.forward_queued",
-			"task_id", taskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
+			"task_id", rep.TaskID, "job_name", rep.JobName, "daemon_id", rep.DaemonID,
 			"endpoint", rep.Endpoint, "retried_write", true)
-		delete(p.staged, taskID)
+		delete(p.staged, key)
 	}
 	return expired
 }
@@ -617,21 +720,21 @@ func (p *PendingReports) flushStagedLocked() []string {
 // bumpAttemptsLocked records one more delivery attempt: a durable report is
 // rewritten so its count survives a restart, a staged one is bumped in
 // memory.
-func (p *PendingReports) bumpAttemptsLocked(taskID string) {
-	if validTaskID(taskID) {
-		if cur, ok := p.readLocked(taskID); ok {
+func (p *PendingReports) bumpAttemptsLocked(key string) {
+	if queueKeyStorable(key) {
+		if cur, ok := p.readLocked(key); ok {
 			// Merge with a concurrent re-enqueue: bump the attempt counter
 			// on the file as it stands now, never clobbering a newer body.
 			cur.Attempts++
 			if err := p.writeLocked(cur); err != nil {
-				p.log.Error("pending report update failed", "task_id", taskID, "err", err)
+				p.log.Error("pending report update failed", "task_id", cur.TaskID, "err", err)
 			}
 			return
 		}
 	}
-	if rep, ok := p.staged[taskID]; ok {
+	if rep, ok := p.staged[key]; ok {
 		rep.Attempts++
-		p.staged[taskID] = rep
+		p.staged[key] = rep
 	}
 }
 
@@ -640,14 +743,15 @@ func (p *PendingReports) bumpAttemptsLocked(taskID string) {
 // have replaced the body while the forward was in flight; the newer record then
 // stays queued for the next drain instead of being deleted by task id.
 func (p *PendingReports) dropIfUnchangedLocked(sent pendingReport) {
-	if validTaskID(sent.TaskID) {
-		if cur, ok := p.readLocked(sent.TaskID); ok && !samePendingReport(cur, sent) {
+	key := sent.queueKey()
+	if queueKeyStorable(key) {
+		if cur, ok := p.readLocked(key); ok && !samePendingReport(cur, sent) {
 			return
 		}
-		p.removeLocked(sent.TaskID)
+		p.removeLocked(key)
 	}
-	if cur, ok := p.staged[sent.TaskID]; ok && samePendingReport(cur, sent) {
-		delete(p.staged, sent.TaskID)
+	if cur, ok := p.staged[key]; ok && samePendingReport(cur, sent) {
+		delete(p.staged, key)
 	}
 }
 
@@ -687,28 +791,29 @@ func sameReportBody(a, b []byte) bool {
 // and settles later.
 func (p *PendingReports) dropSettledLocked(sent pendingReport) (deleteCarrier bool) {
 	p.dropIfUnchangedLocked(sent)
-	if p.entryPresentLocked(sent.TaskID) {
+	key := sent.queueKey()
+	if p.entryPresentLocked(key) {
 		return false
 	}
-	wasBacked := p.carrierBacked[sent.TaskID]
-	delete(p.carrierBacked, sent.TaskID)
+	wasBacked := p.carrierBacked[key]
+	delete(p.carrierBacked, key)
 	return wasBacked
 }
 
 // entryPresentLocked reports whether a queue entry (disk or staged) still
-// holds taskID. The carrier alone is not an entry — it is one entry's
+// holds key. The carrier alone is not an entry — it is one entry's
 // durability face.
-func (p *PendingReports) entryPresentLocked(taskID string) bool {
-	if validTaskID(taskID) {
-		if _, ok := p.readLocked(taskID); ok {
+func (p *PendingReports) entryPresentLocked(key string) bool {
+	if queueKeyStorable(key) {
+		if _, ok := p.readLocked(key); ok {
 			return true
 		}
 	}
-	_, ok := p.staged[taskID]
+	_, ok := p.staged[key]
 	return ok
 }
 
-// diskIDsLocked is the queue's disk face as task ids, read from the directory's
+// diskIDsLocked is the queue's disk face as queue keys, read from the directory's
 // file names only: the capacity bound is an entry count, and a report body can
 // be MiB-sized, so the admission gate never opens or decodes one. A directory
 // that cannot be listed is an error — unknown, never an empty queue (§4.3).
@@ -722,11 +827,15 @@ func (p *PendingReports) diskIDsLocked() (map[string]struct{}, error) {
 		if ent.IsDir() {
 			continue
 		}
-		taskID, ok := strings.CutSuffix(ent.Name(), ".json")
-		if !ok || !validTaskID(taskID) {
+		name, ok := strings.CutSuffix(ent.Name(), ".json")
+		if !ok {
 			continue
 		}
-		ids[taskID] = struct{}{}
+		key, ok := queueKeyFromFileName(name)
+		if !ok {
+			continue
+		}
+		ids[key] = struct{}{}
 	}
 	return ids, nil
 }
@@ -779,12 +888,12 @@ func (p *PendingReports) refusalLocked(diskIDs map[string]struct{}, diskErr erro
 // dropLocked removes a report from the queue, wherever it sits: the durable
 // file, the staging area, or both. The carrier is the caller's (it needs the
 // network), see Drop.
-func (p *PendingReports) dropLocked(taskID string) {
-	if validTaskID(taskID) {
-		p.removeLocked(taskID)
+func (p *PendingReports) dropLocked(key string) {
+	if queueKeyStorable(key) {
+		p.removeLocked(key)
 	}
-	delete(p.staged, taskID)
-	delete(p.carrierBacked, taskID)
+	delete(p.staged, key)
+	delete(p.carrierBacked, key)
 }
 
 // queuedKnownLocked answers Queued from the entries the process actually
@@ -792,17 +901,17 @@ func (p *PendingReports) dropLocked(taskID string) {
 // staged report is an entry the process holds whichever durability face it can
 // still reach — an id the disk cannot name does not make its report delivered
 // (Drain delivers it straight from staging).
-func (p *PendingReports) queuedKnownLocked(taskID string) bool {
-	if p.carrierBacked[taskID] {
+func (p *PendingReports) queuedKnownLocked(key string) bool {
+	if p.carrierBacked[key] {
 		return true
 	}
-	if _, ok := p.staged[taskID]; ok {
+	if _, ok := p.staged[key]; ok {
 		return true
 	}
-	if !validTaskID(taskID) {
+	if !queueKeyStorable(key) {
 		return false
 	}
-	_, ok := p.readLocked(taskID)
+	_, ok := p.readLocked(key)
 	return ok
 }
 
@@ -823,19 +932,19 @@ func (p *PendingReports) queuedKnownLocked(taskID string) bool {
 // asks — go through heldByQueueLocked: reading a synthesized confirmation as
 // "no entry" would sweep its carrier and lose the confirmation on the next
 // reschedule.
-func (p *PendingReports) queuedLocked(taskID string) bool {
+func (p *PendingReports) queuedLocked(key string) bool {
 	if !p.restored {
 		return true
 	}
-	if rep, ok := p.staged[taskID]; ok {
+	if rep, ok := p.staged[key]; ok {
 		return !rep.Synthetic
 	}
-	if validTaskID(taskID) {
-		if rep, ok := p.readLocked(taskID); ok {
+	if queueKeyStorable(key) {
+		if rep, ok := p.readLocked(key); ok {
 			return !rep.Synthetic
 		}
 	}
-	return p.carrierBacked[taskID]
+	return p.carrierBacked[key]
 }
 
 // heldByQueueLocked answers the membership question: does any queue face still
@@ -843,11 +952,11 @@ func (p *PendingReports) queuedLocked(taskID string) bool {
 // member like any other entry — only queuedLocked, the Job gate, treats it
 // differently. An uncompleted carrier list reads every task as held (§4.3), so
 // a sweep before the rebuild deletes nothing.
-func (p *PendingReports) heldByQueueLocked(taskID string) bool {
+func (p *PendingReports) heldByQueueLocked(key string) bool {
 	if !p.restored {
 		return true
 	}
-	return p.queuedKnownLocked(taskID)
+	return p.queuedKnownLocked(key)
 }
 
 // lenLocked is the queue depth across its faces: the disk entries, the
@@ -859,14 +968,14 @@ func (p *PendingReports) heldByQueueLocked(taskID string) bool {
 func (p *PendingReports) lenLocked() int {
 	seen := make(map[string]struct{})
 	for _, rep := range p.listLocked() {
-		seen[rep.TaskID] = struct{}{}
+		seen[rep.queueKey()] = struct{}{}
 	}
-	for taskID := range p.carrierBacked {
-		seen[taskID] = struct{}{}
+	for key := range p.carrierBacked {
+		seen[key] = struct{}{}
 	}
-	for taskID := range p.staged {
-		if !validTaskID(taskID) {
-			seen[taskID] = struct{}{}
+	for key := range p.staged {
+		if !queueKeyStorable(key) {
+			seen[key] = struct{}{}
 		}
 	}
 	return len(seen)
@@ -878,13 +987,13 @@ func (p *PendingReports) lenLocked() int {
 func (p *PendingReports) undeliveredLocked() int {
 	seen := make(map[string]struct{})
 	for _, rep := range p.listLocked() {
-		seen[rep.TaskID] = struct{}{}
+		seen[rep.queueKey()] = struct{}{}
 	}
-	for taskID := range p.carrierBacked {
-		seen[taskID] = struct{}{}
+	for key := range p.carrierBacked {
+		seen[key] = struct{}{}
 	}
-	for taskID := range p.staged {
-		seen[taskID] = struct{}{}
+	for key := range p.staged {
+		seen[key] = struct{}{}
 	}
 	return len(seen)
 }
@@ -915,10 +1024,10 @@ func (p *PendingReports) Len() int {
 // A task id that cannot name a queue file is answered from the in-memory
 // entries only: the node-local copy can never hold it, so its staged report
 // and its carrier are the two faces that make it queued.
-func (p *PendingReports) Queued(taskID string) bool {
+func (p *PendingReports) Queued(taskID string, key ...string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.queuedLocked(taskID)
+	return p.queuedLocked(pendingReportKey(taskID, key))
 }
 
 // Rebuilt reports whether the carrier list completed, so the queue's state is
@@ -935,10 +1044,10 @@ func (p *PendingReports) Rebuilt() bool {
 // exists for taskID. Unlike Queued it does not treat an uncompleted carrier
 // list as "queued": it answers a write decision (does this report still need
 // a write-ahead entry?), where an unknown list must not suppress the write.
-func (p *PendingReports) HasQueuedEntry(taskID string) bool {
+func (p *PendingReports) HasQueuedEntry(taskID string, key ...string) bool {
 	p.mu.Lock()
 	defer p.mu.Unlock()
-	return p.queuedKnownLocked(taskID)
+	return p.queuedKnownLocked(pendingReportKey(taskID, key))
 }
 
 // Drop forgets the report queued for taskID: the direct forward it was
@@ -946,16 +1055,17 @@ func (p *PendingReports) HasQueuedEntry(taskID string) bool {
 // replay is owed. A no-op when nothing is queued. The gauge follows the queue
 // depth — every entry the queue holds, whichever face holds it; a carrier is
 // deleted with the entry (ADR-046 decision 3).
-func (p *PendingReports) Drop(ctx context.Context, taskID string) {
+func (p *PendingReports) Drop(ctx context.Context, taskID string, key ...string) {
+	slot := pendingReportKey(taskID, key)
 	p.mu.Lock()
-	wasBacked := p.carrierBacked[taskID]
-	p.dropLocked(taskID)
+	wasBacked := p.carrierBacked[slot]
+	p.dropLocked(slot)
 	p.notifyLocked()
 	p.mu.Unlock()
 	if wasBacked {
 		// The sweep is the retry handle: a settled carrier whose delete
 		// failed is removed on the next round (§6.5).
-		p.deleteCarrier(ctx, taskID)
+		p.deleteCarrier(ctx, slot)
 	}
 }
 
@@ -965,29 +1075,30 @@ func (p *PendingReports) Drop(ctx context.Context, taskID string) {
 // compensation, a late report — has replaced the endpoint and body, and that
 // newer entry keeps its queue home and its carrier (§10): dropping it by task
 // id would leave its own forward without a write-ahead entry.
-func (p *PendingReports) DropIfUnchanged(ctx context.Context, taskID string, ep Endpoint, body []byte) {
-	sent := pendingReport{TaskID: taskID, Endpoint: string(ep), Body: body}
+func (p *PendingReports) DropIfUnchanged(ctx context.Context, taskID string, ep Endpoint, body []byte, key ...string) {
+	slot := pendingReportKey(taskID, key)
+	sent := pendingReport{Key: slot, TaskID: taskID, Endpoint: string(ep), Body: body}
 	p.mu.Lock()
 	// The faces are compared one by one: a newer body on the disk never hides
 	// this snapshot in staging, and the staged copy is only the latest write
 	// that did not land.
-	if validTaskID(taskID) {
-		if cur, ok := p.readLocked(taskID); ok && samePendingReport(sent, cur) {
-			p.removeLocked(taskID)
+	if queueKeyStorable(slot) {
+		if cur, ok := p.readLocked(slot); ok && samePendingReport(sent, cur) {
+			p.removeLocked(slot)
 		}
 	}
-	if cur, ok := p.staged[taskID]; ok && samePendingReport(sent, cur) {
-		delete(p.staged, taskID)
+	if cur, ok := p.staged[slot]; ok && samePendingReport(sent, cur) {
+		delete(p.staged, slot)
 	}
 	wasBacked := false
-	if !p.entryPresentLocked(taskID) {
-		wasBacked = p.carrierBacked[taskID]
-		delete(p.carrierBacked, taskID)
+	if !p.entryPresentLocked(slot) {
+		wasBacked = p.carrierBacked[slot]
+		delete(p.carrierBacked, slot)
 	}
 	p.notifyLocked()
 	p.mu.Unlock()
 	if wasBacked {
-		p.deleteCarrier(ctx, taskID)
+		p.deleteCarrier(ctx, slot)
 	}
 }
 
@@ -997,25 +1108,25 @@ func (p *PendingReports) DropIfUnchanged(ctx context.Context, taskID string, ep 
 // the delete is pending, and its carrier write answers AlreadyExists for this
 // very object. Removing it then would leave a live entry carrier-backed with
 // no carrier, which is the loss AC-16 forbids on process exit.
-func (p *PendingReports) deleteCarrier(ctx context.Context, taskID string) {
-	unlock := p.carrierLocks.Lock(taskID)
+func (p *PendingReports) deleteCarrier(ctx context.Context, key string) {
+	unlock := p.carrierLocks.Lock(key)
 	defer unlock()
-	p.deleteCarrierLocked(ctx, taskID)
+	p.deleteCarrierLocked(ctx, key)
 }
 
 // deleteCarrierLocked is deleteCarrier with the task's carrier lock held.
-func (p *PendingReports) deleteCarrierLocked(ctx context.Context, taskID string) {
+func (p *PendingReports) deleteCarrierLocked(ctx context.Context, key string) {
 	if p.carriers == nil {
 		return
 	}
 	p.mu.Lock()
-	present := p.entryPresentLocked(taskID)
+	present := p.entryPresentLocked(key)
 	p.mu.Unlock()
 	if present {
 		return
 	}
-	if err := p.carriers.DeleteCarrier(ctx, carrierSecretName(taskID)); err != nil {
-		p.log.Error("pending carrier delete failed", "task_id", taskID, "err", err)
+	if err := p.carriers.DeleteCarrier(ctx, carrierSecretName(key)); err != nil {
+		p.log.Error("pending carrier delete failed", "key", key, "err", err)
 	}
 }
 
@@ -1031,14 +1142,15 @@ func (p *PendingReports) deleteCarrierLocked(ctx context.Context, taskID string)
 // the rebuild deletes nothing. It reports whether the object went. The delete
 // targets the listed name, not a name derived from the task id: the name form
 // is not a selection surface (§6.5, ADR-046 decision 1).
-func (p *PendingReports) SweepCarrier(ctx context.Context, taskID, name string) (bool, error) {
+func (p *PendingReports) SweepCarrier(ctx context.Context, taskID, name string, key ...string) (bool, error) {
 	if p.carriers == nil {
 		return false, nil
 	}
-	unlock := p.carrierLocks.Lock(taskID)
+	slot := pendingReportKey(taskID, key)
+	unlock := p.carrierLocks.Lock(slot)
 	defer unlock()
 	p.mu.Lock()
-	held := p.heldByQueueLocked(taskID)
+	held := p.heldByQueueLocked(slot)
 	p.mu.Unlock()
 	if held {
 		return false, nil
@@ -1073,9 +1185,11 @@ func (p *PendingReports) Restore(ctx context.Context) error {
 	queued := 0
 	for _, c := range carriers {
 		rep := pendingReport{
+			Key:           c.Key,
 			TaskID:        c.TaskID,
 			JobName:       c.JobName,
 			DaemonID:      c.DaemonID,
+			SourceID:      c.SourceID,
 			WorkspaceID:   c.WorkspaceID,
 			Endpoint:      c.Endpoint,
 			Body:          c.Body,
@@ -1094,13 +1208,14 @@ func (p *PendingReports) Restore(ctx context.Context) error {
 			// TTL starts now rather than dropping it unread.
 			rep.EnqueuedAt = p.now()
 		}
-		already := p.queuedKnownLocked(rep.TaskID)
-		p.carrierBacked[rep.TaskID] = true
+		slot := rep.queueKey()
+		already := p.queuedKnownLocked(slot)
+		p.carrierBacked[slot] = true
 		if !already {
 			// The disk (a container restart keeps the emptyDir) is the
 			// in-process copy; it wins when both exist, because it was
 			// written first and a re-enqueue keeps the original clock.
-			p.staged[rep.TaskID] = rep
+			p.staged[slot] = rep
 			queued++
 		}
 	}
@@ -1110,8 +1225,15 @@ func (p *PendingReports) Restore(ctx context.Context) error {
 	return nil
 }
 
-func (p *PendingReports) path(taskID string) string {
-	return filepath.Join(p.dir, taskID+".json")
+func (p *PendingReports) path(key string) string {
+	name, ok := queueFileName(key)
+	if !ok {
+		// A key with no file face is never written; the caller gates on
+		// queueKeyStorable, and this fallback keeps the path inside the queue
+		// directory if one ever slips through.
+		name = strings.ReplaceAll(hex.EncodeToString([]byte(key)), "/", "_")
+	}
+	return filepath.Join(p.dir, name+".json")
 }
 
 // listLocked reads the queue oldest-first so long-stuck reports retry
@@ -1138,17 +1260,25 @@ func (p *PendingReports) listLocked() []pendingReport {
 	return out
 }
 
-// readLocked reads one queue file by task id.
-func (p *PendingReports) readLocked(taskID string) (pendingReport, bool) {
-	return p.readFileLocked(taskID + ".json")
+// readLocked reads one queue file by queue key.
+func (p *PendingReports) readLocked(key string) (pendingReport, bool) {
+	name, ok := queueFileName(key)
+	if !ok {
+		return pendingReport{}, false
+	}
+	return p.readFileLocked(name + ".json")
 }
 
 // readFileLocked parses one queue file; malformed files are quarantined. A
 // name that cannot be a queue file is ignored outright, so no caller can
 // make it read or rename anything outside the queue directory.
 func (p *PendingReports) readFileLocked(name string) (pendingReport, bool) {
-	taskID, ok := strings.CutSuffix(name, ".json")
-	if !ok || !validTaskID(taskID) {
+	fileKey, ok := strings.CutSuffix(name, ".json")
+	if !ok {
+		return pendingReport{}, false
+	}
+	key, ok := queueKeyFromFileName(fileKey)
+	if !ok {
 		return pendingReport{}, false
 	}
 	raw, err := os.ReadFile(filepath.Join(p.dir, name))
@@ -1169,6 +1299,9 @@ func (p *PendingReports) readFileLocked(name string) (pendingReport, bool) {
 		}
 		return pendingReport{}, false
 	}
+	if rep.Key == "" {
+		rep.Key = key
+	}
 	return rep, true
 }
 
@@ -1177,19 +1310,19 @@ func (p *PendingReports) writeLocked(rep pendingReport) error {
 	if err != nil {
 		return fmt.Errorf("encode pending report: %w", err)
 	}
-	tmp := p.path(rep.TaskID) + ".tmp"
+	tmp := p.path(rep.queueKey()) + ".tmp"
 	if err := os.WriteFile(tmp, raw, 0o600); err != nil {
 		return fmt.Errorf("write pending report: %w", err)
 	}
-	if err := os.Rename(tmp, p.path(rep.TaskID)); err != nil {
+	if err := os.Rename(tmp, p.path(rep.queueKey())); err != nil {
 		return fmt.Errorf("commit pending report: %w", err)
 	}
 	return nil
 }
 
-func (p *PendingReports) removeLocked(taskID string) {
-	if err := os.Remove(p.path(taskID)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		p.log.Error("remove pending report failed", "task_id", taskID, "err", err)
+func (p *PendingReports) removeLocked(key string) {
+	if err := os.Remove(p.path(key)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		p.log.Error("remove pending report failed", "key", key, "err", err)
 	}
 }
 

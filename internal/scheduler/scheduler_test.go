@@ -354,11 +354,11 @@ func (f *fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secre
 	}
 	job := f.job
 	if job == nil {
-		job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "fm-" + e.TaskID}}
+		job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobbuilder.DaemonIDForInScope(e.TaskID, e.SourceID, e.WorkspaceID)}}
 	}
 	secret := f.secret
 	if secret == nil {
-		secret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fm-" + e.TaskID + "-cred"}}
+		secret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: jobbuilder.DaemonIDForInScope(e.TaskID, e.SourceID, e.WorkspaceID) + "-cred"}}
 	}
 	hash := f.tokenHash
 	if hash == "" {
@@ -368,13 +368,14 @@ func (f *fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secre
 }
 
 // ResolveName mirrors the production shape for the fallback template the fake
-// stands in for: no format expressed, so the identity name. resolveNameErr
-// injects the name-composition failure the claim path must survive.
+// stands in for: no format expressed, so the identity name — including the
+// source discriminator a source-scoped claim carries. resolveNameErr injects
+// the name-composition failure the claim path must survive.
 func (f *fakeBuilder) ResolveName(e jobbuilder.TaskEntry) (string, error) {
 	if f.resolveNameErr != nil {
 		return "", f.resolveNameErr
 	}
-	return "fm-" + e.TaskID, nil
+	return jobbuilder.DaemonIDForInScope(e.TaskID, e.SourceID, e.WorkspaceID), nil
 }
 
 // RequiresProjectIdentity keeps the fake's claims out of the platform lookup.

@@ -3,6 +3,7 @@ package scheduler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -29,6 +30,13 @@ type ProjectIdentity interface {
 	// retry: an error (unreachable, timeout, no such query) is the caller's
 	// signal to record project.lookup_failed and continue with no identity.
 	ByIssue(ctx context.Context, workspaceID, issueID string) (string, error)
+}
+
+// SourceProjectIdentity is the source-aware project lookup. A deployment
+// serving several Multica servers implements it so the same workspace id on
+// another server cannot answer for this claim.
+type SourceProjectIdentity interface {
+	ByIssueInSource(ctx context.Context, sourceID, workspaceID, issueID string) (string, error)
 }
 
 // projectCacheTTL is the short TTL of the issue-id lookup cache (ADR-048
@@ -60,10 +68,10 @@ type projectCacheEntry struct {
 // carries the workspace: the same issue id resolves independently per
 // workspace (§4.1). An expired entry is removed on read, so the map does not
 // keep dead pairs until a capacity eviction happens to pass over them.
-func (c *projectCache) get(workspaceID, issueID string, now time.Time) (string, bool) {
+func (c *projectCache) get(sourceID, workspaceID, issueID string, now time.Time) (string, bool) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	key := projectCacheKey(workspaceID, issueID)
+	key := projectCacheKey(sourceID, workspaceID, issueID)
 	entry, ok := c.entries[key]
 	if !ok {
 		return "", false
@@ -75,13 +83,13 @@ func (c *projectCache) get(workspaceID, issueID string, now time.Time) (string, 
 	return entry.projectID, true
 }
 
-func (c *projectCache) put(workspaceID, issueID, projectID string, now time.Time) {
+func (c *projectCache) put(sourceID, workspaceID, issueID, projectID string, now time.Time) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	if c.entries == nil {
 		c.entries = map[string]projectCacheEntry{}
 	}
-	key := projectCacheKey(workspaceID, issueID)
+	key := projectCacheKey(sourceID, workspaceID, issueID)
 	if _, ok := c.entries[key]; !ok && len(c.entries) >= projectCacheLimit {
 		c.evictLocked(now)
 	}
@@ -114,9 +122,9 @@ func (c *projectCache) evictLocked(now time.Time) {
 	}
 }
 
-// projectCacheKey partitions the reverse-lookup cache by workspace.
-func projectCacheKey(workspaceID, issueID string) string {
-	return workspaceID + "\x00" + issueID
+// projectCacheKey partitions the reverse-lookup cache by source and workspace.
+func projectCacheKey(sourceID, workspaceID, issueID string) string {
+	return sourceID + "\x00" + workspaceID + "\x00" + issueID
 }
 
 // projectIdentity resolves the project identity of one claim: the payload's
@@ -124,7 +132,7 @@ func projectCacheKey(workspaceID, issueID string) string {
 // lookup, and none when neither yields an identifier. Every failure is a warn;
 // the task continues with the project tiers degraded (ADR-048 decision 4,
 // AC-54).
-func (s *Scheduler) projectIdentity(ctx context.Context, task json.RawMessage, head claimHead) (string, string) {
+func (s *Scheduler) projectIdentity(ctx context.Context, sourceID string, task json.RawMessage, head claimHead) (string, string) {
 	workspaceID := head.WorkspaceID
 	if s.cfg.Project == nil {
 		return "", jobbuilder.ProjectSourceNone
@@ -136,7 +144,7 @@ func (s *Scheduler) projectIdentity(ctx context.Context, task json.RawMessage, h
 		return "", jobbuilder.ProjectSourceNone
 	}
 	now := s.now()
-	if projectID, ok := s.project.get(workspaceID, head.IssueID, now); ok {
+	if projectID, ok := s.project.get(sourceID, workspaceID, head.IssueID, now); ok {
 		if projectID == "" {
 			return "", jobbuilder.ProjectSourceNone
 		}
@@ -144,19 +152,32 @@ func (s *Scheduler) projectIdentity(ctx context.Context, task json.RawMessage, h
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, s.projectLookupTimeout())
 	defer cancel()
-	projectID, err := s.cfg.Project.ByIssue(lookupCtx, workspaceID, head.IssueID)
+	projectID, err := s.projectByIssue(lookupCtx, sourceID, workspaceID, head.IssueID)
 	if err != nil {
 		s.log.WarnContext(ctx, "project.lookup_failed",
 			"task_id", head.ID, "workspace_id", workspaceID, "issue_id", head.IssueID, "err", err.Error())
-		s.project.put(workspaceID, head.IssueID, "", now)
+		s.project.put(sourceID, workspaceID, head.IssueID, "", now)
 		return "", jobbuilder.ProjectSourceNone
 	}
 	projectID = strings.TrimSpace(projectID)
-	s.project.put(workspaceID, head.IssueID, projectID, now)
+	s.project.put(sourceID, workspaceID, head.IssueID, projectID, now)
 	if projectID == "" {
 		return "", jobbuilder.ProjectSourceNone
 	}
 	return projectID, jobbuilder.ProjectSourceAPI
+}
+
+// projectByIssue routes the lookup through the source-aware seam when the
+// claim carries a source.
+func (s *Scheduler) projectByIssue(ctx context.Context, sourceID, workspaceID, issueID string) (string, error) {
+	if sourceID == "" {
+		return s.cfg.Project.ByIssue(ctx, workspaceID, issueID)
+	}
+	lookup, ok := s.cfg.Project.(SourceProjectIdentity)
+	if !ok {
+		return "", fmt.Errorf("project lookup cannot route source %q", sourceID)
+	}
+	return lookup.ByIssueInSource(ctx, sourceID, workspaceID, issueID)
 }
 
 // projectLookupTimeout bounds one reverse lookup so the claim → Job budget

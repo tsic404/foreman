@@ -32,8 +32,12 @@ type TaskEntry struct {
 	IssueIdentifier string
 	AutopilotRunID  string
 	ChatSessionID   string
-	WorkspaceID     string
-	JobRuntimeID    string
+	// SourceID is the stable Multica server the claim came from. It selects
+	// the Job-side address and partitions the Job Token; empty is the legacy
+	// single-source deployment.
+	SourceID     string
+	WorkspaceID  string
+	JobRuntimeID string
 	// RealRuntimeID, RuntimeProvider and RuntimeProfileID are the dispatch
 	// record of the claim: the real runtime it was leased under and the
 	// declared identity S-4 answers for. They are annotated so a K8s rebuild
@@ -77,6 +81,14 @@ type TokenIssuer interface {
 	// of the call's parity with the probe's Start, not of the payload.
 	IssueProbe(jobName, requestID, workspaceID string, ttl time.Duration) (string, error)
 	Hash(token string) string
+}
+
+// SourceTokenIssuer signs a Job Token carrying the claim's source. A
+// multi-source deployment must implement it: a token without the source would
+// be valid on another server that exposes the same workspace id.
+type SourceTokenIssuer interface {
+	IssueInSource(jobName, taskID, sourceID, workspaceID string, ttl time.Duration) (string, error)
+	IssueProbeInSource(jobName, requestID, sourceID, workspaceID string, ttl time.Duration) (string, error)
 }
 
 // NodeIndex exposes the registry's session index and per-node load markers;
@@ -139,7 +151,7 @@ func NewBuilder(cfg Config) (*Builder, error) {
 // An invalid task id, or a name that leaves the name face, fails before any
 // object is produced.
 func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, string, error) {
-	daemonID := DaemonIDFor(e.TaskID)
+	daemonID := DaemonIDForInScope(e.TaskID, e.SourceID, e.WorkspaceID)
 	if len(daemonID) > maxJobNameLength || !dns1123Label.MatchString(daemonID) {
 		return nil, nil, "", fmt.Errorf("%w: %q does not yield a valid daemon id %q", ErrInvalidTaskID, e.TaskID, daemonID)
 	}
@@ -165,13 +177,25 @@ func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, string, erro
 	if err != nil {
 		return nil, nil, "", err
 	}
-	token, err := b.cfg.Issuer.Issue(daemonID, e.TaskID, e.WorkspaceID, b.cfg.JobTokenTTL)
+	token, err := b.issueToken(daemonID, e)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("issue Job Token: %w", err)
 	}
 	b.logPolicyApplied(e, name, ev)
 	b.recordPolicyHits(ev)
-	return job, b.credentialSecret(daemonID, e.TaskID, e.WorkspaceID, token), b.cfg.Issuer.Hash(token), nil
+	return job, b.credentialSecret(daemonID, e.TaskID, e.SourceID, e.WorkspaceID, token), b.cfg.Issuer.Hash(token), nil
+}
+
+// issueToken signs the task Job Token in the entry's source partition.
+func (b *Builder) issueToken(daemonID string, e TaskEntry) (string, error) {
+	if e.SourceID == "" {
+		return b.cfg.Issuer.Issue(daemonID, e.TaskID, e.WorkspaceID, b.cfg.JobTokenTTL)
+	}
+	issuer, ok := b.cfg.Issuer.(SourceTokenIssuer)
+	if !ok {
+		return "", fmt.Errorf("token issuer cannot sign source %q", e.SourceID)
+	}
+	return issuer.IssueInSource(daemonID, e.TaskID, e.SourceID, e.WorkspaceID, b.cfg.JobTokenTTL)
 }
 
 // recordPolicyHits counts one evaluation per axis by source (§9.2 策略命中):
@@ -306,12 +330,16 @@ func (b *Builder) applyWrites(job *batchv1.Job, name, daemonID string, e TaskEnt
 	// daemon-id label is what MULTICA_DAEMON_ID's fieldRef reads, so it is
 	// Foreman's own write and never the template's (ADR-034 decision 8); the
 	// workspace label is the pod's own identity (AC-88).
-	job.Spec.Template.Labels = setKeys(job.Spec.Template.Labels, map[string]string{
+	podLabels := map[string]string{
 		labelAppName:     jobAppName,
 		labelTaskID:      e.TaskID,
 		labelDaemonID:    daemonID,
 		labelWorkspaceID: e.WorkspaceID,
-	})
+	}
+	if e.SourceID != "" {
+		podLabels[labelSourceID] = e.SourceID
+	}
+	job.Spec.Template.Labels = setKeys(job.Spec.Template.Labels, podLabels)
 }
 
 // injectContainerEnv writes the A1.1 keys into containers[0] — the template's

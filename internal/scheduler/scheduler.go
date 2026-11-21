@@ -672,7 +672,14 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 // (a cross-workspace claim must never produce an entry, AC-81). An empty
 // workspaceID keeps the legacy payload-derived form.
 func (s *Scheduler) OnClaimFor(ctx context.Context, workspaceID string, task json.RawMessage) error {
-	return s.onClaimFor(ctx, workspaceID, task, SlotReservation{}, false, ClaimScope{})
+	return s.onClaimFor(ctx, "", workspaceID, task, SlotReservation{}, false, ClaimScope{})
+}
+
+// OnClaimForInSource is the source-aware form of OnClaimFor. A deployment
+// serving several Multica servers must keep the workspace id and the server
+// identity together: the same workspace id can exist on two servers.
+func (s *Scheduler) OnClaimForInSource(ctx context.Context, sourceID, workspaceID string, task json.RawMessage) error {
+	return s.onClaimFor(ctx, sourceID, workspaceID, task, SlotReservation{}, false, ClaimScope{})
 }
 
 // OnClaimReservedFor registers a task against the reservation pair the claim
@@ -680,10 +687,16 @@ func (s *Scheduler) OnClaimFor(ctx context.Context, workspaceID string, task jso
 // C3 request that returned it. It never reserves again; a task that produces
 // no entry releases exactly that pair to the caller's budget.
 func (s *Scheduler) OnClaimReservedFor(ctx context.Context, workspaceID string, task json.RawMessage, res SlotReservation, scope ClaimScope) error {
-	return s.onClaimFor(ctx, workspaceID, task, res, true, scope)
+	return s.onClaimFor(ctx, "", workspaceID, task, res, true, scope)
 }
 
-func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task json.RawMessage, res SlotReservation, reserved bool, scope ClaimScope) error {
+// OnClaimReservedInSource registers a claim under the client's source and
+// workspace identity.
+func (s *Scheduler) OnClaimReservedInSource(ctx context.Context, sourceID, workspaceID string, task json.RawMessage, res SlotReservation, scope ClaimScope) error {
+	return s.onClaimFor(ctx, sourceID, workspaceID, task, res, true, scope)
+}
+
+func (s *Scheduler) onClaimFor(ctx context.Context, sourceID, workspaceID string, task json.RawMessage, res SlotReservation, reserved bool, scope ClaimScope) error {
 	defer s.SyncInflight()
 	workspace := workspaceID
 	owned := false
@@ -707,7 +720,7 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 			if ws == "" {
 				ws = claimWorkspace(task)
 			}
-			took, settleErr := s.settleMalformedClaim(ctx, ws, id, task, res, reserved, err)
+			took, settleErr := s.settleMalformedClaim(ctx, sourceID, ws, id, task, res, reserved, err)
 			if took {
 				owned = true
 			}
@@ -730,14 +743,15 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 		return fmt.Errorf("claim workspace %q does not match payload workspace %q", workspace, head.WorkspaceID)
 	}
 	head.WorkspaceID = workspace
-	unlock, err := s.lockTaskIn(ctx, workspace, head.ID)
+	partition := partitionKey(sourceID, workspace)
+	unlock, err := s.lockTaskIn(ctx, partition, head.ID)
 	if err != nil {
 		return err
 	}
 	defer unlock()
 
 	attempt := 1
-	if existing, ok := s.reg.Get(head.ID); ok {
+	if existing, ok := s.reg.Get(head.ID, partition); ok {
 		// An entry that already exists is the confirmed old attempt: it keeps
 		// its frozen binding and converges even if the agent has since been
 		// switched away. Only a brand-new claim is gated below.
@@ -746,7 +760,7 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 			return err
 		}
 		attempt = priorAttempt + 1
-	} else if s.reg.IsDone(workspace, head.ID) {
+	} else if s.reg.IsDoneInSource(sourceID, workspace, head.ID) {
 		// The task settled within the done window yet the server re-dispatched
 		// it: re-executing would double-run it (invariant 4). The terminal
 		// report retry belongs to the pending-report queue.
@@ -778,9 +792,10 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 	// Job Token's j claim and the uuid5 seed of job_runtime_id (ADR-034
 	// decision 8). The display name is the template's business, so it is
 	// resolved through the builder — the same function Build runs.
-	daemonID := jobbuilder.DaemonIDFor(head.ID)
+	daemonID := jobbuilder.DaemonIDForInScope(head.ID, sourceID, head.WorkspaceID)
 	e := registry.TaskEntry{
 		TaskID:          head.ID,
+		SourceID:        sourceID,
 		AgentID:         head.AgentID,
 		IssueID:         head.IssueID,
 		IssueIdentifier: head.IssueIdentifier,
@@ -838,7 +853,7 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 	// (ADR-048 decision 4), and always before the name, which the policy
 	// cannot influence.
 	if s.builder.RequiresProjectIdentity(jobbuilderEntry(e)) {
-		e.ProjectID, e.ProjectSource = s.projectIdentity(ctx, task, head)
+		e.ProjectID, e.ProjectSource = s.projectIdentity(ctx, sourceID, task, head)
 	}
 	name, nameErr := s.builder.ResolveName(jobbuilderEntry(e))
 	if nameErr != nil {
@@ -873,7 +888,7 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 	if err := s.enqueueShared(ctx, e); err != nil {
 		// No object was created yet; dropping the entry lets the server
 		// re-dispatch after the prepare lease lapses, the deferral path.
-		_ = s.reg.Delete(e.TaskID)
+		_ = s.reg.Delete(e.TaskID, e.ScopeKey())
 		return err
 	}
 	s.log.InfoContext(ctx, "task.claimed",
@@ -902,7 +917,7 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 		// (§4.3, AC-09). Both defer the claim — the entry goes and the server
 		// re-dispatches the task once the prepare lease lapses.
 		if errors.Is(err, ErrStoreUnavailable) || errors.Is(err, errJobNameHeld) {
-			if delErr := s.reg.Delete(e.TaskID); delErr != nil {
+			if delErr := s.reg.Delete(e.TaskID, e.ScopeKey()); delErr != nil {
 				s.log.WarnContext(ctx, "task.claim_drop_failed",
 					"task_id", e.TaskID, "job_name", e.JobName, "err", delErr)
 			}
@@ -967,7 +982,7 @@ func (s *Scheduler) createClaim(ctx context.Context, e registry.TaskEntry) (regi
 	// that Put writes the whole entry back. It never reaches an annotation: a
 	// rebuilt entry cannot restore it and degrades visibly instead
 	// (cred.revoke_unavailable).
-	if err := s.reg.SetTokenHash(e.TaskID, tokenHash); err != nil {
+	if err := s.reg.SetTokenHash(e.TaskID, tokenHash, e.ScopeKey()); err != nil {
 		// Without the digest on the shared row no instance could adjudicate or
 		// revoke the credential, so it is never placed (ADR-046 决策 7).
 		return e, nil, fmt.Errorf("%w: record token digest: %v", ErrStoreUnavailable, err)
@@ -1012,7 +1027,7 @@ func (s *Scheduler) createClaim(ctx context.Context, e registry.TaskEntry) (regi
 	// (§4.1). Recorded in place: this claim's snapshot predates the
 	// Job create, and writing it back wholesale would revert a renewal the
 	// LeaseKeeper landed while the name was held.
-	marked, ok := s.reg.MarkJobCreated(e.TaskID, created.CreationTimestamp.Time)
+	marked, ok := s.reg.MarkJobCreated(e.TaskID, created.CreationTimestamp.Time, e.ScopeKey())
 	trace(createStepJobCreated)
 	if !ok {
 		// The entry left the registry inside the create window — settled
@@ -1089,12 +1104,15 @@ func (s *Scheduler) createJob(ctx context.Context, e registry.TaskEntry, job *ba
 }
 
 // jobOwnedBy reports whether the existing object is a Foreman task Job of this
-// entry's task. Ownership is read from labels, never from the name (§3): the
-// name only says which object the create collided with.
+// attempt. Ownership is read from labels, never from the name (§3): the name
+// only says which object the create collided with. The task id is unique only
+// inside one source, so a same-id Job of another source is another attempt's
+// object and is never this one's corpse to delete.
 func jobOwnedBy(existing *batchv1.Job, e registry.TaskEntry) bool {
 	labels := existing.GetLabels()
 	return labels[registry.LabelManagedBy] == registry.ManagedByForeman &&
-		labels[registry.LabelTaskID] == e.TaskID
+		labels[registry.LabelTaskID] == e.TaskID &&
+		labels[registry.LabelSourceID] == e.SourceID
 }
 
 // resolveDuplicateClaim applies the duplicate-claim rule (§10): C13 decides
@@ -1111,7 +1129,7 @@ func (s *Scheduler) resolveDuplicateClaim(ctx context.Context, existing registry
 			"task_id", existing.TaskID, "old_job_name", existing.JobName, "action", "drop_terminal_entry")
 		return false, 0, nil
 	}
-	st, err := s.server.TaskStatus(ctx, existing.TaskID)
+	st, err := s.taskStatusFor(ctx, existing)
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
 		// The task no longer exists server-side: this is the vanished face of
@@ -1122,7 +1140,7 @@ func (s *Scheduler) resolveDuplicateClaim(ctx context.Context, existing registry
 		// claim is dropped: nothing is built for a deleted task.
 		s.log.WarnContext(ctx, "duplicate_dispatch",
 			"task_id", existing.TaskID, "old_job_name", existing.JobName, "action", "drop_task_gone")
-		return false, 0, s.onTaskVanishedLocked(ctx, existing.TaskID)
+		return false, 0, s.onTaskVanishedLocked(ctx, existing)
 	case err != nil:
 		// Truth unknown: keep the existing entry, drop the new claim; the
 		// reconcile loop converges later.
@@ -1132,7 +1150,7 @@ func (s *Scheduler) resolveDuplicateClaim(ctx context.Context, existing registry
 	}
 	// In-place field update only: the pre-C13 snapshot must not be Put back
 	// wholesale — daemon callbacks may have advanced the entry meanwhile.
-	s.reg.SetLastStatusSeen(existing.TaskID, st)
+	s.reg.SetLastStatusSeen(existing.TaskID, st, existing.ScopeKey())
 
 	switch {
 	case st == "running":
@@ -1293,7 +1311,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 	unlock := func() {}
 	if locked {
 		var lockErr error
-		unlock, lockErr = s.lockTaskFor(ctx, e.TaskID)
+		unlock, lockErr = s.lockTaskForScope(ctx, e.TaskID, e.ScopeKey())
 		if lockErr != nil {
 			return http.StatusServiceUnavailable, nil, lockErr
 		}
@@ -1340,11 +1358,11 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		// forbids rewriting a decided one. The lock draws on the reserve the
 		// gate left unspent, so a held lease cannot extend the S14 round.
 		if verdict == gateUndecided {
-			unlockTerminal, lockErr := s.lockTaskWithin(ctx, e.TaskID, gateDeadline)
+			unlockTerminal, lockErr := s.lockTaskWithin(ctx, e.TaskID, e.ScopeKey(), gateDeadline)
 			if lockErr != nil {
 				return http.StatusServiceUnavailable, nil, lockErr
 			}
-			if fresh, ok := s.reg.Get(e.TaskID); ok {
+			if fresh, ok := s.reg.Get(e.TaskID, e.ScopeKey()); ok {
 				e = fresh
 			}
 			undecided = !e.IsTerminal() && len(e.DecidedReport) == 0
@@ -1355,7 +1373,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 				// report; the rebuilt Job then read a completed task as failed.
 				s.enqueuePending(ctx, e, ep, "", body)
 				result := registry.Result(ep.TerminalResult())
-				_, first, err := s.reg.MarkTerminal(e.TaskID, result, "", now)
+				_, first, err := s.reg.MarkTerminal(e.TaskID, result, "", now, e.ScopeKey())
 				if err != nil {
 					// The verdict this entry was written ahead of never
 					// landed, so the entry must not outlive it: a replay
@@ -1365,7 +1383,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 					// it: a concurrent enqueue of the same task owns its own
 					// entry and its own carrier. The caller's retry then walks
 					// the whole order again.
-					s.pendingReports.DropIfUnchanged(ctx, e.TaskID, ep, body)
+					s.pendingReports.DropIfUnchanged(ctx, e.TaskID, ep, body, pendingKey(e))
 					unlockTerminal()
 					return 0, nil, err
 				}
@@ -1385,16 +1403,16 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 					}
 					// The instance's first terminal forward decides its body:
 					// every later terminal forward takes this one (§4.4).
-					if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body); ok {
+					if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body, e.ScopeKey()); ok {
 						e = registered
 					}
 				}
 			}
 			unlockTerminal()
-		} else if fresh, ok := s.reg.Get(e.TaskID); ok {
+		} else if fresh, ok := s.reg.Get(e.TaskID, e.ScopeKey()); ok {
 			e = fresh
 		}
-		if decided, ok := s.reg.DecidedReport(e.TaskID); ok {
+		if decided, ok := s.reg.DecidedReport(e.TaskID, e.ScopeKey()); ok {
 			body = decided
 		}
 		if !undecided && !s.pendingReports.HasQueuedEntry(e.TaskID) {
@@ -1408,7 +1426,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		}
 	}
 
-	code, resp, err := s.server.Forward(ctx, ep, e.TaskID, body)
+	code, resp, err := s.forwardInScope(ctx, ep, e.TaskID, e.SourceID, e.WorkspaceID, body)
 	if err != nil {
 		if ep.IsTerminal() {
 			// The proxy's retry budget is exhausted (or the transport is
@@ -1434,12 +1452,12 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			// 409 = it already holds a verdict. All three leave nothing to
 			// retry: the write-ahead entry goes, and the Job goes now (the
 			// convergence round would delete it anyway).
-			s.pendingReports.Drop(ctx, e.TaskID)
+			s.pendingReports.Drop(ctx, e.TaskID, pendingKey(e))
 			if ep == EPCancelAck {
 				// The daemon confirmed its own cancellation, so the debt a
 				// settle-on-its-behalf recorded is settled by this arrival and
 				// Foreman never synthesizes a second confirmation (§4.6 兜底一).
-				s.reg.ClearCancelAckOwed(e.TaskID)
+				s.reg.ClearCancelAckOwed(e.TaskID, e.ScopeKey())
 			}
 			if code == 404 && undecided {
 				// §4.4's in-place decision: the server no longer holds the
@@ -1447,7 +1465,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 				// undecided settles with no result; an already-decided replay
 				// keeps the verdict it was decided with. The compare-and-set
 				// guard keeps any other path's verdict (§4.2).
-				s.reg.SettleNoResult(e.TaskID, registry.Result(ep.TerminalResult()))
+				s.reg.SettleNoResult(e.TaskID, registry.Result(ep.TerminalResult()), e.ScopeKey())
 			}
 			s.deleteJob(ctx, e)
 			if code == 404 || code == 409 {
@@ -1458,7 +1476,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			// no queue — the write-ahead entry goes too. The verdict is
 			// written, so the Job is torn down like every other terminal
 			// path; only the log records the loss.
-			s.pendingReports.Drop(ctx, e.TaskID)
+			s.pendingReports.Drop(ctx, e.TaskID, pendingKey(e))
 			s.log.ErrorContext(ctx, "task.forward_failed",
 				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 				"endpoint", string(ep), "status", code)
@@ -1484,7 +1502,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		// daemon the task is settled (the settlement below is a no-op then).
 		switch {
 		case code >= 200 && code < 300:
-			if started, ok := s.reg.MarkStarted(e.TaskID, now); ok {
+			if started, ok := s.reg.MarkStarted(e.TaskID, now, e.ScopeKey()); ok {
 				s.metrics.JobBootSeconds(now.Sub(started.ClaimedAt).Seconds())
 				s.log.InfoContext(ctx, "task.started",
 					"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", started.DaemonID,
@@ -1492,7 +1510,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 			}
 			return code, resp, nil
 		case code == http.StatusConflict:
-			if err := s.OnStartRejected(ctx, e.TaskID); err != nil {
+			if err := s.onStartRejectedLocked(ctx, e); err != nil {
 				s.log.ErrorContext(ctx, "task.settle_failed",
 					"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 					"endpoint", string(ep), "err", err)
@@ -1504,11 +1522,7 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 		// A non-terminal forward answered 404: the server deleted the task
 		// (§4.6). The S-8 round already holds the task lock; every other
 		// endpoint takes it inside OnTaskVanished.
-		vanish := s.OnTaskVanished
-		if locked {
-			vanish = s.onTaskVanishedLocked
-		}
-		if err := vanish(ctx, e.TaskID); err != nil {
+		if err := s.onTaskVanishedLocked(ctx, e); err != nil {
 			s.log.ErrorContext(ctx, "task vanish cleanup failed",
 				"task_id", e.TaskID, "job_name", e.JobName, "err", err)
 		}
@@ -1526,6 +1540,22 @@ func (s *Scheduler) OnReport(ctx context.Context, ep Endpoint, e registry.TaskEn
 // undeliverable forward.
 var upstreamUnavailableBody = []byte(`{"error":"upstream unavailable"}`)
 
+// pendingKey is the pending-report queue's key for one entry. A source-scoped
+// entry carries its own Job name as the key: the upstream task id alone is not
+// unique across servers, so two entries with the same id on two sources must
+// own two queued reports.
+func pendingKey(e registry.TaskEntry) string {
+	return pendingKeyFor(e.SourceID, e.WorkspaceID, e.TaskID)
+}
+
+// pendingKeyFor is pendingKey from an explicit partition.
+func pendingKeyFor(sourceID, workspaceID, taskID string) string {
+	if sourceID != "" {
+		return jobbuilder.DaemonIDForInScope(taskID, sourceID, workspaceID)
+	}
+	return taskID
+}
+
 // enqueuePending lands a terminal report in the scheduler's durable queue —
 // the write-ahead entry every terminal forward is preceded by (§10). The
 // body is the one actually forwarded, so a replay sends the instance's
@@ -1536,7 +1566,18 @@ var upstreamUnavailableBody = []byte(`{"error":"upstream unavailable"}`)
 // its retention bound refuses (§4.6): the queue emitted that drop's error row
 // already, so it is not repeated here.
 func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep Endpoint, failureReason string, body []byte) {
-	if err := s.pendingReports.Enqueue(ctx, e.TaskID, e.JobName, e.DaemonID, e.WorkspaceID, ep, body, failureReason); err != nil {
+	enqueue := func() error {
+		key := pendingKey(e)
+		if e.SourceID == "" {
+			return s.pendingReports.Enqueue(ctx, e.TaskID, e.JobName, e.DaemonID, e.WorkspaceID, ep, body, failureReason, key)
+		}
+		queue, ok := s.pendingReports.(SourcePendingReportQueue)
+		if !ok {
+			return fmt.Errorf("pending queue cannot route source %q", e.SourceID)
+		}
+		return queue.EnqueueInSource(ctx, e.TaskID, e.JobName, e.DaemonID, e.SourceID, e.WorkspaceID, ep, body, failureReason, key)
+	}
+	if err := enqueue(); err != nil {
 		if errors.Is(err, ErrPendingQueueFull) {
 			return
 		}
@@ -1558,26 +1599,50 @@ func (s *Scheduler) enqueuePending(ctx context.Context, e registry.TaskEntry, ep
 // The caller holds the task's lock (OnReport's S8 round), so the C13 answer
 // and the transition cannot be overtaken by another settlement path.
 func (s *Scheduler) OnStartRejected(ctx context.Context, taskID string) error {
-	defer s.SyncInflight()
-	e, ok := s.reg.Get(taskID)
-	if !ok || e.IsTerminal() || !e.StartedAt.IsZero() {
+	return s.OnStartRejectedInScope(ctx, taskID, "")
+}
+
+// OnStartRejectedInScope is OnStartRejected under an explicit partition.
+func (s *Scheduler) OnStartRejectedInScope(ctx context.Context, taskID, scopeKey string) error {
+	e, ok := s.reg.Get(taskID, scopeKey)
+	if !ok {
 		return nil
 	}
-	st, err := s.server.TaskStatus(ctx, taskID)
+	unlock, err := s.lockTaskForScope(ctx, taskID, e.ScopeKey())
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	return s.onStartRejectedLocked(ctx, e)
+}
+
+// onStartRejectedLocked is the S8 409 settlement. The caller holds the task
+// lock (the report round or the public wrapper).
+func (s *Scheduler) onStartRejectedLocked(ctx context.Context, e registry.TaskEntry) error {
+	defer s.SyncInflight()
+	if fresh, ok := s.reg.Get(e.TaskID, e.ScopeKey()); ok {
+		e = fresh
+	} else {
+		return nil
+	}
+	if e.IsTerminal() || !e.StartedAt.IsZero() {
+		return nil
+	}
+	st, err := s.taskStatusFor(ctx, e)
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
-		return s.onTaskVanishedLocked(ctx, taskID)
+		return s.onTaskVanishedLocked(ctx, e)
 	case err != nil:
-		return fmt.Errorf("check status of task %s: %w", taskID, err)
+		return fmt.Errorf("check status of task %s: %w", e.TaskID, err)
 	}
-	s.reg.SetLastStatusSeen(taskID, st)
+	s.reg.SetLastStatusSeen(e.TaskID, st, e.ScopeKey())
 	switch {
 	case st == "running" || st == "waiting_local_directory":
 		// Post-delivery (ADR-026 决策结果 1 证据面②): the daemon holds the
 		// task, so record the start fact, stop renewals and keep the Job.
-		return s.adoptRunningLocked(ctx, taskID, st)
+		return s.adoptRunningLocked(ctx, e, st)
 	case registry.IsTerminalResult(st):
-		return s.settleTerminalLocked(ctx, taskID, st)
+		return s.settleTerminalLocked(ctx, e, st)
 	case st == "queued" || st == "dispatched":
 		return s.failEntry(ctx, e, failReport{
 			reason:  FailureReasonStaleClaim,
@@ -1596,13 +1661,22 @@ func (s *Scheduler) OnStartRejected(ctx context.Context, taskID string) error {
 // outstanding: that answer either lands first (started_at set, this is a
 // no-op) or the start really never happened.
 func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
+	return s.OnBootTimeoutInScope(ctx, taskID, "")
+}
+
+// OnBootTimeoutInScope is OnBootTimeout under an explicit partition.
+func (s *Scheduler) OnBootTimeoutInScope(ctx context.Context, taskID, scopeKey string) error {
+	e, ok := s.reg.Get(taskID, scopeKey)
+	if !ok {
+		return nil
+	}
 	defer s.SyncInflight()
-	unlock, err := s.lockTaskFor(ctx, taskID)
+	unlock, err := s.lockTaskForScope(ctx, taskID, e.ScopeKey())
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	e, ok := s.reg.Get(taskID)
+	e, ok = s.reg.Get(taskID, e.ScopeKey())
 	if !ok || e.IsTerminal() || !e.StartedAt.IsZero() {
 		return nil
 	}
@@ -1626,13 +1700,23 @@ func (s *Scheduler) OnBootTimeout(ctx context.Context, taskID string) error {
 // another attempt on the daemon's next claim. The boot bound is what ends the
 // form, and it is claim-relative, so the number of attempts is bounded by it.
 func (s *Scheduler) OnDeliveryUnconfirmed(ctx context.Context, taskID string) error {
+	return s.OnDeliveryUnconfirmedInScope(ctx, taskID, "")
+}
+
+// OnDeliveryUnconfirmedInScope is OnDeliveryUnconfirmed under an explicit
+// partition.
+func (s *Scheduler) OnDeliveryUnconfirmedInScope(ctx context.Context, taskID, scopeKey string) error {
+	e, ok := s.reg.Get(taskID, scopeKey)
+	if !ok {
+		return nil
+	}
 	defer s.SyncInflight()
-	unlock, err := s.lockTaskFor(ctx, taskID)
+	unlock, err := s.lockTaskForScope(ctx, taskID, e.ScopeKey())
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	e, ok := s.reg.Get(taskID)
+	e, ok = s.reg.Get(taskID, e.ScopeKey())
 	if !ok || e.IsTerminal() || !e.StartedAt.IsZero() || e.DeliveredAt.IsZero() {
 		return nil
 	}
@@ -1656,37 +1740,47 @@ func (s *Scheduler) OnDeliveryUnconfirmed(ctx context.Context, taskID string) er
 // pre-start statuses retry next round, any value outside the domain is
 // reported and never guessed (S-7 + §10: 租约不超时, ADR-026 决策结果 1/3).
 func (s *Scheduler) ConvergeLeaseRefused(ctx context.Context, taskID string) error {
+	return s.ConvergeLeaseRefusedInScope(ctx, taskID, "")
+}
+
+// ConvergeLeaseRefusedInScope is ConvergeLeaseRefused under an explicit
+// partition.
+func (s *Scheduler) ConvergeLeaseRefusedInScope(ctx context.Context, taskID, scopeKey string) error {
+	e, ok := s.reg.Get(taskID, scopeKey)
+	if !ok {
+		return nil
+	}
 	defer s.SyncInflight()
-	unlock, err := s.lockTaskFor(ctx, taskID)
+	unlock, err := s.lockTaskForScope(ctx, taskID, e.ScopeKey())
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	e, ok := s.reg.Get(taskID)
+	e, ok = s.reg.Get(taskID, e.ScopeKey())
 	if !ok || e.IsTerminal() {
 		return nil
 	}
-	st, err := s.server.TaskStatus(ctx, taskID)
+	st, err := s.taskStatusFor(ctx, e)
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
-		return s.onTaskVanishedLocked(ctx, taskID)
+		return s.onTaskVanishedLocked(ctx, e)
 	case err != nil:
 		return err
 	}
-	s.reg.SetLastStatusSeen(taskID, st)
+	s.reg.SetLastStatusSeen(e.TaskID, st, e.ScopeKey())
 	switch {
 	case st == "running" || st == "waiting_local_directory":
 		// The daemon holds the task without Foreman seeing S8 (e.g. a
 		// restart): record the start fact, stop leasing, keep the Job and
 		// wait for the daemon's reports. Only a report advances the state.
-		s.reg.MarkStartFact(taskID, s.now())
+		s.reg.MarkStartFact(e.TaskID, s.now(), e.ScopeKey())
 		return nil
 	case registry.IsTerminalResult(st):
 		// The verdict is C13's, but the cleanup is the settlement path's: an
 		// undelivered report and an uncompleted carrier list both hold the Job
 		// back, exactly as they do for every other terminal writer (§10,
 		// AC-16). Deleting here would drop a report the queue still owns.
-		return s.settleTerminalLocked(ctx, taskID, st)
+		return s.settleTerminalLocked(ctx, e, st)
 	case st == "queued" || st == "dispatched":
 		// Pre-start: no decisive fact — retry next round.
 		return nil
@@ -1717,7 +1811,7 @@ func (s *Scheduler) OnJobGone(ctx context.Context, jobName string) error {
 		return nil
 	}
 	if e.IsTerminal() {
-		if s.pendingReports.Queued(e.TaskID) {
+		if s.pendingReports.Queued(e.TaskID, pendingKey(e)) {
 			// A queued report owns the terminal: the Job goes only once the
 			// replay landed (§10).
 			return nil
@@ -1757,7 +1851,7 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason, detail string)
 	// The key is the task id, so it is resolved before the lock and the
 	// entry re-read under it: a concurrent path must not be settled on a
 	// snapshot it already replaced.
-	unlock, lockErr := s.lockTaskFor(ctx, e.TaskID)
+	unlock, lockErr := s.lockTaskForScope(ctx, e.TaskID, e.ScopeKey())
 	if lockErr != nil {
 		return lockErr
 	}
@@ -1767,30 +1861,30 @@ func (s *Scheduler) FailJob(ctx context.Context, jobName, reason, detail string)
 		return nil
 	}
 	if e.IsTerminal() {
-		if s.pendingReports.Queued(e.TaskID) {
+		if s.pendingReports.Queued(e.TaskID, pendingKey(e)) {
 			return nil
 		}
 		return s.deleteJob(ctx, e)
 	}
-	if s.pendingReports.Queued(e.TaskID) {
+	if s.pendingReports.Queued(e.TaskID, pendingKey(e)) {
 		// §4.3: a task with a pending entry converges only through the
 		// entry's replay and the two settlement classes — never through a
 		// synthesized terminal. This covers the rebuilt entry whose Job
 		// ended after the crash that queued its report.
 		return nil
 	}
-	st, err := s.server.TaskStatus(ctx, e.TaskID)
+	st, err := s.taskStatusFor(ctx, e)
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
 		// Task deleted server-side (scenario #9): settle it without a
 		// report and start the drain.
-		return s.onTaskVanishedLocked(ctx, e.TaskID)
+		return s.onTaskVanishedLocked(ctx, e)
 	case err != nil:
 		return fmt.Errorf("check status of task %s: %w", e.TaskID, err)
 	}
-	s.reg.SetLastStatusSeen(e.TaskID, st)
+	s.reg.SetLastStatusSeen(e.TaskID, st, e.ScopeKey())
 	if registry.IsTerminalResult(st) {
-		return s.settleTerminalLocked(ctx, e.TaskID, st)
+		return s.settleTerminalLocked(ctx, e, st)
 	}
 	return s.failEntry(ctx, e, failReport{
 		reason:  reason,
@@ -1833,7 +1927,7 @@ func (s *Scheduler) failEntry(ctx context.Context, e registry.TaskEntry, report 
 	if err := s.reportFail(ctx, e, body); err != nil {
 		return nil
 	}
-	e, ok := s.reg.Get(e.TaskID)
+	e, ok := s.reg.Get(e.TaskID, e.ScopeKey())
 	if !ok {
 		return nil
 	}
@@ -1854,14 +1948,14 @@ func (s *Scheduler) settleFailure(ctx context.Context, e registry.TaskEntry, rep
 	// the rebuilt entry has no in-memory verdict, and the replay must restore
 	// failure_reason from the entry, never from the body (§4.1).
 	s.enqueuePending(ctx, e, EPFail, report.reason, body)
-	settled, first, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, report.reason, s.now())
+	settled, first, err := s.reg.MarkTerminal(e.TaskID, registry.ResultFailed, report.reason, s.now(), e.ScopeKey())
 	if err != nil {
 		// Same order as an inbound report: the entry preceded the verdict,
 		// so a verdict that failed takes this snapshot with it (§4.6) — and
 		// only this snapshot: another path's newer entry for the same task
 		// keeps its queue home. The convergence round re-derives this
 		// failure from the entry's facts.
-		s.pendingReports.DropIfUnchanged(ctx, e.TaskID, EPFail, body)
+		s.pendingReports.DropIfUnchanged(ctx, e.TaskID, EPFail, body, pendingKey(e))
 		return e, body, err
 	}
 	if first {
@@ -1869,11 +1963,11 @@ func (s *Scheduler) settleFailure(ctx context.Context, e registry.TaskEntry, rep
 			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 			"failure_reason", report.reason)
 		s.metrics.TaskTerminal(string(registry.ResultFailed))
-		if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body); ok {
+		if registered, ok := s.reg.RegisterDecidedReport(e.TaskID, body, e.ScopeKey()); ok {
 			settled = registered
 		}
 	}
-	if decided, ok := s.reg.DecidedReport(e.TaskID); ok {
+	if decided, ok := s.reg.DecidedReport(e.TaskID, e.ScopeKey()); ok {
 		body = decided
 	}
 	return settled, body, nil
@@ -1892,12 +1986,21 @@ func (s *Scheduler) settleFailure(ctx context.Context, e registry.TaskEntry, rep
 // a C13 answer can never reclassify an entry a concurrent report decided
 // (§4.2: terminal is irreversible).
 func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) error {
-	unlock, err := s.lockTaskFor(ctx, taskID)
+	return s.SettleTerminalInScope(ctx, taskID, result, "")
+}
+
+// SettleTerminalInScope is SettleTerminal under an explicit partition.
+func (s *Scheduler) SettleTerminalInScope(ctx context.Context, taskID, result, scopeKey string) error {
+	e, ok := s.reg.Get(taskID, scopeKey)
+	if !ok {
+		return nil
+	}
+	unlock, err := s.lockTaskForScope(ctx, taskID, e.ScopeKey())
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	return s.settleTerminalLocked(ctx, taskID, result)
+	return s.settleTerminalLocked(ctx, e, result)
 }
 
 // SettleCancelled converges a cancelled entry whose daemon never confirmed the
@@ -1908,7 +2011,16 @@ func (s *Scheduler) SettleTerminal(ctx context.Context, taskID, result string) e
 // pods have all terminated (OnJobTerminated); a daemon confirmation that lands
 // first clears the debt.
 func (s *Scheduler) SettleCancelled(ctx context.Context, taskID string) error {
-	unlock, err := s.lockTaskFor(ctx, taskID)
+	return s.SettleCancelledInScope(ctx, taskID, "")
+}
+
+// SettleCancelledInScope is SettleCancelled under an explicit partition.
+func (s *Scheduler) SettleCancelledInScope(ctx context.Context, taskID, scopeKey string) error {
+	e, ok := s.reg.Get(taskID, scopeKey)
+	if !ok {
+		return nil
+	}
+	unlock, err := s.lockTaskForScope(ctx, taskID, e.ScopeKey())
 	if err != nil {
 		return err
 	}
@@ -1916,7 +2028,7 @@ func (s *Scheduler) SettleCancelled(ctx context.Context, taskID string) error {
 	if !s.pendingReports.Rebuilt() {
 		return nil
 	}
-	e, ok := s.reg.Get(taskID)
+	e, ok = s.reg.Get(taskID, e.ScopeKey())
 	if !ok {
 		return nil
 	}
@@ -1924,7 +2036,7 @@ func (s *Scheduler) SettleCancelled(ctx context.Context, taskID string) error {
 		// Only an entry this path decides owes the confirmation: a terminal
 		// one was decided by the daemon's own report (or an earlier settle),
 		// and re-recording the debt would send a second confirmation.
-		if err := s.reg.MarkCancelAckOwed(taskID); err != nil {
+		if err := s.reg.MarkCancelAckOwed(taskID, e.ScopeKey()); err != nil {
 			// The marker's only durable face failed: this process still knows,
 			// so the settlement proceeds — a restart degrades to the
 			// pre-existing behaviour (the server's pending confirmation waits
@@ -1933,13 +2045,13 @@ func (s *Scheduler) SettleCancelled(ctx context.Context, taskID string) error {
 				"task_id", taskID, "err", err)
 		}
 	}
-	return s.settleTerminalLocked(ctx, taskID, string(registry.ResultCancelled))
+	return s.settleTerminalLocked(ctx, e, string(registry.ResultCancelled))
 }
 
 // settleTerminalLocked is SettleTerminal for callers that already hold the
 // task's lock: the S8 answer round (OnStartRejected) and the Job compensation
 // (FailJob).
-func (s *Scheduler) settleTerminalLocked(ctx context.Context, taskID, result string) error {
+func (s *Scheduler) settleTerminalLocked(ctx context.Context, e registry.TaskEntry, result string) error {
 	defer s.SyncInflight()
 	// §4.3: an uncompleted carrier list is not an empty queue. Converging an
 	// entry now could delete the Job of a task whose queued report the
@@ -1947,16 +2059,16 @@ func (s *Scheduler) settleTerminalLocked(ctx context.Context, taskID, result str
 	if !s.pendingReports.Rebuilt() {
 		return nil
 	}
-	e, ok := s.reg.Get(taskID)
+	e, ok := s.reg.Get(e.TaskID, e.ScopeKey())
 	if !ok {
 		return nil
 	}
-	if s.pendingReports.Queued(taskID) {
+	if s.pendingReports.Queued(e.TaskID, pendingKey(e)) {
 		// The partition-and-queue form (§4.6, §10): the objects wait for the
 		// report — a deleted Job must never stand in for a delivered one.
 		return nil
 	}
-	_, first, err := s.reg.MarkTerminal(taskID, registry.Result(result), "", s.now())
+	_, first, err := s.reg.MarkTerminal(e.TaskID, registry.Result(result), "", s.now(), e.ScopeKey())
 	if err != nil {
 		return err
 	}
@@ -1981,18 +2093,27 @@ func (s *Scheduler) settleTerminalLocked(ctx context.Context, taskID, result str
 // decided on, so it must be ordered against DiscardTask's re-read and
 // deletion (§4.2: one decisive fact per transition).
 func (s *Scheduler) AdoptRunning(ctx context.Context, taskID, status string) error {
-	unlock, err := s.lockTaskFor(ctx, taskID)
+	return s.AdoptRunningInScope(ctx, taskID, status, "")
+}
+
+// AdoptRunningInScope is AdoptRunning under an explicit partition.
+func (s *Scheduler) AdoptRunningInScope(ctx context.Context, taskID, status, scopeKey string) error {
+	e, ok := s.reg.Get(taskID, scopeKey)
+	if !ok {
+		return nil
+	}
+	unlock, err := s.lockTaskForScope(ctx, taskID, e.ScopeKey())
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	return s.adoptRunningLocked(ctx, taskID, status)
+	return s.adoptRunningLocked(ctx, e, status)
 }
 
 // adoptRunningLocked is AdoptRunning for callers that already hold the task
 // lock. A terminal entry is never reopened (MarkStartFact refuses it).
-func (s *Scheduler) adoptRunningLocked(ctx context.Context, taskID, status string) error {
-	e, ok := s.reg.MarkStartFact(taskID, s.now())
+func (s *Scheduler) adoptRunningLocked(ctx context.Context, e registry.TaskEntry, status string) error {
+	e, ok := s.reg.MarkStartFact(e.TaskID, s.now(), e.ScopeKey())
 	if !ok {
 		return nil
 	}
@@ -2010,33 +2131,42 @@ func (s *Scheduler) adoptRunningLocked(ctx context.Context, taskID, status strin
 // (ADR-017); a rebuilt entry has none and logs cred.revoke_unavailable. A
 // failed deletion keeps the entry as the only retry handle (§6.4).
 func (s *Scheduler) DiscardTask(ctx context.Context, taskID string) error {
-	unlock, err := s.lockTaskFor(ctx, taskID)
+	return s.DiscardTaskInScope(ctx, taskID, "")
+}
+
+// DiscardTaskInScope is DiscardTask under an explicit partition.
+func (s *Scheduler) DiscardTaskInScope(ctx context.Context, taskID, scopeKey string) error {
+	e, ok := s.reg.Get(taskID, scopeKey)
+	if !ok {
+		return nil
+	}
+	unlock, err := s.lockTaskForScope(ctx, taskID, e.ScopeKey())
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	e, ok := s.reg.Get(taskID)
+	e, ok = s.reg.Get(taskID, e.ScopeKey())
 	if !ok {
 		return nil
 	}
 	if e.IsTerminal() || !e.StartedAt.IsZero() || len(e.Payload) != 0 {
 		return nil
 	}
-	st, err := s.server.TaskStatus(ctx, taskID)
+	st, err := s.taskStatusFor(ctx, e)
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
-		return s.settleVanishedLocked(ctx, taskID)
+		return s.settleVanishedLocked(ctx, e)
 	case err != nil:
 		// Truth unknown: keep the entry as the retry handle.
 		return fmt.Errorf("check status of task %s: %w", taskID, err)
 	}
-	s.reg.SetLastStatusSeen(taskID, st)
+	s.reg.SetLastStatusSeen(taskID, st, e.ScopeKey())
 	switch {
 	case st == "running" || st == "waiting_local_directory":
 		// The daemon holds the task: adopt, never discard.
-		return s.adoptRunningLocked(ctx, taskID, st)
+		return s.adoptRunningLocked(ctx, e, st)
 	case registry.IsTerminalResult(st):
-		return s.settleTerminalLocked(ctx, taskID, st)
+		return s.settleTerminalLocked(ctx, e, st)
 	case st == "queued" || st == "dispatched":
 		return s.discardTaskLocked(ctx, e)
 	default:
@@ -2054,7 +2184,7 @@ func (s *Scheduler) discardTaskLocked(ctx context.Context, e registry.TaskEntry)
 	if err := s.deleteObjects(ctx, e); err != nil {
 		return err
 	}
-	return s.reg.Delete(e.TaskID)
+	return s.reg.Delete(e.TaskID, e.ScopeKey())
 }
 
 // OnTaskVanished settles a task the server deleted (§4.6, C13/C4 404): the
@@ -2066,12 +2196,27 @@ func (s *Scheduler) discardTaskLocked(ctx context.Context, e registry.TaskEntry)
 // once more before the deletion: a stale observation never settles a live
 // task. A decided entry keeps its verdict and only retries the Job deletion.
 func (s *Scheduler) OnTaskVanished(ctx context.Context, taskID string) error {
-	unlock, err := s.lockTaskFor(ctx, taskID)
+	return s.OnTaskVanishedInScope(ctx, taskID, "")
+}
+
+// OnTaskVanishedInScope is OnTaskVanished under an explicit partition.
+func (s *Scheduler) OnTaskVanishedInScope(ctx context.Context, taskID, scopeKey string) error {
+	e, ok := s.reg.Get(taskID, scopeKey)
+	if !ok {
+		return nil
+	}
+	unlock, err := s.lockTaskForScope(ctx, taskID, e.ScopeKey())
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	return s.onTaskVanishedLocked(ctx, taskID)
+	return s.onTaskVanishedLocked(ctx, e)
+}
+
+// OnTaskVanishedInSource is the proxy's entry point: the token names the
+// source and workspace the vanished task belonged to.
+func (s *Scheduler) OnTaskVanishedInSource(ctx context.Context, sourceID, workspaceID, taskID string) error {
+	return s.OnTaskVanishedInScope(ctx, taskID, partitionKey(sourceID, workspaceID))
 }
 
 // onTaskVanishedLocked is OnTaskVanished for callers that already hold the
@@ -2079,38 +2224,38 @@ func (s *Scheduler) OnTaskVanished(ctx context.Context, taskID string) error {
 // verdict deletes the Job and drops the credential's use, so a stale 404 must
 // not be acted on (§4.2). A failed confirmation is not a verdict — the entry
 // is kept and the next round retries.
-func (s *Scheduler) onTaskVanishedLocked(ctx context.Context, taskID string) error {
-	e, ok := s.reg.Get(taskID)
+func (s *Scheduler) onTaskVanishedLocked(ctx context.Context, e registry.TaskEntry) error {
+	e, ok := s.reg.Get(e.TaskID, e.ScopeKey())
 	if !ok {
 		return nil
 	}
 	if e.IsTerminal() {
 		return s.deleteJob(ctx, e)
 	}
-	st, err := s.server.TaskStatus(ctx, taskID)
+	st, err := s.taskStatusFor(ctx, e)
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
-		return s.settleVanishedLocked(ctx, taskID)
+		return s.settleVanishedLocked(ctx, e)
 	case err != nil:
-		return fmt.Errorf("check status of task %s: %w", taskID, err)
+		return fmt.Errorf("check status of task %s: %w", e.TaskID, err)
 	default:
 		// The task still exists: the vanish verdict was not a fact.
-		s.reg.SetLastStatusSeen(taskID, st)
+		s.reg.SetLastStatusSeen(e.TaskID, st, e.ScopeKey())
 		return nil
 	}
 }
 
 // settleVanishedLocked writes the empty-result verdict of a confirmed
 // vanished task and deletes its Job. The caller holds the task lock.
-func (s *Scheduler) settleVanishedLocked(ctx context.Context, taskID string) error {
+func (s *Scheduler) settleVanishedLocked(ctx context.Context, e registry.TaskEntry) error {
 	defer s.SyncInflight()
-	e, ok := s.reg.Get(taskID)
+	e, ok := s.reg.Get(e.TaskID, e.ScopeKey())
 	if !ok {
 		return nil
 	}
 	// A decided entry keeps its verdict: the in-place settlement only writes
 	// the empty result when this path is the first to decide (§4.2, §4.4).
-	_, first, err := s.reg.MarkTerminal(taskID, "", "", s.now())
+	_, first, err := s.reg.MarkTerminal(e.TaskID, "", "", s.now(), e.ScopeKey())
 	if err != nil {
 		return err
 	}
@@ -2131,7 +2276,49 @@ func (s *Scheduler) revokeCredential(ctx context.Context, e registry.TaskEntry) 
 			"task_id", e.TaskID, "job_name", e.JobName)
 		return
 	}
+	if e.SourceID != "" {
+		if revoker, ok := s.revoker.(SourceRevoker); ok {
+			revoker.RevokeInSource(e.TokenHash, e.SourceID, e.WorkspaceID)
+			return
+		}
+		s.log.WarnContext(ctx, "cred.revoke_unavailable",
+			"task_id", e.TaskID, "job_name", e.JobName,
+			"reason", "revoker does not implement source partitioning")
+		return
+	}
 	s.revoker.Revoke(e.TokenHash, e.WorkspaceID)
+}
+
+// forwardInScope sends one report through the client of the entry's source
+// and workspace. A source-aware client is mandatory when the entry carries a
+// source: falling back to the unscoped forward would send the report to
+// whichever server the legacy client points at.
+func (s *Scheduler) forwardInScope(ctx context.Context, ep Endpoint, taskID, sourceID, workspaceID string, body []byte) (int, []byte, error) {
+	if sourceID != "" {
+		forwarder, ok := s.server.(SourceForwarder)
+		if !ok {
+			return 0, nil, fmt.Errorf("server client cannot route source %q", sourceID)
+		}
+		return forwarder.ForwardInSourceWorkspace(ctx, ep, taskID, sourceID, workspaceID, body)
+	}
+	if workspaceID != "" {
+		return s.server.ForwardInWorkspace(ctx, ep, taskID, workspaceID, body)
+	}
+	return s.server.Forward(ctx, ep, taskID, body)
+}
+
+// taskStatusFor reads C13 through the entry's source partition. A source-
+// scoped entry has no workspace-only fallback: borrowing another source's
+// credential would answer for a different server's task with the same id.
+func (s *Scheduler) taskStatusFor(ctx context.Context, e registry.TaskEntry) (string, error) {
+	if e.SourceID == "" {
+		return s.server.TaskStatus(ctx, e.TaskID)
+	}
+	client, ok := s.server.(SourceStatusClient)
+	if !ok {
+		return "", fmt.Errorf("server client cannot route source %q", e.SourceID)
+	}
+	return client.TaskStatusInSource(ctx, e.SourceID, e.WorkspaceID, e.TaskID)
 }
 
 // discardQuietly runs the non-drain discard of a duplicate-claim replacement
@@ -2148,7 +2335,7 @@ func (s *Scheduler) revokeCredential(ctx context.Context, e registry.TaskEntry) 
 // dropped instead. An entry already gone, or a failed deletion, still lets the
 // replacement proceed: the new claim cleans up leftovers idempotently.
 func (s *Scheduler) discardQuietly(ctx context.Context, e registry.TaskEntry) bool {
-	fresh, ok := s.reg.Get(e.TaskID)
+	fresh, ok := s.reg.Get(e.TaskID, e.ScopeKey())
 	if !ok {
 		return true
 	}
@@ -2177,8 +2364,8 @@ func (s *Scheduler) reclaimObjectless(ctx context.Context, e registry.TaskEntry)
 	if e.CancelAckOwed {
 		s.synthesizeCancelAck(ctx, e, time.Time{})
 	}
-	drainSeconds := s.drainSeconds(e.TaskID)
-	if err := s.reg.Delete(e.TaskID); err != nil {
+	drainSeconds := s.drainSeconds(e)
+	if err := s.reg.Delete(e.TaskID, e.ScopeKey()); err != nil {
 		return err
 	}
 	s.metrics.CredReclaimed(JobTerminationReasonNoObjects, drainSeconds)
@@ -2271,10 +2458,10 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 		s.synthesizeCancelAck(ctx, e, podTerminatedAt)
 	}
 	// ④ The entry goes last.
-	if err := s.reg.Delete(e.TaskID); err != nil {
+	if err := s.reg.Delete(e.TaskID, e.ScopeKey()); err != nil {
 		return err
 	}
-	drainSeconds := s.drainSeconds(e.TaskID)
+	drainSeconds := s.drainSeconds(e)
 	s.metrics.CredReclaimed(reason, drainSeconds)
 	podTerminatedAtField := ""
 	if !podTerminatedAt.IsZero() {
@@ -2295,7 +2482,7 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 	// deliberately not part of it: a failure neither stalls the credential's
 	// bound nor keeps the entry — the template's ttlSecondsAfterFinished owns
 	// the leftover Job (§8.1).
-	if !s.pendingReports.Queued(e.TaskID) {
+	if !s.pendingReports.Queued(e.TaskID, pendingKey(e)) {
 		if err := s.deleteJob(ctx, e); err != nil {
 			// The entry is gone, so nothing retries this deletion: the
 			// counter is the only alarm that the Job will live until the
@@ -2324,17 +2511,27 @@ var cancelAckConfirmation = []byte(`{"process_cleanup_confirmed":true}`)
 // permanent 4xx dropped with an error). A forward that settles drops it back
 // out in the same step.
 func (s *Scheduler) synthesizeCancelAck(ctx context.Context, e registry.TaskEntry, podTerminatedAt time.Time) {
-	forward := s.server.Forward
-	if e.WorkspaceID != "" {
-		forward = func(ctx context.Context, ep Endpoint, taskID string, body []byte) (int, []byte, error) {
-			return s.server.ForwardInWorkspace(ctx, ep, taskID, e.WorkspaceID, body)
-		}
+	forward := func(ctx context.Context, ep Endpoint, taskID string, body []byte) (int, []byte, error) {
+		return s.forwardInScope(ctx, ep, taskID, e.SourceID, e.WorkspaceID, body)
 	}
-	queued := s.pendingReports.EnqueueSynthetic(ctx, e.TaskID, e.JobName, e.DaemonID, e.WorkspaceID, EPCancelAck, cancelAckConfirmation) == nil
+	queued := func() bool {
+		if e.SourceID == "" {
+			return s.pendingReports.EnqueueSynthetic(ctx, e.TaskID, e.JobName, e.DaemonID, e.WorkspaceID, EPCancelAck, cancelAckConfirmation, pendingKey(e)) == nil
+		}
+		queue, ok := s.pendingReports.(SourcePendingReportQueue)
+		if !ok {
+			s.log.ErrorContext(ctx, "task.forward_undelivered",
+				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
+				"endpoint", string(EPCancelAck),
+				"reason", "pending queue cannot route source", "source_id", e.SourceID)
+			return false
+		}
+		return queue.EnqueueSyntheticInSource(ctx, e.TaskID, e.JobName, e.DaemonID, e.SourceID, e.WorkspaceID, EPCancelAck, cancelAckConfirmation, pendingKey(e)) == nil
+	}()
 	if queued {
 		// The durable record exists; keeping the entry marker too would only
 		// re-enqueue the same confirmation if this teardown is retried.
-		s.reg.ClearCancelAckOwed(e.TaskID)
+		s.reg.ClearCancelAckOwed(e.TaskID, e.ScopeKey())
 	}
 	podField := ""
 	if !podTerminatedAt.IsZero() {
@@ -2351,15 +2548,15 @@ func (s *Scheduler) synthesizeCancelAck(ctx context.Context, e registry.TaskEntr
 			"workspace_id", e.WorkspaceID, "pod_terminated_at", podField,
 			"queued", queued, "status", 0, "err", err)
 	case terminalReportDelivered(code):
-		s.pendingReports.Drop(ctx, e.TaskID)
-		s.reg.ClearCancelAckOwed(e.TaskID)
+		s.pendingReports.Drop(ctx, e.TaskID, pendingKey(e))
+		s.reg.ClearCancelAckOwed(e.TaskID, e.ScopeKey())
 		s.log.InfoContext(ctx, "task.cancel_ack_synthesized",
 			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 			"workspace_id", e.WorkspaceID, "pod_terminated_at", podField,
 			"queued", queued, "status", code)
 	case permanentTerminalRejection(code):
-		s.pendingReports.Drop(ctx, e.TaskID)
-		s.reg.ClearCancelAckOwed(e.TaskID)
+		s.pendingReports.Drop(ctx, e.TaskID, pendingKey(e))
+		s.reg.ClearCancelAckOwed(e.TaskID, e.ScopeKey())
 		s.log.ErrorContext(ctx, "task.cancel_ack_synthesized",
 			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 			"workspace_id", e.WorkspaceID, "pod_terminated_at", podField,
@@ -2378,8 +2575,8 @@ func (s *Scheduler) synthesizeCancelAck(ctx context.Context, e registry.TaskEntr
 // reclaim — the drain duration the histogram reports. The done index holds
 // the verdict moment; it is written once, at the alive → draining
 // transition, so repeated terminal reports cannot restart the measurement.
-func (s *Scheduler) drainSeconds(taskID string) float64 {
-	at, ok := s.reg.DoneAt(taskID)
+func (s *Scheduler) drainSeconds(e registry.TaskEntry) float64 {
+	at, ok := s.reg.DoneAt(e.TaskID, e.ScopeKey())
 	if !ok {
 		return 0
 	}
@@ -2556,7 +2753,11 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		// The presence key carries the workspace: the same task id in two
 		// workspaces is two instances, and one must not protect the other's
 		// orphaned credential (§6.5 按 workspace 分区).
-		withJob[workspaceTaskKey(jobs[i].Labels[registry.LabelWorkspaceID], taskID)] = struct{}{}
+		withJob[registry.TaskKey(
+			jobs[i].Labels[registry.LabelSourceID],
+			jobs[i].Labels[registry.LabelWorkspaceID],
+			taskID,
+		)] = struct{}{}
 	}
 	var firstErr error
 	var unpartitioned int
@@ -2572,6 +2773,7 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 			continue
 		}
 		workspaceID := secret.Labels[registry.LabelWorkspaceID]
+		sourceID := secret.Labels[registry.LabelSourceID]
 		if workspaceID == "" {
 			// No workspace identity on the object itself means no partition:
 			// the snapshot key, the Job filter and the task lock would all be
@@ -2584,20 +2786,22 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 			// outside its sweep domain (§6.5: 跨 workspace 的对象不清扫).
 			continue
 		}
-		if secret.Name != jobbuilder.CredentialSecretName(jobbuilder.DaemonIDFor(taskID)) {
+		daemonID := jobbuilder.DaemonIDForInScope(taskID, sourceID, workspaceID)
+		if secret.Name != jobbuilder.CredentialSecretName(daemonID) {
 			continue
 		}
-		if _, ok := s.reg.Get(taskID); ok {
+		partition := partitionKey(sourceID, workspaceID)
+		if _, ok := s.reg.Get(taskID, partition); ok {
 			continue
 		}
-		if _, ok := withJob[workspaceTaskKey(workspaceID, taskID)]; ok {
+		if _, ok := withJob[registry.TaskKey(sourceID, workspaceID, taskID)]; ok {
 			continue
 		}
 		// The snapshot above only skips the live face cheaply; it is not the
 		// decision. Take the task's write lock and re-read both halves under
 		// it, so the delete cannot land between a same-task claim's entry
 		// write and the Secret it rebuilds.
-		unlock, lockErr := s.lockTaskIn(ctx, workspaceID, taskID)
+		unlock, lockErr := s.lockTaskIn(ctx, partition, taskID)
 		if lockErr != nil {
 			if firstErr == nil {
 				firstErr = lockErr
@@ -2610,7 +2814,7 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 				"secret", secret.Name, "err", lockErr.Error())
 			continue
 		}
-		owned, checkErr := s.credentialOwner(ctx, workspaceID, taskID)
+		owned, checkErr := s.credentialOwner(ctx, sourceID, workspaceID, taskID)
 		var deleteErr error
 		if checkErr == nil && !owned {
 			deleteErr = s.jobs.DeleteSecret(ctx, secret.Name)
@@ -2647,7 +2851,8 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 		// value the sweep can name (§9.1: cred.orphan_secret_removed).
 		s.log.InfoContext(ctx, "cred.orphan_secret_removed",
 			"task_id", taskID, "workspace_id", workspaceID,
-			"job_name", jobbuilder.DaemonIDFor(taskID), "secret", secret.Name)
+			"source_id", sourceID,
+			"job_name", daemonID, "secret", secret.Name)
 	}
 	if unpartitioned > 0 {
 		// One line per round: a legacy object without the workspace label has
@@ -2701,14 +2906,14 @@ func (s *Scheduler) SweepOrphanSecrets(ctx context.Context) error {
 // called under the task's write lock, so both faces answer for the same
 // moment as the deletion that follows — the round's own list would be a
 // snapshot from before the lock (§6.5 判据面).
-func (s *Scheduler) credentialOwner(ctx context.Context, workspaceID, taskID string) (bool, error) {
+func (s *Scheduler) credentialOwner(ctx context.Context, sourceID, workspaceID, taskID string) (bool, error) {
 	if workspaceID == "" {
 		// No partition means no adjudication: the Job filter would match only
 		// objects without the label and the caller could delete a live
 		// credential. Fail closed (§6.5 按 workspace 分区).
 		return true, nil
 	}
-	if _, ok := s.reg.Get(taskID); ok {
+	if _, ok := s.reg.Get(taskID, partitionKey(sourceID, workspaceID)); ok {
 		return true, nil
 	}
 	jobs, err := s.jobs.ListJobsByTask(ctx, workspaceID, taskID)
@@ -2870,23 +3075,23 @@ func (s *Scheduler) rebuildFromK8s(ctx context.Context) error {
 // clobber a concurrent daemon callback.
 func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) error {
 	if e.IsTerminal() {
-		return s.SettleTerminal(ctx, e.TaskID, string(e.Result))
+		return s.SettleTerminalInScope(ctx, e.TaskID, string(e.Result), e.ScopeKey())
 	}
-	st, err := s.server.TaskStatus(ctx, e.TaskID)
+	st, err := s.taskStatusFor(ctx, e)
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
-		return s.OnTaskVanished(ctx, e.TaskID)
+		return s.OnTaskVanishedInScope(ctx, e.TaskID, e.ScopeKey())
 	case err != nil:
 		return err
 	}
-	s.reg.SetLastStatusSeen(e.TaskID, st)
+	s.reg.SetLastStatusSeen(e.TaskID, st, e.ScopeKey())
 	switch {
 	case st == "running" || st == "waiting_local_directory":
 		// The task is in the daemon's hands: keep the Job and accept its
 		// reports. AdoptRunning records started_at once; it only gates the
 		// boot timeout, so the rebuild-time approximation is safe. A miss
 		// means the entry turned terminal or was deleted mid-round — benign.
-		return s.AdoptRunning(ctx, e.TaskID, st)
+		return s.AdoptRunningInScope(ctx, e.TaskID, st, e.ScopeKey())
 	case st == "queued" || st == "dispatched":
 		// ADR-026 决策 3/5: the discard row is a rebuilt entry — payload lost
 		// with the restart and no start fact. Payload availability is stable
@@ -2899,11 +3104,11 @@ func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) err
 			// §4.3 未完成创建的接续: the claim was persisted but the process
 			// died before the Job existed. Continuing is idempotent and keeps
 			// the task off the redispatch path.
-			return s.ContinueClaim(ctx, e.TaskID)
+			return s.ContinueClaimInScope(ctx, e.TaskID, e.ScopeKey())
 		}
-		return s.DiscardTask(ctx, e.TaskID)
+		return s.DiscardTaskInScope(ctx, e.TaskID, e.ScopeKey())
 	case registry.IsTerminalResult(st):
-		return s.SettleTerminal(ctx, e.TaskID, st)
+		return s.SettleTerminalInScope(ctx, e.TaskID, st, e.ScopeKey())
 	default:
 		s.logUnclassifiedStatus(ctx, e, st)
 		return nil
@@ -3026,9 +3231,10 @@ func claimWorkspace(task json.RawMessage) string {
 // server's lease expiry (AC-76). The lock key is the task's workspace, the same
 // key every other path of that task takes (§4.2 写锁键含 workspace). It reports
 // whether the row took the caller's reservation over.
-func (s *Scheduler) settleMalformedClaim(ctx context.Context, workspaceID, id string, task json.RawMessage, res SlotReservation, reserved bool, parseErr error) (bool, error) {
+func (s *Scheduler) settleMalformedClaim(ctx context.Context, sourceID, workspaceID, id string, task json.RawMessage, res SlotReservation, reserved bool, parseErr error) (bool, error) {
+	partition := partitionKey(sourceID, workspaceID)
 	lockWorkspace := workspaceID
-	if existing, ok := s.reg.Get(id); ok && existing.WorkspaceID != "" {
+	if existing, ok := s.reg.Get(id, partition); ok && existing.WorkspaceID != "" {
 		lockWorkspace = existing.WorkspaceID
 	}
 	unlock, err := s.lockTaskIn(ctx, lockWorkspace, id)
@@ -3037,13 +3243,14 @@ func (s *Scheduler) settleMalformedClaim(ctx context.Context, workspaceID, id st
 	}
 	defer unlock()
 	cause := fmt.Errorf("%w: malformed claim payload: %v", jobbuilder.ErrInvalidTaskID, parseErr)
-	if existing, ok := s.reg.Get(id); ok {
+	if existing, ok := s.reg.Get(id, partition); ok {
 		if !existing.IsTerminal() {
 			s.failClaim(ctx, existing, cause)
 		}
 		return false, nil
 	}
-	if s.reg.IsDoneAny(id) {
+	if (sourceID != "" || workspaceID != "") && s.reg.IsDoneInSource(sourceID, workspaceID, id) ||
+		sourceID == "" && workspaceID == "" && s.reg.IsDoneAny(id) {
 		s.metrics.DuplicateDispatch()
 		s.log.WarnContext(ctx, "duplicate_dispatch",
 			"task_id", id, "old_job_name", "", "action", "drop_terminal_done")
@@ -3060,6 +3267,7 @@ func (s *Scheduler) settleMalformedClaim(ctx context.Context, workspaceID, id st
 	daemonID := jobbuilder.DaemonIDFor(id)
 	e := registry.TaskEntry{
 		TaskID:       id,
+		SourceID:     sourceID,
 		WorkspaceID:  workspaceID,
 		JobNamespace: s.cfg.JobNamespace,
 		// No object exists (or ever will); the identity name is the key the
@@ -3112,18 +3320,18 @@ func (s *Scheduler) noteUnnameableClaim(ctx context.Context, err error, size int
 // (§4.4): when one is registered it wins over the body this call synthesized,
 // so a replay can never displace the verdict.
 func (s *Scheduler) reportFail(ctx context.Context, e registry.TaskEntry, body []byte) error {
-	if decided, ok := s.reg.DecidedReport(e.TaskID); ok {
+	if decided, ok := s.reg.DecidedReport(e.TaskID, e.ScopeKey()); ok {
 		body = decided
 	}
-	code, _, err := s.server.Forward(ctx, EPFail, e.TaskID, body)
+	code, _, err := s.forwardInScope(ctx, EPFail, e.TaskID, e.SourceID, e.WorkspaceID, body)
 	if err == nil {
 		switch {
 		case terminalReportDelivered(code):
-			s.pendingReports.Drop(ctx, e.TaskID)
+			s.pendingReports.Drop(ctx, e.TaskID, pendingKey(e))
 			return nil
 		case permanentTerminalRejection(code):
 			// Permanent (§1.5): a replay would only be refused again.
-			s.pendingReports.Drop(ctx, e.TaskID)
+			s.pendingReports.Drop(ctx, e.TaskID, pendingKey(e))
 		}
 	}
 	if err == nil {
@@ -3158,32 +3366,37 @@ func (s *Scheduler) RestorePendingReports(ctx context.Context) error {
 // is never an inbound report — it does not enter the attribution gate and
 // cannot emit a second attribution decision.
 func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, workspaceID string, body []byte, failureReason string) (int, []byte, error) {
+	return s.DeliverQueuedInSource(ctx, ep, taskID, "", workspaceID, body, failureReason)
+}
+
+// DeliverQueuedInSource is DeliverQueued with the queued report's source as
+// the routing key. It is what a queue rebuilt after a restart uses when the
+// live entry is already gone.
+func (s *Scheduler) DeliverQueuedInSource(ctx context.Context, ep Endpoint, taskID, sourceID, workspaceID string, body []byte, failureReason string) (int, []byte, error) {
 	// The queue snapshot this replay was handed. It is the entry's identity
 	// for every drop below: body may be replaced by the decided body before
 	// the forward, but an unconditional drop by task id would take a newer
 	// enqueue (§10 forbids losing that report).
 	queuedBody := body
-	e, ok := s.reg.Get(taskID)
+	partition := partitionKey(sourceID, workspaceID)
+	e, ok := s.reg.Get(taskID, partition)
+	if ok {
+		sourceID, workspaceID = e.SourceID, e.WorkspaceID
+	}
 	if !ok {
 		// The credential was reclaimed before the report landed: the entry is
 		// gone, but the report still goes — a terminal callback is never
 		// dropped (§10). No objects are left to clean up. The queue entry's
 		// workspace is the only routing key left; an empty one is the
 		// single-workspace shape the pre-ADR-047 callers pass.
-		forward := s.server.Forward
-		if workspaceID != "" {
-			forward = func(ctx context.Context, ep Endpoint, taskID string, body []byte) (int, []byte, error) {
-				return s.server.ForwardInWorkspace(ctx, ep, taskID, workspaceID, body)
-			}
-		}
-		code, resp, err := forward(ctx, ep, taskID, body)
+		code, resp, err := s.forwardInScope(ctx, ep, taskID, sourceID, workspaceID, body)
 		if err == nil && ep.IsTerminal() && permanentTerminalRejection(code) {
 			// A replay of a permanently refused report would only be refused
 			// again: the queue entry goes now instead of at the TTL — but only
 			// while the queue still holds the snapshot just refused. A newer
 			// enqueue for the same task owns its own entry and its own carrier
 			// (§10).
-			s.pendingReports.DropIfUnchanged(ctx, taskID, ep, queuedBody)
+			s.pendingReports.DropIfUnchanged(ctx, taskID, ep, queuedBody, pendingKeyFor(sourceID, workspaceID, taskID))
 			s.log.ErrorContext(ctx, "task.forward_dropped",
 				"task_id", taskID, "endpoint", string(ep), "status", code,
 				"reason", "permanent_4xx")
@@ -3194,11 +3407,11 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, work
 	// body never stands for it, or a synthesized confirmation would be
 	// replayed as whatever body decided the task (§4.6 兜底一).
 	if ep != EPCancelAck {
-		if decided, ok := s.reg.DecidedReport(taskID); ok {
+		if decided, ok := s.reg.DecidedReport(taskID, partition); ok {
 			body = decided
 		}
 	}
-	code, resp, err := s.server.Forward(ctx, ep, taskID, body)
+	code, resp, err := s.forwardInScope(ctx, ep, taskID, sourceID, workspaceID, body)
 	if err != nil {
 		return code, resp, err
 	}
@@ -3211,7 +3424,7 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, work
 			// Accepted (2xx / 404 / 409) means the confirmation is settled
 			// server-side, whoever sent it: the debt a settle-on-the-daemon's-
 			// behalf recorded dies with this replay (§4.6 兜底一).
-			s.reg.ClearCancelAckOwed(taskID)
+			s.reg.ClearCancelAckOwed(taskID, partition)
 		}
 		if code == 404 {
 			// §4.4's in-place decision: the server no longer holds the task.
@@ -3221,11 +3434,11 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, work
 			// keeps its result (§4.2, §4.4). Only an instance that never
 			// reached a verdict settles with no result, and the Job deletion
 			// uses the fresh entry.
-			unlock, lockErr := s.lockTaskFor(ctx, taskID)
+			unlock, lockErr := s.lockTaskForScope(ctx, taskID, partition)
 			if lockErr != nil {
 				return http.StatusServiceUnavailable, nil, lockErr
 			}
-			fresh, ok := s.reg.Get(taskID)
+			fresh, ok := s.reg.Get(taskID, partition)
 			if !ok {
 				// Reclaimed while the replay was in flight: the pre-forward
 				// snapshot is the only Job handle left, and the deletion is
@@ -3235,7 +3448,7 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, work
 				return code, resp, nil
 			}
 			if !fresh.IsTerminal() && len(fresh.DecidedReport) == 0 {
-				if _, _, err := s.reg.MarkTerminal(taskID, "", "", s.now()); err != nil {
+				if _, _, err := s.reg.MarkTerminal(taskID, "", "", s.now(), partition); err != nil {
 					s.log.ErrorContext(ctx, "task.settle_failed",
 						"task_id", taskID, "job_name", fresh.JobName, "daemon_id", fresh.DaemonID,
 						"reason", "server has no record of the task", "err", err)
@@ -3250,7 +3463,7 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, work
 		// carries no verdict, so the replay's endpoint supplies it — without
 		// this the later missing-Job path would synthesize a failure for a
 		// completed task (§4.3).
-		s.settleReplayed(ctx, taskID, ep, failureReason)
+		s.settleReplayed(ctx, taskID, ep, failureReason, partition)
 		s.deleteJob(ctx, e)
 	case permanentTerminalRejection(code):
 		// §1.5: a permanent 4xx is never retried. The queue entry goes so the
@@ -3259,7 +3472,7 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, work
 		// other terminal path. Only the snapshot just refused leaves: a newer
 		// enqueue for the same task — a late report enqueued while this replay
 		// was in flight — keeps its entry and carrier (§10).
-		s.pendingReports.DropIfUnchanged(ctx, taskID, ep, queuedBody)
+		s.pendingReports.DropIfUnchanged(ctx, taskID, ep, queuedBody, pendingKeyFor(sourceID, workspaceID, taskID))
 		s.log.ErrorContext(ctx, "task.forward_dropped",
 			"task_id", taskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 			"endpoint", string(ep), "status", code, "reason", "permanent_4xx")
@@ -3276,13 +3489,13 @@ func (s *Scheduler) DeliverQueued(ctx context.Context, ep Endpoint, taskID, work
 // failureReason is the attribution the queued entry was decided with: a
 // synthesized failure replayed across a restart must project the same
 // failure_reason, never an empty one (§4.1).
-func (s *Scheduler) settleReplayed(ctx context.Context, taskID string, ep Endpoint, failureReason string) {
-	unlock, err := s.lockTaskFor(ctx, taskID)
+func (s *Scheduler) settleReplayed(ctx context.Context, taskID string, ep Endpoint, failureReason, partition string) {
+	unlock, err := s.lockTaskForScope(ctx, taskID, partition)
 	if err != nil {
 		return
 	}
 	defer unlock()
-	fresh, ok := s.reg.Get(taskID)
+	fresh, ok := s.reg.Get(taskID, partition)
 	if !ok || fresh.IsTerminal() || len(fresh.DecidedReport) > 0 {
 		return
 	}
@@ -3291,7 +3504,7 @@ func (s *Scheduler) settleReplayed(ctx context.Context, taskID string, ep Endpoi
 	if result == registry.ResultFailed {
 		reason = failureReason
 	}
-	_, first, err := s.reg.MarkTerminal(taskID, result, reason, s.now())
+	_, first, err := s.reg.MarkTerminal(taskID, result, reason, s.now(), partition)
 	if err != nil {
 		s.log.ErrorContext(ctx, "task.settle_failed",
 			"task_id", taskID, "job_name", fresh.JobName, "daemon_id", fresh.DaemonID,
@@ -3348,6 +3561,7 @@ func jobbuilderEntry(e registry.TaskEntry) jobbuilder.TaskEntry {
 	provider, profileID, _ := registry.SplitRuntimeIdentity(e.RuntimeIdentity)
 	return jobbuilder.TaskEntry{
 		TaskID:           e.TaskID,
+		SourceID:         e.SourceID,
 		AgentID:          e.AgentID,
 		IssueID:          e.IssueID,
 		IssueIdentifier:  e.IssueIdentifier,

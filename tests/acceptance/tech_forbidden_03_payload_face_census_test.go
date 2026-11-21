@@ -209,7 +209,7 @@ var tcPayloadProjectionKeys = []string{
 	"failure_reason", "issue_id", "issue_identifier", "job_created_at",
 	"job_name", "job_namespace", "job_runtime_id", "last_status_seen",
 	"lease_keep_until", "node_name", "result", "started_at", "state",
-	"task_id", "workspace_id",
+	"source_id", "task_id", "workspace_id",
 }
 
 // tcPayloadSnapshotKeys is the shared-state snapshot's key set (§4.3,
@@ -236,15 +236,15 @@ var tcPayloadSnapshotKeys = []string{
 	"last_status_seen", "lease_keep_until", "node_name", "payload",
 	"prior_session_id", "project_id", "project_source",
 	"real_runtime_id", "result", "runtime_identity", "started_at", "state",
-	"task_id", "token_hash", "workspace_id",
+	"source_id", "task_id", "token_hash", "workspace_id",
 }
 
 // tcPayloadCarrierKeys is the pending-report carrier Secret's data key set
 // (§3: 内容 = 终态上报体逐字字节与重放所需身份; §4.6). It is the second
 // design-registered face that carries the verdict body.
 var tcPayloadCarrierKeys = []string{
-	"attempts", "body", "daemon_id", "endpoint", "enqueued_at",
-	"failure_reason", "job_name", "synthetic", "task_id", "workspace_id",
+	"attempts", "body", "daemon_id", "endpoint", "enqueued_at", "key",
+	"failure_reason", "job_name", "source_id", "synthetic", "task_id", "workspace_id",
 }
 
 // tcPayloadCarrierLabelKeys is the carrier's label set (§6.5: 角色标签（载体）
@@ -279,6 +279,7 @@ var tcPayloadJobAnnotationKeys = append(append([]string(nil),
 	"foreman.tsic.top/real-runtime-id",
 	"foreman.tsic.top/runtime-provider",
 	"foreman.tsic.top/runtime-profile-id",
+	"foreman.tsic.top/source-id",
 )
 
 // tcPayloadPodAnnotationKeys is the pod template's annotation set: §4.3 lists
@@ -290,6 +291,7 @@ var tcPayloadJobLabelKeys = []string{
 	"app.kubernetes.io/managed-by",
 	"app.kubernetes.io/name",
 	"foreman.tsic.top/agent-id",
+	"foreman.tsic.top/source-id",
 	"foreman.tsic.top/task-id",
 	"foreman.tsic.top/workspace-id",
 }
@@ -299,6 +301,7 @@ var tcPayloadJobLabelKeys = []string{
 var tcPayloadPodLabelKeys = []string{
 	"app.kubernetes.io/name",
 	"foreman.tsic.top/daemon-id",
+	"foreman.tsic.top/source-id",
 	"foreman.tsic.top/task-id",
 	"foreman.tsic.top/workspace-id",
 }
@@ -352,7 +355,7 @@ var tcPayloadLogKeys = []string{
 	"runtimes", "saturated", "secret", "segment", "server_id", "server_url",
 	"session_exists", "side", "skill_cache", "skill_cache_max_bytes",
 	"skill_cache_ttl", "skipped", "soft_affinity_suppressed",
-	"source", "stage", "state_root", "status",
+	"source", "source_id", "stage", "state_root", "status",
 	"step", "task_dir_ttl", "task_dirs", "task_id",
 	"template", "template_written_faces", "time", "trigger",
 	"ts", "ttl", "ttl_seconds", "type",

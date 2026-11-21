@@ -252,9 +252,9 @@ func TestProjectLookupSkippedWhenNoAxisNeedsIt(t *testing.T) {
 func TestProjectCacheDropsAnExpiredEntryOnRead(t *testing.T) {
 	var c projectCache
 	now := time.Now()
-	c.put("ws-1", "issue-1", "foreman-api", now)
+	c.put("", "ws-1", "issue-1", "foreman-api", now)
 
-	if _, ok := c.get("ws-1", "issue-1", now.Add(projectCacheTTL+time.Second)); ok {
+	if _, ok := c.get("", "ws-1", "issue-1", now.Add(projectCacheTTL+time.Second)); ok {
 		t.Fatal("an entry past its TTL read as fresh")
 	}
 	if got := len(c.entries); got != 0 {
@@ -271,22 +271,22 @@ func TestProjectCacheIsBounded(t *testing.T) {
 	var c projectCache
 	base := time.Now()
 	for i := range projectCacheLimit {
-		c.put("ws-1", fmt.Sprintf("issue-%d", i), "foreman-api", base.Add(time.Duration(i)*time.Millisecond))
+		c.put("", "ws-1", fmt.Sprintf("issue-%d", i), "foreman-api", base.Add(time.Duration(i)*time.Millisecond))
 	}
 	if got := len(c.entries); got != projectCacheLimit {
 		t.Fatalf("cached entries = %d, want the limit %d", got, projectCacheLimit)
 	}
 
 	newest := base.Add(projectCacheLimit * time.Millisecond)
-	c.put("ws-1", "issue-new", "foreman-api", newest)
+	c.put("", "ws-1", "issue-new", "foreman-api", newest)
 
 	if got := len(c.entries); got > projectCacheLimit {
 		t.Fatalf("cached entries = %d after the overflow put, want at most %d", got, projectCacheLimit)
 	}
-	if _, ok := c.get("ws-1", "issue-0", newest); ok {
+	if _, ok := c.get("", "ws-1", "issue-0", newest); ok {
 		t.Error("the oldest pair survived the eviction")
 	}
-	if projectID, ok := c.get("ws-1", "issue-new", newest); !ok || projectID != "foreman-api" {
+	if projectID, ok := c.get("", "ws-1", "issue-new", newest); !ok || projectID != "foreman-api" {
 		t.Errorf("the new pair = %q/%v, want a cache hit", projectID, ok)
 	}
 }
@@ -298,16 +298,16 @@ func TestProjectCacheEvictsExpiredBeforeLive(t *testing.T) {
 	var c projectCache
 	base := time.Now()
 	for i := range projectCacheLimit {
-		c.put("ws-1", fmt.Sprintf("issue-%d", i), "foreman-api", base)
+		c.put("", "ws-1", fmt.Sprintf("issue-%d", i), "foreman-api", base)
 	}
 
 	later := base.Add(projectCacheTTL + time.Second)
-	c.put("ws-1", "issue-new", "foreman-api", later)
+	c.put("", "ws-1", "issue-new", "foreman-api", later)
 
 	if got := len(c.entries); got != 1 {
 		t.Fatalf("cached entries = %d after the expired purge, want the new pair alone", got)
 	}
-	if _, ok := c.get("ws-1", "issue-new", later); !ok {
+	if _, ok := c.get("", "ws-1", "issue-new", later); !ok {
 		t.Error("the new pair did not survive its own put")
 	}
 }

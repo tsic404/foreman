@@ -31,6 +31,7 @@ func (s *FakeServer) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ids := []string{claims.WorkspaceID}
+	sourceID := claims.SourceID
 	if claims.Role == catalogProbeRole {
 		session, found := s.probeSession(claims)
 		if !found {
@@ -43,15 +44,16 @@ func (s *FakeServer) handleWorkspaces(w http.ResponseWriter, r *http.Request) {
 		// The session, not the claims, decides the answer: a workspace-pinned
 		// catalog probe sees its own workspace, a startup / discovery probe
 		// the discovery set (§2.2 S-1).
+		sourceID = session.SourceID
 		if session.WorkspaceID == "" {
-			ids = s.discoverySet()
+			ids = s.discoverySet(sourceID)
 		} else {
 			ids = []string{session.WorkspaceID}
 		}
 	}
 	answer := make([]map[string]string, 0, len(ids))
 	for _, id := range ids {
-		client := s.clientFor(id)
+		client := s.clientFor(sourceID, id)
 		if client == nil {
 			// S-1 promises the Job's own workspace (single element). A
 			// workspace this deployment does not serve is a routing mismatch,
@@ -82,7 +84,7 @@ func (s *FakeServer) handleRepos(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "workspace does not belong to this job")
 		return
 	}
-	client := s.clientFor(ws)
+	client := s.clientFor(claims.SourceID, ws)
 	if client == nil {
 		writeError(w, http.StatusForbidden, "workspace is not configured")
 		return
@@ -112,7 +114,7 @@ func (s *FakeServer) handleRuntimeProfiles(w http.ResponseWriter, r *http.Reques
 		writeError(w, http.StatusForbidden, "workspace does not belong to this job")
 		return
 	}
-	client := s.clientFor(ws)
+	client := s.clientFor(claims.SourceID, ws)
 	if client == nil {
 		writeError(w, http.StatusForbidden, "workspace is not configured")
 		return
@@ -192,7 +194,7 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 	// only ever confirm an id it currently holds; when neither resolves, the
 	// registration is refused instead of answered for another profile or for
 	// the same type's builtin.
-	client := s.clientFor(e.WorkspaceID)
+	client := s.clientFor(e.SourceID, e.WorkspaceID)
 	if client == nil {
 		writeError(w, http.StatusForbidden, "workspace is not configured")
 		return
@@ -297,7 +299,7 @@ func (s *FakeServer) handleHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// runtime id that is not this Job's is answered 404 so the daemon
 	// re-registers (§1.4); the job's own runtime is (re)seeded locally when
 	// this instance serves the Job first (§2.1 任实例服务).
-	e, ok := s.reg.ByDaemonInWorkspace(claims.WorkspaceID, claims.JobName)
+	e, ok := s.reg.ByDaemonInSourceWorkspace(claims.SourceID, claims.WorkspaceID, claims.JobName)
 	if !ok {
 		writeError(w, http.StatusNotFound, "runtime not found")
 		return
@@ -344,7 +346,7 @@ func (s *FakeServer) handleDeregister(w http.ResponseWriter, r *http.Request) {
 	}
 	if rt, ok := s.reg.RuntimeByDaemon(claims.JobName); ok {
 		s.reg.SetRuntimeOffline(rt.JobRuntimeID)
-	} else if e, ok := s.reg.ByDaemonInWorkspace(claims.WorkspaceID, claims.JobName); ok {
+	} else if e, ok := s.reg.ByDaemonInSourceWorkspace(claims.SourceID, claims.WorkspaceID, claims.JobName); ok {
 		s.reg.SetRuntimeOffline(e.JobRuntimeID)
 	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
@@ -391,7 +393,7 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 	// the empty batch's classification face: a concurrent claim can commit a
 	// delivery before the registry's gate, so the default branch re-reads the
 	// entry after the attempt and classifies it there (ADR-032, §4.1).
-	pending, pendingOK := s.reg.ByDaemonInWorkspace(claims.WorkspaceID, req.DaemonID)
+	pending, pendingOK := s.reg.ByDaemonInSourceWorkspace(claims.SourceID, claims.WorkspaceID, req.DaemonID)
 	if pendingOK && pending.WorkspaceID != claims.WorkspaceID {
 		// The token addresses another workspace's task: the cross-workspace
 		// impersonation case, judged like a cross-Job one (§2.1).
@@ -408,7 +410,7 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 			}
 		}
 	}
-	delivery, err := s.sched.Deliver(r.Context(), claims.WorkspaceID, req.DaemonID, runtimeID, req.MaxTasks)
+	delivery, err := s.deliver(r.Context(), claims.SourceID, claims.WorkspaceID, req.DaemonID, runtimeID, req.MaxTasks)
 	if err != nil {
 		if errors.Is(err, scheduler.ErrUnknownDaemon) || errors.Is(err, scheduler.ErrRuntimeMismatch) {
 			writeError(w, http.StatusForbidden, "forbidden")
@@ -446,7 +448,7 @@ func (s *FakeServer) handleClaim(w http.ResponseWriter, r *http.Request) {
 		// lost-response signature and counts on the entry, while a decided
 		// entry's empties (drain never delivers) stay plain (§4.1 交付后的
 		// claim 计数). Re-read once, after the attempt.
-		if entry, ok := s.reg.ByDaemonInWorkspace(claims.WorkspaceID, req.DaemonID); ok &&
+		if entry, ok := s.reg.ByDaemonInSourceWorkspace(claims.SourceID, claims.WorkspaceID, req.DaemonID); ok &&
 			entry.DeliveryUnconfirmed(s.reg.Now()) {
 			s.metrics.DeliveryClaim(DeliveryClaimEmptyUnconfirmed)
 			s.reg.NoteClaimAfterDelivery(entry.TaskID)
@@ -472,7 +474,7 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	entry, ok := s.reg.ByDaemonInWorkspace(claims.WorkspaceID, claims.JobName)
+	entry, ok := s.reg.ByDaemonInSourceWorkspace(claims.SourceID, claims.WorkspaceID, claims.JobName)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
@@ -485,7 +487,7 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
-	client := s.clientFor(entry.WorkspaceID)
+	client := s.clientFor(entry.SourceID, entry.WorkspaceID)
 	if client == nil {
 		writeError(w, http.StatusForbidden, "workspace is not configured")
 		return
@@ -493,7 +495,7 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 	ready, err := client.PrepareLease(r.Context(), entry.RealRuntimeID, tid)
 	switch {
 	case errors.Is(err, scheduler.ErrTaskNotFound):
-		if verr := s.sched.OnTaskVanished(r.Context(), tid); verr != nil {
+		if verr := s.sched.OnTaskVanishedInSource(r.Context(), claims.SourceID, claims.WorkspaceID, tid); verr != nil {
 			s.log.Error("task vanish settlement failed", "task_id", tid, "err", verr)
 		}
 	case err != nil:
@@ -507,7 +509,7 @@ func (s *FakeServer) handlePrepareLease(w http.ResponseWriter, r *http.Request) 
 		// (NewLeaseKeeper defaults to reg.Now), so both writers share one
 		// observation instant.
 		until := s.reg.Now().Add(scheduler.PrepareLeaseTTL)
-		s.reg.SetLeaseKeepUntil(tid, until)
+		s.reg.SetLeaseKeepUntil(tid, until, entry.ScopeKey())
 		s.log.Info("lease.renewed", "task_id", tid, "job_name", claims.JobName,
 			"lease_keep_until", registry.ProjectedTime(until))
 	}
@@ -526,14 +528,14 @@ func (s *FakeServer) handleTaskStatus(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	client := s.clientFor(claims.WorkspaceID)
+	client := s.clientFor(claims.SourceID, claims.WorkspaceID)
 	if client == nil {
 		writeError(w, http.StatusForbidden, "workspace is not configured")
 		return
 	}
 	code, resp, err := client.TaskStatusRaw(r.Context(), tid)
 	if errors.Is(err, scheduler.ErrTaskNotFound) {
-		if verr := s.sched.OnTaskVanished(r.Context(), tid); verr != nil {
+		if verr := s.sched.OnTaskVanishedInSource(r.Context(), claims.SourceID, claims.WorkspaceID, tid); verr != nil {
 			s.log.Error("task vanish settlement failed", "task_id", tid, "err", verr)
 		}
 		writeError(w, http.StatusNotFound, "task not found")
@@ -556,7 +558,7 @@ func (s *FakeServer) handleTaskGCCheck(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	client := s.clientFor(claims.WorkspaceID)
+	client := s.clientFor(claims.SourceID, claims.WorkspaceID)
 	if client == nil {
 		writeError(w, http.StatusForbidden, "workspace is not configured")
 		return
@@ -704,7 +706,7 @@ func (s *FakeServer) handleSkillBundles(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-	code, resp, err := s.bundlesFor(claims.WorkspaceID).Resolve(r.Context(), tid, rid, body)
+	code, resp, err := s.bundlesFor(claims.SourceID, claims.WorkspaceID).Resolve(r.Context(), tid, rid, body)
 	if err != nil {
 		writeError(w, http.StatusBadGateway, "upstream unavailable")
 		return
