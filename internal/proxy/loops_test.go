@@ -449,7 +449,7 @@ func TestHeartbeatAckConsumesUnderTheStreamsRuntime(t *testing.T) {
 			slots := NewCatalogSlots()
 			slots.Put("rid-1", body, time.Now())
 			probes := &fakeProbe{}
-			reporter := NewModelCatalogReporter(cfg, client, probes, slots, &fakeMetrics{})
+			reporter := NewModelCatalogReporter(cfg, client, NewProbeCatalogSource(probes), slots, &fakeMetrics{})
 
 			// The mismatch line is a registered event (§1.3/
 			// §9.2 model.catalog_ack_mismatch): exactly one when

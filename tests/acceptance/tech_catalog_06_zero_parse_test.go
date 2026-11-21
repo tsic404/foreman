@@ -50,7 +50,7 @@ func TestCatalog06ZeroParseNegative(t *testing.T) {
 	// a scrape of the real endpoint would.
 	metrics := observability.NewMetrics()
 	reporterLogs := &writeBuffer{}
-	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.slots, metrics,
+	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, proxy.NewProbeCatalogSource(h.sched), h.slots, metrics,
 		proxy.WithReporterLogger(slog.New(slog.NewJSONHandler(reporterLogs, nil))))
 	// The command must be on the server before the stream's first heartbeat:
 	// the ack is its only delivery channel and the next one is a full C2

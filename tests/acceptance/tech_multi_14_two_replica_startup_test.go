@@ -72,7 +72,7 @@ func TestTechMulti14TwoReplicaStartup(t *testing.T) {
 
 	// A's startup: the startup probe runs (holder), the discovery is declared
 	// and the claim loop's C1 publishes the registration identity.
-	discA, err := bootstrap.StartupDiscoveries(ctx, tw.a.currentLeader(), tw.a.coord, tw.a.sched, tw.a.clientList(), 3*time.Second, assemblyLogger(tw.a))
+	discA, err := bootstrap.StartupDiscoveries(ctx, tw.a.currentLeader(), tw.a.coord, tw.a.sched.RunStartupProbe, tw.a.clientList(), 3*time.Second, assemblyLogger(tw.a))
 	if err != nil {
 		t.Fatalf("A StartupDiscoveries: %v", err)
 	}
@@ -94,7 +94,7 @@ func TestTechMulti14TwoReplicaStartup(t *testing.T) {
 
 	// B's startup: a follower adopts the published declaration — no probe, no
 	// C1 — and carries the same real runtime ids.
-	discB, err := bootstrap.StartupDiscoveries(ctx, tw.b.currentLeader(), tw.b.coord, tw.b.sched, tw.b.clientList(), 3*time.Second, assemblyLogger(tw.b))
+	discB, err := bootstrap.StartupDiscoveries(ctx, tw.b.currentLeader(), tw.b.coord, tw.b.sched.RunStartupProbe, tw.b.clientList(), 3*time.Second, assemblyLogger(tw.b))
 	if err != nil {
 		t.Fatalf("B StartupDiscoveries: %v", err)
 	}

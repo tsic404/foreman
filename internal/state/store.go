@@ -164,6 +164,16 @@ type Snapshot struct {
 	// PriorSessionID is a path on the member's node, not a secret; it is the
 	// soft-affinity key source the continued Job's Build consumes.
 	PriorSessionID string `json:"prior_session_id"`
+	// Frozen release facts: the claim's own snapshot, kept so a restart and a
+	// later impact preview read the same values (V2-C05).
+	CLIVersion       string            `json:"cli_version"`
+	CLIDigests       map[string]string `json:"cli_digests"`
+	AgentCLIVersion  string            `json:"agent_cli_version"`
+	AgentCLIDigests  map[string]string `json:"agent_cli_digests"`
+	ConfigRevision   uint64            `json:"config_revision"`
+	CLIFactsKnown    bool              `json:"cli_facts_known"`
+	AgentFactsKnown  bool              `json:"agent_facts_known"`
+	ConfigFactsKnown bool              `json:"config_facts_known"`
 }
 
 // FromEntry serializes a live row into its shared-store snapshot.
@@ -209,6 +219,14 @@ func FromEntry(e registry.TaskEntry) Snapshot {
 		ProjectID:           e.ProjectID,
 		ProjectSource:       e.ProjectSource,
 		PriorSessionID:      e.PriorSessionID,
+		CLIVersion:          e.CLIVersion,
+		CLIDigests:          cloneStringMap(e.CLIDigests),
+		AgentCLIVersion:     e.AgentCLIVersion,
+		AgentCLIDigests:     cloneStringMap(e.AgentCLIDigests),
+		ConfigRevision:      e.ConfigRevision,
+		CLIFactsKnown:       e.CLIFactsKnown,
+		AgentFactsKnown:     e.AgentFactsKnown,
+		ConfigFactsKnown:    e.ConfigFactsKnown,
 	}
 }
 
@@ -258,7 +276,26 @@ func (s Snapshot) ToEntry() registry.TaskEntry {
 		ProjectID:           s.ProjectID,
 		ProjectSource:       s.ProjectSource,
 		PriorSessionID:      s.PriorSessionID,
+		CLIVersion:          s.CLIVersion,
+		CLIDigests:          cloneStringMap(s.CLIDigests),
+		AgentCLIVersion:     s.AgentCLIVersion,
+		AgentCLIDigests:     cloneStringMap(s.AgentCLIDigests),
+		ConfigRevision:      s.ConfigRevision,
+		CLIFactsKnown:       s.CLIFactsKnown,
+		AgentFactsKnown:     s.AgentFactsKnown,
+		ConfigFactsKnown:    s.ConfigFactsKnown,
 	}
+}
+
+func cloneStringMap(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
 }
 
 var _ Store = noStore{}

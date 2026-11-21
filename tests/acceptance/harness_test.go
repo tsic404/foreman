@@ -3460,7 +3460,7 @@ func (h *harness) waitCatalogMetrics(t *testing.T, n int) {
 // newReporter builds the catalog reporter the catalog scenarios drive.
 func (h *harness) newReporter(t *testing.T) *proxy.ModelCatalogReporter {
 	t.Helper()
-	return proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.slots, h.metrics,
+	return proxy.NewModelCatalogReporter(h.cfg, h.client, proxy.NewProbeCatalogSource(h.sched), h.slots, h.metrics,
 		proxy.WithReporterLogger(slog.New(slog.NewJSONHandler(&writeBuffer{}, nil))))
 }
 
@@ -4111,7 +4111,7 @@ func (h *harness) autoRegisterStartupProbe(t *testing.T, workspaceID string) {
 // wiring cmd/foreman applies. It returns a stop function.
 func (h *harness) startAssemblyControlPlane(t *testing.T, gate func() bool, publisher func(context.Context, *proxy.Client) error) func() {
 	t.Helper()
-	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.client.CatalogSlots(), h.metrics)
+	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, proxy.NewProbeCatalogSource(h.sched), h.client.CatalogSlots(), h.metrics)
 	plane := proxy.NewControlPlane(proxy.ControlPlaneOptions{
 		ProxyConfig: h.cfg,
 		Client:      h.client,

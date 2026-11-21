@@ -223,9 +223,12 @@ var tcPayloadProjectionKeys = []string{
 // prior_session_id) are the rows a continuation renders from (§4.3
 // 未完成创建的接续): the render must reproduce the row's job_name.
 var tcPayloadSnapshotKeys = []string{
+	"agent_cli_digests", "agent_cli_version", "agent_facts_known",
 	"agent_id", "agent_name", "attempt", "autopilot_run_id", "boot_deadline",
 	"cancel_ack_owed",
 	"chat_session_id", "claims_after_delivery", "claimed_at",
+	"cli_digests", "cli_facts_known", "cli_version", "config_facts_known",
+	"config_revision",
 	"completed_at", "daemon_id", "daemon_registered_at", "decided_report",
 	"delivered_at", "deliveries", "delivery_deadline", "drain_deadline",
 	"failure_reason", "issue_id", "issue_identifier", "job_created_at",
@@ -310,7 +313,7 @@ var tcPayloadSecretKeys = []string{"config.json"}
 // every emit path (§9.1: 日志不得记录载荷字段名; ADR-055 §6). "time" is a plain
 // slog.JSONHandler's time key; the production logger renames it to "ts" (§9.1).
 var tcPayloadLogKeys = []string{
-	"ack_runtime_id", "action", "active_jobs", "adopted",
+	"ack_runtime_id", "action", "active_jobs", "adapter", "adopted",
 	"after", "age_seconds", "agent_id", "agent_memory",
 	"agent_memory_ttl", "agent_state", "agent_state_ttl", "attempt",
 	"attempts", "authenticated",
@@ -319,7 +322,7 @@ var tcPayloadLogKeys = []string{
 	"bytes", "c18", "cache_bytes", "cache_max_bytes",
 	"cache_measured", "cache_ttl", "cancel_ack_timeout_seconds", "candidates",
 	"cap_policy", "cap_source", "carriers", "changed",
-	"chat_session_id", "claim_workspace", "claims_after_delivery", "cli_version",
+	"chat_session_id", "claim_workspace", "claims_after_delivery", "cli_id", "cli_version",
 	"code", "component", "conclusion", "count",
 	"credential_scope", "daemon_id", "dead_definitions", "decision",
 	"declaration", "deliver_latency_ms", "delivered_at", "deliveries",
@@ -339,7 +342,7 @@ var tcPayloadLogKeys = []string{
 	"orphan_pods", "orphaned", "outage_seconds", "overridden_keys",
 	"path", "payload_workspace", "phase", "picked",
 	"pod_status", "pod_terminated_at", "pod_terminated_at_source", "policy",
-	"previous", "probe", "probed", "profile_id",
+	"previous", "probe", "discovered", "profile_id",
 	"project_source", "provider", "queued", "quiesce",
 	"read_bytes", "reason", "register", "remaining_ms",
 	"registered_at", "remote_addr", "removed_count", "replay", "request_id",

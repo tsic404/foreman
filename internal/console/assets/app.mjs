@@ -23,6 +23,27 @@ import {
   renderAgents,
   renderBindingResult,
 } from "./lib/agents.mjs";
+import {
+  classBadge,
+  checkOutcome,
+  configForm,
+  definitionForm,
+  discoveryForm,
+  impactHTML,
+  projectionForm,
+  projectionHTML,
+  publishForm,
+  publishOutcome,
+  renderCLIPage,
+  renderPublishOutcome,
+  cliSettingsForm,
+  validateConfig,
+  validateDefinition,
+  validateDiscovery,
+  validateCLISettings,
+  validateVersion,
+  versionForm,
+} from "./lib/cli.mjs";
 import { callout, emptyState, esc } from "./lib/ui.mjs";
 
 const PAGES = [
@@ -74,8 +95,7 @@ const PAGES = [
     icon: "05",
     area: "ADMINISTRATION / CLI",
     title: "Agent CLI 与配置",
-    subtitle: "由 CLI 与配置交付范围提供；本次只保留入口位置。",
-    placeholder: true,
+    subtitle: "分平台发布 CLI，按作用域管理 Agent 配置修订，并在无业务 Job 时执行受限发现。",
   },
   {
     id: "audit",
@@ -100,6 +120,14 @@ const state = {
   agentFilter: { server: "", workspace: "" },
   agentDirectory: null,
   staleAgents: false,
+  cli: { definitions: [], audit: [] },
+  configs: { rows: [], audit: [] },
+  discovery: {
+    adapters: [],
+    requests: [],
+    models: { view: null },
+    filter: { server_id: "", workspace_id: "", runtime_id: "", profile: "" },
+  },
 };
 
 const $ = (id) => document.getElementById(id);
@@ -288,6 +316,101 @@ async function renderAuditPage(root) {
   root.innerHTML = (state.renderedNotice || "") + renderAudit(audit.body?.entries ?? []);
 }
 
+async function ensureSources() {
+  if (state.sources.length > 0) {
+    return;
+  }
+  const sources = await api("/admin/servers");
+  if (sources.status !== 200) {
+    throw new Error(errorText(sources.status, sources.body));
+  }
+  state.sources = Array.isArray(sources.body) ? sources.body : [];
+}
+
+async function renderCLIPagePage(root) {
+  root.innerHTML = emptyState("读取 CLI、配置与发现…");
+  await ensureSources();
+  const [clis, cliAudit, configs, configAudit, adapters, requests] = await Promise.all([
+    api("/admin/cli"),
+    api("/admin/cli-audit"),
+    api("/admin/agent-configs"),
+    api("/admin/agent-configs/audit"),
+    api("/admin/discovery/adapters"),
+    api("/admin/discovery/requests"),
+  ]);
+  for (const [label, response] of [
+    ["CLI", clis],
+    ["CLI 审计", cliAudit],
+    ["Agent 配置", configs],
+    ["配置审计", configAudit],
+    ["发现适配器", adapters],
+    ["发现请求", requests],
+  ]) {
+    if (response.status !== 200) {
+      throw new Error(`${label}：${errorText(response.status, response.body)}`);
+    }
+  }
+  state.cli = {
+    definitions: Array.isArray(clis.body) ? clis.body : [],
+    audit: Array.isArray(cliAudit.body) ? cliAudit.body : [],
+  };
+  state.configs = {
+    rows: Array.isArray(configs.body) ? configs.body : [],
+    audit: Array.isArray(configAudit.body) ? configAudit.body : [],
+  };
+  state.discovery.adapters = Array.isArray(adapters.body) ? adapters.body : [];
+  state.discovery.requests = Array.isArray(requests.body) ? requests.body : [];
+  root.innerHTML =
+    (state.renderedNotice || "") +
+    renderCLIPage({
+      definitions: state.cli.definitions,
+      audit: state.cli.audit,
+      configs: state.configs.rows,
+      configAudit: state.configs.audit,
+      adapters: state.discovery.adapters,
+      requests: state.discovery.requests,
+      models: { view: state.discovery.models.view, filter: state.discovery.filter },
+      sources: state.sources,
+    });
+}
+
+function findCLI(id) {
+  return state.cli.definitions.find((definition) => definition.cli_id === id);
+}
+
+function configKey(config) {
+  return JSON.stringify([config.server_id, config.workspace_id, config.backend, config.profile ?? ""]);
+}
+
+function findConfig(key) {
+  return state.configs.rows.find((config) => configKey(config) === key);
+}
+
+function formValues(form) {
+  return Object.fromEntries(new FormData(form));
+}
+
+function showFormErrors(form, errors) {
+  form.insertAdjacentHTML("beforebegin", fieldErrors(errors));
+  markInvalid(form, errors);
+}
+
+function dialogHead(title) {
+  return `<div class="between"><h2>${esc(title)}</h2><button type="button" data-act="close-dialog">关闭</button></div>`;
+}
+
+async function fetchImpact(cliID, version, generation, releaseGeneration) {
+  const query = new URLSearchParams();
+  if (version) query.set("version", version);
+  if (generation !== undefined && generation !== null && generation !== "") {
+    query.set("generation", String(generation));
+  }
+  if (releaseGeneration !== undefined && releaseGeneration !== null && releaseGeneration !== "") {
+    query.set("release_generation", String(releaseGeneration));
+  }
+  return api(`/admin/cli/${encodeURIComponent(cliID)}/impact?${query.toString()}`);
+}
+
 async function render() {
   const page = currentPage();
   state.page = page.id;
@@ -316,6 +439,8 @@ async function render() {
       await renderSourcesPage(root);
     } else if (page.id === "agents") {
       await renderAgentsPage(root);
+    } else if (page.id === "cli") {
+      await renderCLIPagePage(root);
     } else {
       await renderAuditPage(root);
     }
@@ -510,6 +635,284 @@ function openBindingEditor(key) {
   openDialog(bindingEditor(agent));
 }
 
+function openCLIDefinitionDialog() {
+  openDialog(dialogHead("登记 CLI") + definitionForm(state.sources));
+}
+
+function openCLISettingsDialog(definition) {
+  if (!definition) {
+    return;
+  }
+  openDialog(dialogHead(`发布设置 · ${definition.cli_id}`) + cliSettingsForm(definition));
+}
+
+function openCLIVersionDialog(definition) {
+  if (!definition) {
+    return;
+  }
+  openDialog(dialogHead(`登记候选版本 · ${definition.cli_id}`) + versionForm(definition));
+}
+
+function openCLIPublishDialog(definition) {
+  if (!definition) {
+    return;
+  }
+  openDialog(dialogHead(`发布 · ${definition.cli_id}`) + publishForm(definition));
+}
+
+async function openCLIImpactDialog(cliID, version, generation, releaseGeneration) {
+  const definition = findCLI(cliID);
+  const candidate = version || definition?.current_version || definition?.candidates?.[0] || "";
+  openDialog(dialogHead(`影响预览 · ${cliID}`) + emptyState("读取影响快照…"));
+  const response = await fetchImpact(cliID, candidate, generation, releaseGeneration);
+  if (response.status !== 200) {
+    $("dialog-body").innerHTML =
+      dialogHead(`影响预览 · ${cliID}`) +
+      failure("影响预览未读取", errorText(response.status, response.body));
+    return;
+  }
+  $("dialog-body").innerHTML =
+    dialogHead(`影响预览 · ${cliID}`) +
+    `<p class="sub">候选 ${esc(response.body?.candidate_version || candidate)}；这是只读快照，提交发布时仍会复验代际。</p>` +
+    impactHTML(response.body);
+}
+
+function openConfigDialog(config) {
+  openDialog(dialogHead(config ? "写入 Agent 配置修订" : "写入 Agent 配置") + configForm(config));
+}
+
+function openProjectionDialog(config) {
+  if (!config) {
+    return;
+  }
+  openDialog(dialogHead("per-attempt 只读投影") + projectionForm(config));
+}
+
+function openDiscoveryDialog() {
+  openDialog(dialogHead("发起受限发现") + discoveryForm(state.sources));
+}
+
+function readArtifacts(form) {
+  const artifacts = [];
+  for (const fieldset of form.querySelectorAll("[data-platform]")) {
+    const [os, arch] = String(fieldset.dataset.platform ?? "").split("/");
+    const url = fieldset.querySelector('[name="url"]')?.value ?? "";
+    const sha256 = fieldset.querySelector('[name="sha256"]')?.value ?? "";
+    const rawSize = String(fieldset.querySelector('[name="size"]')?.value ?? "").trim();
+    artifacts.push({
+      platform: { os, arch },
+      url,
+      sha256,
+      size: rawSize === "" ? 0 : Number(rawSize),
+    });
+  }
+  return artifacts;
+}
+
+async function doCLICheck(cliID) {
+  notice(callout("正在检查", `${esc(cliID)}：读取版本源并按检查设置决定是否自动发布。`));
+  const response = await api(`/admin/cli/${encodeURIComponent(cliID)}/check`, { method: "POST" });
+  if (response.status === 200) {
+    state.pageNotice = checkOutcome(response.body);
+  } else {
+    state.pageNotice = failure("检查未完成", errorText(response.status, response.body));
+  }
+  await render();
+}
+
+async function verifyAdapters() {
+  const response = await api("/admin/discovery/adapters/verify", { method: "POST" });
+  if (response.status === 200) {
+    state.discovery.adapters = Array.isArray(response.body) ? response.body : [];
+    state.pageNotice = callout("适配器验证完成", "只把通过命令面探针的适配器标为可信；其余保持不支持/需配置。");
+  } else {
+    state.pageNotice = failure("适配器验证未完成", errorText(response.status, response.body));
+  }
+  await render();
+}
+
+async function verifyAdapter(name) {
+  const response = await api(`/admin/discovery/adapters/${encodeURIComponent(name)}/verify`, { method: "POST" });
+  if (response.status === 200) {
+    const index = state.discovery.adapters.findIndex((adapter) => adapter.name === name);
+    if (index >= 0) {
+      state.discovery.adapters[index] = response.body;
+    }
+    state.pageNotice = callout(`适配器 ${name}`, response.body?.trusted ? "命令面已验证，可执行发现。" : "未通过验证，保持不支持。");
+  } else {
+    state.pageNotice = failure("适配器验证未完成", errorText(response.status, response.body));
+  }
+  await render();
+}
+
+async function submitCLIDefinition(form) {
+  const { errors, payload } = validateDefinition(formValues(form));
+  if (payload === null) {
+    showFormErrors(form, errors);
+    return;
+  }
+  const response = await api("/admin/cli", { method: "POST", body: payload });
+  if (response.status === 201) {
+    closeDialog();
+    state.pageNotice = callout("已登记 CLI", `${esc(payload.cli_id)} 已保存；先登记候选版本，再检查或发布。`);
+    await render();
+    return;
+  }
+  form.insertAdjacentHTML("beforebegin", failure("登记未成功", errorText(response.status, response.body)));
+}
+
+async function submitCLISettings(form) {
+  const { errors, payload } = validateCLISettings(formValues(form));
+  if (payload === null) {
+    showFormErrors(form, errors);
+    return;
+  }
+  const cliID = form.dataset.id;
+  const response = await api(`/admin/cli/${encodeURIComponent(cliID)}/settings`, { method: "PATCH", body: payload });
+  if (response.status === 200) {
+    closeDialog();
+    state.pageNotice = callout("发布设置已保存", `${esc(cliID)} 的检查与自动发布开关已更新。`);
+    await render();
+    return;
+  }
+  form.insertAdjacentHTML("beforebegin", failure("设置未保存", errorText(response.status, response.body)));
+}
+
+async function submitCLIVersion(form) {
+  const { errors, payload } = validateVersion(form.elements.version?.value ?? "", readArtifacts(form));
+  if (payload === null) {
+    showFormErrors(form, errors);
+    return;
+  }
+  const cliID = form.dataset.id;
+  const response = await api(`/admin/cli/${encodeURIComponent(cliID)}/versions`, { method: "POST", body: payload });
+  if (response.status === 201) {
+    closeDialog();
+    state.pageNotice = callout("已登记候选版本", `${esc(cliID)} ${esc(payload.version)} 已登记；发布前仍会逐平台验证。`);
+    await render();
+    return;
+  }
+  form.insertAdjacentHTML("beforebegin", failure("候选版本未登记", errorText(response.status, response.body)));
+}
+
+async function submitCLIPublish(form) {
+  const version = String(form.elements.version?.value ?? "").trim();
+  if (version === "") {
+    showFormErrors(form, { version: "版本不能为空。" });
+    return;
+  }
+  const cliID = form.dataset.id;
+  const response = await api(`/admin/cli/${encodeURIComponent(cliID)}/release`, {
+    method: "POST",
+    body: {
+      version,
+      expected_generation: Number(form.dataset.generation ?? 0),
+      expected_release_generation: Number(form.dataset.releaseGeneration ?? 0),
+    },
+  });
+  const outcome = publishOutcome(response.status, response.body);
+  form.insertAdjacentHTML("beforebegin", renderPublishOutcome(outcome));
+  for (const control of form.querySelectorAll("button, input")) {
+    control.disabled = true;
+  }
+  state.pageNotice = renderPublishOutcome(outcome);
+  await render();
+}
+
+async function submitAgentConfig(form) {
+  const { errors, payload } = validateConfig(formValues(form));
+  if (payload === null) {
+    showFormErrors(form, errors);
+    return;
+  }
+  const values = formValues(form);
+  const serverID = String(values.server_id ?? "").trim();
+  const workspaceID = String(values.workspace_id ?? "").trim();
+  const backend = String(values.backend ?? "").trim();
+  const response = await api(
+    `/admin/agent-configs/${encodeURIComponent(serverID)}/${encodeURIComponent(workspaceID)}/${encodeURIComponent(backend)}`,
+    { method: "PUT", body: payload },
+  );
+  if (response.status === 200) {
+    closeDialog();
+    state.pageNotice = callout("配置修订已记录", `第 ${Number(response.body?.revision ?? 0)} 修订已保存；内容未回显、未持久化。`);
+    await render();
+    return;
+  }
+  form.insertAdjacentHTML("beforebegin", failure("配置未保存", errorText(response.status, response.body)));
+}
+
+async function submitProjection(form) {
+  const attemptID = String(new FormData(form).get("attempt_id") ?? "").trim();
+  const query = new URLSearchParams({ attempt_id: attemptID });
+  if (form.dataset.profile) {
+    query.set("profile", form.dataset.profile);
+  }
+  const response = await api(
+    `/admin/agent-configs/${encodeURIComponent(form.dataset.server)}/${encodeURIComponent(form.dataset.workspace)}/${encodeURIComponent(form.dataset.backend)}/projection?${query.toString()}`,
+  );
+  const box = $("dialog-body");
+  box.querySelector("#projection-result")?.remove();
+  if (response.status === 200) {
+    box.insertAdjacentHTML("beforeend", `<div id="projection-result">${projectionHTML(response.body)}</div>`);
+  } else {
+    box.insertAdjacentHTML("beforeend", `<div id="projection-result">${failure("投影未读取", errorText(response.status, response.body))}</div>`);
+  }
+}
+
+function discoveryResultHTML(request) {
+  const result = request?.result;
+  const classText = result ? classBadge(result.class) : "";
+  const models = (result?.models ?? []).map((model) => esc(model.id)).join("、");
+  const capabilities = (result?.capabilities ?? []).map((capability) => esc(capability.name)).join("、");
+  return `<div class="call ${result?.class === "failed" ? "danger" : result?.class === "unsupported" ? "warn" : "ok"}" role="status">
+    <strong>发现请求 ${esc(request?.id || "")} · ${esc(request?.state || "")}</strong>
+    <div>${classText}${models ? `<div>模型：${models}</div>` : ""}${capabilities ? `<div>能力：${capabilities}</div>` : ""}${result?.detail ? `<div>${esc(result.detail)}</div>` : ""}</div>
+  </div>`;
+}
+
+async function submitDiscovery(form) {
+  const { errors, payload } = validateDiscovery(formValues(form));
+  if (payload === null) {
+    showFormErrors(form, errors);
+    return;
+  }
+  const response = await api("/admin/discovery/requests", { method: "POST", body: payload });
+  const box = $("dialog-body");
+  box.querySelector("#discovery-result")?.remove();
+  if (response.status === 200) {
+    box.insertAdjacentHTML("beforeend", `<div id="discovery-result">${discoveryResultHTML(response.body)}</div>`);
+    state.pageNotice = discoveryResultHTML(response.body);
+    await render();
+    return;
+  }
+  box.insertAdjacentHTML("beforeend", `<div id="discovery-result">${failure("发现未执行", errorText(response.status, response.body))}</div>`);
+}
+
+async function submitModelsFilter(form) {
+  const values = formValues(form);
+  const query = new URLSearchParams();
+  for (const key of ["server_id", "workspace_id", "runtime_id", "profile"]) {
+    const value = String(values[key] ?? "").trim();
+    if (value !== "") {
+      query.set(key, value);
+    }
+  }
+  state.discovery.filter = {
+    server_id: String(values.server_id ?? "").trim(),
+    workspace_id: String(values.workspace_id ?? "").trim(),
+    runtime_id: String(values.runtime_id ?? "").trim(),
+    profile: String(values.profile ?? "").trim(),
+  };
+  const response = await api(`/admin/discovery/models?${query.toString()}`);
+  if (response.status === 200) {
+    state.discovery.models = { view: response.body };
+  } else {
+    state.pageNotice = failure("模型目录未读取", errorText(response.status, response.body));
+  }
+  await render();
+}
+
 function openAttemptDialog(index) {
   const attempt = state.overview?.in_progress?.rows?.[index];
   if (!attempt) {
@@ -627,6 +1030,44 @@ document.addEventListener("click", (event) => {
     case "edit-binding":
       openBindingEditor(id);
       return;
+    case "add-cli":
+      openCLIDefinitionDialog();
+      return;
+    case "cli-settings":
+      openCLISettingsDialog(findCLI(id));
+      return;
+    case "cli-version":
+      openCLIVersionDialog(findCLI(id));
+      return;
+    case "cli-publish":
+      openCLIPublishDialog(findCLI(id));
+      return;
+    case "cli-impact": {
+      const form = control.closest("form");
+      const version = control.dataset.version || form?.elements?.version?.value || "";
+      const generation = control.dataset.generation || form?.dataset?.generation || "";
+      const releaseGeneration = control.dataset.releaseGeneration || form?.dataset?.releaseGeneration || "";
+      openCLIImpactDialog(id, version, generation, releaseGeneration);
+      return;
+    }
+    case "cli-check":
+      doCLICheck(id);
+      return;
+    case "config-write":
+      openConfigDialog(findConfig(id));
+      return;
+    case "config-projection":
+      openProjectionDialog(findConfig(id));
+      return;
+    case "verify-adapters":
+      verifyAdapters();
+      return;
+    case "verify-adapter":
+      verifyAdapter(id);
+      return;
+    case "discovery-request":
+      openDiscoveryDialog();
+      return;
     default:
       return;
   }
@@ -660,6 +1101,22 @@ document.addEventListener("submit", (event) => {
     submitSettings(form);
   } else if (form.id === "binding-form") {
     submitBinding(form);
+  } else if (form.id === "cli-definition-form") {
+    submitCLIDefinition(form);
+  } else if (form.id === "cli-settings-form") {
+    submitCLISettings(form);
+  } else if (form.id === "cli-version-form") {
+    submitCLIVersion(form);
+  } else if (form.id === "cli-publish-form") {
+    submitCLIPublish(form);
+  } else if (form.id === "agent-config-form") {
+    submitAgentConfig(form);
+  } else if (form.id === "projection-form") {
+    submitProjection(form);
+  } else if (form.id === "discovery-form") {
+    submitDiscovery(form);
+  } else if (form.id === "models-filter-form") {
+    submitModelsFilter(form);
   } else if (form.id === "workspace-filter-form") {
     loadDirectory(form.dataset.id, String(new FormData(form).get("workspace_id") ?? "")).then((ok) => {
       if (!ok) {

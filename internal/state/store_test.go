@@ -40,15 +40,23 @@ func TestSnapshotRoundTripKeepsProjectedFieldsAndDropsSecrets(t *testing.T) {
 		DrainDeadline:    time.Date(2026, 10, 4, 12, 1, 0, 0, time.UTC),
 		DeliveryDeadline: time.Date(2026, 10, 4, 12, 0, 30, 0, time.UTC),
 		// The mapping record persists all three; only the settled record strips them.
-		TokenHash:       "deadbeef",
-		Payload:         []byte(`{"auth_token":"secret"}`),
-		DecidedReport:   []byte(`{"result":"completed"}`),
-		PriorSessionID:  "sess",
-		AgentName:       "agent-1",
-		ProjectID:       "pid-1",
-		ProjectSource:   "payload",
-		RealRuntimeID:   "rid-1",
-		RuntimeIdentity: "omp\x00",
+		TokenHash:        "deadbeef",
+		Payload:          []byte(`{"auth_token":"secret"}`),
+		DecidedReport:    []byte(`{"result":"completed"}`),
+		PriorSessionID:   "sess",
+		AgentName:        "agent-1",
+		ProjectID:        "pid-1",
+		ProjectSource:    "payload",
+		RealRuntimeID:    "rid-1",
+		RuntimeIdentity:  "omp\x00",
+		CLIVersion:       "2.0.0",
+		CLIDigests:       map[string]string{"linux/amd64": strings.Repeat("a", 64)},
+		AgentCLIVersion:  "3.0.0",
+		AgentCLIDigests:  map[string]string{"linux/arm64": strings.Repeat("b", 64)},
+		ConfigRevision:   7,
+		CLIFactsKnown:    true,
+		AgentFactsKnown:  true,
+		ConfigFactsKnown: true,
 	}
 	got := FromEntry(e).ToEntry()
 	if got.TaskID != e.TaskID || got.JobName != e.JobName || got.WorkspaceID != e.WorkspaceID {
@@ -66,6 +74,14 @@ func TestSnapshotRoundTripKeepsProjectedFieldsAndDropsSecrets(t *testing.T) {
 	// projection, so they never render in /foreman/tasks.
 	if string(got.Payload) != string(e.Payload) || string(got.DecidedReport) != string(e.DecidedReport) || got.TokenHash != e.TokenHash {
 		t.Fatal("the mapping record's non-projected faces were lost")
+	}
+	if got.CLIVersion != e.CLIVersion || got.AgentCLIVersion != e.AgentCLIVersion ||
+		got.ConfigRevision != e.ConfigRevision || !got.CLIFactsKnown || !got.AgentFactsKnown || !got.ConfigFactsKnown {
+		t.Fatalf("round trip lost the frozen release facts: %+v", got)
+	}
+	if got.CLIDigests["linux/amd64"] != e.CLIDigests["linux/amd64"] ||
+		got.AgentCLIDigests["linux/arm64"] != e.AgentCLIDigests["linux/arm64"] {
+		t.Fatalf("round trip lost the frozen digests: %+v", got)
 	}
 	projected, err := json.Marshal(got)
 	if err != nil {

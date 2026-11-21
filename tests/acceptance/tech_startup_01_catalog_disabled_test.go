@@ -86,7 +86,7 @@ func TestStartupCatalogDisabledDoesNotConsumeAck(t *testing.T) {
 	h.declare(declaredRuntimes())
 
 	logs := &bytes.Buffer{}
-	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.slots, h.metrics,
+	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, proxy.NewProbeCatalogSource(h.sched), h.slots, h.metrics,
 		proxy.WithReporterLogger(slog.New(slog.NewJSONHandler(logs, nil))),
 	)
 	reporter.OnAck(t.Context(), "rid-omp", "req-disabled")

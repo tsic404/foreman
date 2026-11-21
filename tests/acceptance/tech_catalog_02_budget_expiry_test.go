@@ -45,7 +45,7 @@ func TestCatalog02ProbeSilentWithinBudgetRelaysNothing(t *testing.T) {
 	cfg := h.cfg
 	cfg.ModelCatalogTimeout = 800 * time.Millisecond
 	logs := &writeBuffer{}
-	reporter := proxy.NewModelCatalogReporter(cfg, h.client, h.sched, h.slots, h.metrics,
+	reporter := proxy.NewModelCatalogReporter(cfg, h.client, proxy.NewProbeCatalogSource(h.sched), h.slots, h.metrics,
 		proxy.WithReporterLogger(slog.New(slog.NewJSONHandler(logs, nil))))
 	// The command must be on the server before the stream's first heartbeat:
 	// the ack is its only delivery channel and the next one is a full C2

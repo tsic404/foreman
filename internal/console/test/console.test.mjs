@@ -22,6 +22,25 @@ import {
   syncOutcome,
   validateRegistration,
 } from "../assets/lib/sources.mjs";
+import {
+  checkOutcome,
+  classBadge,
+  definitionForm,
+  impactHTML,
+  publishForm,
+  publishOutcome,
+  renderAgentConfigs,
+  renderCLIDefinitions,
+  renderCLIPage,
+  renderDiscovery,
+  renderPublishOutcome,
+  validateCLISettings,
+  validateConfig,
+  validateDefinition,
+  validateDiscovery,
+  validateVersion,
+  versionForm,
+} from "../assets/lib/cli.mjs";
 
 const OVERVIEW = {
   counts: {
@@ -423,4 +442,291 @@ test("BIND-03 escapes upstream names before they reach the page", () => {
   const html = bindingEditor(hostile) + renderAgents([hostile]);
   assert.doesNotMatch(html, /<img src=x/);
   assert.match(html, /&lt;img src=x/);
+});
+
+// CLI-06 / CFG-07 / MODEL-09 ------------------------------------------------
+
+const CLI = {
+  cli_id: "omp",
+  kind: "agent",
+  adapter: "omp",
+  server_id: "atlas",
+  required_platforms: ["linux/amd64", "linux/arm64"],
+  minimum_version: "1.0.0",
+  current_version: "1.0.0",
+  current_generation: 2,
+  auto_check: true,
+  check_period_s: 900,
+  auto_release: false,
+  check_generation: 4,
+  candidates: ["1.0.0", "1.1.0"],
+  releases: [],
+  last_check_at: "2026-11-21T07:00:00Z",
+};
+
+test("CLI-06 shows separate check and auto-release switches with per-platform inputs", () => {
+  const html = renderCLIDefinitions([CLI]);
+  assert.match(html, /定时检查/);
+  assert.match(html, /自动发布关闭/);
+  assert.match(html, /linux\/amd64、linux\/arm64/);
+  assert.match(html, /第 2 代/);
+  const form = versionForm(CLI);
+  assert.match(form, /data-platform="linux\/amd64"/);
+  assert.match(form, /data-platform="linux\/arm64"/);
+  assert.match(form, /SHA-256/);
+});
+
+test("CLI-06 refuses a credentialed artifact URL and duplicate platforms before the request", () => {
+  const invalid = validateVersion("1.0.0", [
+    { platform: { os: "linux", arch: "amd64" }, url: "https://ops:not-a-real-secret@mirror.test/a", sha256: "a".repeat(64), size: 1 },
+    { platform: { os: "linux", arch: "amd64" }, url: "https://mirror.test/a", sha256: "a".repeat(64), size: 1 },
+  ]);
+  assert.equal(invalid.payload, null);
+  assert.ok(invalid.errors.artifacts);
+  assert.ok(invalid.errors["url_linux/amd64"]);
+  const valid = validateVersion("1.0.0", [
+    { platform: { os: "linux", arch: "amd64" }, url: "https://mirror.test/a", sha256: "a".repeat(64), size: 1 },
+  ]);
+  assert.equal(valid.payload.version, "1.0.0");
+  assert.equal(valid.payload.artifacts[0].size, 1);
+});
+
+test("CLI-06 keeps a failed publish on the old pointer and a conflict distinct", () => {
+  const published = publishOutcome(200, { result: "published", version: "2.0.0", generation: 3 });
+  const failed = publishOutcome(422, { result: "failed", version: "2.0.0", kept_version: "1.0.0", reasons: ["linux/arm64: artifact is x86-64, not aarch64"] });
+  const conflict = publishOutcome(409, { result: "conflict", version: "2.0.0", kept_version: "1.0.0", reasons: ["candidate set changed"] });
+  assert.equal(published.tone, "ok");
+  assert.equal(failed.tone, "danger");
+  assert.equal(conflict.tone, "warn");
+  assert.match(renderPublishOutcome(failed), /旧指针保持 1\.0\.0/);
+  assert.match(renderPublishOutcome(conflict), /候选集已变化/);
+  assert.notEqual(failed.title, conflict.title);
+});
+
+test("CLI-06 refuses a malformed definition before it reaches the service", () => {
+  const invalid = validateDefinition({
+    cli_id: "Bad ID",
+    kind: "agent",
+    adapter: "",
+    server_id: "atlas",
+    required_platforms: "linux/amd64, linux/amd64",
+    manifest_url: "http://user:not-a-real-secret@mirror.test/manifest.json",
+    check_period_s: "5",
+    auto_check: "on",
+    auto_release: "off",
+  });
+  for (const field of ["cli_id", "adapter", "required_platforms", "manifest_url", "check_period_s"]) {
+    assert.ok(invalid.errors[field], `no field error for ${field}`);
+  }
+  assert.equal(invalid.payload, null);
+  const valid = validateDefinition({
+    cli_id: "omp",
+    kind: "agent",
+    adapter: "omp",
+    server_id: "atlas",
+    required_platforms: "linux/amd64, linux/arm64",
+    manifest_url: "",
+    check_period_s: "900",
+    auto_check: "on",
+    auto_release: "off",
+  });
+  assert.deepEqual(valid.errors, {});
+  assert.deepEqual(valid.payload.required_platforms, [{ os: "linux", arch: "amd64" }, { os: "linux", arch: "arm64" }]);
+  assert.equal(valid.payload.auto_check, true);
+  assert.equal(valid.payload.auto_release, false);
+  assert.match(definitionForm([{ server_id: "atlas", url: "https://atlas.example.test" }]), /atlas/);
+  assert.deepEqual(validateCLISettings({ check_period_s: "0", auto_check: "on", auto_release: "off" }).errors, {
+    check_period_s: "检查周期需要 ≥30 秒的整数。",
+  });
+});
+
+test("V2-C05 never renders an unknown impact as zero", () => {
+  const unknown = impactHTML({
+    known: false,
+    affected_agents: null,
+    unknown: ["the source directory is stale: credential revoked"],
+    agents: [],
+    in_flight: [],
+  });
+  assert.match(unknown, /影响范围未知/);
+  assert.match(unknown, /credential revoked/);
+  assert.doesNotMatch(unknown, /影响 0 个/);
+  const known = impactHTML({
+    known: true,
+    candidate_version: "2.0.0",
+    current_version: "1.0.0",
+    affected_agents: 0,
+    agents: [],
+    in_flight: [],
+  });
+  assert.match(known, /影响 0 个 Agent/);
+});
+
+test("V2-C05 names the next-start agents and keeps old runs on their frozen version", () => {
+  const html = impactHTML({
+    known: true,
+    cli_id: "omp",
+    kind: "agent",
+    candidate_version: "2.0.0",
+    current_version: "1.0.0",
+    affected_agents: 1,
+    agents: [
+      { agent_id: "dev", agent_name: "开发 Agent", workspace_id: "core", workspace_name: "工程空间", runtime_id: "rt-omp", adapter: "omp", current_version: "1.0.0" },
+    ],
+    in_flight: [
+      { task_id: "task-1", agent_id: "dev", agent_name: "开发 Agent", workspace_id: "core", version: "1.0.0", version_known: true, config_revision: 3, config_revision_known: true, started_at: "2026-11-21T07:00:00Z" },
+    ],
+  });
+  assert.match(html, /开发 Agent/);
+  assert.match(html, /工程空间/);
+  assert.match(html, /task-1/);
+  assert.match(html, /冻结版本/);
+  assert.match(html, /1\.0\.0/);
+  assert.match(html, /不热更新/);
+});
+
+test("V2-C05 keeps missing in-flight facts unknown instead of guessing", () => {
+  const html = impactHTML({
+    known: true,
+    cli_id: "omp",
+    kind: "agent",
+    candidate_version: "2.0.0",
+    current_version: "1.0.0",
+    affected_agents: 1,
+    agents: [],
+    in_flight: [
+      { task_id: "task-unknown", agent_id: "dev", workspace_id: "core", version_known: false, config_revision_known: false },
+    ],
+  });
+  assert.match(html, /task-unknown/);
+  assert.match(html, /未知/);
+  assert.doesNotMatch(html, /无发布版本/);
+  assert.doesNotMatch(html, /config_revision/);
+});
+
+test("V2-C05 submits the release generation the preview observed", () => {
+  const html = publishForm({
+    cli_id: "omp",
+    kind: "agent",
+    check_generation: 4,
+    current_generation: 7,
+    current_version: "1.0.0",
+    candidates: ["1.0.0", "2.0.0"],
+  });
+  assert.match(html, /data-release-generation="7"/);
+  assert.match(html, /data-generation="4"/);
+});
+
+test("CFG-07 renders references and revisions but no config content", () => {
+  const html = renderAgentConfigs([
+    {
+      server_id: "atlas",
+      workspace_id: "core",
+      backend: "omp",
+      profile: "primary",
+      revision: 2,
+      secret_ref: "omp-primary-config",
+      file_name: "config.json",
+      sha256: "b".repeat(64),
+      size: 42,
+      updated_at: "2026-11-21T07:00:00Z",
+      updated_by: "ops",
+    },
+  ]);
+  assert.match(html, /omp-primary-config/);
+  assert.match(html, /第 2 修订/);
+  assert.doesNotMatch(html, /fictional-provider-credential/);
+  assert.match(html, /不创建真实 Secret/);
+});
+
+test("CFG-07 refuses an array, null, malformed JSON and a secret value reference", () => {
+  const base = {
+    server_id: "atlas",
+    workspace_id: "core",
+    backend: "omp",
+    profile: "primary",
+    secret_ref: "omp-primary-config",
+    file_name: "config.json",
+    config: `{"provider":"omp"}`,
+  };
+  for (const config of ["[]", "null", "{", ""]) {
+    const result = validateConfig({ ...base, config });
+    assert.equal(result.payload, null, `config ${config} was accepted`);
+    assert.ok(result.errors.config);
+  }
+  const badRef = validateConfig({ ...base, secret_ref: "Bearer ey-not-a-reference" });
+  assert.ok(badRef.errors.secret_ref);
+  const valid = validateConfig(base);
+  assert.equal(valid.payload.config.provider, "omp");
+  assert.equal(valid.payload.secret_ref, "omp-primary-config");
+});
+
+test("MODEL-09 keeps non-empty, legal empty, unsupported and failed distinct", () => {
+  const labels = ["succeeded_nonempty", "succeeded_empty", "unsupported", "failed"].map((value) => classBadge(value));
+  assert.equal(new Set(labels).size, 4, "the four result classes share a label");
+  const unsupported = renderDiscovery([], [], {
+    filter: {},
+    view: {
+      available: false,
+      class: "unsupported",
+      models: [],
+      detail: "codex app-server protocol is not verified for this build",
+    },
+  });
+  assert.match(unsupported, /不支持 \/ 需配置/);
+  assert.doesNotMatch(unsupported, /0 个模型/);
+  const empty = renderDiscovery([], [], {
+    filter: {},
+    view: { available: true, class: "succeeded_empty", models: [], detail: "" },
+  });
+  assert.match(empty, /合法空列表/);
+  const failed = renderDiscovery([], [], {
+    filter: {},
+    view: { available: false, class: "failed", models: [], detail: "bad JSON" },
+  });
+  assert.match(failed, /发现失败/);
+  assert.match(failed, /不能当作空成功/);
+});
+
+test("MODEL-09 requires an environment and an adapter or CLI", () => {
+  const invalid = validateDiscovery({
+    server_id: "atlas",
+    workspace_id: "core",
+    runtime_id: "rt-omp",
+    kind: "models",
+    cli_id: "",
+    adapter: "",
+    platform: "linux/amd64",
+  });
+  assert.ok(invalid.errors.cli_id);
+  assert.equal(invalid.payload, null);
+  const valid = validateDiscovery({
+    server_id: "atlas",
+    workspace_id: "core",
+    runtime_id: "rt-omp",
+    kind: "models",
+    cli_id: "omp",
+    adapter: "",
+    platform: "linux/amd64",
+    config_revision: "",
+  });
+  assert.deepEqual(valid.errors, {});
+  assert.equal(valid.payload.cli_id, "omp");
+  assert.equal(valid.payload.config_revision, undefined);
+});
+
+test("the CLI page renders every management section without a placeholder", () => {
+  const html = renderCLIPage({
+    definitions: [CLI],
+    audit: [],
+    configs: [],
+    configAudit: [],
+    adapters: [{ name: "omp", kinds: ["models"], trusted: true }],
+    requests: [],
+    models: { filter: {}, view: null },
+  });
+  for (const section of ["CLI 发布线", "CLI 发布审计", "Agent 配置修订", "配置审计", "发现适配器", "发现请求", "模型目录"]) {
+    assert.match(html, new RegExp(section));
+  }
+  assert.doesNotMatch(html, /由 CLI 与配置交付范围提供/);
 });

@@ -29,7 +29,7 @@ func TestStartup04CommandDrivenRelayEndToEnd(t *testing.T) {
 	commandSeen := h.serveProbeDaemon(t, resultBody)
 
 	logs := &writeBuffer{}
-	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.slots, h.metrics,
+	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, proxy.NewProbeCatalogSource(h.sched), h.slots, h.metrics,
 		proxy.WithReporterLogger(slog.New(slog.NewJSONHandler(logs, nil))),
 	)
 	reporter.OnAck(t.Context(), "rid-omp", "req-cmd")
@@ -209,7 +209,7 @@ func TestStartup04StaleCacheStillAnswersWhileTheProbeSlotIsBusy(t *testing.T) {
 	// time sits two TTLs in the past.
 	h.cfg.ModelCatalogCacheTTL = time.Minute
 	logs := &writeBuffer{}
-	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.slots, h.metrics,
+	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, proxy.NewProbeCatalogSource(h.sched), h.slots, h.metrics,
 		proxy.WithReporterLogger(slog.New(slog.NewJSONHandler(logs, nil))))
 
 	// One command of this runtime occupies the single-flight seat: its probe

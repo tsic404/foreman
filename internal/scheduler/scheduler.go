@@ -814,6 +814,18 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 		// (§2.3, ADR-043).
 		RuntimeIdentity: s.resolveRuntimeIdentity(head.RuntimeID, scope),
 	}
+	if s.cfg.ClaimFacts != nil {
+		facts := s.cfg.ClaimFacts(ctx, e.WorkspaceID, e.AgentID, e.RuntimeIdentity,
+			registry.AttemptID(e.TaskID, e.Attempt))
+		e.CLIVersion = facts.MulticaVersion
+		e.CLIDigests = cloneDigests(facts.MulticaDigests)
+		e.AgentCLIVersion = facts.AgentVersion
+		e.AgentCLIDigests = cloneDigests(facts.AgentDigests)
+		e.ConfigRevision = facts.ConfigRevision
+		e.CLIFactsKnown = facts.CLIKnown
+		e.AgentFactsKnown = facts.AgentKnown
+		e.ConfigFactsKnown = facts.ConfigKnown
+	}
 	// A switched-off bound (0 = no upper bound) writes no deadline at
 	// all: the zero value is "no bound", never an expired one, and must not
 	// degrade to claimed_at (§4.2, ADR-026).

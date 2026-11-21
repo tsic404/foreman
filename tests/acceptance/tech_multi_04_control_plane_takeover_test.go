@@ -183,7 +183,7 @@ func startHeartbeatLoop(t *testing.T, h *harness) func() {
 // cancel and wait, for scenarios that pin the exit ordering.
 func startHeartbeatLoopDetached(t *testing.T, h *harness) (cancel func(), wait func()) {
 	t.Helper()
-	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.client.CatalogSlots(), h.metrics)
+	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, proxy.NewProbeCatalogSource(h.sched), h.client.CatalogSlots(), h.metrics)
 	loop := proxy.NewHeartbeatLoop(h.client, reporter)
 	loop.SetLeaderGate(h.leaderHeld)
 	ctx, cancelCtx := context.WithCancel(t.Context())

@@ -247,6 +247,26 @@ spec:
             # rebuilds them.
             - name: FOREMAN_SOURCE_STATE_FILE
               value: "/var/lib/foreman/catalog-sources.json"
+            # CLI release pointers, Agent configuration revisions and
+            # discovery request/result history live on the same writable
+            # emptyDir. They are metadata only: no artifact bytes, config
+            # content or Secret value is written here.
+            - name: FOREMAN_CLI_STATE_FILE
+              value: "/var/lib/foreman/cli-releases.json"
+            - name: FOREMAN_AGENT_CONFIG_STATE_FILE
+              value: "/var/lib/foreman/agent-configs.json"
+            - name: FOREMAN_DISCOVERY_STATE_FILE
+              value: "/var/lib/foreman/discovery.json"
+            # Verified CLI bytes are content-addressed by release domain and
+            # digest on the same writable emptyDir. Only a fully verified
+            # payload enters the cache; a damaged entry is refetched.
+            - name: FOREMAN_CLI_ARTIFACT_CACHE_DIR
+              value: "/var/lib/foreman/cli-cache"
+            # The startup command-surface probe runs this binary. Execution
+            # uses the published, verified CLI artifact instead; a deployment
+            # without either leaves the adapter unsupported.
+            - name: FOREMAN_OMP_BINARY
+              value: "omp"
             - name: FOREMAN_WS_ENABLED
               value: "true"
             # --- shared state (ADR-046 阶段一) ---

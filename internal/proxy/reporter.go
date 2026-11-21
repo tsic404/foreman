@@ -6,51 +6,62 @@ import (
 	"strconv"
 	"sync"
 	"time"
-
-	"github.com/tsic404/foreman/internal/registry"
-	"github.com/tsic404/foreman/internal/scheduler"
 )
 
 // codeLabel renders a C21 status code as the metrics label value; an abandoned
 // relay is reported as "none" (§9.2 指标口径).
 func codeLabel(code int) string { return strconv.Itoa(code) }
 
-// CatalogProbe is the control channel to the catalog-probe Jobs: build/wait/
-// delete. The scheduler owns it (K8s objects); proxy only ever calls it and
-// shares state with it through the probe session table.
-type CatalogProbe interface {
-	// StartProbe builds the probe Job and its credential Secret; mode fixes the
-	// session's command face, and realRuntimeID names the runtime a
-	// command-driven probe relays for (registry.ProbeMode).
-	StartProbe(ctx context.Context, requestID, realRuntimeID, workspaceID string, mode registry.ProbeMode, budget time.Duration) (scheduler.ProbeHandle, error)
-	// AwaitProbeRelayed waits until the probe's result has landed (startup
-	// discovery) or been forwarded (command driven), or the deadline passes.
-	AwaitProbeRelayed(ctx context.Context, h scheduler.ProbeHandle, deadline time.Time) (nodeName string, relayed bool, relayedCode int, err error)
-	// DeleteProbe tears the probe down: session first, then Secret, then Job.
-	DeleteProbe(ctx context.Context, h scheduler.ProbeHandle) error
+// CatalogRequest is one pending_model_list command handed to a catalog source.
+// WorkspaceID is the workspace whose upstream issued the command.
+type CatalogRequest struct {
+	RuntimeID   string
+	RequestID   string
+	WorkspaceID string
+	Deadline    time.Time
+}
+
+// CatalogAnswer is one source's answer. A source either returns the model-list
+// body for the reporter to relay, or reports that it already relayed (the 1.x
+// probe path). A source that cannot produce a model list returns an error: an
+// unsupported or failed discovery must never be relayed as an empty success.
+type CatalogAnswer struct {
+	Body    []byte
+	Relayed bool
+	Code    int
+	Node    string
+}
+
+// CatalogSource answers one pending_model_list command. The 2.0 production
+// source is the restricted control-plane discovery executor, which never
+// creates a probe Job; the probe source is retained for the pinned 1.x
+// acceptance suite.
+type CatalogSource interface {
+	Catalog(ctx context.Context, request CatalogRequest) (CatalogAnswer, error)
 }
 
 // ModelCatalogReporter consumes the C2 ack's pending_model_list and answers it
-// (§1.3): a slot with a cache replays it verbatim, an empty
-// slot falls back to a fresh probe whose result is forwarded verbatim. Both
-// paths are single-flight per real runtime; a replay never occupies the probe
-// slot.
+// (§1.3): a slot with a cache replays it verbatim, an empty slot falls back to
+// the wired catalog source. Both paths are single-flight per real runtime; a
+// replay never occupies the execution slot.
 type ModelCatalogReporter struct {
-	cfg     Config
-	client  *Client
-	probes  CatalogProbe
-	slots   *CatalogSlots
-	metrics Metrics
-	log     *slog.Logger
-	now     func() time.Time
+	cfg        Config
+	client     *Client
+	source     CatalogSource
+	slots      *CatalogSlots
+	metrics    Metrics
+	log        *slog.Logger
+	now        func() time.Time
+	slotReplay bool
 
 	mu         sync.Mutex
-	perRuntime map[string]*runtimeProbeSlot
+	perRuntime map[string]*runtimeCatalogSlot
 }
 
-// runtimeProbeSlot is one real runtime's single-flight state: at most one probe
-// in flight, plus a one-deep waiting slot (a newer request supersedes it).
-type runtimeProbeSlot struct {
+// runtimeCatalogSlot is one real runtime's single-flight state: at most one
+// execution in flight, plus a one-deep waiting slot (a newer request
+// supersedes it).
+type runtimeCatalogSlot struct {
 	occupied *pendingCatalogRequest
 	queued   *pendingCatalogRequest
 }
@@ -73,18 +84,26 @@ func WithReporterLogger(l *slog.Logger) ReporterOption {
 	return func(r *ModelCatalogReporter) { r.log = l.With("component", "model-catalog") }
 }
 
+// WithCatalogSlotReplay controls the per-runtime slot fast path. A source that
+// owns a generation-keyed cache (the discovery executor) turns it off, so a
+// cached body from an older CLI or configuration revision cannot answer.
+func WithCatalogSlotReplay(enabled bool) ReporterOption {
+	return func(r *ModelCatalogReporter) { r.slotReplay = enabled }
+}
+
 // NewModelCatalogReporter wires the reporter to the server client (C21), the
-// probe control channel, the catalog slots and the metrics seam.
-func NewModelCatalogReporter(cfg Config, client *Client, probes CatalogProbe, slots *CatalogSlots, metrics Metrics, opts ...ReporterOption) *ModelCatalogReporter {
+// catalog source, the catalog slots and the metrics seam.
+func NewModelCatalogReporter(cfg Config, client *Client, source CatalogSource, slots *CatalogSlots, metrics Metrics, opts ...ReporterOption) *ModelCatalogReporter {
 	r := &ModelCatalogReporter{
 		cfg:        cfg,
 		client:     client,
-		probes:     probes,
+		source:     source,
 		slots:      slots,
 		metrics:    orNoopMetrics(metrics),
 		log:        slog.Default().With("component", "model-catalog"),
 		now:        time.Now,
-		perRuntime: map[string]*runtimeProbeSlot{},
+		slotReplay: true,
+		perRuntime: map[string]*runtimeCatalogSlot{},
 	}
 	for _, opt := range opts {
 		opt(r)
@@ -99,9 +118,23 @@ func probeMinBudget(timeout time.Duration) time.Duration {
 	return timeout / 3
 }
 
+// catalogBudgetSource lets a source state the smallest remaining budget it can
+// still answer within. A probe needs build and delivery time; an in-process
+// discovery can answer from its cache immediately.
+type catalogBudgetSource interface {
+	MinimumBudget(timeout time.Duration) time.Duration
+}
+
+func (r *ModelCatalogReporter) minimumBudget() time.Duration {
+	if source, ok := r.source.(catalogBudgetSource); ok {
+		return source.MinimumBudget(r.cfg.ModelCatalogTimeout)
+	}
+	return probeMinBudget(r.cfg.ModelCatalogTimeout)
+}
+
 // OnAck consumes one heartbeat ack. It runs inside the heartbeat round of the
-// runtime the ack belongs to (§1.3): an empty slot is
-// filled by a fresh probe, a cached slot is replayed right here.
+// runtime the ack belongs to (§1.3): an empty slot is filled by the wired
+// source, a cached slot is replayed right here.
 func (r *ModelCatalogReporter) OnAck(ctx context.Context, runtimeID, requestID string) {
 	if requestID == "" {
 		return
@@ -127,13 +160,15 @@ func (r *ModelCatalogReporter) OnAck(ctx context.Context, runtimeID, requestID s
 		r.metrics.ModelCatalogRelay("none", 0)
 		return
 	}
-	if slot, ok := r.slots.Get(runtimeID); ok {
-		// The answer leaves the heartbeat round: consuming the ack stays
-		// in-round (§1.3), while the replay — which may
-		// retry inside its own budget — must not stretch the 15s cadence of
-		// this runtime's C2 stream (a replay is meant to be the near-zero path).
-		go r.replay(context.WithoutCancel(ctx), runtimeID, requestID, slot, consumedAt)
-		return
+	if r.slotReplay && r.slots != nil {
+		if slot, ok := r.slots.Get(runtimeID); ok {
+			// The answer leaves the heartbeat round: consuming the ack stays
+			// in-round (§1.3), while the replay — which may
+			// retry inside its own budget — must not stretch the 15s cadence of
+			// this runtime's C2 stream (a replay is meant to be the near-zero path).
+			go r.replay(context.WithoutCancel(ctx), runtimeID, requestID, slot, consumedAt)
+			return
+		}
 	}
 	r.Submit(ctx, runtimeID, requestID, consumedAt)
 }
@@ -177,7 +212,7 @@ func (r *ModelCatalogReporter) Submit(ctx context.Context, runtimeID, requestID 
 	r.mu.Lock()
 	slot := r.perRuntime[runtimeID]
 	if slot == nil {
-		slot = &runtimeProbeSlot{}
+		slot = &runtimeCatalogSlot{}
 		r.perRuntime[runtimeID] = slot
 	}
 	switch {
@@ -216,54 +251,61 @@ func (r *ModelCatalogReporter) release(runtimeID string) {
 	}
 }
 
-// run drives one command through a fresh probe. The budget is anchored at the
-// moment the ack was consumed — never at dequeue time: the server window starts
-// at delivery, and a queued request may already have waited out one full probe
-// (§1.3).
+// run drives one command through the wired source. The budget is anchored at
+// the moment the ack was consumed — never at dequeue time: the server window
+// starts at delivery, and a queued request may already have waited out one
+// full execution (§1.3).
 func (r *ModelCatalogReporter) run(ctx context.Context, runtimeID string, req *pendingCatalogRequest) {
 	start := r.now()
-	// LIFO: Delete must finish before release promotes the next request, or two
-	// probe Jobs of the same runtime coexist.
+	// LIFO: the source must finish before release promotes the next request, or
+	// two executions of the same runtime coexist.
 	defer r.release(runtimeID)
 	deadline := req.consumedAt.Add(r.cfg.ModelCatalogTimeout)
 	remaining := deadline.Sub(start)
-	if remaining < probeMinBudget(r.cfg.ModelCatalogTimeout) {
+	if remaining <= 0 || remaining < r.minimumBudget() {
 		r.log.Warn("model.catalog_relay_failed", "request_id", req.reqID, "runtime_id", runtimeID,
 			"reason", "insufficient budget after queueing")
 		r.metrics.ModelCatalogRelay("none", start.Sub(req.consumedAt).Seconds())
 		return
 	}
 	r.log.Info("model.catalog_requested", "request_id", req.reqID, "remaining_ms", remaining.Milliseconds())
-	probe, err := r.probes.StartProbe(ctx, req.reqID, runtimeID, r.client.WorkspaceID(), registry.ProbeCommandDriven, remaining)
+	if r.source == nil {
+		r.log.Warn("model.catalog_relay_failed", "request_id", req.reqID, "runtime_id", runtimeID,
+			"reason", "no catalog source is wired")
+		r.metrics.ModelCatalogRelay("none", r.now().Sub(req.consumedAt).Seconds())
+		return
+	}
+	answer, err := r.source.Catalog(ctx, CatalogRequest{
+		RuntimeID: runtimeID, RequestID: req.reqID,
+		WorkspaceID: r.client.WorkspaceID(), Deadline: deadline,
+	})
 	if err != nil {
 		r.log.Warn("model.catalog_relay_failed", "request_id", req.reqID, "runtime_id", runtimeID, "reason", err)
 		r.metrics.ModelCatalogRelay("none", r.now().Sub(req.consumedAt).Seconds())
 		return
 	}
-	defer r.probes.DeleteProbe(context.WithoutCancel(ctx), probe)
-	node, relayed, code, err := r.probes.AwaitProbeRelayed(ctx, probe, deadline)
-	if err != nil || !relayed {
-		r.log.Warn("model.catalog_relay_failed", "request_id", req.reqID, "runtime_id", runtimeID,
-			"node_name", node, "reason", reasonOf(err))
+	if answer.Relayed {
+		if answer.Code == 0 {
+			// RelayedAt with code 0: the source used up its retry budget without
+			// the server taking the result — the "转发耗尽" face of the failure
+			// set.
+			r.log.Warn("model.catalog_relay_failed", "request_id", req.reqID, "runtime_id", runtimeID,
+				"node_name", answer.Node, "reason", errRelayExhausted)
+			r.metrics.ModelCatalogRelay("none", r.now().Sub(req.consumedAt).Seconds())
+			return
+		}
+		r.log.Info("model.catalog_relayed", "request_id", req.reqID, "node_name", answer.Node, "code", answer.Code)
+		r.metrics.ModelCatalogRelay(codeLabel(answer.Code), r.now().Sub(req.consumedAt).Seconds())
+		return
+	}
+	relayCtx, cancel := context.WithDeadline(ctx, deadline)
+	defer cancel()
+	code, _, err := relayCatalog(relayCtx, r.client, runtimeID, req.reqID, answer.Body, deadline, r.log)
+	if err != nil {
+		r.log.Warn("model.catalog_relay_failed", "request_id", req.reqID, "runtime_id", runtimeID, "reason", err)
 		r.metrics.ModelCatalogRelay("none", r.now().Sub(req.consumedAt).Seconds())
 		return
 	}
-	if code == 0 {
-		// RelayedAt with code 0: the S27 path used up its retry budget without
-		// the server taking the result — the "转发耗尽" face of the failure set.
-		r.log.Warn("model.catalog_relay_failed", "request_id", req.reqID, "runtime_id", runtimeID,
-			"node_name", node, "reason", errRelayExhausted)
-		r.metrics.ModelCatalogRelay("none", r.now().Sub(req.consumedAt).Seconds())
-		return
-	}
-	r.log.Info("model.catalog_relayed", "request_id", req.reqID, "node_name", node, "code", code)
+	r.log.Info("model.catalog_relayed", "request_id", req.reqID, "code", code)
 	r.metrics.ModelCatalogRelay(codeLabel(code), r.now().Sub(req.consumedAt).Seconds())
-}
-
-// reasonOf keeps the failure event readable when the wait simply ran out.
-func reasonOf(err error) any {
-	if err == nil {
-		return "probe did not report within budget"
-	}
-	return err
 }
