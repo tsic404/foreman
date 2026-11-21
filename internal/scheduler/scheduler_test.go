@@ -59,6 +59,9 @@ type fakeJobs struct {
 	// onListJobs runs inside ListJobs: a test can hold the rebuild's list
 	// open and observe whether Start returns before it completes.
 	onListJobs func()
+	// onListJobsCtx runs inside ListJobs with the caller's context: a test can
+	// hold the rebuild open and observe whether the phase context ends.
+	onListJobsCtx func(context.Context)
 
 	// existingJobs models Jobs already in the cluster: CreateJob answers
 	// AlreadyExists for their names and GetJob returns them (terminating,
@@ -206,9 +209,24 @@ func (f *fakeJobs) secretDeleted(name string) bool {
 	return false
 }
 
-func (f *fakeJobs) ListJobs(context.Context) ([]batchv1.Job, error) {
+func (f *fakeJobs) jobDeleted(name string) bool {
+	for _, got := range f.deletedJobs {
+		if got == name {
+			return true
+		}
+	}
+	return false
+}
+
+func (f *fakeJobs) ListJobs(ctx context.Context) ([]batchv1.Job, error) {
 	if f.onListJobs != nil {
 		f.onListJobs()
+	}
+	if f.onListJobsCtx != nil {
+		f.onListJobsCtx(ctx)
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
 	}
 	if f.listJobsErr != nil {
 		return nil, f.listJobsErr
@@ -278,6 +296,12 @@ type fakeServer struct {
 	// statusBlocks holds TaskStatus until its context ends: a control-plane
 	// answer that arrives after the caller's budget.
 	statusBlocks bool
+	// statusWait holds TaskStatus until it closes or the caller's context
+	// ends: a convergence round a takeover test can hold open past the lease.
+	statusWait <-chan struct{}
+	// onStatusCancelled fires when a held TaskStatus observes its context
+	// ending, so a test can wait for the round's tenure binding to cancel.
+	onStatusCancelled func()
 
 	forwardCode int
 	forwardErr  error
@@ -288,6 +312,16 @@ type fakeServer struct {
 func (f *fakeServer) TaskStatus(ctx context.Context, _ string) (string, error) {
 	if f.onStatus != nil {
 		f.onStatus()
+	}
+	if f.statusWait != nil {
+		select {
+		case <-ctx.Done():
+			if f.onStatusCancelled != nil {
+				f.onStatusCancelled()
+			}
+			return "", ctx.Err()
+		case <-f.statusWait:
+		}
 	}
 	if f.statusBlocks {
 		<-ctx.Done()
@@ -354,11 +388,11 @@ func (f *fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secre
 	}
 	job := f.job
 	if job == nil {
-		job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: "fm-" + e.TaskID}}
+		job = &batchv1.Job{ObjectMeta: metav1.ObjectMeta{Name: jobbuilder.DaemonIDForInScope(e.TaskID, e.SourceID, e.WorkspaceID)}}
 	}
 	secret := f.secret
 	if secret == nil {
-		secret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: "fm-" + e.TaskID + "-cred"}}
+		secret = &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: jobbuilder.DaemonIDForInScope(e.TaskID, e.SourceID, e.WorkspaceID) + "-cred"}}
 	}
 	hash := f.tokenHash
 	if hash == "" {
@@ -368,13 +402,14 @@ func (f *fakeBuilder) Build(e jobbuilder.TaskEntry) (*batchv1.Job, *corev1.Secre
 }
 
 // ResolveName mirrors the production shape for the fallback template the fake
-// stands in for: no format expressed, so the identity name. resolveNameErr
-// injects the name-composition failure the claim path must survive.
+// stands in for: no format expressed, so the identity name — including the
+// source discriminator a source-scoped claim carries. resolveNameErr injects
+// the name-composition failure the claim path must survive.
 func (f *fakeBuilder) ResolveName(e jobbuilder.TaskEntry) (string, error) {
 	if f.resolveNameErr != nil {
 		return "", f.resolveNameErr
 	}
-	return "fm-" + e.TaskID, nil
+	return jobbuilder.DaemonIDForInScope(e.TaskID, e.SourceID, e.WorkspaceID), nil
 }
 
 // RequiresProjectIdentity keeps the fake's claims out of the platform lookup.
@@ -568,8 +603,9 @@ func newFixtureWithEnv(t *testing.T, extra map[string]string) *fixture {
 }
 
 // newFixtureUnder is the shared construction: production's LoadConfig path,
-// with the registry options and environment keys a scenario needs.
-func newFixtureUnder(t *testing.T, opts []registry.Option, extra map[string]string) *fixture {
+// with the registry options and environment keys a scenario needs, plus any
+// scheduler options a scenario adds (the coordination face, a leader gate).
+func newFixtureUnder(t *testing.T, opts []registry.Option, extra map[string]string, schedOpts ...Option) *fixture {
 	t.Helper()
 	f := &fixture{
 		jobs:    &fakeJobs{},
@@ -593,11 +629,13 @@ func newFixtureUnder(t *testing.T, opts []registry.Option, extra map[string]stri
 		t.Fatalf("LoadConfig: %v", err)
 	}
 	s, err := New(cfg, f.reg, f.jobs, f.builder, f.server, f.metrics,
-		WithClock(func() time.Time { return f.now }),
-		WithPendingReports(f.pending),
-		WithRevoker(f.revoker),
-		WithProbeRegistry(registry.NewProbeRegistry()),
-		WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		append([]Option{
+			WithClock(func() time.Time { return f.now }),
+			WithPendingReports(f.pending),
+			WithRevoker(f.revoker),
+			WithProbeRegistry(registry.NewProbeRegistry()),
+			WithLogger(slog.New(slog.NewTextHandler(io.Discard, nil))),
+		}, schedOpts...)...,
 	)
 	if err != nil {
 		t.Fatalf("New: %v", err)

@@ -18,6 +18,7 @@ import (
 
 	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
+	"github.com/tsic404/foreman/internal/scope"
 )
 
 // Client is the fake client: every F→S call of §1.2 (C-1–C-21). It injects
@@ -39,6 +40,12 @@ type Client struct {
 	// taskRuntime resolves the real runtime id a task was dispatched under,
 	// which the S-8 body needs (S-8).
 	taskRuntime func(taskID string) string
+	// taskRuntimeInScope is the scoped form of taskRuntime: it resolves the
+	// attempt under this client's own source/workspace and reports whether the
+	// scope holds one at all. A known attempt without a dispatch record (a Job
+	// rendered before the annotation) keeps the legacy first-declared-runtime
+	// fallback; an unknown task must not borrow another scope's runtime.
+	taskRuntimeInScope func(taskID string) (runtimeID string, known bool)
 
 	mu             sync.RWMutex
 	disc           registry.Discovery
@@ -154,6 +161,13 @@ func (c *Client) WorkspaceState() WorkspaceState {
 // WorkspaceID returns the workspace this client serves. One client serves one
 // (credential, daemon identity) pair (§0).
 func (c *Client) WorkspaceID() string { return c.cfg.WorkspaceID }
+
+// SourceID is the stable Multica server identity this client serves.
+func (c *Client) SourceID() string { return c.cfg.SourceID }
+
+// ScopeKey is the partition key of the source and workspace this client
+// serves. The empty source keeps the legacy raw workspace key.
+func (c *Client) ScopeKey() string { return scope.Key(c.cfg.SourceID, c.cfg.WorkspaceID) }
 
 // ServerURL returns the Multica server this client speaks to, without a
 // trailing slash. It is how a catalog source is recognised as this
@@ -366,7 +380,12 @@ func (c *Client) translateStartBody(taskID string, body []byte) ([]byte, error) 
 	if _, ok := fields["runtime_id"]; !ok {
 		return body, nil
 	}
-	runtimeID, exact := c.runtimeForTask(taskID)
+	runtimeID, exact, known := c.runtimeForTask(taskID)
+	if !known {
+		c.log.Warn("task is not an attempt of this source scope; leaving runtime_id untranslated",
+			"task_id", taskID, "source_id", c.SourceID(), "workspace_id", c.WorkspaceID())
+		return body, nil
+	}
 	if runtimeID == "" {
 		return body, nil
 	}
@@ -590,7 +609,11 @@ func (c *Client) GCCheck(ctx context.Context, taskID string) (int, []byte, error
 // ResolveSkillBundles is C19: forwards the Job daemon's resolve body with
 // the {rid} rewritten to the real runtime id and Foreman's credential (S26).
 func (c *Client) ResolveSkillBundles(ctx context.Context, taskID string, body []byte) (int, []byte, error) {
-	rid, exact := c.runtimeForTask(taskID)
+	rid, exact, known := c.runtimeForTask(taskID)
+	if !known {
+		return 0, nil, fmt.Errorf("skill bundles: task %s is not an attempt of source %q workspace %q",
+			taskID, c.SourceID(), c.WorkspaceID())
+	}
 	if rid == "" {
 		return 0, nil, errors.New("skill bundles: no real runtime registered")
 	}
@@ -608,17 +631,27 @@ func (c *Client) ResolveSkillBundles(ctx context.Context, taskID string, body []
 // Job rendered before that annotation carries none, and then the first
 // declared runtime is the best available answer; exact reports which of the
 // two paths produced the id.
-func (c *Client) runtimeForTask(taskID string) (runtimeID string, exact bool) {
-	if c.taskRuntime != nil {
+func (c *Client) runtimeForTask(taskID string) (runtimeID string, exact, known bool) {
+	if c.taskRuntimeInScope != nil {
+		rid, scoped := c.taskRuntimeInScope(taskID)
+		if !scoped {
+			return "", false, false
+		}
+		if rid != "" {
+			return rid, true, true
+		}
+		// The attempt is this scope's own but carries no dispatch record; the
+		// legacy fallback below is the documented degradation.
+	} else if c.taskRuntime != nil {
 		if rid := c.taskRuntime(taskID); rid != "" {
-			return rid, true
+			return rid, true, true
 		}
 	}
 	ids := c.RuntimeIDs()
 	if len(ids) == 0 {
-		return "", false
+		return "", false, false
 	}
-	return ids[0], false
+	return ids[0], false, true
 }
 
 // ---- C16/C17/C18 ----

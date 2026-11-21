@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"net/http"
@@ -36,6 +37,10 @@ type TaskScheduler interface {
 	Deliver(ctx context.Context, workspaceID, daemonID, runtimeID string, maxTasks int) (scheduler.Delivery, error)
 	OnReport(ctx context.Context, ep scheduler.Endpoint, e registry.TaskEntry, body []byte, sessionID string) (int, []byte, error)
 	OnTaskVanished(ctx context.Context, taskID string) error
+	// OnTaskVanishedInSource is the source-qualified form: two registered
+	// servers can expose the same workspace id, so the token's own partition
+	// names the vanished attempt.
+	OnTaskVanishedInSource(ctx context.Context, sourceID, workspaceID, taskID string) error
 	// FailJob settles a Job whose daemon was refused at S4: the entry reaches
 	// terminal/failed without waiting out the boot deadline (S-4). detail is
 	// the termination facts for the report's error text; that path has none.
@@ -249,27 +254,49 @@ func (s *FakeServer) authenticate(w http.ResponseWriter, r *http.Request, scope 
 	return claims, true
 }
 
-// clientFor resolves the client of one workspace. A single-workspace server
-// built without a set answers with its one client for any id (the legacy
-// path); once a set is wired an unknown workspace resolves to nil.
-func (s *FakeServer) clientFor(workspaceID string) *Client {
-	if client, ok := s.clients.For(workspaceID); ok {
+// clientFor resolves the client of one source and workspace pair. The empty
+// source is the legacy single-source deployment, where the workspace id alone
+// identifies the client.
+func (s *FakeServer) clientFor(sourceID, workspaceID string) *Client {
+	if client, ok := s.clients.ForSource(sourceID, workspaceID); ok {
 		return client
 	}
 	return nil
 }
 
+// deliver picks the delivery face of the token's source. A source-carrying
+// token whose scheduler has no source-aware pickup fails closed instead of
+// falling back to another server's queue.
+func (s *FakeServer) deliver(ctx context.Context, sourceID, workspaceID, daemonID, runtimeID string, maxTasks int) (scheduler.Delivery, error) {
+	if sourceID == "" {
+		return s.sched.Deliver(ctx, workspaceID, daemonID, runtimeID, maxTasks)
+	}
+	src, ok := s.sched.(interface {
+		DeliverInSource(ctx context.Context, sourceID, workspaceID, daemonID, runtimeID string, maxTasks int) (scheduler.Delivery, error)
+	})
+	if !ok {
+		return scheduler.Delivery{}, fmt.Errorf("delivery channel cannot route source %q", sourceID)
+	}
+	return src.DeliverInSource(ctx, sourceID, workspaceID, daemonID, runtimeID, maxTasks)
+}
+
 // workspaceConfigured reports whether the deployment serves workspaceID.
-func (s *FakeServer) workspaceConfigured(workspaceID string) bool {
-	return s.clients.Has(workspaceID)
+func (s *FakeServer) workspaceConfigured(sourceID, workspaceID string) bool {
+	return s.clients.HasScope(sourceID, workspaceID)
 }
 
 // discoverySet returns the discovery set in configuration order (§2.2 S-1):
 // the set the deployment's credentials scope to — for the user-scoped form the
 // C-17 answer (∩ manifest), for the workspace-scoped form the configured
 // pairs. The clients are built from exactly that set, so their ids are it.
-func (s *FakeServer) discoverySet() []string {
-	return s.clients.IDs()
+func (s *FakeServer) discoverySet(sourceID string) []string {
+	ids := make([]string, 0, len(s.clients.All()))
+	for _, client := range s.clients.All() {
+		if client.SourceID() == sourceID {
+			ids = append(ids, client.WorkspaceID())
+		}
+	}
+	return ids
 }
 
 // allowsWorkspace decides whether a token may address a workspace on the
@@ -284,15 +311,15 @@ func (s *FakeServer) allowsWorkspace(claims auth.Claims, workspaceID string) boo
 		return false
 	}
 	session, ok := s.probeSession(claims)
-	return ok && session.WorkspaceID == "" && s.workspaceConfigured(workspaceID)
+	return ok && session.WorkspaceID == "" && s.workspaceConfigured(session.SourceID, workspaceID)
 }
 
 // bundlesFor is the workspace-partitioned S-26 cache.
-func (s *FakeServer) bundlesFor(workspaceID string) *SkillCache {
+func (s *FakeServer) bundlesFor(sourceID, workspaceID string) *SkillCache {
 	if s.bundlesInjected || s.clients == nil {
 		return s.bundles
 	}
-	if cache := s.clients.SkillBundles(workspaceID, s.metrics); cache != nil {
+	if cache := s.clients.SkillBundlesFor(sourceID, workspaceID, s.metrics); cache != nil {
 		return cache
 	}
 	return s.bundles
@@ -363,7 +390,7 @@ func writeError(w http.ResponseWriter, code int, msg string) {
 // entryFor re-reads the token's mapping entry; it may have been deleted
 // between Verify and here (terminal cleanup).
 func (s *FakeServer) entryFor(w http.ResponseWriter, claims auth.Claims) (registry.TaskEntry, bool) {
-	e, ok := s.reg.ByDaemonInWorkspace(claims.WorkspaceID, claims.JobName)
+	e, ok := s.reg.ByDaemonInSourceWorkspace(claims.SourceID, claims.WorkspaceID, claims.JobName)
 	if !ok {
 		writeError(w, http.StatusNotFound, "unknown task")
 		return registry.TaskEntry{}, false
@@ -438,6 +465,18 @@ func (a jobLookup) ByDaemonInWorkspace(workspaceID, daemonID string) (auth.JobEn
 	}, true
 }
 
+func (a jobLookup) ByDaemonInSourceWorkspace(sourceID, workspaceID, daemonID string) (auth.JobEntry, bool) {
+	e, ok := a.reg.ByDaemonInSourceWorkspace(sourceID, workspaceID, daemonID)
+	if !ok {
+		return auth.JobEntry{}, false
+	}
+	return auth.JobEntry{
+		JobRuntimeID: e.JobRuntimeID,
+		WorkspaceID:  e.WorkspaceID,
+		Terminal:     e.IsTerminal(),
+	}, true
+}
+
 // JobTokenIssuer builds the Job Token issuer over the registry's read view
 // (the auth ↔ registry wiring the Job-facing surfaces share). tokenTTL is the
 // issued lifetime; it also bounds the revocation window (ADR-017). probes is
@@ -470,6 +509,7 @@ func (p probeLookup) ProbeByJob(jobName string) (auth.ProbeEntry, bool) {
 		RequestID:    session.RequestID,
 		SelfMintedID: session.SelfMintedID,
 		TokenHash:    session.TokenHash,
+		SourceID:     session.SourceID,
 		WorkspaceID:  session.WorkspaceID,
 	}, true
 }

@@ -16,11 +16,15 @@ package workspace
 import (
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 
 	"k8s.io/apimachinery/pkg/util/validation"
+
+	"github.com/tsic404/foreman/internal/scope"
 )
 
 // Environment variable names of the multi-workspace interface.
@@ -73,6 +77,13 @@ func (s CredentialScope) String() string {
 
 // Identity is one workspace's (credential, daemon identity) pair (§0).
 type Identity struct {
+	// SourceID names the stable Multica server this workspace belongs to.
+	// Empty is the legacy single-source deployment: its workspace ids are the
+	// partition keys, unchanged.
+	SourceID string `json:"source_id,omitempty"`
+	// ServerURL overrides the deployment-level MULTICA_SERVER_URL for this
+	// identity. Empty uses the deployment-level URL.
+	ServerURL   string `json:"server_url,omitempty"`
 	WorkspaceID string `json:"workspace_id"`
 	DaemonID    string `json:"daemon_id"`
 	// Token is the server credential. TokenEnv names the environment variable
@@ -80,6 +91,11 @@ type Identity struct {
 	Token    string `json:"token,omitempty"`
 	TokenEnv string `json:"token_env,omitempty"`
 }
+
+// sourceIDPattern is the stable-source identifier shape. It is deliberately
+// the same character set the catalog's server ids use, so one name can address
+// the same source from the management and runtime faces.
+var sourceIDPattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$`)
 
 // Ref is one discovered workspace: its platform id and display name.
 type Ref struct {
@@ -90,7 +106,8 @@ type Ref struct {
 // Set is the validated workspace-scoped identity list.
 type Set struct {
 	identities []Identity
-	byID       map[string]Identity
+	byScope    map[string]Identity
+	byID       map[string][]Identity
 }
 
 // Deployment is the parsed deployment interface (§10 多 workspace 前置).
@@ -272,13 +289,25 @@ func newSet(identities []Identity, getenv func(string) string) (Set, error) {
 	}
 	out := Set{
 		identities: make([]Identity, 0, len(identities)),
-		byID:       make(map[string]Identity, len(identities)),
+		byScope:    make(map[string]Identity, len(identities)),
+		byID:       make(map[string][]Identity, len(identities)),
 	}
 	daemonIDs := make(map[string]string, len(identities))
 	for i := range identities {
 		identity := identities[i]
+		identity.SourceID = strings.TrimSpace(identity.SourceID)
+		identity.ServerURL = strings.TrimSpace(identity.ServerURL)
 		identity.WorkspaceID = strings.TrimSpace(identity.WorkspaceID)
 		identity.DaemonID = strings.TrimSpace(identity.DaemonID)
+		if identity.SourceID != "" && !sourceIDPattern.MatchString(identity.SourceID) {
+			return Set{}, fmt.Errorf("workspace %s has an illegal source_id %q", identity.WorkspaceID, identity.SourceID)
+		}
+		if identity.ServerURL != "" {
+			parsed, err := url.Parse(identity.ServerURL)
+			if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" {
+				return Set{}, fmt.Errorf("workspace %s has an illegal server_url %q", identity.WorkspaceID, identity.ServerURL)
+			}
+		}
 		// The id is checked before the credential: an illegal value must be
 		// named by its own rule, not by whichever error happens to run first.
 		if identity.WorkspaceID == "" {
@@ -296,15 +325,17 @@ func newSet(identities []Identity, getenv func(string) string) (Set, error) {
 		if identity.DaemonID == "" {
 			return Set{}, fmt.Errorf("workspace %s has no daemon_id", identity.WorkspaceID)
 		}
-		if _, dup := out.byID[identity.WorkspaceID]; dup {
-			return Set{}, fmt.Errorf("workspace %s is configured twice", identity.WorkspaceID)
+		key := scope.Key(identity.SourceID, identity.WorkspaceID)
+		if _, dup := out.byScope[key]; dup {
+			return Set{}, fmt.Errorf("workspace %s is configured twice for source %q", identity.WorkspaceID, identity.SourceID)
 		}
 		if other, dup := daemonIDs[identity.DaemonID]; dup {
 			return Set{}, fmt.Errorf("daemon identity %s is shared by workspaces %s and %s (F2)", identity.DaemonID, other, identity.WorkspaceID)
 		}
 		daemonIDs[identity.DaemonID] = identity.WorkspaceID
 		out.identities = append(out.identities, identity)
-		out.byID[identity.WorkspaceID] = identity
+		out.byScope[key] = identity
+		out.byID[identity.WorkspaceID] = append(out.byID[identity.WorkspaceID], identity)
 	}
 	return out, nil
 }
@@ -391,13 +422,27 @@ func (s Set) All() []Identity {
 
 // Get returns the identity of workspaceID.
 func (s Set) Get(workspaceID string) (Identity, bool) {
-	identity, ok := s.byID[workspaceID]
+	identities := s.byID[workspaceID]
+	if len(identities) != 1 {
+		return Identity{}, false
+	}
+	return identities[0], true
+}
+
+// GetInSource returns the identity of one source and workspace pair.
+func (s Set) GetInSource(sourceID, workspaceID string) (Identity, bool) {
+	identity, ok := s.byScope[scope.Key(sourceID, workspaceID)]
 	return identity, ok
 }
 
 // Has reports whether workspaceID is configured.
 func (s Set) Has(workspaceID string) bool {
-	_, ok := s.byID[workspaceID]
+	return len(s.byID[workspaceID]) > 0
+}
+
+// HasInSource reports whether the source and workspace pair is configured.
+func (s Set) HasInSource(sourceID, workspaceID string) bool {
+	_, ok := s.byScope[scope.Key(sourceID, workspaceID)]
 	return ok
 }
 
@@ -408,6 +453,15 @@ func (s Set) IDs() []string {
 		ids = append(ids, identity.WorkspaceID)
 	}
 	return ids
+}
+
+// Scopes returns the configured (source, workspace) partition keys.
+func (s Set) Scopes() []string {
+	keys := make([]string, 0, len(s.identities))
+	for _, identity := range s.identities {
+		keys = append(keys, scope.Key(identity.SourceID, identity.WorkspaceID))
+	}
+	return keys
 }
 
 // Len reports how many workspaces the deployment configures.

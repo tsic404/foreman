@@ -85,6 +85,11 @@ type SharedStore interface {
 	// GetEntryByJob resolves a Job name to its live row through the shared
 	// index.
 	GetEntryByJob(ctx context.Context, jobName string) (TaskEntry, bool, error)
+	// GetEntryByDaemon resolves a daemon id (the Job Token's j claim) through
+	// the shared daemon index. The daemon id and the Job's display name are
+	// different faces: a template may render a custom metadata.name, so the
+	// Job-name index cannot answer a token lookup (02-contracts V2-C03).
+	GetEntryByDaemon(ctx context.Context, daemonID string) (TaskEntry, bool, error)
 	// DropQueue removes the task's queue marker.
 	DropQueue(ctx context.Context, ws, taskID string) error
 	// ReleaseEntry returns an entry's in-flight slot (both levels;

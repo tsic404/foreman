@@ -12,6 +12,8 @@ import (
 	"time"
 
 	"github.com/coder/websocket"
+
+	"github.com/tsic404/foreman/internal/tenure"
 )
 
 // WSSubscriber is the C20 subscription to the server's daemon WS (ADR-010): N
@@ -326,47 +328,52 @@ func (s *WSSubscriber) Run(ctx context.Context) error {
 		}
 	}
 	for {
-		if s.leader != nil && !s.leader() {
-			stopAll()
-			if !sleepOrDone(ctx, leaderPollInterval) {
-				return nil
-			}
-			continue
-		}
-		reconcile()
-		select {
-		case <-ctx.Done():
+		if !tenure.Await(ctx, s.leader) {
 			return nil
-		case result := <-outcomes:
-			if result.outcome == streamParked {
-				// Parking is a statement about the identity, not about one id:
-				// the rebuild budget is shared across replacements, so even a
-				// replaced stream's park outcome must hold the identity back
-				// for the window (an id that moves on every register is the
-				// same pathology as one that never moves). Idempotent: an
-				// already parked identity keeps its expiry.
-				if _, already := parked[result.identity]; !already {
-					parked[result.identity] = s.now().Add(s.parkRetry)
+		}
+		// The open C-20 connections are the holder's: losing the lease closes
+		// them rather than leaving a follower subscribed to another instance's
+		// runtimes.
+		stopWatch := tenure.Watch(ctx, s.leader, stopAll)
+		for tenure.Holds(s.leader) {
+			reconcile()
+			select {
+			case <-ctx.Done():
+				stopWatch()
+				return nil
+			case result := <-outcomes:
+				if result.outcome == streamParked {
+					// Parking is a statement about the identity, not about one id:
+					// the rebuild budget is shared across replacements, so even a
+					// replaced stream's park outcome must hold the identity back
+					// for the window (an id that moves on every register is the
+					// same pathology as one that never moves). Idempotent: an
+					// already parked identity keeps its expiry.
+					if _, already := parked[result.identity]; !already {
+						parked[result.identity] = s.now().Add(s.parkRetry)
+					}
 				}
-			}
-			// Unregister by identity: the outcome names the stream instance,
-			// not (provider, profile, id). An id that moved away and back names
-			// a different stream, and matching it here would delete that live
-			// connection and orphan its cancel (C-20).
-			sub, ok := connections[result.identity]
-			if !ok || sub.epoch != result.epoch {
-				continue
-			}
-			delete(connections, result.identity)
-			delete(retiring, result.identity)
-		case <-closedEvents:
+				// Unregister by identity: the outcome names the stream instance,
+				// not (provider, profile, id). An id that moved away and back names
+				// a different stream, and matching it here would delete that live
+				// connection and orphan its cancel (C-20).
+				sub, ok := connections[result.identity]
+				if !ok || sub.epoch != result.epoch {
+					continue
+				}
+				delete(connections, result.identity)
+				delete(retiring, result.identity)
+			case <-closedEvents:
 			// A retiring stream's connection has closed: the next reconcile
 			// starts its replacement.
-		case <-changes:
+			case <-changes:
 			// Just wake up: parking is left to its own window, so a provider
 			// whose id moves on every register cannot re-arm by moving.
-		case <-time.After(heartbeatSupervisorInterval):
+			case <-time.After(heartbeatSupervisorInterval):
+			}
 		}
+		stopWatch()
+		stopAll()
 	}
 }
 

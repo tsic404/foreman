@@ -37,7 +37,7 @@ type pendingCall struct {
 	failureReason string
 }
 
-func (f *fakePendingReports) Enqueue(_ context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string) error {
+func (f *fakePendingReports) Enqueue(_ context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string, _ ...string) error {
 	f.reports = append(f.reports, pendingCall{taskID, jobName, daemonID, workspaceID, ep, string(body), failureReason})
 	if f.err != nil {
 		return f.err
@@ -52,7 +52,7 @@ func (f *fakePendingReports) Enqueue(_ context.Context, taskID, jobName, daemonI
 // EnqueueSynthetic records a confirmation Foreman synthesized. It is held like
 // any other entry — membership stays true — but never holds the Job gate:
 // Queued answers false for it.
-func (f *fakePendingReports) EnqueueSynthetic(_ context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte) error {
+func (f *fakePendingReports) EnqueueSynthetic(_ context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, _ ...string) error {
 	f.reports = append(f.reports, pendingCall{taskID, jobName, daemonID, workspaceID, ep, string(body), ""})
 	if f.err != nil {
 		return f.err
@@ -71,7 +71,7 @@ func (f *fakePendingReports) EnqueueSynthetic(_ context.Context, taskID, jobName
 // Queued reports whether the report is still undelivered. An outstanding
 // carrier list reads as "may be queued" (§4.3). A synthesized confirmation is
 // held but never gates the object cleanup (§4.6 兜底一).
-func (f *fakePendingReports) Queued(taskID string) bool {
+func (f *fakePendingReports) Queued(taskID string, _ ...string) bool {
 	if f.notRebuilt {
 		return true
 	}
@@ -83,17 +83,17 @@ func (f *fakePendingReports) Rebuilt() bool { return !f.notRebuilt }
 
 // HasQueuedEntry reports the known membership, ignoring the uncompleted-list
 // conservatism.
-func (f *fakePendingReports) HasQueuedEntry(taskID string) bool { return f.queued[taskID] }
+func (f *fakePendingReports) HasQueuedEntry(taskID string, _ ...string) bool { return f.queued[taskID] }
 
 // Drop forgets the report the direct forward settled.
-func (f *fakePendingReports) Drop(_ context.Context, taskID string) {
+func (f *fakePendingReports) Drop(_ context.Context, taskID string, _ ...string) {
 	delete(f.queued, taskID)
 	delete(f.synthetic, taskID)
 }
 
 // DropIfUnchanged forgets the report only while the recorded snapshot is the
 // one the caller wrote: a later Enqueue for the same task keeps its entry.
-func (f *fakePendingReports) DropIfUnchanged(_ context.Context, taskID string, ep Endpoint, body []byte) {
+func (f *fakePendingReports) DropIfUnchanged(_ context.Context, taskID string, ep Endpoint, body []byte, _ ...string) {
 	for i := len(f.reports) - 1; i >= 0; i-- {
 		rep := f.reports[i]
 		if rep.taskID != taskID {
@@ -109,7 +109,7 @@ func (f *fakePendingReports) DropIfUnchanged(_ context.Context, taskID string, e
 
 // SweepCarrier models the queue's one-step settled check and delete: an
 // unfinished rebuild or a live entry keeps the object.
-func (f *fakePendingReports) SweepCarrier(ctx context.Context, taskID, name string) (bool, error) {
+func (f *fakePendingReports) SweepCarrier(ctx context.Context, taskID, name string, _ ...string) (bool, error) {
 	// Membership, not the Job gate: a synthesized confirmation is held by the
 	// queue, so its carrier must survive until it is delivered (pending.go's
 	// heldByQueueLocked has the same answer).

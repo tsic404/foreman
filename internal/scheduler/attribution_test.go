@@ -799,7 +799,7 @@ func TestTaskStatusWithinMakesNoCallOnASpentBudget(t *testing.T) {
 	g.server.onStatus = func() { called = true }
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Millisecond))
 	defer cancel()
-	if _, err := g.sched.taskStatusWithin(ctx, "task-1"); err == nil || !strings.Contains(err.Error(), "attribution budget exhausted") {
+	if _, err := g.sched.taskStatusWithin(ctx, registry.TaskEntry{TaskID: "task-1"}); err == nil || !strings.Contains(err.Error(), "attribution budget exhausted") {
 		t.Fatalf("taskStatusWithin err = %v, want the budget-exhausted refusal", err)
 	}
 	if called {
