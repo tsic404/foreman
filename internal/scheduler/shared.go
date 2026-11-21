@@ -288,8 +288,8 @@ func (s *Scheduler) ReleaseSlots(ctx context.Context, reserved []SlotReservation
 
 // OnClaimReserved registers a claimed task for the legacy single workspace
 // against the reservation pair the loop holds.
-func (s *Scheduler) OnClaimReserved(ctx context.Context, task json.RawMessage, reserved SlotReservation) error {
-	return s.OnClaimReservedFor(ctx, "", task, reserved)
+func (s *Scheduler) OnClaimReserved(ctx context.Context, task json.RawMessage, reserved SlotReservation, scope ClaimScope) error {
+	return s.OnClaimReservedFor(ctx, "", task, reserved, scope)
 }
 
 // ReconcileSlots is the leader's periodic two-level reconciliation (§10 计数按

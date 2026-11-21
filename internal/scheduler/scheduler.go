@@ -672,18 +672,18 @@ func (s *Scheduler) OnClaim(ctx context.Context, task json.RawMessage) error {
 // (a cross-workspace claim must never produce an entry, AC-81). An empty
 // workspaceID keeps the legacy payload-derived form.
 func (s *Scheduler) OnClaimFor(ctx context.Context, workspaceID string, task json.RawMessage) error {
-	return s.onClaimFor(ctx, workspaceID, task, SlotReservation{}, false)
+	return s.onClaimFor(ctx, workspaceID, task, SlotReservation{}, false, ClaimScope{})
 }
 
 // OnClaimReservedFor registers a task against the reservation pair the claim
-// loop already holds (§10: claim 前必须持有槽位预留). It never reserves again; a
-// task that produces no entry releases exactly that pair to the caller's
-// budget.
-func (s *Scheduler) OnClaimReservedFor(ctx context.Context, workspaceID string, task json.RawMessage, res SlotReservation) error {
-	return s.onClaimFor(ctx, workspaceID, task, res, true)
+// loop already holds (§10: claim 前必须持有槽位预留) and the frozen scope of the
+// C3 request that returned it. It never reserves again; a task that produces
+// no entry releases exactly that pair to the caller's budget.
+func (s *Scheduler) OnClaimReservedFor(ctx context.Context, workspaceID string, task json.RawMessage, res SlotReservation, scope ClaimScope) error {
+	return s.onClaimFor(ctx, workspaceID, task, res, true, scope)
 }
 
-func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task json.RawMessage, res SlotReservation, reserved bool) error {
+func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task json.RawMessage, res SlotReservation, reserved bool, scope ClaimScope) error {
 	defer s.SyncInflight()
 	workspace := workspaceID
 	owned := false
@@ -738,6 +738,9 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 
 	attempt := 1
 	if existing, ok := s.reg.Get(head.ID); ok {
+		// An entry that already exists is the confirmed old attempt: it keeps
+		// its frozen binding and converges even if the agent has since been
+		// switched away. Only a brand-new claim is gated below.
 		proceed, priorAttempt, err := s.resolveDuplicateClaim(ctx, existing)
 		if err != nil || !proceed {
 			return err
@@ -751,6 +754,22 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 		s.log.WarnContext(ctx, "duplicate_dispatch",
 			"task_id", head.ID, "old_job_name", "", "action", "drop_terminal_done")
 		return nil
+	} else if s.cfg.DispatchGate != nil && head.AgentID != "" {
+		// The upstream has already confirmed this task to the payload's real
+		// runtime, so that runtime — not the agent's current binding — is the
+		// identity that owns it (02-contracts V2-C02). The gate answers from
+		// the C3 request's frozen set; a registration refresh that lands before
+		// the entry is written cannot revoke a confirmation made under it.
+		// Only a runtime that request never carried is a refusing answer, and
+		// it is reported rather than dropped so the claim is not lost silently.
+		if owned, known := s.cfg.DispatchGate(ctx, workspace, head.AgentID, head.RuntimeID, scope.RuntimeIDs); known && !owned {
+			s.log.WarnContext(ctx, "task.dispatch_refused",
+				"task_id", head.ID, "workspace_id", workspace,
+				"agent_id", head.AgentID, "runtime_id", head.RuntimeID,
+				"reason", "the claimed runtime is not registered by this deployment")
+			return fmt.Errorf("%w: runtime %q is not registered by this deployment",
+				ErrUnownedClaim, head.RuntimeID)
+		}
 	}
 
 	now := s.now()
@@ -793,7 +812,7 @@ func (s *Scheduler) onClaimFor(ctx context.Context, workspaceID string, task jso
 		// Memory-only: the same dispatch record as an identity, so S-4 can
 		// match the Job's reported runtimes long after a rebuild moved the id
 		// (§2.3, ADR-043).
-		RuntimeIdentity: s.resolveRuntimeIdentity(head.RuntimeID),
+		RuntimeIdentity: s.resolveRuntimeIdentity(head.RuntimeID, scope),
 	}
 	// A switched-off bound (0 = no upper bound) writes no deadline at
 	// all: the zero value is "no bound", never an expired one, and must not
@@ -2883,7 +2902,10 @@ func (s *Scheduler) convergeEntry(ctx context.Context, e registry.TaskEntry) err
 // identity the entry carries (§2.3). A missing resolver or an unresolvable id
 // yields the empty identity: S-4 must refuse such a Job rather than answer for
 // an identity the process never learned.
-func (s *Scheduler) resolveRuntimeIdentity(runtimeID string) string {
+func (s *Scheduler) resolveRuntimeIdentity(runtimeID string, scope ClaimScope) string {
+	if identity, ok := scope.Identity(runtimeID); ok {
+		return identity
+	}
 	if s.runtimeIdentity == nil || runtimeID == "" {
 		return ""
 	}
@@ -2948,6 +2970,13 @@ func permanentTerminalRejection(code int) bool {
 // the scheduler itself counts it and logs at a bounded rate, while the
 // server's lease expiry is the only convergence.
 var ErrUnnameableClaim = errors.New("claim payload has no readable task id")
+
+// ErrUnownedClaim marks a claim the upstream confirmed to a real runtime this
+// deployment never registered. No Job is created for it, and the claim is
+// reported rather than dropped: the upstream believes someone owns the task,
+// so the refusal has to be visible to the loop's operator instead of vanishing
+// with the claim (02-contracts V2-C02 已确认归原 runtime, 04-architecture §3.1).
+var ErrUnownedClaim = errors.New("claimed runtime is not registered by this deployment")
 
 // claimID reads just the task id from a claim payload whose full head parse
 // failed. An id that cannot be read leaves nothing to settle.

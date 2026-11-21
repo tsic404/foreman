@@ -155,6 +155,11 @@ func (c *Client) WorkspaceState() WorkspaceState {
 // (credential, daemon identity) pair (§0).
 func (c *Client) WorkspaceID() string { return c.cfg.WorkspaceID }
 
+// ServerURL returns the Multica server this client speaks to, without a
+// trailing slash. It is how a catalog source is recognised as this
+// deployment's own upstream.
+func (c *Client) ServerURL() string { return c.cfg.ServerURL }
+
 // DaemonID returns the daemon identity this client registers under.
 func (c *Client) DaemonID() string { return c.cfg.DaemonID }
 

@@ -1,0 +1,40 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'; connect-src 'self'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'">
+  <title>Foreman · 运行控制台</title>
+  <link rel="stylesheet" href="assets/console.css">
+</head>
+<body>
+  <div class="app">
+    <aside>
+      <div class="brand"><span class="logo">F</span><div><strong>Foreman</strong><small>运行控制台 · 2.0</small></div></div>
+      <nav id="navs" aria-label="管理入口"></nav>
+      <div class="railfoot">数据来自本部署的 Management surface<br>凭据只保存在本页内存</div>
+    </aside>
+    <main class="main">
+      <div class="topbar">
+        <span id="crumb">Foreman</span>
+        <span class="row">
+          <span id="credential-state" class="badge gray">未连接</span>
+          <button type="button" id="connect">连接凭据</button>
+        </span>
+      </div>
+      <div class="stage">
+        <div class="hero">
+          <div><div class="eyebrow" id="area"></div><h1 id="title"></h1><div class="sub" id="subtitle"></div></div>
+          <div id="scope" class="scope"></div>
+        </div>
+        <div id="content" aria-live="polite"></div>
+        <div id="notice" class="status" role="status" aria-live="polite"></div>
+        <div class="footer">只读接口与绑定写回都走 /admin/*；页面从不保存凭据，刷新后需重新输入。</div>
+      </div>
+    </main>
+  </div>
+  <dialog id="dialog" aria-label="管理操作"><div id="dialog-body"></div></dialog>
+  <div class="tooltip" id="tip" role="tooltip" hidden></div>
+  <script type="module" src="assets/app.mjs"></script>
+</body>
+</html>

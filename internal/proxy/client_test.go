@@ -303,10 +303,11 @@ func TestClaimTasksRequestShape(t *testing.T) {
 		t.Fatalf("max_tasks=0 must not call the server, got %d calls", got)
 	}
 
-	tasks, err := c.ClaimTasks(t.Context(), 5)
+	claim, err := c.ClaimTasks(t.Context(), 5)
 	if err != nil {
 		t.Fatalf("ClaimTasks: %v", err)
 	}
+	tasks := claim.Tasks
 	if len(tasks) != 1 || string(tasks[0]) != `{"id":"t1"}` {
 		t.Fatalf("tasks = %s", tasks)
 	}

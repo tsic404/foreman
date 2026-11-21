@@ -322,6 +322,19 @@ func run() error {
 	// call goes through clientSet.
 	client := clients[0]
 
+	// The multi-source directory, the binding write-back and the overview read
+	// model. The source registry persists across a restart; the snapshots do
+	// not, because they are a read model one sync rebuilds. It is built before
+	// the scheduler so the claim gate can check the one identity the upstream
+	// has already fixed: the real runtime the task was confirmed to. An agent
+	// rebound while the claim is in flight keeps its claim, and a runtime no
+	// registered source declares is refused visibly (§3.1).
+	catalogService, catalogAdmin, err := newCatalogService(getenv, clientSet, reg, baseLog)
+	if err != nil {
+		return err
+	}
+	schedCfg.DispatchGate = catalogService.ClaimOwned
+
 	// Project identity (ADR-048): one adapter answers both platform queries —
 	// the startup policy project name → identifier resolution the builder's
 	// policy gate performs, and the claim-time issue → identifier lookup the
@@ -504,7 +517,7 @@ func run() error {
 		}
 		opsSrv = &http.Server{
 			Addr:              *opsListen,
-			Handler:           ops,
+			Handler:           newOpsRoot(ops, catalogAdmin, obsCfg.OpsCredentials),
 			ReadHeaderTimeout: readHeaderTimeout,
 		}
 	} else {
@@ -524,6 +537,9 @@ func run() error {
 	// the ordinary cancellation path stays a graceful shutdown.
 	sup := lifecycle.New(baseLog, health, cancelLoops)
 	run := func(component string, f func(context.Context) error) { sup.Run(ctx, component, f) }
+	// The automatic sync loop is a critical loop: a stopped catalog sync means
+	// every source's directory silently ages past its period.
+	run("catalog-sync", catalogService.Run)
 	runWorkspace := run
 	if workspaces.Len() > 1 {
 		// A workspace identity's control plane failing at runtime is confined
@@ -918,8 +934,8 @@ func (w workspaceClaimScheduler) ReleaseSlots(ctx context.Context, reserved []sc
 	w.sched.ReleaseClaimSlots(ctx, reserved)
 }
 
-func (w workspaceClaimScheduler) OnClaimReserved(ctx context.Context, task json.RawMessage, reserved scheduler.SlotReservation) error {
-	return w.sched.OnClaimReservedFor(ctx, w.workspaceID, task, reserved)
+func (w workspaceClaimScheduler) OnClaimReserved(ctx context.Context, task json.RawMessage, reserved scheduler.SlotReservation, scope scheduler.ClaimScope) error {
+	return w.sched.OnClaimReservedFor(ctx, w.workspaceID, task, reserved, scope)
 }
 
 // workspaceServer routes a task-addressed server call to the client of the

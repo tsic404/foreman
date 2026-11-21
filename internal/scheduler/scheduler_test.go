@@ -662,6 +662,20 @@ func (f *fixture) claim(t *testing.T, taskID string) registry.TaskEntry {
 	return e
 }
 
+// claimConfirmed runs a claim carrying the C3 request's own frozen scope and
+// returns the registered entry.
+func (f *fixture) claimConfirmed(t *testing.T, taskID string, scope ClaimScope) registry.TaskEntry {
+	t.Helper()
+	if err := f.sched.OnClaimReservedFor(context.Background(), "ws-1", claimPayload(taskID), SlotReservation{}, scope); err != nil {
+		t.Fatalf("OnClaimReservedFor: %v", err)
+	}
+	e, ok := f.reg.Get(taskID)
+	if !ok {
+		t.Fatalf("task %s not registered", taskID)
+	}
+	return e
+}
+
 // ---- OnClaim ----
 
 // A switched-off boot bound (FOREMAN_JOB_BOOT_TIMEOUT=0) writes no
@@ -1183,10 +1197,10 @@ func TestClaimDeferralDoesNotOccupyTheClaimRound(t *testing.T) {
 	probes := 0
 	f.jobs.onGetJob = func() { probes++ }
 
-	if err := f.sched.OnClaimReserved(context.Background(), claimPayload("task-1"), SlotReservation{}); !errors.Is(err, errJobNameHeld) {
+	if err := f.sched.OnClaimReserved(context.Background(), claimPayload("task-1"), SlotReservation{}, ClaimScope{}); !errors.Is(err, errJobNameHeld) {
 		t.Fatalf("OnClaimReserved(task-1) err = %v, want errJobNameHeld", err)
 	}
-	if err := f.sched.OnClaimReserved(context.Background(), claimPayload("task-2"), SlotReservation{}); err != nil {
+	if err := f.sched.OnClaimReserved(context.Background(), claimPayload("task-2"), SlotReservation{}, ClaimScope{}); err != nil {
 		t.Fatalf("OnClaimReserved(task-2): %v", err)
 	}
 

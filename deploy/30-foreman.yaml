@@ -233,6 +233,20 @@ spec:
                 secretKeyRef:
                   name: foreman-secret
                   key: FOREMAN_OPS_TOKEN
+            # Directory of per-source credential files for the management
+            # surface (/admin/*): one file per registration's credential_ref,
+            # mounted from a Secret (deploy/README.md §Management surface). The
+            # catalog stores the reference only; an absent directory leaves
+            # registration answering with an unresolvable reference, never a
+            # fake success.
+            - name: FOREMAN_SOURCE_CREDENTIALS_DIR
+              value: "/etc/foreman/catalog-credentials"
+            # The registered sources survive a container restart: the registry
+            # document lives on the same writable emptyDir as the terminal
+            # report queue. Directory snapshots are not persisted — one sync
+            # rebuilds them.
+            - name: FOREMAN_SOURCE_STATE_FILE
+              value: "/var/lib/foreman/catalog-sources.json"
             - name: FOREMAN_WS_ENABLED
               value: "true"
             # --- shared state (ADR-046 阶段一) ---
@@ -309,8 +323,9 @@ spec:
             capabilities:
               drop: ["ALL"]
           volumeMounts:
-            # ADR-002: no PVC. This emptyDir holds nothing but the durable
-            # terminal-report queue (contract §10) between container restarts.
+            # ADR-002: no PVC. This emptyDir holds the durable terminal-report
+            # queue (contract §10) and the catalog source registry between
+            # container restarts.
             - name: state
               mountPath: /var/lib/foreman
             # §8.1 template carrier: required, so a missing ConfigMap blocks

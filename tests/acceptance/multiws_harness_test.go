@@ -553,8 +553,8 @@ func (w multiWSWorkspaceClaimer) ReleaseSlots(ctx context.Context, reserved []sc
 	w.sched.ReleaseClaimSlots(ctx, reserved)
 }
 
-func (w multiWSWorkspaceClaimer) OnClaimReserved(ctx context.Context, task json.RawMessage, reserved scheduler.SlotReservation) error {
-	return w.sched.OnClaimReservedFor(ctx, w.workspaceID, task, reserved)
+func (w multiWSWorkspaceClaimer) OnClaimReserved(ctx context.Context, task json.RawMessage, reserved scheduler.SlotReservation, scope scheduler.ClaimScope) error {
+	return w.sched.OnClaimReservedFor(ctx, w.workspaceID, task, reserved, scope)
 }
 
 // startClaimLoopFor runs the production claim loop under one workspace's

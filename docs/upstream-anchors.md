@@ -99,3 +99,31 @@ probe's own daemon identity never reaches the server — the server-side runtime
 rows come only from Foreman's per-workspace C-1 with the deployment identity.
 Re-verify when upstream changes the daemon route group or the C-17 answer shape
 (protocol change ⇒ 提案, per 01-scope 变更触发条件).
+
+## Multi-source directory and runtime binding (architecture §3.1 / §3.2, contracts V2-C02)
+
+Premise: the management surface reads a server's workspaces, projects, agents
+and runtimes, and changes one agent's runtime association, using the same
+routes the platform's own console uses — with no Foreman-specific upstream API.
+Verified against the pinned artifact (`multica-ai/multica@2ea01ae4`).
+
+| Fact | Anchor |
+|---|---|
+| `GET /api/daemon/workspaces` answers `[{id, name}]` for the credential's workspace scope; it is the directory's workspace list | `server/cmd/server/router.go` → the daemon route group's `/workspaces` registration; `server/internal/handler/daemon_workspace.go` → `(*Handler).ListDaemonWorkspaces`, `DaemonWorkspaceResponse` |
+| Listing a workspace's projects is `GET /api/projects?workspace_id=<uuid>`, answering `{"projects":[…],"total":N}`; a `total` that does not match the returned rows means the page is incomplete and the caller must keep its previous generation | `server/cmd/server/router.go` → the workspace-scoped `/api/projects` route group; `server/internal/handler/project.go` → `(*Handler).ListProjects`, `ProjectResponse` |
+| Listing a workspace's agents is `GET /api/agents?workspace_id=<uuid>`, answering an array whose rows carry `id`, `workspace_id`, `name`, `runtime_id` (empty when unbound) and `runtime_bound` (the explicit unbound signal) | `server/cmd/server/router.go` → the workspace-scoped `/api/agents` route group; `server/internal/handler/agent.go` → `(*Handler).ListAgents`, `AgentResponse` |
+| Reading one agent is `GET /api/agents/{id}`; it is the read-back the binding contract treats as the only success evidence | `server/internal/handler/agent.go` → `(*Handler).GetAgent`, `AgentResponse` |
+| Listing a workspace's runtimes is `GET /api/runtimes?workspace_id=<uuid>`, answering rows with `id`, `workspace_id`, `name`, `provider`, `status` | `server/cmd/server/router.go` → the workspace-scoped `/api/runtimes` route group; `server/internal/handler/runtime.go` → `(*Handler).ListAgentRuntimes`, `AgentRuntimeResponse` |
+| Writing one agent's runtime association is `PUT /api/agents/{id}` with `{"runtime_id": …}`; `UpdateAgentRequest.RuntimeID` is a pointer, so the body changes that field alone. The upstream validates the runtime against the agent's workspace, and a refusal is a status answer, never a silent no-op | `server/internal/handler/agent.go` → `(*Handler).UpdateAgent`, `UpdateAgentRequest` |
+| That write is **unconditional**: the request carries no version, `If-Match` or expected current value, and `UpdateAgent` is `UPDATE agent … WHERE id = $1` with no compare. Foreman therefore has no atomic way to prevent a competing edit between its comparison read and the write. The adapter reports the capability as unavailable and the management surface disables binding writes with that reason rather than sending an unconditional body; a read-back is success evidence, never protection against an overwrite | `server/internal/handler/agent.go` → `(*Handler).UpdateAgent`; `server/pkg/db/queries/agent.sql` → `UpdateAgent`; `server/pkg/db/generated/agent.sql.go` → `(*Queries).UpdateAgent` |
+| Workspace resolution is the `workspace_id` query or the `X-Workspace-ID` header; a request outside the credential's scope answers `404`, which Foreman reads as "not found", never as an empty directory | `server/internal/middleware/workspace.go` → `ResolveWorkspaceIDFromRequest`; `server/internal/handler/daemon.go` → `(*Handler).requireDaemonWorkspaceAccess` |
+
+**Scope of the premise.** The anchors above establish that the directory and
+the binding write exist on the pinned version; they do not establish that a
+given deployment's credential may enumerate the candidate runtimes or write
+that agent. Foreman therefore disables editing with a reason when the source's
+credential is revoked, and reports a refusal, a timeout or a competing edit as
+its own non-success class — only a read-back that shows the requested runtime
+is reported as applied (02-contracts.md V2-C02, 04-architecture.md §3.2).
+Re-verify when upstream changes these routes, the `AgentResponse` binding
+fields, or the `UpdateAgentRequest` runtime field.
