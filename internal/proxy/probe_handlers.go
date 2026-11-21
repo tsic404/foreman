@@ -63,7 +63,7 @@ func (s *FakeServer) registerProbe(w http.ResponseWriter, r *http.Request, claim
 	if workspaceID == "" {
 		workspaceID = claims.WorkspaceID
 	}
-	client := s.clientFor(workspaceID)
+	client := s.clientFor(session.SourceID, workspaceID)
 	if client == nil {
 		writeError(w, http.StatusForbidden, "workspace is not configured")
 		return
@@ -320,7 +320,7 @@ func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 		// no workspace of its own, and Verify has already refused a token whose
 		// workspace contradicts a pinned session, so this is the one source.
 		workspaceID := claims.WorkspaceID
-		client := s.clientFor(workspaceID)
+		client := s.clientFor(session.SourceID, workspaceID)
 		if client == nil {
 			// Without a configured workspace there is no slot to fill; the
 			// success shape would report a landing that never happened and
@@ -364,7 +364,7 @@ func (s *FakeServer) handleModelResult(w http.ResponseWriter, r *http.Request) {
 		// The relay retries transport errors and 5xx with C-21's backoff,
 		// bounded by the probe's own budget (the consumption-to-answer window);
 		// a 4xx is the upstream's verdict and goes back as it is.
-		client := s.clientFor(session.WorkspaceID)
+		client := s.clientFor(session.SourceID, session.WorkspaceID)
 		if client == nil {
 			writeError(w, http.StatusForbidden, "workspace is not configured")
 			return

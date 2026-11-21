@@ -159,7 +159,12 @@ func (i *catalogRunIndex) RunningAttempts() []catalog.RunAttempt {
 			continue
 		}
 		serverID := ""
-		if i.sourceID != nil {
+		if entry.SourceID != "" {
+			// The entry's frozen source is the authoritative attribution;
+			// resolving the workspace again could pick another server that
+			// exposes the same id.
+			serverID = entry.SourceID
+		} else if i.sourceID != nil {
 			if id, ok := i.sourceID(context.Background(), entry.WorkspaceID); ok {
 				serverID = string(id)
 			}

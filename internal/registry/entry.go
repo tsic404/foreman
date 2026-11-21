@@ -12,6 +12,8 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+
+	"github.com/tsic404/foreman/internal/scope"
 )
 
 // State is the task lifecycle stage (§4.2). It has exactly six
@@ -78,14 +80,18 @@ type TaskEntry struct {
 	IssueIdentifier string `json:"issue_identifier"`
 	AutopilotRunID  string `json:"autopilot_run_id"`
 	ChatSessionID   string `json:"chat_session_id"`
-	WorkspaceID     string `json:"workspace_id"`
-	JobName         string `json:"job_name"`
-	JobNamespace    string `json:"job_namespace"`
-	DaemonID        string `json:"daemon_id"`
-	JobRuntimeID    string `json:"job_runtime_id"`
-	NodeName        string `json:"node_name"`
-	State           State  `json:"state"`
-	Result          Result `json:"result"`
+	// SourceID is the stable Multica server the task came from. Empty is the
+	// legacy single-source deployment. The workspace id alone is not unique
+	// across servers, so shared keys use ScopeKey (02-contracts V2-C03/C06).
+	SourceID     string `json:"source_id"`
+	WorkspaceID  string `json:"workspace_id"`
+	JobName      string `json:"job_name"`
+	JobNamespace string `json:"job_namespace"`
+	DaemonID     string `json:"daemon_id"`
+	JobRuntimeID string `json:"job_runtime_id"`
+	NodeName     string `json:"node_name"`
+	State        State  `json:"state"`
+	Result       Result `json:"result"`
 	// FailureReason is the externally observable attribution of a terminal
 	// failure Foreman judged itself (§4.1): empty for a verdict the
 	// server made (S13/S14/S15 or C13) and for non-failed results.
@@ -234,6 +240,11 @@ type TaskEntry struct {
 	CancelAckOwed bool `json:"-"`
 }
 
+// ScopeKey is the internal partition key of the entry's source and workspace.
+// It is what the shared store and the revocation set key by; upstream calls
+// keep using WorkspaceID (the server-facing id).
+func (e TaskEntry) ScopeKey() string { return scope.Key(e.SourceID, e.WorkspaceID) }
+
 // MarshalJSON renders the entry as /foreman/tasks projects it (§4.1,
 // §9.3): the projection is TaskEntry's own JSON — no second
 // view type to keep in step — with lease_keep_until, started_at and
@@ -343,10 +354,12 @@ const (
 	RolePendingReport = "pending-report"
 	LabelTaskID       = "foreman.tsic.top/task-id"
 	LabelAgentID      = "foreman.tsic.top/agent-id"
+	LabelSourceID     = "foreman.tsic.top/source-id"
 	LabelWorkspaceID  = "foreman.tsic.top/workspace-id"
 
 	AnnoIssueID         = "foreman.tsic.top/issue-id"
 	AnnoIssueIdentifier = "foreman.tsic.top/issue-identifier"
+	AnnoSourceID        = "foreman.tsic.top/source-id"
 	AnnoAutopilotRunID  = "foreman.tsic.top/autopilot-run-id"
 	AnnoChatSessionID   = "foreman.tsic.top/chat-session-id"
 	AnnoDaemonID        = "foreman.tsic.top/daemon-id"
@@ -377,6 +390,7 @@ func TaskEntryFromJob(job batchv1.Job) (TaskEntry, error) {
 	e := TaskEntry{
 		TaskID:       labels[LabelTaskID],
 		AgentID:      labels[LabelAgentID],
+		SourceID:     labels[LabelSourceID],
 		WorkspaceID:  labels[LabelWorkspaceID],
 		JobName:      job.GetName(),
 		JobNamespace: job.GetNamespace(),
@@ -407,6 +421,11 @@ func TaskEntryFromJob(job batchv1.Job) (TaskEntry, error) {
 	}
 	if e.DaemonID == "" {
 		return TaskEntry{}, fmt.Errorf("job %s: missing annotation %s", job.GetName(), AnnoDaemonID)
+	}
+	if e.SourceID == "" {
+		// Jobs rendered before the source label existed carry it as an
+		// annotation; an absent value is the legacy single-source shape.
+		e.SourceID = annos[AnnoSourceID]
 	}
 	if e.JobRuntimeID == "" {
 		return TaskEntry{}, fmt.Errorf("job %s: missing annotation %s", job.GetName(), AnnoJobRuntimeID)

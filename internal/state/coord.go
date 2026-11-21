@@ -28,14 +28,15 @@ const (
 	// Pending reservations: a ZSET per level, member = reservation id,
 	// score = expiry. The counter equals in-flight rows + live reservations;
 	// the set is what lets reconciliation separate the two.
-	keySlotResAll = "foreman:slots:res:global"
-	keySlotResWS  = "foreman:slots:res:ws:" // + ws
-	keyInstance   = "foreman:instance:"     // + instance id (liveness row)
-	keyDecl       = "foreman:declaration:"  // + ws (registration identity)
-	keyProbe      = "foreman:probe:"        // + probe job name (probe session)
-	keySession    = "foreman:session:"      // + ws + ":" + session key (soft-affinity index)
-	keyCatalog    = "foreman:catalog:"      // + real runtime id (catalog slot)
-	keyJobIndex   = "foreman:jobidx:"       // + job name → ws + "\x00" + task id
+	keySlotResAll  = "foreman:slots:res:global"
+	keySlotResWS   = "foreman:slots:res:ws:" // + ws
+	keyInstance    = "foreman:instance:"     // + instance id (liveness row)
+	keyDecl        = "foreman:declaration:"  // + ws (registration identity)
+	keyProbe       = "foreman:probe:"        // + probe job name (probe session)
+	keySession     = "foreman:session:"      // + ws + ":" + session key (soft-affinity index)
+	keyCatalog     = "foreman:catalog:"      // + real runtime id (catalog slot)
+	keyJobIndex    = "foreman:jobidx:"       // + job name → ws + "\x00" + task id
+	keyDaemonIndex = "foreman:daemonidx:"    // + daemon id → ws + "\x00" + task id
 )
 
 // Pickup is the outcome of one S-6 delivery pickup against the shared queue
@@ -121,6 +122,10 @@ type CoordStore interface {
 	GetEntry(ctx context.Context, ws, taskID string) (registry.TaskEntry, bool, error)
 	// GetEntryByJob resolves a Job name through the shared index.
 	GetEntryByJob(ctx context.Context, jobName string) (registry.TaskEntry, bool, error)
+	// GetEntryByDaemon resolves a daemon id through the shared daemon index.
+	// The daemon id is the Job Token's face; a template's display name is a
+	// different key (02-contracts V2-C03).
+	GetEntryByDaemon(ctx context.Context, daemonID string) (registry.TaskEntry, bool, error)
 	// ListEntries lists every live row.
 	ListEntries(ctx context.Context) ([]registry.TaskEntry, error)
 	// ListSettled lists every settled record.
@@ -339,11 +344,14 @@ redis.call('SET', KEYS[2], ARGV[3], 'PX', ARGV[4])
 redis.call('DEL', KEYS[3])
 return 1`)
 
-	// setEntryRetiringSlots: KEYS[1]=row, KEYS[2]=job index, KEYS[3..]=reservation
-	// zsets; ARGV[1]=row raw, ARGV[2]=index value, ARGV[3]=ttl ms, ARGV[4]="1"
-	// when the row is indexed, ARGV[5..]=reservation ids aligned with KEYS[3..].
+	// setEntryRetiringSlots: KEYS[1]=row, KEYS[2]=job index, KEYS[3]=daemon
+	// index, KEYS[4..]=reservation zsets; ARGV[1]=row raw, ARGV[2]=index value,
+	// ARGV[3]=ttl ms, ARGV[4]="1" when the Job name is indexed, ARGV[5]="1" when
+	// the daemon id is indexed, ARGV[6..]=reservation ids aligned with KEYS[4..].
 	// The claim's row becomes visible in the same step that retires the markers
 	// owning its slots, so no reader can see the row and its marker together.
+	// Both indexes carry the attempt: the Job name is the display face and the
+	// daemon id the token face, and a template may render them differently.
 	// Only the named ids go away (another claim's marker stays), and a marker
 	// the lease purge already reclaimed is a no-op: the purge returned its slot
 	// already, and the periodic reconciliation raises a counter below the rows.
@@ -352,7 +360,10 @@ redis.call('SET', KEYS[1], ARGV[1], 'PX', ARGV[3])
 if ARGV[4] == '1' then
   redis.call('SET', KEYS[2], ARGV[2])
 end
-for i = 3, #KEYS do
+if ARGV[5] == '1' then
+  redis.call('SET', KEYS[3], ARGV[2])
+end
+for i = 4, #KEYS do
   redis.call('ZREM', KEYS[i], ARGV[i + 2])
 end
 return 1`)
@@ -368,11 +379,12 @@ redis.call('SET', KEYS[2], ARGV[1], 'PX', ARGV[3])
 redis.call('SET', KEYS[1], ARGV[2], 'PX', ARGV[3])
 return 1`)
 
-	// deleteFull: KEYS[1]=row, KEYS[2]=marker, KEYS[3]=job index.
+	// deleteFull: KEYS[1]=row, KEYS[2]=marker, KEYS[3]=job index,
+	// KEYS[4]=daemon index.
 	scriptDeleteFull = redis.NewScript(`
-redis.call('DEL', KEYS[1])
-redis.call('DEL', KEYS[2])
-redis.call('DEL', KEYS[3])
+for i = 1, #KEYS do
+  redis.call('DEL', KEYS[i])
+end
 return 1`)
 
 	// slotReserve: KEYS[1]=counter, KEYS[2]=reservation zset;
@@ -562,6 +574,14 @@ func (s *redisStore) jobIndexKey(jobName string) string {
 	return keyJobIndex + jobName
 }
 
+// daemonIndexKey names the token face's index. The daemon id is the Job Token's
+// j claim and the credential Secret's base; for a template with a custom
+// metadata.name it is not the Job's display name, so the Job-name index cannot
+// answer a token lookup (02-contracts V2-C03 共享恢复与凭据).
+func (s *redisStore) daemonIndexKey(daemonID string) string {
+	return keyDaemonIndex + daemonID
+}
+
 // casUpdate is the optimistic read-modify-write: mutate runs against the row
 // read from the store, and the write applies only when the row is still
 // byte-identical. write=false (or an error) leaves the row untouched.
@@ -711,24 +731,33 @@ func (s *redisStore) setEntryRetiringSlots(ctx context.Context, ws, taskID strin
 	if err != nil {
 		return err
 	}
-	// A row whose Job name moved leaves the old index behind; drop it so a
-	// name lookup never resolves to a row that no longer owns it.
-	if old, ok, err := s.getEntry(ctx, ws, taskID); err == nil && ok && old.JobName != "" && old.JobName != e.JobName {
-		_ = s.rdb.Del(ctx, s.jobIndexKey(old.JobName)).Err()
+	// A row whose Job name or daemon id moved leaves the old index behind; drop
+	// it so a lookup never resolves to a row that no longer owns the name.
+	if old, ok, err := s.getEntry(ctx, ws, taskID); err == nil && ok {
+		if old.JobName != "" && old.JobName != e.JobName {
+			_ = s.rdb.Del(ctx, s.jobIndexKey(old.JobName)).Err()
+		}
+		if old.DaemonID != "" && old.DaemonID != e.DaemonID {
+			_ = s.rdb.Del(ctx, s.daemonIndexKey(old.DaemonID)).Err()
+		}
 	}
 	index := ws + "\x00" + taskID
-	// A row without a Job name has no name to index: the second key is then the
-	// row key itself, which the script leaves untouched, and the index flag is
-	// off.
+	// A row without a Job name or daemon id has nothing to index: that key is
+	// then the row key itself, which the script leaves untouched, and its flag
+	// is off.
 	row := s.entryKey(ws, taskID)
-	keys := []string{row, row}
-	indexed := "0"
+	keys := []string{row, row, row}
+	jobIndexed, daemonIndexed := "0", "0"
 	if e.JobName != "" {
 		keys[1] = s.jobIndexKey(e.JobName)
-		indexed = "1"
+		jobIndexed = "1"
 	}
-	args := make([]any, 0, 4+len(retire))
-	args = append(args, raw, index, s.entryTTL().Milliseconds(), indexed)
+	if e.DaemonID != "" {
+		keys[2] = s.daemonIndexKey(e.DaemonID)
+		daemonIndexed = "1"
+	}
+	args := make([]any, 0, 5+len(retire))
+	args = append(args, raw, index, s.entryTTL().Milliseconds(), jobIndexed, daemonIndexed)
 	for _, r := range retire {
 		_, reservations := slotKeys(r.WorkspaceID)
 		keys = append(keys, reservations)
@@ -1107,11 +1136,11 @@ func (s *redisStore) settleNoResult(ctx context.Context, ws, taskID string, expe
 
 // DeleteEntry removes the live row, its queue marker and its Job index.
 func (s *redisStore) deleteEntry(ctx context.Context, ws, taskID string) error {
-	jobName := ""
+	jobName, daemonID := "", ""
 	if e, ok, err := s.getEntry(ctx, ws, taskID); err == nil && ok {
-		jobName = e.JobName
+		jobName, daemonID = e.JobName, e.DaemonID
 	}
-	keys := []string{s.entryKey(ws, taskID), s.queueKey(ws, taskID), s.jobIndexKey(jobName)}
+	keys := []string{s.entryKey(ws, taskID), s.queueKey(ws, taskID), s.jobIndexKey(jobName), s.daemonIndexKey(daemonID)}
 	err := scriptDeleteFull.Run(ctx, s.rdb, keys).Err()
 	s.mark(ctx, err)
 	return err
@@ -1153,6 +1182,34 @@ func (s *redisStore) getEntryByJob(ctx context.Context, jobName string) (registr
 	}
 	ws, taskID := string(raw[:idx]), string(raw[idx+1:])
 	return s.getEntry(ctx, ws, taskID)
+}
+
+// getEntryByDaemon resolves a daemon id through the shared daemon index. The
+// row is re-read and its own DaemonID verified, so a stale index (a row whose
+// daemon id moved) never answers for another attempt.
+func (s *redisStore) getEntryByDaemon(ctx context.Context, daemonID string) (registry.TaskEntry, bool, error) {
+	raw, err := s.rdb.Get(ctx, s.daemonIndexKey(daemonID)).Bytes()
+	if errors.Is(err, redis.Nil) {
+		s.mark(ctx, nil)
+		return registry.TaskEntry{}, false, nil
+	}
+	if err != nil {
+		s.mark(ctx, err)
+		return registry.TaskEntry{}, false, err
+	}
+	idx := strings.LastIndexByte(string(raw), 0)
+	if idx <= 0 || idx == len(raw)-1 {
+		return registry.TaskEntry{}, false, nil
+	}
+	ws, taskID := string(raw[:idx]), string(raw[idx+1:])
+	e, ok, err := s.getEntry(ctx, ws, taskID)
+	if err != nil || !ok {
+		return registry.TaskEntry{}, false, err
+	}
+	if e.DaemonID != daemonID {
+		return registry.TaskEntry{}, false, nil
+	}
+	return e, true, nil
 }
 
 // LockTask acquires the per-task write lock. The lock's PX TTL is its lease:

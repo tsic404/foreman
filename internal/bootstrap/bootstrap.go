@@ -18,10 +18,21 @@ import (
 	"github.com/tsic404/foreman/internal/coordination"
 	"github.com/tsic404/foreman/internal/proxy"
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/scope"
 	"github.com/tsic404/foreman/internal/state"
 )
 
-// StartupDiscoveries resolves this replica's declaration set.
+// StartupProber runs the startup discovery of one registered source; satisfied
+// by *scheduler.Scheduler and by the control-plane discovery seam. A source's
+// failure is that source's failure: the holder keeps discovering the others
+// and reports the partial result, so one unreachable server cannot keep a
+// healthy source's control loop from starting.
+type StartupProber interface {
+	RunStartupProbeInSource(ctx context.Context, sourceID string) (map[string]registry.Discovery, error)
+}
+
+// StartupDiscoveries resolves this replica's declaration set through one
+// whole-set discover function.
 //
 // The control-plane discoverer is the only cold-start source: it reads the
 // verified CLI/config declarations and registers them in-process. No probe Job
@@ -86,19 +97,98 @@ func StartupDiscoveries(
 	}
 }
 
+// StartupDiscoveriesDetailed is StartupDiscoveries with the explicit set of
+// sources whose startup discovery failed. A source that answered but had no
+// registered workspace is not in the set: that is a declaration fact, not an
+// unreachable server, and re-discovering it would never change the answer.
+func StartupDiscoveriesDetailed(
+	ctx context.Context,
+	leader *coordination.Leader,
+	coord state.CoordStore,
+	prober StartupProber,
+	clients []*proxy.Client,
+	probeWindow time.Duration,
+	log *slog.Logger,
+) (map[string]registry.Discovery, []string, error) {
+	wait := probeWindow + 30*time.Second
+	if wait < time.Minute {
+		wait = time.Minute
+	}
+	deadline := time.Now().Add(wait)
+	for {
+		records, missing, err := LoadDeclarations(ctx, coord, clients)
+		switch {
+		case err != nil && leader.Held():
+			// The holder cannot reconcile or probe against a store it cannot
+			// read: fail fast instead of reporting a false "nothing declared".
+			return nil, nil, err
+		case err == nil && len(missing) == 0:
+			log.Info("runtime.declaration_adopted", "reason", "published_by_control_plane_holder")
+			return AdoptDeclarations(clients, records, log), nil, nil
+		case leader.Held():
+			// One discovery per source: a source-scoped client is registered
+			// by a discovery carrying that source's identity, and a source
+			// whose identities are already published is not discovered again.
+			if prober == nil {
+				return nil, nil, errors.New("startup discovery is not wired")
+			}
+			probed := make(map[string]registry.Discovery, len(missing))
+			var failures []error
+			var failedSources []string
+			for _, sourceID := range missingSources(clients, missing) {
+				found, perr := prober.RunStartupProbeInSource(ctx, sourceID)
+				if perr != nil {
+					// The failure domain is the source (§1.4): log it with the
+					// source id, keep discovering the others, and let the merge
+					// declare only what was observed.
+					log.Error("runtime.startup_discovery_failed",
+						"source_id", sourceID, "err", perr.Error())
+					failures = append(failures, perr)
+					failedSources = append(failedSources, sourceID)
+					continue
+				}
+				for workspaceID, discovery := range found {
+					probed[scope.Key(sourceID, workspaceID)] = discovery
+				}
+			}
+			if len(records) == 0 && len(probed) == 0 && len(failures) > 0 {
+				// Nothing was observed anywhere: the template (or every
+				// probe) is not runnable, and Foreman must not declare an
+				// empty runtime set (AC-36).
+				return nil, nil, errors.Join(failures...)
+			}
+			log.Info("runtime.declaration_merged",
+				"adopted", len(records), "discovered", len(probed), "missing", len(missing))
+			return MergeDiscoveries(clients, records, probed, log), failedSources, nil
+		case err != nil:
+			// A follower must not turn a store failure into an empty
+			// declaration set: it keeps waiting for the holder's publication.
+			log.Warn("runtime.declaration_read_failed", "err", err.Error())
+		}
+		if time.Now().After(deadline) {
+			return nil, nil, errors.New("startup declaration was not published by the control-plane holder")
+		}
+		select {
+		case <-ctx.Done():
+			return nil, nil, ctx.Err()
+		case <-time.After(250 * time.Millisecond):
+		}
+	}
+}
+
 // LoadDeclarations reads the published declaration of every served workspace
 // and lists the workspaces that have none yet.
 func LoadDeclarations(ctx context.Context, coord state.CoordStore, clients []*proxy.Client) (map[string]proxy.DeclarationRecord, []string, error) {
 	out := make(map[string]proxy.DeclarationRecord, len(clients))
 	var missing []string
 	for _, c := range clients {
-		ws := c.WorkspaceID()
-		raw, ok, err := coord.GetDeclaration(ctx, ws)
+		key := c.ScopeKey()
+		raw, ok, err := coord.GetDeclaration(ctx, key)
 		if err != nil {
 			return nil, nil, err
 		}
 		if !ok {
-			missing = append(missing, ws)
+			missing = append(missing, key)
 			continue
 		}
 		var rec proxy.DeclarationRecord
@@ -106,12 +196,32 @@ func LoadDeclarations(ctx context.Context, coord state.CoordStore, clients []*pr
 			return nil, nil, err
 		}
 		if len(rec.Runtimes) == 0 || len(rec.RuntimeIDs) == 0 {
-			missing = append(missing, ws)
+			missing = append(missing, key)
 			continue
 		}
-		out[ws] = rec
+		out[key] = rec
 	}
 	return out, missing, nil
+}
+
+// missingSources lists the sources with at least one unpublished workspace, in
+// client order so the probe sequence is deterministic. A legacy source-less
+// client yields the empty source id, which keeps the single-source form.
+func missingSources(clients []*proxy.Client, missing []string) []string {
+	unpublished := make(map[string]bool, len(missing))
+	for _, key := range missing {
+		unpublished[key] = true
+	}
+	var out []string
+	seen := make(map[string]bool)
+	for _, c := range clients {
+		if !unpublished[c.ScopeKey()] || seen[c.SourceID()] {
+			continue
+		}
+		seen[c.SourceID()] = true
+		out = append(out, c.SourceID())
+	}
+	return out
 }
 
 // AdoptDeclarations installs the stored declarations without C1 and renders
@@ -126,29 +236,31 @@ func AdoptDeclarations(clients []*proxy.Client, records map[string]proxy.Declara
 func MergeDiscoveries(clients []*proxy.Client, records map[string]proxy.DeclarationRecord, probed map[string]registry.Discovery, log *slog.Logger) map[string]registry.Discovery {
 	out := make(map[string]registry.Discovery, len(clients))
 	for _, c := range clients {
-		ws := c.WorkspaceID()
-		if rec, ok := records[ws]; ok {
+		key := c.ScopeKey()
+		if rec, ok := records[key]; ok {
 			if err := c.Adopt(rec); err != nil {
-				log.Warn("runtime.declaration_adopt_failed", "workspace_id", ws, "err", err.Error())
+				log.Warn("runtime.declaration_adopt_failed", "workspace_id", c.WorkspaceID(), "source_id", c.SourceID(), "err", err.Error())
 				continue
 			}
-			out[ws] = c.Declaration()
+			out[key] = c.Declaration()
 			continue
 		}
-		if d, ok := probed[ws]; ok {
-			out[ws] = d
+		if d, ok := probed[key]; ok {
+			out[key] = d
 		}
 	}
 	return out
 }
 
 // PublishDeclaration stores one workspace's registration identity after its
-// C1: the body the startup probe produced plus the server-assigned runtime
-// ids, so a follower or a future takeover adopts the same rows (AC-77).
-func PublishDeclaration(ctx context.Context, coord state.CoordStore, workspaceID string, cl *proxy.Client) error {
+// C1: the body the control-plane discovery produced plus the server-assigned
+// runtime ids, so a follower or a future takeover adopts the same rows
+// (AC-77). The key is the client's source+workspace scope: the same workspace
+// id on two servers has two identities.
+func PublishDeclaration(ctx context.Context, coord state.CoordStore, scopeKey string, cl *proxy.Client) error {
 	raw, err := json.Marshal(cl.DeclarationRecord())
 	if err != nil {
 		return err
 	}
-	return coord.PutDeclaration(ctx, workspaceID, raw)
+	return coord.PutDeclaration(ctx, scopeKey, raw)
 }

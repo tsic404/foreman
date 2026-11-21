@@ -41,6 +41,21 @@ type ServerClient interface {
 	ForwardInWorkspace(ctx context.Context, ep Endpoint, taskID, workspaceID string, body []byte) (int, []byte, error)
 }
 
+// SourceForwarder is the source-aware form of ServerClient's workspace
+// routing. A deployment serving several Multica servers implements it so a
+// replay or report is sent with the credential of the source it came from,
+// even when two servers expose the same workspace id (02-contracts V2-C03).
+type SourceForwarder interface {
+	ForwardInSourceWorkspace(ctx context.Context, ep Endpoint, taskID, sourceID, workspaceID string, body []byte) (int, []byte, error)
+}
+
+// SourceStatusClient is the source-aware form of ServerClient's C13 read. A
+// source-scoped entry must never borrow another source's credential when two
+// servers expose the same workspace id.
+type SourceStatusClient interface {
+	TaskStatusInSource(ctx context.Context, sourceID, workspaceID, taskID string) (string, error)
+}
+
 // JobBuilder renders the Job and credential Secret for an entry; satisfied
 // by *jobbuilder.Builder. The task payload is not part of the contract: it
 // never reaches a K8s object (F3/ADR-007). tokenHash is the digest of the
@@ -65,6 +80,13 @@ type JobBuilder interface {
 	BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error)
 }
 
+// SourceProbeBuilder is the source-aware probe render. A multi-source
+// deployment implements it so the probe's token and dial address belong to
+// the source that requested the catalog command.
+type SourceProbeBuilder interface {
+	BuildCatalogProbeInSource(requestID, jobRuntimeID, sourceID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error)
+}
+
 // Revoker feeds a revoked credential digest to the Job Token authority
 // (satisfied by *auth.Issuer). The reclaim path calls it before the Secret
 // and the entry go; a missing revoker is a wiring error, not a mode, because
@@ -74,6 +96,13 @@ type JobBuilder interface {
 // adjudicate another's.
 type Revoker interface {
 	Revoke(tokenHash, workspaceID string)
+}
+
+// SourceRevoker is the source-aware form of Revoker. The revocation set is
+// partitioned by (source, workspace), so a token from one server can never be
+// un-revoked by another server's identical workspace id.
+type SourceRevoker interface {
+	RevokeInSource(tokenHash, sourceID, workspaceID string)
 }
 
 // Metrics is the observability seam. The observability module provides the
@@ -137,41 +166,50 @@ type Reconciler interface {
 // cleanup of its task: a deleted Job must never stand in for a delivered
 // report.
 type PendingReportQueue interface {
-	Enqueue(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string) error
+	Enqueue(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string, key ...string) error
 	// EnqueueSynthetic lands a confirmation Foreman synthesized on the
 	// daemon's behalf (§4.6 兜底一). It is durable and replayed like any other
 	// entry, but it never holds the object cleanup back: Queued ignores it.
-	EnqueueSynthetic(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte) error
+	EnqueueSynthetic(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, key ...string) error
 	// Queued reports whether taskID's terminal report is still undelivered.
 	// It is conservative: while the carrier list has not completed every task
 	// reads as queued (§4.3 — an uncompleted rebuild is not an empty queue).
 	// A synthesized confirmation is not counted: it reports the Job's own
 	// termination, not a verdict awaiting delivery.
-	Queued(taskID string) bool
+	Queued(taskID string, key ...string) bool
 	// Rebuilt reports whether the carrier list completed, so the queue's
 	// state is authoritative and a settlement may act on it.
 	Rebuilt() bool
 	// HasQueuedEntry reports the queue membership the process actually
 	// holds; the write-ahead decision uses it so an unknown list never
 	// suppresses a report write.
-	HasQueuedEntry(taskID string) bool
+	HasQueuedEntry(taskID string, key ...string) bool
 	// Drop forgets taskID's report after its direct forward settled it.
-	Drop(ctx context.Context, taskID string)
+	Drop(ctx context.Context, taskID string, key ...string)
 	// DropIfUnchanged forgets taskID's report only while the queue still
 	// holds the snapshot the caller wrote ahead of a verdict that failed to
 	// land: a concurrent enqueue for the same task keeps its own entry (§10).
-	DropIfUnchanged(ctx context.Context, taskID string, ep Endpoint, body []byte)
+	DropIfUnchanged(ctx context.Context, taskID string, ep Endpoint, body []byte, key ...string)
 	// SweepCarrier deletes one listed carrier object when no queue entry
 	// holds its task. The check and the delete are one step under that
 	// task's carrier lock, so an enqueue landing in between keeps its object
 	// (§6.5).
-	SweepCarrier(ctx context.Context, taskID, name string) (bool, error)
+	SweepCarrier(ctx context.Context, taskID, name string, key ...string) (bool, error)
 	// Drain re-delivers every queued report once through sender and returns
 	// how many are still undelivered.
 	Drain(ctx context.Context, sender ReportSender) (int, error)
 	// Restore rebuilds the queue from its cluster carriers (§4.3). An error
 	// means the list did not complete — not that the queue is empty.
 	Restore(ctx context.Context) error
+}
+
+// SourcePendingReportQueue writes a report whose replay must stay on its
+// source even when the live entry is gone. PendingReports implements it; a
+// test double that predates source routing keeps the legacy methods and is
+// only used by source-less claims.
+type SourcePendingReportQueue interface {
+	EnqueueInSource(ctx context.Context, taskID, jobName, daemonID, sourceID, workspaceID string, ep Endpoint, body []byte, failureReason string, key ...string) error
+	EnqueueSyntheticInSource(ctx context.Context, taskID, jobName, daemonID, sourceID, workspaceID string, ep Endpoint, body []byte, key ...string) error
 }
 
 // noopMetrics keeps every Metrics call site nil-safe.

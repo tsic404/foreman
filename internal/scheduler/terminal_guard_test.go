@@ -25,11 +25,11 @@ type enqueueHookQueue struct {
 	onEnqueue func()
 }
 
-func (q *enqueueHookQueue) Enqueue(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string) error {
+func (q *enqueueHookQueue) Enqueue(ctx context.Context, taskID, jobName, daemonID, workspaceID string, ep Endpoint, body []byte, failureReason string, key ...string) error {
 	if q.onEnqueue != nil {
 		q.onEnqueue()
 	}
-	return q.fakePendingReports.Enqueue(ctx, taskID, jobName, daemonID, workspaceID, ep, body, failureReason)
+	return q.fakePendingReports.Enqueue(ctx, taskID, jobName, daemonID, workspaceID, ep, body, failureReason, key...)
 }
 
 // TestOnReportTerminalLosingReportDoesNotCountTheVerdict guards OnReport's
@@ -148,7 +148,7 @@ func TestSettleReplayedLosingTheVanishedRaceDoesNotCountTheVerdict(t *testing.T)
 		return f.now
 	}
 
-	f.sched.settleReplayed(context.Background(), "task-1", EPComplete, "")
+	f.sched.settleReplayed(context.Background(), "task-1", EPComplete, "", "")
 
 	entry, ok := f.reg.Get("task-1")
 	if !ok || !entry.IsTerminal() || entry.Result != "" {

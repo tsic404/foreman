@@ -44,6 +44,12 @@ var ErrInvalidRequestID = errors.New("invalid request id")
 // (§8.4) — and the token always outlives the Job by the drain bound
 // (ADR-017).
 func (b *Builder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
+	return b.BuildCatalogProbeInSource(requestID, jobRuntimeID, "", workspaceID, budget)
+}
+
+// BuildCatalogProbeInSource is the source-aware probe build: the token and
+// the Job-side dial address belong to the probe's source.
+func (b *Builder) BuildCatalogProbeInSource(requestID, jobRuntimeID, sourceID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
 	name := ProbeJobName(requestID)
 	if len(name) > 63 || !dns1123Label.MatchString(name) {
 		return nil, nil, "", fmt.Errorf("%w: %q does not yield a valid probe Job name %q", ErrInvalidRequestID, requestID, name)
@@ -51,15 +57,26 @@ func (b *Builder) BuildCatalogProbe(requestID, jobRuntimeID, workspaceID string,
 	if b.cfg.Issuer == nil {
 		return nil, nil, "", fmt.Errorf("Config.Issuer is required")
 	}
-	job, err := b.renderProbe(name, jobRuntimeID, workspaceID, budget)
+	job, err := b.renderProbe(name, jobRuntimeID, sourceID, workspaceID, budget)
 	if err != nil {
 		return nil, nil, "", err
 	}
-	token, err := b.cfg.Issuer.IssueProbe(name, requestID, workspaceID, budget+b.cfg.JobDrainTimeout)
+	token, err := b.issueProbeToken(name, requestID, sourceID, workspaceID, budget+b.cfg.JobDrainTimeout)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("issue probe Job Token: %w", err)
 	}
-	return job, b.probeCredentialSecret(name, workspaceID, token), b.cfg.Issuer.Hash(token), nil
+	return job, b.probeCredentialSecret(name, sourceID, workspaceID, token), b.cfg.Issuer.Hash(token), nil
+}
+
+func (b *Builder) issueProbeToken(name, requestID, sourceID, workspaceID string, ttl time.Duration) (string, error) {
+	if sourceID == "" {
+		return b.cfg.Issuer.IssueProbe(name, requestID, workspaceID, ttl)
+	}
+	issuer, ok := b.cfg.Issuer.(SourceTokenIssuer)
+	if !ok {
+		return "", fmt.Errorf("token issuer cannot sign source %q", sourceID)
+	}
+	return issuer.IssueProbeInSource(name, requestID, sourceID, workspaceID, ttl)
 }
 
 // ProbeJobName is the probe naming convention: the Job, its credential Secret
@@ -87,7 +104,7 @@ func probeLabels(name string) map[string]string {
 
 // renderProbe is the probe pipeline (§8.4): the template copy through the
 // probe write face, then the budget deadline.
-func (b *Builder) renderProbe(name, jobRuntimeID, workspaceID string, budget time.Duration) (*batchv1.Job, error) {
+func (b *Builder) renderProbe(name, jobRuntimeID, sourceID, workspaceID string, budget time.Duration) (*batchv1.Job, error) {
 	job, err := renderProbeTemplate(b.template, probeValues{
 		jobImage:     b.cfg.JobImage,
 		jobRuntimeID: jobRuntimeID,
@@ -99,7 +116,7 @@ func (b *Builder) renderProbe(name, jobRuntimeID, workspaceID string, budget tim
 	if err != nil {
 		return nil, err
 	}
-	b.applyProbeWrites(job, name, workspaceID)
+	b.applyProbeWrites(job, name, sourceID, workspaceID)
 	writeProbeDeadline(job, budget)
 	return job, nil
 }
@@ -129,7 +146,7 @@ func writeProbeDeadline(job *batchv1.Job, budget time.Duration) {
 // generic substitution). Annotations stay as the template wrote them, minus
 // that domain: a probe maps no task, so it carries none of the task
 // annotations (§4.3).
-func (b *Builder) applyProbeWrites(job *batchv1.Job, name, workspaceID string) {
+func (b *Builder) applyProbeWrites(job *batchv1.Job, name, sourceID, workspaceID string) {
 	injectContainerEnv(job, b.cfg.JobServerURL())
 
 	job.Name = name
@@ -152,6 +169,22 @@ func (b *Builder) applyProbeWrites(job *batchv1.Job, name, workspaceID string) {
 			job.Spec.Template.Labels = map[string]string{}
 		}
 		job.Spec.Template.Labels[labelWorkspaceID] = workspaceID
+	}
+	if sourceID != "" {
+		// The source is part of the probe's identity: two servers can expose
+		// the same workspace id, and the sweep/audit must not merge them.
+		if job.Labels == nil {
+			job.Labels = map[string]string{}
+		}
+		job.Labels[labelSourceID] = sourceID
+		if job.Spec.Template.Labels == nil {
+			job.Spec.Template.Labels = map[string]string{}
+		}
+		job.Spec.Template.Labels[labelSourceID] = sourceID
+		if job.Annotations == nil {
+			job.Annotations = map[string]string{}
+		}
+		job.Annotations[annoSourceID] = sourceID
 	}
 	clearOwnedKeys(job.Labels)
 	clearOwnedKeys(job.Annotations)
@@ -193,7 +226,7 @@ func writeProbeHeartbeat(job *batchv1.Job, interval time.Duration) {
 // a task's (one config.json, mounted 0400 through cred-src), labelled with the
 // probe role and without a task id, so the task-side orphan sweep leaves it to
 // the probe sweep (§6.5).
-func (b *Builder) probeCredentialSecret(name, workspaceID, token string) *corev1.Secret {
+func (b *Builder) probeCredentialSecret(name, sourceID, workspaceID, token string) *corev1.Secret {
 	configJSON := `{"token":` + strconv.Quote(token) + `}`
 	labels := map[string]string{
 		labelAppName:   jobAppName,
@@ -203,6 +236,9 @@ func (b *Builder) probeCredentialSecret(name, workspaceID, token string) *corev1
 	}
 	if workspaceID != "" {
 		labels[labelWorkspaceID] = workspaceID
+	}
+	if sourceID != "" {
+		labels[labelSourceID] = sourceID
 	}
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{

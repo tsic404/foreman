@@ -212,12 +212,12 @@ func (s *Scheduler) awaitPlatformFact(ctx context.Context, e registry.TaskEntry,
 // spends what the evidence reads, the wait and the task lock left of
 // attributionWait, never a fresh control-plane timeout (§10, ADR-031). An
 // exhausted budget makes no call, so the caller takes its undecidable branch.
-func (s *Scheduler) taskStatusWithin(ctx context.Context, taskID string) (string, error) {
+func (s *Scheduler) taskStatusWithin(ctx context.Context, e registry.TaskEntry) (string, error) {
 	deadline, ok := ctx.Deadline()
 	if ok && !time.Now().Before(deadline) {
-		return "", fmt.Errorf("C13 %s: attribution budget exhausted", taskID)
+		return "", fmt.Errorf("C13 %s: attribution budget exhausted", e.TaskID)
 	}
-	return s.server.TaskStatus(ctx, taskID)
+	return s.taskStatusFor(ctx, e)
 }
 
 // lockTaskWithin takes the task lock within what is left of the gate path's
@@ -225,13 +225,13 @@ func (s *Scheduler) taskStatusWithin(ctx context.Context, taskID string) (string
 // stage that draws on attributionWait, so a held lease cannot put the S14
 // response back on the lease's TTL (§10, ADR-031). A zero deadline is a
 // report the gate never ran for; it keeps the caller's own bound.
-func (s *Scheduler) lockTaskWithin(ctx context.Context, taskID string, deadline time.Time) (func(), error) {
+func (s *Scheduler) lockTaskWithin(ctx context.Context, taskID, scopeKey string, deadline time.Time) (func(), error) {
 	if deadline.IsZero() {
-		return s.lockTaskFor(ctx, taskID)
+		return s.lockTaskForScope(ctx, taskID, scopeKey)
 	}
 	lockCtx, cancel := context.WithDeadline(ctx, deadline)
 	defer cancel()
-	return s.lockTaskFor(lockCtx, taskID)
+	return s.lockTaskForScope(lockCtx, taskID, scopeKey)
 }
 
 // gateVerdict is the attribution gate's outcome for its caller. It keeps the
@@ -260,10 +260,10 @@ const (
 func (s *Scheduler) gateDecided(e registry.TaskEntry, body []byte) (registry.TaskEntry, []byte, bool) {
 	unlock := s.taskMu.Lock(e.TaskID)
 	defer unlock()
-	if fresh, ok := s.reg.Get(e.TaskID); ok {
+	if fresh, ok := s.reg.Get(e.TaskID, e.ScopeKey()); ok {
 		e = fresh
 	}
-	if decided, ok := s.reg.DecidedReport(e.TaskID); ok {
+	if decided, ok := s.reg.DecidedReport(e.TaskID, e.ScopeKey()); ok {
 		return e, decided, true
 	}
 	if e.IsTerminal() {
@@ -354,7 +354,7 @@ func (s *Scheduler) attributionGate(ctx context.Context, e registry.TaskEntry, b
 	// the gate is deciding on its behalf, and an instance another path decided
 	// during the wait is never rewritten (§4.4). The lock draws on the same
 	// budget, so a holder cannot keep the gate open for the rest of its lease.
-	unlock, lockErr := s.lockTaskFor(gateCtx, e.TaskID)
+	unlock, lockErr := s.lockTaskForScope(gateCtx, e.TaskID, e.ScopeKey())
 	if lockErr != nil {
 		// The shared task lock is unreachable within the budget: never decide
 		// on a snapshot another instance may be changing. This exit writes no
@@ -364,11 +364,11 @@ func (s *Scheduler) attributionGate(ctx context.Context, e registry.TaskEntry, b
 		return e, body, gateDecidedElsewhere, gateDecision{}
 	}
 	defer unlock()
-	if fresh, ok := s.reg.Get(e.TaskID); ok {
+	if fresh, ok := s.reg.Get(e.TaskID, e.ScopeKey()); ok {
 		e = fresh
 	}
 	if e.IsTerminal() || len(e.DecidedReport) > 0 {
-		if decided, ok := s.reg.DecidedReport(e.TaskID); ok {
+		if decided, ok := s.reg.DecidedReport(e.TaskID, e.ScopeKey()); ok {
 			return e, decided, gateDecidedElsewhere, gateDecision{}
 		}
 		return e, body, gateDecidedElsewhere, gateDecision{}
@@ -378,14 +378,14 @@ func (s *Scheduler) attributionGate(ctx context.Context, e registry.TaskEntry, b
 	// path has left of its budget — never a fresh control-plane timeout.
 	// These exits leave the terminal write to the caller, so their decision
 	// rides back unannounced.
-	st, err := s.taskStatusWithin(gateCtx, e.TaskID)
+	st, err := s.taskStatusWithin(gateCtx, e)
 	switch {
 	case errors.Is(err, ErrTaskNotFound):
 		return e, body, gateUndecided, gateDecision{decision: DecisionC13Settled}
 	case err != nil:
 		return e, body, gateUndecided, gateDecision{decision: DecisionReadError, errorSource: "c13"}
 	}
-	s.reg.SetLastStatusSeen(e.TaskID, st)
+	s.reg.SetLastStatusSeen(e.TaskID, st, e.ScopeKey())
 	if registry.IsTerminalResult(st) {
 		return e, body, gateUndecided, gateDecision{decision: DecisionC13Settled}
 	}

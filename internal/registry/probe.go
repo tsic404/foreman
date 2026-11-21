@@ -42,6 +42,9 @@ type ProbeSession struct {
 	TokenHash     string // sha256 hex of the probe Job Token
 	JobRuntime    string // uuid5(NS_JOB_RUNTIME, JobName)
 	RealRuntimeID string // real runtime id results are relayed to; ProbeCommandDriven only
+	// SourceID is the Multica server the probe belongs to. Empty is the
+	// legacy single-source deployment.
+	SourceID string
 	// WorkspaceID pins the probe to one workspace (catalog probes). Empty on
 	// startup / registration-discovery probes: their registration scope spans
 	// every discovery-set workspace and their S-2 / S-3 answers serve any of them

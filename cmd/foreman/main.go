@@ -18,6 +18,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -36,6 +37,7 @@ import (
 	"github.com/tsic404/foreman/internal/recovery"
 	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/scheduler"
+	"github.com/tsic404/foreman/internal/scope"
 	"github.com/tsic404/foreman/internal/startup"
 	"github.com/tsic404/foreman/internal/state"
 	"github.com/tsic404/foreman/internal/workspace"
@@ -248,6 +250,13 @@ func run() error {
 	}
 
 	slotsByWorkspace := make(map[string]*proxy.CatalogSlots, workspaces.Len())
+	sourceWorkspaces := make(map[string][]string, workspaces.Len())
+	for _, identity := range workspaces.All() {
+		if identity.SourceID != "" {
+			sourceWorkspaces[identity.SourceID] = append(sourceWorkspaces[identity.SourceID], identity.WorkspaceID)
+		}
+	}
+	schedCfg.SourceWorkspaces = sourceWorkspaces
 
 	// One fake client per workspace identity: every F→S call carries that
 	// workspace's credential and daemon identity (§1.1). The
@@ -256,18 +265,25 @@ func run() error {
 	var discoveryProbe proxy.DiscoveryProbeRunner
 	clients := make([]*proxy.Client, 0, workspaces.Len())
 	tokenByWorkspace := make(map[string]string, workspaces.Len())
+	urlByWorkspace := make(map[string]string, workspaces.Len())
 	for _, identity := range workspaces.All() {
 		cfg := proxyCfg
 		cfg.WorkspaceID = identity.WorkspaceID
 		cfg.DaemonID = identity.DaemonID
+		cfg.SourceID = identity.SourceID
+		if identity.ServerURL != "" {
+			cfg.ServerURL = strings.TrimRight(identity.ServerURL, "/")
+		}
 		slots := proxy.NewCatalogSlots()
 		if coordEnabled {
 			// §1.3 跨实例口径: a probe result landed on the holder replays on
 			// any instance that receives the command.
 			slots.AttachShared(coord)
 		}
-		slotsByWorkspace[identity.WorkspaceID] = slots
-		tokenByWorkspace[identity.WorkspaceID] = identity.Token
+		scopeKey := scope.Key(identity.SourceID, identity.WorkspaceID)
+		slotsByWorkspace[scopeKey] = slots
+		tokenByWorkspace[scopeKey] = identity.Token
+		urlByWorkspace[scopeKey] = cfg.ServerURL
 		client := proxy.NewClient(cfg, identity.Token,
 			proxy.WithMetrics(metrics),
 			proxy.WithLogger(baseLog),
@@ -276,17 +292,19 @@ func run() error {
 				if discoveryProbe == nil {
 					return registry.Discovery{}, errors.New("scheduler not wired yet")
 				}
+				if sourceProbe, ok := discoveryProbe.(interface {
+					RunDiscoveryProbeInSource(ctx context.Context, sourceID, workspaceID string) (registry.Discovery, error)
+				}); ok && cfg.SourceID != "" {
+					return sourceProbe.RunDiscoveryProbeInSource(ctx, cfg.SourceID, workspaceID)
+				}
 				return discoveryProbe.RunDiscoveryProbe(ctx, workspaceID)
 			})),
 			// C4/C19/S8 address a task by the real runtime it was dispatched
-			// under (ADR-025); the dispatch record is the entry's.
-			proxy.WithTaskRuntime(func(taskID string) string {
-				e, ok := reg.Get(taskID)
-				if !ok {
-					return ""
-				}
-				return e.RealRuntimeID
-			}),
+			// under (ADR-025); the dispatch record is the entry's, read under
+			// this client's own source/workspace. The upstream task id is only
+			// unique inside one server, so a bare lookup would be ambiguous
+			// exactly when two sources hold it (V2-C02/C03).
+			taskRuntimeResolver(reg, identity.SourceID, identity.WorkspaceID),
 		)
 		if discoveryEvent != nil {
 			for _, ref := range discoveryEvent.Set {
@@ -355,7 +373,7 @@ func run() error {
 	// scheduler performs when a declared tier reads the project side. Each
 	// query runs with its workspace's credential, and its cache is partitioned
 	// by workspace (§4.1).
-	projects := platform.NewProjectQueriesFor(proxyCfg.ServerURL, tokenByWorkspace)
+	projects := platform.NewProjectQueriesForSources(proxyCfg.ServerURL, tokenByWorkspace, urlByWorkspace)
 	jbCfg.NameResolver = projects
 	schedCfg.Project = projects
 
@@ -504,6 +522,7 @@ func run() error {
 		Credentials:    obsCfg.OpsCredentials,
 		Health:         health,
 		WorkspaceIDs:   clientSet.IDs(),
+		Scopes:         servedOpsScopes(clientSet),
 		StartedAt:      started,
 		Logger:         baseLog,
 	})
@@ -600,7 +619,13 @@ func run() error {
 	// them in-process; no probe Job is created.
 
 	startupDiscovery := newControlPlaneDiscovery(catalogService, releaseService, discoveryService, configService, clientSet, baseLog)
-	discoveries, err := resolveStartupDiscoveries(ctx, leader, coord, startupDiscovery, clientSet.All(), schedCfg.StartupProbeTimeout, log)
+	var discoveries map[string]registry.Discovery
+	var failedSources []string
+	if leader != nil {
+		discoveries, failedSources, err = bootstrap.StartupDiscoveriesDetailed(ctx, leader, coord, startupDiscovery, clientSet.All(), schedCfg.StartupProbeTimeout, log)
+	} else {
+		discoveries, failedSources, err = runStartupProbesDetailed(ctx, startupDiscovery, clientSet.All(), log)
+	}
 	if err != nil {
 		// Fail-fast, visible: no registration inside the window means the
 		// template (or the probe) is not runnable, and Foreman must not
@@ -621,7 +646,7 @@ func run() error {
 	servedRefs := make([]workspace.Ref, 0, len(discoveries))
 	unregisteredRefs := make([]workspace.Ref, 0, len(discoveries))
 	for _, c := range clientSet.All() {
-		discovery, ok := discoveries[c.WorkspaceID()]
+		discovery, ok := discoveries[c.ScopeKey()]
 		if !ok {
 			// Discovered but not registered by the probe: no declaration, no
 			// control plane, no service — and never a silent drop (§10 多
@@ -695,45 +720,76 @@ func run() error {
 		return err
 	}
 
-	for _, c := range served {
-		workspaceID := c.WorkspaceID()
-		reporter := proxy.NewModelCatalogReporter(proxyCfg, c,
-			newDiscoveryCatalogSource(discoveryService, catalogService, releaseService, configService, c),
-			c.CatalogSlots(), metrics,
-			proxy.WithCatalogSlotReplay(false),
-			proxy.WithReporterLogger(baseLog))
-		plane := proxy.NewControlPlane(proxy.ControlPlaneOptions{
-			ProxyConfig: proxyCfg,
-			Client:      c,
-			Scheduler:   workspaceClaimScheduler{sched: sched, workspaceID: workspaceID},
-			Registry:    reg,
-			LeaseHooks:  sched,
-			Reporter:    reporter,
-			Metrics:     metrics,
-			Logger:      baseLog,
-			WorkspaceID: workspaceID,
-			WSEnabled:   proxyCfg.WSEnabled,
-		})
-		if leader != nil {
-			// §1.1 发出者口径 / F11: every control-plane loop runs only on the
-			// lease holder — claim, heartbeat (ack consumption), WS
-			// subscription, profile refresh and the proactive lease renewal.
-			plane.SetLeaderGate(leader.Held)
-		}
-		if coordEnabled {
-			// The holder publishes each workspace's registration identity after
-			// C1; followers and a future takeover adopt it (AC-77).
-			ws := workspaceID
-			plane.SetDeclarationPublisher(func(ctx context.Context, cl *proxy.Client) error {
-				return bootstrap.PublishDeclaration(ctx, coord, ws, cl)
+	// startPlanes builds and starts one control-plane set per target client.
+	// The startup path and the per-source recovery path share it: a source
+	// that failed its first discovery must join the same loops later without
+	// restarting the process or repeating the healthy sources' work
+	// (02-contracts V2-C06 按来源退避与对账).
+	startPlanes := func(targets []*proxy.Client) {
+		for _, c := range targets {
+			workspaceID := c.WorkspaceID()
+			reporter := proxy.NewModelCatalogReporter(proxyCfg, c,
+				newDiscoveryCatalogSource(discoveryService, catalogService, releaseService, configService, c),
+				c.CatalogSlots(), metrics,
+				proxy.WithCatalogSlotReplay(false),
+				proxy.WithReporterLogger(baseLog))
+			plane := proxy.NewControlPlane(proxy.ControlPlaneOptions{
+				ProxyConfig: proxyCfg,
+				Client:      c,
+				Scheduler:   workspaceClaimScheduler{sched: sched, sourceID: c.SourceID(), workspaceID: workspaceID},
+				Registry:    reg,
+				LeaseHooks:  sched,
+				Reporter:    reporter,
+				Metrics:     metrics,
+				Logger:      baseLog,
+				WorkspaceID: workspaceID,
+				WSEnabled:   proxyCfg.WSEnabled,
 			})
+			if leader != nil {
+				// §1.1 发出者口径 / F11: every control-plane loop runs only on the
+				// lease holder — claim, heartbeat (ack consumption), WS
+				// subscription, profile refresh and the proactive lease renewal.
+				plane.SetLeaderGate(leader.Held)
+			}
+			if coordEnabled {
+				// The holder publishes each workspace's registration identity after
+				// C1; followers and a future takeover adopt it (AC-77).
+				plane.SetDeclarationPublisher(func(ctx context.Context, cl *proxy.Client) error {
+					return bootstrap.PublishDeclaration(ctx, coord, cl.ScopeKey(), cl)
+				})
+			}
+			// §1.6: with WS closed the profile-refresh/subscriber loops are not
+			// started: profile changes degrade to "effective on the next restart",
+			// as the deployment note says.
+			for _, component := range plane.Components() {
+				runWorkspace(component.Name+"/"+workspaceID, component.Run)
+			}
 		}
-		// §1.6: with WS closed the profile-refresh/subscriber loops are not
-		// started: profile changes degrade to "effective on the next restart",
-		// as the deployment note says.
-		for _, component := range plane.Components() {
-			runWorkspace(component.Name+"/"+workspaceID, component.Run)
+	}
+	startPlanes(served)
+
+	// A source whose first discovery failed keeps its own retry loop: the
+	// healthy sources already serve, and a source that comes back must
+	// register and pick up work in this process lifetime (V2-C06 单来源失联
+	// 只让该域退避; 恢复后再接入). The loop stays alive until shutdown so the
+	// liveness row reflects the process, not the retry's completion.
+	if len(failedSources) > 0 {
+		// In-process discovery registers the source upstream and attach
+		// starts its control loops: both are holder-only actions. The gate is
+		// nil in the single-instance form, where there is no lease to hold.
+		var leaseHeld bootstrap.SourceLeaderGate
+		if leader != nil {
+			leaseHeld = leader.Held
 		}
+		run("source-recovery", func(ctx context.Context) error {
+			bootstrap.RetryFailedSources(ctx, startupDiscovery, clientSet.All(), failedSources, leaseHeld,
+				bootstrap.SourceRetryBackoff, baseLog,
+				func(sourceID string, found map[string]registry.Discovery) bool {
+					return attachRecoveredSource(clientSet.All(), sourceID, found, leaseHeld, startPlanes)
+				})
+			<-ctx.Done()
+			return nil
+		})
 	}
 	run("recovery", reconciler.Run)
 
@@ -940,6 +996,7 @@ func (l *lateReconciler) Reconcile(ctx context.Context) error {
 // budget and claim entry (§10 两级预算; §1.1 控制面逐套).
 type workspaceClaimScheduler struct {
 	sched       *scheduler.Scheduler
+	sourceID    string
 	workspaceID string
 }
 
@@ -954,7 +1011,7 @@ func (w workspaceClaimScheduler) ReleaseSlots(ctx context.Context, reserved []sc
 }
 
 func (w workspaceClaimScheduler) OnClaimReserved(ctx context.Context, task json.RawMessage, reserved scheduler.SlotReservation, scope scheduler.ClaimScope) error {
-	return w.sched.OnClaimReservedFor(ctx, w.workspaceID, task, reserved, scope)
+	return w.sched.OnClaimReservedInSource(ctx, w.sourceID, w.workspaceID, task, reserved, scope)
 }
 
 // workspaceServer routes a task-addressed server call to the client of the
@@ -968,15 +1025,15 @@ type workspaceServer struct {
 
 func (w *workspaceServer) clientFor(taskID string) (*proxy.Client, error) {
 	if entry, ok := w.reg.Get(taskID); ok {
-		if client, found := w.clients.For(entry.WorkspaceID); found {
+		if client, found := w.clients.ForSource(entry.SourceID, entry.WorkspaceID); found {
 			return client, nil
 		}
-		return nil, fmt.Errorf("no client for workspace %q", entry.WorkspaceID)
+		return nil, fmt.Errorf("no client for source %q workspace %q", entry.SourceID, entry.WorkspaceID)
 	}
 	// A settled record keeps the workspace too; fall back to the only client
 	// when the deployment serves one workspace.
 	if settled, ok := w.reg.Settled(taskID); ok {
-		if client, found := w.clients.For(settled.WorkspaceID); found {
+		if client, found := w.clients.ForSource(settled.SourceID, settled.WorkspaceID); found {
 			return client, nil
 		}
 	}
@@ -990,6 +1047,15 @@ func (w *workspaceServer) TaskStatus(ctx context.Context, taskID string) (string
 	client, err := w.clientFor(taskID)
 	if err != nil {
 		return "", err
+	}
+	return client.TaskStatus(ctx, taskID)
+}
+
+// TaskStatusInSource reads C13 through the exact source/workspace credential.
+func (w *workspaceServer) TaskStatusInSource(ctx context.Context, sourceID, workspaceID, taskID string) (string, error) {
+	client, found := w.clients.ForSource(sourceID, workspaceID)
+	if !found {
+		return "", fmt.Errorf("no client for source %q workspace %q", sourceID, workspaceID)
 	}
 	return client.TaskStatus(ctx, taskID)
 }
@@ -1014,6 +1080,17 @@ func (w *workspaceServer) ForwardInWorkspace(ctx context.Context, ep scheduler.E
 	return client.Forward(ctx, ep, taskID, body)
 }
 
+// ForwardInSourceWorkspace routes a replay to the client of the report's
+// source and workspace. It never falls back to a workspace-only match: the
+// same workspace id can exist on two servers.
+func (w *workspaceServer) ForwardInSourceWorkspace(ctx context.Context, ep scheduler.Endpoint, taskID, sourceID, workspaceID string, body []byte) (int, []byte, error) {
+	client, found := w.clients.ForSource(sourceID, workspaceID)
+	if !found {
+		return 0, nil, fmt.Errorf("no client for source %q workspace %q", sourceID, workspaceID)
+	}
+	return client.Forward(ctx, ep, taskID, body)
+}
+
 // registerSourceView builds S31's read-only projection per workspace: the
 // discovery behind the current declaration, the declaration entry by entry
 // keyed by (provider, profile_id), every real runtime's catalog slot state,
@@ -1023,10 +1100,140 @@ func registerSourceView(clients *proxy.ClientSet, slots map[string]*proxy.Catalo
 	return func() map[string]any {
 		views := make(map[string]any, len(clients.All()))
 		for _, client := range clients.All() {
-			views[client.WorkspaceID()] = registerSourceViewOne(client, slots[client.WorkspaceID()])
+			views[sourceViewKey(client)] = registerSourceViewOne(client, slots[client.ScopeKey()])
 		}
 		return views
 	}
+}
+
+// clientsOfSource lists the clients one registered source owns.
+func clientsOfSource(clients []*proxy.Client, sourceID string) []*proxy.Client {
+	out := make([]*proxy.Client, 0, len(clients))
+	for _, client := range clients {
+		if client.SourceID() == sourceID {
+			out = append(out, client)
+		}
+	}
+	return out
+}
+
+// attachRecoveredSource installs one recovered source's probe result: each of
+// that source's clients with a discovered workspace is declared, then its
+// control planes start. No other source's client is touched — the healthy
+// sources are already serving, and re-declaring them would repeat C1.
+func attachRecoveredSource(
+	clients []*proxy.Client,
+	sourceID string,
+	found map[string]registry.Discovery,
+	held bootstrap.SourceLeaderGate,
+	startPlanes func([]*proxy.Client),
+) bool {
+	// The attach starts control loops and declares the source: re-verify the
+	// tenure here, at the side effect, not only at the retry loop's boundary.
+	if held != nil && !held() {
+		return false
+	}
+	var ready []*proxy.Client
+	for _, c := range clientsOfSource(clients, sourceID) {
+		discovery, ok := found[c.ScopeKey()]
+		if !ok {
+			continue
+		}
+		if len(c.RuntimeIDs()) == 0 {
+			c.Declare(discovery)
+		}
+		ready = append(ready, c)
+	}
+	if len(ready) > 0 {
+		startPlanes(ready)
+	}
+	return true
+}
+
+// taskRuntimeResolver wires the frozen-runtime lookup into a client: the
+// production assembly and the regression test both build the option here, so
+// the partition is not re-created differently at each call site.
+func taskRuntimeResolver(reg *registry.Registry, sourceID, workspaceID string) proxy.Option {
+	return proxy.WithTaskRuntimeInScope(scopedTaskRuntime(reg, sourceID, workspaceID))
+}
+
+// scopedTaskRuntime resolves a task's frozen dispatch record under one
+// client's own source/workspace. known=false means the scope holds no attempt
+// for the task: the callback must not borrow another source's entry or guess
+// the first declared runtime, because the same task id can be a different
+// attempt on another server (02-contracts V2-C02/C03).
+func scopedTaskRuntime(reg *registry.Registry, sourceID, workspaceID string) func(taskID string) (string, bool) {
+	return func(taskID string) (string, bool) {
+		e, ok := reg.TaskInScope(sourceID, workspaceID, taskID)
+		if !ok {
+			return "", false
+		}
+		return e.RealRuntimeID, true
+	}
+}
+
+// servedOpsScopes is the ops surface's served source/workspace set. Two
+// registered servers can expose the same workspace id, so the pair — not the
+// workspace alone — is the partition the read routes resolve.
+func servedOpsScopes(clients *proxy.ClientSet) []observability.Scope {
+	all := clients.All()
+	out := make([]observability.Scope, 0, len(all))
+	for _, client := range all {
+		out = append(out, observability.Scope{
+			ServerID:    client.SourceID(),
+			WorkspaceID: client.WorkspaceID(),
+		})
+	}
+	return out
+}
+
+// sourceViewKey names one registration view without collapsing two servers
+// that expose the same workspace id. The legacy single-source form keeps its
+// workspace-id key.
+func sourceViewKey(client *proxy.Client) string {
+	if sourceID := client.SourceID(); sourceID != "" {
+		return sourceID + "/" + client.WorkspaceID()
+	}
+	return client.WorkspaceID()
+}
+
+// runStartupProbes runs one startup probe per source and keys the result by
+// source+workspace. A source-less client keeps the historical workspace key.
+func runStartupProbes(ctx context.Context, prober bootstrap.StartupProber, clients []*proxy.Client, log *slog.Logger) (map[string]registry.Discovery, error) {
+	out, _, err := runStartupProbesDetailed(ctx, prober, clients, log)
+	return out, err
+}
+
+// runStartupProbesDetailed is runStartupProbes with the explicit failure set
+// the per-source recovery loop re-probes.
+func runStartupProbesDetailed(ctx context.Context, prober bootstrap.StartupProber, clients []*proxy.Client, log *slog.Logger) (map[string]registry.Discovery, []string, error) {
+	discoveries := make(map[string]registry.Discovery, len(clients))
+	seen := make(map[string]bool, len(clients))
+	var failures []error
+	var failedSources []string
+	for _, client := range clients {
+		sourceID := client.SourceID()
+		if seen[sourceID] {
+			continue
+		}
+		seen[sourceID] = true
+		found, err := prober.RunStartupProbeInSource(ctx, sourceID)
+		if err != nil {
+			// The failure domain is the source: a restart without the
+			// coordination face still starts every source it could probe.
+			log.Error("runtime.startup_probe_failed", "source_id", sourceID, "err", err.Error())
+			failures = append(failures, err)
+			failedSources = append(failedSources, sourceID)
+			continue
+		}
+		for workspaceID, discovery := range found {
+			discoveries[scope.Key(sourceID, workspaceID)] = discovery
+		}
+	}
+	if len(discoveries) == 0 && len(failures) > 0 {
+		return nil, nil, errors.Join(failures...)
+	}
+	return discoveries, failedSources, nil
 }
 
 func registerSourceViewOne(client *proxy.Client, slots *proxy.CatalogSlots) any {

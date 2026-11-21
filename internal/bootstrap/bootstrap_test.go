@@ -14,6 +14,7 @@ import (
 	"github.com/tsic404/foreman/internal/coordination"
 	"github.com/tsic404/foreman/internal/proxy"
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/scope"
 	"github.com/tsic404/foreman/internal/state"
 )
 
@@ -87,6 +88,74 @@ func TestLoadDeclarationsListsOnlyMissingWorkspaces(t *testing.T) {
 	}
 	if len(missing) != 1 || missing[0] != "ws-b" {
 		t.Fatalf("missing = %v, want [ws-b]", missing)
+	}
+}
+
+// TestLoadDeclarationsKeepsSameWorkspaceSourcesApart pins the declaration
+// store's partition: two servers may expose the same workspace id, and each
+// server's published identity must stay under its own source.
+func TestLoadDeclarationsKeepsSameWorkspaceSourcesApart(t *testing.T) {
+	clientA := proxy.NewClient(proxy.Config{SourceID: "src-a", WorkspaceID: "ws-shared", DaemonID: "foreman-a", Version: "0.1.0"}, "token-a")
+	clientB := proxy.NewClient(proxy.Config{SourceID: "src-b", WorkspaceID: "ws-shared", DaemonID: "foreman-b", Version: "0.1.0"}, "token-b")
+	keyA := scope.Key("src-a", "ws-shared")
+	keyB := scope.Key("src-b", "ws-shared")
+	store := &fakeDeclarationStore{rows: map[string][]byte{
+		keyA: bootstrapTestRecord(t, "ws-shared", "rid-a"),
+		keyB: bootstrapTestRecord(t, "ws-shared", "rid-b"),
+	}}
+
+	records, missing, err := LoadDeclarations(context.Background(), store, []*proxy.Client{clientA, clientB})
+	if err != nil {
+		t.Fatalf("LoadDeclarations: %v", err)
+	}
+	if len(missing) != 0 {
+		t.Fatalf("missing = %v, want none", missing)
+	}
+	if got := records[keyA].RuntimeIDs[registry.RuntimeIdentityKey("omp", "")]; got != "rid-a" {
+		t.Errorf("source A runtime id = %q, want rid-a", got)
+	}
+	if got := records[keyB].RuntimeIDs[registry.RuntimeIdentityKey("omp", "")]; got != "rid-b" {
+		t.Errorf("source B runtime id = %q, want rid-b", got)
+	}
+}
+
+// TestMergeDiscoveriesKeepsSameWorkspaceSourcesApart pins the merge side: a
+// published identity on one source must not be used for the other source's
+// identical workspace id, and each source's probe result lands under its own
+// key.
+func TestMergeDiscoveriesKeepsSameWorkspaceSourcesApart(t *testing.T) {
+	clientA := proxy.NewClient(proxy.Config{SourceID: "src-a", WorkspaceID: "ws-shared", DaemonID: "foreman-a", Version: "0.1.0"}, "token-a")
+	clientB := proxy.NewClient(proxy.Config{SourceID: "src-b", WorkspaceID: "ws-shared", DaemonID: "foreman-b", Version: "0.1.0"}, "token-b")
+	keyA := scope.Key("src-a", "ws-shared")
+	keyB := scope.Key("src-b", "ws-shared")
+	recordA := proxy.DeclarationRecord{
+		WorkspaceID: "ws-shared",
+		CLIVersion:  "published-a",
+		Runtimes:    []registry.DiscoveredRuntime{{Name: "foreman-a", Type: "omp", Version: "0.6.1"}},
+		RuntimeIDs:  map[string]string{registry.RuntimeIdentityKey("omp", ""): "rid-a"},
+	}
+	probedB := registry.Discovery{
+		CLIVersion: "probe-b",
+		Runtimes:   []registry.DiscoveredRuntime{{Name: "foreman-b", Type: "omp", Version: "0.6.2"}},
+	}
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+
+	out := MergeDiscoveries([]*proxy.Client{clientA, clientB},
+		map[string]proxy.DeclarationRecord{keyA: recordA},
+		map[string]registry.Discovery{keyB: probedB},
+		log)
+
+	if got := out[keyA].CLIVersion; got != "published-a" {
+		t.Errorf("source A cli_version = %q, want the published identity", got)
+	}
+	if got := out[keyB].CLIVersion; got != "probe-b" {
+		t.Errorf("source B cli_version = %q, want its own probe result", got)
+	}
+	if ids := clientA.RuntimeIDs(); len(ids) != 1 || ids[0] != "rid-a" {
+		t.Errorf("source A runtime ids = %v, want [rid-a]", ids)
+	}
+	if ids := clientB.RuntimeIDs(); len(ids) != 0 {
+		t.Errorf("source B runtime ids = %v, want none before its own C1", ids)
 	}
 }
 

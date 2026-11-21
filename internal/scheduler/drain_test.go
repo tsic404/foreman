@@ -340,7 +340,9 @@ func TestReclaimWithoutDigestIsVisible(t *testing.T) {
 // handling 场景 #16): no registry entry (any state) AND an explicit Job
 // NotFound. Either half alone deletes a Secret that is still needed.
 func TestSweepOrphanSecretsCriterion(t *testing.T) {
-	f := newFixture(t)
+	// The claim payload's workspace is the served workspace, so the objects
+	// the sweep judges carry the same partition as their entries.
+	f := newFixtureWithEnv(t, map[string]string{EnvWorkspaceID: "ws-1"})
 
 	// A live entry (pending, Job not created yet): the Secret must stay.
 	f.claim(t, "task-live")
@@ -354,6 +356,9 @@ func TestSweepOrphanSecretsCriterion(t *testing.T) {
 		secretObject("fm-task-live-cred", "task-live"),
 		secretObject("fm-task-draining-cred", "task-draining"),
 		secretObject("fm-task-orphan-cred", "task-orphan"),
+	}
+	for i := range f.jobs.secrets {
+		f.jobs.secrets[i].Labels[registry.LabelWorkspaceID] = "ws-1"
 	}
 	// The orphan's Job is gone; the drained task's Job is still there.
 	f.jobs.existingJobs = map[string]*batchv1.Job{

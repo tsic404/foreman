@@ -35,6 +35,25 @@ type LeaseHooks interface {
 	OnTaskVanished(ctx context.Context, taskID string) error
 }
 
+// ScopedLeaseHooks is the source-aware form of LeaseHooks. A deployment that
+// serves two registered servers can hold the same upstream task id twice, so
+// an entry's own partition — never the bare id — must name the attempt the
+// keeper settles.
+type ScopedLeaseHooks interface {
+	OnDeliveryUnconfirmedInScope(ctx context.Context, taskID, scopeKey string) error
+	OnBootTimeoutInScope(ctx context.Context, taskID, scopeKey string) error
+	ConvergeLeaseRefusedInScope(ctx context.Context, taskID, scopeKey string) error
+	OnTaskVanishedInScope(ctx context.Context, taskID, scopeKey string) error
+}
+
+// scopedHooks returns the source-aware hooks when the implementation provides
+// them. A source-less entry keeps the legacy signature so existing hook
+// implementations (and single-source deployments) are unchanged.
+func scopedHooks(hooks LeaseHooks) ScopedLeaseHooks {
+	scoped, _ := hooks.(ScopedLeaseHooks)
+	return scoped
+}
+
 // LeaseKeeper renews prepare leases (C4) for tasks that are claimed but not
 // yet started, every FOREMAN_LEASE_REFRESH_INTERVAL (capped at 20s by the
 // config guard, §10). It also enforces the pre-start terminal bound, the
@@ -51,8 +70,14 @@ type LeaseKeeper struct {
 	// (credential, daemon identity) pair renews only its own tasks (§1.4
 	// 失败粒度含 workspace). Empty keeps the legacy global round.
 	workspace string
-	now       func() time.Time
-	log       *slog.Logger
+	// source is the exact registered server the keeper's client belongs to.
+	// A workspace id alone is not a partition when two sources expose it: the
+	// C4 request would otherwise carry another source's task/runtime identity,
+	// and its answer would extend this domain's lease fact (V2-C03/C06).
+	// Empty keeps the legacy single-source round.
+	source string
+	now    func() time.Time
+	log    *slog.Logger
 }
 
 // LeaseKeeperOption customizes a LeaseKeeper.
@@ -61,6 +86,13 @@ type LeaseKeeperOption func(*LeaseKeeper)
 // WithLeaseWorkspace binds the keeper to one workspace's entries.
 func WithLeaseWorkspace(workspaceID string) LeaseKeeperOption {
 	return func(k *LeaseKeeper) { k.workspace = workspaceID }
+}
+
+// WithLeaseSource binds the keeper to one registered source's entries. The
+// workspace filter alone cannot separate two servers that expose the same
+// workspace id; the pair is the partition.
+func WithLeaseSource(sourceID string) LeaseKeeperOption {
+	return func(k *LeaseKeeper) { k.source = sourceID }
 }
 
 // WithLeaseClock overrides the keeper's clock. The default is reg.Now, the
@@ -105,6 +137,9 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 		if k.workspace != "" && e.WorkspaceID != k.workspace {
 			continue
 		}
+		if k.source != "" && e.SourceID != k.source {
+			continue
+		}
 		if e.RealRuntimeID == "" {
 			// No dispatch record (a Job rendered before the record was
 			// annotated): the startup convergence owns it, and a lease against
@@ -122,7 +157,7 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 			// same file states explicitly.
 			now := k.now()
 			until := now.Add(scheduler.PrepareLeaseTTL)
-			k.reg.SetLeaseKeepUntil(e.TaskID, until)
+			k.reg.SetLeaseKeepUntil(e.TaskID, until, e.ScopeKey())
 			k.log.Info("lease.renewed",
 				"task_id", e.TaskID, "job_name", e.JobName,
 				"lease_keep_until", registry.ProjectedTime(until))
@@ -137,22 +172,22 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 			switch {
 			case e.BootDeadline.IsZero() || !now.After(e.BootDeadline):
 			case e.DeliveredAt.IsZero():
-				if herr := k.hooks.OnBootTimeout(ctx, e.TaskID); herr != nil {
+				if herr := k.bootTimeout(ctx, e); herr != nil {
 					k.log.Error("boot-timeout settlement failed", "task_id", e.TaskID, "err", herr)
 				}
 			default:
-				if herr := k.hooks.OnDeliveryUnconfirmed(ctx, e.TaskID); herr != nil {
+				if herr := k.deliveryUnconfirmed(ctx, e); herr != nil {
 					k.log.Error("delivery-unconfirmed settlement failed", "task_id", e.TaskID, "err", herr)
 				}
 			}
 		case err == nil && !ready:
 			// ready=false (C4 400): the task left the renewable pre-start
 			// state — converge via C13 (started / terminal / gone / retry).
-			if cerr := k.hooks.ConvergeLeaseRefused(ctx, e.TaskID); cerr != nil {
+			if cerr := k.convergeLeaseRefused(ctx, e); cerr != nil {
 				k.log.Debug("lease-refused convergence deferred", "task_id", e.TaskID, "err", cerr)
 			}
 		case errors.Is(err, scheduler.ErrTaskNotFound):
-			if verr := k.hooks.OnTaskVanished(ctx, e.TaskID); verr != nil {
+			if verr := k.taskVanished(ctx, e); verr != nil {
 				k.log.Error("task-vanish settlement failed", "task_id", e.TaskID, "err", verr)
 			}
 		default:
@@ -160,6 +195,34 @@ func (k *LeaseKeeper) round(ctx context.Context) {
 			k.log.Debug("prepare-lease failed", "task_id", e.TaskID, "err", err)
 		}
 	}
+}
+
+func (k *LeaseKeeper) bootTimeout(ctx context.Context, e registry.TaskEntry) error {
+	if scoped := scopedHooks(k.hooks); scoped != nil && e.ScopeKey() != "" {
+		return scoped.OnBootTimeoutInScope(ctx, e.TaskID, e.ScopeKey())
+	}
+	return k.hooks.OnBootTimeout(ctx, e.TaskID)
+}
+
+func (k *LeaseKeeper) deliveryUnconfirmed(ctx context.Context, e registry.TaskEntry) error {
+	if scoped := scopedHooks(k.hooks); scoped != nil && e.ScopeKey() != "" {
+		return scoped.OnDeliveryUnconfirmedInScope(ctx, e.TaskID, e.ScopeKey())
+	}
+	return k.hooks.OnDeliveryUnconfirmed(ctx, e.TaskID)
+}
+
+func (k *LeaseKeeper) convergeLeaseRefused(ctx context.Context, e registry.TaskEntry) error {
+	if scoped := scopedHooks(k.hooks); scoped != nil && e.ScopeKey() != "" {
+		return scoped.ConvergeLeaseRefusedInScope(ctx, e.TaskID, e.ScopeKey())
+	}
+	return k.hooks.ConvergeLeaseRefused(ctx, e.TaskID)
+}
+
+func (k *LeaseKeeper) taskVanished(ctx context.Context, e registry.TaskEntry) error {
+	if scoped := scopedHooks(k.hooks); scoped != nil && e.ScopeKey() != "" {
+		return scoped.OnTaskVanishedInScope(ctx, e.TaskID, e.ScopeKey())
+	}
+	return k.hooks.OnTaskVanished(ctx, e.TaskID)
 }
 
 // leaseable reports whether the entry still needs prepare-lease renewals:

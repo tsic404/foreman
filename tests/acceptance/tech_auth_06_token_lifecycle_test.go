@@ -317,7 +317,7 @@ func TestAuth06DrainUpperBoundReclaimsWithoutATerminationFact(t *testing.T) {
 func TestAuth06OrphanSecretSweepLeavesTheNegativeShapes(t *testing.T) {
 	h := newDeliveryHarness(t)
 	if err := h.reg.Put(registry.TaskEntry{
-		TaskID: "task-live", JobName: "fm-task-live", State: registry.StatePending,
+		TaskID: "task-live", JobName: "fm-task-live", WorkspaceID: "ws-1", State: registry.StatePending,
 	}); err != nil {
 		t.Fatalf("Put: %v", err)
 	}

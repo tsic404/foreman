@@ -167,6 +167,7 @@ func newStateRegistry(t *testing.T, store StateStore) *Registry {
 // restore scan from programmed rows.
 type fakeStateStore struct {
 	puts    map[string]TaskEntry
+	putKeys []string
 	deletes []string
 	settled map[string]TaskEntry
 	revoked map[string]time.Time
@@ -184,8 +185,9 @@ func newFakeStateStore() *fakeStateStore {
 	}
 }
 
-func (f *fakeStateStore) PutEntry(_ context.Context, _, taskID string, e TaskEntry) error {
+func (f *fakeStateStore) PutEntry(_ context.Context, ws, taskID string, e TaskEntry) error {
 	f.puts[taskID] = e
+	f.putKeys = append(f.putKeys, ws+"\x00"+taskID)
 	return nil
 }
 func (f *fakeStateStore) GetEntry(context.Context, string, string) (TaskEntry, bool, error) {
@@ -466,4 +468,35 @@ func TestRegistryFlushReportsAStuckQueue(t *testing.T) {
 	}
 	close(store.gate)
 	flushState(t, r)
+}
+
+// TestRegistrySharedKeysCarrySource pins the source partition of the shared
+// mapping record: two servers may expose the same workspace id, and their rows
+// must never land on the same store key (02-contracts V2-C03/C06).
+func TestRegistrySharedKeysCarrySource(t *testing.T) {
+	store := newFakeStateStore()
+	r := newStateRegistry(t, store)
+	a := entryFor("task-a")
+	a.SourceID, a.WorkspaceID = "src-a", "ws-shared"
+	b := entryFor("task-b")
+	b.SourceID, b.WorkspaceID = "src-b", "ws-shared"
+	if err := r.Put(a); err != nil {
+		t.Fatalf("Put A: %v", err)
+	}
+	if err := r.Put(b); err != nil {
+		t.Fatalf("Put B: %v", err)
+	}
+	flushState(t, r)
+	want := map[string]bool{
+		"src-a\x00ws-shared\x00task-a": true,
+		"src-b\x00ws-shared\x00task-b": true,
+	}
+	if len(store.putKeys) != len(want) {
+		t.Fatalf("shared put keys = %q, want exactly %d entries", store.putKeys, len(want))
+	}
+	for _, key := range store.putKeys {
+		if !want[key] {
+			t.Errorf("shared put key = %q, want a source-scoped key", key)
+		}
+	}
 }

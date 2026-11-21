@@ -65,6 +65,25 @@ type StatusClient interface {
 	TaskStatus(ctx context.Context, taskID string) (string, error)
 }
 
+// SourceStatusClient is the source-aware C13 read. A deployment that serves
+// two registered servers can hold the same upstream task id twice, so the
+// entry's own credential — never another source's — must answer the query.
+type SourceStatusClient interface {
+	TaskStatusInSource(ctx context.Context, sourceID, workspaceID, taskID string) (string, error)
+}
+
+// ScopedSettler is the source-aware settlement surface. Each entry carries its
+// own partition; a bare task id is ambiguous once two sources expose the same
+// id, so the reconciler names the attempt it is converging.
+type ScopedSettler interface {
+	ContinueClaimInScope(ctx context.Context, taskID, scopeKey string) error
+	SettleTerminalInScope(ctx context.Context, taskID, result, scopeKey string) error
+	SettleCancelledInScope(ctx context.Context, taskID, scopeKey string) error
+	AdoptRunningInScope(ctx context.Context, taskID, status, scopeKey string) error
+	DiscardTaskInScope(ctx context.Context, taskID, scopeKey string) error
+	OnTaskVanishedInScope(ctx context.Context, taskID, scopeKey string) error
+}
+
 // Watcher triggers a convergence round on Job/Pod changes so the loop does
 // not wait for the next tick (the Job watcher). The
 // reconciler re-reads the object state itself, so a missed or stale event
@@ -395,7 +414,7 @@ func (r *Reconciler) round(ctx context.Context) error {
 		if ctx.Err() != nil {
 			break
 		}
-		if listErr != nil && !e.IsTerminal() && !r.releasing[e.TaskID] {
+		if listErr != nil && !e.IsTerminal() && !r.releasing[entryKey(e)] {
 			continue
 		}
 		// A re-run reuses the Job name (fm-<task_id>), so the list face can
@@ -458,13 +477,13 @@ func (r *Reconciler) reconcileOne(ctx context.Context, e registry.TaskEntry, pod
 		}
 		return err
 	}
-	if r.releasing[e.TaskID] {
+	if r.releasing[entryKey(e)] {
 		// An earlier round began a report-free release but could not finish
 		// it. The Job may be gone by now, so re-deriving the intent from the
 		// objects would read it as an unexpectedly missing Job and fail a
 		// task that is on its way back to the server queue — finish the
 		// release instead (the deletion is idempotent).
-		return r.release(ctx, e.TaskID)
+		return r.release(ctx, e)
 	}
 	job, err := r.objects.GetJob(ctx, e.JobName)
 	if err != nil {
@@ -483,7 +502,7 @@ func (r *Reconciler) reconcileOne(ctx context.Context, e registry.TaskEntry, pod
 		if !e.IsTerminal() && !e.IsDraining() && e.State == registry.StatePending &&
 			e.StartedAt.IsZero() && e.DeliveredAt.IsZero() && len(e.Payload) != 0 {
 			delete(r.missing, e.JobName)
-			return r.settler.ContinueClaim(ctx, e.TaskID)
+			return r.continueClaim(ctx, e)
 		}
 		// §4.3/§4.6: the Job vanished (deleted, TTL-collected, or never
 		// created). The compensation waits out jobGoneWindow measured from
@@ -521,17 +540,80 @@ func (r *Reconciler) reconcileOne(ctx context.Context, e registry.TaskEntry, pod
 // an optimization only: the authoritative check sits at the deletion surface
 // (DiscardTask re-reads the entry under the task lock), so an S8 transition
 // landing right after this read still wins.
-func (r *Reconciler) release(ctx context.Context, taskID string) error {
-	if e, ok := r.reg.Get(taskID); ok && !e.StartedAt.IsZero() {
-		delete(r.releasing, taskID)
+func (r *Reconciler) release(ctx context.Context, e registry.TaskEntry) error {
+	key := entryKey(e)
+	if fresh, ok := r.reg.Get(e.TaskID, e.ScopeKey()); ok && !fresh.StartedAt.IsZero() {
+		delete(r.releasing, key)
 		return nil
 	}
-	if err := r.settler.DiscardTask(ctx, taskID); err != nil {
-		r.releasing[taskID] = true
+	if err := r.discardTask(ctx, e); err != nil {
+		r.releasing[key] = true
 		return err
 	}
-	delete(r.releasing, taskID)
+	delete(r.releasing, key)
 	return nil
+}
+
+// entryKey is the reconciler's per-attempt bookkeeping key. The bare upstream
+// id is not unique across registered servers.
+func entryKey(e registry.TaskEntry) string {
+	return registry.TaskKey(e.SourceID, e.WorkspaceID, e.TaskID)
+}
+
+func (r *Reconciler) scoped() ScopedSettler {
+	scoped, _ := r.settler.(ScopedSettler)
+	return scoped
+}
+
+func (r *Reconciler) continueClaim(ctx context.Context, e registry.TaskEntry) error {
+	if scoped := r.scoped(); scoped != nil && e.ScopeKey() != "" {
+		return scoped.ContinueClaimInScope(ctx, e.TaskID, e.ScopeKey())
+	}
+	return r.settler.ContinueClaim(ctx, e.TaskID)
+}
+
+func (r *Reconciler) settleTerminal(ctx context.Context, e registry.TaskEntry, result string) error {
+	if scoped := r.scoped(); scoped != nil && e.ScopeKey() != "" {
+		return scoped.SettleTerminalInScope(ctx, e.TaskID, result, e.ScopeKey())
+	}
+	return r.settler.SettleTerminal(ctx, e.TaskID, result)
+}
+
+func (r *Reconciler) settleCancelledInScope(ctx context.Context, e registry.TaskEntry) error {
+	if scoped := r.scoped(); scoped != nil && e.ScopeKey() != "" {
+		return scoped.SettleCancelledInScope(ctx, e.TaskID, e.ScopeKey())
+	}
+	return r.settler.SettleCancelled(ctx, e.TaskID)
+}
+
+func (r *Reconciler) adoptRunning(ctx context.Context, e registry.TaskEntry, status string) error {
+	if scoped := r.scoped(); scoped != nil && e.ScopeKey() != "" {
+		return scoped.AdoptRunningInScope(ctx, e.TaskID, status, e.ScopeKey())
+	}
+	return r.settler.AdoptRunning(ctx, e.TaskID, status)
+}
+
+func (r *Reconciler) discardTask(ctx context.Context, e registry.TaskEntry) error {
+	if scoped := r.scoped(); scoped != nil && e.ScopeKey() != "" {
+		return scoped.DiscardTaskInScope(ctx, e.TaskID, e.ScopeKey())
+	}
+	return r.settler.DiscardTask(ctx, e.TaskID)
+}
+
+func (r *Reconciler) taskVanished(ctx context.Context, e registry.TaskEntry) error {
+	if scoped := r.scoped(); scoped != nil && e.ScopeKey() != "" {
+		return scoped.OnTaskVanishedInScope(ctx, e.TaskID, e.ScopeKey())
+	}
+	return r.settler.OnTaskVanished(ctx, e.TaskID)
+}
+
+func (r *Reconciler) taskStatus(ctx context.Context, e registry.TaskEntry) (string, error) {
+	if e.ScopeKey() != "" {
+		if scoped, ok := r.server.(SourceStatusClient); ok {
+			return scoped.TaskStatusInSource(ctx, e.SourceID, e.WorkspaceID, e.TaskID)
+		}
+	}
+	return r.server.TaskStatus(ctx, e.TaskID)
 }
 
 // settleTerminalEntry retries the Job deletion of a terminal entry, bounded
@@ -541,19 +623,19 @@ func (r *Reconciler) release(ctx context.Context, taskID string) error {
 // picks the retries up with. A pending report that has not landed yet is not
 // a deletion round, so it does not consume the budget.
 func (r *Reconciler) settleTerminalEntry(ctx context.Context, e registry.TaskEntry) error {
-	if r.cleanups[e.TaskID] >= cleanupRetryLimit {
+	if r.cleanups[entryKey(e)] >= cleanupRetryLimit {
 		return nil
 	}
-	if err := r.settler.SettleTerminal(ctx, e.TaskID, string(e.Result)); err != nil {
-		r.cleanups[e.TaskID]++
-		if r.cleanups[e.TaskID] >= cleanupRetryLimit {
+	if err := r.settleTerminal(ctx, e, string(e.Result)); err != nil {
+		r.cleanups[entryKey(e)]++
+		if r.cleanups[entryKey(e)] >= cleanupRetryLimit {
 			r.log.ErrorContext(ctx, "task.cleanup_abandoned",
 				"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
-				"attempts", r.cleanups[e.TaskID], "err", err)
+				"attempts", r.cleanups[entryKey(e)], "err", err)
 		}
 		return err
 	}
-	delete(r.cleanups, e.TaskID)
+	delete(r.cleanups, entryKey(e))
 	return nil
 }
 
@@ -636,21 +718,21 @@ func (r *Reconciler) settleEnded(ctx context.Context, e registry.TaskEntry, reas
 // in-flight task is left alone: the lease keeper and the daemon's own
 // reports own it.
 func (r *Reconciler) settleFromServer(ctx context.Context, e registry.TaskEntry) error {
-	st, err := r.server.TaskStatus(ctx, e.TaskID)
+	st, err := r.taskStatus(ctx, e)
 	switch {
 	case errors.Is(err, scheduler.ErrTaskNotFound):
 		// §4.6: the server deleted the task — settle it terminal with an
 		// empty result (the only source of result="") and delete the Job, but
 		// send no report for a task it never knew. The credential stays until
 		// the Job is gone (ADR-017).
-		delete(r.cancels, e.TaskID)
-		return r.settler.OnTaskVanished(ctx, e.TaskID)
+		delete(r.cancels, entryKey(e))
+		return r.taskVanished(ctx, e)
 	case err != nil:
 		// C13 failed (5xx/network): truth unknown, change nothing this
 		// round (错误处理表).
 		return fmt.Errorf("task status %s: %w", e.TaskID, err)
 	}
-	r.reg.SetLastStatusSeen(e.TaskID, st)
+	r.reg.SetLastStatusSeen(e.TaskID, st, e.ScopeKey())
 
 	// The cancel confirmation window is measured over a continuous cancelled
 	// observation (§4.6). Any other answer ends that stretch: keeping its
@@ -658,20 +740,20 @@ func (r *Reconciler) settleFromServer(ctx context.Context, e registry.TaskEntry)
 	// wait goes to zero and spins) and would make the next cancelled
 	// observation settle on the old window instead of starting a fresh one.
 	if st != statusCancelled {
-		delete(r.cancels, e.TaskID)
+		delete(r.cancels, entryKey(e))
 	}
 
 	switch {
 	case st == statusCancelled:
 		return r.settleCancelled(ctx, e)
 	case registry.IsTerminalResult(st):
-		return r.settler.SettleTerminal(ctx, e.TaskID, st)
+		return r.settleTerminal(ctx, e, st)
 	case st == statusRunning:
 		// §4.3: the task is executing — keep the Job, stop lease
 		// renewals and accept the daemon's reports (a rebuilt entry has no
 		// delivery to replay).
-		delete(r.cancels, e.TaskID)
-		return r.settler.AdoptRunning(ctx, e.TaskID, st)
+		delete(r.cancels, entryKey(e))
+		return r.adoptRunning(ctx, e, st)
 	case st == statusQueued || st == statusDispatched:
 		// §4.3 / ADR-026 决策 3/5: the discard row needs the payload to be
 		// unavailable and the start fact to be absent. Payload availability
@@ -685,14 +767,14 @@ func (r *Reconciler) settleFromServer(ctx context.Context, e registry.TaskEntry)
 			return nil
 		}
 		delete(r.cancels, e.TaskID)
-		return r.release(ctx, e.TaskID)
+		return r.release(ctx, e)
 	case st == statusWaitingLocalDirectory:
 		// §4.3: the daemon holds the task, so a rebuilt entry adopts (start
 		// fact recorded, no renewals). An in-flight entry still holds its
 		// payload and is simply waiting for the daemon to start it.
 		if len(e.Payload) == 0 {
-			delete(r.cancels, e.TaskID)
-			return r.settler.AdoptRunning(ctx, e.TaskID, st)
+			delete(r.cancels, entryKey(e))
+			return r.adoptRunning(ctx, e, st)
 		}
 		return nil
 	default:
@@ -711,11 +793,11 @@ func (r *Reconciler) settleFromServer(ctx context.Context, e registry.TaskEntry)
 // without a fail report — the verdict is already server-side — and deletes
 // the Job, leaving the credential to the drain (ADR-017 路径 ④).
 func (r *Reconciler) settleCancelled(ctx context.Context, e registry.TaskEntry) error {
-	first, ok := r.cancels[e.TaskID]
+	first, ok := r.cancels[entryKey(e)]
 	if !ok {
 		// Same monotonic stamp as the recheck window: immune to wall-clock
 		// steps, stretched — never shortened — by a process suspend.
-		r.cancels[e.TaskID] = time.Now()
+		r.cancels[entryKey(e)] = time.Now()
 		r.log.InfoContext(ctx, "task.cancel_seen",
 			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID)
 		return nil
@@ -726,12 +808,12 @@ func (r *Reconciler) settleCancelled(ctx context.Context, e registry.TaskEntry) 
 	r.log.WarnContext(ctx, "task.cancel_ack_timeout",
 		"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 		"cancel_ack_timeout_seconds", r.cancelAckTimeout.Seconds())
-	delete(r.cancels, e.TaskID)
+	delete(r.cancels, entryKey(e))
 	// cancelled is already terminal server-side: no fail report, but the
 	// verdict still starts the drain (ADR-017 路径 ④). The confirmation the
 	// daemon never sent becomes Foreman's and follows once the instance's
 	// pods are gone (§4.6 兜底一).
-	return r.settler.SettleCancelled(ctx, e.TaskID)
+	return r.settleCancelledInScope(ctx, e)
 }
 
 // reportSuspects flags every live task whose daemon has been silent on both
@@ -756,10 +838,10 @@ func (r *Reconciler) reportSuspects(ctx context.Context) {
 			continue
 		}
 		suspects++
-		if r.suspects[e.TaskID] {
+		if r.suspects[entryKey(e)] {
 			continue
 		}
-		r.suspects[e.TaskID] = true
+		r.suspects[entryKey(e)] = true
 		r.log.WarnContext(ctx, "task.heartbeat_suspect",
 			"task_id", e.TaskID, "job_name", e.JobName, "daemon_id", e.DaemonID,
 			"last_heartbeat_age_seconds", age.Seconds())
@@ -784,7 +866,7 @@ func (r *Reconciler) prune() {
 	liveTasks := make(map[string]bool)
 	liveJobs := make(map[string]bool)
 	for _, e := range r.reg.List() {
-		liveTasks[e.TaskID] = true
+		liveTasks[entryKey(e)] = true
 		liveJobs[e.JobName] = true
 	}
 	for name := range r.ended {
@@ -812,9 +894,9 @@ func (r *Reconciler) prune() {
 			delete(r.releasing, id)
 		}
 	}
-	for id := range r.suspects {
-		if !liveTasks[id] {
-			delete(r.suspects, id)
+	for key := range r.suspects {
+		if !liveTasks[key] {
+			delete(r.suspects, key)
 		}
 	}
 }

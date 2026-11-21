@@ -95,33 +95,58 @@ func (l *ClaimLoop) Wake() {
 // §1.5, AC-86).
 func (l *ClaimLoop) Run(ctx context.Context) error {
 	for {
-		if l.leader != nil && !l.leader() {
-			if !sleepOrDone(ctx, leaderPollInterval) {
+		if !l.awaitLeader(ctx) {
+			return nil
+		}
+		// C1 creates the daemon identity upstream, so the preflight runs under
+		// the tenure: losing the lease cancels an in-flight Register, and a
+		// preflight whose tenure ended is never published as a declaration.
+		preflightCtx, stopWatch, leaseLost := watchTenure(ctx, l.leader)
+		err := l.client.Preflight(preflightCtx)
+		lost := leaseLost()
+		stopWatch()
+		if ctx.Err() != nil {
+			return nil
+		}
+		if lost {
+			l.log.Warn("preflight deferred: control-plane lease lost")
+			continue
+		}
+		if err != nil {
+			wait := l.backoff.next()
+			l.log.Error("preflight failed", "err", err, "retry_in", wait)
+			if !sleepOrDone(ctx, wait) {
 				return nil
 			}
 			continue
 		}
-		err := l.client.Preflight(ctx)
+		l.backoff.reset()
+		if l.onRegistered == nil {
+			break
+		}
+		// The declaration belongs to the C1 answer's tenure: check again here,
+		// after the answer and before the shared write.
+		if l.leader != nil && !l.leader() {
+			l.log.Warn("registration declaration deferred: control-plane lease lost")
+			continue
+		}
+		publishCtx, stopPublish, publishLost := watchTenure(ctx, l.leader)
+		err = l.onRegistered(publishCtx, l.client)
+		lost = publishLost()
+		stopPublish()
+		if ctx.Err() != nil {
+			return nil
+		}
+		if lost {
+			l.log.Warn("registration declaration deferred: control-plane lease lost")
+			continue
+		}
 		if err == nil {
 			break
 		}
-		wait := l.backoff.next()
-		l.log.Error("preflight failed", "err", err, "retry_in", wait)
-		if !sleepOrDone(ctx, wait) {
+		l.log.Error("registration declaration not stored", "err", err)
+		if !sleepOrDone(ctx, l.backoff.next()) {
 			return nil
-		}
-	}
-	l.backoff.reset()
-	if l.onRegistered != nil {
-		for {
-			if err := l.onRegistered(ctx, l.client); err == nil {
-				break
-			} else {
-				l.log.Error("registration declaration not stored", "err", err)
-			}
-			if !sleepOrDone(ctx, l.backoff.next()) {
-				return nil
-			}
 		}
 	}
 	for {
@@ -147,6 +172,67 @@ func (l *ClaimLoop) Run(ctx context.Context) error {
 		case <-time.After(l.interval()):
 		}
 	}
+}
+
+// awaitLeader parks while this instance is not the control-plane holder.
+func (l *ClaimLoop) awaitLeader(ctx context.Context) bool {
+	if l.leader == nil {
+		return true
+	}
+	for !l.leader() {
+		if !sleepOrDone(ctx, leaderPollInterval) {
+			return false
+		}
+	}
+	return true
+}
+
+// watchTenure derives a context that is cancelled when this instance loses
+// the control-plane lease and reports whether that happened. A nil gate is
+// the single-instance form, where there is no tenure to watch.
+func watchTenure(ctx context.Context, held func() bool) (context.Context, func(), func() bool) {
+	if held == nil {
+		return ctx, func() {}, func() bool { return false }
+	}
+	bound, cancel := context.WithCancel(ctx)
+	var mu sync.Mutex
+	lost := false
+	markLost := func() {
+		mu.Lock()
+		lost = true
+		mu.Unlock()
+		cancel()
+	}
+	if !held() {
+		markLost()
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		ticker := time.NewTicker(leaderPollInterval)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-bound.Done():
+				return
+			case <-ticker.C:
+				if !held() {
+					markLost()
+					return
+				}
+			}
+		}
+	}()
+	stop := func() {
+		cancel()
+		<-done
+	}
+	tenureLost := func() bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return lost
+	}
+	return bound, stop, tenureLost
 }
 
 // iterate runs one claim round: budget → reserve → C3 → OnClaimReserved per

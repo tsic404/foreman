@@ -110,6 +110,9 @@ func NewCompensator(settler Settler, log *slog.Logger) *Compensator {
 func (c *Compensator) Fail(ctx context.Context, e registry.TaskEntry, reason, detail string) error {
 	if e.IsTerminal() {
 		// Already settled locally: only the K8s objects may still linger.
+		if scoped, ok := c.settler.(ScopedSettler); ok && e.ScopeKey() != "" {
+			return scoped.SettleTerminalInScope(ctx, e.TaskID, string(e.Result), e.ScopeKey())
+		}
 		return c.settler.SettleTerminal(ctx, e.TaskID, string(e.Result))
 	}
 	if err := c.settler.FailJob(ctx, e.JobName, reason, detail); err != nil {

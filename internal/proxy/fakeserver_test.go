@@ -1159,7 +1159,7 @@ func TestNewFakeServerSkillBundlesInvariant(t *testing.T) {
 	t.Run("injected bundles stand in for the client", func(t *testing.T) {
 		bundles := NewSkillCache(Config{}, nil, &fakeMetrics{})
 		handler := NewFakeServer(nil, nil, nil, nil, nil, &fakeMetrics{}, WithSkillBundles(bundles))
-		if got := handler.bundlesFor("ws-1"); got != bundles {
+		if got := handler.bundlesFor("", "ws-1"); got != bundles {
 			t.Fatalf("bundlesFor = %p, want the injected cache %p", got, bundles)
 		}
 	})

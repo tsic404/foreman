@@ -12,6 +12,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/tsic404/foreman/internal/scope"
 )
 
 // ClockSkew is the tolerated clock drift between a Job pod and Foreman.
@@ -24,8 +26,11 @@ const RoleCatalogProbe = "catalog-probe"
 
 // Claims is the verified content of a Job Token.
 type Claims struct {
-	JobName     string
-	TaskID      string
+	JobName string
+	TaskID  string
+	// SourceID is the stable Multica server the Job belongs to. Empty is the
+	// legacy single-source deployment.
+	SourceID    string
 	WorkspaceID string
 	// Role is "" for a task Job and RoleCatalogProbe for a catalog probe; a
 	// probe token carries no TaskID.
@@ -81,6 +86,18 @@ type DoneIndex interface {
 	IsDone(workspaceID, taskID string) bool
 }
 
+// SourceJobLookup is the source-aware form of JobLookup. A deployment serving
+// more than one Multica server implements it so a token's source is part of
+// the entry adjudication (02-contracts V2-C03: Job token 只适用于自身…来源).
+type SourceJobLookup interface {
+	ByDaemonInSourceWorkspace(sourceID, workspaceID, daemonID string) (JobEntry, bool)
+}
+
+// SourceDoneIndex is the source-aware form of DoneIndex.
+type SourceDoneIndex interface {
+	IsDoneInSource(sourceID, workspaceID, taskID string) bool
+}
+
 // ProbeEntry is the subset of a probe session that Verify needs. WorkspaceID
 // is empty for startup / registration-discovery probes, whose registration
 // scope spans every discovery-set workspace (§1.2).
@@ -89,6 +106,7 @@ type ProbeEntry struct {
 	RequestID    string
 	SelfMintedID string
 	TokenHash    string
+	SourceID     string
 	WorkspaceID  string
 }
 
@@ -234,6 +252,11 @@ func NewIssuer(key []byte, jobs JobLookup, done DoneIndex, tokenTTL time.Duratio
 // Issue creates a Job Token bound to jobName/taskID/workspaceID, valid for
 // ttl from now.
 func (i *Issuer) Issue(jobName, taskID, workspaceID string, ttl time.Duration) (string, error) {
+	return i.IssueInSource(jobName, taskID, "", workspaceID, ttl)
+}
+
+// IssueInSource signs a task Job Token carrying the source identity.
+func (i *Issuer) IssueInSource(jobName, taskID, sourceID, workspaceID string, ttl time.Duration) (string, error) {
 	if jobName == "" || taskID == "" || workspaceID == "" {
 		return "", errors.New("auth: job name, task ID and workspace ID are required")
 	}
@@ -243,6 +266,7 @@ func (i *Issuer) Issue(jobName, taskID, workspaceID string, ttl time.Duration) (
 	segment, err := encodePayload(tokenPayload{
 		JobName:     jobName,
 		TaskID:      taskID,
+		SourceID:    sourceID,
 		WorkspaceID: workspaceID,
 		Expiry:      i.now().Add(ttl).Unix(),
 	})
@@ -258,6 +282,12 @@ func (i *Issuer) Issue(jobName, taskID, workspaceID string, ttl time.Duration) (
 // payload; it is only validated here to keep the signature at parity with the
 // scheduler's Start.
 func (i *Issuer) IssueProbe(jobName, requestID, workspaceID string, ttl time.Duration) (string, error) {
+	return i.IssueProbeInSource(jobName, requestID, "", workspaceID, ttl)
+}
+
+// IssueProbeInSource signs a catalog-probe Job Token carrying the source
+// identity.
+func (i *Issuer) IssueProbeInSource(jobName, requestID, sourceID, workspaceID string, ttl time.Duration) (string, error) {
 	if jobName == "" || requestID == "" || workspaceID == "" {
 		return "", errors.New("auth: job name, request ID and workspace ID are required")
 	}
@@ -267,6 +297,7 @@ func (i *Issuer) IssueProbe(jobName, requestID, workspaceID string, ttl time.Dur
 	segment, err := encodePayload(tokenPayload{
 		JobName:     jobName,
 		Role:        RoleCatalogProbe,
+		SourceID:    sourceID,
 		WorkspaceID: workspaceID,
 		Expiry:      i.now().Add(ttl).Unix(),
 	})
@@ -304,6 +335,7 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 	claims := Claims{
 		JobName:     payload.JobName,
 		TaskID:      payload.TaskID,
+		SourceID:    payload.SourceID,
 		WorkspaceID: payload.WorkspaceID,
 		ExpiresAt:   time.Unix(payload.Expiry, 0),
 	}
@@ -342,6 +374,9 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 		if session.WorkspaceID != "" && session.WorkspaceID != payload.WorkspaceID {
 			return Claims{}, fmt.Errorf("%w: workspace %s", ErrScopeMismatch, payload.WorkspaceID)
 		}
+		if session.SourceID != payload.SourceID {
+			return Claims{}, fmt.Errorf("%w: source %s", ErrScopeMismatch, payload.SourceID)
+		}
 		claims.Role = RoleCatalogProbe
 		// The probe has no task face at all: any {tid} on the path is out of
 		// scope, never a resource to adjudicate (§6.3 作用域行). Without
@@ -363,9 +398,9 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 		// Beyond the grace window the cached facts no longer adjudicate.
 		return Claims{}, fmt.Errorf("%w: outage %s", ErrStateUnavailable, i.health.DownFor())
 	}
-	entry, ok := i.jobs.ByDaemonInWorkspace(payload.WorkspaceID, payload.JobName)
+	entry, ok := i.jobEntry(payload)
 	if !ok {
-		if i.done.IsDone(payload.WorkspaceID, payload.TaskID) && req.IsTerminalEndpoint {
+		if i.isDone(payload) && req.IsTerminalEndpoint {
 			// The replay is idempotent only for the token's own task: the
 			// done index proves that task settled, never that the request
 			// addresses it (§2.1 rule 1). Without this check any settled
@@ -394,7 +429,8 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 	// below is the cross-instance face (§6.1 跨实例一致), so a local miss is
 	// never the whole answer.
 	digest := i.Hash(token)
-	if i.revocations.IsRevoked(payload.WorkspaceID, digest) {
+	revocationKey := scope.Key(payload.SourceID, payload.WorkspaceID)
+	if i.revocations.IsRevoked(revocationKey, digest) {
 		return revocationVerdict(entry, payload, req, claims)
 	}
 	if i.revokeStore != nil {
@@ -403,7 +439,7 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 		// The read is bounded; a failed read is fail-closed on the token face
 		// (the entry existence above already passed).
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		revoked, err := i.revokeStore.IsRevoked(ctx, payload.WorkspaceID, digest)
+		revoked, err := i.revokeStore.IsRevoked(ctx, revocationKey, digest)
 		cancel()
 		if err != nil {
 			// The outage face: within the grace window the in-process set is
@@ -415,7 +451,7 @@ func (i *Issuer) Verify(token string, req RequestScope) (Claims, error) {
 			}
 		}
 		if revoked {
-			i.revocations.Revoke(payload.WorkspaceID, digest, claims.ExpiresAt.Add(ClockSkew))
+			i.revocations.Revoke(revocationKey, digest, claims.ExpiresAt.Add(ClockSkew))
 			return revocationVerdict(entry, payload, req, claims)
 		}
 	}
@@ -454,7 +490,14 @@ func (i *Issuer) Hash(token string) string {
 // never expires an entry early (conservative direction — the digest may
 // outlive the token, never the reverse).
 func (i *Issuer) Revoke(tokenHash, workspaceID string) {
-	i.revocations.Revoke(workspaceID, tokenHash, i.now().Add(i.tokenTTL+ClockSkew))
+	i.RevokeInSource(tokenHash, "", workspaceID)
+}
+
+// RevokeInSource records a revoked token digest under the source and workspace
+// partition it belongs to.
+func (i *Issuer) RevokeInSource(tokenHash, sourceID, workspaceID string) {
+	key := scope.Key(sourceID, workspaceID)
+	i.revocations.Revoke(key, tokenHash, i.now().Add(i.tokenTTL+ClockSkew))
 	if i.revokeStore != nil {
 		// The shared face is the cross-restart authority. A failure leaves
 		// the in-process set holding the digest, so the same-instance face
@@ -462,11 +505,37 @@ func (i *Issuer) Revoke(tokenHash, workspaceID string) {
 		// consistency tolerates, and the reclaim must not fail on it.
 		ctx, cancel := context.WithTimeout(context.Background(), revocationCheckTimeout)
 		defer cancel()
-		if err := i.revokeStore.Revoke(ctx, workspaceID, tokenHash,
+		if err := i.revokeStore.Revoke(ctx, key, tokenHash,
 			i.now().Add(i.tokenTTL+ClockSkew)); err != nil && i.revokeErr != nil {
 			i.revokeErr("revoke", err)
 		}
 	}
+}
+
+// jobEntry adjudicates a token's Job. A token carrying a source is resolved
+// through the source-aware lookup only: falling back to the workspace-only
+// lookup would let the same workspace id on another server answer for it.
+func (i *Issuer) jobEntry(payload tokenPayload) (JobEntry, bool) {
+	if payload.SourceID == "" {
+		return i.jobs.ByDaemonInWorkspace(payload.WorkspaceID, payload.JobName)
+	}
+	lookup, ok := i.jobs.(SourceJobLookup)
+	if !ok {
+		return JobEntry{}, false
+	}
+	return lookup.ByDaemonInSourceWorkspace(payload.SourceID, payload.WorkspaceID, payload.JobName)
+}
+
+// isDone answers the late-replay index under the token's own partition.
+func (i *Issuer) isDone(payload tokenPayload) bool {
+	if payload.SourceID == "" {
+		return i.done.IsDone(payload.WorkspaceID, payload.TaskID)
+	}
+	index, ok := i.done.(SourceDoneIndex)
+	if !ok {
+		return false
+	}
+	return index.IsDoneInSource(payload.SourceID, payload.WorkspaceID, payload.TaskID)
 }
 
 // revocationVerdict is the revoked-token face (§6.4, AC-74). A terminal

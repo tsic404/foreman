@@ -5,7 +5,6 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
-	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -13,6 +12,7 @@ import (
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/scope"
 )
 
 // Log tail bounds for /foreman/tasks/{id}/logs (§9.3).
@@ -24,18 +24,19 @@ const (
 // TaskIndex is the registry read view the ops endpoints need; satisfied by
 // *registry.Registry.
 type TaskIndex interface {
-	// GetInWorkspace returns one live row; the workspace dimension is part of
-	// the projection's partition (§4.1). A shared-state index reads the row
+	// GetInScope returns one live row under the caller's exact
+	// source/workspace partition (§4.1). A shared-state index reads the row
 	// from the adjudication face, so every instance answers the same (§9.3
-	// 多实例口径).
-	GetInWorkspace(workspaceID, taskID string) (registry.TaskEntry, bool)
-	// SettledInWorkspace returns the retained terminal record of an
+	// 多实例口径). It never evicts the local row on a miss: the ops surface is
+	// read-only.
+	GetInScope(scopeKey, taskID string) (registry.TaskEntry, bool)
+	// SettledInScope returns the retained terminal record of an
 	// already-reclaimed task (§4.3, ADR-032): the single-task endpoint answers
 	// with it inside the retention window.
-	SettledInWorkspace(workspaceID, taskID string) (registry.TaskEntry, bool)
-	// ListInWorkspace lists the workspace's live rows ("" = every row, the
+	SettledInScope(scopeKey, taskID string) (registry.TaskEntry, bool)
+	// ListInScope lists one partition's live rows ("" = every row, the
 	// legacy single-workspace shape).
-	ListInWorkspace(workspaceID string) []registry.TaskEntry
+	ListInScope(scopeKey string) []registry.TaskEntry
 }
 
 // OpsConfig carries the values the ops endpoints report. RegisterSource
@@ -59,8 +60,13 @@ type OpsConfig struct {
 	// workspace dimension; a single workspace is its default. Empty keeps
 	// the pre-ADR-047 single-workspace shape.
 	WorkspaceIDs []string
-	StartedAt    time.Time
-	Logger       *slog.Logger
+	// Scopes is the deployment's served source/workspace set. A deployment
+	// that serves two registered servers can expose the same workspace id
+	// twice, so the ops read face needs the full pair. When empty, the
+	// WorkspaceIDs form is the served set (the single-source shape).
+	Scopes    []Scope
+	StartedAt time.Time
+	Logger    *slog.Logger
 }
 
 // OpsHandler is the ops surface's route table. It is the read side of the
@@ -83,7 +89,10 @@ type OpsHandler struct {
 	// workspaceIDs is the deployment's served set (§0, ADR-047); the
 	// credential's grant is resolved against it.
 	workspaceIDs []string
-	registered   []string
+	// scopes is the served source/workspace set. A workspace-only entry is
+	// the legacy single-source shape.
+	scopes     []Scope
+	registered []string
 }
 
 // ServeHTTP authenticates the request and dispatches to the mounted routes.
@@ -114,6 +123,7 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 	handler := &OpsHandler{
 		auth:         newOpsAuth(cfg.Credentials),
 		workspaceIDs: append([]string(nil), cfg.WorkspaceIDs...),
+		scopes:       append([]Scope(nil), cfg.Scopes...),
 	}
 	mux := http.NewServeMux()
 	// register is the single mount point: the pattern is recorded by the same
@@ -164,7 +174,7 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 			writeError(w, scope.status, scope.message)
 			return
 		}
-		entries := index.ListInWorkspace(scope.workspaceID)
+		entries := index.ListInScope(scope.scopeKey)
 		if entries == nil {
 			entries = []registry.TaskEntry{}
 		}
@@ -176,22 +186,22 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 			writeError(w, scope.status, scope.message)
 			return
 		}
-		workspaceID := scope.workspaceID
 		taskID := r.PathValue("taskID")
-		e, ok := index.GetInWorkspace(workspaceID, taskID)
+		e, ok := index.GetInScope(scope.scopeKey, taskID)
 		if !ok {
 			// A reclaimed task keeps answering with its terminal record until
 			// the retention window expires (§9.3, ADR-032):
 			// the convergence instant is no longer the end of the evidence
 			// window. Beyond it, a reclaimed task and one that never existed
 			// are again indistinguishable.
-			e, ok = index.SettledInWorkspace(workspaceID, taskID)
+			e, ok = index.SettledInScope(scope.scopeKey, taskID)
 		}
 		if !ok {
 			writeError(w, http.StatusNotFound, "task not found")
 			return
 		}
-		if workspaceID != "" && e.WorkspaceID != workspaceID {
+		if scope.scopeKey != "" && (e.WorkspaceID != scope.workspaceID ||
+			(scope.sourceID != "" && e.SourceID != scope.sourceID)) {
 			// A cross-workspace task id is indistinguishable from one that
 			// never existed (§4.1: 跨 workspace 一律 404).
 			writeError(w, http.StatusNotFound, "task not found")
@@ -205,11 +215,11 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 			writeError(w, scope.status, scope.message)
 			return
 		}
-		if !workspaceVisible(index, r.PathValue("taskID"), scope.workspaceID) {
+		if !workspaceVisible(index, r.PathValue("taskID"), scope) {
 			writeError(w, http.StatusNotFound, "task not found")
 			return
 		}
-		serveJobLogs(w, r, index, scope.workspaceID, logs, log)
+		serveJobLogs(w, r, index, scope, logs, log)
 	})
 	registerFn("GET /foreman/tasks/{taskID}/payload-preview", func(w http.ResponseWriter, r *http.Request) {
 		scope := handler.scope(r)
@@ -217,9 +227,8 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 			writeError(w, scope.status, scope.message)
 			return
 		}
-		workspaceID := scope.workspaceID
-		e, ok := index.GetInWorkspace(workspaceID, r.PathValue("taskID"))
-		if ok && !workspaceVisible(index, e.TaskID, workspaceID) {
+		e, ok := index.GetInScope(scope.scopeKey, r.PathValue("taskID"))
+		if ok && !workspaceVisible(index, e.TaskID, scope) {
 			ok = false
 		}
 		if !ok {
@@ -264,8 +273,8 @@ func NewOpsHandler(metrics *Metrics, index TaskIndex, logs PodLogReader, cfg Ops
 }
 
 // serveJobLogs proxies the newest pod's log tail for the task's Job.
-func serveJobLogs(w http.ResponseWriter, r *http.Request, index TaskIndex, workspaceID string, logs PodLogReader, log *slog.Logger) {
-	e, ok := index.GetInWorkspace(workspaceID, r.PathValue("taskID"))
+func serveJobLogs(w http.ResponseWriter, r *http.Request, index TaskIndex, s opsScope, logs PodLogReader, log *slog.Logger) {
+	e, ok := index.GetInScope(s.scopeKey, r.PathValue("taskID"))
 	if !ok {
 		writeError(w, http.StatusNotFound, "task not found")
 		return
@@ -315,72 +324,167 @@ func parseTail(raw string) (int64, error) {
 	return n, nil
 }
 
-// opsScope is the workspace dimension an ops request resolves to: either the
-// id, or the refusal the handler answers with (status 0 = resolved).
+// opsScope is the source/workspace dimension an ops request resolves to:
+// either the pair, or the refusal the handler answers with (status 0 =
+// resolved). scopeKey is the registry partition key.
 type opsScope struct {
+	sourceID    string
 	workspaceID string
+	scopeKey    string
 	status      int
 	message     string
 }
 
-// scope resolves the request's workspace dimension from the caller's
-// credential, never from the query alone (§2.2 S-25). A request naming a
-// workspace outside the grant is answered like a workspace that does not
-// exist, so the query parameter cannot widen the partition.
-func (h *OpsHandler) scope(r *http.Request) opsScope {
-	visible := h.visibleWorkspaces(r)
-	if requested := strings.TrimSpace(r.URL.Query().Get("workspace")); requested != "" {
-		if visible != nil && !slices.Contains(visible, requested) {
-			return opsScope{status: http.StatusNotFound, message: "workspace not found"}
-		}
-		return opsScope{workspaceID: requested}
-	}
-	if len(visible) == 1 {
-		return opsScope{workspaceID: visible[0]}
-	}
-	if visible == nil {
-		// The pre-ADR-047 single-workspace shape: the deployment has no
-		// workspace dimension to choose from.
-		return opsScope{}
-	}
-	return opsScope{status: http.StatusBadRequest, message: "workspace is required"}
-}
-
-// visibleWorkspaces is the credential's grant intersected with the deployment's
-// served set. A nil result is the pre-ADR-047 shape (no configured dimension);
-// an empty one grants nothing — the fail-closed answer for an identity the
-// middleware could not resolve.
-func (h *OpsHandler) visibleWorkspaces(r *http.Request) []string {
-	identity, ok := opsIdentityFrom(r.Context())
-	if !ok {
-		return []string{}
-	}
-	if identity.workspaces == nil {
-		return h.workspaceIDs
+// servedScopes is the deployment's served source/workspace set. A deployment
+// configured only with workspace ids keeps the pre-ADR-047 single-source
+// shape; an empty result is that legacy "no dimension" form.
+func (h *OpsHandler) servedScopes() []Scope {
+	if len(h.scopes) > 0 {
+		return h.scopes
 	}
 	if len(h.workspaceIDs) == 0 {
-		return identity.workspaces
+		return nil
 	}
-	visible := make([]string, 0, len(identity.workspaces))
+	out := make([]Scope, 0, len(h.workspaceIDs))
 	for _, workspaceID := range h.workspaceIDs {
-		if slices.Contains(identity.workspaces, workspaceID) {
-			visible = append(visible, workspaceID)
-		}
+		out = append(out, Scope{WorkspaceID: workspaceID})
 	}
-	return visible
+	return out
 }
 
-// cropToGrant keeps only the workspaces the caller's credential may read. A
-// deployment-wide credential keeps the view untouched.
+// visibleScopes is the credential's grant intersected with the deployment's
+// served set. A nil result is the pre-ADR-047 shape (no configured
+// dimension); an empty one grants nothing — the fail-closed answer for an
+// identity the middleware could not resolve.
+func (h *OpsHandler) visibleScopes(r *http.Request) []Scope {
+	served := h.servedScopes()
+	identity, ok := opsIdentityFrom(r.Context())
+	if !ok {
+		return []Scope{}
+	}
+	if identity.scopes == nil && identity.workspaces == nil {
+		return served
+	}
+	if served == nil {
+		return uniqueScopes(identity.scopes)
+	}
+	out := make([]Scope, 0, len(served))
+	for _, grant := range identity.scopes {
+		if grant.ServerID == "" {
+			// The unqualified grant was written for the deployment's one
+			// workspace. It survives only while exactly one served source
+			// holds that id: a second source with the same id makes the old
+			// grant ambiguous, and expanding it to both would silently widen
+			// the credential. The request's `source` query cannot repair that
+			// — it selects what to read, it never grants what to see.
+			matches := make([]Scope, 0, 1)
+			for _, candidate := range served {
+				if candidate.WorkspaceID == grant.WorkspaceID {
+					matches = append(matches, candidate)
+				}
+			}
+			if len(matches) == 1 {
+				out = append(out, matches[0])
+			}
+			continue
+		}
+		for _, candidate := range served {
+			if grant.ServerID == candidate.ServerID && grant.WorkspaceID == candidate.WorkspaceID {
+				out = append(out, candidate)
+			}
+		}
+	}
+	return uniqueScopes(out)
+}
+
+func uniqueScopes(scopes []Scope) []Scope {
+	seen := make(map[string]bool, len(scopes))
+	out := make([]Scope, 0, len(scopes))
+	for _, s := range scopes {
+		key := s.ServerID + "\x00" + s.WorkspaceID
+		if seen[key] {
+			continue
+		}
+		seen[key] = true
+		out = append(out, s)
+	}
+	return out
+}
+
+func opsScopeOf(s Scope) opsScope {
+	return opsScope{
+		sourceID:    s.ServerID,
+		workspaceID: s.WorkspaceID,
+		scopeKey:    scope.Key(s.ServerID, s.WorkspaceID),
+	}
+}
+
+// scope resolves the request's source/workspace dimension from the caller's
+// credential, never from the query alone (§2.2 S-25). A pair outside the
+// grant is answered like one that does not exist, so the query cannot widen
+// the partition. A bare workspace id that two served sources both expose is
+// ambiguous: the request must name the source (400), never one silently
+// picked.
+func (h *OpsHandler) scope(r *http.Request) opsScope {
+	visible := h.visibleScopes(r)
+	if visible == nil {
+		// The pre-ADR-047 single-workspace shape: the deployment has no
+		// source/workspace dimension to choose from.
+		return opsScope{}
+	}
+	query := r.URL.Query()
+	requestedSource := strings.TrimSpace(query.Get("source"))
+	requestedWorkspace := strings.TrimSpace(query.Get("workspace"))
+	if requestedSource == "" && requestedWorkspace == "" {
+		switch len(visible) {
+		case 1:
+			return opsScopeOf(visible[0])
+		case 0:
+			return opsScope{status: http.StatusNotFound, message: "workspace not found"}
+		default:
+			return opsScope{status: http.StatusBadRequest, message: "source and workspace are required"}
+		}
+	}
+	if requestedWorkspace == "" {
+		return opsScope{status: http.StatusBadRequest, message: "workspace is required"}
+	}
+	matches := make([]Scope, 0, 1)
+	for _, candidate := range visible {
+		if candidate.WorkspaceID != requestedWorkspace {
+			continue
+		}
+		if requestedSource != "" && candidate.ServerID != requestedSource {
+			continue
+		}
+		matches = append(matches, candidate)
+	}
+	switch len(matches) {
+	case 0:
+		return opsScope{status: http.StatusNotFound, message: "workspace not found"}
+	case 1:
+		return opsScopeOf(matches[0])
+	default:
+		return opsScope{status: http.StatusBadRequest, message: "source is required"}
+	}
+}
+
+// cropToGrant keeps only the source/workspace keys the caller's credential
+// may read. The view's keys are sourceViewKey's form: "server/workspace" when
+// the source is set, the bare workspace otherwise. A deployment-wide
+// credential keeps the view untouched.
 func (h *OpsHandler) cropToGrant(r *http.Request, view map[string]any) map[string]any {
-	visible := h.visibleWorkspaces(r)
+	visible := h.visibleScopes(r)
 	if visible == nil {
 		return view
 	}
 	cropped := make(map[string]any, len(visible))
-	for _, workspaceID := range visible {
-		if entry, ok := view[workspaceID]; ok {
-			cropped[workspaceID] = entry
+	for _, candidate := range visible {
+		key := candidate.WorkspaceID
+		if candidate.ServerID != "" {
+			key = candidate.ServerID + "/" + candidate.WorkspaceID
+		}
+		if entry, ok := view[key]; ok {
+			cropped[key] = entry
 		}
 	}
 	return cropped
@@ -417,18 +521,18 @@ func serveHealthz(w http.ResponseWriter, health *Health, startedAt time.Time) {
 	writeJSON(w, status, body)
 }
 
-// workspaceVisible applies the projection's workspace partition to the
-// task-addressed ops routes: an entry of another workspace is invisible (404),
+// workspaceVisible applies the projection's source/workspace partition to the
+// task-addressed ops routes: an entry of another partition is invisible (404),
 // exactly like a task that never existed.
-func workspaceVisible(index TaskIndex, taskID, workspaceID string) bool {
-	if workspaceID == "" {
+func workspaceVisible(index TaskIndex, taskID string, s opsScope) bool {
+	if s.scopeKey == "" {
 		return true
 	}
-	e, ok := index.GetInWorkspace(workspaceID, taskID)
+	e, ok := index.GetInScope(s.scopeKey, taskID)
 	if !ok {
-		e, ok = index.SettledInWorkspace(workspaceID, taskID)
+		e, ok = index.SettledInScope(s.scopeKey, taskID)
 	}
-	return ok && e.WorkspaceID == workspaceID
+	return ok && e.WorkspaceID == s.workspaceID && (s.sourceID == "" || e.SourceID == s.sourceID)
 }
 
 func writeJSON(w http.ResponseWriter, status int, v any) {

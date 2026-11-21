@@ -36,14 +36,25 @@ func callerCtx(ctx context.Context) context.Context {
 	return ctx
 }
 
-// lockTaskFor takes the write lock of a task this process already knows; the
-// workspace comes from the local row.
+// lockTaskFor takes the write lock of a task this process already knows. A
+// caller that resolved the row's partition passes it explicitly; otherwise the
+// local row supplies it. An ambiguous bare id (the same task on two sources)
+// locks the bare key: the local mutex still serializes this process, and the
+// caller's registry reads stay scoped.
 func (s *Scheduler) lockTaskFor(ctx context.Context, taskID string) (func(), error) {
-	ws := ""
+	return s.lockTaskForScope(ctx, taskID, "")
+}
+
+// lockTaskForScope is lockTaskFor for a caller that knows the entry's
+// source/workspace partition.
+func (s *Scheduler) lockTaskForScope(ctx context.Context, taskID, scopeKey string) (func(), error) {
+	key := scopeKey
 	if e, ok := s.reg.Get(taskID); ok {
-		ws = e.WorkspaceID
+		if key == "" {
+			key = e.ScopeKey()
+		}
 	}
-	return s.lockTaskIn(ctx, ws, taskID)
+	return s.lockTaskIn(ctx, key, taskID)
 }
 
 // lockOwner names one acquisition. The instance id alone is process-wide, so a
@@ -321,10 +332,17 @@ type Delivery struct {
 // confirmation window/lease and re-delivery live in the shared row. Without a
 // shared store the stage-one in-memory gate applies.
 func (s *Scheduler) Deliver(ctx context.Context, workspaceID, daemonID, runtimeID string, maxTasks int) (Delivery, error) {
+	return s.DeliverInSource(ctx, "", workspaceID, daemonID, runtimeID, maxTasks)
+}
+
+// DeliverInSource is the source-aware delivery pickup. The token's source is
+// part of the entry identity, so the same workspace id on two servers never
+// resolves the same daemon (§02-contracts V2-C03/C06).
+func (s *Scheduler) DeliverInSource(ctx context.Context, sourceID, workspaceID, daemonID, runtimeID string, maxTasks int) (Delivery, error) {
 	if maxTasks < 1 {
 		return Delivery{}, nil
 	}
-	e, ok := s.reg.ByDaemonInWorkspace(workspaceID, daemonID)
+	e, ok := s.reg.ByDaemonInSourceWorkspace(sourceID, workspaceID, daemonID)
 	if !ok {
 		return Delivery{}, fmt.Errorf("%w: %s", ErrUnknownDaemon, daemonID)
 	}
@@ -366,7 +384,7 @@ func (s *Scheduler) Deliver(ctx context.Context, workspaceID, daemonID, runtimeI
 // authority on this instance's copy.
 func (s *Scheduler) deliverShared(ctx context.Context, e registry.TaskEntry) (Delivery, error) {
 	callCtx := callerCtx(ctx)
-	pickup, err := s.shared.PickupDelivery(callCtx, e.WorkspaceID, e.TaskID, s.cfg.DeliveryConfirmTimeout)
+	pickup, err := s.shared.PickupDelivery(callCtx, e.ScopeKey(), e.TaskID, s.cfg.DeliveryConfirmTimeout)
 	if err != nil {
 		return Delivery{}, fmt.Errorf("%w: delivery pickup: %v", ErrStoreUnavailable, err)
 	}
@@ -440,7 +458,7 @@ func (s *Scheduler) enqueueShared(ctx context.Context, e registry.TaskEntry) err
 		return nil
 	}
 	callCtx := callerCtx(ctx)
-	created, err := s.shared.EnqueueEntry(callCtx, e.WorkspaceID, e.TaskID, e)
+	created, err := s.shared.EnqueueEntry(callCtx, e.ScopeKey(), e.TaskID, e)
 	if err != nil {
 		s.metrics.StateError("enqueue")
 		return fmt.Errorf("%w: enqueue: %v", ErrStoreUnavailable, err)
@@ -726,12 +744,17 @@ func (s *Scheduler) AttachShared(ctx context.Context) error {
 // would leave an object no row manages and the recorded name missing
 // (AC-75 至多一个活跃 Job).
 func (s *Scheduler) ContinueClaim(ctx context.Context, taskID string) error {
-	unlock, err := s.lockTaskFor(ctx, taskID)
+	return s.ContinueClaimInScope(ctx, taskID, "")
+}
+
+// ContinueClaimInScope is ContinueClaim under an explicit partition.
+func (s *Scheduler) ContinueClaimInScope(ctx context.Context, taskID, scopeKey string) error {
+	unlock, err := s.lockTaskForScope(ctx, taskID, scopeKey)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	e, ok := s.reg.Get(taskID)
+	e, ok := s.reg.Get(taskID, scopeKey)
 	if !ok || e.IsTerminal() || e.IsDraining() || !e.StartedAt.IsZero() || !e.DeliveredAt.IsZero() || len(e.Payload) == 0 {
 		return nil
 	}
@@ -748,7 +771,7 @@ func (s *Scheduler) ContinueClaim(ctx context.Context, taskID string) error {
 	}
 	if job != nil {
 		// The object exists: the claim's crash landed before the transition.
-		if _, ok := s.reg.MarkJobCreated(taskID, job.CreationTimestamp.Time); !ok {
+		if _, ok := s.reg.MarkJobCreated(taskID, job.CreationTimestamp.Time, e.ScopeKey()); !ok {
 			s.log.WarnContext(ctx, "task.claim_continue_skipped", "task_id", taskID, "reason", "entry changed")
 		}
 		return nil

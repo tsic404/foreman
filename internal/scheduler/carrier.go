@@ -42,9 +42,11 @@ const (
 // Carrier data keys. The body is stored as the exact bytes that were
 // forwarded, so a replay is byte-identical to the enqueue (§4.4 定论体).
 const (
+	carrierKeyKey         = "key"
 	carrierKeyTaskID      = "task_id"
 	carrierKeyJobName     = "job_name"
 	carrierKeyDaemonID    = "daemon_id"
+	carrierKeySourceID    = "source_id"
 	carrierKeyWorkspaceID = "workspace_id"
 	carrierKeyEndpoint    = "endpoint"
 	carrierKeyBody        = "body"
@@ -82,10 +84,18 @@ func carrierTaskIDValid(taskID string) bool {
 
 // Carrier is one pending report's durable form (ADR-046 decision 1).
 type Carrier struct {
-	Name     string
+	Name string
+	// Key is the queue slot this report occupies. The upstream task id alone
+	// is not unique across registered servers, so a source-scoped report
+	// carries a source-qualified key while TaskID stays the id to replay. An
+	// empty Key is the historical bare task-id slot.
+	Key      string
 	TaskID   string
 	JobName  string
 	DaemonID string
+	// SourceID is the Multica server the report came from. It rides the
+	// carrier so a rebuilt queue can route a replay to the same source.
+	SourceID string
 	// WorkspaceID is the credential the replay uses when the entry is gone
 	// (§10, ADR-047). It rides both the object's data and its label so the
 	// queue rebuild and the per-workspace sweep read the same dimension.
@@ -129,16 +139,18 @@ type secretCarrierStore struct {
 // carrierSecretName derives the object name from the task id. Hashing keeps
 // it DNS-1123 safe and unique; the task-id label, not this name, is the
 // locator (§6.5).
-func carrierSecretName(taskID string) string {
-	sum := sha256.Sum256([]byte(taskID))
+func carrierSecretName(key string) string {
+	sum := sha256.Sum256([]byte(key))
 	return carrierSecretPrefix + hex.EncodeToString(sum[:20])
 }
 
 func (c Carrier) data() map[string][]byte {
 	return map[string][]byte{
+		carrierKeyKey:           []byte(c.Key),
 		carrierKeyTaskID:        []byte(c.TaskID),
 		carrierKeyJobName:       []byte(c.JobName),
 		carrierKeyDaemonID:      []byte(c.DaemonID),
+		carrierKeySourceID:      []byte(c.SourceID),
 		carrierKeyWorkspaceID:   []byte(c.WorkspaceID),
 		carrierKeyEndpoint:      []byte(c.Endpoint),
 		carrierKeyBody:          c.Body,
@@ -167,11 +179,18 @@ func (s *secretCarrierStore) PutCarrier(ctx context.Context, c Carrier) error {
 	if c.sizeBytes() > MaxCarrierBytes {
 		return fmt.Errorf("%w: %d bytes > %d", ErrCarrierPayloadTooLarge, c.sizeBytes(), MaxCarrierBytes)
 	}
-	name := carrierSecretName(c.TaskID)
+	key := c.Key
+	if key == "" {
+		key = c.TaskID
+	}
+	name := carrierSecretName(key)
 	labels := map[string]string{
 		registry.LabelManagedBy: registry.ManagedByForeman,
 		registry.LabelRole:      registry.RolePendingReport,
 		registry.LabelTaskID:    c.TaskID,
+	}
+	if c.SourceID != "" {
+		labels[registry.LabelSourceID] = c.SourceID
 	}
 	if c.WorkspaceID != "" {
 		labels[registry.LabelWorkspaceID] = c.WorkspaceID
@@ -234,14 +253,19 @@ func (s *secretCarrierStore) ListCarriers(ctx context.Context) ([]Carrier, error
 		}
 		c := Carrier{
 			Name:          secrets[i].Name,
+			Key:           string(data[carrierKeyKey]),
 			TaskID:        taskID,
 			JobName:       string(data[carrierKeyJobName]),
 			DaemonID:      string(data[carrierKeyDaemonID]),
+			SourceID:      string(data[carrierKeySourceID]),
 			WorkspaceID:   workspaceID,
 			Endpoint:      string(data[carrierKeyEndpoint]),
 			Body:          data[carrierKeyBody],
 			FailureReason: string(data[carrierKeyFailureReason]),
 			Synthetic:     string(data[carrierKeySynthetic]) == "true",
+		}
+		if c.Key == "" {
+			c.Key = c.TaskID
 		}
 		if raw := string(data[carrierKeyEnqueuedAt]); raw != "" {
 			if at, perr := time.Parse(time.RFC3339Nano, raw); perr == nil {
