@@ -32,6 +32,7 @@ type tokenPayload struct {
 	JobName     string `json:"j"`
 	TaskID      string `json:"t,omitempty"`
 	Role        string `json:"r,omitempty"`
+	SourceID    string `json:"s,omitempty"`
 	WorkspaceID string `json:"w"`
 	Expiry      int64  `json:"e"`
 }

@@ -11,6 +11,7 @@ import (
 
 	"github.com/tsic404/foreman/internal/registry"
 	"github.com/tsic404/foreman/internal/state"
+	"github.com/tsic404/foreman/internal/tenure"
 )
 
 // ErrNoSlot reports a claim refused because the shared two-level counters had
@@ -36,14 +37,25 @@ func callerCtx(ctx context.Context) context.Context {
 	return ctx
 }
 
-// lockTaskFor takes the write lock of a task this process already knows; the
-// workspace comes from the local row.
+// lockTaskFor takes the write lock of a task this process already knows. A
+// caller that resolved the row's partition passes it explicitly; otherwise the
+// local row supplies it. An ambiguous bare id (the same task on two sources)
+// locks the bare key: the local mutex still serializes this process, and the
+// caller's registry reads stay scoped.
 func (s *Scheduler) lockTaskFor(ctx context.Context, taskID string) (func(), error) {
-	ws := ""
+	return s.lockTaskForScope(ctx, taskID, "")
+}
+
+// lockTaskForScope is lockTaskFor for a caller that knows the entry's
+// source/workspace partition.
+func (s *Scheduler) lockTaskForScope(ctx context.Context, taskID, scopeKey string) (func(), error) {
+	key := scopeKey
 	if e, ok := s.reg.Get(taskID); ok {
-		ws = e.WorkspaceID
+		if key == "" {
+			key = e.ScopeKey()
+		}
 	}
-	return s.lockTaskIn(ctx, ws, taskID)
+	return s.lockTaskIn(ctx, key, taskID)
 }
 
 // lockOwner names one acquisition. The instance id alone is process-wide, so a
@@ -321,10 +333,17 @@ type Delivery struct {
 // confirmation window/lease and re-delivery live in the shared row. Without a
 // shared store the stage-one in-memory gate applies.
 func (s *Scheduler) Deliver(ctx context.Context, workspaceID, daemonID, runtimeID string, maxTasks int) (Delivery, error) {
+	return s.DeliverInSource(ctx, "", workspaceID, daemonID, runtimeID, maxTasks)
+}
+
+// DeliverInSource is the source-aware delivery pickup. The token's source is
+// part of the entry identity, so the same workspace id on two servers never
+// resolves the same daemon (§02-contracts V2-C03/C06).
+func (s *Scheduler) DeliverInSource(ctx context.Context, sourceID, workspaceID, daemonID, runtimeID string, maxTasks int) (Delivery, error) {
 	if maxTasks < 1 {
 		return Delivery{}, nil
 	}
-	e, ok := s.reg.ByDaemonInWorkspace(workspaceID, daemonID)
+	e, ok := s.reg.ByDaemonInSourceWorkspace(sourceID, workspaceID, daemonID)
 	if !ok {
 		return Delivery{}, fmt.Errorf("%w: %s", ErrUnknownDaemon, daemonID)
 	}
@@ -366,7 +385,7 @@ func (s *Scheduler) Deliver(ctx context.Context, workspaceID, daemonID, runtimeI
 // authority on this instance's copy.
 func (s *Scheduler) deliverShared(ctx context.Context, e registry.TaskEntry) (Delivery, error) {
 	callCtx := callerCtx(ctx)
-	pickup, err := s.shared.PickupDelivery(callCtx, e.WorkspaceID, e.TaskID, s.cfg.DeliveryConfirmTimeout)
+	pickup, err := s.shared.PickupDelivery(callCtx, e.ScopeKey(), e.TaskID, s.cfg.DeliveryConfirmTimeout)
 	if err != nil {
 		return Delivery{}, fmt.Errorf("%w: delivery pickup: %v", ErrStoreUnavailable, err)
 	}
@@ -440,7 +459,7 @@ func (s *Scheduler) enqueueShared(ctx context.Context, e registry.TaskEntry) err
 		return nil
 	}
 	callCtx := callerCtx(ctx)
-	created, err := s.shared.EnqueueEntry(callCtx, e.WorkspaceID, e.TaskID, e)
+	created, err := s.shared.EnqueueEntry(callCtx, e.ScopeKey(), e.TaskID, e)
 	if err != nil {
 		s.metrics.StateError("enqueue")
 		return fmt.Errorf("%w: enqueue: %v", ErrStoreUnavailable, err)
@@ -552,8 +571,20 @@ func (s *Scheduler) syncQueueDepth(ctx context.Context) {
 // loss (AC-76). An empty workspace id is not a level — such a row counts in
 // the global total only, never as a workspace key that could overwrite it.
 func (s *Scheduler) reconcileSlots(ctx context.Context, exact bool) error {
+	return s.reconcileSlotsGated(ctx, exact, nil)
+}
+
+// reconcileSlotsGated is reconcileSlots under an explicit tenure: the startup
+// path passes the control-plane gate, while the takeover path passes nil
+// because its leader loop already renews the lease around the call.
+func (s *Scheduler) reconcileSlotsGated(ctx context.Context, exact bool, gate tenure.Gate) error {
 	if s.shared == nil {
 		return nil
+	}
+	// Effect boundary: the reset rewrites the shared counters and drops the
+	// previous holder's reservations, so it must not run for a lost tenure.
+	if err := tenure.Check(gate); err != nil {
+		return err
 	}
 	callCtx := callerCtx(ctx)
 
@@ -564,7 +595,7 @@ func (s *Scheduler) reconcileSlots(ctx context.Context, exact bool) error {
 		}
 	}
 	if exact {
-		return s.resetSlots(callCtx, levels)
+		return s.resetSlotsGated(callCtx, levels, gate)
 	}
 	return s.repairSlots(callCtx, levels)
 }
@@ -572,12 +603,21 @@ func (s *Scheduler) reconcileSlots(ctx context.Context, exact bool) error {
 // resetSlots is the exact write: every level's counter becomes its live-row
 // count and that level's pending markers go away in the same store step.
 func (s *Scheduler) resetSlots(ctx context.Context, levels []string) error {
+	return s.resetSlotsGated(ctx, levels, nil)
+}
+
+func (s *Scheduler) resetSlotsGated(ctx context.Context, levels []string, gate tenure.Gate) error {
 	total, perWS, err := s.sharedRows(ctx)
 	if err != nil {
 		s.metrics.StateError("read_slots")
 		return fmt.Errorf("%w: list rows: %v", ErrStoreUnavailable, err)
 	}
 	for _, ws := range levels {
+		// One level is one shared write: re-check the tenure before each so a
+		// level list cannot be half-written for the next holder.
+		if err := tenure.Check(gate); err != nil {
+			return err
+		}
 		rows := total
 		if ws != "" {
 			rows = perWS[ws]
@@ -726,12 +766,17 @@ func (s *Scheduler) AttachShared(ctx context.Context) error {
 // would leave an object no row manages and the recorded name missing
 // (AC-75 至多一个活跃 Job).
 func (s *Scheduler) ContinueClaim(ctx context.Context, taskID string) error {
-	unlock, err := s.lockTaskFor(ctx, taskID)
+	return s.ContinueClaimInScope(ctx, taskID, "")
+}
+
+// ContinueClaimInScope is ContinueClaim under an explicit partition.
+func (s *Scheduler) ContinueClaimInScope(ctx context.Context, taskID, scopeKey string) error {
+	unlock, err := s.lockTaskForScope(ctx, taskID, scopeKey)
 	if err != nil {
 		return err
 	}
 	defer unlock()
-	e, ok := s.reg.Get(taskID)
+	e, ok := s.reg.Get(taskID, scopeKey)
 	if !ok || e.IsTerminal() || e.IsDraining() || !e.StartedAt.IsZero() || !e.DeliveredAt.IsZero() || len(e.Payload) == 0 {
 		return nil
 	}
@@ -748,7 +793,7 @@ func (s *Scheduler) ContinueClaim(ctx context.Context, taskID string) error {
 	}
 	if job != nil {
 		// The object exists: the claim's crash landed before the transition.
-		if _, ok := s.reg.MarkJobCreated(taskID, job.CreationTimestamp.Time); !ok {
+		if _, ok := s.reg.MarkJobCreated(taskID, job.CreationTimestamp.Time, e.ScopeKey()); !ok {
 			s.log.WarnContext(ctx, "task.claim_continue_skipped", "task_id", taskID, "reason", "entry changed")
 		}
 		return nil

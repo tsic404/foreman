@@ -117,6 +117,10 @@ type Config struct {
 	// scheduler reads it for the probe orchestration's registration scope and
 	// for the credential-reclaim/sweep partition.
 	Workspaces []string
+	// SourceWorkspaces maps a stable Multica server id to its configured
+	// workspace ids. A source-scoped probe takes its admission workspace from
+	// here; an empty map keeps the legacy single-source answer.
+	SourceWorkspaces map[string][]string
 	// StartupProbeTimeout is the startup probe's wait window: the first probe
 	// must register within it or Foreman exits non-zero (§10 启动探针窗口,
 	// default = JobBootTimeout — one "schedule + pull + register" magnitude).

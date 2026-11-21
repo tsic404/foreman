@@ -76,6 +76,14 @@ func WithTaskRuntime(fn func(taskID string) string) Option {
 	return func(cl *Client) { cl.taskRuntime = fn }
 }
 
+// WithTaskRuntimeInScope is the partitioned form of WithTaskRuntime: the
+// resolver answers from this client's own source/workspace, and known=false
+// means the scope holds no attempt for the task — never another source's
+// record, and never the first declared runtime as a guess.
+func WithTaskRuntimeInScope(fn func(taskID string) (runtimeID string, known bool)) Option {
+	return func(cl *Client) { cl.taskRuntimeInScope = fn }
+}
+
 // Changes returns the client-wide change channel. It is a single queue, kept
 // for tests and one-shot observers; consumers that must see every change (the
 // heartbeat supervisor and the WS subscriber) each use SubscribeChanges, so

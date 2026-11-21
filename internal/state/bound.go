@@ -285,6 +285,12 @@ func (s *redisStore) GetEntryByJob(ctx context.Context, jobName string) (registr
 	})
 }
 
+func (s *redisStore) GetEntryByDaemon(ctx context.Context, daemonID string) (registry.TaskEntry, bool, error) {
+	return storeCall2(s, ctx, func(ctx context.Context) (registry.TaskEntry, bool, error) {
+		return s.getEntryByDaemon(ctx, daemonID)
+	})
+}
+
 func (s *redisStore) LockTask(ctx context.Context, ws, taskID, owner string, ttl time.Duration) (bool, error) {
 	return storeCall(s, ctx, func(ctx context.Context) (bool, error) {
 		return s.lockTask(ctx, ws, taskID, owner, ttl)

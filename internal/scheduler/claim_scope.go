@@ -1,6 +1,17 @@
 package scheduler
 
-import "slices"
+import (
+	"slices"
+
+	"github.com/tsic404/foreman/internal/scope"
+)
+
+// partitionKey composes the source/workspace partition key. It exists so
+// callers holding a ClaimScope value (whose identifier shadows the package)
+// can still name the partition.
+func partitionKey(sourceID, workspaceID string) string {
+	return scope.Key(sourceID, workspaceID)
+}
 
 // ClaimScope is one C3 request's own evidence: the real runtime set that
 // request carried and the declared identity each id answered for at that

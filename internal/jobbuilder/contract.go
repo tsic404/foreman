@@ -14,6 +14,7 @@ const (
 	labelManagedBy   = "app.kubernetes.io/managed-by"
 	labelTaskID      = "foreman.tsic.top/task-id"
 	labelAgentID     = "foreman.tsic.top/agent-id"
+	labelSourceID    = "foreman.tsic.top/source-id"
 	labelWorkspaceID = "foreman.tsic.top/workspace-id"
 	// labelDaemonID is the pod-template label carrying the identity name
 	// fm-<task_id> — the MULTICA_DAEMON_ID fieldRef source and the reason the
@@ -23,6 +24,7 @@ const (
 
 	annoIssueID         = "foreman.tsic.top/issue-id"
 	annoIssueIdentifier = "foreman.tsic.top/issue-identifier"
+	annoSourceID        = "foreman.tsic.top/source-id"
 	annoAutopilotRunID  = "foreman.tsic.top/autopilot-run-id"
 	annoChatSessionID   = "foreman.tsic.top/chat-session-id"
 	annoDaemonID        = "foreman.tsic.top/daemon-id"
@@ -59,13 +61,17 @@ const (
 
 // identityLabels is the Job label set (§4.3).
 func (b *Builder) identityLabels(e TaskEntry) map[string]string {
-	return map[string]string{
+	labels := map[string]string{
 		labelAppName:     jobAppName,
 		labelManagedBy:   managedByForeman,
 		labelTaskID:      e.TaskID,
 		labelAgentID:     e.AgentID,
 		labelWorkspaceID: e.WorkspaceID,
 	}
+	if e.SourceID != "" {
+		labels[labelSourceID] = e.SourceID
+	}
+	return labels
 }
 
 // identityAnnotations is the Job annotation set (§4.3). daemon-id carries the
@@ -90,6 +96,7 @@ func (b *Builder) identityAnnotations(daemonID string, e TaskEntry) map[string]s
 		annoRealRuntimeID:    e.RealRuntimeID,
 		annoRuntimeProvider:  e.RuntimeProvider,
 		annoRuntimeProfileID: e.RuntimeProfileID,
+		annoSourceID:         e.SourceID,
 	} {
 		if value != "" {
 			annotations[key] = value
@@ -130,17 +137,21 @@ var (
 // (ADR-034 decision 8, §3). The workspace label is the object's own identity
 // in the sweep's partition (§6.5): the sweep never derives it from the
 // deployment's configuration, or a lease key would not match the claim's.
-func (b *Builder) credentialSecret(daemonID, taskID, workspaceID, token string) *corev1.Secret {
+func (b *Builder) credentialSecret(daemonID, taskID, sourceID, workspaceID, token string) *corev1.Secret {
 	configJSON := `{"token":` + strconv.Quote(token) + `}`
+	labels := map[string]string{
+		labelManagedBy:   managedByForeman,
+		labelTaskID:      taskID,
+		labelWorkspaceID: workspaceID,
+	}
+	if sourceID != "" {
+		labels[labelSourceID] = sourceID
+	}
 	return &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      CredentialSecretName(daemonID),
 			Namespace: b.cfg.JobNamespace,
-			Labels: map[string]string{
-				labelManagedBy:   managedByForeman,
-				labelTaskID:      taskID,
-				labelWorkspaceID: workspaceID,
-			},
+			Labels:    labels,
 		},
 		Type:       corev1.SecretTypeOpaque,
 		StringData: map[string]string{configFileKey: configJSON},

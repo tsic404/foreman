@@ -16,6 +16,7 @@ import (
 	"strings"
 
 	"github.com/tsic404/foreman/internal/jobbuilder"
+	"github.com/tsic404/foreman/internal/scope"
 )
 
 // ProjectQueries is the production adapter for the platform's two project
@@ -28,7 +29,9 @@ type ProjectQueries struct {
 	// credentials maps workspace id → that workspace's server credential
 	// (§4.1: the lookup runs with the Job's workspace credential).
 	credentials map[string]string
-	client      *http.Client
+	// serverURLs overrides baseURL per source+workspace key.
+	serverURLs map[string]string
+	client     *http.Client
 }
 
 // NewProjectQueries builds the single-workspace adapter over the same server
@@ -41,9 +44,17 @@ func NewProjectQueries(baseURL, workspaceID, token string) *ProjectQueries {
 // NewProjectQueriesFor builds the adapter over one credential per configured
 // workspace.
 func NewProjectQueriesFor(baseURL string, credentials map[string]string) *ProjectQueries {
+	return NewProjectQueriesForSources(baseURL, credentials, nil)
+}
+
+// NewProjectQueriesForSources builds the adapter with one credential and one
+// upstream URL per source+workspace key (scope.Key). A source is the stable
+// Multica server id; an empty source keeps the legacy workspace-only key.
+func NewProjectQueriesForSources(baseURL string, credentials, serverURLs map[string]string) *ProjectQueries {
 	return &ProjectQueries{
 		baseURL:     strings.TrimRight(baseURL, "/"),
 		credentials: credentials,
+		serverURLs:  serverURLs,
 		// No client-level timeout: every call carries the caller's own
 		// bounded context (the startup resolution window / the claim →
 		// Job budget), which is the bound the contract names.
@@ -51,21 +62,50 @@ func NewProjectQueriesFor(baseURL string, credentials map[string]string) *Projec
 	}
 }
 
-// workspaceCredentials resolves the (workspace, token) pair a query runs under.
-// An empty workspace id is the legacy flat-form lookup: it resolves only when
-// exactly one workspace is configured.
-func (q *ProjectQueries) workspaceCredentials(workspaceID string) (string, string, bool) {
-	if workspaceID != "" {
-		token, ok := q.credentials[workspaceID]
-		return workspaceID, token, ok
+// credentialFor resolves one source and workspace pair to its base URL,
+// credential and workspace id. A raw workspace id without a source is the
+// legacy flat form; when it matches several sources the answer is ambiguous
+// and refuses rather than borrowing one server's credential.
+func (q *ProjectQueries) credentialFor(sourceID, workspaceID string) (baseURL, token, ws string, ok bool) {
+	key := scope.Key(sourceID, workspaceID)
+	if token, found := q.credentials[key]; found {
+		return q.baseURLFor(key), token, workspaceID, true
 	}
-	if len(q.credentials) != 1 {
-		return "", "", false
+	if sourceID != "" {
+		return "", "", "", false
 	}
-	for id, token := range q.credentials {
-		return id, token, true
+	var (
+		matchedKey   string
+		matchedToken string
+		matchedWS    string
+		found        bool
+	)
+	for candidate, candidateToken := range q.credentials {
+		_, candidateWS := scope.Split(candidate)
+		if workspaceID != "" && candidateWS != workspaceID {
+			continue
+		}
+		if found {
+			// A bare workspace id that names several sources is not an
+			// identity: fail closed instead of picking one.
+			return "", "", "", false
+		}
+		found = true
+		matchedKey, matchedToken, matchedWS = candidate, candidateToken, candidateWS
 	}
-	return "", "", false
+	if !found {
+		return "", "", "", false
+	}
+	return q.baseURLFor(matchedKey), matchedToken, matchedWS, true
+}
+
+// baseURLFor returns the upstream URL registered for a scope key, falling
+// back to the deployment-level URL.
+func (q *ProjectQueries) baseURLFor(key string) string {
+	if url := strings.TrimRight(q.serverURLs[key], "/"); url != "" {
+		return url
+	}
+	return q.baseURL
 }
 
 // FromPayload reads the claim payload's top-level project_id. It never reads
@@ -89,14 +129,20 @@ func (q *ProjectQueries) FromPayload(task json.RawMessage) string {
 // platform's authority), so agent keys read the documented unavailable
 // degradation.
 func (q *ProjectQueries) ResolveName(ctx context.Context, workspaceID, kind, name string) (jobbuilder.NameResolution, error) {
+	return q.ResolveNameInSource(ctx, "", workspaceID, kind, name)
+}
+
+// ResolveNameInSource is the source-aware name resolution. A source-carrying
+// workspace never falls back to another server's credential.
+func (q *ProjectQueries) ResolveNameInSource(ctx context.Context, sourceID, workspaceID, kind, name string) (jobbuilder.NameResolution, error) {
 	if kind != jobbuilder.PolicyKeyProject {
 		return jobbuilder.NameResolution{Conclusion: jobbuilder.NameUnavailable}, nil
 	}
-	ws, token, ok := q.workspaceCredentials(workspaceID)
+	base, token, ws, ok := q.credentialFor(sourceID, workspaceID)
 	if !ok {
 		return jobbuilder.NameResolution{Conclusion: jobbuilder.NameUnavailable}, fmt.Errorf("no credential for workspace %q", workspaceID)
 	}
-	projects, err := q.listProjects(ctx, ws, token)
+	projects, err := q.listProjects(ctx, base, ws, token)
 	if err != nil {
 		return jobbuilder.NameResolution{}, err
 	}
@@ -122,7 +168,12 @@ func (q *ProjectQueries) ResolveName(ctx context.Context, workspaceID, kind, nam
 // other non-2xx answer is an error, which the caller converges on
 // project.lookup_failed.
 func (q *ProjectQueries) ByIssue(ctx context.Context, workspaceID, issueID string) (string, error) {
-	ws, token, ok := q.workspaceCredentials(workspaceID)
+	return q.ByIssueInSource(ctx, "", workspaceID, issueID)
+}
+
+// ByIssueInSource is the source-aware issue project lookup.
+func (q *ProjectQueries) ByIssueInSource(ctx context.Context, sourceID, workspaceID, issueID string) (string, error) {
+	base, token, ws, ok := q.credentialFor(sourceID, workspaceID)
 	if !ok {
 		return "", fmt.Errorf("no credential for workspace %q", workspaceID)
 	}
@@ -130,7 +181,7 @@ func (q *ProjectQueries) ByIssue(ctx context.Context, workspaceID, issueID strin
 		ProjectID *string `json:"project_id"`
 	}
 	query := url.Values{"workspace_id": {ws}}
-	if err := q.get(ctx, token, "/api/issues/"+url.PathEscape(issueID), query, &issue); err != nil {
+	if err := q.get(ctx, base, token, "/api/issues/"+url.PathEscape(issueID), query, &issue); err != nil {
 		return "", err
 	}
 	if issue.ProjectID == nil {
@@ -148,12 +199,12 @@ type projectRow struct {
 
 // listProjects is GET /api/projects?workspace_id=...: every project of the
 // workspace, with no server-side name filter.
-func (q *ProjectQueries) listProjects(ctx context.Context, workspaceID, token string) ([]projectRow, error) {
+func (q *ProjectQueries) listProjects(ctx context.Context, baseURL, workspaceID, token string) ([]projectRow, error) {
 	var answer struct {
 		Projects []projectRow `json:"projects"`
 	}
 	query := url.Values{"workspace_id": {workspaceID}}
-	if err := q.get(ctx, token, "/api/projects", query, &answer); err != nil {
+	if err := q.get(ctx, baseURL, token, "/api/projects", query, &answer); err != nil {
 		return nil, err
 	}
 	return answer.Projects, nil
@@ -165,8 +216,8 @@ func (q *ProjectQueries) listProjects(ctx context.Context, workspaceID, token st
 const maxAnswerBytes = 1 << 20
 
 // get performs one authenticated read-only GET and decodes a JSON answer.
-func (q *ProjectQueries) get(ctx context.Context, token, path string, query url.Values, out any) error {
-	target := q.baseURL + path
+func (q *ProjectQueries) get(ctx context.Context, baseURL, token, path string, query url.Values, out any) error {
+	target := baseURL + path
 	if encoded := query.Encode(); encoded != "" {
 		target += "?" + encoded
 	}

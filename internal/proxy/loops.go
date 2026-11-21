@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tsic404/foreman/internal/scheduler"
+	"github.com/tsic404/foreman/internal/tenure"
 )
 
 // heartbeatInterval is the C2 cadence (§1.2: every 15s per real runtime).
@@ -62,7 +63,7 @@ type ClaimLoop struct {
 func (l *ClaimLoop) SetRegisteredHook(fn func(context.Context, *Client) error) { l.onRegistered = fn }
 
 // leaderPollInterval is how often a parked control loop re-checks ownership.
-const leaderPollInterval = 500 * time.Millisecond
+const leaderPollInterval = tenure.PollInterval
 
 // SetLeaderGate wires the control-plane ownership check.
 func (l *ClaimLoop) SetLeaderGate(g func() bool) { l.leader = g }
@@ -95,43 +96,79 @@ func (l *ClaimLoop) Wake() {
 // §1.5, AC-86).
 func (l *ClaimLoop) Run(ctx context.Context) error {
 	for {
-		if l.leader != nil && !l.leader() {
-			if !sleepOrDone(ctx, leaderPollInterval) {
+		if !l.awaitLeader(ctx) {
+			return nil
+		}
+		// C1 creates the daemon identity upstream, so the preflight runs under
+		// the tenure: losing the lease cancels an in-flight Register, and a
+		// preflight whose tenure ended is never published as a declaration.
+		preflightCtx, stopWatch, leaseLost := tenure.Bound(ctx, l.leader)
+		err := l.client.Preflight(preflightCtx)
+		lost := leaseLost()
+		stopWatch()
+		if ctx.Err() != nil {
+			return nil
+		}
+		if lost {
+			l.log.Warn("preflight deferred: control-plane lease lost")
+			continue
+		}
+		if err != nil {
+			wait := l.backoff.next()
+			l.log.Error("preflight failed", "err", err, "retry_in", wait)
+			if !sleepOrDone(ctx, wait) {
 				return nil
 			}
 			continue
 		}
-		err := l.client.Preflight(ctx)
+		l.backoff.reset()
+		if l.onRegistered == nil {
+			break
+		}
+		// The declaration belongs to the C1 answer's tenure: check again here,
+		// after the answer and before the shared write.
+		if !tenure.Holds(l.leader) {
+			l.log.Warn("registration declaration deferred: control-plane lease lost")
+			continue
+		}
+		publishCtx, stopPublish, publishLost := tenure.Bound(ctx, l.leader)
+		err = l.onRegistered(publishCtx, l.client)
+		lost = publishLost()
+		stopPublish()
+		if ctx.Err() != nil {
+			return nil
+		}
+		if lost {
+			l.log.Warn("registration declaration deferred: control-plane lease lost")
+			continue
+		}
 		if err == nil {
 			break
 		}
-		wait := l.backoff.next()
-		l.log.Error("preflight failed", "err", err, "retry_in", wait)
-		if !sleepOrDone(ctx, wait) {
+		l.log.Error("registration declaration not stored", "err", err)
+		if !sleepOrDone(ctx, l.backoff.next()) {
 			return nil
 		}
 	}
-	l.backoff.reset()
-	if l.onRegistered != nil {
-		for {
-			if err := l.onRegistered(ctx, l.client); err == nil {
-				break
-			} else {
-				l.log.Error("registration declaration not stored", "err", err)
-			}
-			if !sleepOrDone(ctx, l.backoff.next()) {
-				return nil
-			}
-		}
-	}
 	for {
-		if l.leader != nil && !l.leader() {
-			if !sleepOrDone(ctx, leaderPollInterval) {
-				return nil
-			}
+		if !tenure.Await(ctx, l.leader) {
+			return nil
+		}
+		// Claim dispatch creates Jobs and reservations, so C3 and the
+		// on-claim write run under the tenure: a lost lease cancels the
+		// in-flight claim and skips the job creation for its answer.
+		claimCtx, stopWatch, leaseLost := tenure.Bound(ctx, l.leader)
+		err := l.iterate(claimCtx)
+		lost := leaseLost()
+		stopWatch()
+		if ctx.Err() != nil {
+			return nil
+		}
+		if lost {
+			l.log.Warn("claim deferred: control-plane tenure lost")
 			continue
 		}
-		if err := l.iterate(ctx); err != nil {
+		if err != nil {
 			wait := l.backoff.next()
 			l.log.Error("claim failed", "err", err, "backoff", wait)
 			if !sleepOrDone(ctx, wait) {
@@ -147,6 +184,11 @@ func (l *ClaimLoop) Run(ctx context.Context) error {
 		case <-time.After(l.interval()):
 		}
 	}
+}
+
+// awaitLeader parks while this instance is not the control-plane holder.
+func (l *ClaimLoop) awaitLeader(ctx context.Context) bool {
+	return tenure.Await(ctx, l.leader)
 }
 
 // iterate runs one claim round: budget → reserve → C3 → OnClaimReserved per
@@ -299,24 +341,30 @@ func (l *HeartbeatLoop) Run(ctx context.Context) error {
 		}
 	}
 	for {
-		if l.leader != nil && !l.leader() {
-			stopAll()
-			if !sleepOrDone(ctx, leaderPollInterval) {
-				return nil
-			}
-			continue
-		}
-		reconcile()
-		select {
-		case <-ctx.Done():
+		if !tenure.Await(ctx, l.leader) {
 			return nil
-		case err := <-started:
-			if err != nil {
-				return err
-			}
-		case <-changes:
-		case <-time.After(heartbeatSupervisorInterval):
 		}
+		// The open streams are the holder's: losing the lease closes them
+		// instead of leaving a follower holding another instance's
+		// subscriptions.
+		stopWatch := tenure.Watch(ctx, l.leader, stopAll)
+		for tenure.Holds(l.leader) {
+			reconcile()
+			select {
+			case <-ctx.Done():
+				stopWatch()
+				return nil
+			case err := <-started:
+				if err != nil {
+					stopWatch()
+					return err
+				}
+			case <-changes:
+			case <-time.After(heartbeatSupervisorInterval):
+			}
+		}
+		stopWatch()
+		stopAll()
 	}
 }
 

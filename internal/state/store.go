@@ -93,6 +93,7 @@ type Snapshot struct {
 	IssueIdentifier     string    `json:"issue_identifier"`
 	AutopilotRunID      string    `json:"autopilot_run_id"`
 	ChatSessionID       string    `json:"chat_session_id"`
+	SourceID            string    `json:"source_id"`
 	WorkspaceID         string    `json:"workspace_id"`
 	JobName             string    `json:"job_name"`
 	JobNamespace        string    `json:"job_namespace"`
@@ -185,6 +186,7 @@ func FromEntry(e registry.TaskEntry) Snapshot {
 		IssueIdentifier:     e.IssueIdentifier,
 		AutopilotRunID:      e.AutopilotRunID,
 		ChatSessionID:       e.ChatSessionID,
+		SourceID:            e.SourceID,
 		WorkspaceID:         e.WorkspaceID,
 		JobName:             e.JobName,
 		JobNamespace:        e.JobNamespace,
@@ -242,6 +244,7 @@ func (s Snapshot) ToEntry() registry.TaskEntry {
 		IssueIdentifier:     s.IssueIdentifier,
 		AutopilotRunID:      s.AutopilotRunID,
 		ChatSessionID:       s.ChatSessionID,
+		SourceID:            s.SourceID,
 		WorkspaceID:         s.WorkspaceID,
 		JobName:             s.JobName,
 		JobNamespace:        s.JobNamespace,

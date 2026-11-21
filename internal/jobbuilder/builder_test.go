@@ -35,6 +35,7 @@ var testClaimedAt = time.Date(2026, 10, 4, 8, 30, 0, 0, time.UTC)
 type fakeIssuer struct {
 	jobName     string
 	taskID      string
+	sourceID    string
 	workspaceID string
 	ttl         time.Duration
 	token       string
@@ -44,6 +45,7 @@ type fakeIssuer struct {
 	// call's arguments, so a test can pin the probe's TTL arithmetic.
 	probeJobName     string
 	probeRequestID   string
+	probeSourceID    string
 	probeWorkspaceID string
 	probeTTL         time.Duration
 }
@@ -58,6 +60,22 @@ func (f *fakeIssuer) Issue(jobName, taskID, workspaceID string, ttl time.Duratio
 
 func (f *fakeIssuer) IssueProbe(jobName, requestID, workspaceID string, ttl time.Duration) (string, error) {
 	f.probeJobName, f.probeRequestID, f.probeWorkspaceID, f.probeTTL = jobName, requestID, workspaceID, ttl
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.token, nil
+}
+
+func (f *fakeIssuer) IssueInSource(jobName, taskID, sourceID, workspaceID string, ttl time.Duration) (string, error) {
+	f.jobName, f.taskID, f.sourceID, f.workspaceID, f.ttl = jobName, taskID, sourceID, workspaceID, ttl
+	if f.err != nil {
+		return "", f.err
+	}
+	return f.token, nil
+}
+
+func (f *fakeIssuer) IssueProbeInSource(jobName, requestID, sourceID, workspaceID string, ttl time.Duration) (string, error) {
+	f.probeJobName, f.probeRequestID, f.probeSourceID, f.probeWorkspaceID, f.probeTTL = jobName, requestID, sourceID, workspaceID, ttl
 	if f.err != nil {
 		return "", f.err
 	}
@@ -117,6 +135,38 @@ func testEntry() TaskEntry {
 		ClaimedAt:       testClaimedAt,
 		Attempt:         1,
 		PriorSessionID:  testPriorSession,
+	}
+}
+
+// TestBuildIssuesTokenInTheEntrySource pins the Job Token's source claim: a
+// multi-source deployment must sign the token in the claim's source, or the
+// same workspace id on another server would adjudicate it (V2-C03).
+func TestBuildIssuesTokenInTheEntrySource(t *testing.T) {
+	issuer := &fakeIssuer{token: "fmj_source.sig"}
+	cfg := testConfig()
+	cfg.Issuer = issuer
+	builder := newTestBuilder(t, cfg)
+	entry := testEntry()
+	entry.SourceID = "src-a"
+	job, _, _, err := builder.Build(entry)
+	if err != nil {
+		t.Fatalf("Build: %v", err)
+	}
+	if issuer.sourceID != "src-a" {
+		t.Errorf("token source = %q, want src-a", issuer.sourceID)
+	}
+	if issuer.workspaceID != entry.WorkspaceID {
+		t.Errorf("token workspace = %q, want %q", issuer.workspaceID, entry.WorkspaceID)
+	}
+	const sourceKey = "foreman.tsic.top/source-id"
+	if got := job.Labels[sourceKey]; got != "src-a" {
+		t.Errorf("Job source label = %q, want src-a", got)
+	}
+	if got := job.Spec.Template.Labels[sourceKey]; got != "src-a" {
+		t.Errorf("pod source label = %q, want src-a", got)
+	}
+	if got := job.Annotations[sourceKey]; got != "src-a" {
+		t.Errorf("Job source annotation = %q, want src-a", got)
 	}
 }
 

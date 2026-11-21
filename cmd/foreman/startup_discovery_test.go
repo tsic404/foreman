@@ -204,7 +204,7 @@ func TestControlPlaneDiscoveryWithoutVerifiedDeclarations(t *testing.T) {
 	}
 	discoverer := newControlPlaneDiscovery(
 		catalogService, releaseService, discoveryService, configService, clientSet,
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
 	)
 	out, err := discoverer.Discover(context.Background())
 	if err != nil {
@@ -307,7 +307,7 @@ func TestControlPlaneDiscoveryRegistersVerifiedRuntime(t *testing.T) {
 	}
 	discoverer := newControlPlaneDiscovery(
 		catalogService, releaseService, discoveryService, configService, clientSet,
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
 	)
 	out, err := discoverer.Discover(context.Background())
 	if err != nil {
@@ -419,7 +419,7 @@ func TestControlPlaneDiscoveryRequiresTheExactBoundVersion(t *testing.T) {
 			}
 			discoverer := newControlPlaneDiscovery(
 				catalogService, releaseService, discoveryService, configService, clientSet,
-				slog.New(slog.NewTextHandler(io.Discard, nil)),
+				slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
 			)
 			out, err := discoverer.Discover(context.Background())
 			if err != nil {
@@ -494,7 +494,7 @@ func TestControlPlaneDiscoveryRejectsAnUnverifiedRelease(t *testing.T) {
 	}
 	discoverer := newControlPlaneDiscovery(
 		catalogService, releaseService, discoveryService, configService, clientSet,
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
 	)
 	out, err := discoverer.Discover(context.Background())
 	if err != nil {
@@ -554,7 +554,7 @@ func TestControlPlaneDiscoveryRejectsAFailedBoundProbe(t *testing.T) {
 	}
 	discoverer := newControlPlaneDiscovery(
 		catalogService, releaseService, discoveryService, configService, clientSet,
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
 	)
 	out, err := discoverer.Discover(context.Background())
 	if err != nil {
@@ -616,7 +616,7 @@ func TestControlPlaneDiscoveryDeclaresOnlyConfiguredProfiles(t *testing.T) {
 	}
 	discoverer := newControlPlaneDiscovery(
 		catalogService, releaseService, discoveryService, configService, clientSet,
-		slog.New(slog.NewTextHandler(io.Discard, nil)),
+		slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
 	)
 	out, err := discoverer.Discover(context.Background())
 	if err != nil {

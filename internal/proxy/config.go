@@ -83,6 +83,9 @@ type Config struct {
 	ServerURL   string // MULTICA_SERVER_URL, no trailing slash
 	WorkspaceID string // MULTICA_WORKSPACE_ID
 	DaemonID    string // FOREMAN_DAEMON_ID
+	// SourceID is the stable Multica server identity this client serves.
+	// Empty is the legacy single-source deployment.
+	SourceID string
 	// Version is sent as X-Client-Version before the startup probe registers,
 	// and for the process identity (§1.1). After C1 it is superseded by the
 	// startup discovery's cli_version (the template CLI's real version).

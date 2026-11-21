@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/tsic404/foreman/internal/registry"
+	"github.com/tsic404/foreman/internal/tenure"
 )
 
 // Runtime profile snapshot states, the S-3 three-state of §1.6: a successful
@@ -462,14 +463,28 @@ func (r *ProfileRefresher) Run(ctx context.Context) error {
 			return nil
 		case <-r.trigger:
 		}
-		if r.leader != nil && !r.leader() {
+		if !tenure.Holds(r.leader) {
 			// The invalidation hint arrived on a non-holder: the event is
 			// dropped here, and the next restart converges (§1.6 降级面), so a
 			// non-holder never runs a probe Job or re-registers.
 			r.log.Debug("runtime.profiles_refresh_skipped", "reason", "not control-plane holder")
 			continue
 		}
-		if err := r.client.RefreshRuntimeProfiles(ctx); err != nil {
+		// The refresh creates a probe Job and re-registers, so it runs under
+		// the tenure: losing the lease cancels the sequence instead of letting
+		// a follower commit the new holder's declaration.
+		refreshCtx, stopRefresh, refreshLost := tenure.Bound(ctx, r.leader)
+		err := r.client.RefreshRuntimeProfiles(refreshCtx)
+		lost := refreshLost()
+		stopRefresh()
+		if ctx.Err() != nil {
+			return nil
+		}
+		if lost {
+			r.log.Warn("runtime.profiles_refresh_deferred", "reason", "leader_lease_lost")
+			continue
+		}
+		if err != nil {
 			r.log.Warn("runtime.profiles_refresh_failed", "err", err)
 		}
 	}

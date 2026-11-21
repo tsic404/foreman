@@ -83,7 +83,7 @@ func (h *WSHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, "not found")
 		return
 	}
-	entry, ok := h.reg.ByDaemonInWorkspace(claims.WorkspaceID, claims.JobName)
+	entry, ok := h.reg.ByDaemonInSourceWorkspace(claims.SourceID, claims.WorkspaceID, claims.JobName)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return

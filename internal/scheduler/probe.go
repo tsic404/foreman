@@ -108,6 +108,13 @@ func WithProbeEndpointWait(wait func(ctx context.Context, budget time.Duration) 
 // registration-discovery probe owns no command at all. An id that does not
 // belong to the mode is rejected rather than silently ignored.
 func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID, workspaceID string, mode registry.ProbeMode, budget time.Duration) (ProbeHandle, error) {
+	return s.StartProbeInSource(ctx, requestID, realRuntimeID, "", workspaceID, mode, budget)
+}
+
+// StartProbeInSource is the source-aware probe start: the probe session and
+// its Job Token carry the source, so a probe registered by a Job from one
+// server is never answered with another server's client.
+func (s *Scheduler) StartProbeInSource(ctx context.Context, requestID, realRuntimeID, sourceID, workspaceID string, mode registry.ProbeMode, budget time.Duration) (ProbeHandle, error) {
 	if s.probes == nil {
 		return ProbeHandle{}, errors.New("probe session table is not wired")
 	}
@@ -120,6 +127,7 @@ func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID, wo
 		JobName:    jobName,
 		Mode:       mode,
 		JobRuntime: jobRuntime,
+		SourceID:   sourceID,
 		Deadline:   s.now().Add(budget),
 	}
 	switch mode {
@@ -149,12 +157,12 @@ func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID, wo
 	}
 	tokenWorkspace := workspaceID
 	if tokenWorkspace == "" {
-		tokenWorkspace = s.probeTokenWorkspace()
+		tokenWorkspace = s.probeTokenWorkspaceInSource(sourceID)
 	}
 	if tokenWorkspace == "" {
 		return ProbeHandle{}, errors.New("no workspace configured for the probe credential")
 	}
-	job, cred, tokenHash, err := s.builder.BuildCatalogProbe(requestID, jobRuntime, tokenWorkspace, budget)
+	job, cred, tokenHash, err := s.buildProbe(requestID, jobRuntime, sourceID, tokenWorkspace, budget)
 	if err != nil {
 		return ProbeHandle{}, fmt.Errorf("build catalog probe %s: %w", jobName, err)
 	}
@@ -178,6 +186,19 @@ func (s *Scheduler) StartProbe(ctx context.Context, requestID, realRuntimeID, wo
 		s.trackProbeNode(trackCtx, handle, session.Deadline)
 	}()
 	return handle, nil
+}
+
+// buildProbe renders the probe through the source-aware builder when the
+// session belongs to a source.
+func (s *Scheduler) buildProbe(requestID, jobRuntime, sourceID, workspaceID string, budget time.Duration) (*batchv1.Job, *corev1.Secret, string, error) {
+	if sourceID == "" {
+		return s.builder.BuildCatalogProbe(requestID, jobRuntime, workspaceID, budget)
+	}
+	builder, ok := s.builder.(SourceProbeBuilder)
+	if !ok {
+		return nil, nil, "", fmt.Errorf("job builder cannot render source %q", sourceID)
+	}
+	return builder.BuildCatalogProbeInSource(requestID, jobRuntime, sourceID, workspaceID, budget)
 }
 
 // trackerContext is what a detached probe tracker runs under: the scheduler's
@@ -379,6 +400,14 @@ func (s *Scheduler) RunStartupProbe(ctx context.Context) (map[string]registry.Di
 	return s.runProbe(ctx, true, "startup")
 }
 
+// RunStartupProbeInSource is the per-source startup probe. One Multica server
+// has its own credential, registration identity and discovery set, so a
+// deployment serving several servers probes each one separately: a single
+// source-less probe cannot register a source-scoped client.
+func (s *Scheduler) RunStartupProbeInSource(ctx context.Context, sourceID string) (map[string]registry.Discovery, error) {
+	return s.runProbeInSource(ctx, true, "startup", sourceID)
+}
+
 // RunDiscoveryProbe runs one registration-discovery probe for one workspace
 // (§1.6): the same shape, the same window upper bound and the same cleanup as
 // the startup probe, but registration alone is the completion signal — no
@@ -386,7 +415,13 @@ func (s *Scheduler) RunStartupProbe(ctx context.Context) (map[string]registry.Di
 // C1 body declares). A failure is returned to the caller; it never exits the
 // process.
 func (s *Scheduler) RunDiscoveryProbe(ctx context.Context, workspaceID string) (registry.Discovery, error) {
-	discoveries, err := s.runProbe(ctx, false, "discovery")
+	return s.RunDiscoveryProbeInSource(ctx, "", workspaceID)
+}
+
+// RunDiscoveryProbeInSource is the source-aware registration-discovery probe.
+// Its registrations and S-1 answer are scoped to that source's discovery set.
+func (s *Scheduler) RunDiscoveryProbeInSource(ctx context.Context, sourceID, workspaceID string) (registry.Discovery, error) {
+	discoveries, err := s.runProbeInSource(ctx, false, "discovery", sourceID)
 	if err != nil {
 		return registry.Discovery{}, err
 	}
@@ -403,10 +438,35 @@ func (s *Scheduler) RunDiscoveryProbe(ctx context.Context, workspaceID string) (
 // discovery set and its registrations tell which workspaces it actually
 // serves.
 func (s *Scheduler) probeTokenWorkspace() string {
+	return s.probeTokenWorkspaceInSource("")
+}
+
+// probeTokenWorkspaceInSource is the admission workspace of a source-scoped
+// probe: the first workspace configured for that source.
+func (s *Scheduler) probeTokenWorkspaceInSource(sourceID string) string {
+	if sourceID != "" {
+		if ids := s.cfg.SourceWorkspaces[sourceID]; len(ids) > 0 {
+			return ids[0]
+		}
+		// A source with no configured workspace has no admission credential:
+		// borrowing another source's workspace would send the probe to the
+		// wrong server.
+		return ""
+	}
 	if ids := s.WorkspaceIDs(); len(ids) > 0 {
 		return ids[0]
 	}
 	return s.cfg.WorkspaceID
+}
+
+// probeWorkspaceIDs is the discovery set a probe may register: every
+// configured workspace for the legacy single-source form, and only the
+// source's own workspaces otherwise.
+func (s *Scheduler) probeWorkspaceIDs(sourceID string) []string {
+	if sourceID == "" {
+		return s.WorkspaceIDs()
+	}
+	return s.cfg.SourceWorkspaces[sourceID]
 }
 
 // runProbe is the shared orchestration of the startup probe and the
@@ -417,6 +477,10 @@ func (s *Scheduler) probeTokenWorkspace() string {
 // silently served. Entries outside the set are never returned; when nothing in
 // the set registered, each of them is also reported.
 func (s *Scheduler) runProbe(ctx context.Context, waitCatalog bool, kind string) (map[string]registry.Discovery, error) {
+	return s.runProbeInSource(ctx, waitCatalog, kind, "")
+}
+
+func (s *Scheduler) runProbeInSource(ctx context.Context, waitCatalog bool, kind, sourceID string) (map[string]registry.Discovery, error) {
 	// The startup probe's daemon dials the deployment's own Job-side address.
 	// A cold start reaches this point before the Service has a ready endpoint,
 	// and that daemon does not retry: the Job (backoffLimit 0) is terminal on
@@ -437,7 +501,7 @@ func (s *Scheduler) runProbe(ctx context.Context, waitCatalog bool, kind string)
 	if waitCatalog {
 		mode = registry.ProbeStartupDiscovery
 	}
-	handle, err := s.StartProbe(ctx, minted, "", "", mode, window)
+	handle, err := s.StartProbeInSource(ctx, minted, "", sourceID, "", mode, window)
 	if err != nil {
 		s.reportProbeFailure(ctx, kind, jobbuilder.ProbeJobName(minted), ProbeFailureJobCreateFailed, "", "", false)
 		return nil, fmt.Errorf("%s probe: %w", kind, err)
@@ -551,7 +615,7 @@ settle:
 	}
 	s.teardownStartupProbe(ctx, handle)
 	discoveries := make(map[string]registry.Discovery, len(session.Registrations))
-	for _, workspaceID := range s.WorkspaceIDs() {
+	for _, workspaceID := range s.probeWorkspaceIDs(sourceID) {
 		registration, ok := session.Registration(workspaceID)
 		if !ok {
 			s.log.WarnContext(ctx, "probe.workspace_not_registered", "job_name", handle.JobName,
@@ -564,7 +628,7 @@ settle:
 	if len(discoveries) == 0 && len(session.Registrations) == 0 && !session.RegisteredAt.IsZero() {
 		// Legacy session shape (no per-workspace map): the single captured
 		// registration belongs to the probe's own credential workspace.
-		discoveries[s.probeTokenWorkspace()] = registry.Discovery{
+		discoveries[s.probeTokenWorkspaceInSource(sourceID)] = registry.Discovery{
 			CLIVersion:     session.CLIVersion,
 			Runtimes:       session.Runtimes,
 			FailedProfiles: session.FailedProfiles,

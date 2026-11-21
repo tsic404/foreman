@@ -119,9 +119,8 @@ type Config struct {
 	// falls back to WorkspaceIDs without display names, so a hand-built Config
 	// keeps the identifier form working (name keys then have no match).
 	Workspaces []WorkspaceRef
-
-	Issuer TokenIssuer
-	Nodes  NodeIndex
+	Issuer     TokenIssuer
+	Nodes      NodeIndex
 	// Metrics is the policy-face observability seam (§9.2): the per-axis hit
 	// counter and the startup name-resolution conclusions. Nil degrades to
 	// no-ops, exactly like the other seams.

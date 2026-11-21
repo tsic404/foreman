@@ -46,7 +46,7 @@ func NewControlPlane(opts ControlPlaneOptions) *ControlPlane {
 	claim := NewClaimLoop(opts.ProxyConfig, opts.Client, opts.Scheduler)
 	heartbeat := NewHeartbeatLoop(opts.Client, opts.Reporter)
 	lease := NewLeaseKeeper(opts.Client, opts.Registry, opts.LeaseHooks, opts.ProxyConfig.LeaseRefreshInterval,
-		WithLeaseWorkspace(opts.WorkspaceID))
+		WithLeaseWorkspace(opts.WorkspaceID), WithLeaseSource(opts.ProxyConfig.SourceID))
 	refresher := NewProfileRefresher(opts.Client, WithProfileRefresherLogger(logger))
 	plane := &ControlPlane{
 		Claim:     claim,

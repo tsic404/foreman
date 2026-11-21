@@ -255,13 +255,14 @@ func (r *Registry) put(e TaskEntry, retire []SlotRetirement) error {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if old, ok := r.live[e.TaskID]; ok {
+	key := e.Key()
+	if old, ok := r.live[key]; ok {
 		if old.State == StateTerminal && e.State != StateTerminal {
 			return fmt.Errorf("%w: task %s", ErrTerminalImmutable, e.TaskID)
 		}
 		r.dropIndexesLocked(old)
 	}
-	r.live[e.TaskID] = e
+	r.live[key] = e
 	r.indexLocked(e)
 	if r.shared != nil {
 		return r.writeShared(e, retire)
@@ -280,10 +281,11 @@ func (r *Registry) PutIfAbsent(e TaskEntry) (bool, error) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, ok := r.live[e.TaskID]; ok {
+	key := e.Key()
+	if _, ok := r.live[key]; ok {
 		return false, nil
 	}
-	r.live[e.TaskID] = e
+	r.live[key] = e
 	r.indexLocked(e)
 	// No write-through: PutIfAbsent's callers are the shared-state restore
 	// (the row is already in the store) and the K8s gap-fill. The gap-fill's
@@ -336,7 +338,7 @@ func (r *Registry) persist(taskID string, e TaskEntry) {
 		// snapshot would clobber a concurrent gate write.
 		return
 	}
-	r.enqueueState(stateOp{kind: stateOpPut, ws: e.WorkspaceID, taskID: taskID, e: e})
+	r.enqueueState(stateOp{kind: stateOpPut, ws: e.ScopeKey(), taskID: taskID, e: e})
 }
 
 // persistDelete enqueues the removal of the live row's snapshot.
@@ -344,7 +346,7 @@ func (r *Registry) persistDelete(taskID string, e TaskEntry) {
 	if r.shared != nil {
 		return
 	}
-	r.enqueueState(stateOp{kind: stateOpDelete, ws: e.WorkspaceID, taskID: taskID})
+	r.enqueueState(stateOp{kind: stateOpDelete, ws: e.ScopeKey(), taskID: taskID})
 }
 
 // persistSettled enqueues the settled terminal record (the row a restart
@@ -356,7 +358,7 @@ func (r *Registry) persistSettled(taskID string, e TaskEntry) {
 		// as the terminal verdict.
 		return
 	}
-	r.enqueueState(stateOp{kind: stateOpPutSettled, ws: e.WorkspaceID, taskID: taskID, e: e})
+	r.enqueueState(stateOp{kind: stateOpPutSettled, ws: e.ScopeKey(), taskID: taskID, e: e})
 }
 
 // enqueueState hands one write to the ordered writer. It is a non-blocking
@@ -589,26 +591,33 @@ func (r *Registry) Restore(ctx context.Context) ([]TaskEntry, bool, error) {
 		if at.IsZero() {
 			at = rec.DrainDeadline
 		}
-		r.done.put(rec.TaskID, at, settledRecord(rec))
+		r.done.put(rec.Key(), at, settledRecord(rec))
 	}
 	return entries, true, nil
 }
 
 // indexLocked writes e's secondary indexes. The caller holds r.mu.
 func (r *Registry) indexLocked(e TaskEntry) {
+	key := e.Key()
 	if e.JobName != "" {
-		r.byJob[e.JobName] = e.TaskID
+		r.byJob[e.JobName] = key
 	}
 	if e.DaemonID != "" {
-		r.byDaemon[e.DaemonID] = e.TaskID
+		r.byDaemon[e.DaemonID] = key
 	}
 }
 
-// Get returns the entry for taskID.
-func (r *Registry) Get(taskID string) (TaskEntry, bool) {
+// Get returns the entry for taskID. An optional partition key selects one
+// source/workspace when the same upstream task id exists on two servers; with
+// no key a bare id resolves only while it is unambiguous.
+func (r *Registry) Get(taskID string, scopeKey ...string) (TaskEntry, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	e, ok := r.live[taskID]
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return TaskEntry{}, false
+	}
+	e, ok := r.live[key]
 	return e, ok
 }
 
@@ -626,25 +635,58 @@ func (r *Registry) ByDaemon(daemonID string) (TaskEntry, bool) {
 	return r.get(r.byDaemon[daemonID])
 }
 
-func (r *Registry) get(taskID string) (TaskEntry, bool) {
-	e, ok := r.live[taskID]
+func (r *Registry) get(key string) (TaskEntry, bool) {
+	if key == "" {
+		return TaskEntry{}, false
+	}
+	e, ok := r.live[key]
 	return e, ok
+}
+
+// lookupKeyLocked resolves one task id to its index key. A caller that knows
+// the partition names it explicitly; otherwise the historical bare key wins
+// and a task id carried by more than one partition is ambiguous, never one of
+// them picked silently. The caller holds r.mu.
+func (r *Registry) lookupKeyLocked(taskID string, scopeKey []string) (string, bool) {
+	if len(scopeKey) > 0 && scopeKey[0] != "" {
+		key := keyInScope(scopeKey[0], taskID)
+		_, ok := r.live[key]
+		return key, ok
+	}
+	if _, ok := r.live[taskID]; ok {
+		return taskID, true
+	}
+	found := ""
+	for key, e := range r.live {
+		if e.TaskID != taskID {
+			continue
+		}
+		if found != "" {
+			return "", false
+		}
+		found = key
+	}
+	return found, found != ""
 }
 
 // Delete removes taskID from the live index together with its job runtime
 // rows (DeleteRuntime), so no index grows with process lifetime. The
 // terminal record stays in the done index until its TTL expires.
-func (r *Registry) Delete(taskID string) error {
+func (r *Registry) Delete(taskID string, scopeKey ...string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.live[taskID]; ok {
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return nil
+	}
+	if e, ok := r.live[key]; ok {
 		r.dropIndexesLocked(e)
-		delete(r.live, taskID)
+		delete(r.live, key)
 		r.dropRuntimeLocked(e.JobRuntimeID, e.DaemonID)
 		if r.shared != nil {
 			ctx, cancel := r.sharedCtx()
 			defer cancel()
-			if err := r.shared.DeleteEntry(ctx, e.WorkspaceID, taskID); err != nil {
+			if err := r.shared.DeleteEntry(ctx, e.ScopeKey(), taskID); err != nil {
 				return err
 			}
 			if e.State != StateTerminal {
@@ -663,12 +705,16 @@ func (r *Registry) Delete(taskID string) error {
 // without touching any other field: callers holding a pre-network snapshot
 // must never Put it back wholesale (that would clobber concurrent
 // transitions such as MarkDelivering/MarkStarted).
-func (r *Registry) SetLastStatusSeen(taskID, status string) {
+func (r *Registry) SetLastStatusSeen(taskID, status string, scopeKey ...string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.live[taskID]; ok {
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return
+	}
+	if e, ok := r.live[key]; ok {
 		e.LastStatusSeen = status
-		r.live[taskID] = e
+		r.live[key] = e
 		if r.shared != nil {
 			r.mergeShared(taskID, e, EntryPatch{LastStatusSeen: &status})
 			return
@@ -685,12 +731,16 @@ func (r *Registry) SetLastStatusSeen(taskID, status string) {
 // drift), so it never trails the server's expiry. In-place, like
 // SetLastStatusSeen: callers holding a pre-network snapshot must never Put
 // it back wholesale.
-func (r *Registry) SetLeaseKeepUntil(taskID string, until time.Time) {
+func (r *Registry) SetLeaseKeepUntil(taskID string, until time.Time, scopeKey ...string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if e, ok := r.live[taskID]; ok {
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return
+	}
+	if e, ok := r.live[key]; ok {
 		e.LeaseKeepUntil = until
-		r.live[taskID] = e
+		r.live[key] = e
 		if r.shared != nil {
 			r.mergeShared(taskID, e, EntryPatch{LeaseKeepUntil: &until})
 			return
@@ -750,8 +800,8 @@ func (r *Registry) InflightFor(workspaceID string) int {
 // dedup. The workspace is part of the key, so a terminal task of one
 // workspace never suppresses the same task id in another.
 func (r *Registry) IsDone(workspaceID, taskID string) bool {
-	e, _, ok := r.done.get(taskID)
-	return ok && e.WorkspaceID == workspaceID
+	_, _, ok := r.done.get(keyInScope(workspaceID, taskID))
+	return ok
 }
 
 // IsDoneAny reports whether taskID reached terminal state in any workspace.
@@ -759,14 +809,14 @@ func (r *Registry) IsDone(workspaceID, taskID string) bool {
 // cannot carry a workspace, a settled task under that id must still not be
 // re-executed.
 func (r *Registry) IsDoneAny(taskID string) bool {
-	return r.done.has(taskID)
+	return r.done.hasTask(taskID)
 }
 
 // DoneAt returns the moment the task reached its verdict, as recorded by the
 // single alive → draining transition. The credential reclaim measures the
 // drain duration from it (§9.2 foreman_job_drain_seconds).
-func (r *Registry) DoneAt(taskID string) (time.Time, bool) {
-	_, at, ok := r.done.get(taskID)
+func (r *Registry) DoneAt(taskID string, scopeKey ...string) (time.Time, bool) {
+	_, at, ok := r.done.get(r.doneKey(taskID, scopeKey))
 	return at, ok
 }
 
@@ -775,9 +825,29 @@ func (r *Registry) DoneAt(taskID string) (time.Time, bool) {
 // reclaim deleted the live row, until the retention window expires. It backs
 // the ops endpoint's post-hoc query face (ADR-032); the record never carries
 // the payload body or the token digest.
-func (r *Registry) Settled(taskID string) (TaskEntry, bool) {
-	e, _, ok := r.done.get(taskID)
+func (r *Registry) Settled(taskID string, scopeKey ...string) (TaskEntry, bool) {
+	e, _, ok := r.done.get(r.doneKey(taskID, scopeKey))
 	return e, ok
+}
+
+// doneKey resolves a settled-record key: an explicit partition is exact, and
+// a bare id keeps the historical task-id key, falling back to a unique
+// partitioned key so a reclaimed source-scoped task still answers when no
+// other partition carries its id.
+func (r *Registry) doneKey(taskID string, scopeKey []string) string {
+	if len(scopeKey) > 0 && scopeKey[0] != "" {
+		return keyInScope(scopeKey[0], taskID)
+	}
+	if key, found := r.done.findScopedTask(taskID); found {
+		return key
+	}
+	if _, _, ok := r.done.get(taskID); ok {
+		return taskID
+	}
+	if key, found := r.done.findTask(taskID); found {
+		return key
+	}
+	return taskID
 }
 
 // Now is the registry's own clock. The S6 claim path reads it to classify an
@@ -796,13 +866,17 @@ func (r *Registry) Now() time.Time { return r.now() }
 // only gets the settled entry back (first=false), with its verdict, drain
 // bound and settled record untouched. reason is the attribution of a failure
 // Foreman judged itself; the server's own verdicts carry none (§4.1).
-func (r *Registry) MarkTerminal(taskID string, result Result, reason string, completedAt time.Time) (TaskEntry, bool, error) {
+func (r *Registry) MarkTerminal(taskID string, result Result, reason string, completedAt time.Time, scopeKey ...string) (TaskEntry, bool, error) {
 	if completedAt.IsZero() {
 		completedAt = r.now()
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e, ok := r.live[taskID]
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return TaskEntry{}, false, fmt.Errorf("unknown task %s", taskID)
+	}
+	e, ok := r.live[key]
 	if !ok {
 		return TaskEntry{}, false, fmt.Errorf("unknown task %s", taskID)
 	}
@@ -813,7 +887,7 @@ func (r *Registry) MarkTerminal(taskID string, result Result, reason string, com
 		drainDeadline := r.now().Add(r.drainTimeout)
 		r.mu.Unlock()
 		ctx, cancel := r.sharedCtx()
-		entry, first, err := r.shared.CommitTerminal(ctx, e.WorkspaceID, taskID, result, reason, completedAt, drainDeadline)
+		entry, first, err := r.shared.CommitTerminal(ctx, e.ScopeKey(), taskID, result, reason, completedAt, drainDeadline)
 		cancel()
 		r.mu.Lock()
 		if err != nil {
@@ -829,7 +903,7 @@ func (r *Registry) MarkTerminal(taskID string, result Result, reason string, com
 			if at.IsZero() {
 				at = entry.DrainDeadline
 			}
-			r.done.put(taskID, at, settledRecord(entry))
+			r.done.put(key, at, settledRecord(entry))
 		}
 		if first {
 			r.releaseSlotsShared(entry.WorkspaceID)
@@ -849,8 +923,8 @@ func (r *Registry) MarkTerminal(taskID string, result Result, reason string, com
 	// reclaim deletes the live row (ADR-032). Both faces persist: the live
 	// row (drain keeps the credential valid) and the settled record (the
 	// post-reclaim single-task answer, §4.3).
-	r.done.put(taskID, e.CompletedAt, settledRecord(e))
-	r.live[taskID] = e
+	r.done.put(key, e.CompletedAt, settledRecord(e))
+	r.live[key] = e
 	r.persist(taskID, e)
 	r.persistSettled(taskID, settledRecord(e))
 	return e, true, nil
@@ -861,17 +935,27 @@ func (r *Registry) MarkTerminal(taskID string, result Result, reason string, com
 // nothing is writable and the verdict carries no result. expected is the
 // result that report wrote; a mismatch means another path already decided the
 // entry, and the settled verdict stands (§4.2).
-func (r *Registry) SettleNoResult(taskID string, expected Result) (TaskEntry, bool) {
+func (r *Registry) SettleNoResult(taskID string, expected Result, scopeKey ...string) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e, ok := r.live[taskID]
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return TaskEntry{}, false
+	}
+	e, ok := r.live[key]
 	if !ok || e.State != StateTerminal || e.Result != expected {
 		return e, false
+	}
+	settledKey := key
+	if _, _, ok := r.done.get(settledKey); !ok {
+		if _, _, bareOK := r.done.get(taskID); bareOK {
+			settledKey = taskID
+		}
 	}
 	if r.shared != nil {
 		r.mu.Unlock()
 		ctx, cancel := r.sharedCtx()
-		entry, first, err := r.shared.SettleNoResult(ctx, e.WorkspaceID, taskID, expected)
+		entry, first, err := r.shared.SettleNoResult(ctx, e.ScopeKey(), taskID, expected)
 		cancel()
 		r.mu.Lock()
 		if err != nil {
@@ -881,18 +965,18 @@ func (r *Registry) SettleNoResult(taskID string, expected Result) (TaskEntry, bo
 		if !first {
 			return entry, false
 		}
-		if _, at, ok := r.done.get(taskID); ok {
-			r.done.put(taskID, at, settledRecord(entry))
+		if _, at, ok := r.done.get(settledKey); ok {
+			r.done.put(settledKey, at, settledRecord(entry))
 		}
 		r.cacheEntryLocked(entry)
 		return entry, true
 	}
 	e.Result = ""
 	e.FailureReason = ""
-	r.live[taskID] = e
+	r.live[key] = e
 	r.persist(taskID, e)
-	if _, at, ok := r.done.get(taskID); ok {
-		r.done.put(taskID, at, settledRecord(e))
+	if _, at, ok := r.done.get(settledKey); ok {
+		r.done.put(settledKey, at, settledRecord(e))
 		r.persistSettled(taskID, settledRecord(e))
 	}
 	return e, true
@@ -912,10 +996,14 @@ func settledRecord(e TaskEntry) TaskEntry {
 // DecidedReport returns the terminal body registered for the instance. Its
 // presence is the "already decided" criterion of the attribution gate
 // (§4.4, ADR-031).
-func (r *Registry) DecidedReport(taskID string) ([]byte, bool) {
+func (r *Registry) DecidedReport(taskID string, scopeKey ...string) ([]byte, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	e, ok := r.live[taskID]
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return nil, false
+	}
+	e, ok := r.live[key]
 	if !ok || len(e.DecidedReport) == 0 {
 		return nil, false
 	}
@@ -929,10 +1017,14 @@ func (r *Registry) DecidedReport(taskID string) ([]byte, bool) {
 // daemon, owes the server its confirmation. The marker is not a gate field —
 // it changes neither state nor verdict — so the merge of it can never revert a
 // decision another instance made.
-func (r *Registry) MarkCancelAckOwed(taskID string) error {
+func (r *Registry) MarkCancelAckOwed(taskID string, scopeKey ...string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e, ok := r.live[taskID]
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return fmt.Errorf("%w: cancel confirmation", ErrNoLiveEntry)
+	}
+	e, ok := r.live[key]
 	if !ok {
 		return fmt.Errorf("%w: cancel confirmation", ErrNoLiveEntry)
 	}
@@ -940,7 +1032,7 @@ func (r *Registry) MarkCancelAckOwed(taskID string) error {
 		return nil
 	}
 	e.CancelAckOwed = true
-	r.live[taskID] = e
+	r.live[key] = e
 	if r.shared != nil {
 		owed := true
 		return r.mergeNow(taskID, e, EntryPatch{CancelAckOwed: &owed})
@@ -952,15 +1044,19 @@ func (r *Registry) MarkCancelAckOwed(taskID string) error {
 // ClearCancelAckOwed drops the confirmation debt: either Foreman sent it or the
 // daemon's own confirmation landed first (§4.6 兜底一, "daemon 已确认则不代发").
 // A missing entry or an absent marker is a no-op.
-func (r *Registry) ClearCancelAckOwed(taskID string) {
+func (r *Registry) ClearCancelAckOwed(taskID string, scopeKey ...string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e, ok := r.live[taskID]
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return
+	}
+	e, ok := r.live[key]
 	if !ok || !e.CancelAckOwed {
 		return
 	}
 	e.CancelAckOwed = false
-	r.live[taskID] = e
+	r.live[key] = e
 	if r.shared != nil {
 		owed := false
 		r.mergeShared(taskID, e, EntryPatch{CancelAckOwed: &owed})
@@ -974,23 +1070,27 @@ func (r *Registry) ClearCancelAckOwed(taskID string) {
 // compensation or a late report can never displace the body its verdict was
 // forwarded with (§4.4, ADR-031). A missing entry leaves the registry
 // untouched. It returns the entry as it stands after the call.
-func (r *Registry) RegisterDecidedReport(taskID string, body []byte) (TaskEntry, bool) {
+func (r *Registry) RegisterDecidedReport(taskID string, body []byte, scopeKey ...string) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e, ok := r.live[taskID]
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return TaskEntry{}, false
+	}
+	e, ok := r.live[key]
 	if !ok {
 		return TaskEntry{}, false
 	}
 	if len(e.DecidedReport) == 0 && len(body) > 0 {
 		e.DecidedReport = body
-		r.live[taskID] = e
+		r.live[key] = e
 		// The decided body is part of the mapping record (ADR-046 决策 0).
 		// Both call paths register it right after MarkTerminal, whose write
 		// predates this field, so this write-through is what persists it.
 		if r.shared != nil {
 			r.mu.Unlock()
 			ctx, cancel := r.sharedCtx()
-			entry, first, err := r.shared.CommitDecidedReport(ctx, e.WorkspaceID, taskID, body)
+			entry, first, err := r.shared.CommitDecidedReport(ctx, e.ScopeKey(), taskID, body)
 			cancel()
 			r.mu.Lock()
 			if err != nil {
@@ -1017,15 +1117,19 @@ func (r *Registry) RegisterDecidedReport(taskID string, body []byte) (TaskEntry,
 // did not take must not be handed out (ADR-046 决策 7). A caller holds the
 // task write lock and has just read the entry; a missing entry is
 // ErrNoLiveEntry, never a silent success.
-func (r *Registry) SetTokenHash(taskID, tokenHash string) error {
+func (r *Registry) SetTokenHash(taskID, tokenHash string, scopeKey ...string) error {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e, ok := r.live[taskID]
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return fmt.Errorf("%w: token digest", ErrNoLiveEntry)
+	}
+	e, ok := r.live[key]
 	if !ok {
 		return fmt.Errorf("%w: token digest", ErrNoLiveEntry)
 	}
 	e.TokenHash = tokenHash
-	r.live[taskID] = e
+	r.live[key] = e
 	if r.shared != nil {
 		// A row the other instances cannot read the digest from cannot
 		// adjudicate the credential, so the failure reaches the caller.
@@ -1040,17 +1144,21 @@ func (r *Registry) SetTokenHash(taskID, tokenHash string) error {
 // claim's snapshot predates the Job create, so re-Putting that snapshot would
 // revert a prepare-lease renewal the LeaseKeeper landed in the window (lost
 // update). Returns false once the entry is gone or settled.
-func (r *Registry) MarkJobCreated(taskID string, at time.Time) (TaskEntry, bool) {
+func (r *Registry) MarkJobCreated(taskID string, at time.Time, scopeKey ...string) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e, ok := r.live[taskID]
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return TaskEntry{}, false
+	}
+	e, ok := r.live[key]
 	if !ok || e.State == StateTerminal {
 		return TaskEntry{}, false
 	}
 	if r.shared != nil {
 		r.mu.Unlock()
 		ctx, cancel := r.sharedCtx()
-		entry, first, err := r.shared.CommitJobCreated(ctx, e.WorkspaceID, taskID, at)
+		entry, first, err := r.shared.CommitJobCreated(ctx, e.ScopeKey(), taskID, at)
 		cancel()
 		r.mu.Lock()
 		if err != nil {
@@ -1068,7 +1176,7 @@ func (r *Registry) MarkJobCreated(taskID string, at time.Time) (TaskEntry, bool)
 		e.State = StateJobCreated
 	}
 	e.JobCreatedAt = at
-	r.live[taskID] = e
+	r.live[key] = e
 	r.persist(taskID, e)
 	return e, true
 }
@@ -1087,7 +1195,7 @@ func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntr
 	if r.shared != nil {
 		r.mu.Unlock()
 		ctx, cancel := r.sharedCtx()
-		entry, first, err := r.shared.CommitDaemonRegistered(ctx, e.WorkspaceID, e.TaskID, at)
+		entry, first, err := r.shared.CommitDaemonRegistered(ctx, e.ScopeKey(), e.TaskID, at)
 		cancel()
 		r.mu.Lock()
 		if err != nil {
@@ -1104,7 +1212,7 @@ func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntr
 		e.State = StateDaemonRegistered
 	}
 	e.DaemonRegisteredAt = at
-	r.live[e.TaskID] = e
+	r.live[e.Key()] = e
 	r.persist(e.TaskID, e)
 	return e, true
 }
@@ -1130,7 +1238,7 @@ func (r *Registry) MarkDelivering(daemonID string, at time.Time, delivered json.
 		// commits directly).
 		r.mu.Unlock()
 		ctx, cancel := r.sharedCtx()
-		entry, first, err := r.shared.CommitDelivering(ctx, e.WorkspaceID, e.TaskID, delivered, r.deliveryConfirm)
+		entry, first, err := r.shared.CommitDelivering(ctx, e.ScopeKey(), e.TaskID, delivered, r.deliveryConfirm)
 		cancel()
 		r.mu.Lock()
 		if err != nil {
@@ -1153,7 +1261,7 @@ func (r *Registry) MarkDelivering(daemonID string, at time.Time, delivered json.
 	if r.deliveryConfirm > 0 {
 		e.DeliveryDeadline = at.Add(r.deliveryConfirm)
 	}
-	r.live[e.TaskID] = e
+	r.live[e.Key()] = e
 	r.persist(e.TaskID, e)
 	return e, true
 }
@@ -1175,7 +1283,7 @@ func Deliverable(e TaskEntry, at time.Time) bool {
 // (§4.1). The count is the per-task discriminator between "the request never
 // arrived" and "the response was lost": the daemon keeps asking only when it
 // never got the payload.
-func (r *Registry) NoteClaimAfterDelivery(taskID string) {
+func (r *Registry) NoteClaimAfterDelivery(taskID string, scopeKey ...string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.shared != nil {
@@ -1183,9 +1291,13 @@ func (r *Registry) NoteClaimAfterDelivery(taskID string) {
 		// that decides it; counting again here would double it.
 		return
 	}
-	if e, ok := r.live[taskID]; ok {
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return
+	}
+	if e, ok := r.live[key]; ok {
 		e.ClaimsAfterDelivery++
-		r.live[taskID] = e
+		r.live[key] = e
 		r.persist(taskID, e)
 	}
 }
@@ -1196,17 +1308,21 @@ func (r *Registry) NoteClaimAfterDelivery(taskID string) {
 // entry must accept its running daemon's reports). This is the report path
 // only: the C13 adoption paths record the fact with MarkStartFact and leave
 // the state untouched.
-func (r *Registry) MarkStarted(taskID string, at time.Time) (TaskEntry, bool) {
+func (r *Registry) MarkStarted(taskID string, at time.Time, scopeKey ...string) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return TaskEntry{}, false
+	}
 	if r.shared != nil {
-		e, ok := r.live[taskID]
+		e, ok := r.live[key]
 		if !ok {
 			return TaskEntry{}, false
 		}
 		r.mu.Unlock()
 		ctx, cancel := r.sharedCtx()
-		entry, _, err := r.shared.ConfirmStart(ctx, e.WorkspaceID, taskID, at, true)
+		entry, _, err := r.shared.ConfirmStart(ctx, e.ScopeKey(), taskID, at, true)
 		cancel()
 		r.mu.Lock()
 		if err != nil {
@@ -1219,12 +1335,12 @@ func (r *Registry) MarkStarted(taskID string, at time.Time) (TaskEntry, bool) {
 		r.cacheEntryLocked(entry)
 		return entry, true
 	}
-	e, ok := r.startFactLocked(taskID, at)
+	e, ok := r.startFactLocked(key, at)
 	if !ok {
 		return TaskEntry{}, false
 	}
 	e.State = StateRunning
-	r.live[taskID] = e
+	r.live[key] = e
 	r.persist(taskID, e)
 	return e, true
 }
@@ -1233,17 +1349,21 @@ func (r *Registry) MarkStarted(taskID string, at time.Time) (TaskEntry, bool) {
 // (ADR-026 决策结果 1): adoption observes a post-delivery server status, it is
 // not a report, and the projection must keep showing the rebuild's initial
 // phase. started_at is written once; a terminal entry is never reopened.
-func (r *Registry) MarkStartFact(taskID string, at time.Time) (TaskEntry, bool) {
+func (r *Registry) MarkStartFact(taskID string, at time.Time, scopeKey ...string) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return TaskEntry{}, false
+	}
 	if r.shared != nil {
-		e, ok := r.live[taskID]
+		e, ok := r.live[key]
 		if !ok {
 			return TaskEntry{}, false
 		}
 		r.mu.Unlock()
 		ctx, cancel := r.sharedCtx()
-		entry, _, err := r.shared.ConfirmStart(ctx, e.WorkspaceID, taskID, at, false)
+		entry, _, err := r.shared.ConfirmStart(ctx, e.ScopeKey(), taskID, at, false)
 		cancel()
 		r.mu.Lock()
 		if err != nil {
@@ -1256,7 +1376,7 @@ func (r *Registry) MarkStartFact(taskID string, at time.Time) (TaskEntry, bool) 
 		r.cacheEntryLocked(entry)
 		return entry, true
 	}
-	e, ok := r.startFactLocked(taskID, at)
+	e, ok := r.startFactLocked(key, at)
 	if ok {
 		r.persist(taskID, e)
 	}
@@ -1265,15 +1385,15 @@ func (r *Registry) MarkStartFact(taskID string, at time.Time) (TaskEntry, bool) 
 
 // startFactLocked applies the once-only started_at write; the caller holds
 // r.mu and decides whether the state moves.
-func (r *Registry) startFactLocked(taskID string, at time.Time) (TaskEntry, bool) {
-	e, ok := r.live[taskID]
+func (r *Registry) startFactLocked(key string, at time.Time) (TaskEntry, bool) {
+	e, ok := r.live[key]
 	if !ok || e.State == StateTerminal {
 		return TaskEntry{}, false
 	}
 	if e.StartedAt.IsZero() {
 		e.StartedAt = at
 	}
-	r.live[taskID] = e
+	r.live[key] = e
 	return e, true
 }
 
@@ -1281,15 +1401,19 @@ func (r *Registry) startFactLocked(taskID string, at time.Time) (TaskEntry, bool
 // only: the per-node soft cap counts it, and the entry's terminal report is
 // what feeds the session index (LearnSession) — placement itself never
 // learns, because a Job is built before its pod is scheduled.
-func (r *Registry) SetNode(taskID, nodeName string) {
+func (r *Registry) SetNode(taskID, nodeName string, scopeKey ...string) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	e, ok := r.live[taskID]
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return
+	}
+	e, ok := r.live[key]
 	if !ok {
 		return
 	}
 	e.NodeName = nodeName
-	r.live[taskID] = e
+	r.live[key] = e
 	if r.shared != nil {
 		// §4.1/§4.5: node_name is read back through the shared row by the
 		// daemon report path (session learning) and the ops projection, so it
@@ -1356,10 +1480,11 @@ func (r *Registry) Saturated(nodeName string) bool {
 func (r *Registry) dropIndexesLocked(e TaskEntry) {
 	// A reissued job or daemon key may already belong to another entry:
 	// only drop a mapping while it still points at this one.
-	if r.byJob[e.JobName] == e.TaskID {
+	key := e.Key()
+	if r.byJob[e.JobName] == key {
 		delete(r.byJob, e.JobName)
 	}
-	if r.byDaemon[e.DaemonID] == e.TaskID {
+	if r.byDaemon[e.DaemonID] == key {
 		delete(r.byDaemon, e.DaemonID)
 	}
 }

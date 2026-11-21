@@ -1,6 +1,8 @@
 package jobbuilder
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"strings"
@@ -257,9 +259,16 @@ func taskKeyOf(taskID string) string {
 // being renamed behind the deployer's back.
 func (b *Builder) ResolveName(e TaskEntry) (string, error) {
 	format := templateNameFormat(b.template)
-	name := fallbackJobName(e.TaskID)
+	name := fallbackJobName(e)
 	if format != "" {
 		name = renderNameFormat(format, resolveNameValues(e))
+		if e.SourceID != "" {
+			// A template name is display-only. Two servers can carry the same
+			// task id, so the rendered name needs the same source
+			// discriminator the identity name carries; otherwise the second
+			// attempt collides with the first Job object.
+			name = appendIdentitySuffix(name, e)
+		}
 	}
 	if len(name) > maxJobNameLength || !dns1123Label.MatchString(name) {
 		return "", fmt.Errorf("%w: %q does not yield a valid Job name %q", ErrInvalidTaskID, e.TaskID, name)
@@ -284,6 +293,51 @@ func DaemonIDFor(taskID string) string {
 	return "fm-" + taskID
 }
 
+// DaemonIDForInScope derives the identity name for one source partition:
+// fm-<task_id>-<discriminator>. The upstream task id is only unique inside
+// one server, so the source/workspace partition is what keeps two independent
+// servers from producing one Job, Secret and daemon identity. The empty
+// source keeps the historical form unchanged.
+func DaemonIDForInScope(taskID, sourceID, workspaceID string) string {
+	if sourceID == "" {
+		return DaemonIDFor(taskID)
+	}
+	suffix := "-" + identityDiscriminator(sourceID, workspaceID, taskID)
+	budget := maxJobNameLength - len("fm-") - len(suffix)
+	base := taskID
+	if len(base) > budget {
+		base = base[:budget]
+	}
+	base = strings.TrimRight(base, "-")
+	if base == "" {
+		return "fm" + suffix
+	}
+	return "fm-" + base + suffix
+}
+
+// appendIdentitySuffix fits a rendered display name under the label limit and
+// appends the source discriminator.
+func appendIdentitySuffix(name string, e TaskEntry) string {
+	suffix := "-" + identityDiscriminator(e.SourceID, e.WorkspaceID, e.TaskID)
+	budget := maxJobNameLength - len(suffix)
+	if len(name) > budget {
+		name = name[:budget]
+	}
+	name = strings.TrimRight(name, "-")
+	if name == "" {
+		name = "fm"
+	}
+	return name + suffix
+}
+
+// identityDiscriminator is eight hex characters over the full attempt
+// identity: the scope alone is not enough when a long task id is truncated
+// for the name budget.
+func identityDiscriminator(sourceID, workspaceID, taskID string) string {
+	sum := sha256.Sum256([]byte(sourceID + "\x00" + workspaceID + "\x00" + taskID))
+	return hex.EncodeToString(sum[:4])
+}
+
 // CredentialSecretName is the credential Secret of a Job: the identity name
 // plus the fixed suffix (§3). Like the identity it never follows the template's
 // display name.
@@ -293,7 +347,8 @@ func CredentialSecretName(daemonID string) string {
 
 // fallbackJobName is the display name when the template expresses none — equal
 // to the identity name, which is what makes the legacy template
-// (`metadata.name: fm-<task_id>`) behave exactly as before.
-func fallbackJobName(taskID string) string {
-	return DaemonIDFor(taskID)
+// (`metadata.name: fm-<task_id>`) behave exactly as before and keeps the
+// source-scoped attempt distinct.
+func fallbackJobName(e TaskEntry) string {
+	return DaemonIDForInScope(e.TaskID, e.SourceID, e.WorkspaceID)
 }
