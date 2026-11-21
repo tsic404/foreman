@@ -70,7 +70,7 @@ func TestTechOps02HealthEndpointStaysAvailableWhileServing(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	sup := lifecycle.New(logger, health, cancel)
-	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.client.CatalogSlots(), h.metrics)
+	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, proxy.NewProbeCatalogSource(h.sched), h.client.CatalogSlots(), h.metrics)
 	plane := proxy.NewControlPlane(proxy.ControlPlaneOptions{
 		ProxyConfig: h.cfg,
 		Client:      h.client,

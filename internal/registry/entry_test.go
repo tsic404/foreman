@@ -115,18 +115,18 @@ func jobWithMeta(labels, annos map[string]string) batchv1.Job {
 
 func fullJobMeta() (map[string]string, map[string]string) {
 	return map[string]string{
-			LabelManagedBy:   ManagedByForeman,
-			LabelTaskID:      "task-1",
-			LabelAgentID:     "agent-1",
-			LabelWorkspaceID: "ws-1",
-		}, map[string]string{
-			AnnoIssueID:         "issue-1",
-			AnnoIssueIdentifier: "MULTI-1",
-			AnnoDaemonID:        "fm-task-1",
-			AnnoJobRuntimeID:    "rt-1",
-			AnnoClaimedAt:       "2026-10-04T08:30:00Z",
-			AnnoAttempt:         "3",
-		}
+		LabelManagedBy:   ManagedByForeman,
+		LabelTaskID:      "task-1",
+		LabelAgentID:     "agent-1",
+		LabelWorkspaceID: "ws-1",
+	}, map[string]string{
+		AnnoIssueID:         "issue-1",
+		AnnoIssueIdentifier: "MULTI-1",
+		AnnoDaemonID:        "fm-task-1",
+		AnnoJobRuntimeID:    "rt-1",
+		AnnoClaimedAt:       "2026-10-04T08:30:00Z",
+		AnnoAttempt:         "3",
+	}
 }
 
 func TestTaskEntryFromJobRestoresIdentity(t *testing.T) {

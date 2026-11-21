@@ -36,7 +36,7 @@ func TestCatalog07QueuedBudgetExhaustedSkipsTheProbe(t *testing.T) {
 
 	clock := &steppedClock{}
 	logs := &writeBuffer{}
-	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.slots, h.metrics,
+	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, proxy.NewProbeCatalogSource(h.sched), h.slots, h.metrics,
 		proxy.WithReporterClock(clock.now),
 		proxy.WithReporterLogger(slog.New(slog.NewJSONHandler(logs, nil))))
 
@@ -119,7 +119,7 @@ func TestCatalog07QueuedRequestSupersededNeverStarts(t *testing.T) {
 
 	clock := &steppedClock{}
 	logs := &writeBuffer{}
-	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, h.sched, h.slots, h.metrics,
+	reporter := proxy.NewModelCatalogReporter(h.cfg, h.client, proxy.NewProbeCatalogSource(h.sched), h.slots, h.metrics,
 		proxy.WithReporterClock(clock.now),
 		proxy.WithReporterLogger(slog.New(slog.NewJSONHandler(logs, nil))))
 

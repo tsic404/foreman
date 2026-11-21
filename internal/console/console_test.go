@@ -46,6 +46,7 @@ func TestConsoleServesTheShellAndItsModules(t *testing.T) {
 		"/admin/assets/console.css":    "text/css",
 		"/admin/assets/lib/ui.mjs":     "text/javascript",
 		"/admin/assets/lib/agents.mjs": "text/javascript",
+		"/admin/assets/lib/cli.mjs":    "text/javascript",
 	}
 	for path, kind := range files {
 		rec := serve(t, http.MethodGet, path)

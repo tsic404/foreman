@@ -153,7 +153,7 @@ func newReporterHarness(t *testing.T, cfg Config) *reporterHarness {
 	h.reporter = NewModelCatalogReporter(
 		cfg,
 		h.client,
-		h.probes,
+		NewProbeCatalogSource(h.probes),
 		h.slots,
 		h.metrics,
 		WithReporterClock(func() time.Time { return h.now }),

@@ -1,10 +1,11 @@
 // Package bootstrap resolves one replica's startup declaration: the
-// control-plane holder runs the startup probe unless a published declaration
-// already exists (restart / takeover reuse it with no re-registration), and a
-// follower adopts what the holder published (02-contracts.md §0 术语
-// 「leader」, §1.1 注册体的取值来源, AC-77). cmd/foreman and the
-// assembly-level acceptance tests share this code so the startup path is
-// exercised by the same functions in production and under test.
+// control-plane holder registers the published CLI/config declarations unless
+// a published declaration already exists (restart / takeover reuse it with no
+// re-registration), and a follower adopts what the holder published
+// (02-contracts.md §0 术语「leader」, §1.1 注册体的取值来源, AC-77).
+// cmd/foreman and the assembly-level acceptance tests share this code so the
+// startup path is exercised by the same functions in production and under
+// test.
 package bootstrap
 
 import (
@@ -17,19 +18,17 @@ import (
 	"github.com/tsic404/foreman/internal/coordination"
 	"github.com/tsic404/foreman/internal/proxy"
 	"github.com/tsic404/foreman/internal/registry"
-	"github.com/tsic404/foreman/internal/scheduler"
 	"github.com/tsic404/foreman/internal/state"
 )
 
 // StartupDiscoveries resolves this replica's declaration set.
 //
-// The startup probe is a deployment-level discovery, not a per-workspace one:
-// RunStartupProbe has no workspace filter and the probe daemon registers
-// according to the template's own scope (02-contracts §1.1). What prevents a
-// re-registration is the merge below: MergeDiscoveries adopts the published
-// declaration of every workspace that has one and takes the probe body only
-// for the workspaces that have none, so an identity that was already
-// registered is never declared again (AC-77).
+// The control-plane discoverer is the only cold-start source: it reads the
+// verified CLI/config declarations and registers them in-process. No probe Job
+// is created, and a workspace with no verified declaration stays unavailable.
+// What prevents a re-registration is the merge below: MergeDiscoveries adopts
+// the published declaration of every workspace that has one and takes the
+// control-plane body only for the workspaces that have none (AC-77).
 //
 // A follower only reads what the holder published and never probes or
 // registers. A declaration read failure is not an empty declaration set: the
@@ -38,12 +37,14 @@ func StartupDiscoveries(
 	ctx context.Context,
 	leader *coordination.Leader,
 	coord state.CoordStore,
-	sched *scheduler.Scheduler,
+	discover func(context.Context) (map[string]registry.Discovery, error),
 	clients []*proxy.Client,
-	probeWindow time.Duration,
+	declarationWindow time.Duration,
 	log *slog.Logger,
 ) (map[string]registry.Discovery, error) {
-	wait := probeWindow + scheduler.ProbeEndpointWait(probeWindow) + 30*time.Second
+	// The holder no longer runs a probe Job, so the wait only bounds how long
+	// a follower waits for the holder's published declaration.
+	wait := declarationWindow + 30*time.Second
 	if wait < time.Minute {
 		wait = time.Minute
 	}
@@ -59,16 +60,16 @@ func StartupDiscoveries(
 			log.Info("runtime.declaration_adopted", "reason", "published_by_control_plane_holder")
 			return AdoptDeclarations(clients, records, log), nil
 		case leader.Held():
-			// The probe's scope is the template's, not this list; the merge
-			// keeps the published identities and uses the probe only for the
-			// workspaces that have none.
-			probed, perr := sched.RunStartupProbe(ctx)
-			if perr != nil {
-				return nil, perr
+			if discover == nil {
+				return nil, errors.New("no control-plane discovery is wired")
+			}
+			discovered, derr := discover(ctx)
+			if derr != nil {
+				return nil, derr
 			}
 			log.Info("runtime.declaration_merged",
-				"adopted", len(records), "probed", len(probed), "missing", len(missing))
-			return MergeDiscoveries(clients, records, probed, log), nil
+				"adopted", len(records), "discovered", len(discovered), "missing", len(missing))
+			return MergeDiscoveries(clients, records, discovered, log), nil
 		case err != nil:
 			// A follower must not turn a store failure into an empty
 			// declaration set: it keeps waiting for the holder's publication.

@@ -693,6 +693,50 @@ func TestOnClaimWithoutBootBoundWritesNoDeadline(t *testing.T) {
 	}
 }
 
+// TestClaimFreezesReleaseFacts pins the V2-C05 input: the claim stores the
+// release and configuration facts once, and a later mutation of the provider's
+// maps cannot change the entry.
+func TestClaimFreezesReleaseFacts(t *testing.T) {
+	f := newFixture(t)
+	digests := map[string]string{"linux/amd64": "a"}
+	f.sched.cfg.ClaimFacts = func(context.Context, string, string, string, string) ClaimFacts {
+		return ClaimFacts{
+			MulticaVersion: "2.0.0", MulticaDigests: digests, CLIKnown: true,
+			AgentVersion: "3.0.0", AgentDigests: map[string]string{"linux/arm64": "b"}, AgentKnown: true,
+			ConfigRevision: 7, ConfigKnown: true,
+		}
+	}
+	e := f.claim(t, "task-1")
+	if !e.CLIFactsKnown || e.CLIVersion != "2.0.0" || e.CLIDigests["linux/amd64"] != "a" {
+		t.Fatalf("CLI facts = %+v, want the frozen Multica line", e)
+	}
+	if !e.AgentFactsKnown || e.AgentCLIVersion != "3.0.0" || e.AgentCLIDigests["linux/arm64"] != "b" {
+		t.Fatalf("Agent facts = %+v, want the frozen Agent line", e)
+	}
+	if !e.ConfigFactsKnown || e.ConfigRevision != 7 {
+		t.Fatalf("config facts = %+v, want revision 7", e)
+	}
+	digests["linux/amd64"] = "mutated"
+	if e.CLIDigests["linux/amd64"] != "a" {
+		t.Fatal("the entry aliases the provider's digest map")
+	}
+}
+
+// TestClaimPassesThePerAttemptConfigIdentity: the claim and the first
+// per-attempt projection must address the same frozen configuration binding.
+func TestClaimPassesThePerAttemptConfigIdentity(t *testing.T) {
+	f := newFixture(t)
+	var got string
+	f.sched.cfg.ClaimFacts = func(_ context.Context, _, _, _, attemptID string) ClaimFacts {
+		got = attemptID
+		return ClaimFacts{}
+	}
+	e := f.claim(t, "task-1")
+	if want := registry.AttemptID(e.TaskID, e.Attempt); got != want {
+		t.Fatalf("claim facts attempt id = %q, want %q", got, want)
+	}
+}
+
 func TestOnClaimCreatesSecretJobAndEntry(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "task-1")

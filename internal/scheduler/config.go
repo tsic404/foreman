@@ -151,6 +151,39 @@ type Config struct {
 	// settled as a visible refusing claim, not silently dropped, because the
 	// upstream did confirm it to someone (04-architecture.md §3.1).
 	DispatchGate func(ctx context.Context, workspaceID, agentID, realRuntimeID string, claimedRuntimeIDs []string) (owned, known bool)
+	// ClaimFacts freezes the release and configuration facts one attempt
+	// resolves at claim time. The impact preview reads these facts instead of
+	// inferring a version from StartedAt (02-contracts V2-C05). A nil seam
+	// leaves every fact unknown.
+	ClaimFacts ClaimFactsFunc
+}
+
+// ClaimFacts is one claim's release snapshot. The *Known flags separate a
+// genuine empty fact from a fact the deployment could not resolve.
+type ClaimFacts struct {
+	MulticaVersion string
+	MulticaDigests map[string]string
+	AgentVersion   string
+	AgentDigests   map[string]string
+	ConfigRevision uint64
+	CLIKnown       bool
+	AgentKnown     bool
+	ConfigKnown    bool
+}
+
+// ClaimFactsFunc resolves one claim's release facts. attemptID is the stable
+// per-attempt configuration identity (registry.AttemptID).
+type ClaimFactsFunc func(ctx context.Context, workspaceID, agentID, runtimeIdentity, attemptID string) ClaimFacts
+
+func cloneDigests(values map[string]string) map[string]string {
+	if values == nil {
+		return nil
+	}
+	out := make(map[string]string, len(values))
+	for key, value := range values {
+		out[key] = value
+	}
+	return out
 }
 
 // LoadConfig reads the scheduler configuration from env (os.Getenv when

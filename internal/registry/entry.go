@@ -28,6 +28,13 @@ const (
 	StateTerminal         State = "terminal"
 )
 
+// AttemptID is the per-attempt identity used to freeze the configuration
+// projection. The claim and every later consumer derive it from the task and
+// attempt so they address the same binding.
+func AttemptID(taskID string, attempt int) string {
+	return fmt.Sprintf("%s-%d", taskID, attempt)
+}
+
 // Result classifies a terminal entry; set only when State == StateTerminal.
 type Result string
 
@@ -185,6 +192,20 @@ type TaskEntry struct {
 	// may answer for it. Persisted in the shared state snapshot like
 	// RealRuntimeID, and restored from the Job annotations (§4.3).
 	RuntimeIdentity string `json:"-"`
+
+	// The release facts the claim resolved. They are frozen here so an impact
+	// preview never has to infer a run's version from StartedAt or from the
+	// release history that may already have moved (V2-C05). The two lines are
+	// kept apart because a Multica run and an Agent run resolve different
+	// definitions. A false *Known flag is a fact gap, not an empty version.
+	CLIVersion       string            `json:"-"`
+	CLIDigests       map[string]string `json:"-"`
+	AgentCLIVersion  string            `json:"-"`
+	AgentCLIDigests  map[string]string `json:"-"`
+	ConfigRevision   uint64            `json:"-"`
+	CLIFactsKnown    bool              `json:"-"`
+	AgentFactsKnown  bool              `json:"-"`
+	ConfigFactsKnown bool              `json:"-"`
 
 	// Payload: raw claim payload until MarkDelivering replaces it with the
 	// delivered body — the form the ops preview must serve (S6 / AC-07). It

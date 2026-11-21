@@ -235,3 +235,40 @@ func TestStartupDiscoveriesHolderFailsFastOnDeclarationReadErrors(t *testing.T) 
 		t.Fatalf("err = %v, want the store failure", err)
 	}
 }
+
+// TestStartupDiscoveriesHolderUsesTheControlPlaneSeam: a missing declaration
+// is resolved by the in-process discoverer, never by a probe Job.
+func TestStartupDiscoveriesHolderUsesTheControlPlaneSeam(t *testing.T) {
+	client := bootstrapTestClient(t, "ws-a")
+	store := &fakeDeclarationStore{rows: map[string][]byte{}}
+	leader := coordination.New(heldLeaseStore{}, "holder", bootstrapTestLeaseConfig())
+	log := slog.New(slog.NewJSONHandler(io.Discard, nil))
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = leader.Run(ctx) }()
+	if !leader.WaitHeld(ctx, 5*time.Second) {
+		t.Fatal("the holder never acquired the lease")
+	}
+	called := 0
+	discover := func(context.Context) (map[string]registry.Discovery, error) {
+		called++
+		return map[string]registry.Discovery{
+			"ws-a": {
+				CLIVersion: "2.0.0",
+				Runtimes: []registry.DiscoveredRuntime{{
+					Name: "omp", Type: "omp", Version: "1.0.0",
+				}},
+			},
+		}, nil
+	}
+	out, err := StartupDiscoveries(ctx, leader, store, discover, []*proxy.Client{client}, time.Second, log)
+	if err != nil {
+		t.Fatalf("StartupDiscoveries: %v", err)
+	}
+	if called != 1 {
+		t.Fatalf("discover calls = %d, want 1", called)
+	}
+	if out["ws-a"].CLIVersion != "2.0.0" || len(out["ws-a"].Runtimes) != 1 {
+		t.Fatalf("discoveries = %+v, want the control-plane declaration", out)
+	}
+}

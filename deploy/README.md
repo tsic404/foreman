@@ -130,6 +130,55 @@ curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/admin/overview
 | `GET /admin/overview` | — | the four counts and the in-progress rows |
 | `GET /admin/audit` | `?server_id=` | audit rows, newest first |
 
+The CLI, Agent configuration and restricted discovery faces sit beside the
+catalog routes on the same credential:
+
+| Route | Body / query | Answer |
+|---|---|---|
+| `GET /admin/cli` | — | CLI release lines with their platform set, candidates and pointers |
+| `POST /admin/cli` | `{"cli_id","kind","adapter","server_id","required_platforms","minimum_version","manifest_url","auto_check","check_period_s","auto_release"}` | `201` and the definition view |
+| `GET /admin/cli/{cli_id}` | — | one definition view |
+| `PATCH /admin/cli/{cli_id}/settings` | `{"auto_check","check_period_s","auto_release"}` | the updated view; checking and auto-release are independent |
+| `POST /admin/cli/{cli_id}/check` | — | the check report; a manual check works with auto-check off |
+| `POST /admin/cli/{cli_id}/versions` | `{"version","artifacts":[{"platform":{"os","arch"},"url","sha256","size"}]}` | `201` and the candidate list |
+| `POST /admin/cli/{cli_id}/release` | `{"version","expected_generation","expected_release_generation"}` | `200` published, `409` stale candidate or release generation, `422` verification failed |
+| `GET /admin/cli/{cli_id}/impact` | `?version=&generation=&release_generation=` | the read-only next-start preview; an untrusted scope is `known:false`, never a zero count |
+| `GET /admin/cli/{cli_id}/artifacts/{sha256}` | — | the verified artifact bytes retained by the cache; an unknown digest is `404` |
+| `GET /admin/cli-audit` | — | release/check audit, including the pre-release impact snapshot |
+| `GET /admin/agent-configs` | `?server_id=&workspace_id=` | config revisions; the content is never returned |
+| `PUT /admin/agent-configs/{server}/{workspace}/{backend}` | `{"profile","file_name","secret_ref","config"}` | the recorded revision; the virtual JSON is validated and discarded |
+| `GET /admin/agent-configs/{server}/{workspace}/{backend}/projection` | `?profile=&attempt_id=` | the per-attempt read-only projection description |
+| `GET /admin/agent-configs/audit` | — | config writes without content |
+| `POST /admin/discovery/requests` | `{"server_id","workspace_id","runtime_id","profile","kind","cli_id","adapter","platform","config_revision"}` | the persisted request/result; duplicate upstream ids reconcile once |
+| `GET /admin/discovery/requests` | `?server_id=&workspace_id=` | request history |
+| `GET /admin/discovery/adapters` | — | the adapter trust table |
+| `POST /admin/discovery/adapters/verify` | — | probe every adapter |
+| `POST /admin/discovery/adapters/{name}/verify` | — | probe one adapter |
+| `GET /admin/discovery/models` | `?server_id=&workspace_id=&runtime_id=&profile=` | the current model catalog; legal empty, unsupported and failed are distinct |
+
+The three metadata documents live on the same writable emptyDir as the catalog
+registry: `FOREMAN_CLI_STATE_FILE` (default
+`/var/lib/foreman/cli-releases.json`), `FOREMAN_AGENT_CONFIG_STATE_FILE`
+(`/var/lib/foreman/agent-configs.json`) and `FOREMAN_DISCOVERY_STATE_FILE`
+(`/var/lib/foreman/discovery.json`). They carry release pointers, revisions and
+redacted results only — never artifact bytes, configuration content or a
+Secret value. Verified CLI bytes live in the separate
+`FOREMAN_CLI_ARTIFACT_CACHE_DIR` (default `/var/lib/foreman/cli-cache`),
+addressable only by release domain and frozen digest; a damaged entry is a
+miss and is refetched from the registered source by the same digest.
+`FOREMAN_OMP_BINARY` (default `omp`) names the binary used by the startup
+command-surface probe. Execution uses the published, verified CLI artifact
+and the exact configuration revision; a deployment that does not mount either
+leaves omp unsupported. It never reports an empty model list as success.
+Codex and Claude stay `unsupported` until their command/protocol surfaces are
+verified for the pinned versions.
+
+The Agent configuration surface is a prototype boundary: it validates a
+fictional JSON document, records the digest/size/revision and never creates a
+real Secret. The Job-side projection consumes the returned per-attempt
+description; a production deployment still has to wire the selected revision
+to its Secret manager.
+
 The binding write needs an upstream that can make it conditional on the value
 that was read. The pinned Multica API's `PUT /api/agents/{id}` is
 unconditional — no version or `If-Match` — so the adapter reports the

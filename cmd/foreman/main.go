@@ -333,7 +333,21 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	// CLI release pointers, Agent configuration revisions and the restricted
+	// discovery face. They share the ops credential and the console page
+	// beside the catalog surface; each keeps its own route table.
+	managementAdmin, releaseService, discoveryService, configService, err := newCLISurface(getenv, catalogService, catalogAdmin, clientSet, reg, baseLog)
+	if err != nil {
+		return err
+	}
 	schedCfg.DispatchGate = catalogService.ClaimOwned
+	// The claim freezes the configuration binding it will project. The CLI
+	// versions stay unknown until the Job consumer reports what it actually
+	// executed: the management pointer is not execution evidence (V2-C05).
+	schedCfg.ClaimFacts = releaseClaimFacts{
+		configs:  configService,
+		sourceID: runSourceResolver(catalogService, clientSet),
+	}.Facts
 
 	// Project identity (ADR-048): one adapter answers both platform queries —
 	// the startup policy project name → identifier resolution the builder's
@@ -517,7 +531,7 @@ func run() error {
 		}
 		opsSrv = &http.Server{
 			Addr:              *opsListen,
-			Handler:           newOpsRoot(ops, catalogAdmin, obsCfg.OpsCredentials),
+			Handler:           newOpsRoot(ops, managementAdmin, obsCfg.OpsCredentials),
 			ReadHeaderTimeout: readHeaderTimeout,
 		}
 	} else {
@@ -540,6 +554,9 @@ func run() error {
 	// The automatic sync loop is a critical loop: a stopped catalog sync means
 	// every source's directory silently ages past its period.
 	run("catalog-sync", catalogService.Run)
+	// The automatic CLI check is independent of the release switch: the loop
+	// runs a due check, and Check decides whether an auto release follows.
+	run("release-check", releaseService.Run)
 	runWorkspace := run
 	if workspaces.Len() > 1 {
 		// A workspace identity's control plane failing at runtime is confined
@@ -561,9 +578,8 @@ func run() error {
 		run("instance-liveness", leader.HeartbeatInstance)
 	}
 
-	// Startup orchestration (ADR-025): the startup probe runs before C1, so
-	// the server sees the template environment's real runtimes. The listener
-	// must already be serving — the probe daemon registers through it.
+	// Startup orchestration: the control-plane declaration is resolved before
+	// C1. The listener is already serving for the registration call.
 	listener, err := net.Listen("tcp", *listen)
 	if err != nil {
 		return fmt.Errorf("listen %s: %w", *listen, err)
@@ -578,21 +594,13 @@ func run() error {
 		go func() { serveErr <- opsSrv.Serve(opsListener) }()
 	}
 
-	// §1.6 startup order: the profile snapshot is fetched before the startup
-	// probe, so the probe's daemon reads S-3 as the truth for the profiles it
-	// declares. 404 (old server) and failure are not fatal: S-3 answers 404 or
-	// 503, and the probe continues with the builtin runtime.
-	//
 	// Startup credential checks already ran before the policy gate (they seed
-	// the display names the partition-key resolution reads), so the probe is
-	// the next startup step.
+	// the display names the partition-key resolution reads). The control-plane
+	// discovery reads the published CLI/config declarations and registers
+	// them in-process; no probe Job is created.
 
-	var discoveries map[string]registry.Discovery
-	if leader != nil {
-		discoveries, err = bootstrap.StartupDiscoveries(ctx, leader, coord, sched, clientSet.All(), schedCfg.StartupProbeTimeout, log)
-	} else {
-		discoveries, err = sched.RunStartupProbe(ctx)
-	}
+	startupDiscovery := newControlPlaneDiscovery(catalogService, releaseService, discoveryService, configService, clientSet, baseLog)
+	discoveries, err := resolveStartupDiscoveries(ctx, leader, coord, startupDiscovery, clientSet.All(), schedCfg.StartupProbeTimeout, log)
 	if err != nil {
 		// Fail-fast, visible: no registration inside the window means the
 		// template (or the probe) is not runnable, and Foreman must not
@@ -644,7 +652,8 @@ func run() error {
 			"failed_profiles", len(discovery.FailedProfiles))
 	}
 	if len(served) == 0 {
-		return errors.New("no configured workspace was declared by the startup probe")
+		log.Warn("foreman.serving_unavailable",
+			"detail", "no configured workspace has a verified control-plane declaration; the management surface stays available")
 	}
 	// §9.1 服务事件: one line after the probe, with the effective service
 	// scope and the discovered-but-unregistered members. The set is fixed for
@@ -666,7 +675,14 @@ func run() error {
 	// beside it can list one of those Jobs and write its payload-less
 	// projection over the live entry — losing the payload, the token digest
 	// and the boot/lease deadlines.
-	if leader != nil && !leader.Held() {
+	if len(served) == 0 {
+		// Nothing is declared, so there is no Job face to rebuild and no
+		// claim loop to start. The management surface stays up for the
+		// declarations that make a later restart serve; a K8s failure here
+		// must not turn an empty declaration set into a crash loop.
+		log.Warn("foreman.scheduler_idle",
+			"detail", "no served workspace; registry rebuild and scheduler loops wait for a verified declaration")
+	} else if leader != nil && !leader.Held() {
 		// A follower restores the shared rows so it serves any Job's daemon
 		// face; rebuilding from K8s and converging belong to the leader
 		// (§4.3 阶段二重建职责).
@@ -681,7 +697,10 @@ func run() error {
 
 	for _, c := range served {
 		workspaceID := c.WorkspaceID()
-		reporter := proxy.NewModelCatalogReporter(proxyCfg, c, sched, c.CatalogSlots(), metrics,
+		reporter := proxy.NewModelCatalogReporter(proxyCfg, c,
+			newDiscoveryCatalogSource(discoveryService, catalogService, releaseService, configService, c),
+			c.CatalogSlots(), metrics,
+			proxy.WithCatalogSlotReplay(false),
 			proxy.WithReporterLogger(baseLog))
 		plane := proxy.NewControlPlane(proxy.ControlPlaneOptions{
 			ProxyConfig: proxyCfg,
