@@ -34,8 +34,13 @@ func TestOverviewCountsDistinctObjectsAcrossSources(t *testing.T) {
 		Credentials:       catalogtest.Credentials{},
 		Clock:             clock.Now,
 		ManagedRuntimeIDs: managedRuntimes,
-		EnvironmentCount:  func() int { return environments },
-		RunIndex:          &staticRuns{},
+		EnvironmentCount: func(_ context.Context, grant catalog.Grant) int {
+			if grant.IsDeploymentWide() {
+				return environments
+			}
+			return len(grant.Scopes)
+		},
+		RunIndex: &staticRuns{},
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -98,6 +103,9 @@ func TestOverviewCountsDistinctObjectsAcrossSources(t *testing.T) {
 	}
 	if narrowed.Counts.Agents != 2 {
 		t.Fatalf("narrowed agents = %d, want the two ws-core managed agents", narrowed.Counts.Agents)
+	}
+	if narrowed.Counts.Environments != 2 {
+		t.Fatalf("narrowed environments = %d, want the count over the two scopes", narrowed.Counts.Environments)
 	}
 }
 

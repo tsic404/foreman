@@ -83,7 +83,7 @@ func (s *Service) Overview(ctx context.Context, grant Grant) (OverviewView, erro
 	counts.Agents = len(agents)
 	counts.EnvironmentsAvailable = s.cfg.EnvironmentCount != nil
 	if counts.EnvironmentsAvailable {
-		counts.Environments = s.cfg.EnvironmentCount()
+		counts.Environments = s.cfg.EnvironmentCount(ctx, grant)
 	}
 
 	if s.cfg.RunIndex != nil {

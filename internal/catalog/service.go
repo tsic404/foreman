@@ -48,10 +48,10 @@ type Config struct {
 	// RunIndex is the coordinator's in-flight attempt face. Nil reports the
 	// run facts as unavailable.
 	RunIndex RunIndex
-	// EnvironmentCount is the registered remote environment count. Nil means
-	// the environment registry is not wired (the environment lifecycle is a
-	// separate delivery).
-	EnvironmentCount func() int
+	// EnvironmentCount is the registered remote environment count over the
+	// caller's grant. Nil means the environment registry is not wired (the
+	// environment lifecycle is a separate delivery).
+	EnvironmentCount func(context.Context, Grant) int
 	// Clock is the service's single clock seam.
 	Clock func() time.Time
 	// Logger defaults to slog.Default.
