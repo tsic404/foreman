@@ -40,7 +40,8 @@ func buildForemanBinary(t *testing.T) string {
 // the outcome. Ambient FOREMAN_*/MULTICA_* keys and KUBECONFIG are dropped so
 // the caller's environment cannot change the verdict; an override replaces the
 // base value, including with the empty string.
-func foremanStartupEnv(serverURL string, overrides map[string]string) []string {
+func foremanStartupEnv(t *testing.T, serverURL string, overrides map[string]string) []string {
+	t.Helper()
 	env := make([]string, 0, len(os.Environ())+8)
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
@@ -50,10 +51,11 @@ func foremanStartupEnv(serverURL string, overrides map[string]string) []string {
 		env = append(env, entry)
 	}
 	merged := map[string]string{
-		"MULTICA_SERVER_URL":    serverURL,
-		"MULTICA_WORKSPACE_ID":  "ws-a",
-		"MULTICA_TOKEN":         "mdt_ws-a",
-		"FOREMAN_JOB_TOKEN_KEY": strings.Repeat("ab", 32),
+		"MULTICA_SERVER_URL":             serverURL,
+		"MULTICA_WORKSPACE_ID":           "ws-a",
+		"MULTICA_TOKEN":                  "mdt_ws-a",
+		"FOREMAN_JOB_TOKEN_KEY":          strings.Repeat("ab", 32),
+		"FOREMAN_ENVIRONMENT_STATE_FILE": filepath.Join(t.TempDir(), "environments.json"),
 	}
 	for key, value := range overrides {
 		merged[key] = value
@@ -77,7 +79,7 @@ func runForeman(t *testing.T, bin, serverURL string, overrides map[string]string
 	defer cancel()
 	cmd := exec.CommandContext(ctx, bin)
 	cmd.Dir = t.TempDir()
-	cmd.Env = foremanStartupEnv(serverURL, overrides)
+	cmd.Env = foremanStartupEnv(t, serverURL, overrides)
 	var stdout, stderr strings.Builder
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

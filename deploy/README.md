@@ -6,8 +6,8 @@ Everything is plain YAML — `kubectl apply -f deploy/` installs it in one pass.
 | File | Objects |
 |---|---|
 | `00-namespaces.yaml` | `Namespace foreman`, `Namespace multica-agents` |
-| `10-secrets.yaml` | `Secret foreman-secret` (ns foreman), `Secret registry-tsic` (ns multica-agents + ns foreman) |
-| `20-rbac.yaml` | `ServiceAccount foreman` + `Role`/`RoleBinding` (ns multica-agents), `ServiceAccount multica-omp`, `ServiceAccount foreman-gc` |
+| `10-secrets.yaml` | `Secret foreman-secret` (ns foreman), `Secret registry-tsic` (ns multica-agents + ns foreman), `Secret foreman-environment-registry` (ns foreman) |
+| `20-rbac.yaml` | `ServiceAccount foreman` + `Role`/`RoleBinding` (ns multica-agents), the environment-registry `Role`/`RoleBinding` (ns foreman), `ServiceAccount multica-omp`, `ServiceAccount foreman-gc` |
 | `25-job-template.yaml` | `ConfigMap foreman-job-template` (ns foreman) — the required Job template, mounted by the Deployment |
 | `26-job-policy.yaml` | `ConfigMap foreman-job-policy` (ns foreman) — the **optional** three-axis job policy, mounted by the Deployment |
 | `30-foreman.yaml` | `Deployment foreman` (1 replica) + `Service foreman` (ClusterIP :8080, the Job face only) + `Service foreman-ops` (ClusterIP :8081, the credential-gated ops surface) |
@@ -189,6 +189,110 @@ surface stays read-only rather than risk overwriting another administrator.
 Calls always carry the agent's workspace (the `workspace_id` query and the
 `X-Workspace-ID` header); the pre-read, the write and the read-back all name
 it, and an answer naming another agent or workspace is refused.
+
+### Environment management (`/admin/environments`)
+
+The management surface registers rsbxd targets and drives their lifecycle. A
+registration is a **stable environment id**, never a Kubernetes Node or a Pod
+affinity rule: selection uses only the registered trust domain, allowed
+sources, capabilities and free slots. A target is stored as `pending` after a
+failed verification and is never a scheduling candidate; only a successful
+probe of identity, capabilities and capacity makes it active.
+
+```bash
+curl -s -H "Authorization: Bearer $TOKEN" localhost:8081/admin/environments
+curl -s -H "Authorization: Bearer $TOKEN" -X POST localhost:8081/admin/environments -d '{
+  "id":"build-a",
+  "endpoint":"build-a.example.test:7443",
+  "tls_ref":"ref/build-a",
+  "state_root":"/srv/rsbx/build-a",
+  "trust_domain":"build",
+  "allowed_sources":["atlas"],
+  "capabilities":["nix"],
+  "concurrency":4,
+  "expected_identity":"sha256:…"
+}'
+curl -s -H "Authorization: Bearer $TOKEN" -X POST localhost:8081/admin/environments/build-a/drain
+curl -s -H "Authorization: Bearer $TOKEN" -X POST localhost:8081/admin/environments/build-a/resume
+curl -s -H "Authorization: Bearer $TOKEN" -X DELETE localhost:8081/admin/environments/build-a
+```
+
+| Route | Body / query | Answer |
+|---|---|---|
+| `GET /admin/environments` | `?trust_domain=&source_id=` | registrations the credential's sources reach |
+| `POST /admin/environments` | the registration above | `201` and the environment view; a failed probe still stores the target as `pending` |
+| `GET /admin/environments/{id}` | — | one environment view |
+| `PATCH /admin/environments/{id}` | any registration field | the updated view; identity-affecting edits become `stale` and need `verify` |
+| `POST /admin/environments/{id}/verify` | — | the verification outcome; a failure is a `200` view with the failure on its face |
+| `POST /admin/environments/{id}/drain` | — | `draining`; new slots are refused, live sessions are not evicted |
+| `POST /admin/environments/{id}/resume` | — | `active` when the verification is still valid |
+| `DELETE /admin/environments/{id}` | — | `200` with the tombstone, or `409` with every retirement blocker |
+| `GET /admin/environments/retired` | — | retirement tombstones the credential reaches |
+| `GET /admin/environments/{id}/slots` | — | the active and isolated slot ledger |
+| `POST /admin/environments/{id}/slots/{slot}/confirm` | — | clears an isolated slot after the remote close is confirmed |
+| `GET /admin/environments/{id}/cleanups` | — | pending non-slot cleanups |
+| `POST /admin/environments/{id}/cleanups/{cleanup}/confirm` | — | clears one confirmed cleanup |
+| `GET /admin/environments/audit` | — | environment audit rows, newest first |
+
+Registration, edit, verify, drain, resume, retirement and cleanup confirmation
+need the deployment-wide credential; a workspace-bound credential may read
+only the environments whose `allowed_sources` is empty (every source) or
+intersects its source grant.
+Retirement is refused while an active slot, an isolated slot with an
+unconfirmed close, a pending cleanup or a published/drafted rule still
+references the environment. It removes the registration and keeps a tombstone;
+it never deletes remote files, sessions or Nix roots. A retired id cannot be
+reused. A replacement physical tree at the same address must register a new
+id, and an edit cannot move an existing id to another `state_root`.
+
+The environment registry lives in the `foreman-environment-registry` Secret
+(`FOREMAN_ENVIRONMENT_STATE_SECRET` / `FOREMAN_ENVIRONMENT_STATE_NAMESPACE`),
+not on a Pod volume: registrations, isolated slots and retirement tombstones
+survive a Deployment rollout or Pod eviction, and a retired id stays retired.
+The Secret object ships without a `data` key; Foreman owns the
+`environments.json` key and only needs `get`/`update` on that one object. A
+missing or malformed Secret refuses startup instead of rebuilding an empty
+pool. `FOREMAN_ENVIRONMENT_STATE_FILE` is a development/test fallback used only
+when Foreman runs without a Kubernetes client; it is node-local and is not
+part of the Deployment.
+
+`FOREMAN_ENVIRONMENT_TRUST_DOMAINS` is the comma-separated data-residency
+allowlist. It has no implicit "allow everything" mode: when it is empty every
+registration is refused, and a target whose domain was removed from the list
+leaves the candidate pool after a restart until an operator either restores
+the grant or moves the registration to an approved domain. The shipped
+Deployment leaves it empty on purpose; set the domains this installation is
+approved to use before registering a machine.
+
+Verification runs the deployment-supplied helper named by
+`FOREMAN_ENVIRONMENT_PROBE` directly (no shell). The helper receives the
+target as one JSON document in `FOREMAN_ENVIRONMENT_TARGET`:
+
+```json
+{"endpoint":"build-a.example.test:7443","tls_ref":"ref/build-a",
+ "state_root":"/srv/rsbx/build-a","trust_domain":"build",
+ "allowed_sources":["atlas"],"capabilities":["nix"],"concurrency":4}
+```
+
+It answers on stdout:
+
+```json
+{"tree_id":"…","identity":"sha256:…","capabilities":["nix"],
+ "capacity":8,"version":"rsbxd-…"}
+```
+
+`tree_id` is the persistent tree's ownership identity, not the endpoint;
+duplicate trees are refused and the same endpoint with a new tree supersedes
+the old registration. A `state_root` path is not an ownership key: two hosts
+commonly use the same path, so different endpoints with the same root remain
+separate trees. A tree id observed by a failed first attempt is only an
+observation; it does not freeze the registration, so fixing the endpoint or
+TLS identity and verifying again works under the same id. The helper must
+report a non-empty identity, every declared capability and a capacity at least
+the configured concurrency.
+Unknown fields, trailing JSON, a nonzero exit, a timeout or malformed output
+fail verification and leave the target `pending`. With no helper configured,
+every registration stays pending rather than guessing reachability.
 
 The management console itself is served from the same listener:
 
