@@ -55,6 +55,20 @@ type slotWrite struct {
 	cleared  int64
 }
 
+func (f *fakeCoordStore) Slots(_ context.Context, ws string) (int64, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.counts[ws], nil
+}
+
+func (f *fakeCoordStore) LockTask(context.Context, string, string, string, time.Duration) (bool, error) {
+	return true, nil
+}
+
+func (f *fakeCoordStore) UnlockTask(context.Context, string, string, string) error {
+	return nil
+}
+
 // ReserveSlot mints the reservation id the store keeps as the zset member and
 // hands it back as the caller's retire handle. The workspace hook models the
 // call that spends the last of a call budget: it runs inside the workspace

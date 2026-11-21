@@ -41,6 +41,25 @@ import {
   validateVersion,
   versionForm,
 } from "../assets/lib/cli.mjs";
+import {
+  draftRules,
+  OUTCOME_LABELS,
+  outcomeLabel,
+  previewRequest,
+  previewForm,
+  previewAgentKey,
+  previewSelection,
+  readinessRequest,
+  renderPreview,
+  renderReadiness,
+  renderRules,
+  renderRuleOutcome,
+  ruleEditor,
+  ruleFromForm,
+  ruleLevel,
+  ruleLevelLabel,
+  ruleOutcome,
+} from "../assets/lib/rules.mjs";
 
 const OVERVIEW = {
   counts: {
@@ -427,11 +446,12 @@ test("BIND-03 closes the editor with a reason when the source cannot be written"
   assert.doesNotMatch(html, /data-act="submit-binding"/, "a read-only source still renders a submit button");
 });
 
-test("BIND-03 shows the management class and keeps the readiness action honest", () => {
+test("BIND-03 shows the management class and offers the readiness check", () => {
   const html = renderAgents(DIRECTORY.agents);
   assert.match(html, /Foreman 托管/);
   assert.match(html, /非管理/);
-  assert.match(html, /就绪检查接口尚未提供/, "the page must say the readiness API is missing instead of faking it");
+  assert.match(html, /按 Issue 检查就绪/);
+  assert.match(html, /data-act="ready-check"/);
 });
 
 test("BIND-03 escapes upstream names before they reach the page", () => {
@@ -729,4 +749,443 @@ test("the CLI page renders every management section without a placeholder", () =
     assert.match(html, new RegExp(section));
   }
   assert.doesNotMatch(html, /由 CLI 与配置交付范围提供/);
+});
+
+// RULE-05 / V2-C01 ----------------------------------------------------------
+
+const RULE = {
+  id: "a5",
+  server_id: "atlas",
+  workspace_id: "core",
+  agent_id: "dev",
+  project_id: "p-1",
+  environment_id: "build-a",
+  trust_domain: "build",
+  required_capabilities: ["nix"],
+  prefer_capabilities: ["gpu"],
+  enabled: true,
+};
+
+const RULES_STATE = {
+  revision: 3,
+  published: [RULE],
+  draft: [
+    RULE,
+    { ...RULE, id: "a3", project_id: "", environment_id: "build-b" },
+    { ...RULE, id: "a4", agent_id: "", environment_id: "build-c" },
+  ],
+  draft_base_revision: 3,
+  history: [
+    { revision: 2, rules: [{ ...RULE, id: "a5", environment_id: "build-b" }], published_at: "2026-11-20T10:00:00Z", actor: "ops" },
+    { revision: 3, rules: [RULE], published_at: "2026-11-20T11:00:00Z", actor: "ops" },
+  ],
+  findings: [
+    {
+      code: "rule_conflict",
+      message: "a3 and a4 can both match atlas/core dev without a combined rule",
+      rule_id: "a3",
+      field: "environment_id",
+      remediation: { label: "规则管理", path: "/admin/rules" },
+    },
+  ],
+};
+
+const PREVIEW = {
+  server_id: "atlas",
+  workspace_id: "core",
+  agent_id: "dev",
+  issue_id: "issue-1",
+  project_id: "p-1",
+  project_known: true,
+  runtime_id: "rt-foreman",
+  provider: "codex",
+  management: "foreman",
+  source_generation: 3,
+  source_synced_at: "2026-11-20T12:00:00Z",
+  rules_revision: 3,
+  outcome: "ready",
+  rule_id: "a5",
+  rule_level: "combined",
+  rule_decisions: [
+    { rule_id: "a5", level: "combined", matched: true, selected: true, reason: "highest matching level" },
+    { rule_id: "a3", level: "single-dimension", matched: true, selected: false, reason: "masked by a combined rule for the same pair" },
+    { rule_id: "a4", level: "single-dimension", matched: false, selected: false, reason: "project condition did not match" },
+  ],
+  environment_decisions: [
+    { id: "build-a", selected: true, free_slots: 1, reason: "" },
+    { id: "build-b", selected: false, free_slots: 0, reason: "no free slot" },
+  ],
+  environment: {
+    id: "build-a",
+    endpoint: "build-a.example.test:7443",
+    trust_domain: "build",
+    capabilities: ["nix", "gpu"],
+    concurrency: 2,
+    free_slots: 1,
+  },
+  slot_id: "",
+  clis: {
+    platform: "linux/amd64",
+    multica_version: "1.4.0",
+    multica_sha256: "aaa",
+    agent_version: "0.167.1",
+    agent_sha256: "bbb",
+  },
+  config: {
+    known: true,
+    revision: 7,
+    secret_ref: "ref/codex-config",
+    file_name: "config.json",
+    sha256: "ccc",
+    readability: "verified",
+  },
+  template: { name: "foreman-job", namespace: "foreman", note: "a rule never changes it" },
+  findings: [],
+  checked_at: "2026-11-20T12:05:00Z",
+};
+
+const READINESS = {
+  ...PREVIEW,
+  checks: [
+    { key: "source", label: "来源目录", status: "ready", detail: "目录代际 3 可读", evidence_at: "2026-11-20T12:00:00Z" },
+    {
+      key: "agent",
+      label: "Agent 实际绑定",
+      status: "unmanaged",
+      detail: "the agent's actual runtime is not operated by Foreman",
+      evidence_at: "2026-11-20T12:04:00Z",
+      remediation: { label: "Agent 管理", path: "/admin/agents" },
+    },
+    {
+      key: "config",
+      label: "Agent 配置 Secret",
+      status: "unknown",
+      detail: "配置 Secret 缺少投影身份可读性验证事实",
+      evidence_at: "2026-11-20T12:04:30Z",
+      remediation: { label: "Agent 配置", path: "/admin/agent-configs" },
+    },
+  ],
+  outcome: "unmanaged",
+  primary: {
+    code: "unmanaged_runtime",
+    message: "the agent's actual runtime is not operated by Foreman",
+    rule_id: "",
+    remediation: { label: "Agent 管理", path: "/admin/agents" },
+  },
+};
+
+test("RULE-05 shows the published revision, the draft and the publish refusal findings", () => {
+  const html = renderRules(RULES_STATE, { serverID: "atlas", workspaceID: "core" });
+  assert.match(html, /发布修订 3/);
+  assert.match(html, /草稿未发布/);
+  assert.match(html, /Agent × Project · a5/);
+  assert.match(html, /rule_conflict/);
+  assert.match(html, /a3 and a4 can both match/);
+  assert.match(html, /data-act="rule-publish"/);
+  assert.match(html, /data-act="rule-rollback"/);
+  assert.match(html, /build-a/);
+  assert.match(html, /data-act="rule-edit"/);
+});
+
+test("RULE-05 does not read the service's empty draft as deleting every rule", () => {
+  assert.deepEqual(draftRules({ revision: 0, published: [], draft: [], draft_base_revision: 0 }), []);
+  assert.deepEqual(
+    draftRules({ revision: 0, published: [], draft: [RULE], draft_base_revision: 0 }),
+    [RULE],
+    "a draft saved before the first publish must remain visible",
+  );
+  assert.deepEqual(
+    draftRules({ revision: 2, published: [RULE], draft: [], draft_base_revision: 2 }),
+    [],
+    "a stored empty draft must stay empty",
+  );
+});
+
+test("RULE-05 preview names runtime, both CLI lines, the secret reference and the fixed template", () => {
+  const html = renderPreview(PREVIEW, { serverID: "atlas", workspaceID: "core" });
+  assert.match(html, /当前可接单/);
+  assert.match(html, /rt-foreman/);
+  assert.match(html, /codex/);
+  assert.match(html, /a5/);
+  assert.match(html, /masked by a combined rule/);
+  assert.match(html, /project condition did not match/);
+  assert.match(html, /build-a/);
+  assert.match(html, /linux\/amd64/);
+  assert.match(html, /1\.4\.0/);
+  assert.match(html, /0\.167\.1/);
+  assert.match(html, /ref\/codex-config/);
+  assert.match(html, /foreman-job/);
+  assert.match(html, /a rule never changes it/);
+  assert.match(html, /预览不占槽/);
+});
+
+test("RULE-05 preview keeps a blocked resolution out of the ready tone", () => {
+  const blocked = {
+    ...PREVIEW,
+    outcome: "config_blocked",
+    findings: [
+      {
+        code: "agent_cli_missing",
+        field: "platform",
+        message: "codex CLI is not published for linux/arm64",
+        remediation: { label: "CLI 发布", path: "/admin/cli" },
+      },
+    ],
+  };
+  const html = renderPreview(blocked, { serverID: "atlas", workspaceID: "core" });
+  assert.match(html, /配置阻断/);
+  assert.doesNotMatch(html, /class="call ok"/);
+  assert.match(html, /codex CLI is not published/);
+  assert.match(html, /全部解析问题/);
+  assert.match(html, /data-act="go" data-id="cli"/);
+});
+
+test("RULE-05 a hitting preview can still be not ready", () => {
+  const unknown = {
+    ...PREVIEW,
+    outcome: "unknown",
+    project_known: false,
+    findings: [
+      {
+        code: "project_unknown",
+        message: "the issue's project identity could not be read",
+        remediation: { label: "Multica 管理", path: "/admin/servers" },
+      },
+    ],
+  };
+  const html = renderPreview(unknown, { serverID: "atlas", workspaceID: "core" });
+  assert.match(html, /状态未知/);
+  assert.match(html, /a5/);
+  assert.match(html, /命中并选中/);
+  assert.match(html, /不代表稍后仍可接单/);
+  assert.match(html, /data-act="go" data-id="sources"/);
+});
+
+test("RULE-05 does not call a non-blocking finding a blocker on a ready preview", () => {
+  const readyWithFinding = {
+    ...PREVIEW,
+    findings: [
+      {
+        code: "config_unverified",
+        message: "the selected configuration Secret has no verified readability fact",
+        remediation: { label: "Agent 配置", path: "/admin/agent-configs" },
+      },
+    ],
+  };
+  const html = renderPreview(readyWithFinding, { serverID: "atlas", workspaceID: "core" });
+  assert.match(html, /当前可接单/);
+  assert.doesNotMatch(html, /主阻因/);
+  assert.match(html, /全部解析问题/);
+  assert.match(html, /data-act="go" data-id="cli"/);
+});
+
+test("V2-C01 readiness shows the five-state verdict, evidence times, primary blocker and repair entry", () => {
+  for (const [outcome, label] of Object.entries(OUTCOME_LABELS)) {
+    assert.equal(outcomeLabel(outcome), label[0]);
+  }
+  const html = renderReadiness(READINESS, { serverID: "atlas", workspaceID: "core" });
+  assert.match(html, /非托管/);
+  assert.match(html, /2026-11-20 12:00:00/);
+  assert.match(html, /2026-11-20 12:04:30/);
+  assert.match(html, /主阻因/);
+  assert.match(html, /actual runtime is not operated by Foreman/);
+  assert.match(html, /data-act="go" data-id="agents"/);
+  assert.match(html, /data-act="go" data-id="cli"/);
+  assert.match(html, /只读快照/);
+});
+
+test("V2-C01 renders each of the five verdicts on the readiness page", () => {
+  for (const outcome of Object.keys(OUTCOME_LABELS)) {
+    const report = {
+      ...READINESS,
+      outcome,
+      primary: outcome === "ready" ? null : READINESS.primary,
+    };
+    const html = renderReadiness(report, { serverID: "atlas", workspaceID: "core" });
+    assert.match(html, new RegExp(OUTCOME_LABELS[outcome][0]), `the ${outcome} verdict is not rendered`);
+  }
+});
+
+test("V2-C01 readiness does not hide a single blocker behind a green total", () => {
+  const saturated = {
+    ...READINESS,
+    outcome: "temporarily_saturated",
+    checks: [
+      ...READINESS.checks,
+      {
+        key: "capacity",
+        label: "当前槽位",
+        status: "temporarily_saturated",
+        detail: "环境 build-a 快照空闲 0/2",
+        evidence_at: "2026-11-20T12:05:00Z",
+        remediation: { label: "运行环境", path: "/admin/environments" },
+      },
+    ],
+    primary: {
+      code: "environment_saturated",
+      message: "no environment slot is available",
+      remediation: { label: "运行环境", path: "/admin/environments" },
+    },
+  };
+  const html = renderReadiness(saturated, { serverID: "atlas", workspaceID: "core" });
+  assert.match(html, /暂时满载/);
+  assert.match(html, /no environment slot is available/);
+  assert.match(html, /data-act="go" data-id="environments"/);
+  assert.match(html, /0\/2/);
+});
+
+test("V2-C01 does not present a missing primary blocker as ready", () => {
+  const html = renderReadiness(
+    { ...READINESS, outcome: "unknown", primary: null },
+    { serverID: "atlas", workspaceID: "core" },
+  );
+  assert.match(html, /状态未知/);
+  assert.doesNotMatch(html, /没有主阻因/);
+  assert.match(html, /未给出主阻因/);
+});
+
+test("the request builders keep the Issue authoritative and drop empty fields", () => {
+  assert.deepEqual(
+    previewRequest({ server_id: "atlas", workspace_id: "core", agent_id: "dev", issue_id: "issue-1", project_id: "" }),
+    { server_id: "atlas", workspace_id: "core", agent_id: "dev", issue_id: "issue-1" },
+  );
+  assert.deepEqual(
+    readinessRequest({ server_id: "atlas", workspace_id: "core", agent_id: "dev", issue_id: "issue-1" }),
+    { server_id: "atlas", workspace_id: "core", agent_id: "dev", issue_id: "issue-1" },
+  );
+  assert.deepEqual(
+    readinessRequest({ server_id: "atlas", workspace_id: "core", agent_id: "dev", issue_id: "issue-1", project_id: "p-1" }),
+    { server_id: "atlas", workspace_id: "core", agent_id: "dev", issue_id: "issue-1" },
+    "the readiness check takes the project from the Issue, never from the form",
+  );
+  assert.deepEqual(
+    previewRequest({ server_id: "atlas", workspace_id: "core", agent_id: "dev", issue_id: "issue-1", prior_session_id: "session-1" }),
+    { server_id: "atlas", workspace_id: "core", agent_id: "dev", issue_id: "issue-1", prior_session_id: "session-1" },
+    "a continuation preview must be able to name the original session",
+  );
+});
+
+test("the preview takes Server and Workspace from the chosen Agent, not from the filter", () => {
+  const context = {
+    serverID: "atlas",
+    workspaceID: "lab",
+    agents: [
+      { server_id: "atlas", workspace_id: "core", agent_id: "dev", name: "开发 Agent" },
+      { server_id: "atlas", workspace_id: "lab", agent_id: "ops", name: "运维 Agent" },
+    ],
+  };
+  assert.deepEqual(
+    previewSelection(context, { agent_id: previewAgentKey(context.agents[0]) }),
+    { server_id: "atlas", workspace_id: "core", agent_id: "dev" },
+  );
+  assert.deepEqual(
+    previewSelection(context, { agent_id: previewAgentKey(context.agents[1]) }),
+    { server_id: "atlas", workspace_id: "lab", agent_id: "ops" },
+  );
+  assert.deepEqual(
+    previewSelection({ serverID: "atlas", workspaceID: "core", agents: [] }, {}),
+    { server_id: "atlas", workspace_id: "core", agent_id: "" },
+    "an unknown agent falls back to the visible scope instead of sending an empty id",
+  );
+  const form = previewForm(context, { agent_id: previewAgentKey(context.agents[0]) });
+  assert.match(form, /开发 Agent/);
+  assert.match(form, /core/);
+  assert.match(form, /selected/);
+});
+
+test("the preview keeps two agents with the same ID in different Workspaces apart", () => {
+  const context = {
+    serverID: "atlas",
+    workspaceID: "core",
+    agents: [
+      { server_id: "atlas", workspace_id: "core", agent_id: "dev", name: "开发 Agent" },
+      { server_id: "atlas", workspace_id: "lab", agent_id: "dev", name: "实验 Agent" },
+    ],
+  };
+  const form = previewForm(context, {});
+  const values = [...form.matchAll(/<option value="([^"]*)"[^>]*>([^<]*)<\/option>/g)].map((match) => match[1]);
+  assert.equal(new Set(values).size, values.length, "two rows with one agent ID must not collapse into one option");
+  assert.equal((form.match(/ selected/g) ?? []).length, 0, "an untouched preview selects no Agent");
+  const selectedForm = previewForm(context, { agent_id: previewAgentKey(context.agents[1]) });
+  assert.equal((selectedForm.match(/ selected/g) ?? []).length, 1, "a chosen identity selects exactly one row");
+  assert.match(selectedForm, /实验 Agent/);
+  assert.doesNotMatch(selectedForm, /开发 Agent \/ core \/ dev"/, "the option value stays the identity key, not the label");
+  assert.deepEqual(
+    previewSelection(context, { agent_id: previewAgentKey(context.agents[1]) }),
+    { server_id: "atlas", workspace_id: "lab", agent_id: "dev" },
+  );
+});
+
+test("the Agent page offers the readiness entry instead of a disabled placeholder", () => {
+  const html = renderAgents(DIRECTORY.agents);
+  assert.match(html, /data-act="ready-check"/);
+  assert.doesNotMatch(html, /就绪检查接口尚未提供/);
+  assert.match(html, /按 Issue 检查就绪/);
+});
+
+test("the rule editor carries every condition the endpoint accepts", () => {
+  const html = ruleEditor(RULE);
+  for (const name of [
+    "id",
+    "server_id",
+    "workspace_id",
+    "agent_id",
+    "project_id",
+    "environment_id",
+    "trust_domain",
+    "required_capabilities",
+    "prefer_capabilities",
+    "enabled",
+  ]) {
+    assert.match(html, new RegExp(`name="${name}"`), `the editor has no ${name} field`);
+  }
+  assert.equal(ruleLevelLabel("combined"), "Agent × Project");
+  assert.equal(ruleLevel({ server_id: "atlas", workspace_id: "core", agent_id: "dev" }), "single-dimension");
+  assert.equal(ruleLevel({ server_id: "atlas" }), "server");
+  assert.equal(ruleLevel({}), "global");
+});
+
+test("RULE-05 keeps a conflict refusal distinct from a moved revision", () => {
+  const refused = ruleOutcome(409, {
+    error: "the rule set is invalid",
+    findings: [{ code: "rule_conflict", message: "a3 and a4 disagree", remediation: { label: "规则管理", path: "/admin/rules" } }],
+  });
+  assert.equal(refused.success, false);
+  assert.match(refused.title, /拒绝|校验/);
+  assert.match(renderRuleOutcome(refused), /rule_conflict/);
+  assert.match(renderRuleOutcome(refused), /data-act="go" data-id="rules"/);
+
+  const stale = ruleOutcome(409, { error: "the rules changed since this base revision" });
+  assert.equal(stale.success, false);
+  assert.match(stale.title, /修订已变化/);
+  assert.doesNotMatch(renderRuleOutcome(stale), /rule_conflict/);
+
+  assert.equal(ruleOutcome(200, { revision: 4 }).success, true);
+});
+
+test("RULE-05 turns the editor form into the endpoint's rule shape", () => {
+  const rule = ruleFromForm({
+    id: "a5",
+    server_id: "atlas",
+    workspace_id: "core",
+    agent_id: "dev",
+    project_id: "p-1",
+    environment_id: "build-a",
+    trust_domain: "build",
+    required_capabilities: "nix, gpu",
+    prefer_capabilities: "gpu",
+    enabled: "off",
+  });
+  assert.deepEqual(rule, {
+    id: "a5",
+    server_id: "atlas",
+    workspace_id: "core",
+    agent_id: "dev",
+    project_id: "p-1",
+    environment_id: "build-a",
+    trust_domain: "build",
+    required_capabilities: ["nix", "gpu"],
+    prefer_capabilities: ["gpu"],
+    enabled: false,
+  });
 });

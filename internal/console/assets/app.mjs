@@ -44,6 +44,21 @@ import {
   validateVersion,
   versionForm,
 } from "./lib/cli.mjs";
+import {
+  draftRules,
+  emptyPreview,
+  previewForm,
+  previewRequest,
+  previewSelection,
+  readinessRequest,
+  renderPreview,
+  renderReadiness,
+  renderRuleOutcome,
+  renderRules,
+  ruleEditor,
+  ruleFromForm,
+  ruleOutcome,
+} from "./lib/rules.mjs";
 import { callout, emptyState, esc } from "./lib/ui.mjs";
 
 const PAGES = [
@@ -86,8 +101,7 @@ const PAGES = [
     icon: "04",
     area: "ADMINISTRATION / RULES",
     title: "规则管理与预览",
-    subtitle: "由规则交付范围提供；本次只保留入口位置。",
-    placeholder: true,
+    subtitle: "按 Server、Workspace、Agent 与 Project 选择远端环境；预览不占槽，也不改变 runtime。",
   },
   {
     id: "cli",
@@ -120,6 +134,13 @@ const state = {
   agentFilter: { server: "", workspace: "" },
   agentDirectory: null,
   staleAgents: false,
+  rules: {
+    view: null,
+    directory: null,
+    filter: { server: "", workspace: "" },
+    preview: null,
+    previewValues: {},
+  },
   cli: { definitions: [], audit: [] },
   configs: { rows: [], audit: [] },
   discovery: {
@@ -307,6 +328,71 @@ async function renderAgentsPage(root) {
   root.innerHTML = (state.renderedNotice || "") + agentFiltersHTML() + renderAgents(state.agents);
 }
 
+function rulesFiltersHTML() {
+  const servers = state.sources
+    .map((source) => `<option value="${esc(source.server_id)}" ${source.server_id === state.rules.filter.server ? "selected" : ""}>${esc(source.server_id)} · ${esc(source.url)}</option>`)
+    .join("");
+  const workspaces = (state.rules.directory?.workspaces ?? [])
+    .map((workspace) => `<option value="${esc(workspace.workspace_id)}" ${workspace.workspace_id === state.rules.filter.workspace ? "selected" : ""}>${esc(workspace.name)} / ${esc(workspace.workspace_id)}</option>`)
+    .join("");
+  return `<div class="scope">
+    <label>Multica Server<select data-act="rule-filter" data-field="server"><option value="">全部可见来源</option>${servers}</select></label>
+    <label>Workspace<select data-act="rule-filter" data-field="workspace"><option value="">全部 Workspace</option>${workspaces}</select></label>
+  </div>`;
+}
+
+function rulesContext() {
+  return {
+    serverID: state.rules.filter.server,
+    workspaceID: state.rules.filter.workspace,
+    agents: state.rules.directory?.agents ?? [],
+  };
+}
+
+async function loadRuleDirectory(serverID) {
+  if (!serverID) {
+    state.rules.directory = null;
+    return;
+  }
+  const response = await api(`/admin/servers/${encodeURIComponent(serverID)}/directory`);
+  if (response.status === 200) {
+    state.rules.directory = response.body;
+    return;
+  }
+  state.rules.directory = null;
+  if (response.status === 404) {
+    throw new Error("该来源不在授权范围，或目录不可读。");
+  }
+}
+
+async function renderRulesPage(root) {
+  root.innerHTML = emptyState("读取规则…");
+  await ensureSources();
+  if (!state.rules.filter.server && state.sources.length > 0) {
+    state.rules.filter.server = state.sources[0].server_id;
+  }
+  if (state.rules.filter.server) {
+    await loadRuleDirectory(state.rules.filter.server);
+  }
+  const workspaces = state.rules.directory?.workspaces ?? [];
+  if (workspaces.length > 0 && !workspaces.some((workspace) => workspace.workspace_id === state.rules.filter.workspace)) {
+    state.rules.filter.workspace = workspaces[0].workspace_id;
+  }
+  const response = await api("/admin/rules");
+  if (response.status !== 200) {
+    throw new Error(errorText(response.status, response.body));
+  }
+  state.rules.view = response.body;
+  const context = rulesContext();
+  const preview = state.rules.preview ? renderPreview(state.rules.preview, context) : emptyPreview(context);
+  root.innerHTML =
+    (state.renderedNotice || "") +
+    rulesFiltersHTML() +
+    renderRules(state.rules.view, context) +
+    `<section class="panel"><div class="between"><h2>任务预览 · ${esc(context.serverID)} / ${esc(context.workspaceID)}</h2></div>${previewForm(context, state.rules.previewValues)}</section>` +
+    preview;
+}
+
 async function renderAuditPage(root) {
   root.innerHTML = emptyState("读取审计…");
   const audit = await api("/admin/audit");
@@ -439,6 +525,8 @@ async function render() {
       await renderSourcesPage(root);
     } else if (page.id === "agents") {
       await renderAgentsPage(root);
+    } else if (page.id === "rules") {
+      await renderRulesPage(root);
     } else if (page.id === "cli") {
       await renderCLIPagePage(root);
     } else {
@@ -579,6 +667,195 @@ async function submitBinding(form) {
   state.staleAgents = true;
   if (outcome.success) {
     state.pageNotice = renderBindingResult(outcome);
+  }
+}
+
+function ruleDraftList() {
+  const view = state.rules.view;
+  if (!view) {
+    return [];
+  }
+  return draftRules(view);
+}
+
+function openRuleEditor(rule = {}) {
+  openDialog(dialogHead(rule.id ? `编辑规则 ${rule.id}` : "添加环境规则") + ruleEditor(rule));
+}
+
+function openReadinessDialog(key) {
+  const agent = findAgent(key);
+  if (!agent) {
+    return;
+  }
+  openDialog(
+    dialogHead(`按 Issue 检查就绪 · ${agent.name}`) +
+      `<p class="sub">${esc(agent.server_id)} / ${esc(agent.workspace_id)} / ${esc(agent.agent_id)}。检查只读：不认领、不注册、不下载、不占槽，也不改变绑定。</p>` +
+      `<form id="readiness-form" class="fields" data-key="${esc(key)}">
+        <label>Issue ID<input name="issue_id" required placeholder="issue-1" autocomplete="off"></label>
+        <div class="form-actions"><button type="submit" class="primary">运行就绪检查</button><button type="button" data-act="close-dialog">取消</button></div>
+        <p class="hint">Project 由 Issue 解析。结论分为当前可接单、配置阻断、暂时满载、状态未知和非托管；每一项都会给出证据时点和修复入口。</p>
+      </form>
+      <div id="readiness-result"></div>`,
+  );
+}
+
+async function submitRuleDraft(form) {
+  const values = formValues(form);
+  const rule = ruleFromForm(values);
+  if (rule.id === "") {
+    showFormErrors(form, { id: "规则 ID 不能为空。" });
+    return;
+  }
+  const existingID = form.dataset.id ?? "";
+  const rules = ruleDraftList();
+  const index = existingID === "" ? -1 : rules.findIndex((item) => item.id === existingID);
+  if (rules.some((item, position) => item.id === rule.id && position !== index)) {
+    showFormErrors(form, { id: "同一草稿里已经存在这个规则 ID。" });
+    return;
+  }
+  if (index >= 0) {
+    rules[index] = rule;
+  } else {
+    rules.push(rule);
+  }
+  const response = await saveRuleDraft(rules);
+  if (response.status === 200) {
+    state.rules.view = response.body;
+    state.rules.preview = null;
+    closeDialog();
+    state.pageNotice = callout("草稿已保存", "发布前仍会重新校验；同级冲突或悬空引用会拒绝发布，已发布版本保持不变。");
+    await render();
+    return;
+  }
+  form.insertAdjacentHTML("beforebegin", renderRuleOutcome(ruleOutcome(response.status, response.body)));
+}
+
+async function saveRuleDraft(rules) {
+  const revision = Number(state.rules.view?.revision ?? 0);
+  return api("/admin/rules/draft", { method: "PUT", body: { base_revision: revision, rules } });
+}
+
+async function removeRule(id) {
+  const rules = ruleDraftList().filter((rule) => rule.id !== id);
+  const response = await saveRuleDraft(rules);
+  if (response.status === 200) {
+    state.rules.view = response.body;
+    state.rules.preview = null;
+    state.pageNotice = callout("草稿已更新", `规则 ${id} 已从草稿移除；发布后才会影响新任务。`);
+  } else {
+    state.pageNotice = renderRuleOutcome(ruleOutcome(response.status, response.body));
+  }
+  await render();
+}
+
+async function reloadRules() {
+  const response = await api("/admin/rules");
+  if (response.status === 200) {
+    state.rules.view = response.body;
+  }
+}
+
+async function publishRules() {
+  const revision = Number(state.rules.view?.revision ?? 0);
+  const response = await api("/admin/rules/publish", { method: "POST", body: { base_revision: revision } });
+  if (response.status === 200) {
+    state.rules.preview = null;
+    state.pageNotice = callout("规则已发布", `新修订 r${Number(response.body?.revision ?? 0)}；回滚不改在途快照。`);
+    await reloadRules();
+  } else {
+    state.pageNotice = renderRuleOutcome(ruleOutcome(response.status, response.body));
+    await reloadRules();
+  }
+  await render();
+}
+
+async function rollbackRules(revision) {
+  const base = Number(state.rules.view?.revision ?? 0);
+  const response = await api("/admin/rules/rollback", {
+    method: "POST",
+    body: { revision: Number(revision), base_revision: base },
+  });
+  if (response.status === 200) {
+    state.rules.preview = null;
+    state.pageNotice = callout("已回滚", `历史修订 r${revision} 已重新校验并发布为 r${Number(response.body?.revision ?? 0)}。`);
+    await reloadRules();
+  } else {
+    state.pageNotice = renderRuleOutcome(ruleOutcome(response.status, response.body));
+    await reloadRules();
+  }
+  await render();
+}
+
+async function discardRules() {
+  const published = state.rules.view?.published ?? [];
+  const response = await saveRuleDraft(published);
+  if (response.status === 200) {
+    state.rules.view = response.body;
+    state.rules.preview = null;
+    state.pageNotice = callout("草稿已重置", "草稿内容恢复为当前已发布版本；发布修订没有变化。");
+  } else {
+    state.pageNotice = renderRuleOutcome(ruleOutcome(response.status, response.body));
+  }
+  await render();
+}
+
+async function submitRulePreview(form) {
+  const context = rulesContext();
+  const values = formValues(form);
+  const selection = previewSelection(context, values);
+  const payload = previewRequest({
+    ...values,
+    server_id: selection.server_id,
+    workspace_id: selection.workspace_id,
+    agent_id: selection.agent_id,
+  });
+  if (!payload.issue_id || !payload.agent_id) {
+    showFormErrors(form, {
+      ...(payload.issue_id ? {} : { issue_id: "需要 Issue ID。" }),
+      ...(payload.agent_id ? {} : { agent_id: "需要选择一个 Agent。" }),
+    });
+    return;
+  }
+  const response = await api("/admin/rules/preview", { method: "POST", body: payload });
+  if (response.status === 200) {
+    state.rules.preview = response.body;
+    state.rules.previewValues = values;
+    state.pageNotice = callout("预览完成", "这是只读快照；实际派发会重新解析并原子预留。");
+  } else {
+    state.pageNotice = failure("预览未完成", errorText(response.status, response.body));
+  }
+  await render();
+}
+
+async function submitReadiness(form) {
+  const agent = findAgent(form.dataset.key);
+  if (!agent) {
+    return;
+  }
+  const values = formValues(form);
+  if (String(values.issue_id ?? "").trim() === "") {
+    showFormErrors(form, { issue_id: "需要 Issue ID。" });
+    return;
+  }
+  const payload = readinessRequest({
+    ...values,
+    server_id: agent.server_id,
+    workspace_id: agent.workspace_id,
+    agent_id: agent.agent_id,
+  });
+  const response = await api("/admin/readiness", { method: "POST", body: payload });
+  const box = $("readiness-result");
+  if (!box) {
+    return;
+  }
+  if (response.status === 200) {
+    box.innerHTML = renderReadiness(response.body, {
+      serverID: agent.server_id,
+      workspaceID: agent.workspace_id,
+      agentID: agent.agent_id,
+    });
+  } else {
+    box.innerHTML = failure("就绪检查未完成", errorText(response.status, response.body));
   }
 }
 
@@ -983,6 +1260,7 @@ document.addEventListener("click", (event) => {
   const id = control.dataset.id ?? "";
   switch (action) {
     case "go":
+      closeDialog();
       location.hash = `#/${id}`;
       return;
     case "connect":
@@ -1029,6 +1307,27 @@ document.addEventListener("click", (event) => {
       return;
     case "edit-binding":
       openBindingEditor(id);
+      return;
+    case "ready-check":
+      openReadinessDialog(id);
+      return;
+    case "rule-add":
+      openRuleEditor();
+      return;
+    case "rule-edit":
+      openRuleEditor(ruleDraftList().find((rule) => rule.id === id));
+      return;
+    case "rule-remove":
+      removeRule(id);
+      return;
+    case "rule-publish":
+      publishRules();
+      return;
+    case "rule-rollback":
+      rollbackRules(id);
+      return;
+    case "rule-discard":
+      discardRules();
       return;
     case "add-cli":
       openCLIDefinitionDialog();
@@ -1084,6 +1383,14 @@ document.addEventListener("change", (event) => {
       state.agentFilter.workspace = "";
     }
     render();
+  } else if (control.dataset.act === "rule-filter") {
+    state.rules.filter[control.dataset.field] = control.value;
+    if (control.dataset.field === "server") {
+      state.rules.filter.workspace = "";
+      state.rules.directory = null;
+    }
+    state.rules.preview = null;
+    render();
   }
 });
 
@@ -1101,6 +1408,12 @@ document.addEventListener("submit", (event) => {
     submitSettings(form);
   } else if (form.id === "binding-form") {
     submitBinding(form);
+  } else if (form.id === "readiness-form") {
+    submitReadiness(form);
+  } else if (form.id === "rule-form") {
+    submitRuleDraft(form);
+  } else if (form.id === "rule-preview-form") {
+    submitRulePreview(form);
   } else if (form.id === "cli-definition-form") {
     submitCLIDefinition(form);
   } else if (form.id === "cli-settings-form") {

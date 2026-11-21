@@ -79,6 +79,15 @@ func New(cfg Config) (*Service, error) {
 	}, nil
 }
 
+// RuleReferenceIndex answers the concrete index this service was configured
+// with. The rule manager fills it so a retired environment cannot be deleted
+// out from under a drafted or published rule. Nil means the deployment did not
+// wire a rule manager.
+func (s *Service) RuleReferenceIndex() *MemoryRuleReferences {
+	refs, _ := s.cfg.RuleReferences.(*MemoryRuleReferences)
+	return refs
+}
+
 // storeConflictRetries bounds how many times a transaction is re-run after the
 // durable store reports that another writer committed first.
 const storeConflictRetries = 3

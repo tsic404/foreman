@@ -168,11 +168,16 @@ func environmentGrantFromCatalog(grant catalog.Grant) environment.Grant {
 // other management path to the handler that owns it. One handler is mounted at
 // /admin/ by newOpsRoot, so the environment table is joined here instead of
 // widening the ops route set.
-func newAdminRoot(managementAdmin, environmentAdmin http.Handler) http.Handler {
+func newAdminRoot(managementAdmin, environmentAdmin, rulesAdmin http.Handler) http.Handler {
 	mux := http.NewServeMux()
 	if environmentAdmin != nil {
 		mux.Handle("/admin/environments", environmentAdmin)
 		mux.Handle("/admin/environments/", environmentAdmin)
+	}
+	if rulesAdmin != nil {
+		mux.Handle("/admin/rules", rulesAdmin)
+		mux.Handle("/admin/rules/", rulesAdmin)
+		mux.Handle("/admin/readiness", rulesAdmin)
 	}
 	if managementAdmin != nil {
 		mux.Handle("/", managementAdmin)

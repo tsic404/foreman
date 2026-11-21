@@ -188,6 +188,13 @@ type TaskEntry struct {
 	// rendered before that annotation carries no record.
 	RealRuntimeID string `json:"-"`
 
+	// EnvironmentID and EnvironmentSlotID are the registered environment this
+	// attempt reserved and its slot. A rule only selects the environment, so
+	// the value never reaches the Job template; it is persisted in the shared
+	// snapshot so a restarted instance releases the same slot (§3.4).
+	EnvironmentID     string `json:"-"`
+	EnvironmentSlotID string `json:"-"`
+
 	// RuntimeIdentity is the declared identity the claim was dispatched under
 	// (registry.RuntimeIdentityKey of provider + runtime profile identifier),
 	// resolved once at claim time and never re-resolved: a rebuild moves the

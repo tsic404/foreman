@@ -390,6 +390,22 @@ func run() error {
 	jbCfg.NameResolver = projects
 	schedCfg.Project = projects
 
+	// Environment rules: storage, draft validation, atomic publish and the
+	// resolver the preview and every real dispatch share. The claim path
+	// reserves a slot through the same resolver; preview never does
+	// (04-architecture.md §3.4, 02-contracts V2-C01).
+	claimSourceID := runSourceResolver(catalogService, clientSet)
+	rulesService, rulesAdmin, err := newRulesSurface(getenv, environmentService, catalogService,
+		releaseService, configService, projects,
+		func(ctx context.Context, workspaceID string) (string, bool) {
+			serverID, ok := claimSourceID(ctx, workspaceID)
+			return string(serverID), ok
+		}, schedCfg.JobNamespace, baseLog)
+	if err != nil {
+		return err
+	}
+	schedCfg.EnvironmentBinder = rulesBinder{service: rulesService}
+
 	// Terminal reports that exhausted the retry budget are queued on the
 	// node-local state root and re-sent through the scheduler's single
 	// terminal face (contract §10, ADR-031). Each entry also lands on a
@@ -563,7 +579,7 @@ func run() error {
 		}
 		opsSrv = &http.Server{
 			Addr:              *opsListen,
-			Handler:           newOpsRoot(ops, newAdminRoot(managementAdmin, environmentAdmin), obsCfg.OpsCredentials),
+			Handler:           newOpsRoot(ops, newAdminRoot(managementAdmin, environmentAdmin, rulesAdmin), obsCfg.OpsCredentials),
 			ReadHeaderTimeout: readHeaderTimeout,
 		}
 	} else {

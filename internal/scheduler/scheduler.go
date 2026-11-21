@@ -910,6 +910,39 @@ func (s *Scheduler) onClaimFor(ctx context.Context, sourceID, workspaceID string
 		name = daemonID
 	}
 	e.JobName = name
+	// The published rules select where this attempt runs. The binder is the
+	// same resolver the management preview calls; only this path reserves the
+	// slot. A saturated placement defers the claim (the server re-dispatches
+	// after the prepare lease lapses), a blocked one refuses it before any
+	// object exists (04-architecture.md §3.4).
+	environmentReserved := false
+	defer func() {
+		if environmentReserved {
+			s.releaseEnvironment(ctx, e)
+		}
+	}()
+	if s.cfg.EnvironmentBinder != nil {
+		binding, bindErr := s.cfg.EnvironmentBinder.Bind(ctx, EnvironmentRequest{
+			SourceID: e.SourceID, WorkspaceID: e.WorkspaceID, AgentID: e.AgentID, IssueID: e.IssueID,
+			ProjectID: e.ProjectID, PriorSessionID: e.PriorSessionID,
+			AttemptID: registry.AttemptID(e.TaskID, e.Attempt),
+		})
+		if bindErr != nil {
+			if errors.Is(bindErr, ErrEnvironmentSaturated) {
+				s.log.InfoContext(ctx, "task.environment_saturated",
+					"task_id", e.TaskID, "workspace_id", e.WorkspaceID,
+					"agent_id", e.AgentID, "err", bindErr.Error())
+				return nil
+			}
+			s.log.WarnContext(ctx, "task.environment_blocked",
+				"task_id", e.TaskID, "workspace_id", e.WorkspaceID,
+				"agent_id", e.AgentID, "err", bindErr.Error())
+			return fmt.Errorf("%w: %v", ErrEnvironmentBlocked, bindErr)
+		}
+		e.EnvironmentID = binding.EnvironmentID
+		e.EnvironmentSlotID = binding.SlotID
+		environmentReserved = true
+	}
 	if s.shared != nil && !reserved {
 		// Direct callers (not the claim loop) reserve here; the loop's
 		// reservation is already held and checked before C3.
@@ -928,11 +961,13 @@ func (s *Scheduler) onClaimFor(ctx context.Context, sourceID, workspaceID string
 		return fmt.Errorf("register task %s: %w", e.TaskID, err)
 	}
 	owned = true
+	environmentReserved = false
 	// The claim is enqueued once, before any object exists: the queue row and
 	// the mapping row are the delivery face any instance reads (§5 单次入队).
 	if err := s.enqueueShared(ctx, e); err != nil {
 		// No object was created yet; dropping the entry lets the server
 		// re-dispatch after the prepare lease lapses, the deferral path.
+		s.releaseEnvironment(ctx, e)
 		_ = s.reg.Delete(e.TaskID, e.ScopeKey())
 		return err
 	}
@@ -962,6 +997,7 @@ func (s *Scheduler) onClaimFor(ctx context.Context, sourceID, workspaceID string
 		// (§4.3, AC-09). Both defer the claim — the entry goes and the server
 		// re-dispatches the task once the prepare lease lapses.
 		if errors.Is(err, ErrStoreUnavailable) || errors.Is(err, errJobNameHeld) {
+			s.releaseEnvironment(ctx, e)
 			if delErr := s.reg.Delete(e.TaskID, e.ScopeKey()); delErr != nil {
 				s.log.WarnContext(ctx, "task.claim_drop_failed",
 					"task_id", e.TaskID, "job_name", e.JobName, "err", delErr)
@@ -2229,6 +2265,7 @@ func (s *Scheduler) discardTaskLocked(ctx context.Context, e registry.TaskEntry)
 	if err := s.deleteObjects(ctx, e); err != nil {
 		return err
 	}
+	s.releaseEnvironment(ctx, e)
 	return s.reg.Delete(e.TaskID, e.ScopeKey())
 }
 
@@ -2410,6 +2447,7 @@ func (s *Scheduler) reclaimObjectless(ctx context.Context, e registry.TaskEntry)
 		s.synthesizeCancelAck(ctx, e, time.Time{})
 	}
 	drainSeconds := s.drainSeconds(e)
+	s.releaseEnvironment(ctx, e)
 	if err := s.reg.Delete(e.TaskID, e.ScopeKey()); err != nil {
 		return err
 	}
@@ -2503,6 +2541,7 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 		s.synthesizeCancelAck(ctx, e, podTerminatedAt)
 	}
 	// ④ The entry goes last.
+	s.releaseEnvironment(ctx, e)
 	if err := s.reg.Delete(e.TaskID, e.ScopeKey()); err != nil {
 		return err
 	}

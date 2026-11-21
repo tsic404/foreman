@@ -160,6 +160,11 @@ type Config struct {
 	// inferring a version from StartedAt (02-contracts V2-C05). A nil seam
 	// leaves every fact unknown.
 	ClaimFacts ClaimFactsFunc
+	// EnvironmentBinder resolves the published environment rules for one
+	// claim and reserves the selected environment's slot. Preview and real
+	// dispatch share the resolver behind it; only the reservation differs
+	// (02-contracts V2-C01). A nil seam keeps the pre-environment path.
+	EnvironmentBinder EnvironmentBinder
 }
 
 // ClaimFacts is one claim's release snapshot. The *Known flags separate a
