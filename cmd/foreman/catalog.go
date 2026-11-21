@@ -41,6 +41,7 @@ func newCatalogService(
 	clientSet *proxy.ClientSet,
 	reg *registry.Registry,
 	log *slog.Logger,
+	environmentCount func(context.Context, catalog.Grant) int,
 ) (*catalog.Service, *catalog.AdminHandler, error) {
 	dir := strings.TrimSpace(getenv(EnvCatalogCredentialsDir))
 	if dir == "" {
@@ -67,6 +68,7 @@ func newCatalogService(
 		Credentials:       credentials,
 		ManagedRuntimeIDs: ownRuntimeIDs(clientSet),
 		RunIndex:          runIndex,
+		EnvironmentCount:  environmentCount,
 		Logger:            log,
 	})
 	if err != nil {

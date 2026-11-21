@@ -267,6 +267,28 @@ spec:
             # without either leaves the adapter unsupported.
             - name: FOREMAN_OMP_BINARY
               value: "omp"
+            # Registered rsbxd environments, isolated slots and retirement
+            # tombstones live in this Secret, so they survive a Pod rebuild and
+            # a retired id stays retired. The Secret is created by
+            # 10-secrets.yaml and Foreman only reads/updates its data key. A
+            # registration is not an environment until the probe verifies its
+            # identity, capabilities and capacity (04-architecture.md §3.3).
+            - name: FOREMAN_ENVIRONMENT_STATE_SECRET
+              value: "foreman-environment-registry"
+            - name: FOREMAN_ENVIRONMENT_STATE_NAMESPACE
+              value: "foreman"
+            # Deployment-supplied read-only verification helper. It receives
+            # the target as FOREMAN_ENVIRONMENT_TARGET JSON and answers
+            # {"tree_id","identity","capabilities","capacity","version"} on
+            # stdout. Unset keeps every registration pending (fail closed);
+            # reachability is never inferred from a TCP dial or a K8s Node.
+            - name: FOREMAN_ENVIRONMENT_PROBE
+              value: ""
+            # Comma-separated data-residency allowlist. Empty approves no
+            # domain, so every registration is refused until the deployment
+            # sets the domains it is willing to place data on.
+            - name: FOREMAN_ENVIRONMENT_TRUST_DOMAINS
+              value: ""
             - name: FOREMAN_WS_ENABLED
               value: "true"
             # --- shared state (ADR-046 阶段一) ---
@@ -345,7 +367,8 @@ spec:
           volumeMounts:
             # ADR-002: no PVC. This emptyDir holds the durable terminal-report
             # queue (contract §10) and the catalog source registry between
-            # container restarts.
+            # container restarts. The environment registry is not here: it
+            # lives in the Secret carrier so it survives a Pod rebuild.
             - name: state
               mountPath: /var/lib/foreman
             # §8.1 template carrier: required, so a missing ConfigMap blocks

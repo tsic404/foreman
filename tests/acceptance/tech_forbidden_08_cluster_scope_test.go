@@ -1,9 +1,11 @@
 // TC-tech-forbidden-08 (F8): Foreman touches only the Jobs and Secrets it
 // created. The RBAC face has no cluster-scoped role and no wildcard, and the
-// Job pods carry no API credential. The behavior face is the scheduler's
-// object interface: create/delete/get/list on Jobs and Secrets plus pod reads
-// — there is no update, patch or arbitrary-object method to call. A completed
-// task's deletions name only its own objects.
+// Job pods carry no API credential. The one exception is the environment
+// registry carrier in Foreman's own namespace: get/update on one named Secret,
+// nothing else. The behavior face is the scheduler's object interface:
+// create/delete/get/list on Jobs and Secrets plus pod reads — there is no
+// update, patch or arbitrary-object method to call. A completed task's
+// deletions name only its own objects.
 package acceptance
 
 import (
@@ -27,9 +29,10 @@ type tcForbidden08RBACObject struct {
 	} `json:"metadata"`
 	Automount *bool `json:"automountServiceAccountToken"`
 	Rules     []struct {
-		APIGroups []string `json:"apiGroups"`
-		Resources []string `json:"resources"`
-		Verbs     []string `json:"verbs"`
+		APIGroups     []string `json:"apiGroups"`
+		Resources     []string `json:"resources"`
+		ResourceNames []string `json:"resourceNames"`
+		Verbs         []string `json:"verbs"`
 	} `json:"rules"`
 	RoleRef struct {
 		Kind string `json:"kind"`
@@ -60,6 +63,24 @@ func TestForbidden08ClusterObjectScope(t *testing.T) {
 		case "ClusterRole", "ClusterRoleBinding":
 			t.Errorf("cluster-scoped RBAC object %s/%s", object.Kind, object.Metadata.Name)
 		case "Role":
+			if object.Metadata.Namespace == "foreman" {
+				if object.Metadata.Name != "foreman-environment-registry" {
+					t.Errorf("unexpected Role %s in the foreman namespace", object.Metadata.Name)
+					continue
+				}
+				if len(object.Rules) != 1 {
+					t.Errorf("Role %s has %d rules, want exactly the registry rule", object.Metadata.Name, len(object.Rules))
+					continue
+				}
+				rule := object.Rules[0]
+				if !reflect.DeepEqual(rule.APIGroups, []string{""}) ||
+					!reflect.DeepEqual(rule.Resources, []string{"secrets"}) ||
+					!reflect.DeepEqual(rule.ResourceNames, []string{"foreman-environment-registry"}) ||
+					!reflect.DeepEqual(rule.Verbs, []string{"get", "update"}) {
+					t.Errorf("Role %s is not limited to get/update on its registry Secret: %+v", object.Metadata.Name, rule)
+				}
+				continue
+			}
 			if object.Metadata.Namespace != "multica-agents" {
 				t.Errorf("Role %s namespace = %q, want multica-agents", object.Metadata.Name, object.Metadata.Namespace)
 			}

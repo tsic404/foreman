@@ -27,6 +27,7 @@ import (
 
 	"github.com/tsic404/foreman/internal/auth"
 	"github.com/tsic404/foreman/internal/bootstrap"
+	"github.com/tsic404/foreman/internal/catalog"
 	"github.com/tsic404/foreman/internal/coordination"
 	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/lifecycle"
@@ -329,7 +330,18 @@ func run() error {
 	// has already fixed: the real runtime the task was confirmed to. An agent
 	// rebound while the claim is in flight keeps its claim, and a runtime no
 	// registered source declares is refused visibly (§3.1).
-	catalogService, catalogAdmin, err := newCatalogService(getenv, clientSet, reg, baseLog)
+	environmentService, err := newEnvironmentService(getenv, clientset, baseLog)
+	if err != nil {
+		return err
+	}
+	catalogService, catalogAdmin, err := newCatalogService(getenv, clientSet, reg, baseLog,
+		func(ctx context.Context, grant catalog.Grant) int {
+			return environmentService.CountRegisteredForGrant(ctx, environmentGrantFromCatalog(grant))
+		})
+	if err != nil {
+		return err
+	}
+	environmentAdmin, err := newEnvironmentAdmin(environmentService, catalogService)
 	if err != nil {
 		return err
 	}
@@ -531,7 +543,7 @@ func run() error {
 		}
 		opsSrv = &http.Server{
 			Addr:              *opsListen,
-			Handler:           newOpsRoot(ops, managementAdmin, obsCfg.OpsCredentials),
+			Handler:           newOpsRoot(ops, newAdminRoot(managementAdmin, environmentAdmin), obsCfg.OpsCredentials),
 			ReadHeaderTimeout: readHeaderTimeout,
 		}
 	} else {

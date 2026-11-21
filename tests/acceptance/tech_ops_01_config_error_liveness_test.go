@@ -282,7 +282,7 @@ func TestTechOps01OpsCredentialGate(t *testing.T) {
 		defer cancel()
 
 		cmd := exec.CommandContext(ctx, bin, fmt.Sprintf("-listen=127.0.0.1:%d", port), "-ops-listen=127.0.0.1:0")
-		cmd.Env = foremanStartupEnv(upstream.server.URL, ops01GateEnv(t))
+		cmd.Env = foremanStartupEnv(t, upstream.server.URL, ops01GateEnv(t))
 		var stdout, stderr strings.Builder
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 
@@ -367,7 +367,7 @@ func TestTechOps01OpsCredentialGate(t *testing.T) {
 		// The same deployment shape as the refusal above, minus the listener:
 		// the missing credential is not an error when the surface is off.
 		cmd := exec.CommandContext(ctx, bin, fmt.Sprintf("-listen=127.0.0.1:%d", port), "-ops-listen=")
-		cmd.Env = foremanStartupEnv(upstream.server.URL, ops01GateEnv(t))
+		cmd.Env = foremanStartupEnv(t, upstream.server.URL, ops01GateEnv(t))
 		var stdout, stderr strings.Builder
 		cmd.Stdout, cmd.Stderr = &stdout, &stderr
 		if err := cmd.Start(); err != nil {
