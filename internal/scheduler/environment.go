@@ -28,6 +28,24 @@ type EnvironmentBinding struct {
 	EnvironmentID string
 	SlotID        string
 	RuleID        string
+	// The fixed foreman-job needs the frozen placement facts, not only the
+	// ids: the endpoint, the persistent tree generation and the two verified
+	// CLI artifacts (02-contracts.md V2-C03/C04). They are empty on a partial
+	// legacy binder, which keeps the template path.
+	Endpoint        string
+	TLSRef          string
+	StateRoot       string
+	EnvironmentGen  string
+	Platform        string
+	AgentBackend    string
+	MulticaVersion  string
+	MulticaDigest   string
+	AgentVersion    string
+	AgentDigest     string
+	ConfigRevision  uint64
+	ConfigSecretRef string
+	ConfigFileName  string
+	ConfigDigest    string
 }
 
 // EnvironmentBinder is the one resolver preview and real dispatch share

@@ -10,6 +10,7 @@
 package jobbuilder
 
 import (
+	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -69,6 +70,15 @@ type TaskEntry struct {
 	// NameSource is set by Build from the template's name format: "template"
 	// when the template expresses a format, "fallback" when it does not.
 	NameSource string
+	// FixedAttempt is the frozen two-CLI/environment binding. Non-empty selects
+	// the fixed foreman-job render instead of the deployment template
+	// (02-contracts.md V2-C03).
+	FixedAttempt []byte
+	// EnvironmentID and EnvironmentSlotID are the claim's reservation. The
+	// fixed render refuses a binding that names another environment than the
+	// claim recorded.
+	EnvironmentID     string
+	EnvironmentSlotID string
 }
 
 // TokenIssuer signs per-Job Tokens; satisfied by auth.Issuer. Hash is the
@@ -173,17 +183,35 @@ func (b *Builder) Build(e TaskEntry) (*batchv1.Job, *corev1.Secret, string, erro
 	if err != nil {
 		return nil, nil, "", err
 	}
-	job, ev, err := b.render(name, daemonID, e)
-	if err != nil {
-		return nil, nil, "", err
+	fixedSpec := []byte(nil)
+	var job *batchv1.Job
+	if hasFixedAttempt(e.FixedAttempt) {
+		job, err = b.renderFixed(name, daemonID, e)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		fixedSpec = e.FixedAttempt
+	} else {
+		var ev Evaluation
+		job, ev, err = b.render(name, daemonID, e)
+		if err != nil {
+			return nil, nil, "", err
+		}
+		b.logPolicyApplied(e, name, ev)
+		b.recordPolicyHits(ev)
 	}
 	token, err := b.issueToken(daemonID, e)
 	if err != nil {
 		return nil, nil, "", fmt.Errorf("issue Job Token: %w", err)
 	}
-	b.logPolicyApplied(e, name, ev)
-	b.recordPolicyHits(ev)
-	return job, b.credentialSecret(daemonID, e.TaskID, e.SourceID, e.WorkspaceID, token), b.cfg.Issuer.Hash(token), nil
+	return job, b.credentialSecret(daemonID, e.TaskID, e.SourceID, e.WorkspaceID, token, fixedSpec), b.cfg.Issuer.Hash(token), nil
+}
+
+// hasFixedAttempt distinguishes an absent binding from the JSON null a
+// rebuilt snapshot carries when the claim used the legacy template path.
+func hasFixedAttempt(raw []byte) bool {
+	trimmed := bytes.TrimSpace(raw)
+	return len(trimmed) > 0 && !bytes.Equal(trimmed, []byte("null"))
 }
 
 // issueToken signs the task Job Token in the entry's source partition.

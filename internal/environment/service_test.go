@@ -52,6 +52,142 @@ func newService(t *testing.T, probe environment.Probe) *environment.Service {
 	return service
 }
 
+// V2-C03: the shared slot ledger carries the Job-side phase and session, so a
+// rebuilt Job reads Started/isolated from it instead of a container-local file.
+func TestSlotTransitionsPersistJobAttemptFacts(t *testing.T) {
+	store := environment.NewMemoryStore()
+	newService := func() *environment.Service {
+		t.Helper()
+		probe := environmenttest.NewProbe()
+		probe.Result = probeFacts("tree-1")
+		service, err := environment.New(environment.Config{
+			Store:               store,
+			Probe:               probe,
+			AllowedTrustDomains: []string{"build"},
+			Clock:               testClock,
+		})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return service
+	}
+	ctx := t.Context()
+	service := newService()
+	if _, err := service.Register(ctx, registration("build-a", "build-a.example.test:7443", "/srv/rsbx/build-a", []string{"nix"}, 2), "ops"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1"); err != nil {
+		t.Fatalf("AcquireSlot: %v", err)
+	}
+	if _, err := service.BeginSlot(ctx, "build-a", "slot-1", "claim-a"); err != nil {
+		t.Fatalf("BeginSlot: %v", err)
+	}
+	if _, err := service.BindSlot(ctx, "build-a", "slot-1", "claim-a", "rsbx-session"); err != nil {
+		t.Fatalf("BindSlot: %v", err)
+	}
+	if _, err := service.MarkSlotStarted(ctx, "build-a", "slot-1", "claim-a"); err != nil {
+		t.Fatalf("MarkSlotStarted: %v", err)
+	}
+	if _, err := service.ReleaseSlotByClaim(ctx, "build-a", "slot-1", "claim-a", false); err != nil {
+		t.Fatalf("ReleaseSlotByClaim unconfirmed: %v", err)
+	}
+
+	restarted := newService()
+	slots, err := restarted.Slots(ctx, "build-a", environment.Grant{DeploymentWide: true})
+	if err != nil {
+		t.Fatalf("Slots after restart: %v", err)
+	}
+	if len(slots) != 1 {
+		t.Fatalf("slots = %+v, want the isolated reservation", slots)
+	}
+	slot := slots[0]
+	if slot.State != string(environment.SlotIsolated) || slot.Phase != string(environment.SlotPhaseStarted) ||
+		!slot.Started || slot.SessionID != "rsbx-session" {
+		t.Fatalf("slot = %+v, want isolated/started with the rsbx session", slot)
+	}
+	stored, found, err := restarted.SlotState(ctx, "build-a", "slot-1")
+	if err != nil || !found {
+		t.Fatalf("SlotState after restart = (%+v, %v, %v)", stored, found, err)
+	}
+	if stored.ClaimID != "claim-a" {
+		t.Fatalf("persisted claim = %q, want the isolated execution's claim", stored.ClaimID)
+	}
+	if _, err := restarted.MarkSlotStarted(ctx, "build-a", "slot-1", "claim-a"); !errors.Is(err, environment.ErrSlotIsolated) {
+		t.Fatalf("MarkSlotStarted on an isolated slot = %v, want ErrSlotIsolated", err)
+	}
+}
+
+// V2-C03: one attempt has one execution right. Begin is an atomic winner,
+// Bind cannot replace the winner's session, MarkStarted cannot admit a loser,
+// and only the current claim may release or take over the reservation.
+func TestSlotClaimFencesConcurrentExecutions(t *testing.T) {
+	probe := environmenttest.NewProbe()
+	probe.Result = probeFacts("tree-1")
+	service := newService(t, probe)
+	ctx := t.Context()
+	if _, err := service.Register(ctx, registration("build-a", "build-a.example.test:7443", "/srv/rsbx/build-a", []string{"nix"}, 2), "ops"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1"); err != nil {
+		t.Fatalf("AcquireSlot: %v", err)
+	}
+	if _, err := service.BeginSlot(ctx, "build-a", "slot-1", "claim-a"); err != nil {
+		t.Fatalf("BeginSlot claim-a: %v", err)
+	}
+	if _, err := service.BeginSlot(ctx, "build-a", "slot-1", "claim-b"); !errors.Is(err, environment.ErrSlotClaimed) {
+		t.Fatalf("BeginSlot claim-b = %v, want ErrSlotClaimed", err)
+	}
+	if _, err := service.BeginSlot(ctx, "build-a", "slot-1", "claim-a"); err != nil {
+		t.Fatalf("BeginSlot claim-a retry: %v", err)
+	}
+	if _, err := service.BindSlot(ctx, "build-a", "slot-1", "claim-a", "session-a"); err != nil {
+		t.Fatalf("BindSlot claim-a: %v", err)
+	}
+	if _, err := service.BindSlot(ctx, "build-a", "slot-1", "claim-b", "session-b"); !errors.Is(err, environment.ErrSlotClaimed) {
+		t.Fatalf("BindSlot claim-b = %v, want ErrSlotClaimed", err)
+	}
+	if _, err := service.BindSlot(ctx, "build-a", "slot-1", "claim-a", "session-b"); !errors.Is(err, environment.ErrSlotSessionBound) {
+		t.Fatalf("BindSlot replacing the session = %v, want ErrSlotSessionBound", err)
+	}
+	if _, err := service.MarkSlotStarted(ctx, "build-a", "slot-1", "claim-b"); !errors.Is(err, environment.ErrSlotClaimed) {
+		t.Fatalf("MarkSlotStarted claim-b = %v, want ErrSlotClaimed", err)
+	}
+	if _, err := service.MarkSlotStarted(ctx, "build-a", "slot-1", "claim-a"); err != nil {
+		t.Fatalf("MarkSlotStarted claim-a: %v", err)
+	}
+	if _, err := service.MarkSlotStarted(ctx, "build-a", "slot-1", "claim-a"); err != nil {
+		t.Fatalf("MarkSlotStarted claim-a retry: %v", err)
+	}
+	if _, err := service.ReleaseSlotByClaim(ctx, "build-a", "slot-1", "claim-b", true); !errors.Is(err, environment.ErrSlotClaimed) {
+		t.Fatalf("ReleaseSlotByClaim claim-b = %v, want ErrSlotClaimed", err)
+	}
+	stored, found, err := service.SlotState(ctx, "build-a", "slot-1")
+	if err != nil || !found {
+		t.Fatalf("SlotState after a losing release = (%+v, %v, %v)", stored, found, err)
+	}
+	if stored.ClaimID != "claim-a" || !stored.Started || stored.SessionID != "session-a" {
+		t.Fatalf("slot after a losing release = %+v, want the winner's started session", stored)
+	}
+	if _, err := service.TakeOverSlot(ctx, "build-a", "slot-1", "claim-c", "claim-a"); err != nil {
+		t.Fatalf("TakeOverSlot claim-c: %v", err)
+	}
+	if _, err := service.TakeOverSlot(ctx, "build-a", "slot-1", "claim-d", "claim-a"); !errors.Is(err, environment.ErrSlotClaimed) {
+		t.Fatalf("second TakeOverSlot = %v, want ErrSlotClaimed", err)
+	}
+	if _, err := service.MarkSlotStarted(ctx, "build-a", "slot-1", "claim-a"); !errors.Is(err, environment.ErrSlotClaimed) {
+		t.Fatalf("stale MarkSlotStarted after takeover = %v, want ErrSlotClaimed", err)
+	}
+	if _, err := service.ReleaseSlotByClaim(ctx, "build-a", "slot-1", "claim-a", true); !errors.Is(err, environment.ErrSlotClaimed) {
+		t.Fatalf("stale ReleaseSlotByClaim after takeover = %v, want ErrSlotClaimed", err)
+	}
+	if _, err := service.ReleaseSlotByClaim(ctx, "build-a", "slot-1", "claim-c", true); err != nil {
+		t.Fatalf("ReleaseSlotByClaim takeover winner: %v", err)
+	}
+	if _, found, err := service.SlotState(ctx, "build-a", "slot-1"); err != nil || found {
+		t.Fatalf("SlotState after the winner's release = (found=%v, err=%v), want the slot gone", found, err)
+	}
+}
+
 // ENV-04 / V2-C07: a target that cannot be verified is stored with its failure
 // on its face, but it is not an environment and cannot take a slot.
 func TestRegisterLeavesAFailedTargetOutOfThePool(t *testing.T) {
@@ -79,7 +215,7 @@ func TestRegisterLeavesAFailedTargetOutOfThePool(t *testing.T) {
 	if candidates := service.Candidates(ctx, environment.CandidateFilter{}); len(candidates) != 0 {
 		t.Fatalf("Candidates = %+v, want none for an unverified target", candidates)
 	}
-	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1", "session-1"); !errors.Is(err, environment.ErrNotVerified) {
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1"); !errors.Is(err, environment.ErrNotVerified) {
 		t.Fatalf("AcquireSlot on an unverified target = %v, want ErrNotVerified", err)
 	}
 }
@@ -239,7 +375,7 @@ func TestDrainRefusesNewSlotsAndKeepsExistingSessions(t *testing.T) {
 	if _, err := service.Register(ctx, registration("build-a", "build-a.example.test:7443", "/srv/rsbx/build-a", []string{"nix"}, 2), "ops"); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1", "session-1"); err != nil {
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1"); err != nil {
 		t.Fatalf("AcquireSlot slot-1: %v", err)
 	}
 	drained, err := service.Drain(ctx, "build-a", "ops")
@@ -249,7 +385,7 @@ func TestDrainRefusesNewSlotsAndKeepsExistingSessions(t *testing.T) {
 	if drained.Phase != string(environment.PhaseDraining) || drained.ActiveSlots != 1 {
 		t.Fatalf("drained view = %+v, want draining with the existing slot", drained)
 	}
-	if _, err := service.AcquireSlot(ctx, "build-a", "slot-2", "session-2"); !errors.Is(err, environment.ErrDraining) {
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-2"); !errors.Is(err, environment.ErrDraining) {
 		t.Fatalf("AcquireSlot while draining = %v, want ErrDraining", err)
 	}
 	slots, err := service.Slots(ctx, "build-a", environment.Grant{DeploymentWide: true})
@@ -288,7 +424,7 @@ func TestLoweringTheLimitDoesNotEvictExistingSessions(t *testing.T) {
 		t.Fatalf("Register: %v", err)
 	}
 	for _, slot := range []string{"slot-1", "slot-2"} {
-		if _, err := service.AcquireSlot(ctx, "build-a", slot, "session-"+slot); err != nil {
+		if _, err := service.AcquireSlot(ctx, "build-a", slot); err != nil {
 			t.Fatalf("AcquireSlot %s: %v", slot, err)
 		}
 	}
@@ -300,7 +436,7 @@ func TestLoweringTheLimitDoesNotEvictExistingSessions(t *testing.T) {
 	if updated.Concurrency != 1 || updated.ActiveSlots != 2 {
 		t.Fatalf("updated view = %+v, want limit 1 with two live slots", updated)
 	}
-	if _, err := service.AcquireSlot(ctx, "build-a", "slot-3", "session-3"); !errors.Is(err, environment.ErrFull) {
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-3"); !errors.Is(err, environment.ErrFull) {
 		t.Fatalf("AcquireSlot over the lowered limit = %v, want ErrFull", err)
 	}
 	for _, slot := range []string{"slot-1", "slot-2"} {
@@ -308,7 +444,7 @@ func TestLoweringTheLimitDoesNotEvictExistingSessions(t *testing.T) {
 			t.Fatalf("ReleaseSlot %s: %v", slot, err)
 		}
 	}
-	if _, err := service.AcquireSlot(ctx, "build-a", "slot-3", "session-3"); err != nil {
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-3"); err != nil {
 		t.Fatalf("AcquireSlot after both releases: %v", err)
 	}
 }
@@ -324,7 +460,7 @@ func TestRetirementBlockers(t *testing.T) {
 		if _, err := service.Register(ctx, registration("build-a", "build-a.example.test:7443", "/srv/rsbx/build-a", []string{"nix"}, 2), "ops"); err != nil {
 			t.Fatalf("Register: %v", err)
 		}
-		if _, err := service.AcquireSlot(ctx, "build-a", "slot-1", "session-1"); err != nil {
+		if _, err := service.AcquireSlot(ctx, "build-a", "slot-1"); err != nil {
 			t.Fatalf("AcquireSlot: %v", err)
 		}
 		_, err := service.Retire(ctx, "build-a", "ops")
@@ -348,7 +484,7 @@ func TestRetirementBlockers(t *testing.T) {
 		if _, err := service.Register(ctx, registration("build-a", "build-a.example.test:7443", "/srv/rsbx/build-a", []string{"nix"}, 2), "ops"); err != nil {
 			t.Fatalf("Register: %v", err)
 		}
-		if _, err := service.AcquireSlot(ctx, "build-a", "slot-1", "session-1"); err != nil {
+		if _, err := service.AcquireSlot(ctx, "build-a", "slot-1"); err != nil {
 			t.Fatalf("AcquireSlot: %v", err)
 		}
 		if _, err := service.ReleaseSlot(ctx, "build-a", "slot-1", false); err != nil {
@@ -505,7 +641,7 @@ func TestFileStoreKeepsIsolatedSlotsAndTombstonesAcrossRestart(t *testing.T) {
 	if _, err := service.Register(ctx, registration("build-a", "build-a.example.test:7443", "/srv/rsbx/build-a", []string{"nix"}, 2), "ops"); err != nil {
 		t.Fatalf("Register build-a: %v", err)
 	}
-	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1", "session-1"); err != nil {
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1"); err != nil {
 		t.Fatalf("AcquireSlot: %v", err)
 	}
 	if _, err := service.ReleaseSlot(ctx, "build-a", "slot-1", false); err != nil {
@@ -629,7 +765,7 @@ func TestUpdateMarksTheTargetStaleAndRefusesRelocationWithSlots(t *testing.T) {
 	if _, err := service.Register(ctx, registration("build-a", "build-a.example.test:7443", "/srv/rsbx/build-a", []string{"nix"}, 2), "ops"); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1", "session-1"); err != nil {
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1"); err != nil {
 		t.Fatalf("AcquireSlot: %v", err)
 	}
 	endpoint := "build-b.example.test:7443"

@@ -819,13 +819,12 @@ func (s *Service) Cleanups(ctx context.Context, id ID, grant Grant) ([]CleanupVi
 	return views, nil
 }
 
-// AcquireSlot reserves one slot atomically. A pending, unverified, draining or
-// full environment refuses the reservation.
-func (s *Service) AcquireSlot(ctx context.Context, id ID, slotID, sessionID string) (Slot, error) {
+// AcquireSlot reserves one idle slot atomically. A pending, unverified,
+// draining or full environment refuses the reservation. The new reservation
+// never carries a remote session: a Multica resume path is an affinity key,
+// and only a session the Job actually opened may be recorded by BindSlot.
+func (s *Service) AcquireSlot(ctx context.Context, id ID, slotID string) (Slot, error) {
 	if err := validateSlotID(slotID); err != nil {
-		return Slot{}, err
-	}
-	if err := validateOptionalText("session id", sessionID, 256); err != nil {
 		return Slot{}, err
 	}
 	var slot Slot
@@ -851,7 +850,7 @@ func (s *Service) AcquireSlot(ctx context.Context, id ID, slotID, sessionID stri
 		if _, exists := env.Slots[slotID]; exists {
 			return ErrSlotExists
 		}
-		slot = Slot{ID: slotID, State: SlotActive, SessionID: sessionID, AcquiredAt: s.now()}
+		slot = Slot{ID: slotID, State: SlotActive, AcquiredAt: s.now()}
 		env.Slots[slotID] = slot
 		env.Revision++
 		env.UpdatedAt = s.now()
@@ -867,9 +866,246 @@ func (s *Service) AcquireSlot(ctx context.Context, id ID, slotID, sessionID stri
 	return slot, nil
 }
 
+// SlotState answers one reservation's committed facts. A missing slot is
+// found=false, not an unreadable ledger.
+func (s *Service) SlotState(ctx context.Context, id ID, slotID string) (Slot, bool, error) {
+	var slot Slot
+	var found bool
+	err := s.transact(ctx, func(ctx context.Context, tx Store) error {
+		env, ok, err := tx.GetEnvironment(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			return ErrNotFound
+		}
+		slot, found = env.Slots[slotID]
+		return nil
+	})
+	if err != nil {
+		return Slot{}, false, err
+	}
+	return slot, found, nil
+}
+
+// BeginSlot atomically claims the execution right for one idle reservation and
+// opens the unknown ready window. A second execution of the same attempt gets
+// ErrSlotClaimed; a retry of the same claim is idempotent. A legacy opening
+// record without a claim is fenced by the first caller.
+func (s *Service) BeginSlot(ctx context.Context, id ID, slotID, claimID string) (Slot, error) {
+	if err := validateSlotID(slotID); err != nil {
+		return Slot{}, err
+	}
+	if err := validateClaimID(claimID); err != nil {
+		return Slot{}, err
+	}
+	var result Slot
+	err := s.transact(ctx, func(ctx context.Context, tx Store) error {
+		env, slot, err := s.slotForTransition(ctx, tx, id, slotID)
+		if err != nil {
+			return err
+		}
+		if slot.State == SlotIsolated {
+			return fmt.Errorf("%w: %s", ErrSlotIsolated, slotID)
+		}
+		switch {
+		case slot.Phase == SlotPhaseIdle && slot.ClaimID == "":
+			slot.ClaimID = claimID
+			slot.Phase = SlotPhaseOpening
+			slot.Started = false
+		case slot.Phase == SlotPhaseOpening && slot.ClaimID == claimID:
+			// A lost begin answer is safe to retry for the same execution.
+		case slot.Phase == SlotPhaseOpening && slot.ClaimID == "":
+			// A legacy unknown window had no owner; the first execution fences it.
+			slot.ClaimID = claimID
+		default:
+			return fmt.Errorf("%w: %s", ErrSlotClaimed, slotID)
+		}
+		slot.LastError = ""
+		result, err = s.putSlotTransition(ctx, tx, id, env, slot, "begin")
+		return err
+	})
+	if err != nil {
+		return Slot{}, err
+	}
+	return result, nil
+}
+
+// TakeOverSlot fences a reservation that may already own a remote session.
+// Recovery is the only caller. The observed claim is a compare-and-swap token:
+// two rebuilt Jobs naming the same prior claim race for one winner, and the
+// loser cannot bind, commit or release the slot.
+func (s *Service) TakeOverSlot(ctx context.Context, id ID, slotID, claimID, expectedClaimID string) (Slot, error) {
+	if err := validateSlotID(slotID); err != nil {
+		return Slot{}, err
+	}
+	if err := validateClaimID(claimID); err != nil {
+		return Slot{}, err
+	}
+	if err := validateOptionalText("expected claim id", expectedClaimID, 128); err != nil {
+		return Slot{}, err
+	}
+	var result Slot
+	err := s.transact(ctx, func(ctx context.Context, tx Store) error {
+		env, slot, err := s.slotForTransition(ctx, tx, id, slotID)
+		if err != nil {
+			return err
+		}
+		if slot.ClaimID != expectedClaimID {
+			return fmt.Errorf("%w: %s", ErrSlotClaimed, slotID)
+		}
+		if slot.Phase == SlotPhaseIdle && slot.SessionID == "" && slot.State != SlotIsolated {
+			return fmt.Errorf("%w: %s has nothing to recover", ErrSlotPhase, slotID)
+		}
+		slot.ClaimID = claimID
+		slot.LastError = ""
+		result, err = s.putSlotTransition(ctx, tx, id, env, slot, "takeover")
+		return err
+	})
+	if err != nil {
+		return Slot{}, err
+	}
+	return result, nil
+}
+
+// BindSlot pins the exact remote session this claim opened. Another execution
+// cannot replace the session, and the same claim cannot swap it either.
+func (s *Service) BindSlot(ctx context.Context, id ID, slotID, claimID, sessionID string) (Slot, error) {
+	if err := validateSlotID(slotID); err != nil {
+		return Slot{}, err
+	}
+	if err := validateClaimID(claimID); err != nil {
+		return Slot{}, err
+	}
+	if strings.TrimSpace(sessionID) == "" {
+		return Slot{}, errors.New("a connected slot needs a session id")
+	}
+	if err := validateOptionalText("session id", sessionID, 256); err != nil {
+		return Slot{}, err
+	}
+	var result Slot
+	err := s.transact(ctx, func(ctx context.Context, tx Store) error {
+		env, slot, err := s.slotForTransition(ctx, tx, id, slotID)
+		if err != nil {
+			return err
+		}
+		if slot.ClaimID != claimID {
+			return fmt.Errorf("%w: %s", ErrSlotClaimed, slotID)
+		}
+		if slot.State == SlotIsolated {
+			return fmt.Errorf("%w: %s", ErrSlotIsolated, slotID)
+		}
+		switch slot.Phase {
+		case SlotPhaseConnected:
+			if slot.SessionID == sessionID {
+				result = slot
+				return nil
+			}
+			return fmt.Errorf("%w: %s already names %q", ErrSlotSessionBound, slotID, slot.SessionID)
+		case SlotPhaseOpening:
+			slot.Phase = SlotPhaseConnected
+			slot.SessionID = sessionID
+			slot.Started = false
+		default:
+			return fmt.Errorf("%w: cannot bind from %q", ErrSlotPhase, slot.Phase)
+		}
+		slot.LastError = ""
+		result, err = s.putSlotTransition(ctx, tx, id, env, slot, "connect")
+		return err
+	})
+	if err != nil {
+		return Slot{}, err
+	}
+	return result, nil
+}
+
+// MarkSlotStarted commits dispatch for the claim that bound the session.
+// Replaying the same claim is idempotent; any other execution is refused.
+func (s *Service) MarkSlotStarted(ctx context.Context, id ID, slotID, claimID string) (Slot, error) {
+	if err := validateSlotID(slotID); err != nil {
+		return Slot{}, err
+	}
+	if err := validateClaimID(claimID); err != nil {
+		return Slot{}, err
+	}
+	var result Slot
+	err := s.transact(ctx, func(ctx context.Context, tx Store) error {
+		env, slot, err := s.slotForTransition(ctx, tx, id, slotID)
+		if err != nil {
+			return err
+		}
+		if slot.ClaimID != claimID {
+			return fmt.Errorf("%w: %s", ErrSlotClaimed, slotID)
+		}
+		if slot.State == SlotIsolated {
+			return fmt.Errorf("%w: %s", ErrSlotIsolated, slotID)
+		}
+		switch slot.Phase {
+		case SlotPhaseConnected:
+			slot.Phase = SlotPhaseStarted
+			slot.Started = true
+		case SlotPhaseStarted:
+			result = slot
+			return nil
+		default:
+			return fmt.Errorf("%w: cannot start from %q", ErrSlotPhase, slot.Phase)
+		}
+		slot.LastError = ""
+		result, err = s.putSlotTransition(ctx, tx, id, env, slot, "started")
+		return err
+	})
+	if err != nil {
+		return Slot{}, err
+	}
+	return result, nil
+}
+
+// slotForTransition reads the environment and one reservation for a Job-side
+// mutation.
+func (s *Service) slotForTransition(ctx context.Context, tx Store, id ID, slotID string) (Environment, Slot, error) {
+	env, ok, err := tx.GetEnvironment(ctx, id)
+	if err != nil {
+		return Environment{}, Slot{}, err
+	}
+	if !ok {
+		return Environment{}, Slot{}, ErrNotFound
+	}
+	slot, ok := env.Slots[slotID]
+	if !ok {
+		return Environment{}, Slot{}, ErrSlotNotFound
+	}
+	return env, slot, nil
+}
+
+// putSlotTransition commits one already-decided Job-side slot change.
+func (s *Service) putSlotTransition(ctx context.Context, tx Store, id ID, env Environment, slot Slot, detail string) (Slot, error) {
+	env.Slots[slot.ID] = slot
+	env.Revision++
+	env.UpdatedAt = s.now()
+	if err := tx.PutEnvironment(ctx, env); err != nil {
+		return Slot{}, err
+	}
+	s.appendAudit(ctx, tx, AuditSlotAdvance, id, "job", AuditOK, detail)
+	return slot, nil
+}
+
 // ReleaseSlot releases one slot. A release whose remote cleanup is not
 // confirmed leaves the slot isolated instead of freeing capacity.
 func (s *Service) ReleaseSlot(ctx context.Context, id ID, slotID string, cleanupConfirmed bool) (Slot, error) {
+	return s.releaseSlot(ctx, id, slotID, "", cleanupConfirmed)
+}
+
+// ReleaseSlotByClaim releases a Job-side reservation only for the execution
+// that owns it. A stale instance that lost the Begin/TakeOver race cannot free
+// the winner's slot or mark it isolated.
+func (s *Service) ReleaseSlotByClaim(ctx context.Context, id ID, slotID, claimID string, cleanupConfirmed bool) (Slot, error) {
+	if err := validateClaimID(claimID); err != nil {
+		return Slot{}, err
+	}
+	return s.releaseSlot(ctx, id, slotID, claimID, cleanupConfirmed)
+}
+
+func (s *Service) releaseSlot(ctx context.Context, id ID, slotID, claimID string, cleanupConfirmed bool) (Slot, error) {
 	var result Slot
 	err := s.transact(ctx, func(ctx context.Context, tx Store) error {
 		env, ok, err := tx.GetEnvironment(ctx, id)
@@ -883,22 +1119,29 @@ func (s *Service) ReleaseSlot(ctx context.Context, id ID, slotID string, cleanup
 		if !ok {
 			return ErrSlotNotFound
 		}
+		if claimID != "" && slot.ClaimID != claimID {
+			return fmt.Errorf("%w: %s", ErrSlotClaimed, slotID)
+		}
 		now := s.now()
+		actor := "scheduler"
+		if claimID != "" {
+			actor = "job"
+		}
 		switch {
 		case slot.State == SlotActive && cleanupConfirmed:
 			slot.ReleasedAt = now
 			delete(env.Slots, slotID)
-			s.appendAudit(ctx, tx, AuditSlotRelease, id, "scheduler", AuditOK, slotID)
+			s.appendAudit(ctx, tx, AuditSlotRelease, id, actor, AuditOK, slotID)
 		case slot.State == SlotActive:
 			slot.State = SlotIsolated
 			slot.ReleasedAt = now
 			slot.LastError = "remote cleanup is not confirmed"
 			env.Slots[slotID] = slot
-			s.appendAudit(ctx, tx, AuditSlotIsolate, id, "scheduler", AuditFailed, slotID)
+			s.appendAudit(ctx, tx, AuditSlotIsolate, id, actor, AuditFailed, slotID)
 		case slot.State == SlotIsolated && cleanupConfirmed:
 			slot.ReleasedAt = now
 			delete(env.Slots, slotID)
-			s.appendAudit(ctx, tx, AuditCleanupConfirm, id, "scheduler", AuditOK, slotID)
+			s.appendAudit(ctx, tx, AuditCleanupConfirm, id, actor, AuditOK, slotID)
 		default:
 			result = slot
 			return nil

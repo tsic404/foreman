@@ -29,17 +29,20 @@ MULTICA_CLI_SHA256 ?=
 GOFLAGS ?= -trimpath
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build build-foreman build-gc build-foreman-image build-job-image test vet fmt check acceptance-census acceptance-census-refresh
+.PHONY: all build build-foreman build-gc build-job build-foreman-image build-job-image test vet fmt check acceptance-census acceptance-census-refresh
 
 all: build
 
-build: build-foreman build-gc
+build: build-foreman build-gc build-job
 
 build-foreman:
 	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/foreman ./cmd/foreman
 
 build-gc:
 	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/foreman-gc ./cmd/foreman-gc
+
+build-job:
+	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/foreman-job ./cmd/foreman-job
 
 # build-linux-binary <package> <output>: the static Linux/$(ARCH) binary the
 # Containerfiles copy, named per platform so both can share a build context.
@@ -60,6 +63,7 @@ build-foreman-image:
 # in CI its version tag is the carried daemon version.
 build-job-image:
 	$(call build-linux-binary,./cmd/foreman-gc,$(BIN_DIR)/foreman-gc-linux-$(ARCH))
+	$(call build-linux-binary,./cmd/foreman-job,$(BIN_DIR)/foreman-job-linux-$(ARCH))
 	$(CONTAINER_TOOL) build --platform linux/$(ARCH) -f images/foreman-job.Containerfile \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
 		--build-arg MULTICA_CLI_URL_$(ARCH_UPPER)=$(MULTICA_CLI_URL) \

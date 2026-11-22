@@ -1,6 +1,7 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -153,6 +154,11 @@ type Snapshot struct {
 	EnvironmentID     string `json:"environment_id"`
 	EnvironmentSlotID string `json:"environment_slot_id"`
 
+	// FixedAttempt is the fixed foreman-job binding the claim froze. A rebuilt
+	// instance renders the same two-CLI/environment attempt from it instead of
+	// learning a new placement (02-contracts.md V2-C03).
+	FixedAttempt json.RawMessage `json:"fixed_attempt"`
+
 	// The claim's identity inputs (§4.1 项目身份, §8.3 名字合成, §8.5 身份输入,
 	// §4.5 软亲和). A restored pre-delivery entry is continued by a
 	// convergence round that renders its Job again, and the render must
@@ -225,6 +231,7 @@ func FromEntry(e registry.TaskEntry) Snapshot {
 		RuntimeIdentity:     e.RuntimeIdentity,
 		EnvironmentID:       e.EnvironmentID,
 		EnvironmentSlotID:   e.EnvironmentSlotID,
+		FixedAttempt:        fixedAttemptJSON(e.FixedAttempt),
 		AgentName:           e.AgentName,
 		ProjectID:           e.ProjectID,
 		ProjectSource:       e.ProjectSource,
@@ -285,6 +292,7 @@ func (s Snapshot) ToEntry() registry.TaskEntry {
 		RuntimeIdentity:     s.RuntimeIdentity,
 		EnvironmentID:       s.EnvironmentID,
 		EnvironmentSlotID:   s.EnvironmentSlotID,
+		FixedAttempt:        fixedAttemptJSON(s.FixedAttempt),
 		AgentName:           s.AgentName,
 		ProjectID:           s.ProjectID,
 		ProjectSource:       s.ProjectSource,
@@ -298,6 +306,17 @@ func (s Snapshot) ToEntry() registry.TaskEntry {
 		AgentFactsKnown:     s.AgentFactsKnown,
 		ConfigFactsKnown:    s.ConfigFactsKnown,
 	}
+}
+
+// fixedAttemptJSON keeps JSON null out of the entry: a snapshot of a legacy
+// claim carries the field as null, and a non-empty "null" would be mistaken
+// for a frozen binding by the render.
+func fixedAttemptJSON(raw json.RawMessage) json.RawMessage {
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil
+	}
+	return append(json.RawMessage(nil), raw...)
 }
 
 func cloneStringMap(values map[string]string) map[string]string {

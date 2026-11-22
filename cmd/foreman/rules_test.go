@@ -54,8 +54,8 @@ func (e *sourceScopedEnvironments) List(_ context.Context, _ environment.Filter,
 	return out, nil
 }
 
-func (e *sourceScopedEnvironments) AcquireSlot(_ context.Context, _ environment.ID, slotID, sessionID string) (environment.Slot, error) {
-	return environment.Slot{ID: slotID, State: environment.SlotActive, SessionID: sessionID}, nil
+func (e *sourceScopedEnvironments) AcquireSlot(_ context.Context, _ environment.ID, slotID string) (environment.Slot, error) {
+	return environment.Slot{ID: slotID, State: environment.SlotActive}, nil
 }
 
 func (e *sourceScopedEnvironments) ReleaseSlot(_ context.Context, _ environment.ID, slotID string, _ bool) (environment.Slot, error) {

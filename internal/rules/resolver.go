@@ -21,7 +21,7 @@ import (
 // it.
 type EnvironmentSource interface {
 	List(ctx context.Context, filter environment.Filter, grant environment.Grant) ([]environment.EnvironmentView, error)
-	AcquireSlot(ctx context.Context, id environment.ID, slotID, sessionID string) (environment.Slot, error)
+	AcquireSlot(ctx context.Context, id environment.ID, slotID string) (environment.Slot, error)
 	ReleaseSlot(ctx context.Context, id environment.ID, slotID string, cleanupConfirmed bool) (environment.Slot, error)
 }
 
@@ -153,6 +153,9 @@ type EnvironmentDecision struct {
 type EnvironmentChoice struct {
 	ID           string   `json:"id"`
 	Endpoint     string   `json:"endpoint,omitempty"`
+	TLSRef       string   `json:"tls_ref,omitempty"`
+	StateRoot    string   `json:"state_root,omitempty"`
+	Generation   string   `json:"generation,omitempty"`
 	TrustDomain  string   `json:"trust_domain"`
 	Capabilities []string `json:"capabilities"`
 	Concurrency  int      `json:"concurrency"`
@@ -651,7 +654,9 @@ func (s *Service) resolve(ctx context.Context, req Request, grant catalog.Grant)
 		}
 	}
 	res.Environment = &EnvironmentChoice{
-		ID: chosen.ID, Endpoint: chosen.Endpoint, TrustDomain: chosen.TrustDomain,
+		ID: chosen.ID, Endpoint: chosen.Endpoint, TLSRef: chosen.TLSRef,
+		StateRoot: chosen.StateRoot, Generation: chosen.Verification.TreeID,
+		TrustDomain:  chosen.TrustDomain,
 		Capabilities: append([]string{}, chosen.Capabilities...),
 		Concurrency:  chosen.Concurrency, FreeSlots: chosen.FreeSlots,
 	}
@@ -669,7 +674,9 @@ func (s *Service) resolve(ctx context.Context, req Request, grant catalog.Grant)
 	if req.AttemptID == "" {
 		return Resolution{}, errors.New("rules: a reservation needs an attempt id")
 	}
-	slot, err := s.cfg.Environments.AcquireSlot(ctx, environment.ID(chosen.ID), req.AttemptID, req.PriorSessionID)
+	// A Multica resume path is an affinity key, not an rsbx session. The
+	// ledger starts idle; the Job binds the remote session it actually opened.
+	slot, err := s.cfg.Environments.AcquireSlot(ctx, environment.ID(chosen.ID), req.AttemptID)
 	if err != nil {
 		switch {
 		case errors.Is(err, environment.ErrFull):

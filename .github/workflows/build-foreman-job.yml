@@ -187,13 +187,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          # The Containerfile copies dist/foreman-gc-linux-<arch>: both
-          # platforms sit side by side in the build context and buildx picks one
-          # per platform.
+          # Every per-arch input the Containerfile copies must exist in the
+          # build context: foreman-gc serves the DaemonSet and foreman-job is
+          # the fixed Job's entry point.
           for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
-              -ldflags "-s -w" \
-              -o "dist/foreman-gc-linux-${arch}" ./cmd/foreman-gc
+            for cmd in foreman-gc foreman-job; do
+              CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+                -ldflags "-s -w" \
+                -o "dist/${cmd}-linux-${arch}" "./cmd/${cmd}"
+            done
           done
           ls -l dist
 

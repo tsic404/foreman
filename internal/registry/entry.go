@@ -195,6 +195,13 @@ type TaskEntry struct {
 	EnvironmentID     string `json:"-"`
 	EnvironmentSlotID string `json:"-"`
 
+	// FixedAttempt is the fixed foreman-job's frozen two-CLI/environment
+	// binding (02-contracts.md V2-C03). A non-empty value selects the fixed
+	// execution path at render time; the legacy template path leaves it empty.
+	// It carries references and digests only, never a Secret value, and stays
+	// out of the /foreman/tasks projection.
+	FixedAttempt json.RawMessage `json:"-"`
+
 	// RuntimeIdentity is the declared identity the claim was dispatched under
 	// (registry.RuntimeIdentityKey of provider + runtime profile identifier),
 	// resolved once at claim time and never re-resolved: a rebuild moves the

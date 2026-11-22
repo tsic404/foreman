@@ -35,7 +35,7 @@ func (f *fakeEnvironments) List(context.Context, environment.Filter, environment
 	return append([]environment.EnvironmentView{}, f.views...), nil
 }
 
-func (f *fakeEnvironments) AcquireSlot(_ context.Context, id environment.ID, slotID, sessionID string) (environment.Slot, error) {
+func (f *fakeEnvironments) AcquireSlot(_ context.Context, id environment.ID, slotID string) (environment.Slot, error) {
 	f.acquires++
 	for _, view := range f.views {
 		if view.ID != string(id) {
@@ -45,7 +45,7 @@ func (f *fakeEnvironments) AcquireSlot(_ context.Context, id environment.ID, slo
 			return environment.Slot{}, environment.ErrFull
 		}
 		f.slots[string(id)] = slotID
-		return environment.Slot{ID: slotID, State: environment.SlotActive, SessionID: sessionID}, nil
+		return environment.Slot{ID: slotID, State: environment.SlotActive}, nil
 	}
 	return environment.Slot{}, environment.ErrNotFound
 }

@@ -226,11 +226,17 @@ func projectionOf(attemptID string, revision Revision) Projection {
 	slug := attemptSlug(attemptID)
 	return Projection{
 		AttemptID: attemptID, SecretRef: revision.SecretRef,
-		SecretName: "fm-" + slug + "-agent-config",
+		SecretName: SecretNameForAttempt(attemptID),
 		FileName:   revision.FileName, Revision: revision.Revision,
 		Digest: revision.Digest, MountPath: MountDir + "/" + revision.FileName,
 		VolumeName: "agent-config-" + slug, ReadOnly: true,
 	}
+}
+
+// SecretNameForAttempt is the fixed Job's projection volume name. The claim
+// freezes it before the Job exists, so the render and the projection agree.
+func SecretNameForAttempt(attemptID string) string {
+	return "fm-" + attemptSlug(attemptID) + "-agent-config"
 }
 
 // Audit returns the rows newest first.
