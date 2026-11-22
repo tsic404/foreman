@@ -256,6 +256,53 @@ pool. `FOREMAN_ENVIRONMENT_STATE_FILE` is a development/test fallback used only
 when Foreman runs without a Kubernetes client; it is node-local and is not
 part of the Deployment.
 
+#### Writing the registry document by hand
+
+The object ships without a `data` field on purpose (see the comment on it in
+`deploy/10-secrets.yaml`): a later `kubectl apply -f deploy/` must never
+overwrite the live registry, so Foreman creates the `environments.json` key
+itself on the first accepted mutation. Only an out-of-band seed or repair
+writes that key by hand; a stock installation never needs to.
+
+`environments.json` is one JSON object. This is the empty document:
+
+<!-- environment-registry-empty-document -->
+```json
+{
+  "ledger_id": "",
+  "carrier_uid": "",
+  "generation": 0,
+  "environments": [],
+  "tombstones": []
+}
+```
+
+Keep `ledger_id` and `carrier_uid` empty for a fresh registry. Startup mints a
+ledger identity for the live Secret object, and the first committed write
+stores that `ledger_id` together with the object's `metadata.uid` as
+`carrier_uid`. A hand-written pair is adopted only when its `carrier_uid`
+equals that `metadata.uid` — a uid the object only gets once it exists — so the
+one case for copying a pair verbatim is restoring a document into the very
+Secret it was written through. Overwriting a populated document with this
+template also starts a new ledger instance, and probe evidence bound to the
+old identity stops matching. Leave `generation` at 0: Foreman advances it on
+every committed write. Add environments at runtime with
+`POST /admin/environments` (the registration example and route table above)
+rather than by hand: their entries carry verification and slot state that
+Foreman owns and rewrites.
+
+An array is not a document. Writing `environments.json` as `[]` refuses
+startup with
+
+```
+json: cannot unmarshal array into Go value of type environment.environmentDocument
+```
+
+so every field belongs inside the object above. Seed the key in place
+(`kubectl -n foreman edit secret foreman-environment-registry`, or a patch)
+rather than by adding `data` to a manifest you keep applying: that copy would
+overwrite whatever Foreman has written since.
+
 `FOREMAN_ENVIRONMENT_TRUST_DOMAINS` is the comma-separated data-residency
 allowlist. It has no implicit "allow everything" mode: when it is empty every
 registration is refused, and a target whose domain was removed from the list
