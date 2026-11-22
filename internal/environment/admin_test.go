@@ -212,7 +212,7 @@ func TestAdminRetirementIsBlockedUntilEveryReferenceIsCleared(t *testing.T) {
 	if rec := adminRequest(t, fixture.handler, http.MethodPost, "/admin/environments", "wide", reg); rec.Code != http.StatusCreated {
 		t.Fatalf("POST register = %d %s", rec.Code, rec.Body.String())
 	}
-	if _, err := fixture.service.AcquireSlot(t.Context(), "build-a", "slot-1", "session-1"); err != nil {
+	if _, err := fixture.service.AcquireSlot(t.Context(), "build-a", "slot-1"); err != nil {
 		t.Fatalf("AcquireSlot: %v", err)
 	}
 

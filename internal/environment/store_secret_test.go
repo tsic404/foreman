@@ -68,7 +68,7 @@ func TestSecretStoreKeepsSlotsAndTombstonesAcrossPodRebuild(t *testing.T) {
 	if _, err := first.Register(ctx, registration("build-a", "build-a.example.test:7443", "/srv/rsbx/build-a", []string{"nix"}, 2), "ops"); err != nil {
 		t.Fatalf("Register build-a: %v", err)
 	}
-	if _, err := first.AcquireSlot(ctx, "build-a", "slot-1", "session-1"); err != nil {
+	if _, err := first.AcquireSlot(ctx, "build-a", "slot-1"); err != nil {
 		t.Fatalf("AcquireSlot: %v", err)
 	}
 	if _, err := first.ReleaseSlot(ctx, "build-a", "slot-1", false); err != nil {
@@ -309,7 +309,7 @@ func TestSecretStoreConflictingWriterReloadsTheCommittedLedger(t *testing.T) {
 	if _, err := second.Get(ctx, "build-a", environment.Grant{DeploymentWide: true}); err != nil {
 		t.Fatalf("the second writer cannot see the first registration: %v", err)
 	}
-	if _, err := second.AcquireSlot(ctx, "build-b", "slot-1", "session-1"); err != nil {
+	if _, err := second.AcquireSlot(ctx, "build-b", "slot-1"); err != nil {
 		t.Fatalf("AcquireSlot on the second writer: %v", err)
 	}
 
@@ -459,7 +459,7 @@ func TestStaleInstanceDrainUsesTheCommittedState(t *testing.T) {
 	if drained.Phase != string(environment.PhaseDraining) {
 		t.Fatalf("drain view = %+v, want draining", drained)
 	}
-	if _, err := first.AcquireSlot(ctx, "build-a", "slot-1", "session-1"); !errors.Is(err, environment.ErrDraining) {
+	if _, err := first.AcquireSlot(ctx, "build-a", "slot-1"); !errors.Is(err, environment.ErrDraining) {
 		t.Fatalf("AcquireSlot after the drain = %v, want ErrDraining", err)
 	}
 
@@ -537,7 +537,7 @@ func TestSlotAuditFollowsTheCommit(t *testing.T) {
 	if _, err := seed.Register(ctx, registration("build-a", "build-a.example.test:7443", "/srv/rsbx/build-a", []string{"nix"}, 2), "ops"); err != nil {
 		t.Fatalf("Register on the seed writer: %v", err)
 	}
-	if _, err := seed.AcquireSlot(ctx, "build-a", "slot-1", "session-1"); err != nil {
+	if _, err := seed.AcquireSlot(ctx, "build-a", "slot-1"); err != nil {
 		t.Fatalf("AcquireSlot on the seed writer: %v", err)
 	}
 	withSlot := readRegistrySecret(t, seedClient)
@@ -626,7 +626,7 @@ func TestRegisterRetryReprobesAfterAnotherTreeRegistersAtTheEndpoint(t *testing.
 	if _, err := writer.Get(ctx, "build-e", environment.Grant{DeploymentWide: true}); !errors.Is(err, environment.ErrNotFound) {
 		t.Fatalf("the stale registration was stored: %v", err)
 	}
-	if _, err := writer.AcquireSlot(ctx, "build-e", "slot-1", "session-1"); !errors.Is(err, environment.ErrNotFound) {
+	if _, err := writer.AcquireSlot(ctx, "build-e", "slot-1"); !errors.Is(err, environment.ErrNotFound) {
 		t.Fatalf("AcquireSlot for the stale registration = %v, want ErrNotFound", err)
 	}
 	winner, err := writer.Get(ctx, "build-b", environment.Grant{DeploymentWide: true})
@@ -636,7 +636,7 @@ func TestRegisterRetryReprobesAfterAnotherTreeRegistersAtTheEndpoint(t *testing.
 	if !winner.Verified || !winner.Schedulable || winner.Verification.TreeID != "tree-b" {
 		t.Fatalf("build-b = %+v, want the competing registration still verified and schedulable", winner)
 	}
-	if _, err := writer.AcquireSlot(ctx, "build-b", "slot-b", "session-b"); err != nil {
+	if _, err := writer.AcquireSlot(ctx, "build-b", "slot-b"); err != nil {
 		t.Fatalf("AcquireSlot on build-b: %v", err)
 	}
 }
@@ -694,7 +694,7 @@ func TestPendingVerifyReprobesAfterAnotherTreeRegistersAtTheEndpoint(t *testing.
 	if got := probeA.CallCount(); got < 3 {
 		t.Fatalf("probe calls = %d, want the stale answer probed again", got)
 	}
-	if _, err := first.AcquireSlot(ctx, "build-e", "slot-1", "session-1"); !errors.Is(err, environment.ErrNotVerified) {
+	if _, err := first.AcquireSlot(ctx, "build-e", "slot-1"); !errors.Is(err, environment.ErrNotVerified) {
 		t.Fatalf("AcquireSlot for the pending registration = %v, want ErrNotVerified", err)
 	}
 	winner, err := first.Get(ctx, "build-b", environment.Grant{DeploymentWide: true})
@@ -704,7 +704,7 @@ func TestPendingVerifyReprobesAfterAnotherTreeRegistersAtTheEndpoint(t *testing.
 	if !winner.Verified || !winner.Schedulable || winner.Verification.TreeID != "tree-b" {
 		t.Fatalf("build-b = %+v, want the competing registration still verified and schedulable", winner)
 	}
-	if _, err := first.AcquireSlot(ctx, "build-b", "slot-b", "session-b"); err != nil {
+	if _, err := first.AcquireSlot(ctx, "build-b", "slot-b"); err != nil {
 		t.Fatalf("AcquireSlot on build-b: %v", err)
 	}
 }
@@ -761,7 +761,7 @@ func TestRegisterReprobesAfterASameValueReverification(t *testing.T) {
 	if !after.Verified || !after.Schedulable || after.Verification.TreeID != "tree-b" || after.Phase != before.Phase {
 		t.Fatalf("build-b = %+v, want it unchanged and schedulable", after)
 	}
-	if _, err := writer.AcquireSlot(ctx, "build-b", "slot-b", "session-b"); err != nil {
+	if _, err := writer.AcquireSlot(ctx, "build-b", "slot-b"); err != nil {
 		t.Fatalf("AcquireSlot on build-b: %v", err)
 	}
 }
@@ -833,7 +833,7 @@ func TestRegisterReprobesAfterTheEndpointStateRoundTrips(t *testing.T) {
 	if !after.Verified || !after.Schedulable || after.Verification.TreeID != before.Verification.TreeID || after.Phase != before.Phase {
 		t.Fatalf("build-b = %+v, want the round trip to leave its visible state unchanged", after)
 	}
-	if _, err := writer.AcquireSlot(ctx, "build-b", "slot-b", "session-b"); err != nil {
+	if _, err := writer.AcquireSlot(ctx, "build-b", "slot-b"); err != nil {
 		t.Fatalf("AcquireSlot on build-b: %v", err)
 	}
 	if retired, err := writer.Retired(ctx, environment.Grant{DeploymentWide: true}); err != nil {
@@ -898,7 +898,7 @@ func TestRegisterReprobesAfterTheCarrierIsRecreated(t *testing.T) {
 	if !winner.Verified || !winner.Schedulable || winner.Verification.TreeID != "tree-b" {
 		t.Fatalf("build-b-new = %+v, want the new registration verified and schedulable", winner)
 	}
-	if _, err := writer.AcquireSlot(ctx, "build-b-new", "slot-b", "session-b"); err != nil {
+	if _, err := writer.AcquireSlot(ctx, "build-b-new", "slot-b"); err != nil {
 		t.Fatalf("AcquireSlot on build-b-new: %v", err)
 	}
 }
@@ -960,7 +960,7 @@ func TestRegisterReprobesAfterTheOldDocumentIsRestoredIntoANewCarrier(t *testing
 	if !winner.Verified || !winner.Schedulable || winner.Verification.TreeID != "tree-b" {
 		t.Fatalf("build-b = %+v, want the re-verified registration still schedulable", winner)
 	}
-	if _, err := writer.AcquireSlot(ctx, "build-b", "slot-b", "session-b"); err != nil {
+	if _, err := writer.AcquireSlot(ctx, "build-b", "slot-b"); err != nil {
 		t.Fatalf("AcquireSlot on build-b: %v", err)
 	}
 }
@@ -1017,7 +1017,7 @@ func TestRegisterReprobesAfterTheDocumentIsClearedOnTheSameCarrier(t *testing.T)
 	if !winner.Verified || !winner.Schedulable || winner.Verification.TreeID != "tree-b" {
 		t.Fatalf("build-b-new = %+v, want the new registration verified and schedulable", winner)
 	}
-	if _, err := writer.AcquireSlot(ctx, "build-b-new", "slot-b", "session-b"); err != nil {
+	if _, err := writer.AcquireSlot(ctx, "build-b-new", "slot-b"); err != nil {
 		t.Fatalf("AcquireSlot on build-b-new: %v", err)
 	}
 }
@@ -1127,7 +1127,7 @@ func TestRegisterReprobesAfterTheSameCarrierIsRestoredInPlace(t *testing.T) {
 	if !winner.Verified || !winner.Schedulable || winner.Verification.TreeID != "tree-b" {
 		t.Fatalf("build-b = %+v, want it verified and schedulable", winner)
 	}
-	if _, err := writer.AcquireSlot(ctx, "build-b", "slot-b", "session-b"); err != nil {
+	if _, err := writer.AcquireSlot(ctx, "build-b", "slot-b"); err != nil {
 		t.Fatalf("AcquireSlot on build-b: %v", err)
 	}
 }
@@ -1188,7 +1188,7 @@ func TestVerifyReadsTargetAndEpochFromOneSnapshot(t *testing.T) {
 	if !strings.Contains(view.Verification.Error, "connection refused") {
 		t.Fatalf("verification error = %q, want the probe of the restored target", view.Verification.Error)
 	}
-	if _, err := writer.AcquireSlot(ctx, "build-a", "slot-1", "session-1"); !errors.Is(err, environment.ErrNotVerified) {
+	if _, err := writer.AcquireSlot(ctx, "build-a", "slot-1"); !errors.Is(err, environment.ErrNotVerified) {
 		t.Fatalf("AcquireSlot = %v, want ErrNotVerified", err)
 	}
 }

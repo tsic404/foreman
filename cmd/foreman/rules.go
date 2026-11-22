@@ -110,9 +110,26 @@ func (b rulesBinder) Bind(ctx context.Context, request scheduler.EnvironmentRequ
 		}
 		return scheduler.EnvironmentBinding{}, errors.Join(scheduler.ErrEnvironmentBlocked, err)
 	}
-	return scheduler.EnvironmentBinding{
+	out := scheduler.EnvironmentBinding{
 		EnvironmentID: binding.EnvironmentID, SlotID: binding.SlotID, RuleID: binding.RuleID,
-	}, nil
+		Platform:        binding.Resolution.CLIs.Platform,
+		AgentBackend:    binding.Resolution.Provider,
+		MulticaVersion:  binding.Resolution.CLIs.MulticaVersion,
+		MulticaDigest:   binding.Resolution.CLIs.MulticaDigest,
+		AgentVersion:    binding.Resolution.CLIs.AgentVersion,
+		AgentDigest:     binding.Resolution.CLIs.AgentDigest,
+		ConfigRevision:  binding.Resolution.Config.Revision,
+		ConfigSecretRef: binding.Resolution.Config.SecretRef,
+		ConfigFileName:  binding.Resolution.Config.FileName,
+		ConfigDigest:    binding.Resolution.Config.Digest,
+	}
+	if choice := binding.Resolution.Environment; choice != nil {
+		out.Endpoint = choice.Endpoint
+		out.TLSRef = choice.TLSRef
+		out.StateRoot = choice.StateRoot
+		out.EnvironmentGen = choice.Generation
+	}
+	return out, nil
 }
 
 // Release returns one claim's reservation.

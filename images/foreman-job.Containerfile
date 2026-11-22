@@ -54,6 +54,7 @@ RUN set -eux; \
     chown -R 1000:1000 /home/agent /state
 
 COPY foreman-gc-linux-${TARGETARCH} /usr/local/bin/foreman-gc
+COPY foreman-job-linux-${TARGETARCH} /usr/local/bin/foreman-job
 
 # No ENTRYPOINT and an explicitly empty CMD: the Job pod and the DaemonSet both
 # state the command explicitly, so a pod that forgets it fails at start instead

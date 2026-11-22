@@ -942,6 +942,15 @@ func (s *Scheduler) onClaimFor(ctx context.Context, sourceID, workspaceID string
 		e.EnvironmentID = binding.EnvironmentID
 		e.EnvironmentSlotID = binding.SlotID
 		environmentReserved = true
+		spec, fixed, specErr := fixedAttemptSpec(e, binding)
+		if specErr != nil {
+			s.log.WarnContext(ctx, "task.fixed_placement_incomplete",
+				"task_id", e.TaskID, "environment_id", binding.EnvironmentID, "err", specErr.Error())
+			return fmt.Errorf("%w: %v", ErrEnvironmentBlocked, specErr)
+		}
+		if fixed {
+			e.FixedAttempt = spec
+		}
 	}
 	if s.shared != nil && !reserved {
 		// Direct callers (not the claim loop) reserve here; the loop's
@@ -3671,24 +3680,27 @@ func (s *Scheduler) deleteObjects(ctx context.Context, e registry.TaskEntry) err
 func jobbuilderEntry(e registry.TaskEntry) jobbuilder.TaskEntry {
 	provider, profileID, _ := registry.SplitRuntimeIdentity(e.RuntimeIdentity)
 	return jobbuilder.TaskEntry{
-		TaskID:           e.TaskID,
-		SourceID:         e.SourceID,
-		AgentID:          e.AgentID,
-		IssueID:          e.IssueID,
-		IssueIdentifier:  e.IssueIdentifier,
-		AutopilotRunID:   e.AutopilotRunID,
-		ChatSessionID:    e.ChatSessionID,
-		WorkspaceID:      e.WorkspaceID,
-		JobRuntimeID:     e.JobRuntimeID,
-		RealRuntimeID:    e.RealRuntimeID,
-		RuntimeProvider:  provider,
-		RuntimeProfileID: profileID,
-		ClaimedAt:        e.ClaimedAt,
-		Attempt:          e.Attempt,
-		PriorSessionID:   e.PriorSessionID,
-		AgentName:        e.AgentName,
-		ProjectID:        e.ProjectID,
-		ProjectSource:    e.ProjectSource,
+		TaskID:            e.TaskID,
+		SourceID:          e.SourceID,
+		AgentID:           e.AgentID,
+		IssueID:           e.IssueID,
+		IssueIdentifier:   e.IssueIdentifier,
+		AutopilotRunID:    e.AutopilotRunID,
+		ChatSessionID:     e.ChatSessionID,
+		WorkspaceID:       e.WorkspaceID,
+		JobRuntimeID:      e.JobRuntimeID,
+		RealRuntimeID:     e.RealRuntimeID,
+		RuntimeProvider:   provider,
+		RuntimeProfileID:  profileID,
+		ClaimedAt:         e.ClaimedAt,
+		Attempt:           e.Attempt,
+		PriorSessionID:    e.PriorSessionID,
+		AgentName:         e.AgentName,
+		ProjectID:         e.ProjectID,
+		ProjectSource:     e.ProjectSource,
+		FixedAttempt:      append([]byte(nil), e.FixedAttempt...),
+		EnvironmentID:     e.EnvironmentID,
+		EnvironmentSlotID: e.EnvironmentSlotID,
 	}
 }
 

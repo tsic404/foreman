@@ -129,7 +129,7 @@ func TestRemovingTheTrustDomainGrantAfterRestartDropsThePool(t *testing.T) {
 	if candidates := revoked.Candidates(t.Context(), environment.CandidateFilter{}); len(candidates) != 0 {
 		t.Fatalf("Candidates = %+v, want none after the grant was removed", candidates)
 	}
-	if _, err := revoked.AcquireSlot(t.Context(), "build-a", "slot-1", "session-1"); !errors.Is(err, environment.ErrTrustDomainDenied) {
+	if _, err := revoked.AcquireSlot(t.Context(), "build-a", "slot-1"); !errors.Is(err, environment.ErrTrustDomainDenied) {
 		t.Fatalf("AcquireSlot = %v, want ErrTrustDomainDenied", err)
 	}
 	if _, err := revoked.Verify(t.Context(), "build-a", "ops"); !errors.Is(err, environment.ErrTrustDomainDenied) {

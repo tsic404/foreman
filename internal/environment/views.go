@@ -48,6 +48,8 @@ type EnvironmentView struct {
 type SlotView struct {
 	ID         string `json:"id"`
 	State      string `json:"state"`
+	Phase      string `json:"phase,omitempty"`
+	Started    bool   `json:"started,omitempty"`
 	SessionID  string `json:"session_id,omitempty"`
 	AcquiredAt string `json:"acquired_at,omitempty"`
 	ReleasedAt string `json:"released_at,omitempty"`
@@ -157,6 +159,8 @@ func slotView(slot Slot) SlotView {
 	return SlotView{
 		ID:         slot.ID,
 		State:      string(slot.State),
+		Phase:      string(slot.Phase),
+		Started:    slot.Started,
 		SessionID:  slot.SessionID,
 		AcquiredAt: stamp(slot.AcquiredAt),
 		ReleasedAt: stamp(slot.ReleasedAt),

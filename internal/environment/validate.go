@@ -195,6 +195,16 @@ func validateSlotID(slotID string) error {
 	return nil
 }
 
+// validateClaimID checks the opaque execution lease. It is minted by the Job,
+// stored with the slot and compared under the ledger transaction; it is never
+// a session or environment identity.
+func validateClaimID(claimID string) error {
+	if strings.TrimSpace(claimID) == "" {
+		return invalid("claim id is required")
+	}
+	return validateOptionalText("claim id", claimID, 128)
+}
+
 func missingCapabilities(required, observed []string) []string {
 	if len(required) == 0 {
 		return nil

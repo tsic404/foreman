@@ -40,6 +40,10 @@ const (
 	annoRealRuntimeID    = "foreman.tsic.top/real-runtime-id"
 	annoRuntimeProvider  = "foreman.tsic.top/runtime-provider"
 	annoRuntimeProfileID = "foreman.tsic.top/runtime-profile-id"
+	annoEnvironmentID    = "foreman.tsic.top/environment-id"
+	annoEnvironmentGen   = "foreman.tsic.top/environment-generation"
+	annoSessionID        = "foreman.tsic.top/session-id"
+	annoSlotID           = "foreman.tsic.top/slot-id"
 )
 
 // Names the writers of both render paths share: the Foreman-owned domain, the
@@ -48,6 +52,7 @@ const (
 	jobAppName       = "foreman-job"
 	managedByForeman = "foreman"
 	configFileKey    = "config.json"
+	attemptSpecKey   = "attempt.json"
 	secretCredSuffix = "-cred"
 	foremanDomain    = "foreman.tsic.top/"
 
@@ -137,8 +142,12 @@ var (
 // (ADR-034 decision 8, §3). The workspace label is the object's own identity
 // in the sweep's partition (§6.5): the sweep never derives it from the
 // deployment's configuration, or a lease key would not match the claim's.
-func (b *Builder) credentialSecret(daemonID, taskID, sourceID, workspaceID, token string) *corev1.Secret {
+func (b *Builder) credentialSecret(daemonID, taskID, sourceID, workspaceID, token string, attemptSpec []byte) *corev1.Secret {
 	configJSON := `{"token":` + strconv.Quote(token) + `}`
+	stringData := map[string]string{configFileKey: configJSON}
+	if len(attemptSpec) > 0 {
+		stringData[attemptSpecKey] = string(attemptSpec)
+	}
 	labels := map[string]string{
 		labelManagedBy:   managedByForeman,
 		labelTaskID:      taskID,
@@ -154,6 +163,6 @@ func (b *Builder) credentialSecret(daemonID, taskID, sourceID, workspaceID, toke
 			Labels:    labels,
 		},
 		Type:       corev1.SecretTypeOpaque,
-		StringData: map[string]string{configFileKey: configJSON},
+		StringData: stringData,
 	}
 }

@@ -81,10 +81,28 @@ const (
 	SlotIsolated SlotState = "isolated"
 )
 
+// SlotPhase records how far the Job-side attempt got with a reservation. It
+// lives in the shared ledger, so a rebuilt Pod reads Started/opening from it
+// instead of relying on a container-local file.
+type SlotPhase string
+
+const (
+	SlotPhaseIdle      SlotPhase = ""
+	SlotPhaseOpening   SlotPhase = "opening"
+	SlotPhaseConnected SlotPhase = "connected"
+	SlotPhaseStarted   SlotPhase = "started"
+)
+
 // Slot is one capacity reservation inside an environment.
 type Slot struct {
-	ID         string
-	State      SlotState
+	ID      string
+	State   SlotState
+	Phase   SlotPhase
+	Started bool
+	// ClaimID is the execution lease that owns the current phase transition.
+	// Begin mints it, recovery takes it over atomically, and only the holder
+	// may bind a remote session, commit dispatch or release this reservation.
+	ClaimID    string
 	SessionID  string
 	AcquiredAt time.Time
 	ReleasedAt time.Time
@@ -211,6 +229,7 @@ const (
 	AuditRetire          = "environment.retire"
 	AuditSupersede       = "environment.supersede"
 	AuditSlotAcquire     = "environment.slot.acquire"
+	AuditSlotAdvance     = "environment.slot.advance"
 	AuditSlotRelease     = "environment.slot.release"
 	AuditSlotIsolate     = "environment.slot.isolate"
 	AuditCleanupConfirm  = "environment.cleanup.confirm"
@@ -422,6 +441,10 @@ var (
 	ErrSlotExists        = errors.New("slot is already recorded")
 	ErrSlotNotFound      = errors.New("slot is not recorded")
 	ErrSlotActive        = errors.New("slot is still active")
+	ErrSlotIsolated      = errors.New("slot is isolated")
+	ErrSlotPhase         = errors.New("slot phase transition is not allowed")
+	ErrSlotClaimed       = errors.New("slot is owned by another attempt execution")
+	ErrSlotSessionBound  = errors.New("slot is already bound to another remote session")
 	ErrSlotsPresent      = errors.New("environment has live or isolated slots")
 	ErrCleanupExists     = errors.New("cleanup is already recorded")
 	ErrCleanupNotFound   = errors.New("cleanup is not recorded")

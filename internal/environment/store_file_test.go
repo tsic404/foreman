@@ -162,7 +162,7 @@ func TestFileStoreSlotWriteFailureLeavesTheLedgerUnchanged(t *testing.T) {
 	if err := os.Mkdir(path+".tmp", 0o700); err != nil {
 		t.Fatalf("make the temp path unwritable: %v", err)
 	}
-	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1", "session-1"); err == nil {
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1"); err == nil {
 		t.Fatal("AcquireSlot succeeded although the document write failed")
 	}
 	view, err := service.Get(ctx, "build-a", environment.Grant{DeploymentWide: true})
@@ -249,7 +249,7 @@ func TestFileStoreRenameFailureKeepsThePreviousDocument(t *testing.T) {
 		t.Fatalf("replace the registry with a directory: %v", err)
 	}
 
-	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1", "session-1"); err == nil {
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1"); err == nil {
 		t.Fatal("AcquireSlot succeeded although the document replace failed")
 	}
 	view, err := service.Get(ctx, "build-a", environment.Grant{DeploymentWide: true})
