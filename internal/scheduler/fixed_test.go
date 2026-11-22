@@ -10,6 +10,14 @@ import (
 	"github.com/tsic404/foreman/internal/registry"
 )
 
+const (
+	fixedTestImage  = "ghcr.io/tsic404/rsbx@sha256:" + "1111111111111111111111111111111111111111111111111111111111111111"
+	fixedTestProxy  = "http://foreman.foreman.svc.cluster.local:8080"
+	fixedTestBudget = int64(64 << 20)
+	fixedMultica    = "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+	fixedAgent      = "sha256:3333333333333333333333333333333333333333333333333333333333333333"
+)
+
 func fixedRegistryEntry() registry.TaskEntry {
 	return registry.TaskEntry{
 		TaskID: "task-v2-1", SourceID: "src-a", WorkspaceID: "ws-1",
@@ -24,15 +32,15 @@ func completeEnvironmentBinding() EnvironmentBinding {
 		Endpoint: "build-a.example.test:7443", TLSRef: "ref/build-a",
 		StateRoot: "/srv/rsbx/build-a", EnvironmentGen: "tree-1",
 		Platform: "linux/amd64", AgentBackend: "codex",
-		MulticaVersion: "0.6.1", MulticaDigest: "sha256:multica",
-		AgentVersion: "0.167.1", AgentDigest: "sha256:codex",
+		MulticaVersion: "0.6.1", MulticaDigest: fixedMultica,
+		AgentVersion: "0.167.1", AgentDigest: fixedAgent,
 	}
 }
 
 // TestFixedAttemptSpecFreezesTheBinderFacts pins V2-C03/§6: the claim turns
 // the placement into the fixed Job's exact two-CLI/environment snapshot.
 func TestFixedAttemptSpecFreezesTheBinderFacts(t *testing.T) {
-	raw, fixed, err := fixedAttemptSpec(fixedRegistryEntry(), completeEnvironmentBinding())
+	raw, fixed, err := fixedAttemptSpec(fixedRegistryEntry(), completeEnvironmentBinding(), fixedTestImage, fixedTestProxy, fixedTestBudget)
 	if err != nil {
 		t.Fatalf("fixedAttemptSpec: %v", err)
 	}
@@ -56,6 +64,20 @@ func TestFixedAttemptSpecFreezesTheBinderFacts(t *testing.T) {
 	if binding.SessionID != "" {
 		t.Errorf("remote session id = %q, want no frozen remote session", binding.SessionID)
 	}
+	if binding.Image != "ghcr.io/tsic404/rsbx" || binding.ImageDigest != "sha256:"+strings.Repeat("1", 64) {
+		t.Errorf("carrier = %s@%s, want the configured rsbx digest", binding.Image, binding.ImageDigest)
+	}
+	if binding.Platform != "linux/amd64" || binding.ProxyURL != fixedTestProxy {
+		t.Errorf("client platform/proxy = %q/%q", binding.Platform, binding.ProxyURL)
+	}
+	if binding.CLIBudgetBytes != fixedTestBudget {
+		t.Errorf("CLI budget = %d, want %d", binding.CLIBudgetBytes, fixedTestBudget)
+	}
+	for _, cli := range binding.CLIs {
+		if !strings.HasPrefix(cli.DownloadURL, fixedTestProxy+"/cli/") {
+			t.Errorf("%s CLI download URL %q is not on the Foreman proxy", cli.Kind, cli.DownloadURL)
+		}
+	}
 	if binding.ResumeSessionID != "session-resume" {
 		t.Errorf("resume session = %q, want the Multica session path", binding.ResumeSessionID)
 	}
@@ -73,7 +95,7 @@ func TestFixedAttemptSpecFreezesTheBinderFacts(t *testing.T) {
 func TestFixedAttemptSpecKeepsLegacyBinderOnTemplate(t *testing.T) {
 	raw, fixed, err := fixedAttemptSpec(fixedRegistryEntry(), EnvironmentBinding{
 		EnvironmentID: "build-a", SlotID: "task-v2-1", RuleID: "rule-1",
-	})
+	}, fixedTestImage, fixedTestProxy, fixedTestBudget)
 	if err != nil {
 		t.Fatalf("legacy binder: %v", err)
 	}
@@ -87,7 +109,7 @@ func TestFixedAttemptSpecKeepsLegacyBinderOnTemplate(t *testing.T) {
 func TestFixedAttemptSpecRefusesPartialPlacement(t *testing.T) {
 	partial := completeEnvironmentBinding()
 	partial.Endpoint = ""
-	_, fixed, err := fixedAttemptSpec(fixedRegistryEntry(), partial)
+	_, fixed, err := fixedAttemptSpec(fixedRegistryEntry(), partial, fixedTestImage, fixedTestProxy, fixedTestBudget)
 	if err == nil {
 		t.Fatal("partial placement was accepted")
 	}
@@ -107,7 +129,7 @@ func TestFixedAttemptSpecNamesTheAttemptConfigSecret(t *testing.T) {
 	binding.ConfigSecretRef = "ref/agent-config"
 	binding.ConfigFileName = "config.toml"
 	binding.ConfigDigest = "sha256:config"
-	raw, fixed, err := fixedAttemptSpec(fixedRegistryEntry(), binding)
+	raw, fixed, err := fixedAttemptSpec(fixedRegistryEntry(), binding, fixedTestImage, fixedTestProxy, fixedTestBudget)
 	if err != nil || !fixed {
 		t.Fatalf("fixedAttemptSpec = (fixed=%v, err=%v)", fixed, err)
 	}

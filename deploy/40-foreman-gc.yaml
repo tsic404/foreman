@@ -3,9 +3,9 @@
 #
 # Cleanup runs in the node's state root mounted at /state — never inside a Job
 # pod, because concurrent pods cannot safely judge each other's directories.
-# The image is the Job image (it ships foreman-gc alongside the daemon CLI and
-# dumb-init), the same reference literal as FOREMAN_JOB_IMAGE in
-# 30-foreman.yaml — see deploy/README.md §Images.
+# The DaemonSet runs the Foreman image, which carries foreman-gc beside the
+# server and the Job-side supervisor; the Job carrier is the rsbx image and
+# carries no CLI or collector.
 ---
 apiVersion: apps/v1
 kind: DaemonSet
@@ -41,9 +41,9 @@ spec:
           type: RuntimeDefault
       containers:
         - name: foreman-gc
-          # Same movable reference as FOREMAN_JOB_IMAGE (ADR-012); Always so a
+          # Same movable reference as the foreman Deployment; Always so a
           # moved tag reaches every node instead of a stale cached layer.
-          image: ghcr.io/tsic404/foreman-job:latest
+          image: ghcr.io/tsic404/foreman:latest
           imagePullPolicy: Always
           command: ["/usr/local/bin/foreman-gc"]
           env:

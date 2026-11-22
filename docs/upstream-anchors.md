@@ -9,7 +9,8 @@ defensive form instead of being relied on.
 ## Pinned artifact
 
 `github.com/multica-ai/multica@2ea01ae4` — the `v0.6.1` release commit, the same
-artifact the test cluster pins and the Job image carries.
+artifact the test cluster pins and the Foreman release registry serves to a
+Job through the proxy download face.
 
 ## S-12 token usage (contracts §9.2 / ADR-009 decision 4)
 

@@ -75,9 +75,9 @@ func TestLoadConfigIgnoresTemplateShapeKeys(t *testing.T) {
 	}
 }
 
-// TestLoadConfigJobImageVerbatim: FOREMAN_JOB_IMAGE is a full image reference
-// taken verbatim — tag, digest and tag@digest forms are all legal, and the
-// shape is not a predicate (ADR-012).
+// TestLoadConfigJobImageVerbatim: FOREMAN_JOB_IMAGE is taken verbatim at load
+// time. The claim-time binding refuses a reference without a verified digest
+// (V2-C08); the loader itself does not judge the shape.
 func TestLoadConfigJobImageVerbatim(t *testing.T) {
 	refs := []string{
 		"ghcr.io/tsic404/foreman-job:latest",

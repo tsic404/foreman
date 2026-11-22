@@ -20,7 +20,11 @@ func TestJobFaceMuxExposesOnlyTheJobFaceAndLiveness(t *testing.T) {
 		w.Header().Set("X-Job-Face", "1")
 		w.WriteHeader(http.StatusOK)
 	})
-	mux := newJobFaceMux(fake, observability.NewHealth(), time.Now())
+	downloads := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-CLI-Face", "1")
+		w.WriteHeader(http.StatusOK)
+	})
+	mux := newJobFaceMux(fake, downloads, observability.NewHealth(), time.Now())
 
 	for _, path := range []string{"/api/daemon/workspaces", "/api/daemon/register", "/api/tokens/current/renew"} {
 		rec := httptest.NewRecorder()
@@ -53,6 +57,12 @@ func TestJobFaceMuxExposesOnlyTheJobFaceAndLiveness(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/foreman/healthz", nil))
 	if rec.Code != http.StatusOK {
 		t.Fatalf("/foreman/healthz = %d, want 200", rec.Code)
+	}
+
+	rec = httptest.NewRecorder()
+	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/cli/multica/0.11.1/linux/amd64", nil))
+	if rec.Code != http.StatusOK || rec.Header().Get("X-CLI-Face") != "1" {
+		t.Fatalf("/cli/... = %d, want the CLI download face", rec.Code)
 	}
 	for _, field := range []string{"inflight", "runtime_ids", "task_id", "workspace_id"} {
 		if strings.Contains(rec.Body.String(), field) {

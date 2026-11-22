@@ -942,7 +942,8 @@ func (s *Scheduler) onClaimFor(ctx context.Context, sourceID, workspaceID string
 		e.EnvironmentID = binding.EnvironmentID
 		e.EnvironmentSlotID = binding.SlotID
 		environmentReserved = true
-		spec, fixed, specErr := fixedAttemptSpec(e, binding)
+		spec, fixed, specErr := fixedAttemptSpec(e, binding,
+			s.cfg.JobImage, s.cfg.JobServerURL, s.cfg.CLIBudgetBytes)
 		if specErr != nil {
 			s.log.WarnContext(ctx, "task.fixed_placement_incomplete",
 				"task_id", e.TaskID, "environment_id", binding.EnvironmentID, "err", specErr.Error())

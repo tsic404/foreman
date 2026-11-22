@@ -4,10 +4,14 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 
 	"github.com/tsic404/foreman/internal/attempt"
+	"github.com/tsic404/foreman/internal/auth"
+	"github.com/tsic404/foreman/internal/release"
 )
 
 type v2Cache struct {
@@ -17,13 +21,14 @@ type v2Cache struct {
 	present   map[string]bool
 	artifacts map[string]attempt.Artifact
 	err       error
+	failKind  string
 }
 
 func (c *v2Cache) Ensure(_ context.Context, cli attempt.CLI) (attempt.Artifact, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 	c.requested = append(c.requested, cli)
-	if c.err != nil {
+	if c.err != nil && (c.failKind == "" || c.failKind == cli.Kind) {
 		return attempt.Artifact{}, c.err
 	}
 	artifact, ok := c.artifacts[cli.Kind]
@@ -272,9 +277,15 @@ func v2FixedBinding() attempt.Binding {
 		Endpoint: "build-a.example.test:7443", TLSRef: "ref/build-a",
 		StateRoot: "/srv/rsbx/build-a", EnvironmentGen: "tree-1",
 		SlotID: "task-v2-1",
+		Image:  "ghcr.io/tsic404/rsbx", ImageDigest: "sha256:" + strings.Repeat("1", 64),
+		Platform: "linux/amd64", ProxyURL: "http://foreman.foreman.svc.cluster.local:8080",
 		CLIs: []attempt.CLI{
-			{Kind: attempt.KindMultica, Version: "0.6.1", Platform: "linux/amd64", Digest: "aaaa"},
-			{Kind: attempt.KindAgent, Backend: "codex", Version: "0.167.1", Platform: "linux/amd64", Digest: "bbbb"},
+			{Kind: attempt.KindMultica, Version: "0.6.1", Platform: "linux/amd64",
+				Digest:      "sha256:" + strings.Repeat("2", 64),
+				DownloadURL: "http://foreman.foreman.svc.cluster.local:8080/cli/multica/0.6.1/linux/amd64"},
+			{Kind: attempt.KindAgent, Backend: "codex", Version: "0.167.1", Platform: "linux/amd64",
+				Digest:      "sha256:" + strings.Repeat("3", 64),
+				DownloadURL: "http://foreman.foreman.svc.cluster.local:8080/cli/agent/0.167.1/linux/amd64?backend=codex"},
 		},
 	}
 }
@@ -310,4 +321,70 @@ func v2FixedSupervisor(t *testing.T, storePath string, cache *v2Cache, remote *v
 func v2StorePath(t *testing.T) string {
 	t.Helper()
 	return filepath.Join(t.TempDir(), "attempt-state.json")
+}
+
+type v2DownloadVerifier struct {
+	claims auth.Claims
+}
+
+func (v v2DownloadVerifier) Verify(string, auth.RequestScope) (auth.Claims, error) {
+	return v.claims, nil
+}
+
+type v2DownloadBindings struct {
+	binding attempt.Binding
+}
+
+func (b v2DownloadBindings) FrozenAttempt(sourceID, workspaceID, taskID string) (attempt.Binding, bool) {
+	if b.binding.TaskID != taskID || b.binding.SourceID != sourceID || b.binding.WorkspaceID != workspaceID {
+		return attempt.Binding{}, false
+	}
+	return b.binding, true
+}
+
+type v2PublishedCLI struct {
+	kind     release.Kind
+	adapter  string
+	version  string
+	platform string
+	digest   string
+	body     []byte
+}
+
+type v2DownloadReleases struct {
+	server   string
+	releases []v2PublishedCLI
+	reads    atomic.Int32
+}
+
+func (r *v2DownloadReleases) VerifiedRelease(_ context.Context, serverID string, kind release.Kind, adapter, version, platform string) (string, bool) {
+	if serverID != r.server {
+		return "", false
+	}
+	for _, published := range r.releases {
+		if published.kind != kind {
+			continue
+		}
+		if kind == release.KindAgent && !strings.EqualFold(published.adapter, adapter) {
+			continue
+		}
+		if published.version != version || !strings.EqualFold(published.platform, platform) {
+			continue
+		}
+		return published.digest, true
+	}
+	return "", false
+}
+
+func (r *v2DownloadReleases) VerifiedArtifactByDomain(_ context.Context, serverID, digest string) ([]byte, error) {
+	r.reads.Add(1)
+	if serverID != r.server {
+		return nil, errors.New("unknown artifact")
+	}
+	for _, published := range r.releases {
+		if published.digest == digest {
+			return published.body, nil
+		}
+	}
+	return nil, errors.New("unknown artifact")
 }

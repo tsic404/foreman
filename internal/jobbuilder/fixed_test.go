@@ -6,6 +6,8 @@ import (
 	"strings"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
+
 	"github.com/tsic404/foreman/internal/agentconfig"
 	"github.com/tsic404/foreman/internal/attempt"
 )
@@ -26,9 +28,15 @@ func fixedEntry(t *testing.T) TaskEntry {
 		Endpoint: "build-a.example.test:7443", TLSRef: "ref/build-a",
 		StateRoot: "/srv/rsbx/build-a", EnvironmentGen: "tree-1",
 		SlotID: entry.EnvironmentSlotID,
+		Image:  "ghcr.io/tsic404/rsbx", ImageDigest: "sha256:" + strings.Repeat("1", 64),
+		Platform: "linux/amd64", ProxyURL: "http://foreman.foreman.svc.cluster.local:8080",
 		CLIs: []attempt.CLI{
-			{Kind: attempt.KindMultica, Version: "0.6.1", Platform: "linux/amd64", Digest: "sha256:multica"},
-			{Kind: attempt.KindAgent, Backend: "codex", Version: "0.167.1", Platform: "linux/amd64", Digest: "sha256:codex"},
+			{Kind: attempt.KindMultica, Version: "0.6.1", Platform: "linux/amd64",
+				Digest:      "sha256:" + strings.Repeat("2", 64),
+				DownloadURL: "http://foreman.foreman.svc.cluster.local:8080/cli/multica/0.6.1/linux/amd64"},
+			{Kind: attempt.KindAgent, Backend: "codex", Version: "0.167.1", Platform: "linux/amd64",
+				Digest:      "sha256:" + strings.Repeat("3", 64),
+				DownloadURL: "http://foreman.foreman.svc.cluster.local:8080/cli/agent/0.167.1/linux/amd64?backend=codex"},
 		},
 	}
 	raw, err := json.Marshal(binding)
@@ -50,15 +58,27 @@ func TestFixedRenderCarriesOnlyTheAttemptsTwoCLIs(t *testing.T) {
 	if len(spec.Containers) != 1 {
 		t.Fatalf("fixed Job has %d containers, want exactly the one Agent container", len(spec.Containers))
 	}
-	if len(spec.InitContainers) != 0 {
-		t.Fatalf("fixed Job has %d init containers, want no separate probe/prepare Pod or container", len(spec.InitContainers))
+	if len(spec.InitContainers) != 1 || spec.InitContainers[0].Name != "job-runtime" {
+		t.Fatalf("fixed Job init containers = %+v, want the one job-runtime carrier", spec.InitContainers)
 	}
 	container := spec.Containers[0]
 	if container.Name != "agent" {
 		t.Errorf("container name = %q, want the fixed agent container", container.Name)
 	}
-	if !strings.Contains(strings.Join(container.Command, " "), "/usr/local/bin/foreman-job") {
-		t.Errorf("command = %v, want the fixed foreman-job entry point", container.Command)
+	if got := strings.Join(container.Command, " "); got != "/run/foreman/runtime/foreman-job" {
+		t.Errorf("command = %q, want the supervisor copied from the Foreman runtime image", got)
+	}
+	if strings.Contains(strings.Join(container.Command, " "), "/usr/local/bin/foreman-job") {
+		t.Error("the fixed Job still requires the old foreman-job entry inside the carrier")
+	}
+	if container.Image != "ghcr.io/tsic404/rsbx@sha256:"+strings.Repeat("1", 64) {
+		t.Errorf("carrier image = %q, want the frozen rsbx digest", container.Image)
+	}
+	if container.ImagePullPolicy != corev1.PullIfNotPresent {
+		t.Errorf("carrier pull policy = %q, want IfNotPresent for a digest-pinned image", container.ImagePullPolicy)
+	}
+	if got := spec.NodeSelector["kubernetes.io/arch"]; got != "amd64" {
+		t.Errorf("node arch selector = %q, want amd64 from the frozen platform", got)
 	}
 	for _, name := range []string{"probe", "catalog", "omp", "claude"} {
 		for _, other := range spec.Containers {

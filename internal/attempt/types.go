@@ -2,17 +2,19 @@
 // prepare only this attempt's two CLI artifacts, establish and verify the
 // frozen rsbx session before registering, then dispatch the selected Agent
 // once and settle the remote-side close. It is the Job-side half of
-// 02-contracts.md V2-C03/C04 and 04-architecture.md §6.
+// 02-contracts.md V2-C03/C04 and V2-C08–C12.
 package attempt
 
 import (
 	"errors"
 	"fmt"
+	"net/url"
+	"regexp"
 	"strings"
 )
 
 // CLI kinds. The fixed Job prepares exactly one of each; any other backend is
-// neither downloaded nor mounted (04-architecture.md §6 ①).
+// neither downloaded nor mounted (V2-C09).
 const (
 	KindMultica = "multica"
 	KindAgent   = "agent"
@@ -23,13 +25,16 @@ const (
 const platformSeparator = "/"
 
 // CLI is one frozen artifact reference. Version and Digest come from the
-// claim-time release snapshot; the Job may only use those exact bytes.
+// claim-time release snapshot; the Job may only use those exact bytes, fetched
+// from the Foreman proxy address frozen with the attempt.
 type CLI struct {
-	Kind     string `json:"kind"`
-	Backend  string `json:"backend,omitempty"`
-	Version  string `json:"version"`
-	Platform string `json:"platform"`
-	Digest   string `json:"sha256"`
+	Kind        string `json:"kind"`
+	Backend     string `json:"backend,omitempty"`
+	Version     string `json:"version"`
+	Platform    string `json:"platform"`
+	LibC        string `json:"libc,omitempty"`
+	Digest      string `json:"sha256"`
+	DownloadURL string `json:"download_url"`
 }
 
 // Config is the selected Agent configuration projection. The Job mounts only
@@ -66,8 +71,44 @@ type Binding struct {
 	// affinity key on the client side, not an rsbx session identity.
 	ResumeSessionID string `json:"resume_session_id,omitempty"`
 	SlotID          string `json:"slot_id"`
-	CLIs            []CLI  `json:"clis"`
-	Config          Config `json:"config"`
+	// Image and ImageDigest are the frozen rsbx carrier identity. The render
+	// never derives the image from a movable tag: a deployer-selected digest is
+	// the only carrier input (V2-C08).
+	Image       string `json:"image"`
+	ImageDigest string `json:"image_digest"`
+	// Platform is the client container's os/arch. Both CLIs must match it.
+	Platform string `json:"platform"`
+	// ProxyURL is the Foreman proxy origin this attempt may read. Every CLI
+	// download address must belong to it (V2-C08).
+	ProxyURL string `json:"proxy_url"`
+	// CLIBudgetBytes is the finite download budget shared by the attempt's two
+	// artifacts and their retries. Zero falls back to DefaultCLIBudgetBytes.
+	CLIBudgetBytes int64  `json:"cli_budget_bytes,omitempty"`
+	CLIs           []CLI  `json:"clis"`
+	Config         Config `json:"config"`
+}
+
+// DefaultCLIBudgetBytes is the attempt's default two-artifact download budget.
+// It is per attempt and separate from the control-plane budgets (V2-C28).
+const DefaultCLIBudgetBytes int64 = 512 << 20
+
+var (
+	digestPattern = regexp.MustCompile(`^(?:sha256:)?[0-9a-f]{64}$`)
+	secretTag     = regexp.MustCompile(`(?i)^(?:latest|main|stable)$`)
+)
+
+// DigestHex returns the bare lowercase hex digest, accepting the optional
+// "sha256:" prefix. An empty or malformed value is returned unchanged so the
+// caller's validation can name the original input.
+func DigestHex(digest string) string {
+	value := strings.ToLower(strings.TrimSpace(digest))
+	return strings.TrimPrefix(value, "sha256:")
+}
+
+// ValidDigest reports whether digest is a SHA-256 digest in either the bare or
+// prefixed form.
+func ValidDigest(digest string) bool {
+	return digestPattern.MatchString(strings.ToLower(strings.TrimSpace(digest)))
 }
 
 // Validate checks the closure the fixed Job relies on. The two CLIs are the
@@ -87,6 +128,33 @@ func (b Binding) Validate() error {
 	if len(b.CLIs) != 2 {
 		return fmt.Errorf("exactly two CLI artifacts are required, got %d", len(b.CLIs))
 	}
+	for name, value := range map[string]string{
+		"image": b.Image, "image digest": b.ImageDigest,
+		"platform": b.Platform, "proxy url": b.ProxyURL,
+	} {
+		if strings.TrimSpace(value) == "" {
+			return fmt.Errorf("%s is required", name)
+		}
+	}
+	if strings.Contains(b.Image, "@") {
+		return fmt.Errorf("image %q must name the repository without a digest; the digest is a separate frozen input", b.Image)
+	}
+	if name := b.Image[strings.LastIndex(b.Image, "/")+1:]; strings.Contains(name, ":") {
+		return fmt.Errorf("image %q must name the repository without a tag; the digest is the only frozen carrier input", b.Image)
+	}
+	if !ValidDigest(b.ImageDigest) {
+		return fmt.Errorf("image digest %q is not a sha256 digest", b.ImageDigest)
+	}
+	if strings.Count(b.Platform, platformSeparator) != 1 {
+		return fmt.Errorf("client platform %q is not os/arch", b.Platform)
+	}
+	proxy, err := url.Parse(b.ProxyURL)
+	if err != nil || proxy.Scheme == "" || proxy.Host == "" {
+		return fmt.Errorf("proxy url %q is not an absolute address", b.ProxyURL)
+	}
+	if proxy.Scheme != "http" && proxy.Scheme != "https" {
+		return fmt.Errorf("proxy url %q is not an http(s) address", b.ProxyURL)
+	}
 	seen := map[string]bool{}
 	for _, cli := range b.CLIs {
 		if cli.Kind != KindMultica && cli.Kind != KindAgent {
@@ -99,8 +167,24 @@ func (b Binding) Validate() error {
 		if strings.TrimSpace(cli.Version) == "" || strings.TrimSpace(cli.Platform) == "" || strings.TrimSpace(cli.Digest) == "" {
 			return fmt.Errorf("%s CLI needs version, platform and digest", cli.Kind)
 		}
+		if secretTag.MatchString(strings.TrimSpace(cli.Version)) {
+			return fmt.Errorf("%s CLI version %q is a movable tag, not a frozen release", cli.Kind, cli.Version)
+		}
+		if !ValidDigest(cli.Digest) {
+			return fmt.Errorf("%s CLI digest %q is not a sha256 digest", cli.Kind, cli.Digest)
+		}
+		if cli.Platform != b.Platform {
+			return fmt.Errorf("%s CLI platform %q is not the client platform %q", cli.Kind, cli.Platform, b.Platform)
+		}
 		if strings.Count(cli.Platform, platformSeparator) != 1 {
 			return fmt.Errorf("%s CLI platform %q is not os/arch", cli.Kind, cli.Platform)
+		}
+		download, err := url.Parse(cli.DownloadURL)
+		if err != nil || download.Scheme == "" || download.Host == "" {
+			return fmt.Errorf("%s CLI download address %q is not an absolute address", cli.Kind, cli.DownloadURL)
+		}
+		if download.Scheme != proxy.Scheme || !strings.EqualFold(download.Host, proxy.Host) {
+			return fmt.Errorf("%s CLI download address %q is not on the Foreman proxy %q", cli.Kind, cli.DownloadURL, b.ProxyURL)
 		}
 	}
 	if !seen[KindMultica] || !seen[KindAgent] {
@@ -112,16 +196,6 @@ func (b Binding) Validate() error {
 		}
 	}
 	return nil
-}
-
-// Platform returns the client platform of the attempt.
-func (b Binding) Platform() string {
-	for _, cli := range b.CLIs {
-		if cli.Kind == KindMultica {
-			return cli.Platform
-		}
-	}
-	return ""
 }
 
 // Multica returns the frozen Multica CLI reference.

@@ -8,6 +8,7 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -118,7 +119,7 @@ func (v2LedgerIssues) ByIssue(context.Context, string, string) (string, error) {
 type v2LedgerReleases struct{}
 
 func (v2LedgerReleases) CurrentRelease(context.Context, string, release.Kind, string) (string, map[string]string, bool) {
-	return "1.0.0", map[string]string{"linux/amd64": "sha256:cli"}, true
+	return "1.0.0", map[string]string{"linux/amd64": "sha256:" + strings.Repeat("4", 64)}, true
 }
 
 func v2LedgerRules(t *testing.T, environments *environment.Service) *rules.Service {
@@ -185,11 +186,15 @@ func TestV2ResumeBindingKeepsTheRemoteSessionEmpty(t *testing.T) {
 		Endpoint: choice.Endpoint, TLSRef: choice.TLSRef, StateRoot: choice.StateRoot,
 		EnvironmentGen: choice.Generation, ResumeSessionID: priorSession,
 		SlotID: frozen.SlotID,
+		Image:  "ghcr.io/tsic404/rsbx", ImageDigest: "sha256:" + strings.Repeat("1", 64),
+		Platform: frozen.Resolution.CLIs.Platform, ProxyURL: "http://foreman.foreman.svc.cluster.local:8080",
 		CLIs: []attempt.CLI{
 			{Kind: attempt.KindMultica, Version: frozen.Resolution.CLIs.MulticaVersion,
-				Platform: frozen.Resolution.CLIs.Platform, Digest: frozen.Resolution.CLIs.MulticaDigest},
+				Platform: frozen.Resolution.CLIs.Platform, Digest: frozen.Resolution.CLIs.MulticaDigest,
+				DownloadURL: "http://foreman.foreman.svc.cluster.local:8080/cli/multica/1.0.0/linux/amd64"},
 			{Kind: attempt.KindAgent, Backend: "codex", Version: frozen.Resolution.CLIs.AgentVersion,
-				Platform: frozen.Resolution.CLIs.Platform, Digest: frozen.Resolution.CLIs.AgentDigest},
+				Platform: frozen.Resolution.CLIs.Platform, Digest: frozen.Resolution.CLIs.AgentDigest,
+				DownloadURL: "http://foreman.foreman.svc.cluster.local:8080/cli/agent/1.0.0/linux/amd64?backend=codex"},
 		},
 	}
 	if binding.SessionID != "" {
