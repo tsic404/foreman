@@ -147,6 +147,12 @@ type Snapshot struct {
 	RealRuntimeID   string `json:"real_runtime_id,omitempty"`
 	RuntimeIdentity string `json:"runtime_identity,omitempty"`
 
+	// The claim's environment reservation (§3.4). A rule only selects where
+	// the attempt runs; a restart must release the same slot, so both ids are
+	// part of the mapping record and stay out of the projection.
+	EnvironmentID     string `json:"environment_id"`
+	EnvironmentSlotID string `json:"environment_slot_id"`
+
 	// The claim's identity inputs (§4.1 项目身份, §8.3 名字合成, §8.5 身份输入,
 	// §4.5 软亲和). A restored pre-delivery entry is continued by a
 	// convergence round that renders its Job again, and the render must
@@ -217,6 +223,8 @@ func FromEntry(e registry.TaskEntry) Snapshot {
 		CancelAckOwed:       e.CancelAckOwed,
 		RealRuntimeID:       e.RealRuntimeID,
 		RuntimeIdentity:     e.RuntimeIdentity,
+		EnvironmentID:       e.EnvironmentID,
+		EnvironmentSlotID:   e.EnvironmentSlotID,
 		AgentName:           e.AgentName,
 		ProjectID:           e.ProjectID,
 		ProjectSource:       e.ProjectSource,
@@ -275,6 +283,8 @@ func (s Snapshot) ToEntry() registry.TaskEntry {
 		CancelAckOwed:       s.CancelAckOwed,
 		RealRuntimeID:       s.RealRuntimeID,
 		RuntimeIdentity:     s.RuntimeIdentity,
+		EnvironmentID:       s.EnvironmentID,
+		EnvironmentSlotID:   s.EnvironmentSlotID,
 		AgentName:           s.AgentName,
 		ProjectID:           s.ProjectID,
 		ProjectSource:       s.ProjectSource,

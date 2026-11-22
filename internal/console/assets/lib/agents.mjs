@@ -5,8 +5,6 @@
 import { badge, button, esc, panel, stamp, table } from "./ui.mjs";
 import { managementBadge } from "./sources.mjs";
 
-const READINESS_REASON = "就绪检查接口尚未提供：服务端 Management surface 没有按 Issue 检查的路由，页面不伪造结果。";
-
 // The server's BindingOutcome is serialised without JSON tags today, so the
 // wire carries `Result`; both spellings are read so a tag fix does not break
 // the page.
@@ -128,7 +126,7 @@ function agentRow(agent) {
   const bind = capability.enabled
     ? button("调整 runtime", "edit-binding", agentKey(agent))
     : `<button type="button" disabled title="${esc(capability.reason || "只读")}">调整 runtime</button>`;
-  const readiness = `<button type="button" disabled title="${esc(READINESS_REASON)}">按 Issue 检查就绪</button>`;
+  const readiness = button("按 Issue 检查就绪", "ready-check", agentKey(agent));
   return [
     `${esc(agent.name)}<small>${esc(agent.agent_id)}</small>`,
     esc(agent.server_id),
@@ -146,6 +144,7 @@ export function renderAgents(agents) {
     "Multica Agent",
     `<p class="sub">按来源与 Workspace 查看 Agent 的实际绑定。runtime 候选分两组：Foreman 在此来源已注册的 runtime，以及其他非管理 runtime；两者都保留精确 ID。</p>` +
       `<div class="call" role="status"><strong>只回写 runtime 绑定</strong><div>写回经上游回读确认；拒绝、超时与其他管理员的竞争修改都不会显示成功。非管理不新建 Job，已有运行快照不变。</div></div>` +
+      `<p class="sub">「按 Issue 检查就绪」只读展示当前可接单、配置阻断、暂时满载、状态未知或非托管，并逐项给出证据时点、主阻因与修复入口；它不占槽，也不改变绑定。</p>` +
       table(
         ["Agent / ID", "Server", "Workspace", "当前 runtime", "管理归属", "同步时间", "操作"],
         rows,

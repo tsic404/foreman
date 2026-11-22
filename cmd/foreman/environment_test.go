@@ -44,7 +44,10 @@ func TestNewAdminRootSplitsEnvironmentFromManagementPaths(t *testing.T) {
 	environmentAdmin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = w.Write([]byte("environment"))
 	})
-	root := newAdminRoot(managementAdmin, environmentAdmin)
+	rulesAdmin := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte("rules"))
+	})
+	root := newAdminRoot(managementAdmin, environmentAdmin, rulesAdmin)
 	for _, tc := range []struct {
 		path string
 		want string
@@ -53,6 +56,9 @@ func TestNewAdminRootSplitsEnvironmentFromManagementPaths(t *testing.T) {
 		{path: "/admin/environments/build-a", want: "environment"},
 		{path: "/admin/environments/build-a/slots", want: "environment"},
 		{path: "/admin/environments/audit", want: "environment"},
+		{path: "/admin/rules", want: "rules"},
+		{path: "/admin/rules/preview", want: "rules"},
+		{path: "/admin/readiness", want: "rules"},
 		{path: "/admin/servers", want: "management"},
 		{path: "/admin/overview", want: "management"},
 		{path: "/admin/audit", want: "management"},
