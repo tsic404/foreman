@@ -8,21 +8,22 @@
 #   ② the runtime list is empty — the reset-time state, asserted *before* the
 #      instance starts (the AC-01 premise; once it runs the assertion becomes
 #      "exactly one provider=omp runtime", judged by TC-tech-protocol-01);
-#   ③ the test server reports the artifact anchor v0.6.1 — two stages, because
-#      the field is `omitempty`: a missing `server_version` is a data-surface
-#      mismatch, not a version mismatch;
+#   ③ the running server is one artifact: `/api/config`'s `server_version` and
+#      the version the backend image's own binary reports agree, and the pod's
+#      digest is printed as the round's identity. There is no fixed version to
+#      compare against — the server follows upstream's `latest`;
 #   ④ the selected model source serves the round — the deployment-supplied
 #      endpoint when its triple is set; otherwise the selected local source:
 #      the scripted backend reports its declared model id, or the ollama engine
 #      lists the model its pull step installed. The premise of a real task
 #      result and a non-zero token count, not something to discover at the
 #      inference step;
-#   ⑤ the Job image carries a daemon whose agent start omp accepts: the daemon
-#      passes `--session <path>` up to v0.6.1, which omp (strictly resume-only
-#      there) rejects on the empty file the daemon creates — every task then
-#      dies as `agent_error.process_failure` with no tool call — and
-#      `--session-dir <dir>` from v0.6.2 on. The image's own binary answers,
-#      because a tag is not evidence.
+#   ⑤ the round's CLI delivery is frozen: the Job runs a digest-pinned rsbx
+#      carrier (a moving tag is not an artifact), the runtime image the
+#      supervisor is copied from is declared, and the per-attempt budget for
+#      the two CLIs the Job downloads from the release registry is positive.
+#      There is no Job image whose own binary could answer — the carrier
+#      carries no CLI — so the gate judges the delivery settings, not a tag.
 #
 # Exit codes: 0 = the checks hold; 2 = the environment is blocked — fix it,
 # never run a case against an unknown one. ② only holds before the instance
@@ -37,12 +38,10 @@ need curl
 need jq
 need multica
 
-anchor=${TEST_MULTICA_VERSION_ANCHOR:-v0.6.1}
-
 case ${1:-} in
 '') ;;
 -h | --help)
-	sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'
+	sed -n '2,30p' "$0" | sed 's/^# \{0,1\}//'
 	exit 0
 	;;
 *) die "unknown argument: $1" ;;
@@ -75,16 +74,32 @@ printf '%s' "$runtimes" | jq -e 'type == "array" and length == 0' >/dev/null || 
 }
 info "② ok: the runtime list is empty"
 
-# --- ③ the version anchor, in two stages -------------------------------------
+# --- ③ the running artifact, in two stages -----------------------------------
 
+# The server follows upstream's `latest`, so a fixed version is not the
+# identity to compare against: the gate judges the artifact that is actually
+# running. Two stages, because the field is `omitempty`: a missing
+# `server_version` is a data-surface mismatch, not a version mismatch. The
+# digest is what a round records — the tag alone cannot name the build.
 config=$(curl -fsS -m 30 "$SERVER_URL/api/config") ||
 	blocked "③ $SERVER_URL/api/config is unreachable"
 printf '%s' "$config" | jq -e 'has("server_version")' >/dev/null ||
 	blocked "③ /api/config carries no server_version field — the data surface and the artifact differ (an untagged build hides the field with omitempty); this is not a version mismatch"
-version=$(printf '%s' "$config" | jq -r .server_version)
-[ "$version" = "$anchor" ] ||
-	blocked "③ the server reports $version, the artifact anchor is $anchor"
-info "③ ok: server_version $version"
+version=$(printf '%s' "$config" | jq -r '.server_version // empty')
+[ -n "$version" ] ||
+	blocked "③ /api/config reports an empty server_version — the data surface and the artifact differ"
+server_image=$(server_image_reference) || server_image=
+[ -n "$server_image" ] ||
+	blocked "③ cannot read the image of Deployment $NS/backend — run ./deploy.sh (the test server is part of the test cluster)"
+server_digest=$(server_image_digest) || server_digest=
+[ -n "$server_digest" ] ||
+	blocked "③ cannot read the running backend pod's digest — is $NS/backend up? kubectl -n $NS get pods"
+image_version=$(server_image_version) || image_version=
+[ -n "$image_version" ] ||
+	blocked "③ cannot read the version out of the running backend image $server_image — its own binary does not answer 'multica version'"
+[ "$version" = "$image_version" ] ||
+	blocked "③ the server reports $version, the running image's binary reports $image_version — /api/config does not describe the artifact that is serving"
+info "③ ok: server_version $version, image $server_image @ $server_digest"
 
 # --- ④ the selected model source serves the round ----------------------------
 
@@ -128,33 +143,31 @@ ollama)
 	;;
 esac
 
-# --- ⑤ the Job image's daemon can start omp --------------------------------
+# --- ⑤ the round's CLI delivery is frozen -----------------------------------
 
-# The daemon's agent argv is the contract: `--session <path>` up to v0.6.1,
-# `--session-dir <dir>` from v0.6.2 on. omp's `--session` is an alias of
-# `--resume` — strictly a resume — so an older daemon resumes the empty file it
-# just created, the process exits before its first turn, and the task lands as
-# `agent_error.process_failure` with no tool call. Asserting it here keeps the
-# next round from discovering it as a dead task.
-job_image=$(instance_env FOREMAN_JOB_IMAGE 2>/dev/null) || job_image=
-[ -n "$job_image" ] ||
+# The Job runs the external rsbx carrier and fetches both CLIs from the Foreman
+# release registry through the proxy download face, so there is no Job image
+# whose own binary could answer a version probe. What the gate can assert is
+# the delivery state V2-C08/V2-C28 fix: the carrier is the rsbx repository at a
+# verified index digest (never a moving tag or the legacy foreman-job image),
+# the runtime image the supervisor is copied from is declared (the carrier
+# carries no CLI), and the two downloads have their own positive per-attempt
+# budget. The download budget's isolation from heartbeat/lease/result is the
+# separate limiter in internal/proxy, not an env value, so it is pinned by that
+# package's saturation test rather than here.
+carrier=$(instance_env FOREMAN_JOB_IMAGE 2>/dev/null) || carrier=
+[ -n "$carrier" ] ||
 	blocked "⑤ $INSTANCE_NS/$INSTANCE carries no FOREMAN_JOB_IMAGE — deploy the instance under test first (deploy/README.md)"
-daemon_version=$(job_daemon_version "$job_image") || daemon_version=
-[ -n "$daemon_version" ] ||
-	blocked "⑤ cannot read the daemon version out of Job image $job_image — the image does not answer 'multica version' (pull it on a node, or fix FOREMAN_JOB_IMAGE); every Job's agent start depends on it"
-daemon_floor=0.6.2
-if ! awk -v have="$daemon_version" -v want="$daemon_floor" 'BEGIN {
-	split(have, h, "."); split(want, w, ".")
-	for (i = 1; i <= 3; i++) {
-		a = (h[i] == "" ? 0 : h[i]) + 0
-		b = (w[i] == "" ? 0 : w[i]) + 0
-		if (a > b) exit 0
-		if (a < b) exit 1
-	}
-	exit 0
-}'; then
-	blocked "⑤ Job image $job_image carries multica $daemon_version; the daemon/omp contract needs >= $daemon_floor — a daemon below it starts omp with '--session <path>', omp treats that as --resume and rejects the empty session file it is given ('the session file holds no entries'), and every task dies as agent_error.process_failure with no tool call. Use the Job image built by build-foreman-job.yml for the newest upstream release (ghcr.io/tsic404/foreman-job:<daemon version>)"
-fi
-info "⑤ ok: Job image $job_image carries multica $daemon_version (>= $daemon_floor)"
+printf '%s' "$carrier" | grep -Eq '^ghcr\.io/tsic404/rsbx@sha256:[0-9a-f]{64}$' ||
+	blocked "⑤ FOREMAN_JOB_IMAGE is '$carrier', not the rsbx carrier at a verified index digest (ghcr.io/tsic404/rsbx@sha256:<64 hex>) — V2-C08 names the carrier repository and freezes its digest; a movable tag or the legacy foreman-job image makes the round's CLI delivery unattributable"
+runtime_image=$(instance_env FOREMAN_JOB_RUNTIME_IMAGE 2>/dev/null) || runtime_image=
+[ -n "$runtime_image" ] ||
+	blocked "⑤ $INSTANCE_NS/$INSTANCE carries no FOREMAN_JOB_RUNTIME_IMAGE — the Job supervisor has no declared source"
+cli_budget=$(instance_env FOREMAN_JOB_CLI_BUDGET_BYTES 2>/dev/null) || cli_budget=
+printf '%s' "${cli_budget:-}" | grep -Eq '^[0-9]+$' ||
+	blocked "⑤ FOREMAN_JOB_CLI_BUDGET_BYTES is '${cli_budget:-}', not a byte count — the two frozen CLI downloads have no per-attempt budget (V2-C11)"
+[ "$cli_budget" -gt 0 ] ||
+	blocked "⑤ FOREMAN_JOB_CLI_BUDGET_BYTES is $cli_budget — the proxy download budget must be positive"
+info "⑤ ok: CLI delivery frozen: carrier $carrier, runtime image $runtime_image, download budget $cli_budget bytes (separate limiter, V2-C28)"
 
-info "self-check passed: ①②③④⑤ (access point $ACCESS_URL, model source $model_source, Job daemon $daemon_version)"
+info "self-check passed: ①②③④⑤ (server $version @ $server_digest, access point $ACCESS_URL, model source $model_source, CLI carrier $carrier)"

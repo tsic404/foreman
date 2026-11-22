@@ -21,6 +21,8 @@ import (
 const selfcheckKubectlStub = `#!/bin/sh
 set -eu
 printf '%s\n' "$*" >>"$KUBECTL_LOG"
+default_web_digest=$(printf '%064d' 0 | tr 0 d)
+default_server_digest=$(printf '%064d' 0 | tr 0 a)
 case " $* " in
 *" -n $TEST_MULTICA_INSTANCE_NS get deploy $TEST_MULTICA_INSTANCE -o name "*)
 	printf 'deployment.apps/%s\n' "$TEST_MULTICA_INSTANCE"
@@ -29,22 +31,32 @@ case " $* " in
 	case " $* " in
 	*MULTICA_SERVER_URL*) printf '%s' "$TEST_MULTICA_ACCESS_URL" ;;
 	*FOREMAN_JOB_IMAGE*) printf '%s' "$JOB_IMAGE" ;;
+	*FOREMAN_JOB_RUNTIME_IMAGE*) printf '%s' "${JOB_RUNTIME_IMAGE:-}" ;;
+	*FOREMAN_JOB_CLI_BUDGET_BYTES*) printf '%s' "${JOB_CLI_BUDGET_BYTES:-}" ;;
 	*) printf '' ;;
 	esac
-	;;
-*" get pod test-multica-job-daemon-version -o jsonpath="*)
-	printf 'Succeeded'
-	;;
-*" logs test-multica-job-daemon-version "* | *" logs test-multica-job-daemon-version")
-	printf '{"version":"%s"}' "${JOB_DAEMON_VERSION:-}"
-	;;
-*" delete pod test-multica-job-daemon-version "* | *" apply -f "*)
 	;;
 *" -n $TEST_MULTICA_NS get deploy $TEST_MULTICA_MODEL_DEPLOY -o jsonpath="*)
 	printf '%s' "${LOCAL_MODEL:-}"
 	;;
 *" -n $TEST_MULTICA_NS get deploy $TEST_MULTICA_SCRIPTED_DEPLOY -o jsonpath="*)
 	printf '%s' "${SCRIPTED_MODEL:-}"
+	;;
+*" get deploy backend -n $TEST_MULTICA_NS -o jsonpath="*)
+	printf '%s' "${SERVER_IMAGE-ghcr.io/multica-ai/multica-backend:latest}"
+	;;
+*" get pod -n $TEST_MULTICA_NS "*)
+	case " $* " in
+	*component=web*)
+		printf '{"items":[{"status":{"phase":"Running","containerStatuses":[{"name":"web","imageID":"sha256:%s"}]}}]}' "${WEB_DIGEST-$default_web_digest}"
+		;;
+	*)
+		printf '{"items":[{"status":{"phase":"Running","containerStatuses":[{"name":"backend","imageID":"sha256:%s"}]}}]}' "${SERVER_DIGEST-$default_server_digest}"
+		;;
+	esac
+	;;
+*" exec -n $TEST_MULTICA_NS deploy/backend "*)
+	printf '{"version":"%s"}' "${SERVER_IMAGE_VERSION-v0.11.1}"
 	;;
 *" exec deploy/$TEST_MULTICA_SCRIPTED_DEPLOY "*)
 	[ -z "${SCRIPTED_PROBE_FAILS:-}" ] || {
@@ -162,6 +174,84 @@ type selfcheckRun struct {
 	exit    int
 }
 
+// TestSelfcheckIdentifiesTheRunningServerArtifact pins gate ③. The test server
+// follows upstream's `latest`, so there is no version literal to compare
+// against: the gate judges the artifact that is running — the server's
+// /api/config answer must be the version the image's own binary reports, and
+// the pod must carry a digest the round can quote. Another release passes
+// without touching the script; a disagreement or an unreadable face is
+// QA_BLOCKED with the two values named.
+func TestSelfcheckIdentifiesTheRunningServerArtifact(t *testing.T) {
+	t.Run("a newer latest passes without a script change", func(t *testing.T) {
+		digest := strings.Repeat("b", 64)
+		run := runSelfcheck(t,
+			"SERVER_VERSION=v0.12.3", "SERVER_IMAGE_VERSION=v0.12.3", "SERVER_DIGEST="+digest)
+		if run.exit != 0 {
+			t.Fatalf("selfcheck exited %d for a coherent v0.12.3 server\n--- output ---\n%s", run.exit, run.output)
+		}
+		want := "③ ok: server_version v0.12.3, image ghcr.io/multica-ai/multica-backend:latest @ sha256:" + digest
+		if !strings.Contains(run.output, want) {
+			t.Errorf("output does not carry %q\n--- output ---\n%s", want, run.output)
+		}
+	})
+
+	t.Run("the server and the running image disagree", func(t *testing.T) {
+		run := runSelfcheck(t, "SERVER_VERSION=v0.12.3", "SERVER_IMAGE_VERSION=v0.11.1")
+		if run.exit != 2 {
+			t.Fatalf("selfcheck exited %d for a server that does not describe its image, want the blocked code 2\n--- output ---\n%s", run.exit, run.output)
+		}
+		for _, want := range []string{
+			"③ the server reports v0.12.3",
+			"the running image's binary reports v0.11.1",
+		} {
+			if !strings.Contains(run.output, want) {
+				t.Errorf("the refusal does not name %q\n--- output ---\n%s", want, run.output)
+			}
+		}
+	})
+
+	t.Run("a missing server_version is a data-surface mismatch", func(t *testing.T) {
+		run := runSelfcheck(t, "SERVER_CONFIG={}")
+		if run.exit != 2 {
+			t.Fatalf("selfcheck exited %d for a config without server_version, want the blocked code 2\n--- output ---\n%s", run.exit, run.output)
+		}
+		if want := "carries no server_version field"; !strings.Contains(run.output, want) {
+			t.Errorf("the refusal does not name %q\n--- output ---\n%s", want, run.output)
+		}
+	})
+
+	t.Run("an empty server_version is a data-surface mismatch", func(t *testing.T) {
+		run := runSelfcheck(t, `SERVER_CONFIG={"server_version":""}`)
+		if run.exit != 2 {
+			t.Fatalf("selfcheck exited %d for an empty server_version, want the blocked code 2\n--- output ---\n%s", run.exit, run.output)
+		}
+		if want := "reports an empty server_version"; !strings.Contains(run.output, want) {
+			t.Errorf("the refusal does not name %q\n--- output ---\n%s", want, run.output)
+		}
+	})
+
+	t.Run("a running pod without a digest is not an identity", func(t *testing.T) {
+		run := runSelfcheck(t, "SERVER_DIGEST=")
+		if run.exit != 2 {
+			t.Fatalf("selfcheck exited %d for a pod without a digest, want the blocked code 2\n--- output ---\n%s", run.exit, run.output)
+		}
+		if want := "cannot read the running backend pod's digest"; !strings.Contains(run.output, want) {
+			t.Errorf("the refusal does not name %q\n--- output ---\n%s", want, run.output)
+		}
+	})
+
+	t.Run("an image that does not answer is refused", func(t *testing.T) {
+		run := runSelfcheck(t, "SERVER_IMAGE_VERSION=")
+		if run.exit != 2 {
+			t.Fatalf("selfcheck exited %d for an unreadable backend image, want the blocked code 2\n--- output ---\n%s", run.exit, run.output)
+		}
+		if want := "cannot read the version out of the running backend image"; !strings.Contains(run.output, want) {
+			t.Errorf("the refusal does not name %q\n--- output ---\n%s", want, run.output)
+		}
+	})
+
+}
+
 // runSelfcheck runs the real selfcheck.sh in a sandbox whose kubectl, curl and
 // CLI stubs answer every check; `env` overrides the sandbox defaults.
 func runSelfcheck(t *testing.T, env ...string) selfcheckRun {
@@ -182,7 +272,7 @@ func runSelfcheck(t *testing.T, env ...string) selfcheckRun {
 	kubectlLog := filepath.Join(dir, "kubectl.calls")
 	writeExecutable(t, filepath.Join(binDir, "kubectl"), selfcheckKubectlStub)
 	writeExecutable(t, filepath.Join(binDir, "curl"),
-		"#!/bin/sh\nprintf '%s' '{\"server_version\":\"v0.6.1\"}'\n")
+		"#!/bin/sh\nif [ -n \"${SERVER_CONFIG:-}\" ]; then printf '%s' \"$SERVER_CONFIG\"; else printf '{\"server_version\":\"%s\"}' \"${SERVER_VERSION:-v0.11.1}\"; fi\n")
 	// `need multica` resolves the command; the runtime list itself goes through
 	// the entry's own CLI wrapper beside it.
 	writeExecutable(t, filepath.Join(binDir, "multica"), "#!/bin/sh\nexit 0\n")
@@ -206,8 +296,9 @@ func runSelfcheck(t *testing.T, env ...string) selfcheckRun {
 		"KUBECTL_LOG":                     kubectlLog,
 		"LOCAL_MODEL":                     "",
 		"SCRIPTED_MODEL":                  scriptedModelID,
-		"JOB_IMAGE":                       "ghcr.io/tsic404/foreman-job:latest",
-		"JOB_DAEMON_VERSION":              "0.8.0",
+		"JOB_IMAGE":                       "ghcr.io/tsic404/rsbx@sha256:" + strings.Repeat("c", 64),
+		"JOB_RUNTIME_IMAGE":               "ghcr.io/tsic404/foreman:latest",
+		"JOB_CLI_BUDGET_BYTES":            "536870912",
 		"TEST_MULTICA_PROFILE":            "test-multica",
 		"TEST_MULTICA_SERVER_URL":         "http://127.0.0.1:30080",
 		"TEST_MULTICA_ACCESS_URL":         "http://test-multica-server.multica-test.svc:8080",
@@ -221,6 +312,10 @@ func runSelfcheck(t *testing.T, env ...string) selfcheckRun {
 		"TEST_MULTICA_MODEL_BASE_URL":     "",
 		"TEST_MULTICA_MODEL_ID":           "",
 		"TEST_MULTICA_MODEL_API_KEY":      "",
+		"SERVER_IMAGE":                    "ghcr.io/multica-ai/multica-backend:latest",
+		"SERVER_DIGEST":                   strings.Repeat("a", 64),
+		"SERVER_IMAGE_VERSION":            "v0.11.1",
+		"SERVER_VERSION":                  "v0.11.1",
 	}
 	for _, kv := range env {
 		key, value, _ := strings.Cut(kv, "=")
@@ -251,46 +346,65 @@ func runSelfcheck(t *testing.T, env ...string) selfcheckRun {
 	return selfcheckRun{output: combined.String(), kubectl: string(kubectl), exit: exit}
 }
 
-// TestSelfcheckRefusesADaemonBelowTheOmpContract pins gate ⑤: the Job image's
-// daemon must carry the argv omp accepts. Up to v0.6.1 the daemon passes
-// `--session <path>`, which omp reads as a resume of the empty file it was
-// just given — every task then dies before its first turn. The gate reads the
-// version out of the image's own binary, so a moving tag cannot pass it.
-func TestSelfcheckRefusesADaemonBelowTheOmpContract(t *testing.T) {
-	t.Run("the pre-0.6.2 daemon is refused with the root cause", func(t *testing.T) {
-		run := runSelfcheck(t, "JOB_DAEMON_VERSION=0.6.1")
-		if run.exit == 0 {
-			t.Fatalf("selfcheck accepted a daemon that starts omp with --session\n--- output ---\n%s", run.output)
-		}
-		for _, want := range []string{
-			"⑤ Job image",
-			"carries multica 0.6.1",
-			"--session <path>",
-			"agent_error.process_failure",
-		} {
-			if !strings.Contains(run.output, want) {
-				t.Errorf("the refusal does not name %q\n--- output ---\n%s", want, run.output)
-			}
-		}
-	})
+// TestSelfcheckAssertsTheFrozenCLIDelivery pins gate ⑤. The Job runs the rsbx
+// carrier and downloads both CLIs from the release registry, so no Job image
+// carries a version to probe: the gate asserts the delivery state instead —
+// the carrier is digest-pinned, the supervisor source is declared, and the
+// per-attempt proxy budget is positive. It must not pull or run an image.
+func TestSelfcheckAssertsTheFrozenCLIDelivery(t *testing.T) {
+	carrier := "ghcr.io/tsic404/rsbx@sha256:" + strings.Repeat("c", 64)
 
-	t.Run("the floor itself passes", func(t *testing.T) {
-		run := runSelfcheck(t, "JOB_DAEMON_VERSION=0.6.2")
+	t.Run("the digest-pinned rsbx carrier passes", func(t *testing.T) {
+		run := runSelfcheck(t)
 		if run.exit != 0 {
-			t.Fatalf("selfcheck refused the contract's floor version\n--- output ---\n%s", run.output)
+			t.Fatalf("selfcheck exited %d for a frozen delivery\n--- output ---\n%s", run.exit, run.output)
 		}
-		if !strings.Contains(run.output, "⑤ ok: Job image") {
-			t.Errorf("the passing gate is not reported\n--- output ---\n%s", run.output)
+		want := "⑤ ok: CLI delivery frozen: carrier " + carrier +
+			", runtime image ghcr.io/tsic404/foreman:latest, download budget 536870912 bytes (separate limiter, V2-C28)"
+		if !strings.Contains(run.output, want) {
+			t.Errorf("the passing gate does not carry %q\n--- output ---\n%s", want, run.output)
 		}
 	})
 
-	t.Run("an image that does not answer is refused", func(t *testing.T) {
-		run := runSelfcheck(t, "JOB_DAEMON_VERSION=")
-		if run.exit == 0 {
-			t.Fatalf("selfcheck accepted an unreadable Job image\n--- output ---\n%s", run.output)
+	t.Run("a moving tag is not a carrier artifact", func(t *testing.T) {
+		run := runSelfcheck(t, "JOB_IMAGE=ghcr.io/tsic404/rsbx:latest")
+		if run.exit != 2 {
+			t.Fatalf("selfcheck exited %d for a tag-only carrier, want the blocked code 2\n--- output ---\n%s", run.exit, run.output)
 		}
-		if !strings.Contains(run.output, "cannot read the daemon version out of Job image") {
-			t.Errorf("the refusal does not name the unreadable image\n--- output ---\n%s", run.output)
+		if want := "not the rsbx carrier at a verified index digest"; !strings.Contains(run.output, want) {
+			t.Errorf("the refusal does not name %q\n--- output ---\n%s", want, run.output)
+		}
+	})
+
+	t.Run("the legacy Job image is not a carrier", func(t *testing.T) {
+		run := runSelfcheck(t, "JOB_IMAGE=ghcr.io/tsic404/foreman-job@sha256:"+strings.Repeat("d", 64))
+		if run.exit != 2 {
+			t.Fatalf("selfcheck exited %d for the legacy Job image, want the blocked code 2\n--- output ---\n%s", run.exit, run.output)
+		}
+		if want := "not the rsbx carrier at a verified index digest"; !strings.Contains(run.output, want) {
+			t.Errorf("the refusal does not name %q\n--- output ---\n%s", want, run.output)
+		}
+	})
+
+	t.Run("the supervisor source must be declared", func(t *testing.T) {
+		run := runSelfcheck(t, "JOB_RUNTIME_IMAGE=")
+		if run.exit != 2 {
+			t.Fatalf("selfcheck exited %d without a runtime image, want the blocked code 2\n--- output ---\n%s", run.exit, run.output)
+		}
+		if want := "carries no FOREMAN_JOB_RUNTIME_IMAGE"; !strings.Contains(run.output, want) {
+			t.Errorf("the refusal does not name %q\n--- output ---\n%s", want, run.output)
+		}
+	})
+
+	t.Run("the proxy budget must be a positive byte count", func(t *testing.T) {
+		for _, value := range []string{"", "0", "512MB"} {
+			run := runSelfcheck(t, "JOB_CLI_BUDGET_BYTES="+value)
+			if run.exit != 2 {
+				t.Fatalf("selfcheck exited %d for budget %q, want the blocked code 2\n--- output ---\n%s", run.exit, value, run.output)
+			}
+			if !strings.Contains(run.output, "FOREMAN_JOB_CLI_BUDGET_BYTES") {
+				t.Errorf("the refusal does not name the budget for %q\n--- output ---\n%s", value, run.output)
+			}
 		}
 	})
 }

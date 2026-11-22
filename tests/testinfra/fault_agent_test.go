@@ -183,6 +183,12 @@ path=${path#*/}
 case "$method $path" in
 "GET api/agents") cat "$STUB_AGENTS" ;;
 "GET api/runtimes") printf '[{"id":"rt-omp","provider":"omp","name":"omp-runtime"}]' ;;
+"PUT api/agents/"*/env)
+	id=${path#api/agents/}
+	id=${id%/env}
+	printf '%s' "$body" >"$STUB_STATE/env.$id"
+	printf '{}'
+	;;
 "PUT api/agents/"*)
 	id=${path#api/agents/}
 	printf '%s' "$body" >"$STUB_STATE/put.$id"
@@ -222,6 +228,7 @@ func bindRun(t *testing.T, agents string) (calls []resetCall, out string, err er
 		}
 	}
 	writeExecutable(t, filepath.Join(binDir, "curl"), bindCurlStub)
+	writeExecutable(t, filepath.Join(binDir, "kubectl"), bindKubectlStub)
 	for _, name := range []string{"bind-agent.sh", "lib.sh"} {
 		body, err := os.ReadFile(filepath.Join(libDir, name))
 		if err != nil {
@@ -265,6 +272,21 @@ func bindRun(t *testing.T, agents string) (calls []resetCall, out string, err er
 	return calls, string(raw), err
 }
 
+// bindKubectlStub answers the one cluster read the model branch makes: no
+// local model backend is deployed in this sandbox, which is the chain's floor
+// (both model fields cleared).
+const bindKubectlStub = `#!/bin/sh
+set -eu
+case " $* " in
+*" get deploy "*)
+	printf 'Error from server (NotFound): deployments.apps not found\n' >&2
+	exit 1
+	;;
+esac
+printf 'stub kubectl: unexpected call: %s\n' "$*" >&2
+exit 1
+`
+
 // TestBindAgentBindsBothAgentRows: the failure agent's tasks only reach a Job
 // through the runtime the instance registered, so the bind entry must cover
 // both rows — binding only the working agent leaves the failed class stuck in
@@ -276,24 +298,50 @@ func TestBindAgentBindsBothAgentRows(t *testing.T) {
 	if err != nil {
 		t.Fatalf("bind-agent.sh did not finish: %v\n%s", err, out)
 	}
-	for _, id := range []string{"agent-main", "agent-fault"} {
+	for _, tc := range []struct {
+		id        string
+		wantModel string
+	}{
+		{id: "agent-main", wantModel: ""},
+		{id: "agent-fault", wantModel: "foreman-failing/absent"},
+	} {
 		bound := 0
+		modelWrites := 0
+		envWrites := 0
 		for _, call := range calls {
-			if call.method == "PUT" && call.path == "/api/agents/"+id {
+			if call.method == "PUT" && call.path == "/api/agents/"+tc.id {
 				var body struct {
-					RuntimeID string `json:"runtime_id"`
+					RuntimeID string  `json:"runtime_id"`
+					Model     *string `json:"model"`
 				}
 				if err := json.Unmarshal([]byte(call.body), &body); err != nil {
 					t.Fatalf("%s carried a body that is not JSON: %v", call.path, err)
 				}
-				if body.RuntimeID != "rt-omp" {
-					t.Errorf("%s bound to %q, want rt-omp", call.path, body.RuntimeID)
+				if body.RuntimeID != "" {
+					if body.RuntimeID != "rt-omp" {
+						t.Errorf("%s bound to %q, want rt-omp", call.path, body.RuntimeID)
+					}
+					bound++
 				}
-				bound++
+				if body.Model != nil {
+					if *body.Model != tc.wantModel {
+						t.Errorf("%s model write carries %q, want %q", call.path, *body.Model, tc.wantModel)
+					}
+					modelWrites++
+				}
+			}
+			if call.method == "PUT" && call.path == "/api/agents/"+tc.id+"/env" {
+				envWrites++
 			}
 		}
 		if bound != 1 {
-			t.Errorf("bind-agent.sh sent %d bindings to %s, want 1\n%s", bound, id, out)
+			t.Errorf("bind-agent.sh sent %d bindings to %s, want 1\n%s", bound, tc.id, out)
+		}
+		if modelWrites != 1 {
+			t.Errorf("bind-agent.sh sent %d model writes to %s, want 1 (the write reset.sh deferred)\n%s", modelWrites, tc.id, out)
+		}
+		if envWrites != 1 {
+			t.Errorf("bind-agent.sh sent %d env writes to %s, want 1\n%s", envWrites, tc.id, out)
 		}
 	}
 }

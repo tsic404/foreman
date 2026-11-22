@@ -12,7 +12,6 @@ FOREMAN_NS=${FOREMAN_NAMESPACE:-foreman}
 FOREMAN_URL=${FOREMAN_URL:-http://127.0.0.1:8081}
 TEST_MULTICA_NS=${TEST_MULTICA_NS:-multica-test}
 TEST_MULTICA_SERVER_URL=${TEST_MULTICA_SERVER_URL:-http://127.0.0.1:30080}
-TEST_MULTICA_VERSION_ANCHOR=${TEST_MULTICA_VERSION_ANCHOR:-v0.6.1}
 TEST_AGENT_NAME=${TEST_AGENT_NAME:-foreman-test-agent}
 # The failure agent the test environment creates (testinfra/test-multica
 # README §The failure agent): same runtime, a model selector no round can
@@ -23,6 +22,29 @@ FAULT_AGENT_NAME=${TEST_MULTICA_FAULT_AGENT:-foreman-test-agent-failing}
 SCENARIOS_STATE=${SCENARIOS_STATE:-$HOME/.foreman-uat-scenarios}
 UAT_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
 TEST_MULTICA_DIR=${TEST_MULTICA_DIR:-$(CDPATH= cd -- "$UAT_DIR/../../testinfra/test-multica" && pwd)}
+
+# The running test server's artifact identity. `latest` is a movable tag, so
+# these — not a version literal — are what a round records: the Deployment's
+# image reference, the running pod's digest and the version the image's own
+# binary reports (the same faces ./selfcheck.sh ③ judges).
+test_multica_image_reference() {
+	kubectl get deploy backend -n "$TEST_MULTICA_NS" \
+		-o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null
+}
+test_multica_image_digest() {
+	kubectl get pod -n "$TEST_MULTICA_NS" -l app.kubernetes.io/component=backend -o json 2>/dev/null |
+		jq -r '[.items[]
+			| select(.status.phase == "Running")
+			| .status.containerStatuses[]?
+			| select(.name == "backend")
+			| .imageID][0] // empty' 2>/dev/null |
+		sed -n 's/.*\(sha256:[0-9a-f]\{64\}\).*/\1/p'
+}
+test_multica_image_version() {
+	kubectl exec -n "$TEST_MULTICA_NS" deploy/backend -- sh -c \
+		'command -v multica >/dev/null 2>&1 && multica version --output json || /app/multica version --output json' 2>/dev/null |
+		jq -r '.version // empty' 2>/dev/null
+}
 
 need() { command -v "$1" >/dev/null 2>&1 || { echo "missing required command: $1" >&2; exit 2; }; }
 blocked() { echo "QA_BLOCKED: $*" >&2; exit 2; }

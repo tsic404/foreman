@@ -9,9 +9,13 @@
 # by namespace, database and workspace — no production workspace, token or
 # runtime is ever reused.
 #
-# The version anchor is absolute: every image is pinned to the
-# `v0.6.1` release (multica@2ea01ae4). Upgrade = rebuild this whole
-# environment from a new anchor, never an in-place upgrade.
+# The server images (backend, web) follow upstream's `latest` release: the
+# round is meant to exercise the newest server, not the one chosen when this
+# file was written. `latest` is a movable tag, so the round's identity is the
+# digest the gate reads back from the running pod (selfcheck ③) — the tag
+# alone says nothing about which build served it. Every other image stays
+# pinned; README §Version anchor states why. Upgrade = rebuild the whole
+# environment (`./recycle.sh && ./deploy.sh`), never an in-place upgrade.
 #
 # Apply through ./deploy.sh: it renders the __ENTRY_URL__ placeholders (the
 # browser-reachable frontend entry) and creates the Secret, then waits for the
@@ -325,8 +329,11 @@ spec:
     spec:
       containers:
         - name: backend
-          image: ghcr.io/multica-ai/multica-backend:v0.6.1
-          imagePullPolicy: IfNotPresent
+          image: ghcr.io/multica-ai/multica-backend:latest
+          # A movable tag with IfNotPresent would let a node's cached pull
+          # answer for `latest`, so the gate's digest read-back could belong to
+          # an older release than the registry serves.
+          imagePullPolicy: Always
           envFrom:
             - configMapRef:
                 name: test-multica-config
@@ -418,8 +425,8 @@ spec:
     spec:
       containers:
         - name: web
-          image: ghcr.io/multica-ai/multica-web:v0.6.1
-          imagePullPolicy: IfNotPresent
+          image: ghcr.io/multica-ai/multica-web:latest
+          imagePullPolicy: Always
           env:
             - name: HOSTNAME
               value: "0.0.0.0"

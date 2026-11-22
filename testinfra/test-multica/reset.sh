@@ -33,9 +33,11 @@
 #      an empty one would let omp resolve the node's registration by itself and
 #      the failed class would complete instead;
 #   7. gate — ./selfcheck.sh: the environment gate ①②③④⑤ (the instance points
-#      at the access point, the runtime list is empty, the server reports the
-#      artifact anchor, the selected model source serves the round, and the Job
-#      image's daemon carries the argv omp accepts).
+#      at the access point, the runtime list is empty, the running server's
+#      version and digest are recorded and agree with the image, the selected
+#      model source serves the round, and the CLI delivery settings are frozen:
+#      digest-pinned carrier, declared supervisor source, positive proxy
+#      budget).
 #
 # It is idempotent: everything is looked up by name and only created when
 # missing; the provider registration is one Secret applied in place and one
@@ -56,7 +58,7 @@ for arg in "$@"; do
 	case $arg in
 	--print-token) print_token=1 ;;
 	-h | --help)
-		sed -n '2,39p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
 		exit 0
 		;;
 	*) die "unknown argument: $arg" ;;
@@ -320,8 +322,8 @@ isolate_fault_agent_model() {
 	_served_provider=${model_text%%/*}
 	[ "${FAULT_MODEL_SELECTOR%%/*}" != "$_served_provider" ] ||
 		die "the round's provider ($_served_provider) is the failure agent's selector provider — the failure guarantee would resolve; change TEST_MULTICA_MODEL_PROVIDER / TEST_MULTICA_SCRIPTED_PROVIDER"
-	set_agent_model "$fault_agent_id" "$FAULT_MODEL_SELECTOR" ||
-		die "cannot point agent $FAULT_AGENT_NAME at $FAULT_MODEL_SELECTOR"
+	write_agent_model "$fault_agent_id" "$FAULT_MODEL_SELECTOR" \
+		"cannot point agent $FAULT_AGENT_NAME at $FAULT_MODEL_SELECTOR"
 	set_agent_env "$fault_agent_id" "" ||
 		die "cannot clear agent $FAULT_AGENT_NAME's model backend address"
 	info "agent $FAULT_AGENT_NAME → $FAULT_MODEL_SELECTOR (unresolvable: every task fails)"

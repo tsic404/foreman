@@ -123,8 +123,9 @@ func (q *ProjectQueries) FromPayload(task json.RawMessage) string {
 
 // ResolveName answers the startup name resolution (ADR-048 decision 2). The
 // project section resolves against the workspace's project list by exact title
-// — the platform offers no name filter, and its human-readable project name is
-// the title. The agent section has no anchored workspace-wide query (the
+// — the platform's only name-shaped filter is a title substring, not an exact
+// match, and its human-readable project name is the title. The agent section
+// has no anchored workspace-wide query (the
 // agents list is visibility-filtered, so its absence answer is not the
 // platform's authority), so agent keys read the documented unavailable
 // degradation.
@@ -198,7 +199,7 @@ type projectRow struct {
 }
 
 // listProjects is GET /api/projects?workspace_id=...: every project of the
-// workspace, with no server-side name filter.
+// workspace (no exact-name parameter is sent or offered).
 func (q *ProjectQueries) listProjects(ctx context.Context, baseURL, workspaceID, token string) ([]projectRow, error) {
 	var answer struct {
 		Projects []projectRow `json:"projects"`
