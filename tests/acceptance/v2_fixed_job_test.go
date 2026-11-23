@@ -9,11 +9,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"strings"
 	"testing"
 
 	"github.com/tsic404/foreman/internal/attempt"
+	"github.com/tsic404/foreman/internal/auth"
+	"github.com/tsic404/foreman/internal/proxy"
+	"github.com/tsic404/foreman/internal/release"
 )
 
 // TestV2FixedJobColdStartPreparesExactlyTwoCLIs covers V2-AC03/TC03 and
@@ -461,6 +466,174 @@ func TestV2FixedJobReadyIdentityMustMatchFrozenFacts(t *testing.T) {
 				t.Fatalf("slot releases = %v, want a confirmed release after close", got)
 			}
 		})
+	}
+}
+
+// TestV2FixedJobBindingRefusesUnfrozenCarrierAndProxyInputs covers V2-AC19:
+// a binding without the digest-pinned rsbx carrier, a matching client
+// platform, or a proxy-only download address never reaches preparation,
+// rsbx, registration or a business command.
+func TestV2FixedJobBindingRefusesUnfrozenCarrierAndProxyInputs(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		mutate func(*attempt.Binding)
+	}{
+		{name: "missing image digest", mutate: func(b *attempt.Binding) { b.ImageDigest = "" }},
+		{name: "tagged carrier", mutate: func(b *attempt.Binding) { b.Image = "ghcr.io/tsic404/rsbx:latest" }},
+		{name: "platform mismatch", mutate: func(b *attempt.Binding) { b.CLIs[0].Platform = "linux/arm64" }},
+		{name: "direct release source", mutate: func(b *attempt.Binding) {
+			b.CLIs[1].DownloadURL = "https://github.com/multica-ai/multica/releases/download/v0.6.1/agent"
+		}},
+		{name: "movable CLI version", mutate: func(b *attempt.Binding) { b.CLIs[0].Version = "latest" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			binding := v2FixedBinding()
+			tc.mutate(&binding)
+			cache := &v2Cache{artifacts: v2Artifacts(binding)}
+			remote := &v2Remote{session: v2ReadySession(binding), close: attempt.CloseEvidence{Confirmed: true}}
+			registrar := &v2Registrar{}
+			runner := &v2Runner{result: attempt.RunResult{Delivered: true}}
+			supervisor := v2FixedSupervisor(t, v2StorePath(t), cache, remote, registrar, runner, newV2Slots())
+
+			outcome, err := supervisor.Run(context.Background(), binding)
+			if !errors.Is(err, attempt.ErrRefused) || outcome.Stage != attempt.StageRefused {
+				t.Fatalf("Run = (%+v, %v), want a refusal", outcome, err)
+			}
+			if len(cache.calls()) != 0 {
+				t.Fatalf("preparation ran for an unfrozen binding: %v", cache.calls())
+			}
+			assertZeroBusinessExecution(t, remote, registrar, runner)
+		})
+	}
+}
+
+// TestV2FixedJobDownloadFailureNamesTheArtifactAndNeverFallsBack covers
+// V2-AC19 and V2-C11: a proxy refusal or budget exhaustion stops the attempt
+// before rsbx, registration and business execution; the cache is asked for
+// exactly the frozen two artifacts.
+func TestV2FixedJobDownloadFailureNamesTheArtifactAndNeverFallsBack(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		stage string
+	}{
+		{name: "proxy refused", stage: "download"},
+		{name: "budget exhausted", stage: "budget"},
+		{name: "digest mismatch", stage: "verify"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			binding := v2FixedBinding()
+			agent := binding.CLIs[1]
+			cache := &v2Cache{
+				artifacts: v2Artifacts(binding), failKind: agent.Kind,
+				err: &attempt.DownloadError{
+					Kind: agent.Kind, Backend: agent.Backend, Version: agent.Version,
+					Platform: agent.Platform, Digest: agent.Digest, Stage: tc.stage,
+					Reason: "refused by the frozen proxy",
+				},
+			}
+			remote := &v2Remote{session: v2ReadySession(binding), close: attempt.CloseEvidence{Confirmed: true}}
+			registrar := &v2Registrar{}
+			runner := &v2Runner{result: attempt.RunResult{Delivered: true}}
+			slots := newV2Slots()
+			supervisor := v2FixedSupervisor(t, v2StorePath(t), cache, remote, registrar, runner, slots)
+
+			outcome, err := supervisor.Run(context.Background(), binding)
+			if !errors.Is(err, attempt.ErrRefused) || outcome.Stage != attempt.StageRefused || outcome.Delivered {
+				t.Fatalf("Run = (%+v, %v), want a refused, undelivered attempt", outcome, err)
+			}
+			if !strings.Contains(err.Error(), agent.Kind) || !strings.Contains(err.Error(), agent.Digest) {
+				t.Fatalf("error = %v, want the failing CLI kind and frozen digest", err)
+			}
+			assertZeroBusinessExecution(t, remote, registrar, runner)
+			calls := cache.calls()
+			if len(calls) != 2 || calls[1].Kind != agent.Kind {
+				t.Fatalf("cache calls = %v, want the Multica CLI then the failing frozen Agent artifact", calls)
+			}
+			if got := slots.released(); len(got) != 1 || !got[0] {
+				t.Fatalf("slot releases = %v, want the idle reservation returned", got)
+			}
+		})
+	}
+}
+
+// TestV2FixedJobUnauthorizedCLIRequestIsRefusedBeforeReady covers V2-AC19 and
+// V2-C09/C11: the download face authorizes the attempt's exact frozen tuple,
+// so a published neighbour version is refused before any bytes are read and
+// the Job never opens a session or registers.
+func TestV2FixedJobUnauthorizedCLIRequestIsRefusedBeforeReady(t *testing.T) {
+	frozenMultica := "sha256:" + strings.Repeat("2", 64)
+	frozenAgent := "sha256:" + strings.Repeat("3", 64)
+	newerMultica := "sha256:" + strings.Repeat("4", 64)
+	releases := &v2DownloadReleases{
+		server: "src-a",
+		releases: []v2PublishedCLI{
+			{kind: release.KindMultica, version: "0.6.1", platform: "linux/amd64",
+				digest: frozenMultica, body: []byte("#!/bin/sh\necho multica\n")},
+			{kind: release.KindMultica, version: "0.7.0", platform: "linux/amd64",
+				digest: newerMultica, body: []byte("#!/bin/sh\necho newer\n")},
+			{kind: release.KindAgent, adapter: "codex", version: "0.167.1", platform: "linux/amd64",
+				digest: frozenAgent, body: []byte("#!/bin/sh\necho codex\n")},
+		},
+	}
+	frozen := v2FixedBinding()
+	handler := &proxy.CLIDistribution{
+		Verifier: v2DownloadVerifier{claims: auth.Claims{
+			TaskID: frozen.TaskID, SourceID: frozen.SourceID, WorkspaceID: frozen.WorkspaceID,
+		}},
+		Releases: releases,
+		Attempts: v2DownloadBindings{binding: frozen},
+	}
+	mux := http.NewServeMux()
+	mux.Handle("GET /cli/{kind}/{version}/{os}/{arch}", handler)
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// The Job-side binding asks for a published version this attempt did not
+	// freeze; the authoritative row still names 0.6.1.
+	binding := frozen
+	binding.ProxyURL = server.URL
+	binding.CLIs = append([]attempt.CLI(nil), frozen.CLIs...)
+	binding.CLIs[0].Version = "0.7.0"
+	binding.CLIs[0].Digest = newerMultica
+	binding.CLIs[0].DownloadURL = server.URL + "/cli/multica/0.7.0/linux/amd64?digest=" + newerMultica
+	binding.CLIs[1].DownloadURL = server.URL + "/cli/agent/0.167.1/linux/amd64?digest=" + frozenAgent + "&backend=codex"
+
+	store, err := attempt.NewFileStore(v2StorePath(t))
+	if err != nil {
+		t.Fatalf("NewFileStore: %v", err)
+	}
+	remote := &v2Remote{session: v2ReadySession(binding), close: attempt.CloseEvidence{Confirmed: true}}
+	registrar := &v2Registrar{}
+	runner := &v2Runner{result: attempt.RunResult{Delivered: true}}
+	slots := newV2Slots()
+	supervisor := &attempt.Supervisor{
+		Cache:  &attempt.ProxyCache{BaseURL: server.URL, Token: "fmj_attempt", Dir: t.TempDir()},
+		Remote: remote, Registrar: registrar, Runner: runner, Slots: slots, Store: store,
+	}
+
+	outcome, err := supervisor.Run(context.Background(), binding)
+	if !errors.Is(err, attempt.ErrRefused) {
+		t.Fatalf("Run error = %v, want a refusal", err)
+	}
+	if outcome.Stage != attempt.StageRefused || outcome.Delivered {
+		t.Fatalf("outcome = %+v, want a refused, undelivered attempt", outcome)
+	}
+	var download *attempt.DownloadError
+	if !errors.As(err, &download) || download.Stage != "download" {
+		t.Fatalf("Run error = %v, want the proxy's download refusal", err)
+	}
+	if !strings.Contains(download.Reason, "403") {
+		t.Fatalf("download reason = %q, want the proxy's 403", download.Reason)
+	}
+	if releases.reads.Load() != 0 {
+		t.Fatalf("the published artifact was read %d times", releases.reads.Load())
+	}
+	if remote.readyCalls != 0 || registrar.calls != 0 || runner.calls != 0 {
+		t.Fatalf("ready=%d register=%d run=%d, want zero after the unauthorized tuple",
+			remote.readyCalls, registrar.calls, runner.calls)
+	}
+	if got := slots.released(); len(got) != 1 || !got[0] {
+		t.Fatalf("slot releases = %v, want the idle reservation returned", got)
 	}
 }
 

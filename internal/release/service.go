@@ -820,6 +820,36 @@ func (s *Service) CurrentRelease(ctx context.Context, serverID string, kind Kind
 	return selected.Current.Version, digests, true
 }
 
+// VerifiedRelease answers the published digest of one exact version and
+// platform in a release domain. Unlike CurrentRelease it does not require the
+// version to still be current: an attempt froze this release at claim time,
+// and a later publish must not make that artifact undownloadable (V2-C08).
+func (s *Service) VerifiedRelease(ctx context.Context, serverID string, kind Kind, adapter, version, platform string) (string, bool) {
+	definitions, err := s.store.ListDefinitions(ctx)
+	if err != nil {
+		return "", false
+	}
+	for _, definition := range definitions {
+		if definition.ServerID != serverID || definition.Kind != kind {
+			continue
+		}
+		if kind == KindAgent && !strings.EqualFold(definition.Adapter, adapter) {
+			continue
+		}
+		for _, published := range definition.Releases {
+			if published.Version != version {
+				continue
+			}
+			for _, artifact := range published.Artifacts {
+				if artifact.Platform.Key() == platform {
+					return strings.ToLower(artifact.Digest), true
+				}
+			}
+		}
+	}
+	return "", false
+}
+
 // CurrentDigest answers the published artifact digest one adapter would
 // receive on a platform.
 func (s *Service) CurrentDigest(ctx context.Context, serverID, adapter, platform string) (string, bool) {

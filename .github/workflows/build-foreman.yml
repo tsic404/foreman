@@ -1,7 +1,8 @@
-# Publish the scheduler image:
-# `foreman:<version>` for the Deployment, as a multi-platform manifest list
-# (linux/amd64 + linux/arm64), so a mixed-architecture cluster pulls the
-# platform its node runs.
+# Publish the Foreman image:
+# `foreman:<version>` for the Deployment, the Job-side supervisor and the
+# foreman-gc DaemonSet, as a multi-platform manifest list (linux/amd64 +
+# linux/arm64), so a mixed-architecture cluster pulls the platform its node
+# runs.
 #
 # The release path lives entirely in this workflow: no repository scripts, no
 # make targets (the Makefile is local development only). This line's version
@@ -11,9 +12,10 @@
 # `foreman:latest` and no version tag. A published version tag therefore always
 # names the image built from that tag, which ADR-012 keeps as the rollback path.
 #
-# The Job image has its own line (build-foreman-job.yml) and its own version
-# semantics (the upstream daemon's). The two are independent: this workflow
-# never builds the Job image, and a Job-image run never builds this one.
+# The Job carrier is the externally published rsbx image and has no release
+# line here. A previous foreman-job line published the daemon CLI into the
+# carrier; the new contract forbids a carrier with a preinstalled CLI
+# (V2-C08/C09), so that line and its skip gate are retired.
 #
 # A failed step fails the run: the build/push step's exit code is the only
 # signal this workflow produces — non-zero means the push did not complete, and
@@ -82,7 +84,7 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build the per-platform binary
+      - name: Build the per-platform binaries
         env:
           # The binary reports the version its image carries: v<X.Y.Z> from a tag
           # push, latest from a main push.
@@ -90,13 +92,16 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p dist
-          # The Containerfile copies dist/foreman-linux-<arch>: both platforms
+          # The Containerfile copies dist/<binary>-linux-<arch>: both platforms
           # sit side by side in the build context and buildx picks one per
-          # platform.
+          # platform. The Job-side supervisor and foreman-gc ride the same
+          # image; the Job carrier is rsbx and carries neither.
           for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
-              -ldflags "-s -w -X main.version=$VERSION" \
-              -o "dist/foreman-linux-${arch}" ./cmd/foreman
+            for cmd in foreman foreman-job foreman-gc; do
+              CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+                -ldflags "-s -w -X main.version=$VERSION" \
+                -o "dist/${cmd}-linux-${arch}" "./cmd/${cmd}"
+            done
           done
           ls -l dist
 

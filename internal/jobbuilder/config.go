@@ -18,6 +18,8 @@ import (
 const (
 	EnvJobNamespace        = "FOREMAN_JOB_NAMESPACE"
 	EnvJobImage            = "FOREMAN_JOB_IMAGE"
+	EnvJobRuntimeImage     = "FOREMAN_JOB_RUNTIME_IMAGE"
+	EnvJobCLIBudget        = "FOREMAN_JOB_CLI_BUDGET_BYTES"
 	EnvJobTokenTTL         = "FOREMAN_JOB_TOKEN_TTL"
 	EnvPreferNodeReuse     = "FOREMAN_PREFER_NODE_REUSE"
 	EnvJobDrainTimeout     = "FOREMAN_JOB_DRAIN_TIMEOUT"
@@ -31,7 +33,17 @@ const (
 // Contract defaults.
 const (
 	DefaultJobNamespace = "multica-agents"
-	DefaultJobImage     = "ghcr.io/tsic404/foreman-job:latest"
+	// DefaultJobImage is the rsbx carrier the Job runs. The digest is the
+	// verified index digest; the attempt binding freezes it per attempt
+	// (V2-C08). The carrier carries no Multica or Agent CLI.
+	DefaultJobImage = "ghcr.io/tsic404/rsbx@sha256:4885255c93cf61c0ccce8bf3e00da6da40628b5df4a5522102178b3f1975debf"
+	// DefaultJobRuntimeImage carries foreman-job (the Job-side supervisor) and
+	// the deployment adapters. It is not the Job carrier: an init container
+	// copies the supervisor into an emptyDir and the carrier executes it.
+	DefaultJobRuntimeImage = "ghcr.io/tsic404/foreman:latest"
+	// DefaultCLIBudgetBytes is the per-attempt download budget shared by the
+	// two frozen CLIs and their retries (V2-C09/C11).
+	DefaultCLIBudgetBytes int64 = 512 << 20
 	// DefaultJobServerURL is the reference deployment's Job-side entry point
 	// (§8.2 A1.1): the Service a Job daemon's MULTICA_SERVER_URL resolves to.
 	DefaultJobServerURL = "http://foreman.foreman.svc.cluster.local:8080"
@@ -71,7 +83,12 @@ const (
 type Config struct {
 	JobNamespace string
 	JobImage     string
-	JobTokenTTL  time.Duration
+	// JobRuntimeImage is the Foreman-owned image an init container copies the
+	// Job-side supervisor from. It never carries a CLI.
+	JobRuntimeImage string
+	// CLIBudgetBytes is the per-attempt CLI download budget.
+	CLIBudgetBytes int64
+	JobTokenTTL    time.Duration
 	// ServerURL is FOREMAN_JOB_SERVER_URL: the address written into every Job
 	// daemon's MULTICA_SERVER_URL (§8.2 A1.1). Empty falls back to
 	// DefaultJobServerURL.
@@ -233,6 +250,8 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	cfg := Config{
 		JobNamespace:    DefaultJobNamespace,
 		JobImage:        DefaultJobImage,
+		JobRuntimeImage: DefaultJobRuntimeImage,
+		CLIBudgetBytes:  DefaultCLIBudgetBytes,
 		JobTokenTTL:     DefaultJobTokenTTL,
 		ServerURL:       DefaultJobServerURL,
 		PreferNodeReuse: true,
@@ -254,6 +273,16 @@ func LoadConfig(getenv func(string) string) (Config, error) {
 	// `<registry>/<repo>[:<tag>][@sha256:<digest>]` — shape is not a predicate.
 	if v := strings.TrimSpace(getenv(EnvJobImage)); v != "" {
 		cfg.JobImage = v
+	}
+	if v := strings.TrimSpace(getenv(EnvJobRuntimeImage)); v != "" {
+		cfg.JobRuntimeImage = v
+	}
+	if raw := strings.TrimSpace(getenv(EnvJobCLIBudget)); raw != "" {
+		budget, err := strconv.ParseInt(raw, 10, 64)
+		if err != nil || budget <= 0 {
+			return Config{}, fmt.Errorf("%s must be a positive byte count, got %q", EnvJobCLIBudget, raw)
+		}
+		cfg.CLIBudgetBytes = budget
 	}
 	if raw := strings.TrimSpace(getenv(EnvJobTokenTTL)); raw != "" {
 		ttl, err := time.ParseDuration(raw)

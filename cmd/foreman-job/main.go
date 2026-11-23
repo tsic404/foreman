@@ -2,7 +2,7 @@
 // three-stage attempt contract inside the Job container: prepare the frozen
 // Multica and Agent CLIs, wait for the frozen rsbx session and verify the
 // daemon registration, then dispatch once and settle the remote close.
-// 02-contracts.md V2-C03/C04, 04-architecture.md §6.
+// 02-contracts.md V2-C03/C04, V2-C08–C12.
 package main
 
 import (
@@ -13,6 +13,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strconv"
 	"strings"
 	"syscall"
 
@@ -20,10 +21,17 @@ import (
 )
 
 const (
-	defaultSpecFile  = "/run/foreman/cred/attempt.json"
-	defaultStoreFile = "/run/foreman/state/attempt-state.json"
-	envSpecFile      = "FOREMAN_JOB_SPEC_FILE"
-	envStoreFile     = "FOREMAN_JOB_STORE_FILE"
+	defaultSpecFile   = "/run/foreman/cred/attempt.json"
+	defaultStoreFile  = "/run/foreman/state/attempt-state.json"
+	defaultCLIDir     = "/run/foreman/clis"
+	defaultTokenFile  = "/run/foreman/cred/config.json"
+	defaultRuntimeBin = "/run/foreman/runtime"
+	envSpecFile       = "FOREMAN_JOB_SPEC_FILE"
+	envStoreFile      = "FOREMAN_JOB_STORE_FILE"
+	envCLIDir         = "FOREMAN_JOB_CLI_DIR"
+	envTokenFile      = "FOREMAN_JOB_TOKEN_FILE"
+	envProxyURL       = "FOREMAN_JOB_PROXY_URL"
+	envCLIBudget      = "FOREMAN_JOB_CLI_BUDGET_BYTES"
 )
 
 func main() {
@@ -61,8 +69,12 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
+	cache, err := proxyCache()
+	if err != nil {
+		return err
+	}
 	supervisor := &attempt.Supervisor{
-		Cache:     attempt.ExecCache{Path: helperPath(attempt.EnvCLIHelper)},
+		Cache:     cache,
 		Remote:    attempt.ExecRemote{Path: helperPath(attempt.EnvRSBXHelper)},
 		Registrar: attempt.ExecRegistrar{Path: helperPath(attempt.EnvRegisterHelper)},
 		Runner:    attempt.ExecRunner{Path: helperPath(attempt.EnvRunnerHelper)},
@@ -84,19 +96,61 @@ func helperPath(key string) string {
 		return value
 	}
 	switch key {
-	case attempt.EnvCLIHelper:
-		return "/usr/local/bin/foreman-job-cli"
 	case attempt.EnvRSBXHelper:
-		return "/usr/local/bin/rsbx-remote"
+		return defaultRuntimeBin + "/rsbx-remote"
 	case attempt.EnvRegisterHelper:
-		return "/usr/local/bin/foreman-job-register"
+		return defaultRuntimeBin + "/foreman-job-register"
 	case attempt.EnvRunnerHelper:
-		return "/usr/local/bin/foreman-job-runner"
+		return defaultRuntimeBin + "/foreman-job-runner"
 	case attempt.EnvSlotHelper:
-		return "/usr/local/bin/foreman-job-slots"
+		return defaultRuntimeBin + "/foreman-job-slots"
 	default:
 		return ""
 	}
+}
+
+// proxyCache is the only CLI source the Job has. It reads the attempt's Job
+// token from the credential Secret, never a deployment-wide credential, and
+// keeps every download inside the frozen Foreman proxy origin.
+func proxyCache() (*attempt.ProxyCache, error) {
+	proxyURL := strings.TrimSpace(os.Getenv(envProxyURL))
+	if proxyURL == "" {
+		return nil, fmt.Errorf("%s is required: the Job has no direct-source or preinstalled-CLI fallback", envProxyURL)
+	}
+	token, err := readJobToken(envOrDefault(envTokenFile, defaultTokenFile))
+	if err != nil {
+		return nil, err
+	}
+	budget := attempt.DefaultCLIBudgetBytes
+	if raw := strings.TrimSpace(os.Getenv(envCLIBudget)); raw != "" {
+		value, parseErr := strconv.ParseInt(raw, 10, 64)
+		if parseErr != nil || value <= 0 {
+			return nil, fmt.Errorf("%s must be a positive byte count, got %q", envCLIBudget, raw)
+		}
+		budget = value
+	}
+	return &attempt.ProxyCache{
+		BaseURL: proxyURL, Token: token,
+		Dir:      envOrDefault(envCLIDir, defaultCLIDir),
+		MaxBytes: budget, Attempts: 2,
+	}, nil
+}
+
+func readJobToken(path string) (string, error) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return "", fmt.Errorf("read the Job credential: %w", err)
+	}
+	var credential struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(body, &credential); err != nil {
+		return "", fmt.Errorf("decode the Job credential: %w", err)
+	}
+	if strings.TrimSpace(credential.Token) == "" {
+		return "", errors.New("the Job credential carries no token")
+	}
+	return credential.Token, nil
 }
 
 func envOrDefault(key, fallback string) string {

@@ -82,20 +82,22 @@ Absolute, not drifting: the manifests pin every image to the `v0.6.1` release
 follow the operator's `TEST_MULTICA_MODEL`. The scripted backend is pinned too
 (`scripted-backend.yaml`: `python:3.12.9-alpine3.20`) — a floating base would let
 a node run a different server than the round was verified against. The Job image is not
-part of this pin: `build-foreman-job.yml` resolves upstream's newest release at
-build time and tags the image with that daemon version (`latest` follows the
-newest release), so the CLI a Job runs can be newer than the `v0.6.1` server.
+part of this pin: the Job runs the external rsbx carrier and fetches the
+Multica CLI from the Foreman release registry, so the CLI a Job runs is the
+version that registry verified, which can be newer than the `v0.6.1` server.
 
-The Job image carries a **floor**, though, and it is not optional: the daemon
+The Job's Multica CLI carries a **floor**, though, and it is not optional: the daemon
 starts `omp` with `--session <path>` up to multica v0.6.1 and with
 `--session-dir <dir>` from v0.6.2 on. `omp`'s `--session` is an alias of
 `--resume` — strictly a resume — so an older daemon resumes the empty session
 file it just created, the agent exits before its first turn, and every task
 lands as `agent_error.process_failure` with no tool call. Deploy the image
-built for the newest upstream release (`ghcr.io/tsic404/foreman-job:<daemon
-version>`, e.g. `0.8.0`); `./selfcheck.sh` gate ⑤ refuses anything below
-`0.6.2` with that root cause instead of letting the next round discover it as a
-dead task.
+or release-registry entry built for the newest upstream release (e.g. daemon
+`0.8.0`); `./selfcheck.sh` gate ⑤ refuses anything below `0.6.2` with that root
+cause instead of letting the next round discover it as a dead task. Gate ⑤
+still reads `FOREMAN_JOB_IMAGE` and runs `/usr/local/bin/multica` from it, so it
+must be pointed at the release registry's current Multica version (or updated
+to read that state) before a round that uses the rsbx carrier.
 
 Upgrading means rebuilding the environment against a new anchor
 (`./recycle.sh && ./deploy.sh`), never an in-place upgrade. The environment

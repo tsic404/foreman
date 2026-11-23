@@ -555,114 +555,67 @@ is the workspace-scoped form with one pair.
 
 ## Images
 
-Two images come from this repo: the scheduler image for the Deployment, and the
-Job image (upstream multica CLI + `foreman-gc` + `dumb-init`) that both the Job
-pods and the `foreman-gc` DaemonSet run. Neither image carries an agent
-backend: the Job template's init step installs `omp` into every Job at start-up
-(ADR-033), which is why the shipped template mounts it at the
-`MULTICA_OMP_PATH` the daemon reads. Both are published as **multi-platform
-manifest lists** (`linux/amd64` + `linux/arm64`), so a cluster with nodes of
-both architectures pulls the platform each node runs; nothing in `deploy/`
-names an architecture.
+Two images run a task: the Foreman image this repo publishes, and the external
+rsbx carrier the Job executes. They have different jobs.
 
-Each image has its own release line and its own version semantics:
+| Image | Built here | What it carries |
+|---|---|---|
+| `ghcr.io/tsic404/foreman` | yes | the server, the Job-side supervisor `foreman-job`, `foreman-gc` |
+| `ghcr.io/tsic404/rsbx` | no | the rsbx client; no Multica CLI and no Agent CLI |
 
-| Workflow | Image | Tags | Triggers |
-|---|---|---|---|
-| `.github/workflows/build-foreman.yml` | `ghcr.io/tsic404/foreman` | `v<X.Y.Z>` (tag push), `latest` (everything else) | `main` push, `v*.*.*` tag, manual dispatch |
-| `.github/workflows/build-foreman-job.yml` | `ghcr.io/tsic404/foreman-job` | `<multica daemon version>`, `latest` | `main` push, hourly schedule, manual dispatch |
+`foreman` is published as a **multi-platform manifest list** (`linux/amd64` +
+`linux/arm64`) by `.github/workflows/build-foreman.yml`, which is the whole
+release path. A `v*.*.*` tag push publishes exactly `foreman:v<X.Y.Z>` and
+leaves `latest` alone; every other run (a `main` push or a manual dispatch as
+its re-run entry point) publishes exactly `foreman:latest`. A published
+version tag therefore always names the image built from that tag and stays a
+valid rollback target (ADR-012).
 
-`foreman`'s `<version>` is the trigger's: a `v*.*.*` tag push publishes exactly
-`foreman:v<X.Y.Z>`, any other run (a `main` push, a manual dispatch as its re-run
-entry point) exactly `foreman:latest` — so a published version tag always names
-the image built from that tag and stays a valid rollback target (ADR-012), and
-no main push mints a version. `foreman-job`'s `<version>` is the upstream daemon
-version the image carries, resolved at build time from upstream's newest release
-(never from a repository variable) and verified against that release's checksums.
+**The Job carrier is frozen per attempt.** `FOREMAN_JOB_IMAGE` names the rsbx
+repository *and* the verified index digest
+(`ghcr.io/tsic404/rsbx@sha256:<digest>`); a value without a digest refuses the
+claim, and the Job render never emits a movable carrier tag (V2-C08). The
+shipped literal is the verified index. The rsbx index currently published
+carries only a `linux/amd64` manifest, so a binding's client platform must
+match a platform the digest actually publishes; the Job's node selector copies
+the frozen platform's architecture. Before pinning a different rsbx digest,
+check its manifest list; do not infer the platform from the node pool.
 
-**`latest` never moves backwards**, in either line: it is pushed only by a run
-that publishes newer content — for `foreman` a `main` push (a `v*.*.*` tag push
-publishes its version tag and leaves `latest` alone, however old that tag is),
-for `foreman-job` a run publishing exactly upstream's newest release. Both images
-are referenced by movable tag with `imagePullPolicy: Always` (`FOREMAN_JOB_IMAGE`
-defaults to `foreman-job:latest`), so a build of an older version would otherwise
-roll the whole cluster back. The two lines are independent: a `foreman` tag push
-never changes the Job image's version, and a Job-image run never builds the
-scheduler image.
+**The supervisor is not part of the carrier.** A `job-runtime` init container
+runs from `FOREMAN_JOB_RUNTIME_IMAGE` (default `ghcr.io/tsic404/foreman:latest`)
+and copies `foreman-job` and any deployment adapters from `/usr/local/bin` into
+an emptyDir; the carrier's agent container executes
+`/run/foreman/runtime/foreman-job`. Point `FOREMAN_JOB_RUNTIME_IMAGE` at the
+same release the Deployment runs — a digest or the matching version tag — so an
+old Foreman does not hand a Job a newer supervisor. The runtime image carries
+no CLI either.
 
-A Job-image run whose version is already published **skips** the build and the
-push, so the schedule and `main` pushes normally cost one registry query. That
-also means the automatic path never re-publishes an existing version tag: when a
-`foreman-gc` change has to ship under an unchanged daemon version, run the
-workflow manually with `force` — the version tag is republished, `latest` stays
-where it is (this version is not upstream's newest release):
+**The CLIs arrive only through the proxy.** At start-up the supervisor fetches
+the two frozen artifacts (the Multica CLI and the selected Agent CLI) from
+`/cli/{kind}/{version}/{os}/{arch}?digest=...` on the Job-facing listener,
+using the attempt's own Job token, and verifies platform, exact version,
+digest, executable entry and its download address before it reports rsbx
+ready, registers or delivers (V2-C09–C11). `FOREMAN_JOB_CLI_BUDGET_BYTES`
+(default `536870912`, 512 MiB) is the attempt's shared download budget;
+retries only re-fetch the same frozen artifact, and exhaustion fails the
+attempt. The download limiter is separate from heartbeat, lease and result
+budgets, so a saturated download window cannot reject control traffic
+(V2-C28). There is no direct release-source, image-bundled or local-execution
+fallback.
 
-```bash
-gh workflow run build-foreman-job.yml -f version=0.6.1 -f force=true
-```
-
-Both workflows need no secrets for the push (`GITHUB_TOKEN`, `packages: write`)
-and resolve the upstream CLI artifact from its release checksum manifest, per
-platform. Whichever image ends up as `FOREMAN_JOB_IMAGE` must carry:
-
-- `/usr/bin/dumb-init` — every Job `command` starts with `dumb-init --` (it is
-  the agent container's PID 1, ADR-022), and the build installs Alpine's
-  `dumb-init` package for the default base. A base whose package sources cannot
-  supply it, or a custom image named by a job template, leaves the container
-  without it and the agent fails at exec (pod `Failed` → `job_failed`);
-- the runtime the template's `omp` needs — the musl `omp` build links
-  `libstdc++`/`libgcc_s`, so the image installs Alpine's `libstdc++` package
-  (default base); a slimmer base that ships neither fails at exec;
-- the busybox applets the reference template's init step uses (`wget`, `uname`,
-  `sha256sum`) plus `sh`/`cp`/`chmod`/`chown` for `prepare` — the stock Alpine
-  base has all of them.
-
-`ADR-033` requires those contents, and §8.7 carries them as deployer
-constraints. The release workflows only build and push: checking what a
-published image contains is the design's acceptance face (`03-acceptance.md`
-TC-tech-job-08 for the contents, TC-tech-provenance-01 for the CLI provenance),
-run by QA against the image — not a post-push step in CI.
-
-The Job image is referenced by a **movable tag** in two places that carry the
-same literal (ADR-012):
-
-- `FOREMAN_JOB_IMAGE` in `30-foreman.yaml` (written verbatim into every Job
-  container's `image` — no digest concatenation), and
-- the `image:` of the `foreman-gc` DaemonSet in `40-foreman-gc.yaml`
-  (the DaemonSet runs the same image as the Job pods).
-
-Rolling forward is one step: point `FOREMAN_JOB_IMAGE` at the new reference, or
-let the tag itself move. Rolling back uses the version tags CI keeps publishing
-— the scheduler's `v<ver>` and the Job image's `<multica version>`; `latest`
-alone is never the only published tag. Every container in the Job template
-defaults to `imagePullPolicy: Always`, which is what lets a moved tag reach a
-node that already cached the reference; a deployment that pins a version tag can
-set `imagePullPolicy: IfNotPresent` in the job template (§Job template below)
-and accepts that a moved tag then skips cached nodes. `foreman-gc` pulls
-`Always` for the same reason.
-
-CI publishes each run's references (the `release-<image>-<version>` artifact and
-the workflow summary) as the run's own record — nothing in `deploy/` is
-backfilled from it.
+Release and rollback are the same one-step operation as before: point the
+Deployment at another `foreman` tag (and `FOREMAN_JOB_RUNTIME_IMAGE` at the
+same release); the gc DaemonSet in `40-foreman-gc.yaml` runs the Foreman image
+and pulls `Always`. Changing the rsbx carrier means changing
+`FOREMAN_JOB_IMAGE` to another verified digest and restarting Foreman —
+in-flight attempts keep the digest they froze.
 
 Local builds are for development and staging clusters, never the release path:
-`make build-job-image` builds one platform's image (`linux/$(ARCH)`, the host
-architecture unless `ARCH=` says otherwise) and takes the upstream CLI archive
-URL + SHA-256, so the built image can be checked against the upstream release
-(AC-13 provenance):
-
-```bash
-make build-job-image \
-  MULTICA_CLI_URL=https://github.com/multica-ai/multica/releases/download/v0.6.1/multica-cli-0.6.1-linux-amd64.tar.gz \
-  MULTICA_CLI_SHA256=<sha256 from that release's checksums.txt>
-```
-
-Verification is not part of the release path: the workflows resolve the version,
-build the multi-platform image and push it, and that is all. What the published
-image contains is checked by the design's acceptance cases against the image
-(TC-tech-job-08 / TC-tech-provenance-01), which is where the contents and
-provenance assertions live. The release record reflects the push command's exit
-code only — a non-zero exit does not prove that nothing landed, so check the
+`make build-foreman-image` builds one platform's image (`linux/$(ARCH)`, the
+host architecture unless `ARCH=` says otherwise) containing all three
+binaries. What a published image contains is checked by the design's
+acceptance cases; the release record reflects the push command's exit code
+only — a non-zero exit does not prove that nothing landed, so check the
 registry before re-running.
 
 ## Shared state store (stage one)
@@ -832,8 +785,18 @@ The ones a staging/test cluster usually overrides:
 
 ## Job template (required)
 
-The Job's shape comes from one place: the ConfigMap `foreman-job-template`,
-which `25-job-template.yaml` ships and the Deployment mounts at
+The V2 dispatch path does **not** read this template. When the rules binder
+freezes an attempt, the Job's shape comes from the fixed render
+(`internal/jobbuilder/fixed.go`): the digest-pinned rsbx carrier, the
+supervisor init container and the frozen attempt binding. The template below
+remains a required startup artifact because a claim without a frozen binding
+(the pre-V2 fallback) still renders from it; a deployment that always binds an
+environment never creates that shape. Do not point a legacy template at the
+rsbx carrier: it executes the carrier's preinstalled `/usr/local/bin/multica`,
+which V2-C08 forbids.
+
+On that legacy path the Job's shape comes from one place: the ConfigMap
+`foreman-job-template`, which `25-job-template.yaml` ships and the Deployment mounts at
 `/etc/foreman/job-template/` as a **non-optional** read-only volume (key
 `job-overlay.yaml`). The shipped content is the **reference template** — a byte
 copy of the in-repo baseline `internal/jobbuilder/testdata/job-baseline.yaml`
@@ -885,7 +848,7 @@ added or normalized.
 | `<task_id>` / `<agent_id>` / `<workspace_id>` | the task's ids |
 | `<issue_id>` / `<issue-identifier>` / `<autopilot_run_id>` / `<chat_session_id>` | the task's trigger context |
 | `<job runtime uuid>` / `<RFC3339>` / `<attempt>` | the Job runtime id / the claim time / the task's attempt number |
-| `<job-image>` | `FOREMAN_JOB_IMAGE` |
+| `<job-image>` | `FOREMAN_JOB_IMAGE` (legacy template path only; the fixed render uses the binding's `image@digest`) |
 | `<job-name>` / `<daemon-id>` | the final display name / the identity name `fm-<task_id>` |
 | `<agent-name>` | the payload's raw `agent.name` (any characters; only the name face normalizes it) |
 | `<preferred node>` | the node holding the resumed session's file (`session_id` of the task's previous run); with no resumed session — a first run — or no known node for it, or `FOREMAN_PREFER_NODE_REUSE=false`, or a `nodeSelector` policy hit, the whole affinity item carrying it is dropped. This literal is the substitution set's **one exception**: it is consumed only where it is *recognized* — a `values` entry of a preferred-affinity `matchExpressions` reading exactly this literal — so anywhere else it stays verbatim, and the apiserver judges that position at Job creation |
@@ -896,8 +859,8 @@ Unregistered `<...>` literals stay as written, so a template that writes
 the reference template has the placeholder in every container it declares
 (`agent`, `omp`, `prepare`).
 
-**The template also provides the agent backend.** The Job image carries no
-`omp` (ADR-033), so the shipped reference template's `omp` init container
+**On the legacy path the template also provides the agent backend.** The rsbx
+carrier carries no `omp`, so the shipped reference template's `omp` init container
 fetches the architecture's musl build from upstream's newest release, verifies
 it against that release's `SHA256SUMS.txt`, and leaves it where the agent
 container mounts it as the `MULTICA_OMP_PATH` file. A deployer's own template
@@ -1042,9 +1005,10 @@ before copying the reference template:
   copies it into the profile directory inside that Job's credential volume);
   without one the task fails with `job_auth_failed` — nothing checks this at
   startup.
-- A template carrying its own `image` removes the image audit anchor:
-  `/foreman/version` keeps reporting `FOREMAN_JOB_IMAGE`, which is then no
-  longer what the Job runs.
+- On the legacy template path, a template carrying its own `image` removes the
+  image audit anchor: `/foreman/version` keeps reporting `FOREMAN_JOB_IMAGE`,
+  which is then no longer what the Job runs. The fixed render does not read
+  the template's `image` at all.
 - `MULTICA_DAEMON_ID` reads the pod-template label `foreman.tsic.top/daemon-id`,
   which Foreman writes with the identity name `fm-<task_id>`. A template that
   sets `manualSelector: true` (or otherwise replaces the Job's selector) makes

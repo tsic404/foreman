@@ -1,12 +1,12 @@
-// Package release pins the two release workflows' version semantics: both images
-// ride movable tags with `imagePullPolicy: Always`, so a run must publish exactly
-// the tag its trigger names. For build-foreman.yml that is the version tag on a
-// `v*.*.*` tag push — never `latest`, so the tag keeps naming the image built
-// from it (ADR-012's rollback path) — and `latest` on a main push — never a
-// version tag, so the untagged line cannot mint or overwrite one. The scripts
-// under test are the workflows' own `run:` blocks — with their `env:` expressions
-// resolved against the preceding step's outputs, so the wiring is under test too
-// — executed with stubbed docker/curl.
+// Package release pins the release workflow's version semantics: the Foreman
+// image rides a movable tag with `imagePullPolicy: Always`, so a run must
+// publish exactly the tag its trigger names. For build-foreman.yml that is the
+// version tag on a `v*.*.*` tag push — never `latest`, so the tag keeps naming
+// the image built from it (ADR-012's rollback path) — and `latest` on a main
+// push — never a version tag, so the untagged line cannot mint or overwrite
+// one. The scripts under test are the workflow's own `run:` blocks — with their
+// `env:` expressions resolved against the preceding step's outputs, so the
+// wiring is under test too — executed with stubbed docker.
 package release
 
 import (
@@ -19,68 +19,7 @@ import (
 	"testing"
 )
 
-const (
-	foremanWorkflow    = "../../.github/workflows/build-foreman.yml"
-	foremanJobWorkflow = "../../.github/workflows/build-foreman-job.yml"
-)
-
-// TestJobImageLatestOnlyFollowsUpstreamsNewestRelease covers
-// build-foreman-job.yml: the version is upstream's newest release unless a
-// dispatch names one, and only the run that publishes upstream's newest release
-// moves `foreman-job:latest`.
-func TestJobImageLatestOnlyFollowsUpstreamsNewestRelease(t *testing.T) {
-	requireTools(t, "bash", "git")
-	top := workflowEnv(t, foremanJobWorkflow)
-	steps := workflowSteps(t, foremanJobWorkflow)
-	resolve := requireStep(t, steps, "Resolve the upstream daemon version", foremanJobWorkflow)
-	publish := requireStep(t, steps, "Build and push the image", foremanJobWorkflow)
-
-	for _, tc := range []struct {
-		input      string
-		version    string
-		isNewest   string
-		wantLatest bool
-	}{
-		{input: "", version: "0.6.3", isNewest: "true", wantLatest: true},
-		{input: "0.6.3", version: "0.6.3", isNewest: "true", wantLatest: true},
-		{input: "v0.6.3", version: "0.6.3", isNewest: "true", wantLatest: true},
-		{input: "0.6.1", version: "0.6.1", isNewest: "false", wantLatest: false},
-	} {
-		t.Run("input="+tc.input, func(t *testing.T) {
-			dir := t.TempDir()
-			stub(t, dir, "curl", "#!/bin/sh\necho \"https://github.com/multica-ai/multica/releases/tag/v0.6.3\"\n")
-			resolved := runStep(t, resolve.run, dir, dir, mergeEnv(top, resolveEnv(t, resolve.env, everyInput(tc.input), nil)))
-			assertOutput(t, resolved, "version", tc.version)
-			assertOutput(t, resolved, "is_newest", tc.isNewest)
-			assertOutput(t, resolved, "latest", "0.6.3")
-
-			// The publish step's own env decides whether `latest` moves: its
-			// PUSH_LATEST must come from the resolve step's output, never from
-			// the trigger alone.
-			// Outputs of the step this case skips (the artifact resolution):
-			// the publish step's own wiring is what is under test.
-			env := mergeEnv(top, resolveEnv(t, publish.env, nil, map[string]string{
-				"MULTICA_CLI_URL_AMD64":    "u",
-				"MULTICA_CLI_SHA256_AMD64": "s",
-				"MULTICA_CLI_URL_ARM64":    "u",
-				"MULTICA_CLI_SHA256_ARM64": "s",
-			}, resolved.outputs))
-			buildArgs := runPublish(t, publish.run, dir, env)
-			if got := strings.Contains(buildArgs, "foreman-job:latest"); got != tc.wantLatest {
-				t.Errorf("buildx args contain foreman-job:latest = %v, want %v\n%s", got, tc.wantLatest, buildArgs)
-			}
-		})
-	}
-
-	t.Run("junk input is refused", func(t *testing.T) {
-		dir := t.TempDir()
-		stub(t, dir, "curl", "#!/bin/sh\necho \"https://github.com/multica-ai/multica/releases/tag/v0.6.3\"\n")
-		out := runStepAllowFailure(t, resolve.run, dir, dir, mergeEnv(top, resolveEnv(t, resolve.env, everyInput("garbage"), nil)))
-		if out.err == nil {
-			t.Fatalf("version resolution accepted a non-release input:\n%s", out.stdout)
-		}
-	})
-}
+const foremanWorkflow = "../../.github/workflows/build-foreman.yml"
 
 // TestForemanImageTagPushPublishesOnlyThatVersion covers build-foreman.yml: a
 // `v*.*.*` tag push publishes exactly `foreman:v<X.Y.Z>` — never `latest`,

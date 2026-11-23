@@ -1,8 +1,7 @@
 # The check line for pull requests into `main`: what a PR can show before it is
-# merged. It is separate from the release path (build-foreman.yml,
-# build-foreman-job.yml), which stays the only thing that publishes anything —
-# a release run never waits on this workflow, and editing this file can never
-# change what a release does.
+# merged. It is separate from the release path (build-foreman.yml), which stays
+# the only thing that publishes anything — a release run never waits on this
+# workflow, and editing this file can never change what a release does.
 #
 # Two jobs, parallel and independent. `check` is the gate the owner asked for
 # (build + tests); `image` proves the Containerfile and the two-platform build
@@ -94,7 +93,7 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Build the per-platform binary
+      - name: Build the per-platform binaries
         # Same shape as the release step, with the version frozen to the one a
         # local build stamps in (`main.version` defaults to `dev`): a check has
         # no tag to resolve, and inventing one would judge a false version.
@@ -102,9 +101,11 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           for arch in amd64 arm64; do
-            CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
-              -ldflags "-s -w -X main.version=dev" \
-              -o "dist/foreman-linux-${arch}" ./cmd/foreman
+            for cmd in foreman foreman-job foreman-gc; do
+              CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
+                -ldflags "-s -w -X main.version=dev" \
+                -o "dist/${cmd}-linux-${arch}" "./cmd/${cmd}"
+            done
           done
           ls -l dist
 

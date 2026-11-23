@@ -12,9 +12,10 @@
 # Job at a specific replica).
 # Environment: every key with its deployment default spelled out, except
 # MULTICA_SERVER_URL / MULTICA_WORKSPACE_ID (deployment values) and the two
-# secret keys. FOREMAN_JOB_IMAGE is a full movable image reference (ADR-012);
-# the foreman-gc DaemonSet carries the same literal — see deploy/README.md
-# §Images.
+# secret keys. FOREMAN_JOB_IMAGE is the external rsbx carrier reference and
+# must carry a verified digest (V2-C08); FOREMAN_JOB_RUNTIME_IMAGE is the
+# Foreman image the supervisor is copied from. The foreman-gc DaemonSet runs
+# the Foreman image — see deploy/README.md §Images.
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -124,7 +125,19 @@ spec:
             - name: FOREMAN_JOB_SERVER_URL
               value: "http://foreman.foreman.svc.cluster.local:8080"
             - name: FOREMAN_JOB_IMAGE
-              value: "ghcr.io/tsic404/foreman-job:latest"
+              # The rsbx carrier. The digest is the verified index the
+              # deployer selected; each attempt freezes it (V2-C08). The
+              # carrier carries neither the Multica CLI nor an Agent CLI.
+              value: "ghcr.io/tsic404/rsbx@sha256:4885255c93cf61c0ccce8bf3e00da6da40628b5df4a5522102178b3f1975debf"
+            # Foreman-owned runtime image: an init container copies the
+            # Job-side supervisor from it into the carrier. It is not the Job
+            # carrier and carries no CLI.
+            - name: FOREMAN_JOB_RUNTIME_IMAGE
+              value: "ghcr.io/tsic404/foreman:latest"
+            # Per-attempt budget for the two frozen CLI downloads, separate
+            # from heartbeat / lease / result budgets (V2-C28).
+            - name: FOREMAN_JOB_CLI_BUDGET_BYTES
+              value: "536870912"
             - name: FOREMAN_MAX_INFLIGHT_JOBS
               value: "100"
             - name: FOREMAN_CLAIM_BATCH_MAX

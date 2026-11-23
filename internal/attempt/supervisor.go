@@ -378,9 +378,11 @@ func (s *Supervisor) prepare(ctx context.Context, binding Binding) ([]Artifact, 
 		}
 		artifact, err := s.Cache.Ensure(ctx, want)
 		if err != nil {
+			s.logPrepareFailure(binding, want, "download", err)
 			return prepared, fmt.Errorf("prepare %s CLI: %w", kind, err)
 		}
 		if err := verifyArtifact(want, artifact); err != nil {
+			s.logPrepareFailure(binding, want, "verify", err)
 			return prepared, err
 		}
 		prepared = append(prepared, artifact)
@@ -396,12 +398,29 @@ func verifyArtifact(want CLI, got Artifact) error {
 		return fmt.Errorf("%s CLI version %q does not match the frozen %q", want.Kind, got.Version, want.Version)
 	case got.Platform != want.Platform:
 		return fmt.Errorf("%s CLI platform %q does not match the frozen %q", want.Kind, got.Platform, want.Platform)
-	case got.Digest != want.Digest:
+	case DigestHex(got.Digest) != DigestHex(want.Digest):
 		return fmt.Errorf("%s CLI digest %q does not match the frozen %q", want.Kind, got.Digest, want.Digest)
 	case got.Path == "":
 		return fmt.Errorf("%s CLI has no local path", want.Kind)
 	}
 	return nil
+}
+
+// logPrepareFailure records exactly the facts V2-C11 requires: the original
+// source and attempt, the failed stage, the CLI kind, its frozen
+// version/platform/digest, and a reason that carries no credential.
+func (s *Supervisor) logPrepareFailure(binding Binding, cli CLI, stage string, err error) {
+	s.log().Warn("attempt.cli_prepare_failed",
+		"attempt_id", binding.AttemptID,
+		"task_id", binding.TaskID,
+		"source_id", binding.SourceID,
+		"stage", "preparing/"+stage,
+		"cli_kind", cli.Kind,
+		"cli_backend", cli.Backend,
+		"cli_version", cli.Version,
+		"cli_platform", cli.Platform,
+		"cli_digest", DigestHex(cli.Digest),
+		"reason", err.Error())
 }
 
 // verifySession requires the complete frozen identity. A missing generation or

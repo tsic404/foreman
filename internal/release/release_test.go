@@ -210,6 +210,55 @@ func TestPublishRequiresEveryRequiredPlatform(t *testing.T) {
 	}
 }
 
+// TestVerifiedReleaseServesAnOlderFrozenPublish covers the CLI download face's
+// authorization: an attempt that froze the previous release must still find
+// its exact version and platform after a newer release becomes current
+// (V2-C08/C09).
+func TestVerifiedReleaseServesAnOlderFrozenPublish(t *testing.T) {
+	amd64 := elfFor("amd64")
+	arm64 := elfFor("arm64")
+	amd64b := append(elfFor("amd64"), 0x01)
+	arm64b := append(elfFor("arm64"), 0x01)
+	fetcher := &fakeFetcher{bodies: map[string][]byte{
+		"https://mirror.test/omp-1-amd64": amd64,
+		"https://mirror.test/omp-1-arm64": arm64,
+		"https://mirror.test/omp-2-amd64": amd64b,
+		"https://mirror.test/omp-2-arm64": arm64b,
+	}}
+	service := newTestService(t, fetcher, syncedDirectory(), nil)
+	registerTestDefinition(t, service)
+	addVersion(t, service, "1.0.0", []Artifact{
+		artifactForTest(Platform{OS: "linux", Arch: "amd64"}, "https://mirror.test/omp-1-amd64", amd64),
+		artifactForTest(Platform{OS: "linux", Arch: "arm64"}, "https://mirror.test/omp-1-arm64", arm64),
+	})
+	if outcome := publish(t, service, "1.0.0", 1); outcome.Result != PublishPublished {
+		t.Fatalf("publish 1.0.0 = %+v", outcome)
+	}
+	addVersion(t, service, "2.0.0", []Artifact{
+		artifactForTest(Platform{OS: "linux", Arch: "amd64"}, "https://mirror.test/omp-2-amd64", amd64b),
+		artifactForTest(Platform{OS: "linux", Arch: "arm64"}, "https://mirror.test/omp-2-arm64", arm64b),
+	})
+	if outcome := publish(t, service, "2.0.0", 2); outcome.Result != PublishPublished {
+		t.Fatalf("publish 2.0.0 = %+v", outcome)
+	}
+
+	if got, ok := service.VerifiedRelease(context.Background(), "atlas", KindAgent, "omp", "1.0.0", "linux/amd64"); !ok || got != digestOf(amd64) {
+		t.Fatalf("older frozen release = (%q, %v), want %q", got, ok, digestOf(amd64))
+	}
+	for _, tc := range []struct {
+		name, server, adapter, version, platform string
+	}{
+		{name: "unknown version", server: "atlas", adapter: "omp", version: "0.9.0", platform: "linux/amd64"},
+		{name: "unknown platform", server: "atlas", adapter: "omp", version: "1.0.0", platform: "linux/riscv64"},
+		{name: "other source", server: "other", adapter: "omp", version: "1.0.0", platform: "linux/amd64"},
+		{name: "other adapter", server: "atlas", adapter: "claude", version: "1.0.0", platform: "linux/amd64"},
+	} {
+		if got, ok := service.VerifiedRelease(context.Background(), tc.server, KindAgent, tc.adapter, tc.version, tc.platform); ok {
+			t.Errorf("%s: VerifiedRelease = %q, want no answer", tc.name, got)
+		}
+	}
+}
+
 // TestManualReleaseWorksWhileCheckingIsOff is the switch independence clause:
 // the automatic check may be disabled, and a manual release of a registered
 // candidate still publishes.

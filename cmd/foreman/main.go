@@ -108,6 +108,9 @@ func run() error {
 	if err != nil {
 		return err
 	}
+	schedCfg.JobImage = jbCfg.JobImage
+	schedCfg.JobServerURL = jbCfg.JobServerURL()
+	schedCfg.CLIBudgetBytes = jbCfg.CLIBudgetBytes
 	// The user-scoped discovery form has no workspace identity in the
 	// interface; the scheduler's single-workspace seams read this field, so it
 	// is filled from the discovery result below.
@@ -541,6 +544,15 @@ func run() error {
 	}
 	fakeServer := proxy.NewFakeServer(issuer, reg, sched, client, ws, metrics,
 		proxy.WithProbeRegistry(probes), proxy.WithClientSet(clientSet))
+	// The Job downloads its frozen CLI artifacts from this listener under its
+	// own token. The route is outside /api so it never joins the daemon-face
+	// census, and its limiter is separate from every control-plane budget
+	// (V2-C28).
+	cliDownloads := &proxy.CLIDistribution{
+		Verifier: issuer, Releases: releaseService,
+		Attempts: proxy.RegistryAttempts{Registry: reg},
+		Limiter:  proxy.NewDownloadLimiter(4), Logger: baseLog,
+	}
 	// The liveness view the health endpoint serves (§9.3): the loops register
 	// as they start, and a critical loop that stops turns the probe red.
 	health := observability.NewHealth()
@@ -557,7 +569,7 @@ func run() error {
 	})
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           newJobFaceMux(fakeServer, health, started),
+		Handler:           newJobFaceMux(fakeServer, cliDownloads, health, started),
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 	// The ops surface is a second listener: the Job-facing Service publishes
@@ -941,9 +953,12 @@ func run() error {
 // — a Job pod dialing this listener with its own Job Token reaches no ops
 // route (§2.2 S-25) — and the health route answers the liveness verdict alone,
 // never a task, workspace or runtime identity field.
-func newJobFaceMux(fakeServer http.Handler, health *observability.Health, startedAt time.Time) *http.ServeMux {
+func newJobFaceMux(fakeServer, cliDownloads http.Handler, health *observability.Health, startedAt time.Time) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("/api/", fakeServer)
+	if cliDownloads != nil {
+		mux.Handle("GET /cli/{kind}/{version}/{os}/{arch}", cliDownloads)
+	}
 	mux.Handle("GET /foreman/healthz", observability.NewHealthHandler(health, startedAt))
 	return mux
 }

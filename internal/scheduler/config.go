@@ -165,6 +165,14 @@ type Config struct {
 	// dispatch share the resolver behind it; only the reservation differs
 	// (02-contracts V2-C01). A nil seam keeps the pre-environment path.
 	EnvironmentBinder EnvironmentBinder
+	// JobImage is the configured rsbx carrier reference. The fixed attempt
+	// freezes its digest; a reference without one refuses the claim (V2-C08).
+	JobImage string
+	// JobServerURL is the Foreman proxy origin frozen into the attempt's CLI
+	// download addresses.
+	JobServerURL string
+	// CLIBudgetBytes is the per-attempt CLI download budget.
+	CLIBudgetBytes int64
 }
 
 // ClaimFacts is one claim's release snapshot. The *Known flags separate a
