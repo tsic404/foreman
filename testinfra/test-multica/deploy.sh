@@ -13,9 +13,9 @@
 #
 # It is idempotent: an existing Secret (and therefore the existing database
 # password) is never overwritten, and re-applying the manifests only rolls what
-# changed. The version anchor is in deploy.yaml — upgrading means rebuilding
-# the environment from a new anchor (./recycle.sh && ./deploy.sh), never an
-# in-place upgrade.
+# changed. The server images follow upstream's `latest` tag — a moved tag is
+# picked up by rebuilding the environment (./recycle.sh && ./deploy.sh), and
+# the rollout's own digest is printed as the round's identity.
 
 set -eu
 
@@ -28,7 +28,7 @@ need jq
 for arg in "$@"; do
 	case $arg in
 	-h | --help)
-		sed -n '2,17p' "$0" | sed 's/^# \{0,1\}//'
+		sed -n '2,18p' "$0" | sed 's/^# \{0,1\}//'
 		exit 0
 		;;
 	*) die "unknown argument: $arg" ;;
@@ -192,5 +192,20 @@ for d in $deployments; do
 		die "deployment $d did not become ready — kubectl -n $NS describe deploy/$d"
 	info "deploy/$d ready"
 done
+
+# 4. The artifact identity of this rollout. `latest` is a movable tag, so the
+#    tag cannot say which build a round runs: read the digest back from the pod
+#    that just rolled, plus the version the image's own binary reports, and
+#    print both as the round's record. ./selfcheck.sh ③ re-asserts the same
+#    identity against the server's own /api/config answer at the start of the
+#    round, after a reset.
+backend_image=$(server_image_reference) || backend_image=
+backend_digest=$(server_image_digest backend) || backend_digest=
+backend_version=$(server_image_version) || backend_version=
+web_digest=$(server_image_digest web) || web_digest=
+[ -n "$backend_image" ] && [ -n "$backend_digest" ] && [ -n "$web_digest" ] &&
+	[ -n "$backend_version" ] ||
+	die "cannot read the rolled server's identity — is $NS/backend up, and does its image answer 'multica version'?"
+info "artifact: server $backend_version ($backend_image @ $backend_digest), web @ $web_digest"
 
 info "done. server: $SERVER_URL/api/config · entry: $ENTRY_URL"

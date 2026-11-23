@@ -101,6 +101,18 @@ bind_one() { # <agent-name>
 bind_one "$AGENT_NAME"
 bind_one "$FAULT_AGENT_NAME"
 
+# The model writes land after the binding: upstream v0.11 refuses a model
+# update on an agent with no runtime, so ./reset.sh left them for here. The
+# failure agent keeps its unresolvable selector; the test agent takes the
+# round's source.
+apply_round_model "$agent" ||
+	die "cannot point agent $AGENT_NAME at the round's model"
+fault_agent=$(agent_id "$FAULT_AGENT_NAME") || die "cannot read the agent list"
+set_agent_model "$fault_agent" "$FAULT_MODEL_SELECTOR" ||
+	die "cannot point agent $FAULT_AGENT_NAME at $FAULT_MODEL_SELECTOR"
+set_agent_env "$fault_agent" "" ||
+	die "cannot clear agent $FAULT_AGENT_NAME's model backend address"
+
 # The 可手动触发的 autopilots (`./multica-test autopilot trigger <id>`), one
 # per task shape. Both are created now that the assignee has a runtime; one
 # left over from an earlier round is re-pointed at the current agent,

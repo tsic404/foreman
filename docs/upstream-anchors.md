@@ -1,18 +1,36 @@
 # Upstream anchors
 
-The design repo's §7 requires every upstream protocol fact Foreman relies on to
-be anchored here as **repo + commit** and **file + symbol** — never a line
-number, which drifts with the upstream version. A fact whose anchor moves is
-re-verified before the next release; an unverified fact is implemented in the
-defensive form instead of being relied on.
+Every upstream protocol fact Foreman relies on is anchored here as
+**repo + commit** and **file + symbol** — never a line number, which drifts
+with the upstream version. The basis is `02-contracts.md` V2-C21, which requires
+the registration to be refreshed by the actual version, and V2-C02's
+**上线门禁**, which requires identity, authorized write-back with read-back and
+switch-race attribution to be proven on the **target** Multica version;
+`03-acceptance.md` §部署与证据 requires the build's artifact and image digest to
+be recorded. A fact whose anchor moves is re-verified before the next release;
+an unverified fact is implemented in the defensive form instead of being relied
+on.
 
-## Pinned artifact
+## Artifact anchors
 
-`github.com/multica-ai/multica@2ea01ae4` — the `v0.6.1` release commit, the same
-artifact the test cluster pins and the Foreman release registry serves to a
-Job through the proxy download face.
+Two anchors, for two different jobs:
 
-## S-12 token usage (contracts §9.2 / ADR-009 decision 4)
+- **Protocol facts.** Everything below was read from
+  `github.com/multica-ai/multica@e1fe10d6` — the `v0.11.1` release — and is
+  re-verified against the artifact each round actually runs, not preserved from
+  one old release. The round that re-validated this file ran the backend image
+  `ghcr.io/multica-ai/multica-backend@sha256:49db0b3d2b1a711fd92c440fd564c79d85a660f59b834bc6917382c86c1e32f7`
+  (`v0.11.1`), which is the provenance recorded by
+  `testinfra/test-multica/README.md` §Version anchor.
+- **Test base and Job CLIs.** They are not pinned either: the test cluster
+  deploys the `latest` tags of `multica-backend` and `multica-web` and records
+  the digest it actually ran; the Job receives both CLIs from the Foreman
+  release registry through its proxy download face.
+
+A fact the round relies on is re-verified against that round's server, or
+implemented in the defensive form, per the rule above.
+
+## S-12 token usage (V2-C06 协议保真)
 
 Premise: the daemon's S-12 usage report is the wire source of the token
 metric. Each entry carries the provider, model and the four token counters;
@@ -23,7 +41,7 @@ the optional cost figure is not consumed by Foreman.
 | The daemon posts `{"usage":[{provider, model, input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd_ticks?}]}` to `POST /api/daemon/tasks/{taskId}/usage` | `server/internal/daemon/client.go` → `(*Client).ReportTaskUsage` |
 | The usage entry carries the four token counters; `cost_usd_ticks` is optional | `server/internal/daemon/types.go` → `TaskUsageEntry` |
 
-## Skill-bundle resolve (contracts §1.8 / §7, ADR-045)
+## Skill-bundle resolve (V2-C03 交付与凭据, V2-C06)
 
 Premise: the resolve response is content-addressed — the same reference set
 yields the same response body — and the request payload bytes carry no task or
@@ -49,37 +67,37 @@ before the edit. That is the version-lag class the upstream daemon already has
 (it reuses its on-disk bundle for an unchanged ref across dispatches); it is
 bounded by `FOREMAN_SKILL_CACHE_FRESH_TTL`, and a claim taken after the edit
 carries the new hash — a different payload, hence a different key. Re-verify this
-anchor when the upstream changes the resolve semantics (ADR-045 复审触发).
+anchor when the upstream changes the resolve semantics (V2-C03 复审触发).
 
-## Project identity queries (contracts §4.1 / §8.5, ADR-048)
+## Project identity queries (V2-C01 就绪检查, V2-C15 来源同步)
 
-Premise: the platform exposes the two read-only project-identity lookups
-ADR-048 relies on — a workspace project name resolved to its opaque project
-identifier at startup, and an issue's project identifier read once per claim —
-and Foreman can call them with its existing server credential.
+Premise: the platform exposes the two read-only project-identity lookups the
+startup name resolution and the per-claim identity read rely on — a workspace
+project name resolved to its opaque project identifier at startup, and an
+issue's project identifier read once per claim — and Foreman can call them with
+its existing server credential.
 
 | Fact | Anchor |
 |---|---|
-| The claim payload carries the project identifier at its **top-level** `project_id` (omitted when the task has no project); `project_title` / `project_description` are prompt context and are not the identity | `server/internal/handler/agent.go` → `AgentTaskResponse.ProjectID`, `AgentTaskResponse.ProjectTitle` |
+| The claim payload carries the project identifier at its **top-level** `project_id` (omitted when the task has no project); `project_title` is prompt context and is not the identity | `server/internal/handler/agent.go` → `AgentTaskResponse.ProjectID`, `AgentTaskResponse.ProjectTitle` |
 | Listing a workspace's projects is `GET /api/projects?workspace_id=<uuid>`, answering `{"projects":[{id,title,…}],"total":N}`; the human-readable project name is `title` and the opaque identifier is `id` | `server/cmd/server/router.go` → the workspace-scoped `/api/projects` route group; `server/internal/handler/project.go` → `(*Handler).ListProjects`, `ProjectResponse` |
-| No server-side project-name filter exists (the list accepts only `status` / `priority`), so a policy key is resolved by exact equality over the returned list: zero matches = absent, more than one = ambiguous | `server/internal/handler/project.go` → `(*Handler).ListProjects` |
+| No server-side exact-name filter exists — the list takes `q` (a case-insensitive title substring), `status`, `priority`, `lead`, archived and paging/sort controls — so a policy key is resolved by exact equality over the returned list: zero matches = absent, more than one = ambiguous | `server/internal/handler/project.go` → `(*Handler).ListProjects`; `server/internal/handler/project_list.go` → `parseProjectListQuery`, the `q`/`status`/`priority` filter |
 | Reading one issue is `GET /api/issues/{id}?workspace_id=<uuid>`; the answer carries `project_id` (nullable — a task without a project), which is the claim-time answer | `server/cmd/server/router.go` → the `GET /api/issues/{id}` registration; `server/internal/handler/issue.go` → `(*Handler).GetIssue`, `IssueResponse.ProjectID` |
 | Both routes are user-API routes: they authenticate the bearer token through `middleware.Auth` (PAT / JWT / task token) inside the workspace-membership group. A daemon-only `mdt_` token is not accepted there, so these two queries need the `mul_` PAT form (`MULTICA_TOKEN` accepts both); a rejected call converges on the documented unavailable/failure class, never on a silent empty answer | `server/cmd/server/router.go` → the `middleware.RequireWorkspaceMember` group and its `middleware.Auth`; `server/internal/middleware/auth.go` → `Auth` |
 | There is **no** workspace-wide, visibility-independent agent-name lookup: `GET /api/agents` filters private agents by the caller's membership/ownership, so an absent answer is not the platform's authority. Foreman therefore concludes `unavailable` for agent policy keys (the documented degradation: warn, boot continues, agent section still matches by exact name). | `server/internal/handler/agent.go` → `(*Handler).ListAgents`; `server/internal/handler/agent_access.go` → `memberAllowedToViewAgent` |
 
 **Scope of the premise.** The project name resolution above reads the project's
-`title`; the design's excluded option was promoting the claim payload's
-`project_title` to an identity name, not failing to resolve a configured name
-through the platform's project list. Title uniqueness is not promised, which is
-why more than one exact match refuses startup as ambiguous (ADR-048 decision 2)
-rather than picking one.
+`title`; the excluded option was promoting the claim payload's `project_title`
+to an identity name, not failing to resolve a configured name through the
+platform's project list. Title uniqueness is not promised, which is why more
+than one exact match refuses startup as ambiguous rather than picking one.
 
-## Multi-workspace credential scope and probe registration (contracts §0 / §1.1 / §1.2 / §7, ADR-049)
+## Multi-workspace credential scope and probe registration (V2-C03, V2-C06)
 
-Premise: the workspace set a credential can act for is answered by C-17, the
-daemon has no configuration that narrows its registration scope, and the
-cross-workspace answer shapes are the ones ADR-049 decision 4 names. Verified
-against the pinned artifact (`multica-ai/multica@2ea01ae4`).
+Premise: the workspace set a credential can act for is answered by the daemon
+workspace list, the daemon has no configuration that narrows its registration
+scope, and the cross-workspace answers are 404, never 403. Verified against the
+deployed artifact (`multica-ai/multica@e1fe10d6`, `v0.11.1`).
 
 | Fact | Anchor |
 |---|---|
@@ -98,15 +116,16 @@ answers. The probe-side registration remains Foreman-local by contract (S-4
 captures it into the probe session; it is never forwarded upstream), so the
 probe's own daemon identity never reaches the server — the server-side runtime
 rows come only from Foreman's per-workspace C-1 with the deployment identity.
-Re-verify when upstream changes the daemon route group or the C-17 answer shape
-(protocol change ⇒ 提案, per 01-scope 变更触发条件).
+Re-verify when upstream changes the daemon route group or the workspace-list
+answer shape (protocol change ⇒ 提案).
 
-## Multi-source directory and runtime binding (architecture §3.1 / §3.2, contracts V2-C02)
+## Multi-source directory and runtime binding (V2-C02, V2-C15, V2-C16)
 
 Premise: the management surface reads a server's workspaces, projects, agents
 and runtimes, and changes one agent's runtime association, using the same
 routes the platform's own console uses — with no Foreman-specific upstream API.
-Verified against the pinned artifact (`multica-ai/multica@2ea01ae4`).
+Verified against the deployed artifact (`multica-ai/multica@e1fe10d6`,
+`v0.11.1`).
 
 | Fact | Anchor |
 |---|---|
@@ -125,6 +144,6 @@ given deployment's credential may enumerate the candidate runtimes or write
 that agent. Foreman therefore disables editing with a reason when the source's
 credential is revoked, and reports a refusal, a timeout or a competing edit as
 its own non-success class — only a read-back that shows the requested runtime
-is reported as applied (02-contracts.md V2-C02, 04-architecture.md §3.2).
+is reported as applied (02-contracts.md V2-C02, V2-C16).
 Re-verify when upstream changes these routes, the `AgentResponse` binding
 fields, or the `UpdateAgentRequest` runtime field.

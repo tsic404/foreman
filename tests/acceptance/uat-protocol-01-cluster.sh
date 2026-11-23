@@ -2,9 +2,9 @@
 # TC-uat-protocol-01 — G2: a Multica instance is taken over without changing
 # anything upstream. The carrier compares the running test-environment objects
 # with the pinned test-infra manifest (images are the upstream identity face),
-# checks the server's version anchor, then follows one real task through
-# registration, claim, start and report. The agent-to-server passthrough is not
-# judged here: its evidence is AC-15's cases.
+# checks that the server's own version matches the running image's binary, then
+# follows one real task through registration, claim, start and report. The
+# agent-to-server passthrough is not judged here: its evidence is AC-15's cases.
 #
 #   TASK_ID=<id> ./uat-protocol-01-cluster.sh
 # TASK_ID is the task this round dispatched after wiring. The carrier takes it
@@ -60,9 +60,17 @@ extra=$(comm -13 "$tmp/admitted" "$tmp/running")
 config=$(curl -fsS -m 30 "$TEST_MULTICA_SERVER_URL/api/config") ||
 	blocked "cannot read $TEST_MULTICA_SERVER_URL/api/config"
 version=$(printf '%s' "$config" | jq -r '.server_version // empty')
-[ "$version" = "$TEST_MULTICA_VERSION_ANCHOR" ] ||
-	blocked "the test server reports $version, the artifact anchor is $TEST_MULTICA_VERSION_ANCHOR"
-observe "upstream: images match the manifest, server_version=$version"
+[ -n "$version" ] ||
+	blocked "the test server reports no server_version — the data surface and the artifact differ"
+image_version=$(test_multica_image_version) || image_version=
+[ -n "$image_version" ] ||
+	blocked "cannot read the version out of the running backend image $(test_multica_image_reference) — its own binary does not answer 'multica version'"
+[ "$version" = "$image_version" ] ||
+	blocked "the test server reports $version, the running image's binary reports $image_version — /api/config does not describe the artifact that is serving"
+digest=$(test_multica_image_digest) || digest=
+[ -n "$digest" ] ||
+	blocked "cannot read the running backend pod's digest — is $TEST_MULTICA_NS/backend up?"
+observe "upstream: images match the manifest, server_version=$version ($digest)"
 
 # ---- Registration -----------------------------------------------------------
 runtimes=$(mcli runtime list --output json) ||

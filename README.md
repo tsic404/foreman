@@ -49,13 +49,15 @@ README): a test-environment component, not part of `deploy/`.
 
 Deployment lives in `deploy/` (namespaces, RBAC, Secrets, Deployment/Service,
 `foreman-gc` DaemonSet) and is applied with `kubectl apply -f deploy/`; see
-`deploy/README.md` for the Secret values, the movable Job image reference and
-the digest-pinned rsbx carrier, the CLI proxy face and the node-local state
+`deploy/README.md` for the Secret values, the digest-pinned rsbx carrier and
+the supervisor runtime image, the CLI proxy face and the node-local state
 root.
 
 ## Status
 
-Early development. The protocol feasibility has been validated against Multica daemon `v0.6.0`.
+Early development. The protocol facts are re-verified against the Multica
+release each acceptance round deploys (currently `v0.11.1`, see
+`docs/upstream-anchors.md`).
 
 ## License
 

@@ -72,37 +72,65 @@ names what the backend actually serves.
 
 ## Version anchor
 
-Absolute, not drifting: the manifests pin every image to the `v0.6.1` release
-(`multica@2ea01ae4`) — `deploy.yaml` carries the upstream images
-(`ghcr.io/multica-ai/multica-backend:v0.6.1`,
-`ghcr.io/multica-ai/multica-web:v0.6.1`, with `pgvector/pgvector:pg17` and
-`nginx:1.27-alpine` as the persistence and entry layers), and
-`model-backend.yaml` pins the local backend the same way
-(`ollama/ollama:0.40.11`); that backend's model tag is the only value that may
-follow the operator's `TEST_MULTICA_MODEL`. The scripted backend is pinned too
-(`scripted-backend.yaml`: `python:3.12.9-alpine3.20`) — a floating base would let
-a node run a different server than the round was verified against. The Job image is not
-part of this pin: the Job runs the external rsbx carrier and fetches the
-Multica CLI from the Foreman release registry, so the CLI a Job runs is the
-version that registry verified, which can be newer than the `v0.6.1` server.
+The server follows upstream. `deploy.yaml` carries the two upstream images by
+their floating tag (`ghcr.io/multica-ai/multica-backend:latest`,
+`ghcr.io/multica-ai/multica-web:latest`) and pulls them with
+`imagePullPolicy: Always`, so a round runs the release that was newest when it
+was deployed, not the one chosen when this file was written. A tag is not
+evidence of which build ran: `./deploy.sh` reads the rollout's version and
+digest back and prints them, and `./selfcheck.sh` ③ re-asserts the identity at
+the start of every round — `/api/config`'s `server_version` must equal the
+version the running backend image's own binary reports, and the pod must carry a
+digest. That version plus digest is the round's record; `latest` alone is not.
 
-The Job's Multica CLI carries a **floor**, though, and it is not optional: the daemon
-starts `omp` with `--session <path>` up to multica v0.6.1 and with
-`--session-dir <dir>` from v0.6.2 on. `omp`'s `--session` is an alias of
-`--resume` — strictly a resume — so an older daemon resumes the empty session
-file it just created, the agent exits before its first turn, and every task
-lands as `agent_error.process_failure` with no tool call. Deploy the image
-or release-registry entry built for the newest upstream release (e.g. daemon
-`0.8.0`); `./selfcheck.sh` gate ⑤ refuses anything below `0.6.2` with that root
-cause instead of letting the next round discover it as a dead task. Gate ⑤
-still reads `FOREMAN_JOB_IMAGE` and runs `/usr/local/bin/multica` from it, so it
-must be pointed at the release registry's current Multica version (or updated
-to read that state) before a round that uses the rsbx carrier.
+`latest` can move between rounds, which is exactly why the digest is recorded:
+two rounds may legitimately run different servers, but **one round must run one
+image**. The gate fails when a running pod carries no digest, or when the
+server's self-report and its image disagree — a node cache serving an older
+pull is a different artifact, not a version mismatch. A deploy that has to
+follow a moved tag rebuilds the environment (`./recycle.sh && ./deploy.sh`);
+the digest the gate prints is what the round quotes.
 
-Upgrading means rebuilding the environment against a new anchor
-(`./recycle.sh && ./deploy.sh`), never an in-place upgrade. The environment
-gate asserts the anchor from the server's own `/api/config` (self-check ③, two
-stages: a missing field is a data-surface mismatch, not a version mismatch).
+Everything else stays pinned. None of it is the artifact under test, and a
+floating fixture would make a failure unattributable:
+
+| Image | Why it stays pinned |
+|---|---|
+| `pgvector/pgvector:pg17` | the database major version is a data-format commitment: the PVC outlives pods, and the backend's migrations must run on the engine the round chose |
+| `nginx:1.27-alpine` | the entry proxy's config (`test-multica-proxy`) is written against this directive set |
+| `ollama/ollama:0.40.11` | the engine version changes the model output and token counts a round judges; only its served model tag follows `TEST_MULTICA_MODEL` |
+| `python:3.12.9-alpine3.20` | the scripted backend's `sleep` window is fixture behaviour; a floating base could move the window a round declares |
+
+The Job CLIs are not part of this pin either: the Job runs the external rsbx
+carrier and fetches both CLIs from the Foreman release registry, so the CLI a
+Job runs is the version that registry verified, which can be newer than the
+test server.
+
+Under that carrier there is no Job image whose own binary could answer a
+version probe, so gate ⑤ asserts the delivery state instead of a tag:
+`FOREMAN_JOB_IMAGE` must be the `ghcr.io/tsic404/rsbx` carrier at a verified
+index digest — never a movable tag or the legacy `foreman-job` image
+(V2-C08) — `FOREMAN_JOB_RUNTIME_IMAGE` must name the supervisor source (the
+carrier itself carries no CLI), and `FOREMAN_JOB_CLI_BUDGET_BYTES` must be a
+positive per-attempt budget for the two proxied downloads (V2-C11). The
+download budget's isolation from heartbeat/lease/result (V2-C28) is the
+separate `DownloadLimiter` in `internal/proxy`, covered by
+`TestCLIDownloadSaturationDoesNotBlockControlRequests`, not an env value.
+Which CLI version a Job ran is recorded from the release registry's verified
+release, not from a Job image tag.
+
+The protocol facts in `docs/upstream-anchors.md` follow the version this round
+deployed, not a fixed older release: they are re-verified against the running
+server's release (V2-C21 refreshes the registration by the actual version; the
+上线门禁 in V2-C02 requires identity, write-back/read-back and switch-race
+attribution to be proven on the target version), and the round records that
+version with the digest.
+
+Upgrading means rebuilding the environment (`./recycle.sh && ./deploy.sh`),
+never an in-place upgrade: a moved `latest` tag only reaches a rebuild, and the
+digest read-back says which build the round got. Self-check ③ is two-staged
+because the field is `omitempty`: a missing `server_version` is a data-surface
+mismatch, not a version mismatch.
 
 ## Operating the environment
 
@@ -141,13 +169,14 @@ agent to the `provider=omp` runtime it registers. The full round is:
 
 `reset.sh` and `wire.sh` both run `./selfcheck.sh` — the environment gate
 ①②③④⑤ — while the instance is stopped: ① it points at the access point (never
-the production address), ② the runtime list is empty, ③ the server reports the
-artifact anchor, ④ the selected model source serves the round (the supplied
-endpoint, or the local backend and the model it serves), ⑤ the Job image's
-daemon can start `omp` (see §Version anchor — the gate runs the image's own
-`multica version`, because a tag is not evidence). Any failure is `QA_BLOCKED`
-(exit 2); once the instance runs, ②'s assertion becomes "exactly one
-`provider=omp` runtime", which TC-tech-protocol-01 judges.
+the production address), ② the runtime list is empty, ③ the running server's
+version and digest are read back and the version agrees with the image's own
+binary (see §Version anchor), ④ the selected model source serves the round (the
+supplied endpoint, or the local backend and the model it serves), ⑤ the Job
+image's daemon can start `omp` (the gate runs the image's own `multica
+version`, because a tag is not evidence). Any failure is `QA_BLOCKED` (exit 2);
+once the instance runs, ②'s assertion becomes "exactly one `provider=omp`
+runtime", which TC-tech-protocol-01 judges.
 
 On a fresh environment the first `reset.sh` stops at ① — the Deployment still
 carries the production address from `deploy/` — and `./wire.sh` is what fixes

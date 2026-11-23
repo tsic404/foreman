@@ -38,10 +38,22 @@ get)
 	case $2 in
 	service) printf '{"items":[]}' ;;
 	secret) printf 'secret/test-multica-secrets\n' ;;
+	deploy) printf 'ghcr.io/multica-ai/multica-backend:latest' ;;
+	pod)
+		case " $* " in
+		*component=web*)
+			printf '{"items":[{"status":{"phase":"Running","containerStatuses":[{"name":"web","imageID":"sha256:%s"}]}}]}' "$(printf '%064d' 0 | tr 0 d)"
+			;;
+		*)
+			printf '{"items":[{"status":{"phase":"Running","containerStatuses":[{"name":"backend","imageID":"sha256:%s"}]}}]}' "$(printf '%064d' 0 | tr 0 a)"
+			;;
+		esac
+		;;
 	*) exit 1 ;;
 	esac
 	;;
 rollout) ;;
+exec) printf '{"version":"v0.11.1"}' ;;
 *) exit 1 ;;
 esac
 `

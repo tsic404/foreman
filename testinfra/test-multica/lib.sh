@@ -461,77 +461,44 @@ state_root() {
 	printf '%s' "${_root:-$STATE_ROOT}"
 }
 
-# job_daemon_version <image>: the `multica` version the Job image carries, as
-# the image's own binary reports it. The daemon's omp contract changed at
-# v0.6.2 — `--session <path>` (strictly a resume for omp, so the empty file the
-# daemon creates kills every task before its prompt) gave way to
-# `--session-dir <dir>` — so the version is the one fact that separates a round
-# that can run tasks from one that cannot. The tag is not evidence (`latest`
-# moves, a hand-built image may carry anything), so a one-shot Pod in the Job
-# namespace — the one place the image's pull secret exists — runs the binary
-# and prints what it says. Empty when the image cannot answer.
-job_daemon_version() {
-	_image=$1
-	_job_ns=$(instance_env FOREMAN_JOB_NAMESPACE 2>/dev/null) || _job_ns=
-	_job_ns=${_job_ns:-multica-agents}
-	_name=test-multica-job-daemon-version
-	_work=$(mktemp -d)
-	jq -n --arg ns "$_job_ns" --arg name "$_name" --arg image "$_image" '{
-		apiVersion: "v1",
-		kind: "Pod",
-		metadata: {
-			name: $name,
-			namespace: $ns,
-			labels: {
-				"app.kubernetes.io/name": "test-multica",
-				"test-multica/role": "job-version"
-			}
-		},
-		spec: {
-			restartPolicy: "Never",
-			automountServiceAccountToken: false,
-			imagePullSecrets: [{ name: "registry-tsic" }],
-			containers: [{
-				name: "version",
-				image: $image,
-				# The Job template pulls with Always, and FOREMAN_JOB_IMAGE is a
-				# movable tag: a node cache would let an older image answer for
-				# `latest`, turning this gate into a false pass (or a false block
-				# once the cache ages). Same policy as the Jobs it guards.
-				imagePullPolicy: "Always",
-				command: ["/usr/local/bin/multica", "version", "--output", "json"],
-				securityContext: {
-					runAsUser: 1000,
-					runAsNonRoot: true,
-					allowPrivilegeEscalation: false,
-					readOnlyRootFilesystem: true,
-					capabilities: { drop: ["ALL"] }
-				},
-				resources: {
-					requests: { cpu: "10m", memory: "16Mi" },
-					limits: { cpu: "200m", memory: "128Mi" }
-				}
-			}]
-		}
-	}' >"$_work/pod.yaml" ||
-		die "cannot render the Job version Pod"
-	k delete pod "$_name" -n "$_job_ns" --ignore-not-found --wait=true >/dev/null 2>&1 || true
-	k apply -f "$_work/pod.yaml" >/dev/null ||
-		die "cannot apply the Job version Pod $_name"
-	_deadline=$(( $(date +%s) + MODEL_WAIT ))
-	while :; do
-		_phase=$(kubectl -n "$_job_ns" get pod "$_name" -o jsonpath='{.status.phase}' 2>/dev/null) ||
-			_phase=
-		case $_phase in
-		Succeeded | Failed) break ;;
-		esac
-		[ "$(date +%s)" -lt "$_deadline" ] || break
-		sleep 3
-	done
-	_out=$(kubectl -n "$_job_ns" logs "$_name" 2>/dev/null) || _out=
-	k delete pod "$_name" -n "$_job_ns" --ignore-not-found --wait=true >/dev/null 2>&1 || true
-	rm -rf "$_work"
-	printf '%s' "$_out" | jq -r '.version // empty' 2>/dev/null || true
+# --- The test server's artifact ----------------------------------------------
+# The backend and web images follow upstream's `latest` tag, so a round's
+# identity is the image the Deployment declares, the digest the running pod
+# actually carries and the version that image's own binary reports — a tag is
+# movable, and /api/config's server_version is the server describing itself.
+# ./deploy.sh records the identity, ./selfcheck.sh ③ judges it, and the UAT
+# carriers read the same faces.
+
+# server_image_reference: the backend image the test cluster's Deployment
+# declares. Empty when it cannot be read; the caller names the failure.
+server_image_reference() {
+	kubectl get deploy backend -n "$NS" \
+		-o jsonpath='{.spec.template.spec.containers[0].image}' 2>/dev/null
+}
+
+# server_image_digest <component>: the digest of the image the running
+# component's pod carries (the container name equals the component for every
+# Deployment in deploy.yaml). The runtime reports `imageID` as `sha256:…`,
+# `docker://sha256:…` or `repo@sha256:…`; the digest is the last `sha256:` part.
+server_image_digest() {
+	_component=${1:-backend}
+	kubectl get pod -n "$NS" -l "app.kubernetes.io/component=$_component" -o json 2>/dev/null |
+		jq -r --arg name "$_component" '[.items[]
+			| select(.status.phase == "Running")
+			| .status.containerStatuses[]?
+			| select(.name == $name)
+			| .imageID][0] // empty' 2>/dev/null |
+		sed -n 's/.*\(sha256:[0-9a-f]\{64\}\).*/\1/p'
+}
+
+# server_image_version: the version the running backend image's own binary
+# reports. The image ships the `multica` CLI beside the server (upstream
+# Dockerfile), and both are stamped from the release it was built as; asking it
+# keeps the gate free of a hardcoded release.
+server_image_version() {
+	kubectl exec -n "$NS" deploy/backend -- sh -c \
+		'command -v multica >/dev/null 2>&1 && multica version --output json || /app/multica version --output json' 2>/dev/null |
+		jq -r '.version // empty' 2>/dev/null
 }
 
 # schedulable_linux_nodes: every node a Job can land on, one name per line.
@@ -718,11 +685,33 @@ remove_model_provider() {
 }
 
 # set_agent_model <agent-id> <selector>: point the test agent at the
-# registration (or clear it with an empty selector).
+# registration (or clear it with an empty selector). Upstream v0.11 validates
+# the write against the agent's runtime, and ./reset.sh deliberately leaves the
+# agent unbound until Foreman registers one: that branch returns 3 and
+# ./bind-agent.sh applies the write after the binding.
 set_agent_model() {
 	_body=$(jq -nc --arg model "$2" '{model: $model}') ||
 		die "cannot render the agent model update"
-	wsapi PUT "/api/agents/$1" "$_body" >/dev/null
+	if wsapi PUT "/api/agents/$1" "$_body" >/dev/null 2>&1; then
+		return 0
+	fi
+	_agent=$(wsapi GET "/api/agents/$1" 2>/dev/null) || return 1
+	_runtime=$(printf '%s' "$_agent" | jq -r '.runtime_id // ""' 2>/dev/null) ||
+		return 1
+	[ -z "$_runtime" ] || return 1
+	info "agent $1 has no runtime yet — model write deferred to ./bind-agent.sh"
+	return 3
+}
+
+# write_agent_model <agent-id> <selector> <failure>: set_agent_model with the
+# deferred branch treated as success — the caller retries after binding.
+write_agent_model() {
+	_rc=0
+	set_agent_model "$1" "$2" || _rc=$?
+	case $_rc in
+	0 | 3) ;;
+	*) die "$3" ;;
+	esac
 }
 
 # set_agent_env <agent-id> <base-url>: the env endpoint replaces the map
@@ -736,6 +725,35 @@ set_agent_env() {
 		_body='{"custom_env":{}}'
 	fi
 	wsapi PUT "/api/agents/$1/env" "$_body" >/dev/null
+}
+
+# apply_round_model <agent-id>: write the round's model selector and backend
+# address onto an agent that is already bound. ./bind-agent.sh calls this after
+# the runtime exists; ./reset.sh's earlier write is deferred for that reason.
+# The selector is re-derived from the round's source rather than carried in
+# state, so a re-run binds the agent and its model together.
+apply_round_model() {
+	_text=
+	_url=
+	_source=$(model_source) || die "cannot resolve the model source"
+	case $_source in
+	endpoint)
+		_text=$(model_selector)
+		;;
+	scripted)
+		if scripted_model_backend; then
+			_text=$scripted_model_text
+		fi
+		;;
+	ollama)
+		if local_model_backend; then
+			_text=$local_model_text
+			_url=$MODEL_BACKEND_URL
+		fi
+		;;
+	esac
+	set_agent_model "$1" "$_text" || return 1
+	set_agent_env "$1" "$_url"
 }
 
 # local_model_backend: the keyless engine ./deploy.sh installed, as the
@@ -836,8 +854,8 @@ register_model_endpoint() {
 		install_model_provider ||
 			die "the model endpoint could not be registered"
 		model_text=$(model_selector)
-		set_agent_model "$agent_id" "$model_text" ||
-			die "cannot point agent $AGENT_NAME at $model_text"
+		write_agent_model "$agent_id" "$model_text" \
+			"cannot point agent $AGENT_NAME at $model_text"
 		set_agent_env "$agent_id" "" ||
 			die "cannot clear agent $AGENT_NAME's model backend address"
 		info "agent $AGENT_NAME → $model_text"
@@ -853,8 +871,8 @@ register_model_endpoint() {
 			install_model_provider ||
 				die "the scripted model endpoint could not be registered"
 			model_text=$scripted_model_text
-			set_agent_model "$agent_id" "$model_text" ||
-				die "cannot point agent $AGENT_NAME at $model_text"
+			write_agent_model "$agent_id" "$model_text" \
+				"cannot point agent $AGENT_NAME at $model_text"
 			set_agent_env "$agent_id" "" ||
 				die "cannot clear agent $AGENT_NAME's model backend address"
 			info "agent $AGENT_NAME → $model_text ($SCRIPTED_MODEL_URL)"
@@ -864,8 +882,8 @@ register_model_endpoint() {
 	ollama)
 		if local_model_backend; then
 			model_text=$local_model_text
-			set_agent_model "$agent_id" "$model_text" ||
-				die "cannot point agent $AGENT_NAME at $model_text"
+			write_agent_model "$agent_id" "$model_text" \
+				"cannot point agent $AGENT_NAME at $model_text"
 			set_agent_env "$agent_id" "$MODEL_BACKEND_URL" ||
 				die "cannot set agent $AGENT_NAME's model backend address"
 			info "agent $AGENT_NAME → $model_text ($MODEL_BACKEND_URL)"
@@ -873,8 +891,7 @@ register_model_endpoint() {
 		fi
 		;;
 	esac
-	set_agent_model "$agent_id" "" ||
-		die "cannot clear the agent model"
+	write_agent_model "$agent_id" "" "cannot clear the agent model"
 	set_agent_env "$agent_id" "" ||
 		die "cannot clear agent $AGENT_NAME's model backend address"
 }
