@@ -69,7 +69,7 @@ func run(ctx context.Context, log *slog.Logger) error {
 	if err != nil {
 		return err
 	}
-	cache, err := proxyCache()
+	cache, err := cliCache()
 	if err != nil {
 		return err
 	}
@@ -96,6 +96,8 @@ func helperPath(key string) string {
 		return value
 	}
 	switch key {
+	case attempt.EnvCLIHelper:
+		return defaultRuntimeBin + "/foreman-job-cli"
 	case attempt.EnvRSBXHelper:
 		return defaultRuntimeBin + "/rsbx-remote"
 	case attempt.EnvRegisterHelper:
@@ -107,6 +109,19 @@ func helperPath(key string) string {
 	default:
 		return ""
 	}
+}
+
+// cliCache prefers the deployment's CLI adapter when one is shipped beside the
+// supervisor. The reference image always ships it, so the fallback exists for
+// a deployment that deliberately runs a supervisor without adapters: it then
+// fetches the artifact itself, with the same frozen reference and the same
+// digest check. The two paths answer the same observable facts.
+func cliCache() (attempt.Cache, error) {
+	path := helperPath(attempt.EnvCLIHelper)
+	if info, err := os.Stat(path); err == nil && !info.IsDir() && info.Mode().Perm()&0o111 != 0 {
+		return attempt.ExecCache{Path: path}, nil
+	}
+	return proxyCache()
 }
 
 // proxyCache is the only CLI source the Job has. It reads the attempt's Job

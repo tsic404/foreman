@@ -567,6 +567,7 @@ func (r *Registry) Restore(ctx context.Context) ([]TaskEntry, bool, error) {
 				Name:            "foreman-job",
 				Online:          true,
 				LastHeartbeatAt: r.now(),
+				SandboxPosture:  e.SandboxPosture,
 			})
 		}
 		restored++
@@ -1041,6 +1042,36 @@ func (r *Registry) MarkCancelAckOwed(taskID string, scopeKey ...string) error {
 	return nil
 }
 
+// MarkSlotCloseOwed records that a reservation's trusted Pod-close half is
+// still owed after the credential was reclaimed at the drain bound (§3.4).
+// The entry is kept as the only same-attempt handle for that fact, so the
+// marker is written through the shared state face synchronously: a restart
+// between the bound and the Pod's disappearance must still own the debt. Like
+// CancelAckOwed it is a teardown fact, not a gate field.
+func (r *Registry) MarkSlotCloseOwed(taskID string, scopeKey ...string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return fmt.Errorf("%w: slot close debt", ErrNoLiveEntry)
+	}
+	e, ok := r.live[key]
+	if !ok {
+		return fmt.Errorf("%w: slot close debt", ErrNoLiveEntry)
+	}
+	if e.SlotCloseOwed {
+		return nil
+	}
+	e.SlotCloseOwed = true
+	r.live[key] = e
+	if r.shared != nil {
+		owed := true
+		return r.mergeNow(taskID, e, EntryPatch{SlotCloseOwed: &owed})
+	}
+	r.persist(taskID, e)
+	return nil
+}
+
 // ClearCancelAckOwed drops the confirmation debt: either Foreman sent it or the
 // daemon's own confirmation landed first (§4.6 兜底一, "daemon 已确认则不代发").
 // A missing entry or an absent marker is a no-op.
@@ -1138,6 +1169,30 @@ func (r *Registry) SetTokenHash(taskID, tokenHash string, scopeKey ...string) er
 	return nil
 }
 
+// SetSandboxPosture records the posture the rendered Job actually carries
+// (ADR-002 consequence 1: the run detail must present the privilege and the
+// execution user truthfully). It writes in place like the other single-fact
+// setters, so a concurrent gate write is never reverted.
+func (r *Registry) SetSandboxPosture(taskID string, posture SandboxPosture, scopeKey ...string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	key, ok := r.lookupKeyLocked(taskID, scopeKey)
+	if !ok {
+		return fmt.Errorf("%w: sandbox posture", ErrNoLiveEntry)
+	}
+	e, ok := r.live[key]
+	if !ok {
+		return fmt.Errorf("%w: sandbox posture", ErrNoLiveEntry)
+	}
+	e.SandboxPosture = posture
+	r.live[key] = e
+	if r.shared != nil {
+		return r.mergeNow(taskID, e, EntryPatch{SandboxPosture: &posture})
+	}
+	r.persist(taskID, e)
+	return nil
+}
+
 // MarkJobCreated advances pending → job_created and records the apiserver's
 // creationTimestamp as job_created_at (§4.1: the pod instance
 // filter's basis, never a local clock reading). It writes in place — the
@@ -1183,8 +1238,11 @@ func (r *Registry) MarkJobCreated(taskID string, at time.Time, scopeKey ...strin
 
 // MarkDaemonRegistered advances job_created → daemon_registered on S4
 // (idempotent: re-registration refreshes the timestamp without regressing
-// delivering/running entries).
-func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntry, bool) {
+// delivering/running entries). daemonCLIVersion and agentRuntimeVersion are
+// the two versions the registration body reported; they are recorded as
+// separate facts so the Job-side supervisor can verify the daemon CLI without
+// confusing it with the Agent runtime.
+func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time, daemonCLIVersion, agentRuntimeVersion string) (TaskEntry, bool) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	e, ok := r.get(r.byDaemon[daemonID])
@@ -1195,7 +1253,7 @@ func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntr
 	if r.shared != nil {
 		r.mu.Unlock()
 		ctx, cancel := r.sharedCtx()
-		entry, first, err := r.shared.CommitDaemonRegistered(ctx, e.ScopeKey(), e.TaskID, at)
+		entry, first, err := r.shared.CommitDaemonRegistered(ctx, e.ScopeKey(), e.TaskID, at, daemonCLIVersion, agentRuntimeVersion)
 		cancel()
 		r.mu.Lock()
 		if err != nil {
@@ -1212,6 +1270,8 @@ func (r *Registry) MarkDaemonRegistered(daemonID string, at time.Time) (TaskEntr
 		e.State = StateDaemonRegistered
 	}
 	e.DaemonRegisteredAt = at
+	e.DaemonCLIVersion = daemonCLIVersion
+	e.AgentRuntimeVersion = agentRuntimeVersion
 	r.live[e.Key()] = e
 	r.persist(e.TaskID, e)
 	return e, true

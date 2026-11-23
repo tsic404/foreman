@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/tsic404/foreman/internal/observability"
+	"github.com/tsic404/foreman/internal/proxy"
 )
 
 // TestJobFaceMuxExposesOnlyTheJobFaceAndLiveness pins the listener split: the
@@ -24,7 +25,11 @@ func TestJobFaceMuxExposesOnlyTheJobFaceAndLiveness(t *testing.T) {
 		w.Header().Set("X-CLI-Face", "1")
 		w.WriteHeader(http.StatusOK)
 	})
-	mux := newJobFaceMux(fake, downloads, observability.NewHealth(), time.Now())
+	attempts := http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("X-Attempt-Face", "1")
+		w.WriteHeader(http.StatusOK)
+	})
+	mux := newJobFaceMux(fake, downloads, attempts, observability.NewHealth(), time.Now())
 
 	for _, path := range []string{"/api/daemon/workspaces", "/api/daemon/register", "/api/tokens/current/renew"} {
 		rec := httptest.NewRecorder()
@@ -63,6 +68,16 @@ func TestJobFaceMuxExposesOnlyTheJobFaceAndLiveness(t *testing.T) {
 	mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/cli/multica/0.11.1/linux/amd64", nil))
 	if rec.Code != http.StatusOK || rec.Header().Get("X-CLI-Face") != "1" {
 		t.Fatalf("/cli/... = %d, want the CLI download face", rec.Code)
+	}
+	// The attempt projection is the reference adapters' read face. It is
+	// mounted beside the daemon API, never under it, and it is reached with
+	// the Job token the adapter already holds.
+	for _, path := range []string{proxy.AttemptFacePath, proxy.AttemptFacePath + "/slots/begin"} {
+		rec := httptest.NewRecorder()
+		mux.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, path, nil))
+		if rec.Code != http.StatusOK || rec.Header().Get("X-Attempt-Face") != "1" {
+			t.Errorf("%s = %d, want the attempt projection", path, rec.Code)
+		}
 	}
 	for _, field := range []string{"inflight", "runtime_ids", "task_id", "workspace_id"} {
 		if strings.Contains(rec.Body.String(), field) {

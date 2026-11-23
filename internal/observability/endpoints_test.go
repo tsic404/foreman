@@ -982,3 +982,56 @@ func TestLoadedServerQualifiedCredentialDoesNotBorrowALocalWorkspace(t *testing.
 		t.Fatalf("a source-qualified grant read the local workspace's tasks: %s", rec.Body)
 	}
 }
+
+// TestTasksProjectTheSandboxPosture pins ADR-002 consequence 1 on the ops
+// surface: the task detail states the privilege and the execution user the
+// attempt's Job declares, and an unrecorded posture reads as known=false
+// rather than as a non-privileged default.
+func TestTasksProjectTheSandboxPosture(t *testing.T) {
+	reg := registry.New(time.Now)
+	_ = reg.Put(registry.TaskEntry{
+		TaskID:         "t-1",
+		JobName:        "fm-t-1",
+		State:          registry.StateRunning,
+		SandboxPosture: registry.SandboxPosture{Known: true, Privileged: true, RunAsUser: 0, RunAsUserSet: true},
+	})
+	_ = reg.Put(registry.TaskEntry{TaskID: "t-2", JobName: "fm-t-2", State: registry.StateRunning})
+	handler := newTestHandler(reg, nil)
+
+	rec := do(t, handler, "/foreman/tasks/t-1")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var detail struct {
+		Posture struct {
+			Known        bool  `json:"known"`
+			Privileged   bool  `json:"privileged"`
+			RunAsUser    int64 `json:"run_as_user"`
+			RunAsUserSet bool  `json:"run_as_user_set"`
+		} `json:"sandbox_posture"`
+	}
+	decodeBody(t, rec, &detail)
+	if !detail.Posture.Known || !detail.Posture.Privileged || !detail.Posture.RunAsUserSet || detail.Posture.RunAsUser != 0 {
+		t.Fatalf("task detail posture = %+v, want the recorded privileged root posture", detail.Posture)
+	}
+
+	rec = do(t, handler, "/foreman/tasks")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d", rec.Code)
+	}
+	var rows []struct {
+		TaskID  string `json:"task_id"`
+		Posture struct {
+			Known bool `json:"known"`
+		} `json:"sandbox_posture"`
+	}
+	decodeBody(t, rec, &rows)
+	if len(rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(rows))
+	}
+	for _, row := range rows {
+		if row.TaskID == "t-2" && row.Posture.Known {
+			t.Fatalf("unrecorded row reads as a known posture: %+v", row)
+		}
+	}
+}

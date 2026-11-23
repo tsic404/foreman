@@ -88,6 +88,37 @@ func TestV2FixedJobPrepareFailureIsZeroExecution(t *testing.T) {
 	}
 }
 
+// TestV2FixedJobStartedCommitFailureIsZeroExecution pins the dispatch fence:
+// the shared "started" commit is what lets the server hand the payload over.
+// A commit that fails refuses the attempt before the runner, so no business
+// command runs even though registration succeeded.
+func TestV2FixedJobStartedCommitFailureIsZeroExecution(t *testing.T) {
+	binding := v2FixedBinding()
+	cache := &v2Cache{artifacts: v2Artifacts(binding)}
+	// The reference adapter cannot confirm the remote close through the
+	// carrier; the reservation therefore stays isolated.
+	remote := &v2Remote{session: v2ReadySession(binding), close: attempt.CloseEvidence{Confirmed: false}}
+	registrar := &v2Registrar{}
+	runner := &v2Runner{result: attempt.RunResult{Delivered: true}}
+	slots := newV2Slots()
+	slots.startErr = errors.New("the shared ledger refused the start commit")
+	supervisor := v2FixedSupervisor(t, v2StorePath(t), cache, remote, registrar, runner, slots)
+
+	outcome, err := supervisor.Run(context.Background(), binding)
+	if !errors.Is(err, attempt.ErrRefused) {
+		t.Fatalf("Run error = %v, want a refusal", err)
+	}
+	if outcome.Stage != attempt.StageRefused || outcome.Delivered {
+		t.Fatalf("outcome = %+v, want a refused, undelivered attempt", outcome)
+	}
+	if runner.calls != 0 {
+		t.Fatalf("runner calls = %d, want zero business execution", runner.calls)
+	}
+	if got := slots.released(); len(got) != 1 || got[0] {
+		t.Fatalf("slot releases = %v, want one unconfirmed release (isolated)", got)
+	}
+}
+
 // TestV2FixedJobReadyUnknownIsolatesWithoutFallback covers V2-AC03/TC03 and
 // 04-architecture §6 ②: a lost ready answer may still have created a session,
 // so the slot is isolated, never released, and no Pod-local execution starts.

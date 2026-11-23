@@ -119,7 +119,7 @@ func TestIntegrationFailedJobIsCompensated(t *testing.T) {
 	if entry.TokenHash != "hash-of-t1" {
 		t.Fatalf("token_hash = %q, want the digest the builder returned", entry.TokenHash)
 	}
-	reg.MarkDaemonRegistered(entry.DaemonID, time.Now())
+	reg.MarkDaemonRegistered(entry.DaemonID, time.Now(), "", "")
 	if _, err := sched.Deliver(context.Background(), entry.WorkspaceID, entry.DaemonID, entry.JobRuntimeID, 1); err != nil {
 		t.Fatalf("Deliver: %v", err)
 	}

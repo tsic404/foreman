@@ -101,7 +101,7 @@ jobs:
           set -euo pipefail
           mkdir -p dist
           for arch in amd64 arm64; do
-            for cmd in foreman foreman-job foreman-gc; do
+            for cmd in foreman foreman-job foreman-gc foreman-job-cli rsbx-remote foreman-job-register foreman-job-runner foreman-job-slots; do
               CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
                 -ldflags "-s -w -X main.version=dev" \
                 -o "dist/${cmd}-linux-${arch}" "./cmd/${cmd}"

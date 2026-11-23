@@ -276,7 +276,7 @@ func TestRegistryPersistsTransitions(t *testing.T) {
 		t.Fatalf("MarkJobCreated persisted state %q, want job_created", got.State)
 	}
 
-	if _, ok := r.MarkDaemonRegistered("fm-t1", testNow); !ok {
+	if _, ok := r.MarkDaemonRegistered("fm-t1", testNow, "", ""); !ok {
 		t.Fatal("MarkDaemonRegistered failed")
 	}
 	flushState(t, r)

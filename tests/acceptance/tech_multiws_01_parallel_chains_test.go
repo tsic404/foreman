@@ -41,7 +41,7 @@ func TestTechMultiWS01ParallelChainsDoNotCross(t *testing.T) {
 
 	// Each daemon registers (S4) before delivery is legal.
 	for _, e := range []registry.TaskEntry{entryA, entryB} {
-		if _, ok := m.reg.MarkDaemonRegistered(e.DaemonID, time.Now()); !ok {
+		if _, ok := m.reg.MarkDaemonRegistered(e.DaemonID, time.Now(), "", ""); !ok {
 			t.Fatalf("MarkDaemonRegistered(%s) refused", e.DaemonID)
 		}
 	}

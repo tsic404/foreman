@@ -1466,7 +1466,7 @@ func TestOnClaimDropsTaskInDoneIndex(t *testing.T) {
 func TestDeliverHandsTaskOnceWithRuntimeRewrite(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "task-1")
-	if _, ok := f.reg.MarkDaemonRegistered(e.DaemonID, testNow); !ok {
+	if _, ok := f.reg.MarkDaemonRegistered(e.DaemonID, testNow, "", ""); !ok {
 		t.Fatal("MarkDaemonRegistered failed")
 	}
 	// S4 registered the job runtime before the daemon can claim.
@@ -1536,7 +1536,7 @@ func TestDeliverRearmsAnUnconfirmedDelivery(t *testing.T) {
 	f := newFixtureWith(t, registry.WithDeliveryConfirmTimeout(window))
 	logs := newLogScheduler(t, f, slog.LevelDebug)
 	e := f.claim(t, "task-1")
-	if _, ok := f.reg.MarkDaemonRegistered(e.DaemonID, testNow); !ok {
+	if _, ok := f.reg.MarkDaemonRegistered(e.DaemonID, testNow, "", ""); !ok {
 		t.Fatal("MarkDaemonRegistered failed")
 	}
 
@@ -1598,7 +1598,7 @@ func TestDeliverRearmsAnUnconfirmedDelivery(t *testing.T) {
 func TestDeliverRejectsStrangers(t *testing.T) {
 	f := newFixture(t)
 	e := f.claim(t, "task-1")
-	f.reg.MarkDaemonRegistered(e.DaemonID, testNow)
+	f.reg.MarkDaemonRegistered(e.DaemonID, testNow, "", "")
 
 	if _, err := deliverStageOne(f, "ghost", e.JobRuntimeID, 1); !errors.Is(err, ErrUnknownDaemon) {
 		t.Fatalf("unknown daemon: %v", err)
@@ -3400,7 +3400,7 @@ func TestTaskEventsCarryIdentity(t *testing.T) {
 		f := newFixture(t)
 		buf := newLogScheduler(t, f, slog.LevelInfo)
 		e := f.claim(t, "task-1")
-		if _, ok := f.reg.MarkDaemonRegistered(e.DaemonID, f.now); !ok {
+		if _, ok := f.reg.MarkDaemonRegistered(e.DaemonID, f.now, "", ""); !ok {
 			t.Fatal("MarkDaemonRegistered failed")
 		}
 		if got, err := deliverStageOne(f, e.DaemonID, e.JobRuntimeID, 1); err != nil || len(got) != 1 {

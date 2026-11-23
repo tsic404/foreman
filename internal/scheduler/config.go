@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/tsic404/foreman/internal/jobbuilder"
+	"github.com/tsic404/foreman/internal/registry"
 )
 
 // Environment variable names read by LoadConfig.
@@ -155,6 +156,17 @@ type Config struct {
 	// settled as a visible refusing claim, not silently dropped, because the
 	// upstream did confirm it to someone (04-architecture.md §3.1).
 	DispatchGate func(ctx context.Context, workspaceID, agentID, realRuntimeID string, claimedRuntimeIDs []string) (owned, known bool)
+	// DeliveryGate decides whether the S-6 payload may be handed to the
+	// daemon yet. A fixed attempt carries a shared reservation, and the
+	// supervisor commits "started" only after it verified the registration
+	// and won the execution claim; until then the payload stays with the
+	// server and the daemon receives an empty batch. A legacy entry without a
+	// frozen binding keeps the old behaviour.
+	//
+	// false is a plain "not yet", not an error: the daemon keeps polling.
+	// An unreadable gate fails the claim closed with ErrStoreUnavailable, so
+	// a payload is never handed over against an unknown ledger.
+	DeliveryGate func(ctx context.Context, entry registry.TaskEntry) (bool, error)
 	// ClaimFacts freezes the release and configuration facts one attempt
 	// resolves at claim time. The impact preview reads these facts instead of
 	// inferring a version from StartedAt (02-contracts V2-C05). A nil seam

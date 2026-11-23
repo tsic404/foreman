@@ -126,7 +126,7 @@ func TestTechMultiWS09NoManifestDiscovery(t *testing.T) {
 		if entry.WorkspaceID != workspaceID {
 			t.Fatalf("entry workspace = %q, want %q", entry.WorkspaceID, workspaceID)
 		}
-		if _, ok := m.reg.MarkDaemonRegistered(entry.DaemonID, time.Now()); !ok {
+		if _, ok := m.reg.MarkDaemonRegistered(entry.DaemonID, time.Now(), "", ""); !ok {
 			t.Fatalf("MarkDaemonRegistered(%s) refused", entry.DaemonID)
 		}
 		delivery, err := m.sched.Deliver(context.Background(), entry.WorkspaceID, entry.DaemonID, entry.JobRuntimeID, 1)

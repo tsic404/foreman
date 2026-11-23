@@ -94,12 +94,16 @@ func newCLISurface(
 		return nil, nil, nil, nil, err
 	}
 	ompBinary := strings.TrimSpace(getenv(EnvOMPBinary))
+	ompReason := "no global omp probe binary is configured; trust is established from a verified published artifact"
+	if ompBinary != "" {
+		ompReason = "omp command surface is not verified"
+	}
 	discoveryService, err := discovery.New(discovery.Config{
 		Store:     discoveryStore,
 		Artifacts: releaseService,
 		Configs:   noMaterializedConfig{},
 		Adapters: []discovery.AdapterRegistration{
-			{Adapter: discovery.NewOMPAdapter(ompBinary), Reason: "omp command surface is not verified"},
+			{Adapter: discovery.NewOMPAdapter(ompBinary), Reason: ompReason},
 			{Adapter: discovery.NewUnsupportedAdapter("codex", "codex app-server protocol is not verified for this build"), Reason: "codex app-server protocol is not verified for this build"},
 			{Adapter: discovery.NewUnsupportedAdapter("claude", "no non-interactive model enumeration command is verified"), Reason: "no non-interactive model enumeration command is verified"},
 		},

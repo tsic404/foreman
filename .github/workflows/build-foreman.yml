@@ -17,6 +17,12 @@
 # carrier; the new contract forbids a carrier with a preinstalled CLI
 # (V2-C08/C09), so that line and its skip gate are retired.
 #
+# The image also carries the reference Job execution adapters (V2-C29): a
+# Job's init container copies them beside the supervisor into the runtime
+# volume. They are Foreman's own binaries, not a CLI, so V2-C08 still holds —
+# the carrier ships none of them, and the Job still fetches its CLIs through
+# the proxy.
+#
 # A failed step fails the run: the build/push step's exit code is the only
 # signal this workflow produces — non-zero means the push did not complete, and
 # a partial push may have landed (check the registry before re-running). What
@@ -94,10 +100,11 @@ jobs:
           mkdir -p dist
           # The Containerfile copies dist/<binary>-linux-<arch>: both platforms
           # sit side by side in the build context and buildx picks one per
-          # platform. The Job-side supervisor and foreman-gc ride the same
-          # image; the Job carrier is rsbx and carries neither.
+          # platform. The Job-side supervisor, foreman-gc and the reference
+          # Job adapters ride the same image; the Job carrier is rsbx and
+          # carries none of them.
           for arch in amd64 arm64; do
-            for cmd in foreman foreman-job foreman-gc; do
+            for cmd in foreman foreman-job foreman-gc foreman-job-cli rsbx-remote foreman-job-register foreman-job-runner foreman-job-slots; do
               CGO_ENABLED=0 GOOS=linux GOARCH="$arch" go build -trimpath \
                 -ldflags "-s -w -X main.version=$VERSION" \
                 -o "dist/${cmd}-linux-${arch}" "./cmd/${cmd}"

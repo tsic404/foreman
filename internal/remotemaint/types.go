@@ -73,7 +73,10 @@ type Environments interface {
 	List(ctx context.Context, filter environment.Filter, grant environment.Grant) ([]environment.EnvironmentView, error)
 	Get(ctx context.Context, id environment.ID, grant environment.Grant) (environment.EnvironmentView, error)
 	Slots(ctx context.Context, id environment.ID, grant environment.Grant) ([]environment.SlotView, error)
-	ReleaseSlot(ctx context.Context, id environment.ID, slotID string, cleanupConfirmed bool) (environment.Slot, error)
+	// ConfirmRemoteClose submits the remote-close half of the release gate.
+	// It must not return capacity: the maintenance loop observes remote
+	// sessions, never Pods.
+	ConfirmRemoteClose(ctx context.Context, id environment.ID, slotID string) (environment.Slot, error)
 }
 
 // Locker serializes writers and reclaimers of one environment/source/workspace

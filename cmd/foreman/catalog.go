@@ -172,14 +172,19 @@ func (i *catalogRunIndex) RunningAttempts() []catalog.RunAttempt {
 			}
 		}
 		out = append(out, catalog.RunAttempt{
-			ServerID:        serverID,
-			WorkspaceID:     entry.WorkspaceID,
-			AgentID:         entry.AgentID,
-			AgentName:       entry.AgentName,
-			IssueID:         entry.IssueID,
-			IssueIdentifier: entry.IssueIdentifier,
-			Status:          string(entry.State),
-			StartedAt:       entry.StartedAt,
+			ServerID:            serverID,
+			WorkspaceID:         entry.WorkspaceID,
+			AgentID:             entry.AgentID,
+			AgentName:           entry.AgentName,
+			IssueID:             entry.IssueID,
+			IssueIdentifier:     entry.IssueIdentifier,
+			Status:              string(entry.State),
+			StartedAt:           entry.StartedAt,
+			PostureKnown:        entry.SandboxPosture.Known,
+			PosturePrivileged:   entry.SandboxPosture.Privileged,
+			PostureRunAsUser:    entry.SandboxPosture.RunAsUser,
+			PostureRunAsUserSet: entry.SandboxPosture.RunAsUserSet,
+			PostureRunAsNonRoot: entry.SandboxPosture.RunAsNonRoot,
 		})
 	}
 	return out

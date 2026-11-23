@@ -18,7 +18,7 @@ import (
 // refusal: the fixed path never guesses an endpoint or an artifact.
 func fixedAttemptSpec(e registry.TaskEntry, binding EnvironmentBinding, jobImage, proxyURL string, cliBudget int64) ([]byte, bool, error) {
 	if binding.Endpoint == "" && binding.TLSRef == "" && binding.StateRoot == "" &&
-		binding.EnvironmentGen == "" && binding.Platform == "" && binding.AgentBackend == "" &&
+		binding.EnvironmentGen == "" && binding.EnvironmentIdentity == "" && binding.Platform == "" && binding.AgentBackend == "" &&
 		binding.MulticaVersion == "" && binding.MulticaDigest == "" &&
 		binding.AgentVersion == "" && binding.AgentDigest == "" && binding.ConfigRevision == 0 {
 		// A legacy binder answered only the reservation ids.
@@ -29,6 +29,7 @@ func fixedAttemptSpec(e registry.TaskEntry, binding EnvironmentBinding, jobImage
 		"environment TLS ref":    binding.TLSRef,
 		"environment state root": binding.StateRoot,
 		"environment generation": binding.EnvironmentGen,
+		"environment identity":   binding.EnvironmentIdentity,
 		"platform":               binding.Platform,
 		"agent backend":          binding.AgentBackend,
 		"multica CLI version":    binding.MulticaVersion,
@@ -76,8 +77,9 @@ func fixedAttemptSpec(e registry.TaskEntry, binding EnvironmentBinding, jobImage
 		WorkspaceID: e.WorkspaceID, AgentID: e.AgentID, DaemonID: e.DaemonID,
 		JobRuntimeID: e.JobRuntimeID, EnvironmentID: binding.EnvironmentID,
 		Endpoint: binding.Endpoint, TLSRef: binding.TLSRef, StateRoot: binding.StateRoot,
-		EnvironmentGen: binding.EnvironmentGen, ResumeSessionID: e.PriorSessionID,
-		SlotID: binding.SlotID, Config: config,
+		EnvironmentGen: binding.EnvironmentGen, EnvironmentIdentity: binding.EnvironmentIdentity,
+		ResumeSessionID: e.PriorSessionID,
+		SlotID:          binding.SlotID, Config: config,
 		Image: image, ImageDigest: imageDigest, Platform: binding.Platform,
 		ProxyURL: proxyURL, CLIBudgetBytes: cliBudget,
 		CLIs: []attempt.CLI{

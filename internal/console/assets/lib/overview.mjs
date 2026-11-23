@@ -102,6 +102,27 @@ function tilesHTML(tiles) {
     .join("")}</div>`;
 }
 
+// sandboxPosture renders the execution posture the attempt's Job actually
+// declares. An unrecorded fact is shown as "未记录", never as 非特权: the run
+// detail must not claim a posture it never read (ADR-002 consequence 1).
+//
+// The UID decides root. runAsNonRoot is what admission enforces, not who runs:
+// its false value says nothing, so a uid of 1000 stays an ordinary user even
+// when admission does not enforce non-root. A security context without a
+// runAsUser is an unread UID, not root.
+export function sandboxPosture(posture) {
+  if (!posture || posture.known !== true) {
+    return "未记录";
+  }
+  // run_as_user_set is the presence marker: without it the zero default is an
+  // absent fact, and calling that root would invent an identity.
+  const user =
+    posture.run_as_user_set === true
+      ? `uid ${posture.run_as_user}（${posture.run_as_user === 0 ? "root" : "非 root"}）`
+      : "uid 未记录";
+  return `${posture.privileged ? "特权" : "非特权"} · ${user}`;
+}
+
 export function attemptDetail(attempt) {
   const facts = [
     ["Multica Server", attempt.server_id],
@@ -109,6 +130,7 @@ export function attemptDetail(attempt) {
     ["Agent", `${attempt.agent_name ?? ""} / ${attempt.agent_id ?? ""}`],
     ["Issue", `${attempt.issue_identifier ?? ""} · ${attempt.issue_id ?? ""}`],
     ["远程执行节点", attempt.environment || "未记录"],
+    ["沙箱执行姿态", sandboxPosture(attempt.sandbox_posture)],
     ["状态", attempt.status],
     ["开始", stamp(attempt.started_at)],
   ];

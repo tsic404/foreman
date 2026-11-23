@@ -12,6 +12,7 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 
 	"github.com/tsic404/foreman/internal/scope"
 )
@@ -100,6 +101,15 @@ type TaskEntry struct {
 	ClaimedAt          time.Time `json:"claimed_at"`
 	JobCreatedAt       time.Time `json:"job_created_at"`
 	DaemonRegisteredAt time.Time `json:"daemon_registered_at"`
+	// DaemonCLIVersion and AgentRuntimeVersion are the two distinct versions
+	// the S-4 registration reported: the Multica CLI the daemon actually runs
+	// and the selected Agent runtime's own version. They are recorded
+	// separately because the Job-side supervisor verifies the daemon CLI
+	// version against the frozen Multica artifact; an Agent version that
+	// legitimately differs must never fail that check. Both stay out of the
+	// /foreman/tasks projection and persist only in the shared snapshot.
+	DaemonCLIVersion    string `json:"-"`
+	AgentRuntimeVersion string `json:"-"`
 	// DeliveredAt is the commit instant of the delivery that stands on the
 	// entry: the first one, or the latest re-delivery once an expired
 	// confirmation window released the payload again. Once non-zero it never
@@ -126,6 +136,14 @@ type TaskEntry struct {
 	// stamped after the response returned (Registry.SetLeaseKeepUntil).
 	LeaseKeepUntil time.Time `json:"lease_keep_until"`
 	LastStatusSeen string    `json:"last_status_seen"`
+
+	// SandboxPosture is what this attempt's Job actually gives the sandbox
+	// client container: the privilege mode and the user it runs as. It is read
+	// from the rendered Pod spec (SandboxPostureOf), never inferred from the
+	// render path, so the run and ops details describe the posture of the Job
+	// that exists. A zero value (Known=false) is an absent fact, not
+	// "non-privileged": the run detail must not claim a posture it never read.
+	SandboxPosture SandboxPosture `json:"sandbox_posture"`
 
 	// Job lifecycle fields (§4.3): never projected into /foreman/tasks and
 	// never written to a K8s object; they persist only in the shared state
@@ -252,6 +270,18 @@ type TaskEntry struct {
 	// shared state snapshot and comes back with a restored entry. Never
 	// projected, never annotated, never read as a verdict.
 	CancelAckOwed bool `json:"-"`
+
+	// SlotCloseOwed marks a reservation whose credential the drain bound
+	// already reclaimed while the trusted Pod-close half was still outstanding
+	// (§3.4, V2-C29). Deleting the entry then would drop the only same-attempt
+	// handle that can submit that half once the Pod is provably gone, so the
+	// entry is kept as the debt's durable record: the environment/slot and the
+	// Job instance identity ride this row. The reconciler retries the
+	// submission on a real termination fact; an unconfirmed remote close keeps
+	// the reservation isolated, so this flag never authorizes a timed release.
+	// Persisted only in the shared state snapshot (ADR-046 阶段一), never
+	// projected or annotated.
+	SlotCloseOwed bool `json:"-"`
 }
 
 // ScopeKey is the internal partition key of the entry's source and workspace.
@@ -343,14 +373,80 @@ func (e TaskEntry) DeliveryUnconfirmed(at time.Time) bool {
 
 // JobRuntime is the fake runtime registered to a Job's daemon (§2.3).
 type JobRuntime struct {
-	JobRuntimeID    string    `json:"job_runtime_id"`
-	DaemonID        string    `json:"daemon_id"`
-	TaskID          string    `json:"task_id"`
-	Provider        string    `json:"provider"`
-	Name            string    `json:"name"`
+	JobRuntimeID string `json:"job_runtime_id"`
+	DaemonID     string `json:"daemon_id"`
+	TaskID       string `json:"task_id"`
+	Provider     string `json:"provider"`
+	Name         string `json:"name"`
+	// Version is the CLI version the daemon declared for this runtime at
+	// registration. It is what the upstream acknowledged, never a version
+	// Foreman guessed: an empty declaration stays empty.
+	Version         string    `json:"version,omitempty"`
 	Online          bool      `json:"online"`
 	LastHeartbeatAt time.Time `json:"last_heartbeat_at"`
 	DeliveredTaskID string    `json:"delivered_task_id"`
+	// SandboxPosture is the posture of the Job this runtime runs in, so the
+	// runtime detail answers the same fact as the run detail instead of
+	// leaving a reader to assume the container is unprivileged (ADR-002
+	// consequence 1). Zero value means not recorded.
+	SandboxPosture SandboxPosture `json:"sandbox_posture"`
+}
+
+// SandboxPosture is the execution posture the attempt's Job gives its sandbox
+// client container. Known=false means the rendered container declared no
+// security context, so the posture was never read: callers must render that
+// as "not recorded" rather than as a non-privileged default.
+//
+// RunAsUserSet separates "runs as uid 0" from "declared no runAsUser": the
+// zero default would otherwise read as root. RunAsNonRoot is what admission
+// enforces, not who runs, so only the UID decides root.
+type SandboxPosture struct {
+	Known        bool  `json:"known"`
+	Privileged   bool  `json:"privileged"`
+	RunAsUser    int64 `json:"run_as_user"`
+	RunAsUserSet bool  `json:"run_as_user_set"`
+	RunAsNonRoot bool  `json:"run_as_non_root"`
+}
+
+// SandboxPostureOf reads the posture from the Pod spec the Job carries. The
+// sandbox client is the "agent" container the render names; a spec without one
+// (a foreign shape) yields the unknown value rather than a guess.
+func SandboxPostureOf(spec corev1.PodSpec) SandboxPosture {
+	container, ok := sandboxClientContainer(spec.Containers)
+	if !ok || container.SecurityContext == nil {
+		return SandboxPosture{}
+	}
+	security := container.SecurityContext
+	posture := SandboxPosture{Known: true}
+	if security.Privileged != nil {
+		posture.Privileged = *security.Privileged
+	}
+	if security.RunAsUser != nil {
+		posture.RunAsUser = *security.RunAsUser
+		posture.RunAsUserSet = true
+	} else if spec.SecurityContext != nil && spec.SecurityContext.RunAsUser != nil {
+		posture.RunAsUser = *spec.SecurityContext.RunAsUser
+		posture.RunAsUserSet = true
+	}
+	if security.RunAsNonRoot != nil {
+		posture.RunAsNonRoot = *security.RunAsNonRoot
+	}
+	return posture
+}
+
+// sandboxClientContainer finds the container that carries the sandbox client:
+// the render names it "agent"; a template that renamed it falls back to the
+// first container, which is the one the injection rules write to (§8.2 A1.1).
+func sandboxClientContainer(containers []corev1.Container) (corev1.Container, bool) {
+	for _, container := range containers {
+		if container.Name == "agent" {
+			return container, true
+		}
+	}
+	if len(containers) == 0 {
+		return corev1.Container{}, false
+	}
+	return containers[0], true
 }
 
 // Label and annotation keys carried by every foreman Job.
@@ -426,6 +522,10 @@ func TaskEntryFromJob(job batchv1.Job) (TaskEntry, error) {
 		// before this face existed, which is exactly the "unknown identity"
 		// the registration refusal is reserved for.
 		RealRuntimeID: annos[AnnoRealRuntimeID],
+		// The rebuilt row states the posture of the object it was rebuilt
+		// from, so a run detail served after a restart or a K8s fill-gaps
+		// round answers the same fact as one served from the live claim.
+		SandboxPosture: SandboxPostureOf(job.Spec.Template.Spec),
 	}
 	if provider := annos[AnnoRuntimeProvider]; provider != "" {
 		e.RuntimeIdentity = RuntimeIdentityKey(provider, annos[AnnoRuntimeProfileID])

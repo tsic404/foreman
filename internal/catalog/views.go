@@ -211,6 +211,22 @@ type AttemptView struct {
 	Environment     string `json:"environment,omitempty"`
 	Status          string `json:"status"`
 	StartedAt       string `json:"started_at,omitempty"`
+	// SandboxPosture is the run detail's posture fact: privilege and the user
+	// the sandbox client container runs as. Known=false renders as "not
+	// recorded" rather than as a non-privileged default (ADR-002).
+	SandboxPosture PostureView `json:"sandbox_posture"`
+}
+
+// PostureView is one attempt's sandbox posture as the run detail presents it.
+type PostureView struct {
+	Known      bool `json:"known"`
+	Privileged bool `json:"privileged"`
+	// RunAsUser is the execution user, and RunAsUserSet says whether the Job
+	// declared one. Only the UID decides root: RunAsNonRoot is an admission
+	// rule, not an identity, so its false value never implies root.
+	RunAsUser    int64 `json:"run_as_user"`
+	RunAsUserSet bool  `json:"run_as_user_set"`
+	RunAsNonRoot bool  `json:"run_as_non_root"`
 }
 
 // InProgressView is the overview's in-flight section. Available is false when

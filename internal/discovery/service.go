@@ -256,6 +256,33 @@ func (s *Service) VerifyBoundAdapter(ctx context.Context, name, binaryPath, expe
 	return nil
 }
 
+// TrustPublished records the trust a deployment earns from a verified
+// published payload: the bound probe ran the exact bytes the Job will execute
+// and found the command surface this adapter's parser depends on. A global
+// binary installed beside the server is not required for that evidence, and
+// the published payload is the stronger check because it cannot drift from
+// what the runtime runs.
+func (s *Service) TrustPublished(name, version string) AdapterStatus {
+	s.mu.Lock()
+	state, ok := s.adapters[name]
+	if !ok {
+		s.mu.Unlock()
+		return AdapterStatus{Name: name}
+	}
+	changed := !state.trusted
+	state.trusted = true
+	state.reason = ""
+	state.verifiedAt = s.now()
+	status := statusOf(state)
+	s.mu.Unlock()
+	if !changed {
+		return status
+	}
+	s.log.Info("discovery.adapter", "name", status.Name, "status", "trusted",
+		"reason", "verified published artifact "+strings.TrimSpace(version))
+	return status
+}
+
 // Adapters returns the trust table.
 func (s *Service) Adapters() []AdapterStatus {
 	s.mu.Lock()

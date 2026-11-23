@@ -31,7 +31,8 @@ func completeEnvironmentBinding() EnvironmentBinding {
 		EnvironmentID: "build-a", SlotID: "task-v2-1", RuleID: "rule-1",
 		Endpoint: "build-a.example.test:7443", TLSRef: "ref/build-a",
 		StateRoot: "/srv/rsbx/build-a", EnvironmentGen: "tree-1",
-		Platform: "linux/amd64", AgentBackend: "codex",
+		EnvironmentIdentity: "sha256:tree-1-identity",
+		Platform:            "linux/amd64", AgentBackend: "codex",
 		MulticaVersion: "0.6.1", MulticaDigest: fixedMultica,
 		AgentVersion: "0.167.1", AgentDigest: fixedAgent,
 	}

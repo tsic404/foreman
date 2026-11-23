@@ -63,6 +63,10 @@ type Binding struct {
 	TLSRef         string `json:"tls_ref,omitempty"`
 	StateRoot      string `json:"state_root"`
 	EnvironmentGen string `json:"environment_generation,omitempty"`
+	// EnvironmentIdentity is the target identity the environment's verification
+	// observed. The Job-side ready check must match it against a fresh read of
+	// the same verified fact; a parseable TLS bundle alone is not that identity.
+	EnvironmentIdentity string `json:"environment_identity,omitempty"`
 	// SessionID is the frozen remote rsbx session this attempt must resume.
 	// Empty means the claim has no prior remote session; a non-empty value is
 	// an exact identity requirement, never an affinity hint.
@@ -249,13 +253,21 @@ type Session struct {
 	EnvironmentID string `json:"environment_id"`
 	Generation    string `json:"generation,omitempty"`
 	Endpoint      string `json:"endpoint,omitempty"`
+	// TLSFingerprint names the trust material the session was opened with.
+	// Empty means the deployment authenticates the carrier through its own
+	// channel rather than a Job-mounted bundle.
+	TLSFingerprint string `json:"tls_fingerprint,omitempty"`
 }
 
-// Registration is the daemon's registration fact.
+// Registration is the daemon's registration fact. Version is the Multica CLI
+// the daemon actually runs — the value the supervisor verifies against the
+// frozen Multica artifact. AgentVersion is the selected Agent runtime's own
+// version and is recorded, not compared to the daemon's.
 type Registration struct {
-	DaemonID  string `json:"daemon_id"`
-	RuntimeID string `json:"runtime_id"`
-	Version   string `json:"version"`
+	DaemonID     string `json:"daemon_id"`
+	RuntimeID    string `json:"runtime_id"`
+	Version      string `json:"version"`
+	AgentVersion string `json:"agent_version,omitempty"`
 }
 
 // CloseEvidence is the remote-side close observation. Confirmed is the only

@@ -21,7 +21,8 @@ Multica Server  ◄── fake client ──  Foreman  ── fake server ──
 ```bash
 make build-foreman        # bin/foreman      — the scheduler process
 make build-gc             # bin/foreman-gc   — node-local cache collector
-make build-foreman-image  # Foreman image: server + Job supervisor + gc (linux/$(ARCH))
+make build-job-adapters   # bin/<adapter>    — the five reference Job adapters
+make build-foreman-image  # Foreman image: server + Job supervisor + gc + adapters (linux/$(ARCH))
 make check                # gofmt + vet + tests + build
 ```
 
@@ -29,8 +30,10 @@ The repo publishes one image, `foreman`, as a multi-platform manifest list
 (`linux/amd64` + `linux/arm64`) through `.github/workflows/build-foreman.yml`:
 a `v*.*.*` tag push publishes exactly `foreman:v<X.Y.Z>` and never touches
 `latest`, every other run publishes `foreman:latest`. It carries the server,
-the Job-side supervisor and `foreman-gc`. `.github/workflows/` is the whole
-release path. `make build-foreman-image` is the single-platform local
+the Job-side supervisor, `foreman-gc` and the reference Job execution adapters
+(`foreman-job-cli`, `rsbx-remote`, `foreman-job-register`, `foreman-job-runner`,
+`foreman-job-slots`). `.github/workflows/` is the whole release path.
+`make build-foreman-image` is the single-platform local
 equivalent (`ARCH=` picks the platform). Outside the release path, a pull
 request into `main` is checked by `pr-check.yml` — `go build ./...`,
 `go test -race ./...`, and a two-platform image build that publishes nothing.

@@ -319,26 +319,26 @@ func TestMarkDaemonRegistered(t *testing.T) {
 	e := entryFor("t1")
 	e.State = StateJobCreated
 	_ = r.Put(e)
-	e, ok := r.MarkDaemonRegistered("fm-t1", testNow)
+	e, ok := r.MarkDaemonRegistered("fm-t1", testNow, "", "")
 	if !ok || e.State != StateDaemonRegistered || e.DaemonRegisteredAt != testNow {
 		t.Fatalf("MarkDaemonRegistered = %v, %v", e, ok)
 	}
 
 	// A pending entry (Job not yet created) cannot have a daemon.
 	_ = r.Put(entryFor("t2"))
-	if _, ok := r.MarkDaemonRegistered("fm-t2", testNow); ok {
+	if _, ok := r.MarkDaemonRegistered("fm-t2", testNow, "", ""); ok {
 		t.Fatal("pending entry accepted a daemon registration")
 	}
 
 	// A running entry is not regressed by a duplicate S4.
 	e.State = StateRunning
 	_ = r.Put(e)
-	e, ok = r.MarkDaemonRegistered("fm-t1", testNow.Add(time.Minute))
+	e, ok = r.MarkDaemonRegistered("fm-t1", testNow.Add(time.Minute), "", "")
 	if !ok || e.State != StateRunning {
 		t.Fatalf("running entry regressed: %v", e.State)
 	}
 
-	if _, ok := r.MarkDaemonRegistered("ghost", testNow); ok {
+	if _, ok := r.MarkDaemonRegistered("ghost", testNow, "", ""); ok {
 		t.Fatal("unknown daemon registered")
 	}
 }

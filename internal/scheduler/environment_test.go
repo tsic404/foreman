@@ -5,15 +5,18 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+	"time"
 
 	"github.com/tsic404/foreman/internal/registry"
 )
 
 type fakeEnvironmentBinder struct {
-	requests []EnvironmentRequest
-	binding  EnvironmentBinding
-	err      error
-	released []EnvironmentBinding
+	requests  []EnvironmentRequest
+	binding   EnvironmentBinding
+	err       error
+	released  []EnvironmentBinding
+	isolated  []EnvironmentBinding
+	podClosed []EnvironmentBinding
 }
 
 func (f *fakeEnvironmentBinder) Bind(_ context.Context, request EnvironmentRequest) (EnvironmentBinding, error) {
@@ -23,6 +26,16 @@ func (f *fakeEnvironmentBinder) Bind(_ context.Context, request EnvironmentReque
 
 func (f *fakeEnvironmentBinder) Release(_ context.Context, binding EnvironmentBinding) error {
 	f.released = append(f.released, binding)
+	return nil
+}
+
+func (f *fakeEnvironmentBinder) Isolate(_ context.Context, binding EnvironmentBinding) error {
+	f.isolated = append(f.isolated, binding)
+	return nil
+}
+
+func (f *fakeEnvironmentBinder) ReleaseAfterPodClosed(_ context.Context, binding EnvironmentBinding) error {
+	f.podClosed = append(f.podClosed, binding)
 	return nil
 }
 
@@ -181,5 +194,53 @@ func TestFailedClaimWriteReleasesTheEnvironmentReservation(t *testing.T) {
 	}
 	if _, ok := f.reg.Get("task-1"); ok {
 		t.Fatal("a failed claim write left a registry entry")
+	}
+}
+
+// TestDrainTimeoutIsolatesTheEnvironmentInsteadOfReleasing: a drain bound that
+// expires proves nothing about the Pod. OnJobTerminated must isolate the
+// reservation (capacity stays held) instead of calling the no-Pod release, and
+// only a real job_terminated fact may submit the Pod-close half.
+func TestDrainTimeoutIsolatesTheEnvironmentInsteadOfReleasing(t *testing.T) {
+	f := newFixture(t)
+	binder := &fakeEnvironmentBinder{binding: EnvironmentBinding{
+		EnvironmentID: "build-a", SlotID: "slot-1", RuleID: "a5",
+	}}
+	f.sched.cfg.EnvironmentBinder = binder
+	f.claim(t, "task-1")
+	if _, _, err := f.reg.MarkTerminal("task-1", registry.ResultFailed, "", f.now); err != nil {
+		t.Fatalf("MarkTerminal: %v", err)
+	}
+
+	if err := f.sched.OnJobTerminated(context.Background(), "fm-task-1",
+		JobTerminationReasonDrainTimeout, time.Time{}, 1); err != nil {
+		t.Fatalf("OnJobTerminated: %v", err)
+	}
+	if len(binder.released) != 0 {
+		t.Fatalf("a drain timeout released the slot: %+v", binder.released)
+	}
+	if len(binder.podClosed) != 0 {
+		t.Fatalf("a drain timeout claimed the Pod was closed: %+v", binder.podClosed)
+	}
+	if len(binder.isolated) != 1 || binder.isolated[0].SlotID != "slot-1" {
+		t.Fatalf("isolates = %+v, want the entry's slot isolated", binder.isolated)
+	}
+
+	// A real Job-terminated fact carries the Pod-close half and no isolate.
+	g := newFixture(t)
+	terminated := &fakeEnvironmentBinder{binding: EnvironmentBinding{
+		EnvironmentID: "build-b", SlotID: "slot-2", RuleID: "a6",
+	}}
+	g.sched.cfg.EnvironmentBinder = terminated
+	g.claim(t, "task-2")
+	if _, _, err := g.reg.MarkTerminal("task-2", registry.ResultCompleted, "", g.now); err != nil {
+		t.Fatalf("MarkTerminal: %v", err)
+	}
+	if err := g.sched.OnJobTerminated(context.Background(), "fm-task-2",
+		JobTerminationReasonJobTerminated, g.now, 0); err != nil {
+		t.Fatalf("OnJobTerminated: %v", err)
+	}
+	if len(terminated.podClosed) != 1 || terminated.podClosed[0].SlotID != "slot-2" {
+		t.Fatalf("pod-closed = %+v, want the Job-terminated fact to submit the Pod close", terminated.podClosed)
 	}
 }

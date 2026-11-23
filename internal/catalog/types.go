@@ -327,6 +327,14 @@ type RunAttempt struct {
 	Environment     string
 	Status          string
 	StartedAt       time.Time
+	// SandboxPosture is what the attempt's Job actually gives its sandbox
+	// client container. PostureKnown=false is an unrecorded fact, never a
+	// non-privileged default (ADR-002 consequence 1).
+	PostureKnown        bool
+	PosturePrivileged   bool
+	PostureRunAsUser    int64
+	PostureRunAsUserSet bool
+	PostureRunAsNonRoot bool
 }
 
 // RunIndex is the coordinator seam the overview reads attempts from. A nil one

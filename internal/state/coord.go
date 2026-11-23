@@ -102,8 +102,9 @@ type CoordStore interface {
 	CommitDelivering(ctx context.Context, ws, taskID string, payload []byte, window time.Duration) (registry.TaskEntry, bool, error)
 	// CommitJobCreated records the Job creation timestamp.
 	CommitJobCreated(ctx context.Context, ws, taskID string, at time.Time) (registry.TaskEntry, bool, error)
-	// CommitDaemonRegistered records the S-4 registration.
-	CommitDaemonRegistered(ctx context.Context, ws, taskID string, at time.Time) (registry.TaskEntry, bool, error)
+	// CommitDaemonRegistered records the S-4 registration and the two
+	// versions it reported.
+	CommitDaemonRegistered(ctx context.Context, ws, taskID string, at time.Time, daemonCLIVersion, agentRuntimeVersion string) (registry.TaskEntry, bool, error)
 	// CommitTerminal writes the terminal verdict, the settled record and drops
 	// the queue marker atomically; first=false when already terminal.
 	CommitTerminal(ctx context.Context, ws, taskID string, result registry.Result, reason string, completedAt, drainDeadline time.Time) (registry.TaskEntry, bool, error)
@@ -802,6 +803,14 @@ func (s *redisStore) mergeEntry(ctx context.Context, ws, taskID string, p regist
 			e.CancelAckOwed = *p.CancelAckOwed
 			changed = true
 		}
+		if p.SlotCloseOwed != nil && e.SlotCloseOwed != *p.SlotCloseOwed {
+			e.SlotCloseOwed = *p.SlotCloseOwed
+			changed = true
+		}
+		if p.SandboxPosture != nil && e.SandboxPosture != *p.SandboxPosture {
+			e.SandboxPosture = *p.SandboxPosture
+			changed = true
+		}
 		return e, changed, nil
 	})
 	return err
@@ -994,7 +1003,7 @@ func (s *redisStore) commitJobCreated(ctx context.Context, ws, taskID string, at
 }
 
 // CommitDaemonRegistered records the S-4 registration.
-func (s *redisStore) commitDaemonRegistered(ctx context.Context, ws, taskID string, at time.Time) (registry.TaskEntry, bool, error) {
+func (s *redisStore) commitDaemonRegistered(ctx context.Context, ws, taskID string, at time.Time, daemonCLIVersion, agentRuntimeVersion string) (registry.TaskEntry, bool, error) {
 	entry, ok, err := s.casUpdate(ctx, s.entryKey(ws, taskID), func(e registry.TaskEntry) (registry.TaskEntry, bool, error) {
 		if e.State == registry.StateTerminal || e.State == registry.StatePending {
 			return e, false, nil
@@ -1003,6 +1012,8 @@ func (s *redisStore) commitDaemonRegistered(ctx context.Context, ws, taskID stri
 			e.State = registry.StateDaemonRegistered
 		}
 		e.DaemonRegisteredAt = at
+		e.DaemonCLIVersion = daemonCLIVersion
+		e.AgentRuntimeVersion = agentRuntimeVersion
 		return e, true, nil
 	})
 	return entry, ok, err

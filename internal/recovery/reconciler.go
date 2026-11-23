@@ -662,6 +662,23 @@ func (r *Reconciler) reclaimIfDue(ctx context.Context, e registry.TaskEntry) err
 	if !e.IsDraining() {
 		return nil
 	}
+	if e.SlotCloseOwed {
+		// The credential is already reclaimed at the drain bound; only the
+		// trusted Pod-close half of the reservation is outstanding, and this
+		// kept entry is its durable handle. A real termination fact resolves
+		// it; anything less keeps the slot isolated. The bound must never fire
+		// a second timed release on the same attempt.
+		evidence, err := r.settler.JobTerminationEvidence(ctx, e.JobName, e.JobCreatedAt)
+		if err != nil {
+			r.log.WarnContext(ctx, "job.termination_evidence_failed",
+				"task_id", e.TaskID, "job_name", e.JobName, "err", err)
+			return nil
+		}
+		if !evidence.IsTerminated {
+			return nil
+		}
+		return r.settler.OnJobTerminated(ctx, e.JobName, scheduler.JobTerminationReasonJobTerminated, evidence.LastFinishedAt, evidence.AlivePods)
+	}
 	if e.FailureReason == scheduler.FailureReasonInvalidTaskID {
 		// No Job or Secret ever existed for this instance (an invalid task id,
 		// or a malformed claim dead letter). Its identity-derived names may be

@@ -88,7 +88,7 @@ func TestSlotTransitionsPersistJobAttemptFacts(t *testing.T) {
 	if _, err := service.MarkSlotStarted(ctx, "build-a", "slot-1", "claim-a"); err != nil {
 		t.Fatalf("MarkSlotStarted: %v", err)
 	}
-	if _, err := service.ReleaseSlotByClaim(ctx, "build-a", "slot-1", "claim-a", false); err != nil {
+	if _, err := service.ReleaseSlotByClaim(ctx, "build-a", "slot-1", "claim-a", false, false); err != nil {
 		t.Fatalf("ReleaseSlotByClaim unconfirmed: %v", err)
 	}
 
@@ -114,6 +114,185 @@ func TestSlotTransitionsPersistJobAttemptFacts(t *testing.T) {
 	}
 	if _, err := restarted.MarkSlotStarted(ctx, "build-a", "slot-1", "claim-a"); !errors.Is(err, environment.ErrSlotIsolated) {
 		t.Fatalf("MarkSlotStarted on an isolated slot = %v, want ErrSlotIsolated", err)
+	}
+}
+
+// V2-C29: capacity returns only when the remote close and the Pod close are
+// both proven. A confirmed remote close with the Pod still running keeps the
+// reservation (and its capacity).
+func TestReleaseKeepsCapacityUntilBothCloseFactsExist(t *testing.T) {
+	ctx := t.Context()
+	probe := environmenttest.NewProbe()
+	probe.Result = probeFacts("tree-1")
+	service := newService(t, probe)
+	if _, err := service.Register(ctx, registration("build-a", "build-a.example.test:7443", "/srv/rsbx/build-a", []string{"nix"}, 1), "ops"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1"); err != nil {
+		t.Fatalf("AcquireSlot: %v", err)
+	}
+	if _, err := service.BeginSlot(ctx, "build-a", "slot-1", "claim-a"); err != nil {
+		t.Fatalf("BeginSlot: %v", err)
+	}
+	if _, err := service.BindSlot(ctx, "build-a", "slot-1", "claim-a", "session-a"); err != nil {
+		t.Fatalf("BindSlot: %v", err)
+	}
+	if _, err := service.MarkSlotStarted(ctx, "build-a", "slot-1", "claim-a"); err != nil {
+		t.Fatalf("MarkSlotStarted: %v", err)
+	}
+
+	slot, err := service.ReleaseSlotByClaim(ctx, "build-a", "slot-1", "claim-a", true, false)
+	if err != nil {
+		t.Fatalf("ReleaseSlotByClaim remote-only: %v", err)
+	}
+	if !slot.RemoteClosed {
+		t.Fatal("the confirmed remote close was not recorded")
+	}
+	if slot.State != environment.SlotActive {
+		t.Fatalf("slot state = %q, want the reservation kept while the Pod is alive", slot.State)
+	}
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-2"); !errors.Is(err, environment.ErrFull) {
+		t.Fatalf("AcquireSlot with the Pod still alive = %v, want ErrFull", err)
+	}
+
+	if _, err := service.ReleaseSlotOnPodClosed(ctx, "build-a", "slot-1"); err != nil {
+		t.Fatalf("ReleaseSlotOnPodClosed: %v", err)
+	}
+	if _, found, err := service.SlotState(ctx, "build-a", "slot-1"); err != nil || found {
+		t.Fatalf("SlotState after both facts = (found=%v, err=%v), want the slot gone", found, err)
+	}
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-2"); err != nil {
+		t.Fatalf("AcquireSlot after both facts: %v", err)
+	}
+}
+
+// V2-C29: draining a Job whose Pod may still be running isolates the slot
+// instead of claiming closure. Capacity stays held until both the trusted Pod
+// close and the remote close are recorded.
+func TestIsolateSlotKeepsCapacityUntilBothCloseFactsExist(t *testing.T) {
+	ctx := t.Context()
+	probe := environmenttest.NewProbe()
+	probe.Result = probeFacts("tree-1")
+	service := newService(t, probe)
+	if _, err := service.Register(ctx, registration("build-a", "build-a.example.test:7443", "/srv/rsbx/build-a", []string{"nix"}, 1), "ops"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1"); err != nil {
+		t.Fatalf("AcquireSlot: %v", err)
+	}
+
+	slot, err := service.IsolateSlot(ctx, "build-a", "slot-1")
+	if err != nil {
+		t.Fatalf("IsolateSlot: %v", err)
+	}
+	if slot.State != environment.SlotIsolated {
+		t.Fatalf("isolated slot state = %q, want isolated", slot.State)
+	}
+	if slot.RemoteClosed || slot.PodClosed {
+		t.Fatalf("isolate claimed a close fact it did not observe: %+v", slot)
+	}
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-2"); !errors.Is(err, environment.ErrFull) {
+		t.Fatalf("AcquireSlot while the isolated slot still holds capacity = %v, want ErrFull", err)
+	}
+
+	// A remote close alone still does not return capacity: the Pod fact is
+	// missing.
+	if _, err := service.ConfirmRemoteClose(ctx, "build-a", "slot-1"); err != nil {
+		t.Fatalf("ConfirmRemoteClose: %v", err)
+	}
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-2"); !errors.Is(err, environment.ErrFull) {
+		t.Fatalf("AcquireSlot with only the remote close = %v, want ErrFull", err)
+	}
+
+	if _, err := service.ReleaseSlotOnPodClosed(ctx, "build-a", "slot-1"); err != nil {
+		t.Fatalf("ReleaseSlotOnPodClosed: %v", err)
+	}
+	if _, found, err := service.SlotState(ctx, "build-a", "slot-1"); err != nil || found {
+		t.Fatalf("SlotState after both facts = (found=%v, err=%v), want the slot gone", found, err)
+	}
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-2"); err != nil {
+		t.Fatalf("AcquireSlot after both facts: %v", err)
+	}
+}
+
+// Observe runs the deployment's probe without writing the ledger: the ready
+// check needs the target's current facts, not another verification.
+func TestObserveAnswersFreshFactsWithoutWritingTheLedger(t *testing.T) {
+	ctx := t.Context()
+	probe := environmenttest.NewProbe()
+	probe.Result = probeFacts("tree-1")
+	service := newService(t, probe)
+	if _, err := service.Register(ctx, registration("build-a", "build-a.example.test:7443", "/srv/rsbx/build-a", []string{"nix"}, 1), "ops"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	before, err := service.Get(ctx, "build-a", environment.Grant{DeploymentWide: true})
+	if err != nil {
+		t.Fatalf("Get before: %v", err)
+	}
+
+	// The target now reports a different tree. Observe answers it and leaves
+	// the verified ledger untouched.
+	probe.Result = probeFacts("tree-2")
+	observed, err := service.Observe(ctx, "build-a", environment.Grant{DeploymentWide: true})
+	if err != nil {
+		t.Fatalf("Observe: %v", err)
+	}
+	if observed.TreeID != "tree-2" {
+		t.Fatalf("observed tree = %q, want the probe's current answer", observed.TreeID)
+	}
+	after, err := service.Get(ctx, "build-a", environment.Grant{DeploymentWide: true})
+	if err != nil {
+		t.Fatalf("Get after: %v", err)
+	}
+	if after.Verification.TreeID != before.Verification.TreeID || after.Revision != before.Revision {
+		t.Fatalf("Observe wrote the ledger: before=%+v after=%+v", before.Verification, after.Verification)
+	}
+
+	if _, err := service.Observe(ctx, "missing", environment.Grant{DeploymentWide: true}); !errors.Is(err, environment.ErrNotFound) {
+		t.Fatalf("Observe for an unknown environment = %v, want ErrNotFound", err)
+	}
+}
+
+// A Pod close with no recorded remote close is an unknown remote state: the
+// slot stays isolated and its capacity is not returned.
+func TestPodCloseWithoutRemoteCloseStaysIsolated(t *testing.T) {
+	ctx := t.Context()
+	probe := environmenttest.NewProbe()
+	probe.Result = probeFacts("tree-1")
+	service := newService(t, probe)
+	if _, err := service.Register(ctx, registration("build-a", "build-a.example.test:7443", "/srv/rsbx/build-a", []string{"nix"}, 1), "ops"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1"); err != nil {
+		t.Fatalf("AcquireSlot: %v", err)
+	}
+	if _, err := service.BeginSlot(ctx, "build-a", "slot-1", "claim-a"); err != nil {
+		t.Fatalf("BeginSlot: %v", err)
+	}
+	if _, err := service.ReleaseSlotOnPodClosed(ctx, "build-a", "slot-1"); err != nil {
+		t.Fatalf("ReleaseSlotOnPodClosed: %v", err)
+	}
+	slot, found, err := service.SlotState(ctx, "build-a", "slot-1")
+	if err != nil || !found {
+		t.Fatalf("SlotState = (found=%v, err=%v), want the isolated reservation kept", found, err)
+	}
+	if slot.State != environment.SlotIsolated {
+		t.Fatalf("slot state = %q, want isolated", slot.State)
+	}
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-2"); !errors.Is(err, environment.ErrFull) {
+		t.Fatalf("AcquireSlot with an unknown remote close = %v, want ErrFull", err)
+	}
+
+	// The two facts may arrive in either order: the Pod close is recorded
+	// first, and the later remote confirmation completes the release.
+	if _, err := service.ConfirmRemoteClose(ctx, "build-a", "slot-1"); err != nil {
+		t.Fatalf("ConfirmRemoteClose after the Pod close: %v", err)
+	}
+	if _, found, err := service.SlotState(ctx, "build-a", "slot-1"); err != nil || found {
+		t.Fatalf("SlotState after both facts = (found=%v, err=%v), want the slot gone", found, err)
+	}
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-2"); err != nil {
+		t.Fatalf("AcquireSlot after both facts: %v", err)
 	}
 }
 
@@ -158,7 +337,7 @@ func TestSlotClaimFencesConcurrentExecutions(t *testing.T) {
 	if _, err := service.MarkSlotStarted(ctx, "build-a", "slot-1", "claim-a"); err != nil {
 		t.Fatalf("MarkSlotStarted claim-a retry: %v", err)
 	}
-	if _, err := service.ReleaseSlotByClaim(ctx, "build-a", "slot-1", "claim-b", true); !errors.Is(err, environment.ErrSlotClaimed) {
+	if _, err := service.ReleaseSlotByClaim(ctx, "build-a", "slot-1", "claim-b", true, false); !errors.Is(err, environment.ErrSlotClaimed) {
 		t.Fatalf("ReleaseSlotByClaim claim-b = %v, want ErrSlotClaimed", err)
 	}
 	stored, found, err := service.SlotState(ctx, "build-a", "slot-1")
@@ -177,10 +356,10 @@ func TestSlotClaimFencesConcurrentExecutions(t *testing.T) {
 	if _, err := service.MarkSlotStarted(ctx, "build-a", "slot-1", "claim-a"); !errors.Is(err, environment.ErrSlotClaimed) {
 		t.Fatalf("stale MarkSlotStarted after takeover = %v, want ErrSlotClaimed", err)
 	}
-	if _, err := service.ReleaseSlotByClaim(ctx, "build-a", "slot-1", "claim-a", true); !errors.Is(err, environment.ErrSlotClaimed) {
+	if _, err := service.ReleaseSlotByClaim(ctx, "build-a", "slot-1", "claim-a", true, false); !errors.Is(err, environment.ErrSlotClaimed) {
 		t.Fatalf("stale ReleaseSlotByClaim after takeover = %v, want ErrSlotClaimed", err)
 	}
-	if _, err := service.ReleaseSlotByClaim(ctx, "build-a", "slot-1", "claim-c", true); err != nil {
+	if _, err := service.ReleaseSlotByClaim(ctx, "build-a", "slot-1", "claim-c", true, true); err != nil {
 		t.Fatalf("ReleaseSlotByClaim takeover winner: %v", err)
 	}
 	if _, found, err := service.SlotState(ctx, "build-a", "slot-1"); err != nil || found {

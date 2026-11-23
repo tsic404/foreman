@@ -101,7 +101,7 @@ func TestProxyCacheFetchesOnlyFromTheFrozenProxy(t *testing.T) {
 
 	binding := testBinding(server.URL, multica, agent)
 	dir := t.TempDir()
-	cache := &ProxyCache{BaseURL: server.URL, Token: "fmj_attempt", Dir: dir}
+	cache := &ProxyCache{BaseURL: server.URL, Token: "fmj_attempt", Dir: dir, MaxBytes: DefaultCLIBudgetBytes}
 	for _, cli := range binding.CLIs {
 		artifact, err := cache.Ensure(context.Background(), cli)
 		if err != nil {
@@ -146,7 +146,7 @@ func TestProxyCacheReusesVerifiedBytesWithinTheAttempt(t *testing.T) {
 	defer server.Close()
 
 	binding := testBinding(server.URL, multica, agent)
-	cache := &ProxyCache{BaseURL: server.URL, Dir: t.TempDir()}
+	cache := &ProxyCache{BaseURL: server.URL, Dir: t.TempDir(), MaxBytes: DefaultCLIBudgetBytes}
 	for i := 0; i < 2; i++ {
 		if _, err := cache.Ensure(context.Background(), binding.CLIs[0]); err != nil {
 			t.Fatalf("Ensure: %v", err)
@@ -167,7 +167,7 @@ func TestProxyCacheRefetchesCorruptedBytes(t *testing.T) {
 	defer server.Close()
 
 	binding := testBinding(server.URL, multica, agent)
-	cache := &ProxyCache{BaseURL: server.URL, Dir: t.TempDir()}
+	cache := &ProxyCache{BaseURL: server.URL, Dir: t.TempDir(), MaxBytes: DefaultCLIBudgetBytes}
 	artifact, err := cache.Ensure(context.Background(), binding.CLIs[0])
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)
@@ -195,7 +195,7 @@ func TestProxyCacheRefusesAForeignDownloadAddress(t *testing.T) {
 
 	binding := testBinding("http://proxy.example.test:8080", multica, agent)
 	binding.CLIs[0].DownloadURL = foreign.URL + "/cli/multica/0.11.1/linux/amd64"
-	cache := &ProxyCache{BaseURL: "http://proxy.example.test:8080", Dir: t.TempDir()}
+	cache := &ProxyCache{BaseURL: "http://proxy.example.test:8080", Dir: t.TempDir(), MaxBytes: DefaultCLIBudgetBytes}
 	_, err := cache.Ensure(context.Background(), binding.CLIs[0])
 	var download *DownloadError
 	if !errors.As(err, &download) || download.Stage != "authorization" {
@@ -225,7 +225,7 @@ func TestProxyCacheRefusesRedirectsWithoutContactingTheTarget(t *testing.T) {
 	binding := testBinding(proxy.URL, multica, agent)
 	dir := t.TempDir()
 	cache := &ProxyCache{
-		BaseURL: proxy.URL, Dir: dir,
+		BaseURL: proxy.URL, Dir: dir, MaxBytes: DefaultCLIBudgetBytes,
 		Attempts: 3, RetryDelay: time.Millisecond,
 	}
 	_, err := cache.Ensure(context.Background(), binding.CLIs[0])
@@ -260,7 +260,7 @@ func TestProxyCacheRefusesDigestMismatchWithoutKeepingBytes(t *testing.T) {
 
 	binding := testBinding(server.URL, multica, agent)
 	dir := t.TempDir()
-	cache := &ProxyCache{BaseURL: server.URL, Dir: dir}
+	cache := &ProxyCache{BaseURL: server.URL, Dir: dir, MaxBytes: DefaultCLIBudgetBytes}
 	_, err := cache.Ensure(context.Background(), binding.CLIs[0])
 	var download *DownloadError
 	if !errors.As(err, &download) || download.Stage != "verify" {
@@ -275,6 +275,48 @@ func TestProxyCacheRefusesDigestMismatchWithoutKeepingBytes(t *testing.T) {
 	}
 }
 
+// TestProxyCacheFailedDownloadStillSpendsTheBudget pins the retry path: bytes
+// read before a verification failure count against the attempt, so a later
+// helper on the same attempt gets the reduced remainder and cannot refetch.
+func TestProxyCacheFailedDownloadStillSpendsTheBudget(t *testing.T) {
+	served := executableBody("served")
+	expected := executableBody("expected")
+	other := executableBody("other")
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case strings.HasPrefix(r.URL.Path, "/cli/multica/"):
+			_, _ = w.Write(served)
+		case strings.HasPrefix(r.URL.Path, "/cli/agent/"):
+			_, _ = w.Write(other)
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	binding := testBinding(server.URL, served, other)
+	// The frozen digest names bytes the server does not serve: the download
+	// completes, then fails verification. Those bytes are still spent.
+	binding.CLIs[0].Digest = frozenDigest(expected)
+	dir := t.TempDir()
+	first := &ProxyCache{BaseURL: server.URL, Dir: dir, MaxBytes: int64(len(served))}
+	if _, err := first.Ensure(context.Background(), binding.CLIs[0]); err == nil {
+		t.Fatal("Ensure accepted a digest mismatch")
+	}
+	if first.Consumed() == 0 {
+		t.Fatal("a failed verification did not count the bytes it read")
+	}
+
+	// A fresh helper on the same attempt sees the exhausted remainder, not a
+	// new default budget.
+	second := &ProxyCache{BaseURL: server.URL, Dir: dir, MaxBytes: 0}
+	_, err := second.Ensure(context.Background(), binding.CLIs[1])
+	var download *DownloadError
+	if !errors.As(err, &download) || download.Stage != "budget" {
+		t.Fatalf("Ensure after a failed download = %v, want a budget refusal", err)
+	}
+}
+
 func TestProxyCacheRefusesNonExecutableBytes(t *testing.T) {
 	multica, agent := executableBody("multica"), executableBody("codex")
 	plain := []byte("not a program")
@@ -285,7 +327,7 @@ func TestProxyCacheRefusesNonExecutableBytes(t *testing.T) {
 
 	binding := testBinding(server.URL, multica, agent)
 	binding.CLIs[0].Digest = frozenDigest(plain)
-	cache := &ProxyCache{BaseURL: server.URL, Dir: t.TempDir()}
+	cache := &ProxyCache{BaseURL: server.URL, Dir: t.TempDir(), MaxBytes: DefaultCLIBudgetBytes}
 	_, err := cache.Ensure(context.Background(), binding.CLIs[0])
 	var download *DownloadError
 	if !errors.As(err, &download) || download.Stage != "verify" {
@@ -325,7 +367,7 @@ func TestProxyCacheNamesTheFrozenArtifactOnFailure(t *testing.T) {
 
 	binding := testBinding(server.URL, multica, agent)
 	cli := binding.CLIs[1]
-	cache := &ProxyCache{BaseURL: server.URL, Dir: t.TempDir()}
+	cache := &ProxyCache{BaseURL: server.URL, Dir: t.TempDir(), MaxBytes: DefaultCLIBudgetBytes}
 	_, err := cache.Ensure(context.Background(), cli)
 	var download *DownloadError
 	if !errors.As(err, &download) {
@@ -351,7 +393,7 @@ func TestProxyCacheRetriesOnlyTheSameFrozenArtifact(t *testing.T) {
 	defer server.Close()
 
 	binding := testBinding(server.URL, multica, agent)
-	cache := &ProxyCache{BaseURL: server.URL, Dir: t.TempDir(), Attempts: 2, RetryDelay: time.Millisecond}
+	cache := &ProxyCache{BaseURL: server.URL, Dir: t.TempDir(), MaxBytes: DefaultCLIBudgetBytes, Attempts: 2, RetryDelay: time.Millisecond}
 	artifact, err := cache.Ensure(context.Background(), binding.CLIs[0])
 	if err != nil {
 		t.Fatalf("Ensure: %v", err)

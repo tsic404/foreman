@@ -32,18 +32,22 @@ const acceptanceMatrixDesignAnchor = "b8892e7c9dbf07b7ab7c92c9a8294d3edbcb556c"
 // helpers build the scenarios the numbered files judge, and the guards pin
 // this repository's own artifacts; neither claims a TC of their own.
 var acceptanceFixtures = map[string]bool{
-	"deploy_manifest_probe_window_guard_test.go": true,
-	"harness_test.go":               true,
-	"multi_shared_helpers_test.go":  true,
-	"multiws_harness_test.go":       true,
-	"probe_session_helpers_test.go": true,
-	"v2_fixed_helpers_test.go":      true,
-	"v2_fixed_job_test.go":          true,
-	"v2_remote_maintenance_test.go": true,
-	"uat-lib.sh":                    true,
-	"uat-scenarios.sh":              true,
-	"uat_run_status_guard_test.go":  true,
-	"uat_scenarios_carrier_test.go": true,
+	"deploy_manifest_control_plane_scratch_guard_test.go": true,
+	"deploy_manifest_probe_window_guard_test.go":          true,
+	"deploy_manifest_runtime_declaration_guard_test.go":   true,
+	"harness_test.go":                      true,
+	"images_foreman_runtime_guard_test.go": true,
+	"multi_shared_helpers_test.go":         true,
+	"multiws_harness_test.go":              true,
+	"probe_session_helpers_test.go":        true,
+	"v2_fixed_helpers_test.go":             true,
+	"v2_fixed_job_test.go":                 true,
+	"v2_fixed_session_plane_test.go":       true,
+	"v2_remote_maintenance_test.go":        true,
+	"uat-lib.sh":                           true,
+	"uat-scenarios.sh":                     true,
+	"uat_run_status_guard_test.go":         true,
+	"uat_scenarios_carrier_test.go":        true,
 }
 
 var (

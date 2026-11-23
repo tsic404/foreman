@@ -124,5 +124,12 @@ func attemptView(attempt RunAttempt) AttemptView {
 		Environment:     attempt.Environment,
 		Status:          attempt.Status,
 		StartedAt:       stamp(attempt.StartedAt),
+		SandboxPosture: PostureView{
+			Known:        attempt.PostureKnown,
+			Privileged:   attempt.PosturePrivileged,
+			RunAsUser:    attempt.PostureRunAsUser,
+			RunAsUserSet: attempt.PostureRunAsUserSet,
+			RunAsNonRoot: attempt.PostureRunAsNonRoot,
+		},
 	}
 }

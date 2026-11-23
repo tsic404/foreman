@@ -7,6 +7,7 @@ import (
 	"time"
 
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -277,5 +278,124 @@ func TestProjectionRendersAbsentLeaseAsEmpty(t *testing.T) {
 	}
 	if got = projected["lease_keep_until"]; got != ProjectedTime(at) {
 		t.Errorf("lease_keep_until = %v, want %q", projected["lease_keep_until"], ProjectedTime(at))
+	}
+}
+
+// TestSandboxPostureOfReadsTheRenderedContainer pins ADR-002 consequence 1:
+// the posture the run detail presents is the one the Job actually declares,
+// read from the Pod spec, never inferred from which render path produced it.
+func TestSandboxPostureOfReadsTheRenderedContainer(t *testing.T) {
+	privileged := true
+	nonRoot := false
+	root := int64(0)
+	spec := corev1.PodSpec{Containers: []corev1.Container{{
+		Name: "agent",
+		SecurityContext: &corev1.SecurityContext{
+			Privileged:   &privileged,
+			RunAsUser:    &root,
+			RunAsNonRoot: &nonRoot,
+		},
+	}}}
+	posture := SandboxPostureOf(spec)
+	if !posture.Known || !posture.Privileged || posture.RunAsUser != 0 || !posture.RunAsUserSet || posture.RunAsNonRoot {
+		t.Fatalf("posture = %+v, want the privileged root container the spec declares", posture)
+	}
+}
+
+// TestSandboxPostureOfKeepsANonZeroUserApartFromRoot: runAsNonRoot is an
+// admission rule, not an identity, so uid 1000 is an ordinary user even when
+// the flag is false; a spec with no runAsUser is an unread UID, not root.
+func TestSandboxPostureOfKeepsANonZeroUserApartFromRoot(t *testing.T) {
+	uid := int64(1000)
+	notEnforced := false
+	spec := corev1.PodSpec{Containers: []corev1.Container{{
+		Name:            "agent",
+		SecurityContext: &corev1.SecurityContext{RunAsUser: &uid, RunAsNonRoot: &notEnforced},
+	}}}
+	posture := SandboxPostureOf(spec)
+	if !posture.Known || !posture.RunAsUserSet || posture.RunAsUser != 1000 {
+		t.Fatalf("posture = %+v, want the uid 1000 the spec declares", posture)
+	}
+
+	unset := corev1.PodSpec{Containers: []corev1.Container{{
+		Name:            "agent",
+		SecurityContext: &corev1.SecurityContext{Privileged: &notEnforced},
+	}}}
+	if posture := SandboxPostureOf(unset); posture.RunAsUserSet || posture.RunAsUser != 0 {
+		t.Fatalf("posture = %+v, want an absent runAsUser to stay absent", posture)
+	}
+}
+
+// TestSandboxPostureOfUnrecordedStaysUnknown: a container with no security
+// context is an unrecorded fact, never a non-privileged default.
+func TestSandboxPostureOfUnrecordedStaysUnknown(t *testing.T) {
+	spec := corev1.PodSpec{Containers: []corev1.Container{{Name: "agent"}}}
+	if posture := SandboxPostureOf(spec); posture.Known {
+		t.Fatalf("posture = %+v, want unknown", posture)
+	}
+}
+
+// TestTaskEntryFromJobRestoresSandboxPosture: a row rebuilt from the Job
+// object answers the same posture as a live claim, so the run detail does not
+// lose the fact across a restart.
+func TestTaskEntryFromJobRestoresSandboxPosture(t *testing.T) {
+	labels, annos := fullJobMeta()
+	job := jobWithMeta(labels, annos)
+	privileged := true
+	root := int64(0)
+	job.Spec.Template.Spec.Containers = []corev1.Container{{
+		Name:            "agent",
+		SecurityContext: &corev1.SecurityContext{Privileged: &privileged, RunAsUser: &root},
+	}}
+	e, err := TaskEntryFromJob(job)
+	if err != nil {
+		t.Fatalf("TaskEntryFromJob: %v", err)
+	}
+	if !e.SandboxPosture.Known || !e.SandboxPosture.Privileged || !e.SandboxPosture.RunAsUserSet || e.SandboxPosture.RunAsUser != 0 {
+		t.Fatalf("sandbox posture = %+v, want the Job's privileged root container", e.SandboxPosture)
+	}
+}
+
+// TestTaskEntryProjectionCarriesSandboxPosture: the ops detail must project
+// privilege and the execution user, and an unrecorded posture must read as
+// unknown rather than as non-privileged.
+func TestTaskEntryProjectionCarriesSandboxPosture(t *testing.T) {
+	raw, err := json.Marshal(TaskEntry{
+		TaskID:         "t-1",
+		SandboxPosture: SandboxPosture{Known: true, Privileged: true, RunAsUser: 0, RunAsUserSet: true},
+	})
+	if err != nil {
+		t.Fatalf("marshal entry: %v", err)
+	}
+	var projected struct {
+		Posture struct {
+			Known        bool  `json:"known"`
+			Privileged   bool  `json:"privileged"`
+			RunAsUser    int64 `json:"run_as_user"`
+			RunAsUserSet bool  `json:"run_as_user_set"`
+		} `json:"sandbox_posture"`
+	}
+	if err := json.Unmarshal(raw, &projected); err != nil {
+		t.Fatalf("unmarshal entry: %v", err)
+	}
+	if !projected.Posture.Known || !projected.Posture.Privileged || !projected.Posture.RunAsUserSet ||
+		projected.Posture.RunAsUser != 0 {
+		t.Fatalf("sandbox_posture = %+v, want the recorded privileged root posture", projected.Posture)
+	}
+
+	raw, err = json.Marshal(TaskEntry{TaskID: "t-2"})
+	if err != nil {
+		t.Fatalf("marshal entry: %v", err)
+	}
+	var unknown map[string]any
+	if err := json.Unmarshal(raw, &unknown); err != nil {
+		t.Fatalf("unmarshal entry: %v", err)
+	}
+	posture, ok := unknown["sandbox_posture"].(map[string]any)
+	if !ok {
+		t.Fatalf("projection dropped sandbox_posture: %v", unknown)
+	}
+	if posture["known"] != false {
+		t.Fatalf("sandbox_posture = %v, want known=false for an unrecorded fact", posture)
 	}
 }

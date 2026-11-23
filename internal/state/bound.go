@@ -243,9 +243,9 @@ func (s *redisStore) CommitJobCreated(ctx context.Context, ws, taskID string, at
 	})
 }
 
-func (s *redisStore) CommitDaemonRegistered(ctx context.Context, ws, taskID string, at time.Time) (registry.TaskEntry, bool, error) {
+func (s *redisStore) CommitDaemonRegistered(ctx context.Context, ws, taskID string, at time.Time, daemonCLIVersion, agentRuntimeVersion string) (registry.TaskEntry, bool, error) {
 	return storeCall2(s, ctx, func(ctx context.Context) (registry.TaskEntry, bool, error) {
-		return s.commitDaemonRegistered(ctx, ws, taskID, at)
+		return s.commitDaemonRegistered(ctx, ws, taskID, at, daemonCLIVersion, agentRuntimeVersion)
 	})
 }
 

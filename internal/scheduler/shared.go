@@ -350,6 +350,15 @@ func (s *Scheduler) DeliverInSource(ctx context.Context, sourceID, workspaceID, 
 	if runtimeID != e.JobRuntimeID {
 		return Delivery{}, fmt.Errorf("%w: %s", ErrRuntimeMismatch, runtimeID)
 	}
+	if s.cfg.DeliveryGate != nil {
+		ready, gateErr := s.cfg.DeliveryGate(ctx, e)
+		if gateErr != nil {
+			return Delivery{}, fmt.Errorf("%w: delivery gate: %v", ErrStoreUnavailable, gateErr)
+		}
+		if !ready {
+			return Delivery{}, nil
+		}
+	}
 	if s.shared != nil {
 		return s.deliverShared(ctx, e)
 	}
@@ -795,6 +804,11 @@ func (s *Scheduler) ContinueClaimInScope(ctx context.Context, taskID, scopeKey s
 		// The object exists: the claim's crash landed before the transition.
 		if _, ok := s.reg.MarkJobCreated(taskID, job.CreationTimestamp.Time, e.ScopeKey()); !ok {
 			s.log.WarnContext(ctx, "task.claim_continue_skipped", "task_id", taskID, "reason", "entry changed")
+			return nil
+		}
+		posture := registry.SandboxPostureOf(job.Spec.Template.Spec)
+		if err := s.reg.SetSandboxPosture(taskID, posture, e.ScopeKey()); err != nil {
+			s.log.WarnContext(ctx, "job.posture_unrecorded", "task_id", taskID, "err", err.Error())
 		}
 		return nil
 	}
