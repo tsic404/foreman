@@ -1120,6 +1120,19 @@ func (s *Scheduler) createClaim(ctx context.Context, e registry.TaskEntry) (regi
 	// LeaseKeeper landed while the name was held.
 	marked, ok := s.reg.MarkJobCreated(e.TaskID, created.CreationTimestamp.Time, e.ScopeKey())
 	trace(createStepJobCreated)
+	if ok {
+		// The posture is read from the Job that now exists, so the run and
+		// ops details state what the cluster runs rather than what the render
+		// intended (ADR-002 consequence 1). It gates nothing: a write failure
+		// leaves the fact unrecorded instead of failing a created claim.
+		posture := registry.SandboxPostureOf(created.Spec.Template.Spec)
+		if err := s.reg.SetSandboxPosture(e.TaskID, posture, e.ScopeKey()); err != nil {
+			s.log.WarnContext(ctx, "job.posture_unrecorded",
+				"task_id", e.TaskID, "job_name", e.JobName, "err", err.Error())
+		} else {
+			marked.SandboxPosture = posture
+		}
+	}
 	if !ok {
 		// The entry left the registry inside the create window — settled
 		// (e.g. cancelled while the Job name was held) or reclaimed. The
@@ -2530,6 +2543,14 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 		podTerminatedAt = s.now()
 		source = PodTerminatedAtSourceObserved
 	}
+	// A kept debt handle means the credential was already reclaimed at the
+	// drain bound and the reservation was isolated then. This call is the
+	// follow-on Pod-close resolution, never a second timed verdict: it must
+	// not re-reclaim the credential (the Secret is already gone) and must not
+	// isolate the reservation again after the release below.
+	if e.SlotCloseOwed {
+		return s.resolveSlotCloseDebt(ctx, e, reason, podTerminatedAt, orphanPods)
+	}
 	// ① Revoke first: it is in-process and must not depend on the K8s API,
 	// so a failing teardown can never leave the credential usable.
 	s.revokeCredential(ctx, e)
@@ -2550,8 +2571,28 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 	if e.CancelAckOwed && reason == JobTerminationReasonJobTerminated {
 		s.synthesizeCancelAck(ctx, e, podTerminatedAt)
 	}
-	// ④ The entry goes last.
-	s.releaseEnvironment(ctx, e)
+	// The Pod-close half of the environment release gate: a reservation whose
+	// remote close the Job-side route already recorded returns its capacity
+	// now. Only the Job-terminated fact carries it; a drain bound that expired
+	// with pods alive does not.
+	var podCloseErr error
+	if reason == JobTerminationReasonJobTerminated {
+		podCloseErr = s.releaseEnvironmentAfterPodClose(ctx, e)
+	}
+	// ④ The entry goes last. A terminated Job may still have a Pod (drain
+	// timeout, an unobserved deletion), so this path never claims Pod closure:
+	// it isolates the reservation, and only the trusted Pod-close fact above
+	// can complete the release.
+	s.isolateEnvironment(ctx, e)
+	// Keep the entry as the same-attempt Pod-close handle when the reservation
+	// still owes that half: the drain bound closed with the Pod alive, or the
+	// trusted submission above failed. Deleting it would drop the only handle
+	// that can submit the fact later and leak the slot for its whole TTL. The
+	// remote half is deliberately untouched, so an unconfirmed remote close
+	// stays isolated — this is a retry handle, never a timed release.
+	if s.slotCloseDebtApplies(e) && (reason == JobTerminationReasonDrainTimeout || podCloseErr != nil) {
+		return s.keepSlotCloseDebt(ctx, e, reason, source, podTerminatedAt, orphanPods)
+	}
 	if err := s.reg.Delete(e.TaskID, e.ScopeKey()); err != nil {
 		return err
 	}
@@ -2584,6 +2625,56 @@ func (s *Scheduler) OnJobTerminated(ctx context.Context, jobName, reason string,
 			s.metrics.JobDeleteFailed("catch_up")
 		}
 	}
+	return nil
+}
+
+// keepSlotCloseDebt turns the entry into the durable handle for the
+// reservation's outstanding Pod-close half. The credential is already revoked
+// and its Secret deleted, so the cred.reclaimed event fires once here; the
+// reconciler then retries the trusted submission until the Job's pods are
+// provably gone.
+func (s *Scheduler) keepSlotCloseDebt(ctx context.Context, e registry.TaskEntry, reason, source string, podTerminatedAt time.Time, orphanPods int) error {
+	if err := s.reg.MarkSlotCloseOwed(e.TaskID, e.ScopeKey()); err != nil {
+		return err
+	}
+	drainSeconds := s.drainSeconds(e)
+	s.metrics.CredReclaimed(reason, drainSeconds)
+	podTerminatedAtField := ""
+	if !podTerminatedAt.IsZero() {
+		podTerminatedAtField = podTerminatedAt.UTC().Format(time.RFC3339)
+	}
+	s.log.InfoContext(ctx, "cred.reclaimed",
+		"task_id", e.TaskID, "job_name", e.JobName, "workspace_id", e.WorkspaceID, "reason", reason,
+		"drain_seconds", drainSeconds,
+		"pod_terminated_at", podTerminatedAtField,
+		"pod_terminated_at_source", source,
+		"orphan_pods", orphanPods,
+		"slot_close_owed", true)
+	return nil
+}
+
+// resolveSlotCloseDebt completes a kept entry's reservation once the trusted
+// Pod-close fact is real. A non-termination verdict never closes it: the drain
+// bound must not fire twice on the same attempt, and an unconfirmed remote
+// close keeps the reservation isolated. A failed submission keeps the handle
+// so the next round retries it.
+func (s *Scheduler) resolveSlotCloseDebt(ctx context.Context, e registry.TaskEntry, reason string, podTerminatedAt time.Time, orphanPods int) error {
+	if reason != JobTerminationReasonJobTerminated {
+		return nil
+	}
+	if e.CancelAckOwed {
+		s.synthesizeCancelAck(ctx, e, podTerminatedAt)
+	}
+	if err := s.releaseEnvironmentAfterPodClose(ctx, e); err != nil {
+		return err
+	}
+	if err := s.reg.Delete(e.TaskID, e.ScopeKey()); err != nil {
+		return err
+	}
+	s.log.InfoContext(ctx, "environment.slot_close_debt_resolved",
+		"task_id", e.TaskID, "job_name", e.JobName, "workspace_id", e.WorkspaceID,
+		"environment_id", e.EnvironmentID, "slot_id", e.EnvironmentSlotID,
+		"orphan_pods", orphanPods)
 	return nil
 }
 

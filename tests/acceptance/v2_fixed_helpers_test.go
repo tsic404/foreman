@@ -135,6 +135,7 @@ type v2Slots struct {
 	starts    int
 	statusErr error
 	err       error
+	startErr  error
 }
 
 func newV2Slots() *v2Slots {
@@ -216,6 +217,9 @@ func (s *v2Slots) Bind(_ context.Context, _ attempt.Binding, claimID string, ses
 func (s *v2Slots) MarkStarted(_ context.Context, _ attempt.Binding, claimID string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.startErr != nil {
+		return s.startErr
+	}
 	if s.err != nil {
 		return s.err
 	}

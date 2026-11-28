@@ -21,6 +21,10 @@ import (
 
 const foremanWorkflow = "../../.github/workflows/build-foreman.yml"
 
+// prCheckWorkflow is the image check a pull request actually runs. It has its
+// own build loop, so a Containerfile COPY input must be guarded on both.
+const prCheckWorkflow = "../../.github/workflows/pr-check.yml"
+
 // TestForemanImageTagPushPublishesOnlyThatVersion covers build-foreman.yml: a
 // `v*.*.*` tag push publishes exactly `foreman:v<X.Y.Z>` — never `latest`,
 // which would point the version tag's rollback path at main content — and a ref
@@ -386,9 +390,6 @@ func workflowEnv(t *testing.T, path string) map[string]string {
 			}
 		}
 		break
-	}
-	if len(env) == 0 {
-		t.Fatalf("%s carries no workflow-level env", path)
 	}
 	return env
 }

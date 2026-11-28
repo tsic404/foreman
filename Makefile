@@ -19,11 +19,11 @@ BASE_IMAGE ?= alpine:3.20
 GOFLAGS ?= -trimpath
 LDFLAGS := -s -w -X main.version=$(VERSION)
 
-.PHONY: all build build-foreman build-gc build-job build-foreman-image test vet fmt check acceptance-census acceptance-census-refresh
+.PHONY: all build build-foreman build-gc build-job build-job-adapters build-foreman-image test vet fmt check acceptance-census acceptance-census-refresh
 
 all: build
 
-build: build-foreman build-gc build-job
+build: build-foreman build-gc build-job build-job-adapters
 
 build-foreman:
 	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/foreman ./cmd/foreman
@@ -33,6 +33,17 @@ build-gc:
 
 build-job:
 	CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/foreman-job ./cmd/foreman-job
+
+# The reference Job adapters (V2-C29). They ship inside the runtime image
+# beside foreman-job and are copied into the Job's runtime volume by the
+# job-runtime init container; a deployment that supplies its own adapters
+# replaces the runtime image and leaves these alone.
+JOB_ADAPTERS := foreman-job-cli rsbx-remote foreman-job-register foreman-job-runner foreman-job-slots
+
+build-job-adapters:
+	@for cmd in $(JOB_ADAPTERS); do \
+		CGO_ENABLED=0 go build $(GOFLAGS) -ldflags '$(LDFLAGS)' -o $(BIN_DIR)/$$cmd ./cmd/$$cmd || exit 1; \
+	done
 
 # build-linux-binary <package> <output>: the static Linux/$(ARCH) binary the
 # Containerfiles copy, named per platform so both can share a build context.
@@ -46,6 +57,9 @@ build-foreman-image:
 	$(call build-linux-binary,./cmd/foreman,$(BIN_DIR)/foreman-linux-$(ARCH))
 	$(call build-linux-binary,./cmd/foreman-job,$(BIN_DIR)/foreman-job-linux-$(ARCH))
 	$(call build-linux-binary,./cmd/foreman-gc,$(BIN_DIR)/foreman-gc-linux-$(ARCH))
+	@for cmd in $(JOB_ADAPTERS); do \
+		$(call build-linux-binary,./cmd/$$cmd,$(BIN_DIR)/$$cmd-linux-$(ARCH)) || exit 1; \
+	done
 	$(CONTAINER_TOOL) build --platform linux/$(ARCH) -f images/foreman.Containerfile \
 		--build-arg BASE_IMAGE=$(BASE_IMAGE) \
 		-t $(FOREMAN_IMAGE) $(BIN_DIR)

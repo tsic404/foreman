@@ -31,7 +31,9 @@ type ProxyCache struct {
 	Token string
 	// Dir holds the verified bytes for this attempt.
 	Dir string
-	// MaxBytes bounds all downloads of this attempt, retries included.
+	// MaxBytes bounds all downloads of this attempt, retries included. Zero is
+	// an exhausted budget, not a request for the default: a cache miss then
+	// fails while a verified cache hit is still served.
 	MaxBytes int64
 	// Attempts is the number of same-artifact attempts on a transient failure.
 	// Zero means one.
@@ -243,15 +245,26 @@ func readBounded(body io.Reader, cli CLI, c *ProxyCache) ([]byte, error) {
 func (c *ProxyCache) consume(cli CLI, n int64) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	// The caller passes the bytes still available for this attempt. Zero means
+	// exactly exhausted; falling back to the default here would hand an
+	// exhausted attempt a fresh budget on its next artifact or retry.
 	limit := c.MaxBytes
-	if limit <= 0 {
-		limit = DefaultCLIBudgetBytes
+	if limit < 0 {
+		return c.failure(cli, "budget", "the attempt's CLI download budget is not a byte count")
 	}
 	if c.used+n > limit {
 		return c.failure(cli, "budget", fmt.Sprintf("the attempt's CLI download budget of %d bytes is exhausted", limit))
 	}
 	c.used += n
 	return nil
+}
+
+// Consumed reports the bytes this cache actually downloaded. A verified cache
+// hit consumes nothing: only fetched bytes count against the attempt's budget.
+func (c *ProxyCache) Consumed() int64 {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.used
 }
 
 func writeVerified(path string, body []byte, cli CLI) error {

@@ -22,6 +22,16 @@ type EntryPatch struct {
 	// moves state, the verdict, the start fact or the delivery accounting, so
 	// a late merge of it cannot revert a decision another instance made.
 	CancelAckOwed *bool
+	// SlotCloseOwed carries the reservation's outstanding Pod-close half
+	// (§3.4). Like CancelAckOwed it is a teardown fact about this attempt, not
+	// a gate field: it never moves state or the verdict, so a late merge can
+	// only keep or clear the retry handle.
+	SlotCloseOwed *bool
+	// SandboxPosture carries the posture the rendered Job declares for its
+	// sandbox client (ADR-002 consequence 1). It is a presentation fact about
+	// this attempt and moves no gate field, so a late merge cannot revert a
+	// decision.
+	SandboxPosture *SandboxPosture
 }
 
 // SlotRetirement names one reservation marker whose in-flight slot a claim's
@@ -67,8 +77,11 @@ type SharedStore interface {
 	// stage two delivers through the queue pickup). The shared store stamps
 	// the commit and its confirmation window on its own clock.
 	CommitDelivering(ctx context.Context, ws, taskID string, payload []byte, window time.Duration) (TaskEntry, bool, error)
-	// CommitDaemonRegistered records the S-4 registration.
-	CommitDaemonRegistered(ctx context.Context, ws, taskID string, at time.Time) (TaskEntry, bool, error)
+	// CommitDaemonRegistered records the S-4 registration together with the
+	// two versions it reported: the daemon's Multica CLI version and the
+	// selected Agent runtime's version. They are separate facts; the Job-side
+	// supervisor compares only the former to the frozen Multica artifact.
+	CommitDaemonRegistered(ctx context.Context, ws, taskID string, at time.Time, daemonCLIVersion, agentRuntimeVersion string) (TaskEntry, bool, error)
 	// CommitTerminal writes the terminal verdict, the settled record and drops
 	// the queue row in one atomic step; first=false when another instance
 	// already settled the task.

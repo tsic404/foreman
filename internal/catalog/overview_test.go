@@ -267,3 +267,54 @@ func TestSourceListIsCroppedToTheGrant(t *testing.T) {
 		t.Fatalf("a synced source with a valid credential closed its editor: %+v", cropped[0].WriteBack)
 	}
 }
+
+// TestOverviewProjectsTheSandboxPosture pins ADR-002 consequence 1 on the
+// response side: the run detail states the privilege and the execution user
+// the attempt's Job declares, and an attempt whose posture was never read
+// answers known=false instead of a non-privileged default.
+func TestOverviewProjectsTheSandboxPosture(t *testing.T) {
+	upstream := seededUpstream()
+	clock := &fixedClock{now: timeAt()}
+	started := timeAt().Add(-5 * time.Minute)
+	attempts := &staticRuns{rows: []catalog.RunAttempt{
+		{
+			ServerID: "atlas", WorkspaceID: "ws-core", AgentID: "agent-managed", AgentName: "dev",
+			IssueID: "issue-1", IssueIdentifier: "TSI-1", Environment: "env-1", Status: "running", StartedAt: started,
+			PostureKnown: true, PosturePrivileged: true, PostureRunAsUser: 0, PostureRunAsUserSet: true, PostureRunAsNonRoot: false,
+		},
+		{
+			ServerID: "atlas", WorkspaceID: "ws-core", AgentID: "agent-managed", AgentName: "dev",
+			IssueID: "issue-2", IssueIdentifier: "TSI-2", Environment: "env-2", Status: "running", StartedAt: started.Add(time.Minute),
+		},
+	}}
+	service, err := catalog.New(catalog.Config{
+		Upstream:          upstream,
+		Credentials:       catalogtest.Credentials{},
+		Clock:             clock.Now,
+		ManagedRuntimeIDs: managedRuntimes,
+		RunIndex:          attempts,
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	register(t, service, "atlas", false)
+	if _, err := service.Sync(context.Background(), "atlas"); err != nil {
+		t.Fatalf("Sync: %v", err)
+	}
+
+	view, err := service.Overview(context.Background(), catalog.Grant{})
+	if err != nil {
+		t.Fatalf("Overview: %v", err)
+	}
+	if len(view.InProgress.Rows) != 2 {
+		t.Fatalf("rows = %d, want 2", len(view.InProgress.Rows))
+	}
+	recorded := view.InProgress.Rows[0].SandboxPosture
+	if !recorded.Known || !recorded.Privileged || !recorded.RunAsUserSet || recorded.RunAsUser != 0 || recorded.RunAsNonRoot {
+		t.Fatalf("posture = %+v, want the recorded privileged root posture", recorded)
+	}
+	unrecorded := view.InProgress.Rows[1].SandboxPosture
+	if unrecorded.Known {
+		t.Fatalf("posture = %+v, want known=false for an attempt that recorded nothing", unrecorded)
+	}
+}

@@ -102,8 +102,17 @@ type Slot struct {
 	// ClaimID is the execution lease that owns the current phase transition.
 	// Begin mints it, recovery takes it over atomically, and only the holder
 	// may bind a remote session, commit dispatch or release this reservation.
-	ClaimID    string
-	SessionID  string
+	ClaimID   string
+	SessionID string
+	// RemoteClosed records a confirmed remote close. It is one half of the
+	// release gate: capacity returns only once the bound Pod is closed too.
+	// A remote close with the Pod still running keeps the reservation (and
+	// its capacity) in place.
+	RemoteClosed bool
+	// PodClosed records the trusted platform observation that the bound Job
+	// has no running Pod left. It is the other half of the release gate and
+	// is kept separately so the two facts may arrive in either order.
+	PodClosed  bool
 	AcquiredAt time.Time
 	ReleasedAt time.Time
 	LastError  string

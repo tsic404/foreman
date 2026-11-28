@@ -370,6 +370,29 @@ func (s *Service) Get(ctx context.Context, id ID, grant Grant) (EnvironmentView,
 	return view, nil
 }
 
+// Observe runs the deployment's read-only probe against one registration
+// without writing the ledger. A Job-side ready check uses it to compare the
+// target's current identity with the frozen binding; a probe that cannot
+// answer is an error, never a ready.
+func (s *Service) Observe(ctx context.Context, id ID, grant Grant) (ProbeResult, error) {
+	var target Target
+	err := s.transact(ctx, func(ctx context.Context, tx Store) error {
+		env, ok, err := tx.GetEnvironment(ctx, id)
+		if err != nil {
+			return err
+		}
+		if !ok || !grant.AllowsEnvironment(env) {
+			return ErrNotFound
+		}
+		target = env.Target
+		return nil
+	})
+	if err != nil {
+		return ProbeResult{}, err
+	}
+	return s.probe(ctx, target)
+}
+
 // Update edits one target's configuration. An identity-affecting edit marks
 // the verification stale; a policy-only edit leaves it valid.
 func (s *Service) Update(ctx context.Context, id ID, patch Patch, actor string) (EnvironmentView, error) {
@@ -1089,23 +1112,52 @@ func (s *Service) putSlotTransition(ctx context.Context, tx Store, id ID, env En
 	return slot, nil
 }
 
-// ReleaseSlot releases one slot. A release whose remote cleanup is not
-// confirmed leaves the slot isolated instead of freeing capacity.
+// ReleaseSlot releases one slot whose execution never produced a Pod. The
+// caller's cleanup confirmation is the only evidence that exists on that
+// path, and no Pod can still be running, so it is the whole gate. An attempt
+// that created a Job must never come through here: its Pod may still be alive,
+// so the caller isolates with IsolateSlot instead.
 func (s *Service) ReleaseSlot(ctx context.Context, id ID, slotID string, cleanupConfirmed bool) (Slot, error) {
-	return s.releaseSlot(ctx, id, slotID, "", cleanupConfirmed)
+	return s.releaseSlot(ctx, id, slotID, "", cleanupConfirmed, true)
+}
+
+// IsolateSlot keeps one reservation without claiming either half of the close
+// gate. It is the release for an attempt that created a Job: the Pod may still
+// be running or unobserved, so the slot stays isolated and its capacity stays
+// held until trusted Pod-close and remote-close facts arrive.
+func (s *Service) IsolateSlot(ctx context.Context, id ID, slotID string) (Slot, error) {
+	return s.releaseSlot(ctx, id, slotID, "", false, false)
 }
 
 // ReleaseSlotByClaim releases a Job-side reservation only for the execution
 // that owns it. A stale instance that lost the Begin/TakeOver race cannot free
-// the winner's slot or mark it isolated.
-func (s *Service) ReleaseSlotByClaim(ctx context.Context, id ID, slotID, claimID string, cleanupConfirmed bool) (Slot, error) {
+// the winner's slot or mark it isolated. remoteConfirmed and podClosed are two
+// separate facts: capacity returns only when both hold; a remote close with
+// the Pod still running is recorded and the reservation keeps its capacity.
+func (s *Service) ReleaseSlotByClaim(ctx context.Context, id ID, slotID, claimID string, remoteConfirmed, podClosed bool) (Slot, error) {
 	if err := validateClaimID(claimID); err != nil {
 		return Slot{}, err
 	}
-	return s.releaseSlot(ctx, id, slotID, claimID, cleanupConfirmed)
+	return s.releaseSlot(ctx, id, slotID, claimID, remoteConfirmed, podClosed)
 }
 
-func (s *Service) releaseSlot(ctx context.Context, id ID, slotID, claimID string, cleanupConfirmed bool) (Slot, error) {
+// ConfirmRemoteClose records the remote-close half without claiming anything
+// about the Pod. The maintenance path proves a remote session ended; it does
+// not observe Pods, so capacity stays with the reservation until the trusted
+// platform observer reports the Pod close.
+func (s *Service) ConfirmRemoteClose(ctx context.Context, id ID, slotID string) (Slot, error) {
+	return s.releaseSlot(ctx, id, slotID, "", true, false)
+}
+
+// ReleaseSlotOnPodClosed is the trusted platform observer's half of the gate:
+// the bound Job's pods are gone. It completes a release whose remote close was
+// already recorded; with no such record the remote state is unknown and the
+// slot stays isolated.
+func (s *Service) ReleaseSlotOnPodClosed(ctx context.Context, id ID, slotID string) (Slot, error) {
+	return s.releaseSlot(ctx, id, slotID, "", false, true)
+}
+
+func (s *Service) releaseSlot(ctx context.Context, id ID, slotID, claimID string, remoteConfirmed, podClosed bool) (Slot, error) {
 	var result Slot
 	err := s.transact(ctx, func(ctx context.Context, tx Store) error {
 		env, ok, err := tx.GetEnvironment(ctx, id)
@@ -1127,24 +1179,39 @@ func (s *Service) releaseSlot(ctx context.Context, id ID, slotID, claimID string
 		if claimID != "" {
 			actor = "job"
 		}
+		if remoteConfirmed {
+			slot.RemoteClosed = true
+		}
+		if podClosed {
+			slot.PodClosed = true
+		}
 		switch {
-		case slot.State == SlotActive && cleanupConfirmed:
+		case slot.RemoteClosed && slot.PodClosed:
+			// Both halves of the gate are proven: the remote session is
+			// closed and the bound Pod is gone. Capacity returns.
 			slot.ReleasedAt = now
 			delete(env.Slots, slotID)
 			s.appendAudit(ctx, tx, AuditSlotRelease, id, actor, AuditOK, slotID)
-		case slot.State == SlotActive:
+		case slot.State == SlotIsolated:
+			// The remote side is still unknown (or only one half is proven):
+			// keep the reservation isolated and record the new fact.
+			if remoteConfirmed {
+				slot.LastError = "the remote session is closed; the pod is still running"
+			}
+			env.Slots[slotID] = slot
+			s.appendAudit(ctx, tx, AuditSlotIsolate, id, actor, AuditFailed, slotID)
+		case slot.RemoteClosed:
+			// One half proven: the remote close is recorded, capacity stays
+			// with the reservation until the Pod-close fact arrives.
+			slot.LastError = "the remote session is closed; the pod is still running"
+			env.Slots[slotID] = slot
+			s.appendAudit(ctx, tx, AuditSlotAdvance, id, actor, AuditOK, "remote_closed")
+		default:
 			slot.State = SlotIsolated
 			slot.ReleasedAt = now
 			slot.LastError = "remote cleanup is not confirmed"
 			env.Slots[slotID] = slot
 			s.appendAudit(ctx, tx, AuditSlotIsolate, id, actor, AuditFailed, slotID)
-		case slot.State == SlotIsolated && cleanupConfirmed:
-			slot.ReleasedAt = now
-			delete(env.Slots, slotID)
-			s.appendAudit(ctx, tx, AuditCleanupConfirm, id, actor, AuditOK, slotID)
-		default:
-			result = slot
-			return nil
 		}
 		env.Revision++
 		env.UpdatedAt = now

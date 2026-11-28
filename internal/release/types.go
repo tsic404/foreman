@@ -31,8 +31,13 @@ const (
 	MaxCandidates = 32
 	// MaxReleases bounds one definition's release history.
 	MaxReleases = 32
-	// MaxArtifactBytes bounds one verification download.
-	MaxArtifactBytes = 64 << 20
+	// MaxArtifactBytes bounds one verification download. It matches the
+	// attempt's two-artifact budget (FOREMAN_JOB_CLI_BUDGET_BYTES): an artifact
+	// larger than the whole budget could never be downloaded by the Job that
+	// froze it, so refusing to verify it only moves the failure later. A
+	// published Agent CLI is 200-300 MiB in practice, which the old 64 MiB
+	// bound rejected before the Job ever saw it.
+	MaxArtifactBytes = 512 << 20
 )
 
 // Platform is one artifact's target. Libc is optional because not every

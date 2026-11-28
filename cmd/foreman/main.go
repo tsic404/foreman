@@ -30,6 +30,7 @@ import (
 	"github.com/tsic404/foreman/internal/bootstrap"
 	"github.com/tsic404/foreman/internal/catalog"
 	"github.com/tsic404/foreman/internal/coordination"
+	"github.com/tsic404/foreman/internal/environment"
 	"github.com/tsic404/foreman/internal/jobbuilder"
 	"github.com/tsic404/foreman/internal/lifecycle"
 	"github.com/tsic404/foreman/internal/observability"
@@ -375,6 +376,7 @@ func run() error {
 		return err
 	}
 	schedCfg.DispatchGate = catalogService.ClaimOwned
+	schedCfg.DeliveryGate = newFixedDeliveryGate(environmentService)
 	// The claim freezes the configuration binding it will project. The CLI
 	// versions stay unknown until the Job consumer reports what it actually
 	// executed: the management pointer is not execution evidence (V2-C05).
@@ -556,6 +558,27 @@ func run() error {
 	// The liveness view the health endpoint serves (§9.3): the loops register
 	// as they start, and a critical loop that stops turns the probe red.
 	health := observability.NewHealth()
+	// The attempt projection answers the reference Job adapters what the
+	// attempt's own frozen binding holds and what the shared ledger recorded.
+	// It is on the Job face because a Job's token is the only credential it
+	// ever presents, and every answer is scoped to that token's attempt.
+	attemptFace := &proxy.AttemptFace{
+		Verifier: issuer,
+		Registry: reg,
+		Slots:    environmentService,
+		Environment: func(ctx context.Context, id string) (proxy.EnvironmentFact, error) {
+			observed, observeErr := environmentService.Observe(ctx, environment.ID(id), environment.Grant{DeploymentWide: true})
+			if observeErr != nil {
+				return proxy.EnvironmentFact{}, observeErr
+			}
+			return proxy.EnvironmentFact{
+				TreeID:   observed.TreeID,
+				Identity: observed.Identity,
+				State:    "observed",
+			}, nil
+		},
+		PodsClosed: newPodCloseObserver(clientset, schedCfg.JobNamespace),
+	}
 	ops := observability.NewOpsHandler(metrics, reg, observability.NewK8sPodLogReader(clientset), observability.OpsConfig{
 		Version:        version,
 		JobImage:       jbCfg.JobImage,
@@ -569,7 +592,7 @@ func run() error {
 	})
 	srv := &http.Server{
 		Addr:              *listen,
-		Handler:           newJobFaceMux(fakeServer, cliDownloads, health, started),
+		Handler:           newJobFaceMux(fakeServer, cliDownloads, attemptFace, health, started),
 		ReadHeaderTimeout: readHeaderTimeout,
 	}
 	// The ops surface is a second listener: the Job-facing Service publishes
@@ -783,12 +806,15 @@ func run() error {
 	}
 
 	// startPlanes builds and starts one control-plane set per target client.
-	// The startup path and the per-source recovery path share it: a source
-	// that failed its first discovery must join the same loops later without
-	// restarting the process or repeating the healthy sources' work
-	// (02-contracts V2-C06 按来源退避与对账).
+	// The startup path, the per-source recovery and the publication hook share
+	// it: a source that joins later must not repeat the healthy sources' work,
+	// and one scope never starts a second loop set (V2-C06 按来源退避与对账).
+	scopes := newPlaneScopes()
 	startPlanes := func(targets []*proxy.Client) {
 		for _, c := range targets {
+			if !scopes.Claim(c) {
+				continue
+			}
 			workspaceID := c.WorkspaceID()
 			reporter := proxy.NewModelCatalogReporter(proxyCfg, c,
 				newDiscoveryCatalogSource(discoveryService, catalogService, releaseService, configService, c),
@@ -830,6 +856,18 @@ func run() error {
 	}
 	startPlanes(served)
 
+	// One coordinator owns both the publication hook and the failed-source
+	// recovery: they register the same upstream identity, so they must share
+	// one per-source attempt slot. A publication after a failed attempt keeps
+	// retrying until it lands; a repeat publication of the same target kicks
+	// the unfinished declaration again instead of succeeding as a no-op.
+	attach := func(sourceID string, found map[string]registry.Discovery) bool {
+		return attachRecoveredSource(clientSet.All(), sourceID, found, leaseHeld, startPlanes)
+	}
+	declarations := newDeclarationSync(ctx, startupDiscovery, scopes.Served, leaseHeld, attach, baseLog,
+		bootstrap.SourceRetryBackoff)
+	releaseService.SetPublishHook(declarations.Kick)
+
 	// A source whose first discovery failed keeps its own retry loop: the
 	// healthy sources already serve, and a source that comes back must
 	// register and pick up work in this process lifetime (V2-C06 单来源失联
@@ -837,11 +875,9 @@ func run() error {
 	// liveness row reflects the process, not the retry's completion.
 	if len(failedSources) > 0 {
 		run("source-recovery", func(ctx context.Context) error {
-			bootstrap.RetryFailedSources(ctx, startupDiscovery, clientSet.All(), failedSources, leaseHeld,
+			bootstrap.RetryFailedSources(ctx, declarations.Prober(startupDiscovery), clientSet.All(), failedSources, leaseHeld,
 				bootstrap.SourceRetryBackoff, baseLog,
-				func(sourceID string, found map[string]registry.Discovery) bool {
-					return attachRecoveredSource(clientSet.All(), sourceID, found, leaseHeld, startPlanes)
-				})
+				attach)
 			<-ctx.Done()
 			return nil
 		})
@@ -953,11 +989,18 @@ func run() error {
 // — a Job pod dialing this listener with its own Job Token reaches no ops
 // route (§2.2 S-25) — and the health route answers the liveness verdict alone,
 // never a task, workspace or runtime identity field.
-func newJobFaceMux(fakeServer, cliDownloads http.Handler, health *observability.Health, startedAt time.Time) *http.ServeMux {
+func newJobFaceMux(fakeServer, cliDownloads, attemptFace http.Handler, health *observability.Health, startedAt time.Time) *http.ServeMux {
 	mux := http.NewServeMux()
 	mux.Handle("/api/", fakeServer)
 	if cliDownloads != nil {
 		mux.Handle("GET /cli/{kind}/{version}/{os}/{arch}", cliDownloads)
+	}
+	if attemptFace != nil {
+		// Foreman's own attempt projection for the reference Job adapters.
+		// It sits beside the daemon API rather than under it, so it never
+		// joins the daemon-face census (§2.2 S-25).
+		mux.Handle(proxy.AttemptFacePath, attemptFace)
+		mux.Handle(proxy.AttemptFacePath+"/", attemptFace)
 	}
 	mux.Handle("GET /foreman/healthz", observability.NewHealthHandler(health, startedAt))
 	return mux

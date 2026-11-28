@@ -63,7 +63,9 @@ func (l v2LedgerSlots) MarkStarted(ctx context.Context, binding attempt.Binding,
 }
 
 func (l v2LedgerSlots) Release(ctx context.Context, binding attempt.Binding, claimID string, confirmed bool) error {
-	_, err := l.service.ReleaseSlotByClaim(ctx, environment.ID(binding.EnvironmentID), binding.SlotID, claimID, confirmed)
+	// A Job-side adapter can prove the remote close but never the Pod close;
+	// the trusted platform observer supplies the second half.
+	_, err := l.service.ReleaseSlotByClaim(ctx, environment.ID(binding.EnvironmentID), binding.SlotID, claimID, confirmed, false)
 	return err
 }
 
@@ -225,8 +227,18 @@ func TestV2ResumeBindingKeepsTheRemoteSessionEmpty(t *testing.T) {
 	if len(remote.closed) != 1 || remote.closed[0] == priorSession || remote.closed[0] != outcome.Session.ID {
 		t.Fatalf("closed sessions = %v, want only the opened rsbx session", remote.closed)
 	}
+	slot, found, err = environments.SlotState(ctx, environment.ID(frozen.EnvironmentID), frozen.SlotID)
+	if err != nil || !found {
+		t.Fatalf("slot after the confirmed close = (%+v, %v, %v), want the reservation kept until the Pod close", slot, found, err)
+	}
+	if !slot.RemoteClosed {
+		t.Fatalf("slot = %+v, want the remote close recorded", slot)
+	}
+	if _, err := environments.ReleaseSlotOnPodClosed(ctx, environment.ID(frozen.EnvironmentID), frozen.SlotID); err != nil {
+		t.Fatalf("ReleaseSlotOnPodClosed: %v", err)
+	}
 	if _, found, err := environments.SlotState(ctx, environment.ID(frozen.EnvironmentID), frozen.SlotID); err != nil || found {
-		t.Fatalf("slot after the confirmed close = (found=%v, err=%v), want it released", found, err)
+		t.Fatalf("slot after both close facts = (found=%v, err=%v), want it released", found, err)
 	}
 }
 
@@ -381,7 +393,7 @@ func TestV2ConcurrentExecutionsRaceForOneClaim(t *testing.T) {
 	if slot.ClaimID != winnerClaim || !slot.Started || slot.SessionID == "" {
 		t.Fatalf("slot = %+v, want the winner's started session", slot)
 	}
-	if _, err := environments.ReleaseSlotByClaim(ctx, environment.ID(binding.EnvironmentID), binding.SlotID, loserClaim, true); !errors.Is(err, environment.ErrSlotClaimed) {
+	if _, err := environments.ReleaseSlotByClaim(ctx, environment.ID(binding.EnvironmentID), binding.SlotID, loserClaim, true, false); !errors.Is(err, environment.ErrSlotClaimed) {
 		t.Fatalf("loser ReleaseSlotByClaim = %v, want ErrSlotClaimed", err)
 	}
 	if slot, found, err := environments.SlotState(ctx, environment.ID(binding.EnvironmentID), binding.SlotID); err != nil || !found || slot.ClaimID != winnerClaim {
@@ -408,7 +420,17 @@ func TestV2ConcurrentExecutionsRaceForOneClaim(t *testing.T) {
 		t.Fatalf("winner ready=%d register=%d run=%d, want one each",
 			winning.remote.readyCalls, winning.registrar.calls, winning.runner.calls)
 	}
+	slot, found, err = environments.SlotState(ctx, environment.ID(binding.EnvironmentID), binding.SlotID)
+	if err != nil || !found {
+		t.Fatalf("slot after the winner released = (%+v, %v, %v), want the reservation kept until the Pod close", slot, found, err)
+	}
+	if !slot.RemoteClosed {
+		t.Fatalf("slot = %+v, want the winner's remote close recorded", slot)
+	}
+	if _, err := environments.ReleaseSlotOnPodClosed(ctx, environment.ID(binding.EnvironmentID), binding.SlotID); err != nil {
+		t.Fatalf("ReleaseSlotOnPodClosed: %v", err)
+	}
 	if _, found, err := environments.SlotState(ctx, environment.ID(binding.EnvironmentID), binding.SlotID); err != nil || found {
-		t.Fatalf("slot after the winner released = (found=%v, err=%v), want it gone", found, err)
+		t.Fatalf("slot after both close facts = (found=%v, err=%v), want it gone", found, err)
 	}
 }

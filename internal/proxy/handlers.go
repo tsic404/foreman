@@ -238,10 +238,17 @@ func (s *FakeServer) handleRegister(w http.ResponseWriter, r *http.Request) {
 		TaskID:          e.TaskID,
 		Provider:        provider,
 		Name:            name,
+		Version:         req.CLIVersion,
 		Online:          true,
 		LastHeartbeatAt: time.Now(),
+		// The runtime detail states the posture of the Job this runtime
+		// registered from, so it never reads as unprivileged by default.
+		SandboxPosture: e.SandboxPosture,
 	})
-	registered, stillLive := s.reg.MarkDaemonRegistered(claims.JobName, time.Now())
+	// The daemon's own CLI version is what the Job-side supervisor verifies
+	// against the frozen Multica artifact; the selected Agent runtime's
+	// version is a separate fact and may legitimately differ.
+	registered, stillLive := s.reg.MarkDaemonRegistered(claims.JobName, time.Now(), req.CLIVersion, declared.Version)
 	s.log.Info("daemon.registered",
 		"task_id", e.TaskID, "job_name", e.JobName, "workspace_id", e.WorkspaceID,
 		"daemon_id", claims.JobName, "job_runtime_id", e.JobRuntimeID,

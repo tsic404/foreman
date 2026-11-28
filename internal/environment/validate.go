@@ -1,12 +1,12 @@
 package environment
 
 import (
-	"net"
 	"path"
 	"regexp"
 	"sort"
-	"strconv"
 	"strings"
+
+	"github.com/tsic404/foreman/internal/rsbxendpoint"
 )
 
 var (
@@ -90,16 +90,19 @@ func validateEndpoint(endpoint string) error {
 	if endpoint == "" {
 		return invalid("endpoint is required")
 	}
-	if strings.ContainsAny(endpoint, " \t\r\n") {
+	if strings.ContainsAny(endpoint, "\t\r\n") {
 		return invalid("endpoint must not contain whitespace")
 	}
-	host, portText, err := net.SplitHostPort(endpoint)
-	if err != nil || host == "" {
-		return invalid("endpoint must be host:port")
+	// Only the explicit command form carries spaces: the other forms are one
+	// token, so an embedded space is a typo rather than a destination.
+	if !strings.HasPrefix(endpoint, "cmd:") && strings.Contains(endpoint, " ") {
+		return invalid("endpoint must not contain whitespace")
 	}
-	port, err := strconv.Atoi(portText)
-	if err != nil || port < 1 || port > 65535 {
-		return invalid("endpoint port must be between 1 and 65535")
+	// The registration accepts exactly the forms the Job side can open. A
+	// second, narrower check here is what made the only accepted form resolve
+	// to a carrier transport the shipped image cannot serve.
+	if _, err := rsbxendpoint.Parse(endpoint); err != nil {
+		return invalid("%s", err.Error())
 	}
 	return nil
 }

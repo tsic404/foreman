@@ -208,8 +208,8 @@ var tcPayloadProjectionKeys = []string{
 	"daemon_id", "daemon_registered_at", "delivered_at", "deliveries",
 	"failure_reason", "issue_id", "issue_identifier", "job_created_at",
 	"job_name", "job_namespace", "job_runtime_id", "last_status_seen",
-	"lease_keep_until", "node_name", "result", "started_at", "state",
-	"source_id", "task_id", "workspace_id",
+	"lease_keep_until", "node_name", "result", "sandbox_posture", "started_at",
+	"state", "source_id", "task_id", "workspace_id",
 }
 
 // tcPayloadSnapshotKeys is the shared-state snapshot's key set (§4.3,
@@ -224,20 +224,20 @@ var tcPayloadProjectionKeys = []string{
 // 未完成创建的接续): the render must reproduce the row's job_name.
 var tcPayloadSnapshotKeys = []string{
 	"agent_cli_digests", "agent_cli_version", "agent_facts_known",
-	"agent_id", "agent_name", "attempt", "autopilot_run_id", "boot_deadline",
+	"agent_id", "agent_name", "agent_runtime_version", "attempt", "autopilot_run_id", "boot_deadline",
 	"cancel_ack_owed",
 	"chat_session_id", "claims_after_delivery", "claimed_at",
 	"cli_digests", "cli_facts_known", "cli_version", "config_facts_known",
 	"config_revision",
-	"completed_at", "daemon_id", "daemon_registered_at", "decided_report",
+	"completed_at", "daemon_cli_version", "daemon_id", "daemon_registered_at", "decided_report",
 	"delivered_at", "deliveries", "delivery_deadline", "drain_deadline",
 	"environment_id", "environment_slot_id", "fixed_attempt",
 	"failure_reason", "issue_id", "issue_identifier", "job_created_at",
 	"job_name", "job_namespace", "job_phase", "job_runtime_id",
 	"last_status_seen", "lease_keep_until", "node_name", "payload",
 	"prior_session_id", "project_id", "project_source",
-	"real_runtime_id", "result", "runtime_identity", "started_at", "state",
-	"source_id", "task_id", "token_hash", "workspace_id",
+	"real_runtime_id", "result", "runtime_identity", "sandbox_posture", "started_at", "state",
+	"slot_close_owed", "source_id", "task_id", "token_hash", "workspace_id",
 }
 
 // tcPayloadCarrierKeys is the pending-report carrier Secret's data key set
@@ -357,7 +357,7 @@ var tcPayloadLogKeys = []string{
 	"rules", "runtime_id",
 	"runtimes", "saturated", "secret", "segment", "server_id", "server_url",
 	"session_exists", "side", "skill_cache", "skill_cache_max_bytes", "skipped",
-	"skill_cache_ttl", "slot_id", "soft_affinity_suppressed",
+	"skill_cache_ttl", "slot_close_owed", "slot_id", "soft_affinity_suppressed",
 	"source", "source_id", "stage", "state_file", "state_root", "status",
 	"step", "task_dir_ttl", "task_dirs", "task_id",
 	"template", "template_written_faces", "time", "trigger",

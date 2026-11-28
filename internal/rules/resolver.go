@@ -23,6 +23,12 @@ type EnvironmentSource interface {
 	List(ctx context.Context, filter environment.Filter, grant environment.Grant) ([]environment.EnvironmentView, error)
 	AcquireSlot(ctx context.Context, id environment.ID, slotID string) (environment.Slot, error)
 	ReleaseSlot(ctx context.Context, id environment.ID, slotID string, cleanupConfirmed bool) (environment.Slot, error)
+	// ReleaseSlotOnPodClosed completes a release whose remote close is
+	// already recorded. The trusted platform observer calls it once the
+	// attempt's Job has no running Pod left.
+	ReleaseSlotOnPodClosed(ctx context.Context, id environment.ID, slotID string) (environment.Slot, error)
+	// IsolateSlot keeps a reservation without claiming either close fact.
+	IsolateSlot(ctx context.Context, id environment.ID, slotID string) (environment.Slot, error)
 }
 
 // CatalogSource is the directory read. *catalog.Service satisfies it.
@@ -156,6 +162,7 @@ type EnvironmentChoice struct {
 	TLSRef       string   `json:"tls_ref,omitempty"`
 	StateRoot    string   `json:"state_root,omitempty"`
 	Generation   string   `json:"generation,omitempty"`
+	Identity     string   `json:"identity,omitempty"`
 	TrustDomain  string   `json:"trust_domain"`
 	Capabilities []string `json:"capabilities"`
 	Concurrency  int      `json:"concurrency"`
@@ -279,13 +286,41 @@ func (s *Service) Bind(ctx context.Context, req Request) (Binding, error) {
 	}
 }
 
-// Release returns one reservation. An unconfirmed remote close leaves the slot
-// isolated for the operator, which is the honest state (§3.3).
+// Release returns one reservation whose attempt never produced a Pod. An
+// unconfirmed remote close leaves the slot isolated for the operator, which is
+// the honest state (§3.3). An attempt that created a Job must use Isolate: its
+// Pod may still be running.
 func (s *Service) Release(ctx context.Context, binding Binding) error {
 	if binding.EnvironmentID == "" || binding.SlotID == "" {
 		return nil
 	}
 	_, err := s.cfg.Environments.ReleaseSlot(ctx, environment.ID(binding.EnvironmentID), binding.SlotID, false)
+	if errors.Is(err, environment.ErrNotFound) || errors.Is(err, environment.ErrSlotNotFound) {
+		return nil
+	}
+	return err
+}
+
+// Isolate keeps one reservation for an attempt that created a Job. Neither
+// close half is claimed, so capacity stays held until the Pod-close observer
+// and the Job-side remote close report their own facts.
+func (s *Service) Isolate(ctx context.Context, binding Binding) error {
+	if binding.EnvironmentID == "" || binding.SlotID == "" {
+		return nil
+	}
+	_, err := s.cfg.Environments.IsolateSlot(ctx, environment.ID(binding.EnvironmentID), binding.SlotID)
+	if errors.Is(err, environment.ErrNotFound) || errors.Is(err, environment.ErrSlotNotFound) {
+		return nil
+	}
+	return err
+}
+
+// ReleaseAfterPodClosed is the trusted Pod-close half of the release gate.
+func (s *Service) ReleaseAfterPodClosed(ctx context.Context, binding Binding) error {
+	if binding.EnvironmentID == "" || binding.SlotID == "" {
+		return nil
+	}
+	_, err := s.cfg.Environments.ReleaseSlotOnPodClosed(ctx, environment.ID(binding.EnvironmentID), binding.SlotID)
 	if errors.Is(err, environment.ErrNotFound) || errors.Is(err, environment.ErrSlotNotFound) {
 		return nil
 	}
@@ -656,6 +691,7 @@ func (s *Service) resolve(ctx context.Context, req Request, grant catalog.Grant)
 	res.Environment = &EnvironmentChoice{
 		ID: chosen.ID, Endpoint: chosen.Endpoint, TLSRef: chosen.TLSRef,
 		StateRoot: chosen.StateRoot, Generation: chosen.Verification.TreeID,
+		Identity:     chosen.Verification.Identity,
 		TrustDomain:  chosen.TrustDomain,
 		Capabilities: append([]string{}, chosen.Capabilities...),
 		Concurrency:  chosen.Concurrency, FreeSlots: chosen.FreeSlots,

@@ -5,7 +5,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 
-import { overviewModel, renderOverview } from "../assets/lib/overview.mjs";
+import { overviewModel, renderOverview, sandboxPosture } from "../assets/lib/overview.mjs";
 import {
   agentKey,
   bindingEditor,
@@ -85,6 +85,7 @@ const OVERVIEW = {
         environment: "build-a",
         status: "running",
         started_at: "2026-11-20T12:00:00Z",
+        sandbox_posture: { known: true, privileged: true, run_as_user: 0, run_as_user_set: true, run_as_non_root: false },
       },
       {
         server_id: "atlas",
@@ -96,6 +97,8 @@ const OVERVIEW = {
         environment: "build-b",
         status: "running",
         started_at: "2026-11-20T12:05:00Z",
+        // An unrecorded posture is a fact gap, never a non-privileged default.
+        sandbox_posture: { known: false, privileged: false, run_as_user: 0, run_as_user_set: false, run_as_non_root: false },
       },
       {
         // Same display name as atlas/core/dev: a different source, so a
@@ -254,6 +257,69 @@ test("UI-01 exposes Server, Workspace, Issue and environment on hover, focus and
   }
   assert.match(html, /<button[^>]*data-act="run-detail"[^>]*aria-describedby="run-detail-0"/);
   assert.match(html, /class="run-detail"/, "the detail block must be reachable from CSS hover/focus");
+});
+
+test("UI-01 states the sandbox posture the attempt's Job actually runs with", () => {
+  const html = renderOverview(OVERVIEW, SOURCES);
+  const detail = html.match(/id="run-detail-0"[\s\S]*?<\/dl>/);
+  assert.ok(detail, "the first attempt has no addressable detail block");
+  assert.ok(
+    detail[0].includes("特权 · uid 0（root）"),
+    "the run detail does not state the privileged root posture the Job declares",
+  );
+});
+
+test("UI-01 shows an unrecorded sandbox posture as unrecorded, never as non-privileged", () => {
+  assert.equal(sandboxPosture({ known: false, privileged: false, run_as_user: 0, run_as_user_set: false, run_as_non_root: false }), "未记录");
+  assert.equal(sandboxPosture(undefined), "未记录");
+  const html = renderOverview(OVERVIEW, SOURCES);
+  const second = html.match(/id="run-detail-1"[\s\S]*?<\/dl>/);
+  assert.ok(second, "the second attempt has no addressable detail block");
+  assert.ok(second[0].includes("未记录"), "an unrecorded posture was rendered as a concrete posture");
+  assert.doesNotMatch(second[0], /非特权 · uid 0/, "an unrecorded posture was described as non-privileged");
+});
+
+test("UI-01 tells a non-zero UID apart from root instead of trusting runAsNonRoot", () => {
+  // runAsNonRoot only says whether admission enforces a non-root user; false
+  // says nothing about who runs. A uid of 1000 is an ordinary user even when
+  // that flag is false, and must never be labelled root.
+  assert.equal(
+    sandboxPosture({ known: true, privileged: false, run_as_user: 1000, run_as_user_set: true, run_as_non_root: false }),
+    "非特权 · uid 1000（非 root）",
+  );
+  const html = renderOverview(
+    {
+      ...OVERVIEW,
+      in_progress: {
+        ...OVERVIEW.in_progress,
+        rows: [
+          {
+            ...OVERVIEW.in_progress.rows[0],
+            sandbox_posture: { known: true, privileged: false, run_as_user: 1000, run_as_user_set: true, run_as_non_root: false },
+          },
+        ],
+      },
+    },
+    SOURCES,
+  );
+  const detail = html.match(/id="run-detail-0"[\s\S]*?<\/dl>/);
+  assert.ok(detail, "the first attempt has no addressable detail block");
+  assert.ok(detail[0].includes("uid 1000（非 root）"), "a non-root UID was not reported as a non-root user");
+  assert.doesNotMatch(detail[0], /uid 1000（root）/, "a non-root UID was labelled root");
+});
+
+test("UI-01 keeps root when runAsNonRoot is set, and never invents a UID it did not read", () => {
+  // Admission would reject this combination, so the render code must simply
+  // not invert or crash on it: the UID decides.
+  assert.equal(
+    sandboxPosture({ known: true, privileged: true, run_as_user: 0, run_as_user_set: true, run_as_non_root: true }),
+    "特权 · uid 0（root）",
+  );
+  // A security context without a runAsUser is an unread UID, not root.
+  assert.equal(
+    sandboxPosture({ known: true, privileged: false, run_as_user: 0, run_as_user_set: false, run_as_non_root: false }),
+    "非特权 · uid 未记录",
+  );
 });
 
 test("UI-01 removes finished runs from the home page", () => {

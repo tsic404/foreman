@@ -83,7 +83,37 @@ func (f *HTTPFetcher) Fetch(ctx context.Context, rawURL string, limit int64) ([]
 	if limit <= 0 {
 		limit = MaxArtifactBytes
 	}
-	body, err := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	return readBounded(response.Body, response.ContentLength, limit)
+}
+
+// readBounded reads at most limit bytes. A declared length inside the bound is
+// allocated once and filled: io.ReadAll grows its buffer by doubling, so a
+// 275 MiB artifact ends up holding a 512 MiB buffer plus the copy during
+// growth. Verification runs in the control plane, whose memory limit has to
+// cover one such download, and that transient is what a real Agent CLI hits.
+func readBounded(r io.Reader, length, limit int64) ([]byte, error) {
+	if length > limit {
+		return nil, fmt.Errorf("artifact exceeds the %d byte verification bound", limit)
+	}
+	if length > 0 {
+		body := make([]byte, length)
+		if _, err := io.ReadFull(r, body); err != nil {
+			if errors.Is(err, io.ErrUnexpectedEOF) {
+				return nil, errors.New("artifact ended before its declared length")
+			}
+			return nil, err
+		}
+		var extra [1]byte
+		n, err := r.Read(extra[:])
+		if n > 0 {
+			return nil, fmt.Errorf("artifact exceeds the %d byte verification bound", limit)
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			return nil, err
+		}
+		return body, nil
+	}
+	body, err := io.ReadAll(io.LimitReader(r, limit+1))
 	if err != nil {
 		return nil, err
 	}

@@ -133,7 +133,10 @@ func (s *Service) confirmOneSlot(ctx context.Context, environmentID string, cand
 		s.skip(ctx, report, AuditEntry{EnvironmentID: environmentID, ObjectID: candidate.ID, Reason: "session_still_open"})
 		return
 	}
-	if _, err := s.cfg.Environments.ReleaseSlot(ctx, environment.ID(environmentID), current.ID, true); err != nil {
+	// The maintenance loop proves the remote session ended. It has no
+	// Pod-close observation, so it submits only that half of the gate: the
+	// trusted platform observer returns the capacity when the Pod is gone.
+	if _, err := s.cfg.Environments.ConfirmRemoteClose(ctx, environment.ID(environmentID), current.ID); err != nil {
 		s.fail(ctx, report, AuditEntry{EnvironmentID: environmentID, ObjectID: candidate.ID, Reason: err.Error()})
 		return
 	}

@@ -128,6 +128,7 @@ func (b rulesBinder) Bind(ctx context.Context, request scheduler.EnvironmentRequ
 		out.TLSRef = choice.TLSRef
 		out.StateRoot = choice.StateRoot
 		out.EnvironmentGen = choice.Generation
+		out.EnvironmentIdentity = choice.Identity
 	}
 	return out, nil
 }
@@ -135,6 +136,23 @@ func (b rulesBinder) Bind(ctx context.Context, request scheduler.EnvironmentRequ
 // Release returns one claim's reservation.
 func (b rulesBinder) Release(ctx context.Context, binding scheduler.EnvironmentBinding) error {
 	return b.service.Release(ctx, rules.Binding{
+		EnvironmentID: binding.EnvironmentID, SlotID: binding.SlotID, RuleID: binding.RuleID,
+	})
+}
+
+// Isolate keeps the reservation of an attempt whose Job may still exist. It is
+// the release for a terminated Job: a drain bound proves no Pod closure.
+func (b rulesBinder) Isolate(ctx context.Context, binding scheduler.EnvironmentBinding) error {
+	return b.service.Isolate(ctx, rules.Binding{
+		EnvironmentID: binding.EnvironmentID, SlotID: binding.SlotID, RuleID: binding.RuleID,
+	})
+}
+
+// ReleaseAfterPodClosed completes the release once the bound Job's pods are
+// gone. The remote close was recorded by the Job-side release route; this is
+// the second half of the two-sided gate.
+func (b rulesBinder) ReleaseAfterPodClosed(ctx context.Context, binding scheduler.EnvironmentBinding) error {
+	return b.service.ReleaseAfterPodClosed(ctx, rules.Binding{
 		EnvironmentID: binding.EnvironmentID, SlotID: binding.SlotID, RuleID: binding.RuleID,
 	})
 }

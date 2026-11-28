@@ -200,10 +200,13 @@ func TestV2RemoteMaintenanceConfirmsIsolatedSlotOnlyAfterClose(t *testing.T) {
 		t.Fatalf("RunOnce after close: %v", err)
 	}
 	if report.SlotsConfirmed != 1 {
-		t.Fatalf("confirmed = %d, want the now-proven slot returned", report.SlotsConfirmed)
+		t.Fatalf("confirmed = %d, want the remote close submitted", report.SlotsConfirmed)
 	}
 	if len(fixture.ledger.releases) != 1 || !fixture.ledger.releases[0].confirmed {
-		t.Fatalf("releases = %+v, want one confirmed release", fixture.ledger.releases)
+		t.Fatalf("releases = %+v, want one confirmed remote close", fixture.ledger.releases)
+	}
+	if len(fixture.ledger.slots) != 1 {
+		t.Fatalf("slots = %+v, want the reservation kept until the Pod-close fact", fixture.ledger.slots)
 	}
 	if !hasAudit(report, remotemaint.AuditConfirm, "remote_close_confirmed") {
 		t.Fatalf("audit = %+v, want the confirmed close recorded", report.Entries)
@@ -304,10 +307,9 @@ func (l *v2EnvironmentLedger) Slots(context.Context, environment.ID, environment
 	return append([]environment.SlotView(nil), l.slots...), nil
 }
 
-func (l *v2EnvironmentLedger) ReleaseSlot(_ context.Context, _ environment.ID, slotID string, cleanupConfirmed bool) (environment.Slot, error) {
-	l.releases = append(l.releases, v2SlotRelease{id: slotID, confirmed: cleanupConfirmed})
-	l.slots = nil
-	return environment.Slot{ID: slotID}, nil
+func (l *v2EnvironmentLedger) ConfirmRemoteClose(_ context.Context, _ environment.ID, slotID string) (environment.Slot, error) {
+	l.releases = append(l.releases, v2SlotRelease{id: slotID, confirmed: true})
+	return environment.Slot{ID: slotID, RemoteClosed: true}, nil
 }
 
 type v2Inventory struct {

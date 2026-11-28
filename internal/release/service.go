@@ -40,6 +40,12 @@ type Config struct {
 	TickInterval time.Duration
 	Clock        func() time.Time
 	Logger       *slog.Logger
+	// OnPublished is invoked after a successful pointer switch, naming the
+	// release domain it belongs to. A publication is the event V2-C21
+	// refreshes a registration on, so the control plane re-resolves that
+	// source instead of waiting for a restart. The callback runs outside the
+	// service mutex and must not block on the caller's request path.
+	OnPublished func(serverID string)
 }
 
 // DefaultTickInterval is the automatic loop's wake-up cadence.
@@ -54,6 +60,9 @@ type Service struct {
 	now   func() time.Time
 	log   *slog.Logger
 	mu    sync.Mutex
+
+	hookMu      sync.Mutex
+	onPublished func(serverID string)
 }
 
 // New builds the service.
@@ -74,10 +83,11 @@ func New(cfg Config) (*Service, error) {
 		cfg.Logger = slog.Default()
 	}
 	return &Service{
-		cfg:   cfg,
-		store: cfg.Store,
-		now:   cfg.Clock,
-		log:   cfg.Logger.With("component", "release"),
+		cfg:         cfg,
+		store:       cfg.Store,
+		now:         cfg.Clock,
+		log:         cfg.Logger.With("component", "release"),
+		onPublished: cfg.OnPublished,
 	}, nil
 }
 
@@ -524,7 +534,15 @@ func (s *Service) Publish(ctx context.Context, cliID, version string, expectedGe
 			Workspaces: len(impact.Workspaces), InFlight: len(impact.InFlight),
 		})
 		existing := *current.Current
+		serverID := current.ServerID
 		s.mu.Unlock()
+		// The pointer is already the requested one, but the declaration it
+		// implies may never have landed (for example a registration failure).
+		// A repeated publish is the operator's retry signal, so it must reach
+		// the hook instead of succeeding as an unrecoverable no-op.
+		if hook := s.publishHook(); hook != nil {
+			hook(serverID)
+		}
 		outcome.Result = PublishPublished
 		outcome.Generation = existing.Generation
 		outcome.Published = &existing
@@ -565,12 +583,33 @@ func (s *Service) Publish(ctx context.Context, cliID, version string, expectedGe
 		Known: impact.Known, Agents: impact.AffectedAgents,
 		Workspaces: len(impact.Workspaces), InFlight: len(impact.InFlight),
 	})
+	serverID := current.ServerID
 	s.mu.Unlock()
 
+	// The pointer switched: hand the source to the re-declaration hook. It runs
+	// outside the mutex because it re-reads the release domain it just wrote.
+	if hook := s.publishHook(); hook != nil {
+		hook(serverID)
+	}
 	outcome.Result = PublishPublished
 	outcome.Generation = generation
 	outcome.Published = published
 	return outcome, nil
+}
+
+// SetPublishHook installs the callback a successful pointer switch invokes. It
+// replaces the config-supplied one, so the assembly can wire it after the
+// control plane it names exists.
+func (s *Service) SetPublishHook(hook func(serverID string)) {
+	s.hookMu.Lock()
+	s.onPublished = hook
+	s.hookMu.Unlock()
+}
+
+func (s *Service) publishHook() func(serverID string) {
+	s.hookMu.Lock()
+	defer s.hookMu.Unlock()
+	return s.onPublished
 }
 
 // Impact answers what the next start resolves for one candidate version. It

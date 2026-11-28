@@ -62,6 +62,14 @@ func (e *sourceScopedEnvironments) ReleaseSlot(_ context.Context, _ environment.
 	return environment.Slot{ID: slotID}, nil
 }
 
+func (e *sourceScopedEnvironments) ReleaseSlotOnPodClosed(_ context.Context, _ environment.ID, slotID string) (environment.Slot, error) {
+	return environment.Slot{ID: slotID}, nil
+}
+
+func (e *sourceScopedEnvironments) IsolateSlot(_ context.Context, _ environment.ID, slotID string) (environment.Slot, error) {
+	return environment.Slot{ID: slotID, State: environment.SlotIsolated}, nil
+}
+
 type sharedWorkspaceIssues struct{}
 
 func (sharedWorkspaceIssues) ByIssue(context.Context, string, string) (string, error) {

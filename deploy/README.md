@@ -166,12 +166,23 @@ Secret value. Verified CLI bytes live in the separate
 `FOREMAN_CLI_ARTIFACT_CACHE_DIR` (default `/var/lib/foreman/cli-cache`),
 addressable only by release domain and frozen digest; a damaged entry is a
 miss and is refetched from the registered source by the same digest.
-`FOREMAN_OMP_BINARY` (default `omp`) names the binary used by the startup
-command-surface probe. Execution uses the published, verified CLI artifact
-and the exact configuration revision; a deployment that does not mount either
-leaves omp unsupported. It never reports an empty model list as success.
-Codex and Claude stay `unsupported` until their command/protocol surfaces are
-verified for the pinned versions.
+`FOREMAN_OMP_BINARY` is optional and unset in the shipped manifest: the
+reference image carries no Agent CLI. While it is unset, the adapter is
+trusted by the bound probe of the exact published artifact — the same bytes a
+Job runs — and the trust table flips to `trusted` when that probe passes
+(`discovery.adapter name=omp status=trusted`). Set it only when the image
+really installs an omp binary beside the server; the startup probe then uses
+that path. Execution always uses the published, verified CLI artifact and the
+exact configuration revision. It never reports an empty model list as
+success. Codex and Claude stay `unsupported` until their command/protocol
+surfaces are verified for the pinned versions.
+
+A successful publish re-resolves its release domain: a source whose cold-start
+declaration was empty registers its runtime as soon as the Agent CLI is
+published, without a restart. A refused or timed-out registration retries with
+backoff, and republishing the same version is a retry signal for a declaration
+that never landed. A source already serving is not re-registered; its new
+pointer takes effect on the next start, which the impact preview describes.
 
 The Agent configuration surface is a prototype boundary: it validates a
 fictional JSON document, records the digest/size/revision and never creates a
@@ -216,6 +227,14 @@ curl -s -H "Authorization: Bearer $TOKEN" -X POST localhost:8081/admin/environme
 curl -s -H "Authorization: Bearer $TOKEN" -X POST localhost:8081/admin/environments/build-a/resume
 curl -s -H "Authorization: Bearer $TOKEN" -X DELETE localhost:8081/admin/environments/build-a
 ```
+
+`endpoint` accepts the same forms the Job-side adapter opens: a bare
+`host:port` or `tls://host:port` for the authenticated network channel, an
+absolute socket path or `unix:///…` for a node-local socket, and
+`ssh://[user@]host[:port]` or `cmd:<argv>` for a deployment that carries its
+own ssh client. A form no carrier channel serves is refused at registration,
+so a stored target is always one an attempt can reach. §Session transports in
+the Job template section documents the projection each form needs.
 
 | Route | Body / query | Answer |
 |---|---|---|
@@ -560,7 +579,7 @@ rsbx carrier the Job executes. They have different jobs.
 
 | Image | Built here | What it carries |
 |---|---|---|
-| `ghcr.io/tsic404/foreman` | yes | the server, the Job-side supervisor `foreman-job`, `foreman-gc` |
+| `ghcr.io/tsic404/foreman` | yes | the server, the Job-side supervisor `foreman-job`, `foreman-gc`, and the reference Job execution adapters |
 | `ghcr.io/tsic404/rsbx` | no | the rsbx client; no Multica CLI and no Agent CLI |
 
 `foreman` is published as a **multi-platform manifest list** (`linux/amd64` +
@@ -583,12 +602,76 @@ check its manifest list; do not infer the platform from the node pool.
 
 **The supervisor is not part of the carrier.** A `job-runtime` init container
 runs from `FOREMAN_JOB_RUNTIME_IMAGE` (default `ghcr.io/tsic404/foreman:latest`)
-and copies `foreman-job` and any deployment adapters from `/usr/local/bin` into
-an emptyDir; the carrier's agent container executes
+and copies `foreman-job` and the reference Job adapters from `/usr/local/bin`
+into an emptyDir; the carrier's agent container executes
 `/run/foreman/runtime/foreman-job`. Point `FOREMAN_JOB_RUNTIME_IMAGE` at the
 same release the Deployment runs — a digest or the matching version tag — so an
 old Foreman does not hand a Job a newer supervisor. The runtime image carries
 no CLI either.
+
+**The Job's execution adapters ship in the runtime image.** `foreman-job-cli`
+(CLI fetch), `rsbx-remote` (session open and close), `foreman-job-register`
+(registration observation), `foreman-job-runner` (dispatch) and
+`foreman-job-slots` (shared ledger) are the reference implementation of
+`02-contracts.md` V2-C29. They are the default, not a requirement: a deployment
+that supplies its own adapters points `FOREMAN_JOB_RUNTIME_IMAGE` at an image
+carrying them under `/usr/local/bin` with the same names, and the supervisor
+starts them the same way. The process, argument and environment conventions
+between the supervisor and an adapter are an implementation detail of this
+build, so a replacement must be built against this release's supervisor.
+
+### Session transports and material
+
+`rsbx-remote` and the management surface accept the same endpoint forms, and
+the registration refuses a form the adapter cannot open:
+
+| Form | Carrier channel | What the Job projects |
+|---|---|---|
+| `/abs/path/daemon.sock`, `unix:///abs/path/daemon.sock` | local socket | the socket's directory, at the same path, read-only |
+| `host:port`, `tls://host:port` | authenticated network (`tls`) | `foreman-env-tls-<environment id>`, read-only |
+| `ssh://[user@]host[:port]` | `ssh` stdio | nothing (`SSL_CERT_FILE` when a bundle is configured) |
+| `cmd:<argv>` | explicit stdio command | nothing |
+
+A bare `host:port` selects the authenticated network channel: the shipped
+carrier carries no ssh client, so the historically accepted form must not
+resolve to a program the image does not contain. A deployment that does carry
+an ssh client names that channel explicitly. The carrier authenticates the
+network channel with mutual TLS; termination and the ssh client's own identity,
+proxy and host-key configuration stay the deployer's.
+
+For the network channel the Job mounts exactly the selected environment's
+material: create a Secret `foreman-env-tls-<environment id>` in
+`FOREMAN_JOB_NAMESPACE` with the keys `ca.pem` (the trust anchor),
+`cert.pem` (the client certificate), `key.pem` (its private key) and,
+optionally, `server_name` (the name the client expects in the server's
+certificate). `tls_ref` must still be the registration's `ref/<name>`; the
+reference render mounts the Secret at `/run/foreman/tls/ref/<name>` and points
+`FOREMAN_JOB_TLS_DIR` at `/run/foreman/tls`. A missing, incomplete or
+unmatched set refuses the session before anything starts; a certificate the
+server's CA does not accept fails the handshake, which the run shows as a
+connection failure with zero business delivery (V2-C12).
+
+**The carrier client's posture.** The rsbx client mounts the sandbox with
+FUSE, so its container needs `/dev/fuse` and the privilege the device's cgroup
+requires. The reference fixed render therefore runs the `agent` container as
+root with `privileged: true`, and projects `/dev/fuse` plus exactly the unix
+socket the chosen endpoint names — never its directory, so a runtime socket
+that shares that directory (a `containerd.sock` under `/run`, say) does not
+enter the Pod. The privilege stays with the sandbox boundary: the
+business commands the carrier starts execute on the rsbx daemon's host, not in
+the Pod, and the render keeps host namespaces and container-runtime sockets
+out. The reference template in `25-job-template.yaml` is a different shape and
+stays non-privileged; it serves only the legacy path that does not read this
+render (see §Job template). A deployment that replaces the reference adapters
+supplies its own posture with them.
+
+Before it opens a session the reference `rsbx-remote` runs the deployment's own
+environment probe once more and compares the observed tree identity and target
+identity with the frozen binding. A tree that was replaced under the same
+`state_root`, a target whose identity no longer matches, or a probe that cannot
+observe the target refuses the session — ready is never answered from the
+frozen input. This needs the probe reachable from the Job face at ready time;
+without it the attempt fails closed instead of starting on an unverified tree.
 
 **The CLIs arrive only through the proxy.** At start-up the supervisor fetches
 the two frozen artifacts (the Multica CLI and the selected Agent CLI) from
@@ -603,6 +686,29 @@ budgets, so a saturated download window cannot reject control traffic
 (V2-C28). There is no direct release-source, image-bundled or local-execution
 fallback.
 
+Verification also limits one downloaded artifact, but that limit is an
+implementation choice of this build, not a capacity guarantee: do not size
+other components against it, and expect it to move with the implementation.
+The reference Deployment requests 512 MiB and limits the container to 1 GiB
+because verification buffers one artifact before it enters the cache. Treat
+both figures as this deployment's own resource recommendation, not as part of
+the CLI release contract.
+
+**The attempt-state volume carries a second copy of those artifacts.** The
+carrier keeps its sandbox and a verified snapshot of every program it runs
+locally under the same root, and the session's cache directory is one of those
+entries, so an open session writes both frozen artifacts into the volume again.
+The fixed render therefore sizes the volume as the attempt's download budget
+plus `512Mi` of headroom for the sandbox, the session log and the local
+records, with a `2Gi` floor; raising `FOREMAN_JOB_CLI_BUDGET_BYTES` raises the
+volume with it. A budget so large that the budget plus the headroom no longer
+fits an `int64` is refused at render time instead of wrapping to a negative
+size and clamping back to the floor. A volume sized for the record alone
+evicts the Job in the middle of a session — `64Mi` was smaller than one Agent
+artifact, and the eviction reached the task as a failed terminal with no close
+record. Leaving the volume unbounded is not the alternative: one Job would
+then fill the node's disk.
+
 Release and rollback are the same one-step operation as before: point the
 Deployment at another `foreman` tag (and `FOREMAN_JOB_RUNTIME_IMAGE` at the
 same release); the gc DaemonSet in `40-foreman-gc.yaml` runs the Foreman image
@@ -612,8 +718,9 @@ in-flight attempts keep the digest they froze.
 
 Local builds are for development and staging clusters, never the release path:
 `make build-foreman-image` builds one platform's image (`linux/$(ARCH)`, the
-host architecture unless `ARCH=` says otherwise) containing all three
-binaries. What a published image contains is checked by the design's
+host architecture unless `ARCH=` says otherwise) containing the server, the
+supervisor, `foreman-gc` and the five reference adapters. What a published
+image contains is checked by the design's
 acceptance cases; the release record reflects the push command's exit code
 only — a non-zero exit does not prove that nothing landed, so check the
 registry before re-running.
@@ -1088,6 +1195,20 @@ Foreman declares to the server; it also doubles as the template preflight.
 - **Credential duty**: the probe's Job Token sits in the template-shaped pod and
   the template's own processes can read it — do not add a process to the probe
   that must not hold it (same rule as the task Jobs).
+- **Control-plane scratch duty**: before the catalog probe, the control plane
+  verifies a published release by materializing it with `os.MkdirTemp("", …)`
+  under its own `TMPDIR` (`cmd/foreman/startup_discovery.go`), and the omp
+  adapter does the same (`internal/discovery/builtin.go`). The foreman
+  container runs with `readOnlyRootFilesystem: true`, so the Deployment must
+  set `TMPDIR` and mount a writable, size-limited `emptyDir` there — the
+  shipped manifest points it at `/tmp` with a `2Gi` limit, the same provision
+  the Job template gives its carrier. Dropping either half fails every bound
+  verification with `read-only file system` and leaves the adapter untrusted.
+  The control-plane image must also carry the runtime the payload links:
+  `images/foreman.Containerfile` installs `libstdc++`, because the bound probe
+  executes the same omp binary the Job runs (ADR-033 puts the same requirement
+  on the Job image). An image without it writes the artifact and then fails at
+  the dynamic loader, so the adapter never reaches `trusted`.
 - The advertised model catalog is discovered **at startup, on the single node
   the probe landed on, and replayed from cache** for later server commands
   (`FOREMAN_MODEL_CATALOG_CACHE_TTL`, default `6h`, stale caches still answer

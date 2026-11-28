@@ -25,12 +25,11 @@ type OMPAdapter struct {
 	Binary string
 }
 
-// NewOMPAdapter returns an adapter for the omp CLI.
+// NewOMPAdapter returns an adapter for the omp CLI. An empty binary means the
+// deployment installs no global probe binary: the adapter is then trusted from
+// a verified published artifact instead, which is the payload the Job runs.
 func NewOMPAdapter(binary string) *OMPAdapter {
-	if strings.TrimSpace(binary) == "" {
-		binary = "omp"
-	}
-	return &OMPAdapter{Binary: binary}
+	return &OMPAdapter{Binary: strings.TrimSpace(binary)}
 }
 
 // Name implements Adapter.
@@ -41,6 +40,9 @@ func (a *OMPAdapter) Kinds() []Kind { return []Kind{KindModels} }
 
 // Probe verifies the help surface the parser depends on.
 func (a *OMPAdapter) Probe(ctx context.Context) error {
+	if a.Binary == "" {
+		return errors.New("no global omp probe binary is configured; trust is established from a verified published artifact")
+	}
 	if _, err := probeOMPCommandSurface(ctx, a.Binary); err != nil {
 		return err
 	}

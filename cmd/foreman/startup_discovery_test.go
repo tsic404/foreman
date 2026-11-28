@@ -115,6 +115,19 @@ func startupTestDiscovery(t *testing.T, adapters ...discovery.AdapterRegistratio
 	})
 }
 
+// startupAdapterStatus reads one adapter's trust row from the discovery
+// service, so a test can judge the table the management surface reports.
+func startupAdapterStatus(t *testing.T, service *discovery.Service, name string) discovery.AdapterStatus {
+	t.Helper()
+	for _, status := range service.Adapters() {
+		if status.Name == name {
+			return status
+		}
+	}
+	t.Fatalf("adapter %q is not registered", name)
+	return discovery.AdapterStatus{}
+}
+
 // verifiedReleaseService builds an Agent definition whose current release is
 // backed by a matching verification record and cached bytes.
 func verifiedReleaseService(t *testing.T, serverID, adapter string, body []byte, verified bool) *release.Service {
@@ -324,6 +337,113 @@ func TestControlPlaneDiscoveryRegistersVerifiedRuntime(t *testing.T) {
 	}
 	if ids := client.RuntimeIDs(); len(ids) != 1 || ids[0] != "rid-omp" {
 		t.Fatalf("runtime ids = %v, want the registered rid-omp", ids)
+	}
+}
+
+// TestControlPlaneDiscoveryTrustsAVerifiedPublishedPayload: the control-plane
+// image carries no Agent CLI, so the global probe cannot trust omp. Probing
+// the exact published bytes is what earns trust and declares the runtime; a
+// payload that reports another version earns neither (V2-C09/C20).
+func TestControlPlaneDiscoveryTrustsAVerifiedPublishedPayload(t *testing.T) {
+	cases := []struct {
+		name     string
+		reported string
+		want     bool
+	}{
+		{name: "matching", reported: "omp/1.0.0", want: true},
+		{name: "mismatch", reported: "omp/9.9.9"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var registrations atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/daemon/register" {
+					w.WriteHeader(http.StatusNotFound)
+					return
+				}
+				registrations.Add(1)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"runtimes": []map[string]any{{
+						"id": "rid-omp", "name": "omp", "provider": "omp",
+						"status": "online", "profile_id": "primary",
+					}},
+				})
+			}))
+			defer server.Close()
+
+			payload := []byte("#!/bin/sh\n" +
+				"if [ \"$1\" = \"--version\" ]; then echo '" + tc.reported + "'; exit 0; fi\n" +
+				"if [ \"$1\" = \"models\" ] && [ \"$2\" = \"ls\" ] && [ \"$3\" = \"--help\" ]; then echo '--json --no-extensions'; exit 0; fi\n" +
+				"exit 1\n")
+
+			client := startupTestClient(t, server.URL)
+			clientSet, err := proxy.NewClientSet(client)
+			if err != nil {
+				t.Fatalf("NewClientSet: %v", err)
+			}
+			catalogService, err := startupTestCatalog(t, server.URL)
+			if err != nil {
+				t.Fatalf("catalog.New: %v", err)
+			}
+			releaseService := verifiedReleaseServiceVersion(t, "atlas", "omp", "1.0.0", payload, true)
+			configService, err := agentconfig.New(agentconfig.Config{Store: agentconfig.NewMemoryStore()})
+			if err != nil {
+				t.Fatalf("agentconfig.New: %v", err)
+			}
+			if _, err := configService.Write(context.Background(), agentconfig.Scope{
+				ServerID: "atlas", WorkspaceID: "ws-a", Backend: "omp", Profile: "primary",
+			}, agentconfig.WriteRequest{
+				SecretRef: "omp-primary", FileName: "config.json",
+				Config: json.RawMessage(`{"provider":"omp"}`),
+			}, "ops"); err != nil {
+				t.Fatalf("config Write: %v", err)
+			}
+			discoveryService, err := startupTestDiscovery(t,
+				discovery.AdapterRegistration{Adapter: discovery.NewOMPAdapter("")},
+			)
+			if err != nil {
+				t.Fatalf("discovery.New: %v", err)
+			}
+			if _, err := discoveryService.VerifyAdapter(context.Background(), "omp"); err != nil {
+				t.Fatalf("VerifyAdapter: %v", err)
+			}
+			if before := startupAdapterStatus(t, discoveryService, "omp"); before.Trusted {
+				t.Fatalf("adapter is trusted before any payload was probed: %+v", before)
+			}
+
+			discoverer := newControlPlaneDiscovery(
+				catalogService, releaseService, discoveryService, configService, clientSet,
+				slog.New(slog.NewTextHandler(io.Discard, nil)), nil,
+			)
+			out, err := discoverer.Discover(context.Background())
+			if err != nil {
+				t.Fatalf("Discover: %v", err)
+			}
+			after := startupAdapterStatus(t, discoveryService, "omp")
+			if tc.want {
+				if !after.Trusted {
+					t.Fatalf("adapter = %+v, want trusted from the verified payload", after)
+				}
+				if got := registrations.Load(); got != 1 {
+					t.Fatalf("registrations = %d, want 1", got)
+				}
+				declaration, ok := out["ws-a"]
+				if !ok || len(declaration.Runtimes) != 1 || declaration.Runtimes[0].Version != "1.0.0" {
+					t.Fatalf("discoveries = %+v, want the verified omp runtime", out)
+				}
+				return
+			}
+			if after.Trusted {
+				t.Fatalf("adapter = %+v, want untrusted after a mismatched payload", after)
+			}
+			if got := registrations.Load(); got != 0 {
+				t.Fatalf("registrations = %d, want none", got)
+			}
+			if len(out) != 0 {
+				t.Fatalf("discoveries = %+v, want none", out)
+			}
+		})
 	}
 }
 

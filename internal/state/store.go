@@ -108,6 +108,8 @@ type Snapshot struct {
 	ClaimedAt           time.Time `json:"claimed_at"`
 	JobCreatedAt        time.Time `json:"job_created_at"`
 	DaemonRegisteredAt  time.Time `json:"daemon_registered_at"`
+	DaemonCLIVersion    string    `json:"daemon_cli_version"`
+	AgentRuntimeVersion string    `json:"agent_runtime_version"`
 	DeliveredAt         time.Time `json:"delivered_at"`
 	Deliveries          int       `json:"deliveries"`
 	ClaimsAfterDelivery int       `json:"claims_after_delivery"`
@@ -115,10 +117,14 @@ type Snapshot struct {
 	BootDeadline        time.Time `json:"boot_deadline"`
 	LeaseKeepUntil      time.Time `json:"lease_keep_until"`
 	LastStatusSeen      string    `json:"last_status_seen"`
-	JobPhase            string    `json:"job_phase"`
-	DrainDeadline       time.Time `json:"drain_deadline"`
-	DeliveryDeadline    time.Time `json:"delivery_deadline"`
-	CompletedAt         time.Time `json:"completed_at"`
+	// SandboxPosture is the posture read from the created Job (ADR-002
+	// consequence 1). A restart must keep answering it, so it is part of the
+	// mapping record; the projection carries it to the run and ops details.
+	SandboxPosture   registry.SandboxPosture `json:"sandbox_posture"`
+	JobPhase         string                  `json:"job_phase"`
+	DrainDeadline    time.Time               `json:"drain_deadline"`
+	DeliveryDeadline time.Time               `json:"delivery_deadline"`
+	CompletedAt      time.Time               `json:"completed_at"`
 
 	// The mapping record's non-projected faces (ADR-046 决策 0): the delivery
 	// body (§4.3: 任务载荷存在共享状态的条目里), the instance's decided
@@ -138,6 +144,13 @@ type Snapshot struct {
 	// flag, not a body: the settled record and the projection stay untouched.
 	// The key is always present — the row's shape is one shape.
 	CancelAckOwed bool `json:"cancel_ack_owed"`
+
+	// SlotCloseOwed is the reservation's outstanding Pod-close half (§3.4):
+	// the credential was reclaimed at the drain bound and the kept entry is
+	// the only same-attempt handle for that fact. A restart between the bound
+	// and the Pod's actual disappearance must restore the debt, so it is part
+	// of the mapping record like CancelAckOwed. The key is always present.
+	SlotCloseOwed bool `json:"slot_close_owed"`
 
 	// The claim-time dispatch record (§4.1's non-projected fields). A
 	// restored pre-delivery entry keeps renewing its prepare lease (C4) and
@@ -212,6 +225,8 @@ func FromEntry(e registry.TaskEntry) Snapshot {
 		ClaimedAt:           e.ClaimedAt,
 		JobCreatedAt:        e.JobCreatedAt,
 		DaemonRegisteredAt:  e.DaemonRegisteredAt,
+		DaemonCLIVersion:    e.DaemonCLIVersion,
+		AgentRuntimeVersion: e.AgentRuntimeVersion,
 		DeliveredAt:         e.DeliveredAt,
 		Deliveries:          e.Deliveries,
 		ClaimsAfterDelivery: e.ClaimsAfterDelivery,
@@ -219,6 +234,7 @@ func FromEntry(e registry.TaskEntry) Snapshot {
 		BootDeadline:        e.BootDeadline,
 		LeaseKeepUntil:      e.LeaseKeepUntil,
 		LastStatusSeen:      e.LastStatusSeen,
+		SandboxPosture:      e.SandboxPosture,
 		JobPhase:            string(e.JobPhase),
 		DrainDeadline:       e.DrainDeadline,
 		DeliveryDeadline:    e.DeliveryDeadline,
@@ -227,6 +243,7 @@ func FromEntry(e registry.TaskEntry) Snapshot {
 		DecidedReport:       e.DecidedReport,
 		TokenHash:           e.TokenHash,
 		CancelAckOwed:       e.CancelAckOwed,
+		SlotCloseOwed:       e.SlotCloseOwed,
 		RealRuntimeID:       e.RealRuntimeID,
 		RuntimeIdentity:     e.RuntimeIdentity,
 		EnvironmentID:       e.EnvironmentID,
@@ -273,6 +290,8 @@ func (s Snapshot) ToEntry() registry.TaskEntry {
 		ClaimedAt:           s.ClaimedAt,
 		JobCreatedAt:        s.JobCreatedAt,
 		DaemonRegisteredAt:  s.DaemonRegisteredAt,
+		DaemonCLIVersion:    s.DaemonCLIVersion,
+		AgentRuntimeVersion: s.AgentRuntimeVersion,
 		DeliveredAt:         s.DeliveredAt,
 		Deliveries:          s.Deliveries,
 		ClaimsAfterDelivery: s.ClaimsAfterDelivery,
@@ -280,6 +299,7 @@ func (s Snapshot) ToEntry() registry.TaskEntry {
 		BootDeadline:        s.BootDeadline,
 		LeaseKeepUntil:      s.LeaseKeepUntil,
 		LastStatusSeen:      s.LastStatusSeen,
+		SandboxPosture:      s.SandboxPosture,
 		JobPhase:            registry.JobPhase(s.JobPhase),
 		DrainDeadline:       s.DrainDeadline,
 		DeliveryDeadline:    s.DeliveryDeadline,
@@ -288,6 +308,7 @@ func (s Snapshot) ToEntry() registry.TaskEntry {
 		DecidedReport:       s.DecidedReport,
 		TokenHash:           s.TokenHash,
 		CancelAckOwed:       s.CancelAckOwed,
+		SlotCloseOwed:       s.SlotCloseOwed,
 		RealRuntimeID:       s.RealRuntimeID,
 		RuntimeIdentity:     s.RuntimeIdentity,
 		EnvironmentID:       s.EnvironmentID,

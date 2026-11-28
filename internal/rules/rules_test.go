@@ -24,6 +24,7 @@ type fakeEnvironments struct {
 	views    []environment.EnvironmentView
 	acquires int
 	releases int
+	isolates int
 	slots    map[string]string
 }
 
@@ -54,6 +55,17 @@ func (f *fakeEnvironments) ReleaseSlot(_ context.Context, id environment.ID, slo
 	f.releases++
 	delete(f.slots, string(id))
 	return environment.Slot{ID: slotID}, nil
+}
+
+func (f *fakeEnvironments) ReleaseSlotOnPodClosed(_ context.Context, id environment.ID, slotID string) (environment.Slot, error) {
+	f.releases++
+	delete(f.slots, string(id))
+	return environment.Slot{ID: slotID}, nil
+}
+
+func (f *fakeEnvironments) IsolateSlot(_ context.Context, _ environment.ID, slotID string) (environment.Slot, error) {
+	f.isolates++
+	return environment.Slot{ID: slotID, State: environment.SlotIsolated}, nil
 }
 
 type fakeReleases struct {

@@ -2,16 +2,20 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
 
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 
+	"github.com/tsic404/foreman/internal/attempt"
 	"github.com/tsic404/foreman/internal/catalog"
 	"github.com/tsic404/foreman/internal/environment"
 	"github.com/tsic404/foreman/internal/observability"
+	"github.com/tsic404/foreman/internal/registry"
 )
 
 const (
@@ -194,4 +198,71 @@ func splitCommaList(raw string) []string {
 		}
 	}
 	return out
+}
+
+// newPodCloseObserver answers the release gate's second half from the bound
+// Job's own pods. "Closed" means no Pod exists or every Pod has reached a
+// terminal phase; a missing Job name is unknown, never closed.
+func newPodCloseObserver(clientset kubernetes.Interface, defaultNamespace string) func(context.Context, registry.TaskEntry, attempt.Binding) (bool, error) {
+	if clientset == nil {
+		return nil
+	}
+	return func(ctx context.Context, entry registry.TaskEntry, _ attempt.Binding) (bool, error) {
+		if strings.TrimSpace(entry.JobName) == "" {
+			return false, errors.New("the entry names no Job")
+		}
+		namespace := strings.TrimSpace(entry.JobNamespace)
+		if namespace == "" {
+			namespace = defaultNamespace
+		}
+		pods, err := clientset.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+			LabelSelector: "job-name=" + entry.JobName,
+		})
+		if err != nil {
+			return false, err
+		}
+		if len(pods.Items) == 0 {
+			// The caller is a live process inside the bound Job, so an empty
+			// list means the observation failed to match its Pod — unknown,
+			// not closed.
+			return false, errors.New("no pod matches the bound Job")
+		}
+		for _, pod := range pods.Items {
+			if pod.Status.Phase != "Succeeded" && pod.Status.Phase != "Failed" {
+				return false, nil
+			}
+		}
+		return true, nil
+	}
+}
+
+// newFixedDeliveryGate holds a fixed attempt's payload until the supervisor
+// has verified the registration and committed "started" to the shared ledger.
+// The commit is the only server-visible proof that the Job-side preconditions
+// passed; without it the daemon receives an empty batch and keeps polling.
+func newFixedDeliveryGate(slots *environment.Service) func(context.Context, registry.TaskEntry) (bool, error) {
+	if slots == nil {
+		return nil
+	}
+	return func(ctx context.Context, entry registry.TaskEntry) (bool, error) {
+		if len(entry.FixedAttempt) == 0 {
+			// The legacy template path has no shared reservation to wait for.
+			return true, nil
+		}
+		var binding attempt.Binding
+		if err := json.Unmarshal(entry.FixedAttempt, &binding); err != nil {
+			return false, err
+		}
+		if binding.EnvironmentID == "" || binding.SlotID == "" {
+			return false, errors.New("the frozen attempt names no reservation")
+		}
+		slot, found, err := slots.SlotState(ctx, environment.ID(binding.EnvironmentID), binding.SlotID)
+		if err != nil {
+			return false, err
+		}
+		if !found {
+			return false, nil
+		}
+		return slot.State == environment.SlotActive && slot.Started && slot.ClaimID != "", nil
+	}
 }

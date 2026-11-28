@@ -275,11 +275,23 @@ spec:
             # payload enters the cache; a damaged entry is refetched.
             - name: FOREMAN_CLI_ARTIFACT_CACHE_DIR
               value: "/var/lib/foreman/cli-cache"
-            # The startup command-surface probe runs this binary. Execution
-            # uses the published, verified CLI artifact instead; a deployment
-            # without either leaves the adapter unsupported.
-            - name: FOREMAN_OMP_BINARY
-              value: "omp"
+            # Bound verification and the omp adapter materialize the verified
+            # payload with os.MkdirTemp("", …), which resolves to TMPDIR. The
+            # container's root filesystem is read-only, so this env names the
+            # scratch emptyDir mounted at /tmp below. Without both the probe
+            # dies with "read-only file system" and every adapter stays
+            # untrusted (deploy/README.md §Catalog probe and model catalog).
+            - name: TMPDIR
+              value: "/tmp"
+            - name: TMP
+              value: "/tmp"
+            - name: TEMP
+              value: "/tmp"
+            # No global omp probe binary is shipped: the control-plane image
+            # carries no Agent CLI (V2-C09/V2-C20). An adapter is trusted from
+            # the verified published payload it will actually run, and the
+            # startup probe reports that until a release is published. Set
+            # FOREMAN_OMP_BINARY only when the image really installs one.
             # Registered rsbxd environments, isolated slots and retirement
             # tombstones live in this Secret, so they survive a Pod rebuild and
             # a retired id stays retired. The Secret is created by
@@ -366,10 +378,15 @@ spec:
           resources:
             requests:
               cpu: 200m
-              memory: 256Mi
+              # One verification download is buffered in memory before it is
+              # written to the artifact cache, so the limit has to cover one
+              # Agent CLI artifact (200-300 MiB in practice) plus the rest of
+              # the server. A bound larger than the limit turns a publish into
+              # an OOM kill instead of a verified release.
+              memory: 512Mi
             limits:
               cpu: "1"
-              memory: 512Mi
+              memory: 1Gi
           securityContext:
             runAsNonRoot: true
             runAsUser: 1000
@@ -384,6 +401,13 @@ spec:
             # lives in the Secret carrier so it survives a Pod rebuild.
             - name: state
               mountPath: /var/lib/foreman
+            # Scratch for the bound probe and the omp adapter: the verified
+            # payload (a 200-300 MiB Agent CLI) is written here and removed
+            # after the check. The sizeLimit is one artifact plus headroom,
+            # matching the Job template's /tmp allowance; an unbounded scratch
+            # would let a repeated verification fill the node's disk.
+            - name: tmp
+              mountPath: /tmp
             # §8.1 template carrier: required, so a missing ConfigMap blocks
             # pod creation with CreateContainerConfigError (the container-layer
             # half of the fail-fast pair) instead of starting a Foreman with
@@ -398,9 +422,21 @@ spec:
             - name: job-policy
               mountPath: /etc/foreman/policy
               readOnly: true
+            # Per-source credential files for the management surface. The
+            # catalog stores only the reference; without this mount every
+            # registration answers with an unresolvable credential_ref.
+            # Optional: an installation with no catalog source keeps serving,
+            # and a registration fails closed instead of starting the pod in
+            # CreateContainerConfigError (deploy/README.md §Management surface).
+            - name: catalog-credentials
+              mountPath: /etc/foreman/catalog-credentials
+              readOnly: true
       volumes:
         - name: state
           emptyDir: {}
+        - name: tmp
+          emptyDir:
+            sizeLimit: 2Gi
         - name: job-template
           configMap:
             name: foreman-job-template
@@ -408,6 +444,10 @@ spec:
         - name: job-policy
           configMap:
             name: foreman-job-policy
+            optional: true
+        - name: catalog-credentials
+          secret:
+            secretName: foreman-catalog-credentials
             optional: true
 ---
 # Job-side entry point: the Job daemon's MULTICA_SERVER_URL resolves to

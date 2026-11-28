@@ -13,11 +13,17 @@ import (
 	"testing"
 	"time"
 
+	corev1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes/fake"
+
+	"github.com/tsic404/foreman/internal/attempt"
 	"github.com/tsic404/foreman/internal/catalog"
 	"github.com/tsic404/foreman/internal/catalog/catalogtest"
 	"github.com/tsic404/foreman/internal/environment"
 	"github.com/tsic404/foreman/internal/environment/environmenttest"
 	"github.com/tsic404/foreman/internal/observability"
+	"github.com/tsic404/foreman/internal/registry"
 )
 
 func environmentTestLogger() *slog.Logger {
@@ -335,5 +341,88 @@ func TestNewEnvironmentAdminResolvesAWorkspaceCredentialToItsSource(t *testing.T
 	}
 	if rec := request(http.MethodDelete, "/admin/environments/build-a", true); rec.Code != http.StatusForbidden {
 		t.Fatalf("DELETE with the workspace credential = %d, want 403", rec.Code)
+	}
+}
+
+// TestFixedDeliveryGateWaitsForStartedSlot pins the production gate the S-6
+// handler calls: a frozen attempt's payload is held until the supervisor has
+// committed the started phase on the shared ledger.
+func TestFixedDeliveryGateWaitsForStartedSlot(t *testing.T) {
+	ctx := t.Context()
+	probe := environmenttest.NewProbe()
+	probe.Result = environment.ProbeResult{
+		TreeID: "tree-1", Identity: "sha256:tree-1", Capabilities: []string{"nix"},
+		Capacity: 2, Version: "rsbxd-test",
+	}
+	service, err := environment.New(environment.Config{
+		Probe:               probe,
+		AllowedTrustDomains: []string{"build"},
+	})
+	if err != nil {
+		t.Fatalf("environment.New: %v", err)
+	}
+	if _, err := service.Register(ctx, cmdEnvironmentRegistration("build-a"), "test"); err != nil {
+		t.Fatalf("Register: %v", err)
+	}
+	if _, err := service.AcquireSlot(ctx, "build-a", "slot-1"); err != nil {
+		t.Fatalf("AcquireSlot: %v", err)
+	}
+	if _, err := service.BeginSlot(ctx, "build-a", "slot-1", "claim-1"); err != nil {
+		t.Fatalf("BeginSlot: %v", err)
+	}
+
+	raw, err := json.Marshal(attempt.Binding{AttemptID: "task-1", EnvironmentID: "build-a", SlotID: "slot-1"})
+	if err != nil {
+		t.Fatalf("encode the frozen binding: %v", err)
+	}
+	entry := registry.TaskEntry{FixedAttempt: raw}
+	gate := newFixedDeliveryGate(service)
+	ready, err := gate(ctx, entry)
+	if err != nil || ready {
+		t.Fatalf("gate before started = (%v, %v), want a plain not-yet", ready, err)
+	}
+	if _, err := service.BindSlot(ctx, "build-a", "slot-1", "claim-1", "session-1"); err != nil {
+		t.Fatalf("BindSlot: %v", err)
+	}
+	if ready, err := gate(ctx, entry); err != nil || ready {
+		t.Fatalf("gate after bind = (%v, %v), want still not-yet", ready, err)
+	}
+	if _, err := service.MarkSlotStarted(ctx, "build-a", "slot-1", "claim-1"); err != nil {
+		t.Fatalf("MarkSlotStarted: %v", err)
+	}
+	if ready, err := gate(ctx, entry); err != nil || !ready {
+		t.Fatalf("gate after started = (%v, %v), want the payload released", ready, err)
+	}
+
+	bad := registry.TaskEntry{FixedAttempt: json.RawMessage("{")}
+	if _, err := gate(ctx, bad); err == nil {
+		t.Fatal("gate accepted an unreadable frozen binding")
+	}
+}
+
+// TestPodCloseObserverKeepsUnknownAndClosedApart pins the trusted observer:
+// only terminal Pods prove a close, and an empty match is unknown rather than
+// permission to return capacity.
+func TestPodCloseObserverKeepsUnknownAndClosedApart(t *testing.T) {
+	ctx := t.Context()
+	entry := registry.TaskEntry{JobName: "fm-task-1", JobNamespace: "foreman"}
+	if closed, err := newPodCloseObserver(fake.NewSimpleClientset(), "foreman")(ctx, entry, attempt.Binding{}); err == nil || closed {
+		t.Fatalf("no matching pod = (%v, %v), want unknown", closed, err)
+	}
+	pod := &corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name: "fm-task-1-x", Namespace: "foreman",
+			Labels: map[string]string{"job-name": "fm-task-1"},
+		},
+		Status: corev1.PodStatus{Phase: corev1.PodRunning},
+	}
+	observer := newPodCloseObserver(fake.NewSimpleClientset(pod), "foreman")
+	if closed, err := observer(ctx, entry, attempt.Binding{}); err != nil || closed {
+		t.Fatalf("running pod = (%v, %v), want still open", closed, err)
+	}
+	pod.Status.Phase = corev1.PodSucceeded
+	observer = newPodCloseObserver(fake.NewSimpleClientset(pod), "foreman")
+	if closed, err := observer(ctx, entry, attempt.Binding{}); err != nil || !closed {
+		t.Fatalf("terminal pod = (%v, %v), want closed", closed, err)
 	}
 }

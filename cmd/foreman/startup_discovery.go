@@ -8,6 +8,9 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
+	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -85,7 +88,6 @@ func (d *controlPlaneDiscovery) Discover(ctx context.Context) (map[string]regist
 	if err != nil {
 		return nil, err
 	}
-	trusted := d.trustedAdapters()
 	out := map[string]registry.Discovery{}
 	for _, sourceID := range d.sourceIDs() {
 		// Between sources: a tenure lost after the previous source must not
@@ -94,7 +96,7 @@ func (d *controlPlaneDiscovery) Discover(ctx context.Context) (map[string]regist
 			d.log.Warn("runtime.control_plane_discovery_deferred", "reason", "leader_lease_lost")
 			return nil, err
 		}
-		found, derr := d.discoverSource(ctx, sourceID, configs, trusted)
+		found, derr := d.discoverSource(ctx, sourceID, configs)
 		if derr != nil {
 			if errors.Is(derr, tenure.ErrLost) {
 				d.log.Warn("runtime.control_plane_discovery_deferred", "reason", "leader_lease_lost")
@@ -137,20 +139,12 @@ func (d *controlPlaneDiscovery) DiscoverSource(ctx context.Context, sourceID str
 	if err != nil {
 		return nil, err
 	}
-	return d.discoverSource(ctx, sourceID, configs, d.trustedAdapters())
+	return d.discoverSource(ctx, sourceID, configs)
 }
 
 // RunStartupProbeInSource implements the bootstrap per-source discovery seam.
 func (d *controlPlaneDiscovery) RunStartupProbeInSource(ctx context.Context, sourceID string) (map[string]registry.Discovery, error) {
 	return d.DiscoverSource(ctx, sourceID)
-}
-
-func (d *controlPlaneDiscovery) trustedAdapters() map[string]bool {
-	trusted := map[string]bool{}
-	for _, status := range d.discovery.Adapters() {
-		trusted[status.Name] = status.Trusted
-	}
-	return trusted
 }
 
 func (d *controlPlaneDiscovery) sourceIDs() []string {
@@ -180,23 +174,42 @@ func (e *sourceRegistrationError) Error() string {
 
 func (e *sourceRegistrationError) Unwrap() error { return e.err }
 
+// errDeclarationStale reports that the published release set changed between
+// the probe that built a declaration and its registration commit. The attempt
+// is abandoned rather than overwriting the newer declaration; the caller
+// re-resolves with the facts it just read.
+var errDeclarationStale = errors.New("the published declaration changed before its registration commit")
+
 func (d *controlPlaneDiscovery) discoverSource(
 	ctx context.Context,
 	sourceID string,
 	configs []agentconfig.View,
-	trusted map[string]bool,
 ) (map[string]registry.Discovery, error) {
 	out := map[string]registry.Discovery{}
 	for _, client := range d.clients.All() {
 		if client.SourceID() != sourceID {
 			continue
 		}
-		declaration, err := d.resolveClient(ctx, client, configs, trusted)
+		declaration, verified, serverID, err := d.resolveClient(ctx, client, configs)
 		if err != nil {
 			return nil, err
 		}
 		if len(declaration.Runtimes) == 0 {
 			continue
+		}
+		// A client that already completed C1 holds this process's live
+		// identity. A second C1 would duplicate the registration, and an
+		// older declaration read before a newer publication could replace it
+		// (AC-77: a served declaration is never re-registered).
+		if len(client.RuntimeIDs()) > 0 {
+			out[client.WorkspaceID()] = declaration
+			continue
+		}
+		// The probe may have run for seconds. Re-read the published set at
+		// the commit point so a publication that landed in between is not
+		// overwritten by the declaration this attempt resolved earlier.
+		if err := d.recheckRelease(ctx, serverID, verified); err != nil {
+			return nil, err
 		}
 		// C1 creates the daemon identity upstream. Resolution reads published
 		// facts with no external side effect, but the registration is
@@ -225,6 +238,38 @@ func (d *controlPlaneDiscovery) discoverSource(
 	return out, nil
 }
 
+func (d *controlPlaneDiscovery) recheckRelease(ctx context.Context, serverID string, used []release.VerifiedAgentRelease) error {
+	fresh, err := d.releases.VerifiedAgentReleases(ctx, serverID)
+	if err != nil {
+		return err
+	}
+	if !sameVerifiedReleases(used, fresh) {
+		return errDeclarationStale
+	}
+	return nil
+}
+
+// sameVerifiedReleases compares the release identity a declaration was built
+// from, independent of the store's order.
+func sameVerifiedReleases(left, right []release.VerifiedAgentRelease) bool {
+	keys := func(releases []release.VerifiedAgentRelease) []string {
+		out := make([]string, 0, len(releases))
+		for _, candidate := range releases {
+			artifacts := make([]string, 0, len(candidate.Artifacts))
+			for _, artifact := range candidate.Artifacts {
+				artifacts = append(artifacts, artifact.Platform.Key()+":"+
+					strings.ToLower(artifact.Digest)+":"+strconv.FormatInt(artifact.Size, 10))
+			}
+			sort.Strings(artifacts)
+			out = append(out, candidate.CLIID+"\x00"+candidate.Adapter+"\x00"+
+				candidate.Version+"\x00"+strings.Join(artifacts, ","))
+		}
+		sort.Strings(out)
+		return out
+	}
+	return slices.Equal(keys(left), keys(right))
+}
+
 // resolveClient derives one client's declaration from the published CLI and
 // configuration facts. It performs no upstream write: the caller decides
 // whether this instance may still register.
@@ -232,39 +277,43 @@ func (d *controlPlaneDiscovery) resolveClient(
 	ctx context.Context,
 	client *proxy.Client,
 	configs []agentconfig.View,
-	trusted map[string]bool,
-) (registry.Discovery, error) {
-	sourceID, ok := d.catalog.SourceIDForURL(ctx, client.ServerURL())
+) (registry.Discovery, []release.VerifiedAgentRelease, string, error) {
+	catalogID, ok := d.catalog.SourceIDForURL(ctx, client.ServerURL())
 	if !ok {
-		return registry.Discovery{}, nil
+		return registry.Discovery{}, nil, "", nil
 	}
+	serverID := string(catalogID)
 	declaration := registry.Discovery{}
-	if version, ok := d.releases.CurrentVersion(ctx, string(sourceID), release.KindMultica, ""); ok {
+	if version, ok := d.releases.CurrentVersion(ctx, serverID, release.KindMultica, ""); ok {
 		declaration.CLIVersion = version
 	}
-	verified, err := d.releases.VerifiedAgentReleases(ctx, string(sourceID))
+	verified, err := d.releases.VerifiedAgentReleases(ctx, serverID)
 	if err != nil {
-		return registry.Discovery{}, err
+		return registry.Discovery{}, nil, "", err
 	}
 	seen := map[string]bool{}
 	for _, candidate := range verified {
-		if !trusted[candidate.Adapter] {
-			continue
-		}
-		if err := d.verifyBound(ctx, string(sourceID), candidate); err != nil {
+		// The bound probe runs the exact published bytes with the fixed
+		// commands the parser depends on, so passing it is what makes the
+		// adapter trusted for this release. A deployment that installs no
+		// probe binary beside the server is not therefore untrusted: the
+		// verified payload cannot drift from what the runtime executes, and
+		// it is the stronger check.
+		if err := d.verifyBound(ctx, serverID, candidate); err != nil {
 			d.log.Warn("runtime.bound_verification_failed",
 				"workspace_id", client.WorkspaceID(),
-				"server_id", string(sourceID),
+				"server_id", serverID,
 				"cli_id", candidate.CLIID,
 				"version", candidate.Version,
 				"err", err.Error())
 			continue
 		}
-		profiles := configuredProfiles(configs, string(sourceID), client.WorkspaceID(), candidate.Adapter)
+		d.discovery.TrustPublished(candidate.Adapter, candidate.Version)
+		profiles := configuredProfiles(configs, serverID, client.WorkspaceID(), candidate.Adapter)
 		if len(profiles) == 0 {
 			d.log.Warn("runtime.configuration_unavailable",
 				"workspace_id", client.WorkspaceID(),
-				"server_id", string(sourceID),
+				"server_id", serverID,
 				"adapter", candidate.Adapter,
 				"detail", "no registered Agent configuration scope is available; the runtime is not declared")
 			continue
@@ -284,11 +333,11 @@ func (d *controlPlaneDiscovery) resolveClient(
 	if len(declaration.Runtimes) == 0 {
 		d.log.Warn("runtime.declaration_unavailable",
 			"workspace_id", client.WorkspaceID(),
-			"server_id", string(sourceID),
+			"server_id", serverID,
 			"detail", "no verified Agent CLI definition is available; the workspace is not served")
-		return declaration, nil
+		return declaration, verified, serverID, nil
 	}
-	return declaration, nil
+	return declaration, verified, serverID, nil
 }
 
 // verifyBound probes the exact published payload on the platform the
